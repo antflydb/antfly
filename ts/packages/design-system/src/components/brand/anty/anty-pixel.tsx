@@ -15,10 +15,7 @@ const sizePx: Record<AntyPixelSize, number> = {
   xl: 192,
 };
 
-export interface AntyPixelProps extends Omit<
-  React.HTMLAttributes<HTMLSpanElement>,
-  "children"
-> {
+export interface AntyPixelProps extends Omit<React.HTMLAttributes<HTMLSpanElement>, "children"> {
   /**
    * Pixel resolution of the mark.
    * - `"diagonal"` — 24×24, the high-fidelity Anty silhouette: rounded top-left and
@@ -60,7 +57,7 @@ export const AntyPixel = React.forwardRef<HTMLSpanElement, AntyPixelProps>(
       style,
       ...props
     },
-    ref,
+    ref
   ) => {
     const px = sizePx[size];
     const viewBox = variant === "square" ? "0 0 12 12" : "0 0 24 24";
@@ -97,7 +94,7 @@ export const AntyPixel = React.forwardRef<HTMLSpanElement, AntyPixelProps>(
         </svg>
       </span>
     );
-  },
+  }
 );
 AntyPixel.displayName = "AntyPixel";
 

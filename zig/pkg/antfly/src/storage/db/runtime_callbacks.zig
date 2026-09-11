@@ -95,3 +95,12 @@ pub const PromotionOwner = struct {
         return self.vtable.is_local_owner(self.ptr);
     }
 };
+
+pub const DenseNativeMigrationPolicySource = struct {
+    ptr: *const anyopaque,
+    authority_permitted: *const fn (ptr: *const anyopaque) bool,
+
+    pub fn authorityPermitted(self: @This()) bool {
+        return self.authority_permitted(self.ptr);
+    }
+};

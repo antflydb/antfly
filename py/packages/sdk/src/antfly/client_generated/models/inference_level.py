@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceLevel(str, Enum):
+class InferenceLevel(StrEnum):
     DEBUG = "debug"
     ERROR = "error"
     INFO = "info"

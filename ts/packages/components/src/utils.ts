@@ -4,10 +4,12 @@ import type {
   GenerationConfidence,
   QueryHit,
   RetrievalAgentStreamCallbacks,
+  SSEStepStarted,
+  SSEToolMode,
 } from "@antfly/sdk";
 import {
   AntflyClient,
-  type QueryRequest,
+  type GlobalQueryRequest,
   type QueryResponses,
   type RetrievalAgentRequest,
   type RetrievalAgentResult,
@@ -15,7 +17,7 @@ import {
 import qs from "qs";
 
 export interface MultiqueryRequest {
-  query: QueryRequest;
+  query: GlobalQueryRequest;
 }
 
 let defaultClient: AntflyClient | null = null;
@@ -166,7 +168,9 @@ export interface AnswerCallbacks {
   onConfidence?: (data: GenerationConfidence) => void;
   onFollowup?: (question: string) => void;
   onEvalResult?: (data: EvalResult) => void;
-  onStepStarted?: (step: import("@antfly/sdk").SSEStepStarted) => void;
+  onToolMode?: (data: SSEToolMode) => void;
+  onStepStarted?: (step: SSEStepStarted) => void;
+  onStepProgress?: (data: Record<string, unknown>) => void;
   onStepCompleted?: (step: import("@antfly/sdk").AgentStep) => void;
   onComplete?: () => void;
   onError?: (error: Error | string) => void;
@@ -202,7 +206,10 @@ export async function streamAnswer(
       callbacks.onGeneration ||
       callbacks.onConfidence ||
       callbacks.onFollowup ||
+      callbacks.onEvalResult ||
+      callbacks.onToolMode ||
       callbacks.onStepStarted ||
+      callbacks.onStepProgress ||
       callbacks.onStepCompleted
     );
 
@@ -219,7 +226,9 @@ export async function streamAnswer(
           onReasoning: callbacks.onReasoning,
           onHit: callbacks.onHit,
           onGeneration: callbacks.onGeneration,
+          onToolMode: callbacks.onToolMode,
           onStepStarted: callbacks.onStepStarted,
+          onStepProgress: callbacks.onStepProgress,
           onStepCompleted: callbacks.onStepCompleted,
           onConfidence: callbacks.onConfidence,
           onFollowup: callbacks.onFollowup,
@@ -239,28 +248,13 @@ export async function streamAnswer(
       : undefined;
 
     // Call the retrieval agent endpoint
-    const result = await client.retrievalAgent(retrievalRequest, sdkCallbacks);
-
-    // Handle non-streaming response (RetrievalAgentResult)
-    if (result && typeof result === "object" && "generation" in result) {
-      if (callbacks.onRetrievalAgentResult) {
-        callbacks.onRetrievalAgentResult(result as RetrievalAgentResult);
-      }
-      if (callbacks.onComplete) {
-        callbacks.onComplete();
-      }
-      return new AbortController(); // Return a dummy controller for consistency
+    if (sdkCallbacks) {
+      return await client.streamRetrievalAgent(retrievalRequest, sdkCallbacks);
     }
 
-    // Handle streaming response (AbortController)
-    if (result && typeof result === "object" && "abort" in result) {
-      return result as AbortController;
-    }
-
-    // Fallback
-    if (callbacks.onComplete) {
-      callbacks.onComplete();
-    }
+    const result: RetrievalAgentResult = await client.retrievalAgent(retrievalRequest);
+    callbacks.onRetrievalAgentResult?.(result);
+    callbacks.onComplete?.();
     return new AbortController();
   } catch (error) {
     if (error instanceof Error) {

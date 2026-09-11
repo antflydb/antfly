@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class VertexSearchConfigService(str, Enum):
+class VertexSearchConfigService(StrEnum):
     AGENT_SEARCH = "agent_search"
 
     def __str__(self) -> str:

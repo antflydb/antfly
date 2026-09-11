@@ -61,7 +61,7 @@ pub const OnnxExecutor = struct {
         value_device: []DeviceId,
         _: []const NodeId,
         device_id: DeviceId,
-        _: PartitionExecutor.ExecutionContext,
+        exec_ctx: PartitionExecutor.ExecutionContext,
     ) anyerror!void {
         const self: *OnnxExecutor = @ptrCast(@alignCast(ctx));
 
@@ -83,7 +83,13 @@ pub const OnnxExecutor = struct {
             inputs[i] = try Tensor.initFloat32(self.allocator, info.name, shape_i64, data);
         }
 
-        const outputs = try self.session.run(inputs, self.allocator);
+        const outputs = if (exec_ctx.options) |options|
+            if (options.execution_control) |control|
+                try self.session.runWithControl(inputs, self.allocator, control)
+            else
+                try self.session.run(inputs, self.allocator)
+        else
+            try self.session.run(inputs, self.allocator);
         defer {
             for (outputs) |*tensor| tensor.deinit();
             self.allocator.free(outputs);

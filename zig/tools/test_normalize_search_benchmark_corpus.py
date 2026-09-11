@@ -24,8 +24,7 @@ class NormalizeSearchCorpusTest(unittest.TestCase):
             output = root / "canonical.jsonl"
             manifest_path = root / "manifest.json"
             source.write_text(
-                '{"title":"ignored","body":"Hello\\nworld"}\n\n'
-                '{"body":"CAFÉ 😀"}\n',
+                '{"title":"ignored","body":"Hello\\nworld"}\n\n{"body":"CAFÉ 😀"}\n',
                 encoding="utf-8",
             )
             manifest = normalizer.normalize(source, output, manifest_path, "body")
@@ -44,7 +43,9 @@ class NormalizeSearchCorpusTest(unittest.TestCase):
             source = root / "source.jsonl"
             source.write_text('{"text":"wrong field"}\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "field 'body'"):
-                normalizer.normalize(source, root / "out.jsonl", root / "manifest.json", "body")
+                normalizer.normalize(
+                    source, root / "out.jsonl", root / "manifest.json", "body"
+                )
 
 
 if __name__ == "__main__":

@@ -29,24 +29,13 @@ const Config = struct {
 };
 
 const Barrier = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    waiting: usize = 0,
-    open: bool = false,
+    io: std.Io,
+    waiting: std.atomic.Value(usize) = .init(0),
+    open: std.Io.Event = .unset,
 
     fn wait(self: *@This(), total: usize) void {
-        var registered = false;
-        while (true) {
-            lockAtomic(&self.mutex);
-            if (!registered) {
-                self.waiting += 1;
-                registered = true;
-                if (self.waiting == total) self.open = true;
-            }
-            const ready = self.open;
-            self.mutex.unlock();
-            if (ready) return;
-            std.Thread.yield() catch {};
-        }
+        if (self.waiting.fetchAdd(1, .acq_rel) + 1 == total) self.open.set(self.io);
+        self.open.waitUncancelable(self.io);
     }
 };
 
@@ -190,6 +179,13 @@ fn parseNextU64(args: *std.process.Args.Iterator, flag: []const u8) !u64 {
 }
 
 fn runCase(alloc: std.mem.Allocator, cfg: Config, grouped: bool) !RunResult {
+    var worker_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(cfg.threads) });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
+    return runCaseWithIo(alloc, cfg, grouped, scheduling_io);
+}
+
+fn runCaseWithIo(alloc: std.mem.Allocator, cfg: Config, grouped: bool, scheduling_io: std.Io) !RunResult {
     var path_buf: [256]u8 = undefined;
     const path = benchTmpPath(&path_buf, if (grouped) "grouped" else "plain");
     cleanupBenchDirAt(path);
@@ -208,12 +204,17 @@ fn runCase(alloc: std.mem.Allocator, cfg: Config, grouped: bool) !RunResult {
     defer alloc.free(payload);
     @memset(payload, 'x');
 
-    var barrier = Barrier{};
+    var barrier = Barrier{ .io = scheduling_io };
     const workers = try alloc.alloc(Worker, cfg.threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.threads);
     defer alloc.free(threads);
 
+    var started_tasks: usize = 0;
+    defer {
+        barrier.open.set(scheduling_io);
+        for (threads[0..started_tasks]) |*future| future.await(scheduling_io);
+    }
     for (workers, 0..) |*worker, idx| {
         worker.* = .{
             .wal_impl = &wal_impl,
@@ -221,11 +222,12 @@ fn runCase(alloc: std.mem.Allocator, cfg: Config, grouped: bool) !RunResult {
             .payload = payload,
             .appends = cfg.appends_per_thread,
         };
-        threads[idx] = try std.Thread.spawn(.{}, Worker.run, .{ worker, cfg.threads });
+        threads[idx] = try scheduling_io.concurrent(Worker.run, .{ worker, cfg.threads });
+        started_tasks += 1;
     }
 
     const started = nowNs();
-    for (threads) |thread| thread.join();
+    for (threads) |*future| future.await(scheduling_io);
     const elapsed_ns = elapsedSince(started);
 
     for (workers) |worker| {
@@ -358,8 +360,18 @@ fn elapsedSince(started: u64) u64 {
     return nowNs() - started;
 }
 
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
+test "benchmark partial startup releases its barrier and drains workers" {
+    for (0..2) |capacity| {
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(capacity),
+        });
+        defer io_impl.deinit();
+        try std.testing.expectError(error.ConcurrencyUnavailable, runCaseWithIo(
+            std.testing.allocator,
+            .{ .threads = 2, .appends_per_thread = 1, .no_sync = true },
+            false,
+            io_impl.io(),
+        ));
     }
 }

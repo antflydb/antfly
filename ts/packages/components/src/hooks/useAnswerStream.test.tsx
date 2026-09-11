@@ -150,6 +150,43 @@ describe("useAnswerStream", () => {
     expect(result.current.isStreaming).toBe(false);
   });
 
+  it("should populate state from a non-streaming retrieval result", async () => {
+    vi.mocked(utils.streamAnswer).mockImplementation(
+      async (_url, _request, _headers, callbacks) => {
+        callbacks.onRetrievalAgentResult?.({
+          status: "completed",
+          hits: [{ _id: "json-doc", _score: 1, _source: { title: "JSON result" } } as QueryHit],
+          classification: {
+            route_type: "question",
+            strategy: "simple",
+            semantic_mode: "rewrite",
+            improved_query: "improved JSON query",
+            semantic_query: "semantic JSON query",
+            confidence: 0.95,
+          },
+          generation: "Answer returned as JSON",
+          followup_questions: ["Another question?"],
+        });
+        callbacks.onComplete?.();
+        return new AbortController();
+      }
+    );
+
+    const { result } = renderHook(() => useAnswerStream());
+    await act(async () => {
+      await result.current.startStream({
+        url: "http://localhost:8080/db/v1",
+        request: { query: "question", queries: [{ table: "docs" }] },
+      });
+    });
+
+    expect(result.current.answer).toBe("Answer returned as JSON");
+    expect(result.current.hits[0]._id).toBe("json-doc");
+    expect(result.current.classification?.semantic_query).toBe("semantic JSON query");
+    expect(result.current.followUpQuestions).toEqual(["Another question?"]);
+    expect(result.current.isStreaming).toBe(false);
+  });
+
   it("should handle string errors", async () => {
     const errorString = "Network error";
 

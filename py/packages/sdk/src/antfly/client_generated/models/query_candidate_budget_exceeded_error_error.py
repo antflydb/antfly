@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryCandidateBudgetExceededErrorError(str, Enum):
+class QueryCandidateBudgetExceededErrorError(StrEnum):
     QUERY_CANDIDATE_BUDGET_EXCEEDED = "query_candidate_budget_exceeded"
 
     def __str__(self) -> str:

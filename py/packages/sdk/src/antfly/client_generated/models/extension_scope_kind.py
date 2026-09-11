@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExtensionScopeKind(str, Enum):
+class ExtensionScopeKind(StrEnum):
     CLUSTER = "cluster"
     EMBEDDED_DB = "embedded_db"
     TABLE = "table"

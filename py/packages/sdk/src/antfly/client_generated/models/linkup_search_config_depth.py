@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LinkupSearchConfigDepth(str, Enum):
+class LinkupSearchConfigDepth(StrEnum):
     DEEP = "deep"
     STANDARD = "standard"
 

@@ -2614,6 +2614,185 @@ extern "C" __global__ void termite_attention_f32_block(
     }
 }
 
+// Qwen3-VL vision attention for graph-layout [B, S, H, 64] tensors.  The
+// generic scalar fallback assigns one thread to every output channel and
+// consequently recomputes Q*K once per channel.  At the production S=576
+// image shape that repeats the score work 64 times.  This schedule owns a
+// 32-query tile for one head, forms Q*K and P*V with BF16 tensor cores, and
+// keeps the online-softmax state and output tile in FP32.  Q/K/V arrive as
+// FP32 because that is the graph ABI; narrowing happens only in CTA-local
+// shared memory and matches the BF16 model's activation precision.
+//
+// The symbol remains present in the portable sm_75 artifact, but its body is
+// intentionally empty there.  Runtime dispatch requires SM80+ before it can
+// select this kernel.
+extern "C" __global__ __launch_bounds__(256) void termite_qwen3vl_vision_attention_tc_bf16_m32n16(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr unsigned int kThreads = 256u;
+    constexpr unsigned int kQueryTile = 32u;
+    constexpr unsigned int kKeyTile = 16u;
+    constexpr unsigned int kHeadDim = 64u;
+    constexpr float kNegInf = -3.402823466e+38f;
+    if (seq_len == 0u || head_dim != kHeadDim || blockDim.x != kThreads) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int query_tiles = (seq_len + kQueryTile - 1u) / kQueryTile;
+    const unsigned int block = blockIdx.x;
+    const unsigned int query_tile = block % query_tiles;
+    const unsigned int matrix = block / query_tiles;
+    const unsigned int head = matrix % num_heads;
+    const unsigned int b = matrix / num_heads;
+    if (b >= batch) return;
+
+    const unsigned int hidden = num_heads * kHeadDim;
+    const unsigned int head_off = head * kHeadDim;
+    const unsigned int query_start = query_tile * kQueryTile;
+    constexpr float scale = 0.125f;
+
+    __shared__ __align__(16) __nv_bfloat16 q_tile[kQueryTile * kHeadDim];
+    // K is transposed to the [D, N] row-major layout expected by WMMA B.
+    __shared__ __align__(16) __nv_bfloat16 k_tile[kHeadDim * kKeyTile];
+    __shared__ __align__(16) __nv_bfloat16 v_tile[kKeyTile * kHeadDim];
+    __shared__ __align__(16) float scores[kQueryTile * kKeyTile];
+    __shared__ __align__(16) __nv_bfloat16 probabilities[kQueryTile * kKeyTile];
+    __shared__ __align__(16) float output[kQueryTile * kHeadDim];
+    __shared__ float running_max[kQueryTile];
+    __shared__ float running_sum[kQueryTile];
+    __shared__ float row_alpha[kQueryTile];
+
+    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+        const unsigned int row = index / kHeadDim;
+        const unsigned int d = index - row * kHeadDim;
+        const unsigned int qi = query_start + row;
+        const float value = qi < seq_len ? q[(b * seq_len + qi) * hidden + head_off + d] : 0.0f;
+        q_tile[index] = __float2bfloat16_rn(value);
+        output[index] = 0.0f;
+    }
+    if (tid < kQueryTile) {
+        running_max[tid] = kNegInf;
+        running_sum[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int key_start = 0u; key_start < seq_len; key_start += kKeyTile) {
+        for (unsigned int index = tid; index < kHeadDim * kKeyTile; index += kThreads) {
+            const unsigned int d = index / kKeyTile;
+            const unsigned int n = index - d * kKeyTile;
+            const unsigned int ki = key_start + n;
+            const float kval = ki < seq_len ? k[(b * seq_len + ki) * hidden + head_off + d] : 0.0f;
+            k_tile[index] = __float2bfloat16_rn(kval);
+            v_tile[n * kHeadDim + d] = __float2bfloat16_rn(
+                ki < seq_len ? v[(b * seq_len + ki) * hidden + head_off + d] : 0.0f
+            );
+        }
+        __syncthreads();
+
+        // Two warps form the two 16-query halves of the 32x16 score tile.
+        if (warp < 2u) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag;
+                wmma::load_matrix_sync(a_frag, q_tile + warp * 16u * kHeadDim + d0, kHeadDim);
+                wmma::load_matrix_sync(b_frag, k_tile + d0 * kKeyTile, kKeyTile);
+                wmma::mma_sync(acc, a_frag, b_frag, acc);
+            }
+            wmma::store_matrix_sync(scores + warp * 16u * kKeyTile, acc, kKeyTile, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // Each half-warp normalizes one row.  Eight warps cover all 32 rows
+        // in two passes while preserving an FP32 online-softmax accumulator.
+        #pragma unroll
+        for (unsigned int group = 0u; group < 2u; ++group) {
+            const unsigned int lane_group = lane >> 4u;
+            const unsigned int key_lane = lane & 15u;
+            const unsigned int m = warp * 4u + group * 2u + lane_group;
+            const unsigned int qi = query_start + m;
+            const unsigned int ki = key_start + key_lane;
+            const unsigned int group_mask = lane_group == 0u ? 0x0000ffffu : 0xffff0000u;
+            float score = kNegInf;
+            if (qi < seq_len && ki < seq_len) score = scores[m * kKeyTile + key_lane] * scale;
+            float tile_max = score;
+            #pragma unroll
+            for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) {
+                tile_max = fmaxf(tile_max, __shfl_down_sync(group_mask, tile_max, offset));
+            }
+            const unsigned int leader = lane_group * 16u;
+            tile_max = __shfl_sync(group_mask, tile_max, leader);
+            const float old_max = running_max[m];
+            const float next_max = fmaxf(old_max, tile_max);
+            const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
+            const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
+            float tile_sum = beta;
+            #pragma unroll
+            for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) {
+                tile_sum += __shfl_down_sync(group_mask, tile_sum, offset);
+            }
+            tile_sum = __shfl_sync(group_mask, tile_sum, leader);
+            probabilities[m * kKeyTile + key_lane] = __float2bfloat16_rn(beta);
+            if (key_lane == 0u) {
+                running_max[m] = next_max;
+                running_sum[m] = running_sum[m] * alpha + tile_sum;
+                row_alpha[m] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+            output[index] *= row_alpha[index / kHeadDim];
+        }
+        __syncthreads();
+
+        // Eight warps cover both query fragments and all four output-D
+        // fragments, so P*V for the 32x64 output tile completes in one pass.
+        const unsigned int output_query_chunk = warp >> 2u;
+        const unsigned int output_d_chunk = warp & 3u;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::load_matrix_sync(acc, output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, kHeadDim, wmma::mem_row_major);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> p_frag;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> v_frag;
+        wmma::load_matrix_sync(p_frag, probabilities + output_query_chunk * 16u * kKeyTile, kKeyTile);
+        wmma::load_matrix_sync(v_frag, v_tile + output_d_chunk * 16u, kHeadDim);
+        wmma::mma_sync(acc, p_frag, v_frag, acc);
+        wmma::store_matrix_sync(output + output_query_chunk * 16u * kHeadDim + output_d_chunk * 16u, acc, kHeadDim, wmma::mem_row_major);
+        __syncthreads();
+    }
+
+    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+        const unsigned int m = index / kHeadDim;
+        const unsigned int d = index - m * kHeadDim;
+        const unsigned int qi = query_start + m;
+        if (qi < seq_len) {
+            const float denom = running_sum[m];
+            dst[(b * seq_len + qi) * hidden + head_off + d] = denom > 0.0f ? output[index] / denom : 0.0f;
+        }
+    }
+#else
+    (void)dst;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)batch;
+    (void)seq_len;
+    (void)num_heads;
+    (void)head_dim;
+#endif
+}
+
 // Shape-specialized BERT encoder prefill attention for the BGE-M3/XLM-R hot
 // path: full attention over head-major [batch, heads, 256, 64] tensors.
 //
@@ -3668,6 +3847,85 @@ extern "C" __global__ void termite_rope_f32(
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
 }
 
+// Qwen3-VL text M-RoPE. Positions are axis-major [3, token_count], while
+// input/output are token-major chunks of head_dim floats. The section values
+// count rotary pairs and are validated by the host before launch.
+extern "C" __global__ void termite_qwen3vl_mrope_f32(
+    float* dst,
+    const float* input,
+    const unsigned int* positions,
+    unsigned int total_chunks,
+    unsigned int token_count,
+    unsigned int chunks_per_token,
+    unsigned int head_dim,
+    float theta,
+    float freq_scale,
+    unsigned int section_height,
+    unsigned int section_width
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total) return;
+
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int rotary_pairs = head_dim / 2u;
+    unsigned int pair = d < rotary_pairs ? d : d - rotary_pairs;
+    unsigned int axis = 0u;
+    if ((pair % 3u) == 1u && pair < section_height * 3u) {
+        axis = 1u;
+    } else if ((pair % 3u) == 2u && pair < section_width * 3u) {
+        axis = 2u;
+    }
+    unsigned int token = chunk / chunks_per_token;
+    unsigned int position = positions[axis * token_count + token];
+    float exponent = (2.0f * (float)pair) / (float)head_dim;
+    float frequency = 1.0f / powf(theta, exponent);
+    float angle = (float)position * freq_scale * frequency;
+    float s = sinf(angle);
+    float c = cosf(angle);
+    unsigned int base = chunk * head_dim;
+    float left = input[base + pair];
+    float right = input[base + rotary_pairs + pair];
+    dst[idx] = d < rotary_pairs ? left * c - right * s : left * s + right * c;
+}
+
+// Qwen3-VL vision RoPE. Positions are axis-major [height,width] and each
+// axis restarts the frequency index at zero, matching the HF concatenation.
+extern "C" __global__ void termite_qwen3vl_vision_rope_f32(
+    float* dst,
+    const float* input,
+    const unsigned int* positions,
+    unsigned int total_chunks,
+    unsigned int token_count,
+    unsigned int heads_per_token,
+    unsigned int head_dim,
+    float theta
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total) return;
+
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int rotary_pairs = head_dim / 2u;
+    unsigned int pairs_per_axis = rotary_pairs / 2u;
+    unsigned int pair = d < rotary_pairs ? d : d - rotary_pairs;
+    unsigned int axis = pair < pairs_per_axis ? 0u : 1u;
+    unsigned int local_pair = pair % pairs_per_axis;
+    unsigned int token = chunk / heads_per_token;
+    unsigned int position = positions[axis * token_count + token];
+    float exponent = (2.0f * (float)local_pair) / (float)(head_dim / 2u);
+    float frequency = 1.0f / powf(theta, exponent);
+    float angle = (float)position * frequency;
+    float s = sinf(angle);
+    float c = cosf(angle);
+    unsigned int base = chunk * head_dim;
+    float left = input[base + pair];
+    float right = input[base + rotary_pairs + pair];
+    dst[idx] = d < rotary_pairs ? left * c - right * s : left * s + right * c;
+}
+
 extern "C" __global__ void termite_rope_decode_scalars_f32(
     float* dst,
     const float* input,
@@ -4146,7 +4404,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_fast_f32(
     unsigned int lane = threadIdx.x;
     unsigned int block = blockIdx.x;
     unsigned int total_blocks = batch * q_seq_len * num_heads;
-    if (batch != 1u ||
+    if (batch == 0u ||
         q_seq_len <= 1u ||
         block >= total_blocks ||
         mask_len != 0u ||
@@ -12209,6 +12467,35 @@ extern "C" __global__ void termite_dequant_q4_0_bf16(
             unsigned char packed = bp[2u + i];
             out[i] = termite_f32_to_bf16((float)((int)(packed & 0x0fu) - 8) * d);
             out[i + 16u] = termite_f32_to_bf16((float)((int)(packed >> 4) - 8) * d);
+        }
+    }
+}
+
+// Repack GGUF Q8_0 blocks (f16 scale followed by 32 signed bytes) into the
+// tensor-core layout consumed by termite_q8_0_tc_value_at: all scales first,
+// followed by all quant bytes. The encoded size is unchanged. Doing this on
+// the device avoids millions of tiny host memcpy calls and a second H2D copy
+// when a Q8 projector is prepared lazily.
+extern "C" __global__ void termite_pack_q8_0_tensor_core(
+    unsigned char* dst,
+    const unsigned char* src,
+    unsigned int block_count
+) {
+    size_t scale_bytes = (size_t)block_count * 2u;
+    size_t quant_bytes = (size_t)block_count * 32u;
+    size_t total_bytes = scale_bytes + quant_bytes;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; idx < total_bytes; idx += stride) {
+        if (idx < scale_bytes) {
+            size_t block = idx >> 1u;
+            size_t lane = idx & 1u;
+            dst[idx] = src[block * 34u + lane];
+        } else {
+            size_t quant_idx = idx - scale_bytes;
+            size_t block = quant_idx >> 5u;
+            size_t lane = quant_idx & 31u;
+            dst[idx] = src[block * 34u + 2u + lane];
         }
     }
 }

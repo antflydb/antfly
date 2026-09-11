@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableBackupStatusStatus(str, Enum):
+class TableBackupStatusStatus(StrEnum):
     AMBIGUOUS = "ambiguous"
     COMPLETED = "completed"
     FAILED = "failed"

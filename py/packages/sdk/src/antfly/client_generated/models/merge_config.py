@@ -25,7 +25,6 @@ class MergeConfig:
             full_text_search.
             rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula
             rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores
-            failover: Use full_text_search if embedding generation fails
         weights (MergeConfigWeights | Unset): Named weights keyed by index name. `full_text` for the full-text search
             index;
             embedding index names for vector indexes.

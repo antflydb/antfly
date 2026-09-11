@@ -23,14 +23,14 @@ pub const common_secrets = @import("common/secrets.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");
 pub const data_raft_apply = @import("data/storage/raft_apply_store.zig");
 pub const data_raft_projection_wire = @import("storage/data_raft_projection_wire.zig");
-pub const db = @import("storage/db/mod.zig");
+pub const common = @import("common/mod.zig");
+pub const db = @import("antfly_source_root").antfly_sources.selected_db;
 pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 pub const graph_query = @import("graph/query.zig");
 pub const ha_seed_activation = @import("storage/ha/seed_activation.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
-pub const inference_provider_client = @import("storage/inference_provider_client.zig");
 pub const managed_embedder = @import("inference/managed_embedder.zig");
 pub const lite = @import("storage/lite/mod.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
@@ -48,8 +48,21 @@ pub const scraping = @import("antfly_scraping");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const raft_catalog = @import("raft/catalog.zig");
+pub const shard = @import("storage/shard.zig");
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
+pub const testing = @import("common/test_directory.zig");
+
+pub const local_write = @import("antfly_source_root").antfly_sources.local_write;
+
+pub const local_query_contract = @import("api/local_query_contract.zig");
+
+pub const inference_provider = @import("standalone/inference_provider.zig");
+
+pub const physical_resources = @import("storage/physical_resources.zig");
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_storage.zig");

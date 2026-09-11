@@ -14,9 +14,10 @@
 
 const std = @import("std");
 const structlog = @import("structlog");
-const build_options = @import("build_options");
+const build_info = @import("build_info");
 const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -73,7 +74,12 @@ fn mainImpl(init: std.process.Init) !void {
         .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
         .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
-        .inference => return runRuntimeUnit(.inference, subcommand, init, &args),
+        .inference => {
+            var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+            defer worker_lifetime.deinit(init.io);
+            if (try inference_process_supervisor.runIfNeeded(init, 2, &worker_lifetime)) return;
+            return runRuntimeUnit(.inference, subcommand, init, &args);
+        },
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
         .serverless => return runRuntimeUnit(.serverless, subcommand, init, &args),
         .standalone => return runRuntimeUnit(.standalone, subcommand, init, &args),
@@ -96,8 +102,10 @@ extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callc
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
-fn runRuntimeUnit(
+pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
     command: []const u8,
     init: std.process.Init,
@@ -130,7 +138,13 @@ fn runRuntimeUnit(
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),
-        .standalone => antfly_runtime_standalone(&context),
+        .standalone => if (std.mem.eql(u8, command, "lite"))
+            if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
+                antfly_runtime_standalone_lite(&context)
+            else
+                antfly_runtime_lite(&context)
+        else
+            antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
 }
@@ -248,7 +262,7 @@ fn printUsage(argv0: []const u8) void {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
+    std.debug.print("antfly {s} (zig runtime)\n", .{build_info.version()});
 }
 
 test "main cmd compiles" {

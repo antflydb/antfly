@@ -250,7 +250,7 @@ fn initBenchServer(alloc: std.mem.Allocator, replica_root_dir: []const u8) antfl
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             BenchCatalog.iface(),
-            raft_mod.read_gate.noopReadableLeaseRequester(),
+            raft_mod.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,

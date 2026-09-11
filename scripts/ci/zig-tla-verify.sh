@@ -41,7 +41,7 @@ download_tla_tools() {
 extract_raft_trace() {
   (
     cd zig
-    ANTFLY_TRACE_FILE=/tmp/raft-trace.ndjson zig build -Dwith_tla=true raft-test
+    ANTFLY_TRACE_FILE=/tmp/raft-trace.ndjson zig build -Dwith_tla=true antfly-raft-test
   )
   test -s /tmp/raft-trace.ndjson
   echo "Raft trace lines: $(wc -l < /tmp/raft-trace.ndjson)"
@@ -54,7 +54,7 @@ validate_raft_trace() {
 extract_txn_trace() {
   (
     cd zig
-    ANTFLY_TRACE_FILE=/tmp/txn-trace.ndjson zig build -Dwith_tla=true lib-db-txn-test
+    ANTFLY_TRACE_FILE=/tmp/txn-trace.ndjson zig build -Dwith_tla=true antfly-storage-db-txn-test
   )
   test -s /tmp/txn-trace.ndjson
   echo "Transaction trace lines: $(wc -l < /tmp/txn-trace.ndjson)"

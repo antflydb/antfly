@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
@@ -35,8 +36,11 @@ const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const LegacyLiteHandle = if (control_only_storage_sources) struct {} else antfly.lite.backend.Handle;
 const LegacyAuthBackend = if (control_only_storage_sources) struct {} else antfly.lsm_backend.BackendHandle;
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
+const inference_chunker = @import("inference_chunker");
+const chunking_types = @import("../chunking/types.zig");
 
 const ApiHttpServer = antfly.public_api.ApiHttpServer;
 const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
@@ -45,9 +49,7 @@ const public_api_max_requests_per_connection: u32 = 64;
 const public_api_max_body_size: usize = antfly.common.http.default_max_request_bytes;
 const local_schema_migration_finalize_interval_ms: u64 = std.time.ms_per_s;
 
-const LocalInferenceConnectionContext = struct {
-    handle: *anyopaque,
-};
+const LocalInferenceConnectionContext = inference_provider.LocalInferenceConnectionContext;
 
 const LocalSchemaProgressProvider = struct {
     ptr: *anyopaque,
@@ -219,6 +221,8 @@ const InferenceRuntimeConfigWire = struct {
         ttl_ms: u64 = 300_000,
     };
 
+    embedded_enabled: bool = true,
+    worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     max_concurrent_requests: ?usize = null,
     kernel_jit: KernelJit = .{},
     prompt_cache: PromptCache = .{},
@@ -242,6 +246,7 @@ const RuntimeLeaseWatchdog = struct {
     const ObservationFailureStage = enum { fetch, validation };
 
     watchdog: antfly.ha.kubernetes_lease_watchdog.Watchdog,
+    io: std.Io,
     executor: lease_executor.LeaseExecutor,
     uri: []u8,
     token_path: []const u8,
@@ -320,6 +325,7 @@ const RuntimeLeaseWatchdog = struct {
                 .grace_ns = grace_ms * std.time.ns_per_ms,
                 .sentinel_path = sentinel_path,
             }, sentinel_generation, repaired_generation),
+            .io = io,
             .executor = executor,
             .uri = try antfly.ha.kubernetes_lease_watchdog.leaseURLAlloc(alloc, api_endpoint.host, api_endpoint.port, namespace, lease_name),
             .token_path = env.get("ANTFLY_HA_LEASE_TOKEN_PATH") orelse antfly.ha.kubernetes_lease_watchdog.service_account_token_path,
@@ -354,11 +360,9 @@ const RuntimeLeaseWatchdog = struct {
 
     fn recordRepairReceipt(ptr: *anyopaque, result: antfly.ha.rejoin.RewindResult) !void {
         const self: *RuntimeLeaseWatchdog = @ptrCast(@alignCast(ptr));
-        var io_impl = std.Io.Threaded.init(self.executor.alloc, .{});
-        defer io_impl.deinit();
         _ = try antfly.ha.kubernetes_lease_watchdog.persistRepairReceipt(
             self.executor.alloc,
-            io_impl.io(),
+            self.io,
             self.watchdog.cfg.sentinel_path,
             self.stable_topology_id,
             self.node_id,
@@ -734,6 +738,7 @@ const LocalStandaloneMetadata = struct {
     catalog_store: ?*antfly.storage_backend_erased.Store,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     storage_engine: antfly.common.config.StorageEngine = .local,
+    vector_source_storage_allowed: bool = true,
     epoch: u64 = 1,
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
@@ -877,6 +882,8 @@ const LocalStandaloneMetadata = struct {
                 .drop_table_exact = dropTableExact,
                 .update_schema = updateSchema,
                 .update_schema_versioned = updateSchemaVersioned,
+                .update_schema_versioned_expected = updateSchemaVersionedExpected,
+                .mutate_schema = mutateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
@@ -1117,6 +1124,9 @@ const LocalStandaloneMetadata = struct {
 
     fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const replicated = !self.vector_source_storage_allowed or
+            (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try req.storage.validateStandalone(req.num_shards orelse 1, replicated, self.storage_engine != .local);
         const table = try deriveStandaloneTableRecord(self.storage_engine, table_name, req);
         const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
         defer {
@@ -1322,19 +1332,53 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn updateSchemaVersioned(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn updateSchemaVersionedExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema_json: []const u8,
+        expected_version: ?u32,
+    ) !u32 {
+        var result = try mutateSchema(ptr, alloc, table_name, .replace, schema_json, expected_version);
+        defer result.deinit(alloc);
+        return result.version;
+    }
+
+    fn mutateSchema(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: antfly.public_api.tables.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !antfly.public_api.tables.SchemaMutationResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
-        const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
+        if (expected_version) |expected| {
+            if (try antfly.public_api.tables.schemaVersion(table.schema_json) != expected)
+                return error.SchemaVersionChanged;
+        }
+        const updated = try antfly.public_api.tables.applySchemaMutationRecord(alloc, table, mode, body);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
         const version = try antfly.public_api.tables.schemaVersion(updated.schema_json);
+        var result = antfly.public_api.tables.SchemaMutationResult{
+            .version = version,
+            .schema_json = try alloc.dupe(u8, updated.schema_json),
+        };
+        errdefer result.deinit(alloc);
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try mutation.commit(self);
-        return version;
+        return result;
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1699,7 +1743,12 @@ const LocalStandaloneMetadata = struct {
                 else => return err,
             };
             break :blk try self.alloc.dupe(u8, value);
-        } else readFileAlloc(self.alloc, self.catalog_path, 64 * 1024 * 1024) catch |err| switch (err) {
+        } else readFileAlloc(
+            self.alloc,
+            self.backend_runtime.io() orelse std.Options.debug_io,
+            self.catalog_path,
+            64 * 1024 * 1024,
+        ) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -1753,7 +1802,12 @@ const LocalStandaloneMetadata = struct {
             try txn.commit();
             try store.sync(true);
         } else {
-            try writeFileAtomically(self.alloc, self.catalog_path, encoded);
+            try writeFileAtomically(
+                self.alloc,
+                self.backend_runtime.io() orelse std.Options.debug_io,
+                self.catalog_path,
+                encoded,
+            );
         }
     }
 };
@@ -1785,6 +1839,7 @@ fn deriveStandaloneTableRecord(
     table_name: []const u8,
     req: antfly.public_api.tables.CreateTableRequest,
 ) !antfly.metadata.TableRecord {
+    try req.storage.validateStandalone(req.num_shards orelse 1, false, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
     }
@@ -1865,21 +1920,29 @@ pub fn runFromIterator(
     defer termination_signals.deinit();
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
+    var setup_io = std.Io.Threaded.init(alloc, .{});
+    defer setup_io.deinit();
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
     if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
+        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+        secret_store_initialized = true;
+    } else {
+        const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
+        defer alloc.free(default_secret_store_path);
+        secret_store = try antfly.common.secrets.FileStore.initWithIo(alloc, setup_io.io(), default_secret_store_path);
         secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecretsForDeployment(
+        try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(
             alloc,
+            setup_io.io(),
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         )
     else
@@ -1900,10 +1963,11 @@ pub fn runFromIterator(
     defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
     var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
     const remote_content = if (cli.config_path) |config_path| blk: {
-        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.initWithIo(
             alloc,
+            setup_io.io(),
             config_path,
-            if (secret_store_initialized) &secret_store else null,
+            &secret_store,
             .standalone,
         );
         remote_content_runtime_initialized = true;
@@ -1926,7 +1990,7 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, data_dir);
+    if (storage_engine == .local) try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
     // Validate and freeze the HA role before any startup helper can mutate a
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
@@ -1936,8 +2000,6 @@ pub fn runFromIterator(
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
 
-    var setup_io = std.Io.Threaded.init(alloc, .{});
-    defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureParent(setup_io.io(), resolved.local_metadata_catalog_path);
@@ -2098,12 +2160,25 @@ pub fn runFromIterator(
 
     const configured_inference: antfly.common.config.Config.InferenceConfig =
         if (loaded_cfg) |cfg| cfg.inference else .{};
+    // An explicit inference endpoint is a process-isolation contract, not a
+    // fallback hint. In this mode standalone must not retain hidden in-process
+    // routes or provider callbacks that can route a wedged native/GPU kernel
+    // back into the database process.
+    const embedded_inference_enabled = configured_inference.api_url == null;
     const effective_kernel_jit_mode = try resolveKernelJitMode(
         configured_inference.kernel_jit.mode,
         platform.env.getenv("ANTFLY_INFERENCE_KERNEL_JIT_MODE"),
         cli.inference_kernel_jit_mode,
     );
+    var worker_environment: std.ArrayList(@typeInfo(@FieldType(InferenceRuntimeConfigWire, "worker_environment")).pointer.child) = .empty;
+    defer worker_environment.deinit(alloc);
+    var environment_iterator = init.environ_map.iterator();
+    while (environment_iterator.next()) |entry| {
+        try worker_environment.append(alloc, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+    }
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
+        .embedded_enabled = embedded_inference_enabled,
+        .worker_environment = worker_environment.items,
         .max_concurrent_requests = resolveInferenceMaxConcurrentRequests(loaded_cfg),
         .kernel_jit = .{
             .mode = effective_kernel_jit_mode,
@@ -2137,8 +2212,8 @@ pub fn runFromIterator(
         .process_memory_limit_provenance = inferenceMemoryLimitProvenance(
             process_memory_resolution.effective_source,
         ),
-        .preload_ptr = if (active_preload.len == 0) null else active_preload.ptr,
-        .preload_len = active_preload.len,
+        .preload_ptr = if (!embedded_inference_enabled or active_preload.len == 0) null else active_preload.ptr,
+        .preload_len = if (embedded_inference_enabled) active_preload.len else 0,
         .keep_alive = inference_bridge.OptionalString.init(if (loaded_cfg) |cfg| cfg.inference.keep_alive else null),
         .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
@@ -2185,15 +2260,10 @@ pub fn runFromIterator(
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
-        init.io,
+        setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
-
-    if (!secret_store_initialized) {
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, resolved.secret_store_path);
-        secret_store_initialized = true;
-    }
 
     const internal_service_secret = try secret_store.getOwned(alloc, internal_service_secret_key);
     defer if (internal_service_secret) |value| alloc.free(value);
@@ -2242,8 +2312,9 @@ pub fn runFromIterator(
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         }
-        user_manager = try antfly.usermgr.UserManager.init(
+        user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
+            setup_io.io(),
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
@@ -2307,6 +2378,16 @@ pub fn runFromIterator(
         return err;
     };
     defer local_metadata.deinit();
+    local_metadata.vector_source_storage_allowed = !ha_role_requested;
+    // Reject persisted experimental tables before HA can snapshot or mirror
+    // primary roots whose references need a separate source-store lifecycle.
+    if (ha_role_requested) {
+        var tables = local_metadata.manager.tables.valueIterator();
+        while (tables.next()) |table| {
+            if (table.storage.dense_embeddings == .vector_store)
+                return error.VectorStoreRequiresLocalSingleShardTable;
+        }
+    }
     if (lite_path != null) {
         if (comptime control_only_storage_sources) {
             try local_metadata.adoptEmbeddedLiteRootFromKernelIfNeeded(&storage_kernel_context);
@@ -2491,17 +2572,17 @@ pub fn runFromIterator(
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
-            .inference_request_admission_source = .{
+            .inference_request_admission_source = if (embedded_inference_enabled) .{
                 .ptr = antfly_node,
                 .try_acquire_fn = tryAcquireEmbeddedInferenceRequest,
                 .release_fn = releaseEmbeddedInferenceRequest,
                 .stats_fn = embeddedInferenceRequestStats,
-            },
-            .local_inference_connection_target = .{
+            } else null,
+            .local_inference_connection_target = if (embedded_inference_enabled) .{
                 .capabilities = inference_connection_abi.Capability.streaming_response,
                 .context = &local_inference_connection_context,
                 .invoke = invokeLocalInferenceConnection,
-            },
+            } else null,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
@@ -2549,6 +2630,18 @@ pub fn runFromIterator(
         } else .{},
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
+    // A non-HA standalone process is the complete set of readers and writers
+    // for its local generations; there is no older peer whose storage
+    // capability must be negotiated. Provisioned storage defaults closed for
+    // distributed startup, but LocalStandaloneMetadata has no remote store
+    // reporter that could ever open that gate. Authorize the current native
+    // format before the public listener becomes reachable so a freshly
+    // created dense index is v2 from its first catalog publication. HA roles
+    // remain closed until their replication protocol has an equivalent
+    // all-peer capability fence.
+    if (standaloneNativeAuthorityInitiallyPermitted(cli)) {
+        data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
+    }
     defer data_server.deinitWithDeadline(supervisor.deadline());
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
@@ -2644,7 +2737,10 @@ pub fn runFromIterator(
         )).configure(&configure_context);
         if (!configure_status.isOk()) return inference_bridge.errorFromStatus(configure_status);
     }
-    data_server.setAntflyProvider(inferenceBoundaryProvider(&embedded_provider_lifetime));
+    data_server.setAntflyProvider(if (embedded_inference_enabled)
+        inferenceBoundaryProvider(&embedded_provider_lifetime)
+    else
+        null);
 
     // Initialize API server (wires caches + sources) without binding a listener.
     try data_server.initApiServer();
@@ -2689,7 +2785,10 @@ pub fn runFromIterator(
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
     const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
+    defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
+        .observer_io = http_observer_lease.io(),
         .max_active_h1_requests = public_http_config.max_connections,
         .max_active_connections = @as(usize, public_http_config.max_connections) +| antfly.common.health_server.max_connections,
         .max_active_requests = @as(usize, public_http_config.max_request_tasks) +| antfly.common.health_server.max_connections,
@@ -2734,6 +2833,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2748,6 +2848,7 @@ pub fn runFromIterator(
             cors_config,
             &handler,
             antfly_node,
+            embedded_inference_enabled,
             api_server,
             &local_metadata,
             &unified_api_ready,
@@ -2886,13 +2987,14 @@ fn serveUnifiedWithInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2909,13 +3011,14 @@ fn serveUnifiedWithLinkedInference(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2933,6 +3036,7 @@ fn serveUnifiedInner(
     cors_config: ?*const antfly.common.config.Config.CorsConfig,
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
+    register_inference_routes: bool,
     api_server: *ApiHttpServer,
     local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
@@ -2960,17 +3064,19 @@ fn serveUnifiedInner(
         for (linked_inference_routes.items) |route| alloc.destroy(route);
         linked_inference_routes.deinit(alloc);
     }
-    if (comptime inline_inference) {
-        try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
-    } else {
-        const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
-        try registerLinkedInferenceManifest(
-            alloc,
-            &server,
-            antfly_node,
-            functions,
-            &linked_inference_routes,
-        );
+    if (register_inference_routes) {
+        if (comptime inline_inference) {
+            try inference_host.linkedInferenceRegisterRoutesOn(antfly_node, &server);
+        } else {
+            const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+            try registerLinkedInferenceManifest(
+                alloc,
+                &server,
+                antfly_node,
+                functions,
+                &linked_inference_routes,
+            );
+        }
     }
 
     // Runtime roles consume the shared direct/linked kernel registrar instead
@@ -3073,6 +3179,7 @@ fn registerLinkedInferenceManifest(
             .post => .POST,
             .put => .PUT,
             .delete => .DELETE,
+            .patch => .PATCH,
         }, entry.path.slice(), linkedInferenceHttpHandler, route);
     }
 }
@@ -3103,6 +3210,7 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
             else => return error.MethodNotAllowed,
         },
         .path = runtime_http_abi.Bytes.init(context.request.uri.path),
@@ -3287,25 +3395,27 @@ fn corsRequest(route_context: *StandaloneHttpContext, ctx: *httpx.Context, next:
     const is_preflight = requested_method != null;
     const allowed_origin = corsAllowedOrigin(config, origin);
 
-    if (allowed_origin == null or
+    const allowed = !(allowed_origin == null or
         (is_preflight and !corsMethodAllowed(config, requested_method.?)) or
         (is_preflight and !corsRequestHeadersAllowed(config, ctx.header("access-control-request-headers"))) or
-        (!is_preflight and !corsMethodAllowed(config, ctx.request.method.toString())))
-    {
-        if (!is_preflight) {
-            try ctx.response.headers.append("Vary", "Origin");
-            return next.call(ctx);
-        }
+        (!is_preflight and !corsMethodAllowed(config, ctx.request.method.toString())));
+    if (is_preflight and !allowed) {
         try appendCorsPreflightVary(&ctx.response.headers, true);
         return ctx.status(403).text("CORS request denied");
     }
 
-    try applyCorsOriginHeaders(&ctx.response.headers, config, allowed_origin.?);
     if (!is_preflight) {
-        try applyCorsExposedHeaders(ctx, config);
-        return next.call(ctx);
+        const origin_policy = if (allowed) allowed_origin else null;
+        // Before next: streaming commits read this transport-owned policy.
+        // After next: linked handlers may return a separately owned Response.
+        try applyCorsActualHeaders(ctx.allocator, &ctx.response.headers, config, origin_policy);
+        var response = try next.call(ctx);
+        errdefer response.deinit();
+        try applyCorsActualHeaders(ctx.allocator, &response.headers, config, origin_policy);
+        return response;
     }
 
+    try applyCorsOriginHeaders(&ctx.response.headers, config, allowed_origin.?);
     try appendCorsPreflightVary(&ctx.response.headers, false);
     try applyCorsPreflightHeaders(ctx, config);
     return ctx.status(204).text("");
@@ -3317,22 +3427,55 @@ fn applyCorsOriginHeaders(
     allowed_origin: []const u8,
 ) !void {
     try headers.set("Access-Control-Allow-Origin", allowed_origin);
-    if (!std.mem.eql(u8, allowed_origin, "*")) try headers.append("Vary", "Origin");
-    if (config.allow_credentials orelse false) try headers.set("Access-Control-Allow-Credentials", "true");
+    if (!std.mem.eql(u8, allowed_origin, "*")) try appendCorsVaryOrigin(headers);
+    if (config.allow_credentials orelse false) {
+        try headers.set("Access-Control-Allow-Credentials", "true");
+    } else {
+        _ = headers.remove("Access-Control-Allow-Credentials");
+    }
+}
+
+fn appendCorsVaryOrigin(headers: *httpx.Headers) !void {
+    for (headers.iterator()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "Vary")) continue;
+        var tokens = std.mem.splitScalar(u8, header.value, ',');
+        while (tokens.next()) |token| {
+            const value = std.mem.trim(u8, token, " \t");
+            if (std.ascii.eqlIgnoreCase(value, "Origin") or std.mem.eql(u8, value, "*")) return;
+        }
+    }
+    try headers.append("Vary", "Origin");
+}
+
+fn applyCorsActualHeaders(
+    alloc: std.mem.Allocator,
+    headers: *httpx.Headers,
+    config: *const antfly.common.config.Config.CorsConfig,
+    allowed_origin: ?[]const u8,
+) !void {
+    if (allowed_origin) |origin| {
+        try applyCorsOriginHeaders(headers, config, origin);
+        const exposed = config.exposed_headers orelse &cors_default_exposed_headers;
+        if (exposed.len > 0) {
+            const joined = try joinCorsValues(alloc, exposed);
+            defer alloc.free(joined);
+            try headers.set("Access-Control-Expose-Headers", joined);
+        } else {
+            _ = headers.remove("Access-Control-Expose-Headers");
+        }
+    } else {
+        // A downstream response cannot relax the host's configured policy.
+        _ = headers.remove("Access-Control-Allow-Origin");
+        _ = headers.remove("Access-Control-Allow-Credentials");
+        _ = headers.remove("Access-Control-Expose-Headers");
+        try appendCorsVaryOrigin(headers);
+    }
 }
 
 fn appendCorsPreflightVary(headers: *httpx.Headers, include_origin: bool) !void {
     if (include_origin) try headers.append("Vary", "Origin");
     try headers.append("Vary", "Access-Control-Request-Method");
     try headers.append("Vary", "Access-Control-Request-Headers");
-}
-
-fn applyCorsExposedHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
-    const exposed = config.exposed_headers orelse &cors_default_exposed_headers;
-    if (exposed.len == 0) return;
-    const joined = try joinCorsValues(ctx.allocator, exposed);
-    defer ctx.allocator.free(joined);
-    try ctx.response.headers.set("Access-Control-Expose-Headers", joined);
 }
 
 fn applyCorsPreflightHeaders(ctx: *httpx.Context, config: *const antfly.common.config.Config.CorsConfig) !void {
@@ -3492,16 +3635,7 @@ fn isInferenceApiPath(path: []const u8) bool {
         hasPathComponentPrefix(path, inference_bridge.public_api_prefix);
 }
 
-fn isInteractiveGeneratePath(path: []const u8) bool {
-    for ([_][]const u8{ inference_bridge.ai_api_prefix, inference_bridge.public_api_prefix }) |prefix| {
-        if (!std.mem.startsWith(u8, path, prefix)) continue;
-        const suffix = path[prefix.len..];
-        if (std.mem.eql(u8, suffix, "/generate") or
-            std.mem.eql(u8, suffix, "/generate/batch") or
-            std.mem.eql(u8, suffix, "/chat/completions")) return true;
-    }
-    return false;
-}
+const isInteractiveGeneratePath = inference_provider.isInteractiveGeneratePath;
 
 fn hasPathComponentPrefix(path: []const u8, prefix: []const u8) bool {
     return std.mem.eql(u8, path, prefix) or
@@ -3772,6 +3906,10 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
+fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
 fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     const deadline = deadline_ns orelse {
         lockAtomic(mutex);
@@ -3780,23 +3918,14 @@ fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     while (true) {
         if (platform_time.monotonicNs() >= deadline) return false;
         if (mutex.tryLock()) return true;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
-}
-
-fn writeFileAtomically(alloc: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata-{d}", .{ path, platform_time.monotonicNs() });
+fn writeFileAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    // Catalog mutations are serialized by LocalStandaloneMetadata.mutex.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-standalone-metadata", .{path});
     defer alloc.free(tmp_path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
 
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
@@ -4198,6 +4327,57 @@ fn resolveLocalBaseDir(
     return try antfly.common.config.resolveLocalBaseDir(alloc, cfg);
 }
 
+fn configLocalBaseDirHintFromRaw(alloc: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const storage_value = root.get("storage") orelse return null;
+    const storage = switch (storage_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const local_value = storage.get("local") orelse return null;
+    const local = switch (local_value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const base_value = local.get("base_dir") orelse return null;
+    const base_dir = switch (base_value) {
+        .string => |value| value,
+        else => return error.InvalidConfig,
+    };
+    if (antfly.common.secrets.parseSecretReference(base_dir) != null)
+        return error.InvalidConfig;
+    return try alloc.dupe(u8, base_dir);
+}
+
+fn configLocalBaseDirHintFromPath(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    defer alloc.free(raw);
+    return try configLocalBaseDirHintFromRaw(alloc, raw);
+}
+
+fn resolveDefaultSecretStorePathBeforeConfig(alloc: std.mem.Allocator, cli: CliConfig) ![]u8 {
+    const raw_base = if (cli.data_dir) |path|
+        try alloc.dupe(u8, path)
+    else if (cli.config_path) |config_path|
+        (try configLocalBaseDirHintFromPath(alloc, config_path)) orelse
+            try antfly.common.config.defaultLocalBaseDir(alloc)
+    else
+        try antfly.common.config.defaultLocalBaseDir(alloc);
+    defer alloc.free(raw_base);
+    const base = try normalizeResolvedPathAlloc(alloc, raw_base);
+    defer alloc.free(base);
+    const joined = try std.fs.path.join(alloc, &.{ base, "secrets.json" });
+    defer alloc.free(joined);
+    return try normalizeResolvedPathAlloc(alloc, joined);
+}
+
 fn resolvePaths(
     alloc: std.mem.Allocator,
     cli: CliConfig,
@@ -4270,6 +4450,7 @@ fn resolvePaths(
 
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
+    io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
     var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -4282,7 +4463,7 @@ fn initLayeredSecretStore(
         errdefer alloc.free(normalized_path);
         try normalized_paths.append(alloc, normalized_path);
     }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
 }
 
 fn resolveExtensionPackageStoreDir(
@@ -4321,12 +4502,9 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-
     var probe = path;
     while (true) {
-        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), probe, alloc) catch |err| switch (err) {
+        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, probe, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -4399,6 +4577,10 @@ fn haStandbyRequested(cli: CliConfig) bool {
         cli.ha_standby_node_id != null or
         cli.ha_standby_upstream_url != null or
         cli.ha_standby_slot != null;
+}
+
+fn standaloneNativeAuthorityInitiallyPermitted(cli: CliConfig) bool {
+    return !haPrimaryRequested(cli) and !haStandbyRequested(cli);
 }
 
 fn haContinuousMutationGuardEnabled(cli: CliConfig) bool {
@@ -4942,59 +5124,7 @@ fn resolveInferenceBudgetOverrides(cli: CliConfig) !InferenceBudgetOverrides {
 /// API runtimes borrow this stable object rather than the model-manager handle
 /// directly, so shutdown can reject new calls and wait for every admitted call
 /// before destroying the underlying inference node.
-const EmbeddedInferenceProviderLifetime = struct {
-    const closed_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
-    const count_mask: usize = closed_bit - 1;
-
-    handle: *anyopaque,
-    // Admission and borrower count share one modification order. A separate
-    // accepting flag and counter would leave a check/increment window where
-    // shutdown could observe zero and destroy the node before that borrower
-    // committed its reference.
-    state: std.atomic.Value(usize) = .init(0),
-
-    const CallGuard = struct {
-        owner: *EmbeddedInferenceProviderLifetime,
-        active: bool = true,
-
-        fn deinit(self: *@This()) void {
-            if (!self.active) return;
-            const previous = self.owner.state.fetchSub(1, .acq_rel);
-            std.debug.assert(previous & count_mask > 0);
-            self.active = false;
-        }
-    };
-
-    fn acquire(self: *EmbeddedInferenceProviderLifetime) !CallGuard {
-        var observed = self.state.load(.acquire);
-        while (true) {
-            if (observed & closed_bit != 0) return error.InferenceProviderShuttingDown;
-            if (observed & count_mask == count_mask)
-                return error.InferenceProviderCallCapacityExhausted;
-            if (self.state.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
-                observed = actual;
-                continue;
-            }
-            return .{ .owner = self };
-        }
-    }
-
-    fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
-        _ = self.state.fetchOr(closed_bit, .acq_rel);
-        while (self.activeCallCount() != 0) {
-            std.atomic.spinLoopHint();
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn isAccepting(self: *const EmbeddedInferenceProviderLifetime) bool {
-        return self.state.load(.acquire) & closed_bit == 0;
-    }
-
-    fn activeCallCount(self: *const EmbeddedInferenceProviderLifetime) usize {
-        return self.state.load(.acquire) & count_mask;
-    }
-};
+const EmbeddedInferenceProviderLifetime = inference_provider.EmbeddedInferenceProviderLifetime;
 
 test "embedded provider lifetime rejects new calls and joins admitted calls" {
     var handle_storage: u8 = 0;
@@ -5011,93 +5141,65 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
         }
     };
     var quiesce = Quiesce{ .lifetime = &lifetime };
-    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
+    defer {
+        guard.deinit();
+        thread.await(std.testing.io);
+    }
     while (lifetime.isAccepting()) std.atomic.spinLoopHint();
 
     try std.testing.expect(!quiesce.returned.load(.acquire));
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
     guard.deinit();
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(quiesce.returned.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
 }
 
-fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) antfly.inference.managed_embedder.AntflyProvider {
-    return .{
-        .ptr = lifetime,
-        .embed_dense_texts = inferenceProviderEmbedDenseTexts,
-        .embed_dense_texts_with_context = inferenceProviderEmbedDenseTextsWithContext,
-        .embed_sparse_texts = inferenceProviderEmbedSparseTexts,
-        .embed_dense_parts = inferenceProviderEmbedDenseParts,
-        .embed_dense_parts_with_context = inferenceProviderEmbedDensePartsWithContext,
-        .rerank_texts = inferenceProviderRerankTexts,
-        .generate_text = inferenceProviderGenerateText,
-        .generate_messages = inferenceProviderGenerateMessages,
-        .read_images = inferenceProviderReadImages,
-        .transcribe_audio = inferenceProviderTranscribeAudio,
-        .extract = inferenceProviderExtract,
-        .list_models_json = inferenceProviderListModelsJson,
-    };
-}
+const inferenceBoundaryProvider = inference_provider.inferenceBoundaryProvider;
 
-fn invokeInferenceProvider(
+const invokeInferenceProvider = inference_provider.invokeInferenceProvider;
+
+const invokeInferenceProviderControlled = inference_provider.invokeInferenceProviderControlled;
+
+fn invokeInferenceProviderWithBinary(
     comptime Result: type,
     alloc: std.mem.Allocator,
     provider_context: *anyopaque,
     operation: inference_bridge.ProviderOperation,
     request: anytype,
     deadline_ns: ?u64,
+    binary_payloads: []const inference_bridge.ProviderBinaryPayload,
+    attachment_refs: []const inference_bridge.ProviderAttachmentRef,
 ) !Result {
-    const lifetime: *EmbeddedInferenceProviderLifetime = @ptrCast(@alignCast(provider_context));
-    var call_guard = try lifetime.acquire();
-    defer call_guard.deinit();
-    const handle = lifetime.handle;
-    const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
-    defer alloc.free(request_json);
-    var response_handle: ?*anyopaque = null;
-    var response_json: inference_bridge.String = undefined;
-    const effective_deadline_ns = deadline_ns orelse platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
-    const context = inference_bridge.ProviderInvokeContext{
-        .abi_version = inference_bridge.abi_version,
-        .handle = handle,
-        .operation = @intFromEnum(operation),
-        .request_json = inference_bridge.String.init(request_json),
-        .deadline_ns = effective_deadline_ns,
-        .has_deadline = 1,
-        .out_response_handle = &response_handle,
-        .out_response_json = &response_json,
-    };
-    if (comptime inline_inference_codegen) {
-        try inference_host.linkedInferenceInvokeProvider(&context);
-    } else {
-        const status = (try linkedInferenceApi(
-            inference_bridge.Capability.provider,
-        )).invoke_provider(&context);
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    return try invokeInferenceProviderWithBinaryContext(Result, alloc, provider_context, operation, request, requestContextFromControls(deadline_ns, .none), binary_payloads, attachment_refs);
+}
+
+const invokeInferenceProviderWithBinaryControlled = inference_provider.invokeInferenceProviderWithBinaryControlled;
+
+const requestContextFromControls = inference_provider.requestContextFromControls;
+
+const invokeInferenceProviderWithBinaryContext = inference_provider.invokeInferenceProviderWithBinaryContext;
+
+const ProviderInvocationCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const ProviderInvocationCancellation = @ptrCast(@alignCast(raw orelse return 1));
+        return @intFromBool(self.token.isCancelled());
     }
-    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
-    defer if (comptime inline_inference_codegen)
-        inference_host.linkedInferenceDestroyProviderResponse(owned_response)
-    else
-        linkedInferenceApiInfallible().destroy_provider_response(owned_response);
-    return try std.json.parseFromSliceLeaky(Result, alloc, response_json.slice(), .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-}
 
-fn linkedInferenceApi(required_capabilities: u64) !*const inference_bridge.FunctionTable {
-    const table = inference_bridge.antfly_standalone_inference_get_function_table();
-    if (!inference_bridge.validFunctionTable(table, required_capabilities))
-        return error.UnsupportedVersion;
-    return table;
-}
+    fn view(self: *const ProviderInvocationCancellation) runtime_http_abi.CancellationView {
+        if (self.token.ptr == null or self.token.is_cancelled_fn == null) return .{};
+        return .{ .context = self, .is_cancelled = requested };
+    }
+};
 
-fn linkedInferenceApiInfallible() *const inference_bridge.FunctionTable {
-    return linkedInferenceApi(0) catch @panic("linked inference ABI changed after startup");
-}
+const linkedInferenceApi = inference_provider.linkedInferenceApi;
+
+const linkedInferenceApiInfallible = inference_provider.linkedInferenceApiInfallible;
 
 /// Dispatch the runtime-reserved local-inference connection through the same
 /// embedded route handler used by the public inference API. This preserves the
@@ -5111,28 +5213,7 @@ fn invokeLocalInferenceConnection(context: *const inference_connection_abi.Invok
     return .ok;
 }
 
-const LocalInferenceInvocationLifetime = struct {
-    upstream: runtime_http_abi.CancellationView,
-    deadline_ns: u64,
-
-    fn expired(self: *const LocalInferenceInvocationLifetime) bool {
-        return self.deadline_ns != 0 and platform_time.monotonicNs() >= self.deadline_ns;
-    }
-
-    fn check(self: *const LocalInferenceInvocationLifetime) !void {
-        if (self.upstream.requested()) return error.Canceled;
-        if (self.expired()) return error.Timeout;
-    }
-
-    fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
-        const self: *const LocalInferenceInvocationLifetime = @ptrCast(@alignCast(raw orelse return 1));
-        return @intFromBool(self.upstream.requested() or self.expired());
-    }
-
-    fn cancellation(self: *const LocalInferenceInvocationLifetime) runtime_http_abi.CancellationView {
-        return .{ .context = self, .is_cancelled = isCancelled };
-    }
-};
+const LocalInferenceInvocationLifetime = inference_provider.LocalInferenceInvocationLifetime;
 
 test "standalone local inference lifetime distinguishes deadline from upstream cancellation" {
     const expired = LocalInferenceInvocationLifetime{
@@ -5154,131 +5235,11 @@ test "standalone local inference lifetime distinguishes deadline from upstream c
     try std.testing.expectError(error.Canceled, canceled.check());
 }
 
-fn ownedInferenceConnectionBytes(alloc: std.mem.Allocator, value: []const u8) !inference_connection_abi.OwnedBytes {
-    const owned = try alloc.dupe(u8, value);
-    return .{
-        .ptr = if (owned.len == 0) null else owned.ptr,
-        .len = owned.len,
-    };
-}
+const ownedInferenceConnectionBytes = inference_provider.ownedInferenceConnectionBytes;
 
-fn optionalOwnedInferenceConnectionBytes(
-    alloc: std.mem.Allocator,
-    value: ?[]const u8,
-) !inference_connection_abi.OptionalOwnedBytes {
-    const present = value orelse return .{};
-    return .{
-        .bytes = try ownedInferenceConnectionBytes(alloc, present),
-        .present = 1,
-    };
-}
+const optionalOwnedInferenceConnectionBytes = inference_provider.optionalOwnedInferenceConnectionBytes;
 
-fn invokeLocalInferenceConnectionFallible(context: *const inference_connection_abi.InvokeContext) !void {
-    if (!inference_connection_abi.validInvokeContext(context)) return error.UnsupportedVersion;
-    const local_context: *LocalInferenceConnectionContext = @ptrCast(@alignCast(context.target_context));
-    const alloc = context.allocator.asStd();
-    const operation = context.operation.slice();
-    const body = context.body.slice();
-    var lifetime = LocalInferenceInvocationLifetime{
-        .upstream = context.cancellation,
-        .deadline_ns = context.deadline_ns,
-    };
-    try lifetime.check();
-    const functions: ?*const inference_bridge.FunctionTable = if (comptime inline_inference_codegen)
-        null
-    else
-        try linkedInferenceApi(inference_bridge.Capability.route_manifest);
-
-    var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
-    var entries_len: usize = 0;
-    const manifest_context = inference_bridge.RouteManifestContext{
-        .abi_version = inference_bridge.abi_version,
-        .handle = local_context.handle,
-        .out_entries = &entries_ptr,
-        .out_len = &entries_len,
-    };
-    if (comptime inline_inference_codegen) {
-        try inference_host.linkedInferenceRouteManifest(&manifest_context);
-    } else {
-        const status = functions.?.route_manifest(&manifest_context);
-        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
-    }
-
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ inference_bridge.ai_api_prefix, operation });
-    defer alloc.free(path);
-    const interactive_generate = isInteractiveGeneratePath(path);
-    if (interactive_generate)
-        _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchAdd(1, .monotonic);
-    defer {
-        if (interactive_generate)
-            _ = antfly.db.enrichment_types.interactive_generate_inflight.fetchSub(1, .monotonic);
-    }
-    const entries = if (entries_ptr) |ptr| ptr[0..entries_len] else &.{};
-    const route_handle = for (entries) |entry| {
-        if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), path))
-            break entry.route_handle;
-    } else return error.UnsupportedInferenceOperation;
-
-    const headers = [_]runtime_http_abi.HeaderView{.{
-        .name = runtime_http_abi.Bytes.init("Content-Type"),
-        .value = runtime_http_abi.Bytes.init("application/json"),
-    }};
-    const request = runtime_http_abi.HttpRequestView{
-        .method = .post,
-        .path = runtime_http_abi.Bytes.init(path),
-        .headers_ptr = &headers,
-        .headers_len = headers.len,
-        .body = runtime_http_abi.OptionalBytes.init(body),
-        .content_type = runtime_http_abi.OptionalBytes.init("application/json"),
-    };
-    var response_handle: ?*anyopaque = null;
-    var response_view: runtime_http_abi.HttpResponseView = undefined;
-    const handle_context = inference_bridge.HttpHandleContext{
-        .abi_version = inference_bridge.abi_version,
-        .route_handle = route_handle,
-        .request = &request,
-        .cancellation = lifetime.cancellation(),
-        .stream = context.stream,
-        .out_response_handle = &response_handle,
-        .out_response = &response_view,
-    };
-    if (comptime inline_inference_codegen) {
-        inference_host.linkedInferenceHandleHttp(&handle_context) catch |err| {
-            try lifetime.check();
-            return err;
-        };
-    } else {
-        const status = functions.?.handle_http(&handle_context);
-        if (!status.isOk()) {
-            try lifetime.check();
-            return inference_bridge.errorFromStatus(status);
-        }
-    }
-    try lifetime.check();
-    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
-    defer if (comptime inline_inference_codegen)
-        inference_host.linkedInferenceDestroyHttpResponse(owned_response)
-    else
-        functions.?.destroy_http_response(owned_response);
-
-    var response: inference_connection_abi.InvokeResponse = .{
-        .status = response_view.status,
-        .body = try ownedInferenceConnectionBytes(alloc, response_view.body.slice()),
-    };
-    errdefer alloc.free(response.body.slice());
-    var retry_after: ?[]const u8 = null;
-    const response_headers = if (response_view.headers_ptr) |ptr| ptr[0..response_view.headers_len] else &.{};
-    for (response_headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name.slice(), "Retry-After")) {
-            retry_after = header.value.slice();
-            break;
-        }
-    }
-    response.retry_after = try optionalOwnedInferenceConnectionBytes(alloc, retry_after);
-    errdefer if (response.retry_after.present != 0) alloc.free(response.retry_after.bytes.slice());
-    response.content_type = try optionalOwnedInferenceConnectionBytes(alloc, response_view.content_type.slice());
-    context.out_response.* = response;
-}
+const invokeLocalInferenceConnectionFallible = inference_provider.invokeLocalInferenceConnectionFallible;
 
 fn tryAcquireEmbeddedInferenceRequest(handle: *anyopaque) bool {
     if (comptime inline_inference_codegen) {
@@ -5311,153 +5272,99 @@ fn embeddedInferenceRequestStats(handle: *anyopaque) antfly.common.request_admis
     };
 }
 
-fn inferenceProviderEmbedDenseTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![][]f32 {
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts, .{
-        .model = model,
-        .texts = texts,
-    }, null);
-}
+const inferenceProviderEmbedDenseTexts = inference_provider.inferenceProviderEmbedDenseTexts;
 
-fn inferenceProviderEmbedDenseTextsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    try context.check();
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
-        .model = model,
-        .texts = texts,
-    }, context.deadline_ns);
-}
+const inferenceProviderEmbedDenseTextsWithContext = inference_provider.inferenceProviderEmbedDenseTextsWithContext;
 
-fn inferenceProviderEmbedSparseTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    texts: []const []const u8,
-) anyerror![]antfly.inference.managed_embedder.SparseEmbedding {
-    return try invokeInferenceProvider([]antfly.inference.managed_embedder.SparseEmbedding, alloc, handle, .embed_sparse_texts, .{
-        .model = model,
-        .texts = texts,
-    }, null);
-}
+const inferenceProviderEmbedSparseTexts = inference_provider.inferenceProviderEmbedSparseTexts;
 
-fn inferenceProviderEmbedDenseParts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-) anyerror![][]f32 {
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts, .{
-        .model = model,
-        .parts = parts,
-    }, null);
-}
+const inferenceProviderEmbedSparseTextsWithContext = inference_provider.inferenceProviderEmbedSparseTextsWithContext;
 
-fn inferenceProviderEmbedDensePartsWithContext(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    parts: []const antfly.template.ContentPart,
-    context: antfly.inference.managed_embedder.EmbeddingRequestContext,
-) anyerror![][]f32 {
-    try context.check();
-    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_parts_with_context, .{
-        .model = model,
-        .parts = parts,
-    }, context.deadline_ns);
-}
+const inferenceProviderEmbedDenseParts = inference_provider.inferenceProviderEmbedDenseParts;
 
-fn inferenceProviderRerankTexts(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    query: []const u8,
-    documents: []const []const u8,
-) anyerror![]f32 {
-    return try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
-        .model = model,
-        .query = query,
-        .documents = documents,
-    }, null);
-}
+const inferenceProviderEmbedDensePartsWithContext = inference_provider.inferenceProviderEmbedDensePartsWithContext;
 
-fn inferenceProviderGenerateText(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    roles: []const []const u8,
-    contents: []const []const u8,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_text, .{
-        .model = model,
-        .roles = roles,
-        .contents = contents,
-    }, null);
-}
+const inferenceProviderEmbedDensePartsBorrowed = inference_provider.inferenceProviderEmbedDensePartsBorrowed;
 
-fn inferenceProviderGenerateMessages(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const antfly.inference.ChatMessage,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .generate_messages, .{
-        .model = model,
-        .messages = messages,
-    }, null);
-}
+const inferenceProviderRerankTexts = inference_provider.inferenceProviderRerankTexts;
 
-fn inferenceProviderReadImages(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.readers.Request,
-) anyerror![]antfly.readers.Result {
-    return try invokeInferenceProvider([]antfly.readers.Result, alloc, handle, .read_images, .{
-        .model = model,
-        .request = request,
-    }, null);
-}
+const inferenceProviderRerankTextsWithContext = inference_provider.inferenceProviderRerankTextsWithContext;
 
-fn inferenceProviderTranscribeAudio(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.transcribing.Request,
-) anyerror!antfly.transcribing.Response {
-    return try invokeInferenceProvider(antfly.transcribing.Response, alloc, handle, .transcribe_audio, .{
-        .model = model,
-        .request = request,
-    }, null);
-}
+const inferenceProviderGenerateText = inference_provider.inferenceProviderGenerateText;
 
-fn inferenceProviderExtract(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    request: antfly.extracting.Request,
-) anyerror!antfly.extracting.Response {
-    const json = try invokeInferenceProvider([]u8, alloc, handle, .extract, .{
-        .model = model,
-        .request = request,
-    }, null);
-    return .{ .allocator = alloc, .json = json };
-}
+const inferenceProviderGenerateTextWithContext = inference_provider.inferenceProviderGenerateTextWithContext;
 
-fn inferenceProviderListModelsJson(
-    handle: *anyopaque,
-    alloc: std.mem.Allocator,
-) anyerror![]u8 {
-    return try invokeInferenceProvider([]u8, alloc, handle, .list_models_json, .{}, null);
-}
+const inferenceProviderGenerateMessages = inference_provider.inferenceProviderGenerateMessages;
+
+const inferenceProviderGenerateJson = inference_provider.inferenceProviderGenerateJson;
+
+const inferenceProviderGenerateMessagesWithContext = inference_provider.inferenceProviderGenerateMessagesWithContext;
+
+const inferenceProviderGenerateMessagesWithAttachments = inference_provider.inferenceProviderGenerateMessagesWithAttachments;
+
+const inferenceProviderGenerateMessagesWithAttachmentsWithContext = inference_provider.inferenceProviderGenerateMessagesWithAttachmentsWithContext;
+
+const inferenceProviderGenerateMessagesWithAttachmentsControlled = inference_provider.inferenceProviderGenerateMessagesWithAttachmentsControlled;
+
+const inferenceProviderModelCapabilities = inference_provider.inferenceProviderModelCapabilities;
+
+const inferenceProviderModelCapabilitiesWithContext = inference_provider.inferenceProviderModelCapabilitiesWithContext;
+
+const inferenceProviderChunkInput = inference_provider.inferenceProviderChunkInput;
+
+const inferenceProviderChunkInputWithContext = inference_provider.inferenceProviderChunkInputWithContext;
+
+const inferenceProviderChunkInputControlled = inference_provider.inferenceProviderChunkInputControlled;
+
+const inferenceProviderRewriteTexts = inference_provider.inferenceProviderRewriteTexts;
+
+const inferenceProviderClassifyTexts = inference_provider.inferenceProviderClassifyTexts;
+
+const inferenceProviderReadImages = inference_provider.inferenceProviderReadImages;
+
+const inferenceProviderReadImagesWithContext = inference_provider.inferenceProviderReadImagesWithContext;
+
+const inferenceProviderReadEncodedImages = inference_provider.inferenceProviderReadEncodedImages;
+
+const inferenceProviderReadEncodedImagesWithContext = inference_provider.inferenceProviderReadEncodedImagesWithContext;
+
+const inferenceProviderReadEncodedImagesControlled = inference_provider.inferenceProviderReadEncodedImagesControlled;
+
+const inferenceProviderReadEncodedImagesReported = inference_provider.inferenceProviderReadEncodedImagesReported;
+
+const inferenceProviderReadEncodedImagesReportedWithContext = inference_provider.inferenceProviderReadEncodedImagesReportedWithContext;
+
+const inferenceProviderReadEncodedImagesReportedControlled = inference_provider.inferenceProviderReadEncodedImagesReportedControlled;
+
+const encodedImageProviderMetadata = inference_provider.encodedImageProviderMetadata;
+
+const EncodedImageProviderPayloads = inference_provider.EncodedImageProviderPayloads;
+
+const encodedImageProviderPayloadsAlloc = inference_provider.encodedImageProviderPayloadsAlloc;
+
+const inferenceProviderReadRasterImagesReported = inference_provider.inferenceProviderReadRasterImagesReported;
+
+const inferenceProviderReadRasterImagesReportedWithContext = inference_provider.inferenceProviderReadRasterImagesReportedWithContext;
+
+const inferenceProviderReadRasterImagesReportedControlled = inference_provider.inferenceProviderReadRasterImagesReportedControlled;
+
+const inferenceProviderEmbedDenseRasters = inference_provider.inferenceProviderEmbedDenseRasters;
+
+const RasterProviderPayloads = inference_provider.RasterProviderPayloads;
+
+const rasterProviderPayloadsAlloc = inference_provider.rasterProviderPayloadsAlloc;
+
+const inferenceProviderTranscribeAudio = inference_provider.inferenceProviderTranscribeAudio;
+
+const inferenceProviderTranscribeAudioWithContext = inference_provider.inferenceProviderTranscribeAudioWithContext;
+
+const inferenceProviderExtract = inference_provider.inferenceProviderExtract;
+
+const inferenceProviderExtractWithContext = inference_provider.inferenceProviderExtractWithContext;
+
+const inferenceProviderExtractControlled = inference_provider.inferenceProviderExtractControlled;
+
+const inferenceProviderListModelsJson = inference_provider.inferenceProviderListModelsJson;
 
 fn inferenceResourceSlices(amounts: *const inference_bridge.AdmissionAmounts) ![3]antfly.resource_manager.SliceAmount {
     return .{
@@ -6097,7 +6004,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "data:image/png;base64,AQI=",
+                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
                 .mime_type = "image/png",
             } },
         } },
@@ -6111,7 +6018,11 @@ test "standalone runtime local generator accepts media url data uris" {
     const message = converted.messages[0];
     try std.testing.expectEqualStrings("describe", message.content);
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, message.image_bytes.?[0]);
+    var expected = [_]u8{0} ** 24;
+    @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
+    std.mem.writeInt(u32, expected[16..20], 2, .big);
+    std.mem.writeInt(u32, expected[20..24], 3, .big);
+    try std.testing.expectEqualSlices(u8, &expected, message.image_bytes.?[0]);
     try std.testing.expectEqual(@as(usize, 2), message.content_parts.?.len);
     try std.testing.expectEqual(@as(usize, 0), message.content_parts.?[1].image);
 }
@@ -6134,6 +6045,244 @@ test "standalone runtime local dense embed preserves borrowed binary media" {
     try std.testing.expectEqualSlices(u8, &raw, direct[2].media.data);
 }
 
+test "standalone encoded reader ABI round trips borrowed payloads" {
+    const alloc = std.testing.allocator;
+    const png = [_]u8{ 0x89, 'P', 'N', 'G', 1 };
+    const jpeg = [_]u8{ 0xff, 0xd8, 0xff, 2 };
+    const images = [_]antfly.readers.EncodedImage{
+        .{ .bytes = &png, .mime_type = "image/png" },
+        .{ .bytes = &jpeg, .mime_type = "image/jpeg" },
+    };
+    const request = antfly.readers.EncodedRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "mixed-deadbeef",
+    };
+
+    const FakeReader = struct {
+        first_ptr: [*]const u8,
+        second_ptr: [*]const u8,
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            encoded: antfly.readers.EncodedRequest,
+        ) ![]antfly.readers.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", encoded.prompt.?);
+            try std.testing.expectEqual(@as(i64, 128), encoded.max_tokens.?);
+            try std.testing.expectEqualStrings("mixed-deadbeef", encoded.source_fingerprint.?);
+            try std.testing.expectEqual(@as(usize, 2), encoded.images.len);
+            try std.testing.expectEqualStrings("image/png", encoded.images[0].mime_type);
+            try std.testing.expectEqualStrings("image/jpeg", encoded.images[1].mime_type);
+            try std.testing.expectEqual(@intFromPtr(self.first_ptr), @intFromPtr(encoded.images[0].bytes.ptr));
+            try std.testing.expectEqual(@intFromPtr(self.second_ptr), @intFromPtr(encoded.images[1].bytes.ptr));
+
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            out[0] = .{ .text = try result_alloc.dupe(u8, "first") };
+            out[1] = .{ .text = try result_alloc.dupe(u8, "second") };
+            return out;
+        }
+    };
+    var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_encoded_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
+
+    // Traverse the production caller, ProviderInvokeContext construction,
+    // host operation dispatch, borrowed-payload decode, JSON response, and
+    // response destruction without loading a model.
+    const results = try inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", request);
+    defer {
+        for (results) |*result| antfly.readers.deinitResult(alloc, result);
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqualStrings("first", results[0].text);
+    try std.testing.expectEqualStrings("second", results[1].text);
+
+    // Keep malformed-context coverage at the codec boundary, where a corrupt
+    // pointer/count pair can be represented without dereferencing it.
+    var payloads = try encodedImageProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = encodedImageProviderMetadata("florence2", request);
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, request_json, null, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+    var bad_metadata = metadata;
+    bad_metadata.image_count += 1;
+    const bad_json = try std.json.Stringify.valueAlloc(alloc, bad_metadata, .{});
+    defer alloc.free(bad_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, bad_json, payloads.payloads.ptr, payloads.payloads.len, payloads.refs.ptr, payloads.refs.len),
+    );
+
+    const invalid_mime_images = [_]antfly.readers.EncodedImage{.{ .bytes = &png, .mime_type = "" }};
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inferenceProviderReadEncodedImages(&lifetime, alloc, "florence2", .{ .images = &invalid_mime_images }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const empty_request = antfly.readers.EncodedRequest{ .images = &.{} };
+    const empty_metadata = encodedImageProviderMetadata("florence2", empty_request);
+    const empty_json = try std.json.Stringify.valueAlloc(alloc, empty_metadata, .{});
+    defer alloc.free(empty_json);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inference_host.decodeReadEncodedImagesProviderRequest(alloc, empty_json, null, 0, null, 0),
+    );
+
+    const unused_handle: *anyopaque = @ptrFromInt(1);
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImages(unused_handle, alloc, "florence2", empty_request),
+    );
+    try std.testing.expectError(
+        error.ReadBatchTooLarge,
+        inferenceProviderReadEncodedImagesReported(unused_handle, alloc, "florence2", empty_request),
+    );
+}
+
+test "standalone raster reader ABI preserves borrowed strided pages and identity" {
+    const alloc = std.testing.allocator;
+    var first = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    var second = [_]u8{ 7, 8, 9, 255, 10, 11, 12, 255 };
+    const images = [_]antfly.readers.RasterImage{
+        .{ .bytes = &first, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:1", .source_fingerprint = "doc", .page_number = 1 },
+        .{ .bytes = &second, .width = 2, .height = 1, .stride_bytes = 8, .item_id = "page:2", .source_fingerprint = "doc", .page_number = 2 },
+    };
+    const request = antfly.readers.RasterRequest{
+        .images = &images,
+        .prompt = "<OCR>",
+        .max_tokens = 128,
+        .source_fingerprint = "doc",
+    };
+
+    const FakeReader = struct {
+        expected: [2][*]const u8,
+        observed_addresses: [2]usize = .{ 0, 0 },
+        calls: usize = 0,
+
+        fn read(
+            ptr: *anyopaque,
+            result_alloc: std.mem.Allocator,
+            model: []const u8,
+            raster_request: antfly.readers.RasterRequest,
+        ) !antfly.readers.BatchResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("florence2", model);
+            try std.testing.expectEqualStrings("<OCR>", raster_request.prompt.?);
+            try std.testing.expectEqual(@as(usize, 2), raster_request.images.len);
+            const out = try result_alloc.alloc(antfly.readers.Result, 2);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*result| antfly.readers.deinitResult(result_alloc, result);
+                result_alloc.free(out);
+            }
+            for (raster_request.images, 0..) |raster, i| {
+                try std.testing.expectEqual(@intFromPtr(self.expected[i]), @intFromPtr(raster.bytes.ptr));
+                try std.testing.expectEqual(@as(usize, 8), raster.stride_bytes);
+                self.observed_addresses[i] = @intFromPtr(raster.bytes.ptr);
+                out[i] = .{
+                    .text = try result_alloc.dupe(u8, if (i == 0) "first" else "second"),
+                    .item_id = try result_alloc.dupe(u8, raster.item_id),
+                    .source_fingerprint = if (raster.source_fingerprint) |value| try result_alloc.dupe(u8, value) else null,
+                    .page_number = raster.page_number,
+                };
+                filled += 1;
+            }
+            return .{
+                .items = out,
+                .execution = .{ .requested_items = 2, .native_batches = 1, .native_items = 2 },
+            };
+        }
+    };
+    var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
+    var state = inference_host.LinkedInferenceState{
+        .alloc = alloc,
+        .executor = try @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io).receive(),
+        .io = std.testing.io,
+        .node = undefined, // The model-free override must not enter Node.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .read_raster_images_override = .{ .ptr = &fake, .read_fn = FakeReader.read },
+    };
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = &state };
+
+    var batch = try inferenceProviderReadRasterImagesReported(&lifetime, alloc, "florence2", request);
+    defer batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@intFromPtr(first[0..].ptr), fake.observed_addresses[0]);
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+    first[0] = 99;
+    try std.testing.expectEqualStrings("first", batch.items[0].text);
+
+    var payloads = try rasterProviderPayloadsAlloc(alloc, request.images);
+    defer payloads.deinit(alloc);
+    const metadata = inference_bridge.ReadRasterImagesRequest{
+        .model = "florence2",
+        .raster_count = request.images.len,
+        .rasters = payloads.metadata,
+        .prompt = request.prompt,
+        .max_tokens = request.max_tokens,
+        .source_fingerprint = request.source_fingerprint,
+    };
+    const request_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
+    defer alloc.free(request_json);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            null,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
+    );
+    payloads.refs[1].item_index = payloads.refs[0].item_index;
+    try std.testing.expectError(
+        error.InvalidArguments,
+        inference_host.decodeReadRasterImagesProviderRequest(
+            alloc,
+            request_json,
+            payloads.payloads.ptr,
+            payloads.payloads.len,
+            payloads.refs.ptr,
+            payloads.refs.len,
+        ),
+    );
+}
+
 test "standalone runtime local generator preflights mixed resident media exactly" {
     const messages = [_]antfly.inference.ChatMessage{.{
         .role = .user,
@@ -6143,17 +6292,17 @@ test "standalone runtime local generator preflights mixed resident media exactly
                 .data = "AQID",
                 .mime_type = "audio/wav",
             } },
-            .{ .image_url = .{ .url = "data:image/png;base64,BAU=" } },
+            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" } },
         } },
     }};
 
     const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
     try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
     try std.testing.expectEqual(
-        @as(usize, "AQID".len + "data:image/png;base64,BAU=".len),
+        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD".len),
         preflight.encoded_media_bytes,
     );
-    try std.testing.expectEqual(@as(usize, 5), preflight.decoded_media_bytes);
+    try std.testing.expectEqual(@as(usize, 27), preflight.decoded_media_bytes);
     try std.testing.expectEqual(@as(usize, 2), preflight.media_count);
     try std.testing.expectEqual(@as(usize, 1), preflight.image_count);
     try std.testing.expect(preflight.has_audio);
@@ -6183,6 +6332,9 @@ test "standalone runtime leaves auth disabled unless config or cli enables it" {
 }
 
 test "standalone continuous HA mutation guard follows role lifecycle" {
+    try std.testing.expect(standaloneNativeAuthorityInitiallyPermitted(.{}));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_primary_log = "/ha/primary.wal" }));
+    try std.testing.expect(!standaloneNativeAuthorityInitiallyPermitted(.{ .ha_standby_log = "/ha/standby.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{}));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{ .ha_primary_log = "/ha/primary.wal" }));
     try std.testing.expect(!haContinuousMutationGuardEnabled(.{
@@ -6345,6 +6497,53 @@ test "standalone inference middleware reuses public API authentication" {
     api_server.cfg.user_manager = null;
     api_server.cfg.trusted_principal_secret = "test-secret";
     try Harness.expect(middleware, "/ai/v1/models", null, 401);
+}
+
+test "standalone CORS middleware finalizes independently owned responses" {
+    const Harness = struct {
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            // Models the linked API/inference response, which does not own
+            // the outer context's response builder or middleware headers.
+            var response = httpx.Response.init(ctx.allocator, 200);
+            errdefer response.deinit();
+            try response.headers.set("Access-Control-Allow-Origin", "*");
+            try response.headers.set("Access-Control-Allow-Credentials", "true");
+            try response.headers.set("Vary", "Accept-Encoding");
+            try response.headers.set("X-Request-ID", "preserved");
+            return response;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var config = antfly.common.config.Config.CorsConfig{
+        .allowed_origins = &.{@constCast("https://allowed.example")},
+        .allow_credentials = false,
+    };
+    var route_context = StandaloneHttpContext{ .api_server = null, .cors_config = &config };
+    for ([_][]const u8{ "https://allowed.example", "https://denied.example" }) |origin| {
+        var request = try httpx.Request.init(alloc, .POST, "/db/v1/agents/retrieval");
+        defer request.deinit();
+        try request.setHeader("Origin", origin);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var next = httpx.Next{ ._call = Harness.next };
+        var response = try corsRequest(&route_context, &ctx, &next);
+        defer response.deinit();
+        if (std.mem.eql(u8, origin, "https://allowed.example")) {
+            try std.testing.expectEqualStrings(origin, response.headers.get("Access-Control-Allow-Origin").?);
+            try std.testing.expectEqualStrings(origin, ctx.response.headers.get("Access-Control-Allow-Origin").?);
+        } else {
+            try std.testing.expect(response.headers.get("Access-Control-Allow-Origin") == null);
+        }
+        try std.testing.expect(response.headers.get("Access-Control-Allow-Credentials") == null);
+        try std.testing.expectEqualStrings("preserved", response.headers.get("X-Request-ID").?);
+        var vary_count: usize = 0;
+        for (response.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Vary")) vary_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), vary_count);
+        try applyCorsActualHeaders(alloc, &response.headers, &config, null);
+        try std.testing.expectEqualStrings("Accept-Encoding", response.headers.get("Vary").?);
+    }
 }
 
 test "standalone CORS middleware enforces dynamic configuration" {
@@ -8049,6 +8248,23 @@ test "standalone runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
 }
 
+test "standalone resolves the default secret store before full config parsing" {
+    const alloc = std.testing.allocator;
+    const base_dir = (try configLocalBaseDirHintFromRaw(alloc,
+        \\{"storage":{"local":{"base_dir":"/var/lib/antfly"}},"generators":{"default":{"api_key":"${secret:generator.key}"}}}
+    )).?;
+    defer alloc.free(base_dir);
+    try std.testing.expectEqualStrings("/var/lib/antfly", base_dir);
+
+    try std.testing.expect((try configLocalBaseDirHintFromRaw(alloc, "{}")) == null);
+    try std.testing.expectError(
+        error.InvalidConfig,
+        configLocalBaseDirHintFromRaw(alloc,
+            \\{"storage":{"local":{"base_dir":"${secret:data.dir}"}}}
+        ),
+    );
+}
+
 test "standalone runtime resolves explicit extension package store path" {
     const alloc = std.testing.allocator;
     const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
@@ -8192,6 +8408,45 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
 }
 
+test "standalone schema mutation supports atomic merge patch and version CAS" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0,\"description\":\"before\"}",
+    });
+
+    const source = metadata.statusSource();
+    var result = try source.mutateSchema(alloc, "docs", .merge_patch, "{\"description\":\"after\"}", 0);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.version);
+    try std.testing.expect(std.mem.indexOf(u8, result.schema_json, "\"description\":\"after\"") != null);
+    try std.testing.expectError(
+        error.SchemaVersionChanged,
+        source.mutateSchema(alloc, "docs", .replace, "{}", 0),
+    );
+}
+
 test "standalone routing watch does not report absence after one probe" {
     const alloc = std.testing.allocator;
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
@@ -8232,7 +8487,7 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    try writeFileAtomically(alloc, catalog_path, "{not-json");
+    try writeFileAtomically(alloc, std.Options.debug_io, catalog_path, "{not-json");
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
@@ -8436,6 +8691,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
+        .io = std.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",
@@ -8484,6 +8740,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
                 .grace_ns = 10 * std.time.ns_per_s,
                 .sentinel_path = "/tmp/lease-fenced",
             }, null, null),
+            .io = std.testing.io,
             .executor = undefined,
             .uri = undefined,
             .token_path = "",
@@ -8524,6 +8781,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
+        .io = std.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",

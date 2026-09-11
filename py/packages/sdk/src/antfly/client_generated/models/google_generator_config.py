@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.google_generator_config_provider import GoogleGeneratorConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="GoogleGeneratorConfig")
@@ -16,6 +17,7 @@ class GoogleGeneratorConfig:
     """Configuration for the Google generative AI provider (Gemini).
 
     Attributes:
+        provider (GoogleGeneratorConfigProvider):
         model (str): The name of the generative model to use. Default: 'gemini-2.5-flash'. Example: gemini-2.5-flash.
         project_id (str | Unset): The Google Cloud project ID.
         location (str | Unset): The Google Cloud location (e.g., 'us-central1').
@@ -27,6 +29,7 @@ class GoogleGeneratorConfig:
         url (str | Unset): The URL of the Google API endpoint.
     """
 
+    provider: GoogleGeneratorConfigProvider
     model: str = "gemini-2.5-flash"
     project_id: str | Unset = UNSET
     location: str | Unset = UNSET
@@ -39,6 +42,8 @@ class GoogleGeneratorConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         project_id = self.project_id
@@ -61,6 +66,7 @@ class GoogleGeneratorConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -86,6 +92,8 @@ class GoogleGeneratorConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = GoogleGeneratorConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         project_id = d.pop("project_id", UNSET)
@@ -105,6 +113,7 @@ class GoogleGeneratorConfig:
         url = d.pop("url", UNSET)
 
         google_generator_config = cls(
+            provider=provider,
             model=model,
             project_id=project_id,
             location=location,

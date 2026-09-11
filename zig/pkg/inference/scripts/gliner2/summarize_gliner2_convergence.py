@@ -19,7 +19,10 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from compare_gliner2_lora_python_zig import COMPARISON_CONTRACT, UPSTREAM_SAMPLING_DEFAULTS
+from compare_gliner2_lora_python_zig import (
+    COMPARISON_CONTRACT,
+    UPSTREAM_SAMPLING_DEFAULTS,
+)
 from evaluate_gliner2_full_task import EVALUATION_CONTRACT, REQUIRED_MINIMA
 from gliner2_release_contract import (
     CANONICAL_GLINER2_VERSION,
@@ -104,7 +107,10 @@ BACKEND_STOCHASTIC_STRICT_CHECKS = {
 
 def required_stochastic_strict_checks(zig_backend: str) -> tuple[str, ...]:
     try:
-        return COMMON_STOCHASTIC_STRICT_CHECKS + BACKEND_STOCHASTIC_STRICT_CHECKS[zig_backend]
+        return (
+            COMMON_STOCHASTIC_STRICT_CHECKS
+            + BACKEND_STOCHASTIC_STRICT_CHECKS[zig_backend]
+        )
     except KeyError as exc:
         raise ValueError(f"unsupported Zig convergence backend: {zig_backend}") from exc
 
@@ -196,7 +202,11 @@ def valid_losses(value: Any) -> tuple[list[float] | None, str | None]:
         return None, "loss curve is missing or empty"
     losses: list[float] = []
     for raw in value:
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(float(raw)):
+        if (
+            not isinstance(raw, (int, float))
+            or isinstance(raw, bool)
+            or not math.isfinite(float(raw))
+        ):
             return None, "loss curve contains a nonfinite or nonnumeric value"
         losses.append(float(raw))
     if losses[-1] > max(losses[0] * 2.0, losses[0] + 1.0):
@@ -237,32 +247,55 @@ def side_training_evidence(
         steps = generated.get("total_steps")
         rows = generated.get("train_metrics_history")
         if not oracle_runtime_matches(generated.get("oracle"), verified_oracle):
-            raise ValueError("Python trainer oracle metadata is missing, unpinned, or imported outside its checkout")
+            raise ValueError(
+                "Python trainer oracle metadata is missing, unpinned, or imported outside its checkout"
+            )
         side_oracle = generated["oracle"]
     else:
         manifest = result.get("training_manifest")
         rows = result.get("training_metrics")
         if not isinstance(manifest, dict):
             raise ValueError("Zig training manifest evidence is missing")
-        if str(manifest.get("backend", "")).lower() != zig_backend or manifest.get("objective") != "gliner2-total-loss":
-            raise ValueError(f"Zig trainer evidence is not a {zig_backend.upper()} full-task run")
-        if manifest.get("training_precision") != "fp32" or manifest.get("optimizer_state_precision") != "fp32":
-            raise ValueError("Zig trainer evidence is not the production FP32 precision contract")
+        if (
+            str(manifest.get("backend", "")).lower() != zig_backend
+            or manifest.get("objective") != "gliner2-total-loss"
+        ):
+            raise ValueError(
+                f"Zig trainer evidence is not a {zig_backend.upper()} full-task run"
+            )
+        if (
+            manifest.get("training_precision") != "fp32"
+            or manifest.get("optimizer_state_precision") != "fp32"
+        ):
+            raise ValueError(
+                "Zig trainer evidence is not the production FP32 precision contract"
+            )
         if manifest.get("lora_only_trainables") is not True:
             raise ValueError("Zig trainer evidence is not LoRA-only")
         steps = manifest.get("optimizer_steps")
         side_oracle = None
-    if not isinstance(steps, int) or isinstance(steps, bool) or steps != requested_steps or steps <= 0:
-        raise ValueError(f"{side} optimizer_steps must equal requested comparison steps ({requested_steps})")
+    if (
+        not isinstance(steps, int)
+        or isinstance(steps, bool)
+        or steps != requested_steps
+        or steps <= 0
+    ):
+        raise ValueError(
+            f"{side} optimizer_steps must equal requested comparison steps ({requested_steps})"
+        )
     if not isinstance(rows, list):
         raise ValueError(f"{side} chronological training metrics are missing")
     if side == "python":
         loss_rows = rows
     else:
-        loss_rows = [row for row in rows if isinstance(row, dict) and row.get("event") == "step"]
+        loss_rows = [
+            row for row in rows if isinstance(row, dict) and row.get("event") == "step"
+        ]
     losses = [row.get("loss") for row in loss_rows if isinstance(row, dict)]
     if len(losses) != steps:
-        raise ValueError(f"{side} loss count {len(losses)} does not match optimizer_steps {steps}")
+        raise ValueError(
+            f"{side} loss count {len(losses)} does not match optimizer_steps {steps}"
+        )
     return steps, losses, side_oracle
 
 
@@ -297,16 +330,22 @@ def evaluation_evidence(
     ):
         raise ValueError(f"{label} does not use the canonical scoring runtime")
     if not oracle_runtime_matches(report.get("oracle"), verified_oracle):
-        raise ValueError(f"{label} oracle metadata is missing, unpinned, or imported outside its checkout")
+        raise ValueError(
+            f"{label} oracle metadata is missing, unpinned, or imported outside its checkout"
+        )
     if (
         not isinstance(artifacts, dict)
         or artifacts.get("base_model_fingerprint_sha256") != fingerprints["base_model"]
         or artifacts.get("peft_adapter_fingerprint_sha256") != adapter_fingerprint
         or artifacts.get("eval_data_fingerprint_sha256") != fingerprints["eval_data"]
     ):
-        raise ValueError(f"{label} artifact fingerprints do not match the selected evidence")
+        raise ValueError(
+            f"{label} artifact fingerprints do not match the selected evidence"
+        )
     metrics = report.get("metrics")
-    if not isinstance(metrics, dict) or any(metric(metrics, key) is None for key in REQUIRED_MINIMA):
+    if not isinstance(metrics, dict) or any(
+        metric(metrics, key) is None for key in REQUIRED_MINIMA
+    ):
         raise ValueError(f"{label} is missing one or more canonical release metrics")
     return metrics
 
@@ -325,7 +364,9 @@ def stochastic_comparison_errors(
     if config.get("python_sampling_policy") != "upstream-default":
         errors.append("Fastino SamplingConfig must retain the pinned upstream defaults")
     if config.get("python_schema_conditioning_policy") != "upstream-training-default":
-        errors.append("Fastino schema conditioning must retain upstream training-mode stochasticity")
+        errors.append(
+            "Fastino schema conditioning must retain upstream training-mode stochasticity"
+        )
     if config.get("python_train_shuffle") is not True:
         errors.append("Fastino training-example/task shuffle must remain enabled")
     if config.get("disable_python_model_dropout") is not False:
@@ -333,28 +374,50 @@ def stochastic_comparison_errors(
     if not exact_numeric(config.get("lora_dropout"), 0.0):
         errors.append("LoRA dropout must match the pinned Fastino default of 0.0")
     if not exact_numeric(config.get("span_negative_mask_rate"), 0.5):
-        errors.append("negative-span masking must match the pinned Fastino default of 0.5")
+        errors.append(
+            "negative-span masking must match the pinned Fastino default of 0.5"
+        )
 
     metrics = python_result.get("metrics")
     if not isinstance(metrics, dict):
         errors.append("generated Fastino trainer metrics are missing")
     else:
         if metrics.get("sampling_policy") != "upstream-default":
-            errors.append("generated Fastino trainer did not apply the upstream sampling policy")
+            errors.append(
+                "generated Fastino trainer did not apply the upstream sampling policy"
+            )
         if not sampling_config_matches(metrics.get("sampling_config")):
-            errors.append("generated Fastino trainer SamplingConfig differs from the pinned defaults")
+            errors.append(
+                "generated Fastino trainer SamplingConfig differs from the pinned defaults"
+            )
         if metrics.get("schema_conditioning_policy") != "upstream-training-default":
-            errors.append("generated Fastino trainer did not retain upstream schema conditioning")
+            errors.append(
+                "generated Fastino trainer did not retain upstream schema conditioning"
+            )
         if metrics.get("training_deterministic") is not False:
-            errors.append("generated Fastino trainer did not retain deterministic=False")
+            errors.append(
+                "generated Fastino trainer did not retain deterministic=False"
+            )
         if metrics.get("train_shuffle") is not True:
             errors.append("generated Fastino trainer did not retain shuffle")
         configured_dropout = metrics.get("configured_dropout_modules")
-        if not isinstance(configured_dropout, int) or isinstance(configured_dropout, bool) or configured_dropout <= 0:
-            errors.append("generated Fastino model did not expose active upstream dropout modules")
+        if (
+            not isinstance(configured_dropout, int)
+            or isinstance(configured_dropout, bool)
+            or configured_dropout <= 0
+        ):
+            errors.append(
+                "generated Fastino model did not expose active upstream dropout modules"
+            )
         disabled_dropout = metrics.get("disabled_dropout_modules")
-        if not isinstance(disabled_dropout, int) or isinstance(disabled_dropout, bool) or disabled_dropout != 0:
-            errors.append("generated Fastino trainer disabled one or more model dropout modules")
+        if (
+            not isinstance(disabled_dropout, int)
+            or isinstance(disabled_dropout, bool)
+            or disabled_dropout != 0
+        ):
+            errors.append(
+                "generated Fastino trainer disabled one or more model dropout modules"
+            )
 
     manifest = zig_result.get("training_manifest")
     if not isinstance(manifest, dict):
@@ -377,9 +440,15 @@ def stochastic_comparison_errors(
 
     strict_checks = summary.get("strict_checks")
     if summary.get("strict_mode") is not True or not isinstance(strict_checks, dict):
-        errors.append("comparison must complete with strict runtime/artifact gating enabled")
+        errors.append(
+            "comparison must complete with strict runtime/artifact gating enabled"
+        )
     else:
-        failed = [name for name in required_stochastic_strict_checks(zig_backend) if strict_checks.get(name) is not True]
+        failed = [
+            name
+            for name in required_stochastic_strict_checks(zig_backend)
+            if strict_checks.get(name) is not True
+        ]
         if failed:
             errors.append("required strict checks did not pass: " + ", ".join(failed))
     return errors
@@ -403,7 +472,9 @@ def materialize_study(
     if manifest.get("contract") != INPUT_CONTRACT:
         raise ValueError(f"input contract must be {INPUT_CONTRACT}")
     if set(manifest) != {"contract", "minimums", "runs"}:
-        raise ValueError("evidence manifest may contain only contract, minimums, and runs")
+        raise ValueError(
+            "evidence manifest may contain only contract, minimums, and runs"
+        )
     minimums = parsed_minima(manifest.get("minimums"))
     runs = manifest.get("runs")
     if not isinstance(runs, list) or len(runs) != 5:
@@ -414,52 +485,84 @@ def materialize_study(
     for index, run in enumerate(runs):
         label = f"run {index + 1}"
         if not isinstance(run, dict) or set(run) != {
-            "seed", "comparison_report", "python_evaluation_report", "zig_evaluation_report"
+            "seed",
+            "comparison_report",
+            "python_evaluation_report",
+            "zig_evaluation_report",
         }:
             raise ValueError(
                 f"{label} must contain only seed and the comparison/Python-evaluation/Zig-evaluation report paths"
             )
         seed = run.get("seed")
-        if not isinstance(seed, (int, str)) or isinstance(seed, bool) or seed in seen_seeds:
+        if (
+            not isinstance(seed, (int, str))
+            or isinstance(seed, bool)
+            or seed in seen_seeds
+        ):
             raise ValueError(f"{label} seed must be a unique integer or string")
         seen_seeds.add(seed)
         report_paths = {
-            "comparison": evidence_path(run.get("comparison_report"), manifest_dir, f"{label} comparison_report"),
+            "comparison": evidence_path(
+                run.get("comparison_report"), manifest_dir, f"{label} comparison_report"
+            ),
             "python_evaluation": evidence_path(
-                run.get("python_evaluation_report"), manifest_dir, f"{label} python_evaluation_report"
+                run.get("python_evaluation_report"),
+                manifest_dir,
+                f"{label} python_evaluation_report",
             ),
             "zig_evaluation": evidence_path(
-                run.get("zig_evaluation_report"), manifest_dir, f"{label} zig_evaluation_report"
+                run.get("zig_evaluation_report"),
+                manifest_dir,
+                f"{label} zig_evaluation_report",
             ),
         }
         if any(path in seen_reports for path in report_paths.values()):
             raise ValueError(f"{label} reuses an evidence report from another seed")
         seen_reports.update(report_paths.values())
-        comparison = json_object(report_paths["comparison"], f"{label} comparison report")
+        comparison = json_object(
+            report_paths["comparison"], f"{label} comparison report"
+        )
         config = comparison.get("config")
         summary = comparison.get("summary")
-        if comparison.get("contract") != COMPARISON_CONTRACT or not isinstance(config, dict):
-            raise ValueError(f"{label} comparison report is not a {COMPARISON_CONTRACT} report")
+        if comparison.get("contract") != COMPARISON_CONTRACT or not isinstance(
+            config, dict
+        ):
+            raise ValueError(
+                f"{label} comparison report is not a {COMPARISON_CONTRACT} report"
+            )
         if (
             config.get("seed") != seed
             or config.get("model_dir") != str(model_dir)
             or config.get("train_data") != str(train_data)
             or config.get("model_fingerprint_sha256") != fingerprints["base_model"]
-            or config.get("training_data_fingerprint_sha256") != fingerprints["train_data"]
+            or config.get("training_data_fingerprint_sha256")
+            != fingerprints["train_data"]
             or config.get("scoring_normalization") != CANONICAL_NORMALIZATION
             or config.get("zig_backend") != zig_backend
             or config.get("zig_objective") != "gliner2-total-loss"
             or config.get("zig_lora_only_trainables") is not True
             or not oracle_subset_matches(config.get("oracle"), verified_oracle)
         ):
-            raise ValueError(f"{label} comparison configuration is not the selected stochastic {zig_backend.upper()} study")
+            raise ValueError(
+                f"{label} comparison configuration is not the selected stochastic {zig_backend.upper()} study"
+            )
         python_result = comparison.get("python")
         zig_result = comparison.get("zig")
-        if not isinstance(summary, dict) or not isinstance(python_result, dict) or not isinstance(zig_result, dict):
-            raise ValueError(f"{label} comparison report is missing its summary or trainer results")
-        stochastic_errors = stochastic_comparison_errors(config, summary, python_result, zig_result, zig_backend)
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(python_result, dict)
+            or not isinstance(zig_result, dict)
+        ):
+            raise ValueError(
+                f"{label} comparison report is missing its summary or trainer results"
+            )
+        stochastic_errors = stochastic_comparison_errors(
+            config, summary, python_result, zig_result, zig_backend
+        )
         if stochastic_errors:
-            raise ValueError(f"{label} is not a stock-stochastic Fastino study: {'; '.join(stochastic_errors)}")
+            raise ValueError(
+                f"{label} is not a stock-stochastic Fastino study: {'; '.join(stochastic_errors)}"
+            )
         requested_steps = config.get("steps")
         if (
             not isinstance(requested_steps, int)
@@ -469,24 +572,34 @@ def materialize_study(
             or summary.get("requested_step_count") != requested_steps
             or summary.get("step_count_valid") is not True
         ):
-            raise ValueError(f"{label} comparison report has invalid requested/completed step evidence")
+            raise ValueError(
+                f"{label} comparison report has invalid requested/completed step evidence"
+            )
         adapter_dirs = {
-            "python": (report_paths["comparison"].parent / "python" / "final").resolve(),
+            "python": (
+                report_paths["comparison"].parent / "python" / "final"
+            ).resolve(),
             "zig": (report_paths["comparison"].parent / "zig").resolve(),
         }
         adapter_fingerprints: dict[str, str] = {}
         for side in SIDES:
             try:
-                adapter_fingerprints[side] = peft_adapter_fingerprint(adapter_dirs[side])
+                adapter_fingerprints[side] = peft_adapter_fingerprint(
+                    adapter_dirs[side]
+                )
             except (OSError, ValueError) as exc:
-                raise ValueError(f"{label} {side} adapter bundle is missing or invalid: {exc}") from exc
+                raise ValueError(
+                    f"{label} {side} adapter bundle is missing or invalid: {exc}"
+                ) from exc
         sides: dict[str, dict[str, Any]] = {}
         for side in SIDES:
             steps, losses, side_oracle = side_training_evidence(
                 comparison, side, requested_steps, verified_oracle, zig_backend
             )
             eval_key = f"{side}_evaluation"
-            evaluation = json_object(report_paths[eval_key], f"{label} {side} evaluation")
+            evaluation = json_object(
+                report_paths[eval_key], f"{label} {side} evaluation"
+            )
             metrics = evaluation_evidence(
                 evaluation,
                 label=f"{label} {side} evaluation",
@@ -512,14 +625,16 @@ def materialize_study(
                 },
                 **({"oracle": side_oracle} if side == "python" else {}),
             }
-        derived_runs.append({
-            "seed": seed,
-            "comparison_report": {
-                "path": str(report_paths["comparison"]),
-                "sha256": sha256_file(report_paths["comparison"]),
-            },
-            **sides,
-        })
+        derived_runs.append(
+            {
+                "seed": seed,
+                "comparison_report": {
+                    "path": str(report_paths["comparison"]),
+                    "sha256": sha256_file(report_paths["comparison"]),
+                },
+                **sides,
+            }
+        )
     return {
         "contract": DERIVED_CONTRACT,
         "evidence_contract": EVIDENCE_CONTRACT,
@@ -542,18 +657,27 @@ def materialize_study(
 
 def summarize(payload: dict[str, Any]) -> dict[str, Any]:
     failures: list[str] = []
-    if payload.get("contract") != DERIVED_CONTRACT or payload.get("evidence_contract") != EVIDENCE_CONTRACT:
-        failures.append("convergence data was not derived from the versioned evidence manifest")
+    if (
+        payload.get("contract") != DERIVED_CONTRACT
+        or payload.get("evidence_contract") != EVIDENCE_CONTRACT
+    ):
+        failures.append(
+            "convergence data was not derived from the versioned evidence manifest"
+        )
     upstream = payload.get("oracle")
     if not isinstance(upstream, dict) or upstream.get("commit") != UPSTREAM_COMMIT:
         failures.append(f"oracle commit must be {UPSTREAM_COMMIT}")
-        upstream = {"commit": upstream.get("commit") if isinstance(upstream, dict) else None}
+        upstream = {
+            "commit": upstream.get("commit") if isinstance(upstream, dict) else None
+        }
     if payload.get("normalization") != CANONICAL_NORMALIZATION:
         failures.append(f"normalization must be {CANONICAL_NORMALIZATION}")
     if payload.get("unicode_version") != CANONICAL_UNICODE_VERSION:
         failures.append(f"unicode_version must be {CANONICAL_UNICODE_VERSION}")
     if payload.get("training_policy") != STOCK_STOCHASTIC_TRAINING_POLICY:
-        failures.append("training_policy must retain the pinned Fastino stochastic defaults")
+        failures.append(
+            "training_policy must retain the pinned Fastino stochastic defaults"
+        )
     fingerprints = payload.get("fingerprints")
     if not isinstance(fingerprints, dict):
         fingerprints = {}
@@ -574,14 +698,20 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
 
     seen_seeds: set[Any] = set()
     run_results: list[dict[str, Any]] = []
-    by_metric: dict[str, list[tuple[float, float]]] = {key: [] for key in REQUIRED_MINIMA}
+    by_metric: dict[str, list[tuple[float, float]]] = {
+        key: [] for key in REQUIRED_MINIMA
+    }
     for index, raw_run in enumerate(runs):
         run_failures: list[str] = []
         if not isinstance(raw_run, dict):
             failures.append(f"run {index + 1} must be an object")
             continue
         seed = raw_run.get("seed")
-        if not isinstance(seed, (int, str)) or isinstance(seed, bool) or seed in seen_seeds:
+        if (
+            not isinstance(seed, (int, str))
+            or isinstance(seed, bool)
+            or seed in seen_seeds
+        ):
             run_failures.append("seed must be a unique integer or string")
         else:
             seen_seeds.add(seed)
@@ -611,19 +741,25 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
                 or not is_sha256(evaluation_report.get("sha256"))
                 or not isinstance(evaluation_report.get("path"), str)
             ):
-                run_failures.append(f"{side_name} adapter/evaluation evidence is missing")
+                run_failures.append(
+                    f"{side_name} adapter/evaluation evidence is missing"
+                )
             side_oracle: dict[str, Any] | None = None
             if side_name == "python":
                 raw_oracle = side.get("oracle")
                 if not oracle_runtime_matches(raw_oracle, upstream):
-                    run_failures.append("python oracle metadata is missing, unpinned, or imported outside its checkout")
+                    run_failures.append(
+                        "python oracle metadata is missing, unpinned, or imported outside its checkout"
+                    )
                 else:
                     side_oracle = raw_oracle
             parsed_metrics: dict[str, float] = {}
             for key in REQUIRED_MINIMA:
                 value = metric(metrics, key)
                 if value is None:
-                    run_failures.append(f"{side_name} metric {key} is missing or invalid")
+                    run_failures.append(
+                        f"{side_name} metric {key} is missing or invalid"
+                    )
                 else:
                     parsed_metrics[key] = value
             sides[side_name] = {
@@ -640,15 +776,21 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
                     "optimizer-step mismatch: "
                     f"python={sides['python']['optimizer_steps']} zig={sides['zig']['optimizer_steps']}"
                 )
-            if len(sides["python"]["metrics"]) == len(REQUIRED_MINIMA) and len(sides["zig"]["metrics"]) == len(REQUIRED_MINIMA):
+            if len(sides["python"]["metrics"]) == len(REQUIRED_MINIMA) and len(
+                sides["zig"]["metrics"]
+            ) == len(REQUIRED_MINIMA):
                 for key in REQUIRED_MINIMA:
                     python_value = sides["python"]["metrics"][key]
                     zig_value = sides["zig"]["metrics"][key]
                     by_metric[key].append((python_value, zig_value))
                     if key in minimums and zig_value < minimums[key]:
-                        run_failures.append(f"Zig {key}={zig_value} below floor {minimums[key]}")
+                        run_failures.append(
+                            f"Zig {key}={zig_value} below floor {minimums[key]}"
+                        )
                     if python_value - zig_value > 0.05:
-                        run_failures.append(f"paired {key} deficit {python_value - zig_value:.6f} exceeds 0.05")
+                        run_failures.append(
+                            f"paired {key} deficit {python_value - zig_value:.6f} exceeds 0.05"
+                        )
         if run_failures:
             failures.extend(f"seed {seed!r}: {failure}" for failure in run_failures)
         comparison_report = raw_run.get("comparison_report")
@@ -658,20 +800,26 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
             or not isinstance(comparison_report.get("path"), str)
         ):
             failures.append(f"seed {seed!r}: comparison-report evidence is missing")
-        run_results.append({
-            "seed": seed,
-            "pass": not run_failures,
-            "failures": run_failures,
-            "comparison_report": comparison_report,
-            **sides,
-        })
+        run_results.append(
+            {
+                "seed": seed,
+                "pass": not run_failures,
+                "failures": run_failures,
+                "comparison_report": comparison_report,
+                **sides,
+            }
+        )
 
     metric_results: dict[str, Any] = {}
     for key in sorted(REQUIRED_MINIMA):
         pairs = by_metric[key]
         python_mean = statistics.fmean(pair[0] for pair in pairs) if pairs else None
         zig_mean = statistics.fmean(pair[1] for pair in pairs) if pairs else None
-        mean_deficit = python_mean - zig_mean if python_mean is not None and zig_mean is not None else None
+        mean_deficit = (
+            python_mean - zig_mean
+            if python_mean is not None and zig_mean is not None
+            else None
+        )
         max_pair_deficit = max((python - zig for python, zig in pairs), default=None)
         passes = bool(
             len(pairs) == 5
@@ -715,9 +863,26 @@ def summarize(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 PROJECTION_KEYS = (
-    "contract", "evidence_contract", "evidence_bound", "pass", "failures", "oracle",
-    "normalization", "unicode_version", "training_policy", "accelerator_backend", "training_precision", "fingerprints", "artifact_paths", "seed_count",
-    "minimums", "thresholds", "loss_curve_policy", "stochastic_policy", "runs", "metrics",
+    "contract",
+    "evidence_contract",
+    "evidence_bound",
+    "pass",
+    "failures",
+    "oracle",
+    "normalization",
+    "unicode_version",
+    "training_policy",
+    "accelerator_backend",
+    "training_precision",
+    "fingerprints",
+    "artifact_paths",
+    "seed_count",
+    "minimums",
+    "thresholds",
+    "loss_curve_policy",
+    "stochastic_policy",
+    "runs",
+    "metrics",
 )
 
 
@@ -731,8 +896,14 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
         source = summary.get("source")
         manifest_ref = source.get("manifest") if isinstance(source, dict) else None
         artifacts = source.get("artifacts") if isinstance(source, dict) else None
-        upstream_source = source.get("upstream_source") if isinstance(source, dict) else None
-        if not isinstance(manifest_ref, dict) or not isinstance(artifacts, dict) or not isinstance(upstream_source, str):
+        upstream_source = (
+            source.get("upstream_source") if isinstance(source, dict) else None
+        )
+        if (
+            not isinstance(manifest_ref, dict)
+            or not isinstance(artifacts, dict)
+            or not isinstance(upstream_source, str)
+        ):
             raise ValueError("convergence summary has no re-verifiable source evidence")
         manifest_path = Path(str(manifest_ref.get("path"))).resolve()
         if sha256_file(manifest_path) != manifest_ref.get("sha256"):
@@ -741,13 +912,20 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
         fingerprints: dict[str, str] = {}
         for name in ("base_model", "train_data", "eval_data"):
             ref = artifacts.get(name)
-            if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not is_sha256(ref.get("fingerprint")):
+            if (
+                not isinstance(ref, dict)
+                or not isinstance(ref.get("path"), str)
+                or not is_sha256(ref.get("fingerprint"))
+            ):
                 raise ValueError(f"convergence source artifact {name} is missing")
             paths[name] = Path(ref["path"]).resolve()
         fingerprints["base_model"] = base_model_fingerprint(paths["base_model"])
         fingerprints["train_data"] = path_fingerprint(paths["train_data"])
         fingerprints["eval_data"] = path_fingerprint(paths["eval_data"])
-        if any(fingerprints[name] != artifacts[name].get("fingerprint") for name in fingerprints):
+        if any(
+            fingerprints[name] != artifacts[name].get("fingerprint")
+            for name in fingerprints
+        ):
             raise ValueError("convergence source artifact fingerprint changed")
         runtime = verify_canonical_python_runtime()
         package_versions = verify_canonical_oracle_packages()
@@ -772,7 +950,9 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
         )
         rebuilt = summarize(derived)
         if summary_projection(rebuilt) != summary_projection(summary):
-            raise ValueError("convergence summary no longer matches its trainer/evaluator evidence")
+            raise ValueError(
+                "convergence summary no longer matches its trainer/evaluator evidence"
+            )
         if rebuilt.get("pass") is not True:
             raise ValueError("re-derived convergence evidence does not pass")
     except (OSError, ValueError) as exc:
@@ -782,7 +962,12 @@ def verify_summary_evidence(summary: dict[str, Any]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="Evidence manifest containing only per-seed report paths")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Evidence manifest containing only per-seed report paths",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--upstream-source", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -826,7 +1011,10 @@ def main() -> int:
         summary["source"] = {
             "manifest": {"path": str(args.input), "sha256": sha256_file(args.input)},
             "artifacts": {
-                name: {"path": derived["artifact_paths"][name], "fingerprint": fingerprints[name]}
+                name: {
+                    "path": derived["artifact_paths"][name],
+                    "fingerprint": fingerprints[name],
+                }
                 for name in ("base_model", "train_data", "eval_data")
             },
             "upstream_source": str(upstream_source),
@@ -843,7 +1031,9 @@ def main() -> int:
             "unicode_version": CANONICAL_UNICODE_VERSION,
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    args.output.write_text(
+        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+    )
     print(f"convergence summary: {args.output}")
     return 0 if summary["pass"] else 1
 

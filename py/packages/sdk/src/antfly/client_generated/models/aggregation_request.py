@@ -66,8 +66,8 @@ class AggregationRequest:
               current, else an exact distinct scan (default).
             - exact: always compute an exact distinct count.
             - approximate: require a matching sketch; error if none applies.
-        fields (list[str] | Unset): Ordered field list for multi-field terms aggregations. Bucket keys are returned as
-            JSON arrays in the same order.
+        fields (list[str] | Unset): Ordered field list for multi-field terms aggregations. Each bucket key is a JSON
+            string containing the serialized value array in the same order; clients should parse bucket.key as JSON.
         size (int | Unset): Maximum number of buckets to return (for bucketing aggregations) Example: 10.
         ranges (list[AggregationRange] | Unset): Ranges for range aggregations
         date_ranges (list[AggregationDateRange] | Unset): Date ranges for date_range aggregations

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ClusterRestoreRequestRestoreMode(str, Enum):
+class ClusterRestoreRequestRestoreMode(StrEnum):
     FAIL_IF_EXISTS = "fail_if_exists"
     OVERWRITE = "overwrite"
     SKIP_IF_EXISTS = "skip_if_exists"

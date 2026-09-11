@@ -22,6 +22,8 @@ extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_
 extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
+pub const execution_control = @import("execution_control.zig");
+pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const sentencepiece = @import("inference_tokenizer").sentencepiece;
 pub const hf_tokenizer = @import("inference_hf_tokenizer");
 pub const tokenizer = @import("inference_tokenizer");
@@ -30,6 +32,8 @@ pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
 pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
+pub const executor_microbatch = @import("server/executor_microbatch.zig");
+pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");
 pub const singleflight = @import("cache/singleflight.zig");
 pub const registry = @import("registry/registry.zig");
@@ -48,6 +52,9 @@ pub const architectures = struct {
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
     pub const projector_format = @import("architectures/projector_format.zig");
+    pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
+    pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
+    pub const qwen3vl_reranker = @import("architectures/qwen3vl_reranker.zig");
 };
 pub const finetune = @import("finetune/root.zig");
 pub const finetune_cli = @import("finetune/cli/root.zig");
@@ -94,6 +101,7 @@ pub const native_compute = struct {
 
 test {
     _ = backends;
+    _ = execution_control;
     _ = sentencepiece;
     _ = hf_tokenizer;
     _ = tokenizer;
@@ -101,11 +109,15 @@ test {
     _ = chunker;
     _ = pipelines;
     _ = @import("pipelines/gliner.zig");
+    _ = @import("pipelines/gemma4_channels.zig");
     _ = extractors;
     _ = server;
+    _ = executor_microbatch;
+    _ = tensor_microbatch;
     _ = cache;
     _ = singleflight;
     _ = registry;
+    _ = tabular;
     _ = models;
     _ = gguf;
     _ = runtime;
@@ -119,7 +131,14 @@ test {
     _ = architectures;
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
+    _ = architectures.qwen3vl_plan;
+    _ = architectures.qwen3vl_projector;
+    _ = architectures.qwen3vl_reranker;
+    _ = @import("architectures/gpt.zig");
+    _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
+    _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("embedding_trace.zig");
     _ = @import("server/model_manager.zig");
     _ = finetune;
     _ = finetune_cli;

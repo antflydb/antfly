@@ -36,10 +36,19 @@ from conftest import (
     InferenceGeneratorServer,
     InferenceRerankerServer,
     StandaloneAntflyServer,
+    defer_module_tempdir_cleanup,
     resolve_binary_path,
 )
 from helpers import wait_until
 from port_reservations import find_free_port
+
+
+# enrichment_runtime.zig permits six worker attempts, each containing six
+# provider attempts. Inline sleeps total 7.75s per worker attempt; the five
+# worker backoffs total 15.5s. Exhaustion therefore needs 62s of scheduled
+# backoff alone, plus HTTP/storage work and scheduling. Keep this finite
+# allowance aligned with that policy instead of relying on no-op retry sleeps.
+TRANSIENT_EMBEDDING_SETTLE_TIMEOUT_S = 90.0
 
 
 class TinyImageServer:
@@ -69,6 +78,7 @@ class TinyImageServer:
             def log_message(self, format: str, *args: object) -> None:
                 _ = format
                 _ = args
+
         # Bind port zero atomically; probing and then reopening a selected port
         # leaves an avoidable race with parallel E2E workers.
         self._server = ThreadingHTTPServer((host, 0), Handler)
@@ -107,7 +117,7 @@ def cli_media_server():
 
 
 @pytest.fixture(scope="module")
-def cli_server(cli_inference_servers):
+def cli_server(cli_inference_servers, request):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"antfly binary not found: {binary}")
@@ -116,7 +126,10 @@ def cli_server(cli_inference_servers):
     server = StandaloneAntflyServer(binary, "127.0.0.1", port)
     server.cli_inference_urls = cli_inference_servers
     yield server
-    server.stop()
+    # Stop processes now, but wait for the final teardown report before deciding
+    # whether this module's runtime directory should be retained for diagnostics.
+    defer_module_tempdir_cleanup(request.node, server.tempdir)
+    server.stop(cleanup_root=False)
 
 
 @pytest.fixture(scope="module")
@@ -545,11 +558,24 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             for line in logs_while_building.splitlines()
             if repair_pass_log in line and f"table={table} " in line
         )
-        # One bounded pass per five-second audit period (plus a boundary race)
-        # is expected; the regression produced hundreds of immediate passes.
-        assert repair_passes_after - repair_passes_before <= 3, (
+        # The group may consume one causal wake for each of the two indexes in
+        # addition to the two five-second level audits. The regression produced
+        # hundreds of no-op passes by promoting every repeated observation to
+        # an immediate wake; keep the assertion on that bounded event budget,
+        # rather than depending on which side of the sampling boundary the two
+        # legitimate activation wakes land.
+        repair_pass_delta = repair_passes_after - repair_passes_before
+        assert repair_pass_delta <= 4, (
             "periodic startup observation repeatedly promoted known repair "
-            "debt to an immediate wake"
+            f"debt to an immediate wake: delta={repair_pass_delta}\n"
+            + "\n".join(
+                line
+                for line in logs_while_building.splitlines()
+                if (
+                    (repair_pass_log in line or "provisioned index repair pass" in line)
+                    and f"table={table} " in line
+                )
+            )
         )
         for name, before_count in rebuild_log_counts.items():
             assert (
@@ -598,25 +624,32 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_coverage = image_status["status"]["source_coverage"]
         assert image_coverage["policy"] == "partial"
         assert image_coverage["total"] == 3
-        assert image_coverage["covered"] >= 1
+        # The query-visible vector count and asynchronous source census have
+        # independent publication points. searchable-artifacts only promises
+        # the former; check exact source outcomes after complete readiness below.
         assert image_coverage["failed"] == 0
         assert image_status["status"]["readiness"]["queryable"] is True
         assert image_status["status"]["searchable_vectors"] >= 1
 
-        # The searchable-artifact threshold proves serving authority, not
-        # convergence authority. Wait separately for an exact target
-        # observation before asserting whole-source completion.
+        # A source census can settle before replay/publication does. The
+        # warning-free query below requires the full readiness milestone,
+        # not only one searchable image or completed source decisions.
         def completed_image_coverage() -> dict | None:
             current = parse_json(
                 cli("index", "get", "--table", table, "--index", "thumbnail").stdout
             )
             coverage = current["status"]["source_coverage"]
-            if coverage["observation_complete"] and coverage["complete"]:
+            if (
+                coverage["observation_complete"]
+                and coverage["complete"]
+                and current["status"]["readiness"]["state"] == "ready"
+                and current["status"]["milestones"]["complete"]["reached"]
+            ):
                 return current
             return None
 
         completed_image_status = wait_until(
-            completed_image_coverage, timeout_s=5.0, interval_s=0.025
+            completed_image_coverage, timeout_s=20.0, interval_s=0.025
         )
         assert completed_image_status is not None, json.dumps(image_status, indent=2)
         completed_image_coverage_status = completed_image_status["status"][
@@ -625,6 +658,32 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert completed_image_coverage_status["covered"] == 1
         assert completed_image_coverage_status["skipped"] == 2
         assert completed_image_coverage_status["healthy"] is True
+        # The query advisory reads the table-wide list projection, while the
+        # completion loop above reads the named-index projection. Once the
+        # exact source target is settled, neither route may accept a late
+        # owner snapshot that forgets classified coverage without a source
+        # mutation. Sample several publication cycles to make that authority
+        # boundary deterministic rather than relying on the query timing.
+        for _ in range(8):
+            listed = parse_json(
+                cli("index", "list", "--table", table, "--output", "json").stdout
+            )
+            listed_thumbnail = next(
+                item for item in listed if item["config"]["name"] == "thumbnail"
+            )["status"]
+            listed_coverage = listed_thumbnail["source_coverage"]
+            assert listed_coverage["observation_complete"] is True, json.dumps(
+                listed_thumbnail, indent=2
+            )
+            listed_settled = sum(
+                int(listed_coverage.get(field) or 0)
+                for field in ("covered", "skipped", "failed")
+            )
+            assert listed_settled == 3, json.dumps(listed_thumbnail, indent=2)
+            assert listed_coverage["complete"] is True, json.dumps(
+                listed_thumbnail, indent=2
+            )
+            time.sleep(0.025)
         assert cli_media_server.request_count >= 1, (
             "the image quickstart path did not exercise remoteMedia over HTTP"
         )
@@ -677,12 +736,23 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 return status
             return None
 
+        retry_started = time.monotonic()
         settled_failure = wait_until(
-            isolated_failure_is_settled, timeout_s=30.0, interval_s=0.05
+            isolated_failure_is_settled,
+            timeout_s=TRANSIENT_EMBEDDING_SETTLE_TIMEOUT_S,
+            interval_s=0.05,
         )
-        assert settled_failure is not None, cli(
-            "index", "get", "--table", table, "--index", "thumbnail"
-        ).stdout
+        retry_elapsed = time.monotonic() - retry_started
+        retry_requests = embedder_server.transient_embedding_requests
+        assert settled_failure is not None, (
+            f"ClipClap failure did not settle after {retry_elapsed:.2f}s; "
+            f"provider_requests={retry_requests}\n"
+            + cli("index", "get", "--table", table, "--index", "thumbnail").stdout
+        )
+        print(
+            f"ClipClap retries settled after {retry_elapsed:.2f}s "
+            f"({retry_requests} provider requests)"
+        )
         embedder_server.release_transient_embedding_failures()
         assert embedder_server.transient_embedding_requests > 1
         assert settled_failure["enrichment_runtime"]["worker_failed"] is False

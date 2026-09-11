@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -594,7 +595,7 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
         raw[raw.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len],
         .little,
     );
-    if (std.hash.Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
+    if (Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
     if (!std.mem.eql(u8, body[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
     var pos: usize = checkpoint_magic.len;
     const format_version = try readCheckpointInt(body, &pos, u32);
@@ -688,7 +689,7 @@ fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
         try appendCheckpointInt(alloc, &out, u64, value.published_count orelse 0);
         try out.appendSlice(alloc, name);
     }
-    try appendCheckpointInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    try appendCheckpointInt(alloc, &out, u32, Crc32.hash(out.items));
     if (out.items.len > checkpoint_max_bytes) return error.InvalidDerivedApplyState;
     return try out.toOwnedSlice(alloc);
 }
@@ -951,7 +952,7 @@ test "projection checkpoint reads v2 without inventing a publication certificate
     try appendCheckpointInt(alloc, &encoded, u64, 9);
     try appendCheckpointInt(alloc, &encoded, u64, 0x1234);
     try encoded.appendSlice(alloc, name);
-    try appendCheckpointInt(alloc, &encoded, u32, std.hash.Crc32.hash(encoded.items));
+    try appendCheckpointInt(alloc, &encoded, u32, Crc32.hash(encoded.items));
 
     var checkpoint = try decodeCheckpoint(alloc, encoded.items);
     defer checkpoint.deinit(alloc);
@@ -1165,7 +1166,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -1192,8 +1193,15 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
 
     var barrier = Barrier{};
     var workers: [worker_count]Worker = undefined;
-    var threads: [worker_count]std.Thread = undefined;
+    var threads: [worker_count]std.Io.Future(void) = undefined;
     const names = [_][]const u8{ "idx0", "idx1", "idx2", "idx3", "idx4", "idx5" };
+    var started_tasks: usize = 0;
+    defer {
+        lockAtomicMutex(&barrier.mutex);
+        barrier.open = true;
+        barrier.mutex.unlock();
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    }
     for (&workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
@@ -1203,9 +1211,10 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
             .sequence = @intCast(i + 1),
             .barrier = &barrier,
         };
-        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        threads[i] = try std.testing.io.concurrent(Worker.run, .{worker});
+        started_tasks += 1;
     }
-    for (&threads) |thread| thread.join();
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (&workers) |*worker| {
         if (worker.err) |err| return err;
     }

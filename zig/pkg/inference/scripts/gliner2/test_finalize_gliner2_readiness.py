@@ -88,7 +88,11 @@ def evidence() -> dict:
             "accelerator_backend": "metal",
             "training_precision": "fp32",
             "thresholds": {"max_mean_deficit": 0.02, "max_paired_deficit": 0.05},
-            "fingerprints": {"base_model": SHA_MODEL, "train_data": SHA_TRAIN, "eval_data": SHA_EVAL},
+            "fingerprints": {
+                "base_model": SHA_MODEL,
+                "train_data": SHA_TRAIN,
+                "eval_data": SHA_EVAL,
+            },
             "runs": [{"seed": seed, "pass": True} for seed in range(5)],
             "metrics": {key: {"pass": True} for key in REQUIRED_MINIMA},
         },
@@ -102,13 +106,18 @@ class ReadinessFinalizerTest(unittest.TestCase):
         convergence_evidence_errors = values.pop("convergence_evidence_errors", [])
         hardware_qualification = values.pop("hardware_qualification", None)
         hardware_qualification_errors = values.pop("hardware_qualification_errors", [])
-        release_adapter_fingerprint = values.pop("release_adapter_fingerprint", SHA_ADAPTER)
-        release_manifest = values.pop("release_manifest", {
-            "backend": "Metal",
-            "compiled_required": True,
-            "training_precision": "fp32",
-            "optimizer_state_precision": "fp32",
-        })
+        release_adapter_fingerprint = values.pop(
+            "release_adapter_fingerprint", SHA_ADAPTER
+        )
+        release_manifest = values.pop(
+            "release_manifest",
+            {
+                "backend": "Metal",
+                "compiled_required": True,
+                "training_precision": "fp32",
+                "optimizer_state_precision": "fp32",
+            },
+        )
         backend = values.pop("backend", "metal")
         return build_summary(
             backend=backend,
@@ -130,7 +139,9 @@ class ReadinessFinalizerTest(unittest.TestCase):
 
     def test_all_measured_gates_compute_production_ready_true(self) -> None:
         result = self.build()
-        self.assertTrue(result["production_ready"], result["production_readiness_blockers"])
+        self.assertTrue(
+            result["production_ready"], result["production_readiness_blockers"]
+        )
         self.assertEqual([], result["production_readiness_blockers"])
         self.assertEqual("metal", result["accelerator_backend"])
 
@@ -155,15 +166,23 @@ class ReadinessFinalizerTest(unittest.TestCase):
             },
             **cuda_values,
         )
-        self.assertTrue(result["production_ready"], result["production_readiness_blockers"])
+        self.assertTrue(
+            result["production_ready"], result["production_readiness_blockers"]
+        )
         mislabeled = self.build(backend="cuda")
         self.assertFalse(mislabeled["production_ready"])
         self.assertFalse(mislabeled["checks"]["release_adapter_backend_and_precision"])
 
     def test_stochastic_and_fail_closed_unicode_are_policies_not_blockers(self) -> None:
         result = self.build()
-        self.assertIn("exact Python RNG-stream equality is not required", result["policies"]["stochastic_training"])
-        self.assertIn("not a readiness blocker", result["policies"]["unsupported_training_unicode"])
+        self.assertIn(
+            "exact Python RNG-stream equality is not required",
+            result["policies"]["stochastic_training"],
+        )
+        self.assertIn(
+            "not a readiness blocker",
+            result["policies"]["unsupported_training_unicode"],
+        )
 
     def test_missing_convergence_or_normalization_mismatch_blocks(self) -> None:
         missing = self.build(convergence_report=None)
@@ -172,7 +191,9 @@ class ReadinessFinalizerTest(unittest.TestCase):
         mismatch["normalization"] = "legacy"
         result = self.build(native_report=mismatch)
         self.assertFalse(result["production_ready"])
-        self.assertIn("normalization", " ".join(result["production_readiness_blockers"]))
+        self.assertIn(
+            "normalization", " ".join(result["production_readiness_blockers"])
+        )
 
     def test_mismatched_fingerprints_block(self) -> None:
         convergence = evidence()["convergence_report"]

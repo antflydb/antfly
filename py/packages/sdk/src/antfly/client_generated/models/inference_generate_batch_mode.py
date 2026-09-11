@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceGenerateBatchMode(str, Enum):
+class InferenceGenerateBatchMode(StrEnum):
     SYNC = "sync"
 
     def __str__(self) -> str:

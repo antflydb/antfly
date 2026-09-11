@@ -336,7 +336,7 @@ pub const Lexer = struct {
         }
         if (self.pos + 1 < self.source.len and
             (isIdStart(self.source[self.pos + 1]) or self.source[self.pos + 1] == '.' or
-            std.ascii.isDigit(self.source[self.pos + 1]) or self.source[self.pos + 1] == '['))
+                std.ascii.isDigit(self.source[self.pos + 1]) or self.source[self.pos + 1] == '['))
         {
             // Separator before identifier or bracket literal
             self.advance();

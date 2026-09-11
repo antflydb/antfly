@@ -119,7 +119,9 @@ class HAStandaloneNode:
 
     def start(self, *, enable_replication: bool = True) -> None:
         self.node_root.mkdir(parents=True, exist_ok=True)
-        command = _standalone_stateful_command(self.binary, host=self.host, port=self.port, root=self.node_root)
+        command = _standalone_stateful_command(
+            self.binary, host=self.host, port=self.port, root=self.node_root
+        )
         command.extend(["--health", "true", "--health-port", str(self.health_port)])
         if self.role == "primary":
             command.extend(
@@ -162,7 +164,11 @@ class HAStandaloneNode:
             command.extend(["--ha-shard-id", str(self.shard_id)])
         if self.table_id is not None:
             command.extend(["--ha-table-id", str(self.table_id)])
-        if self.role == "primary" and self.sync_standby_name is not None and self.table_id is not None:
+        if (
+            self.role == "primary"
+            and self.sync_standby_name is not None
+            and self.table_id is not None
+        ):
             command.extend(
                 [
                     "--ha-sync-mode",
@@ -204,7 +210,9 @@ class HAStandaloneNode:
         if not wait_for_server(self.url, path="/readyz", timeout=30.0):
             logs = self.debug_logs()
             self.stop()
-            raise RuntimeError(f"HA {self.role} node failed to start at {self.url}\n{logs}")
+            raise RuntimeError(
+                f"HA {self.role} node failed to start at {self.url}\n{logs}"
+            )
 
     def reset_ha_state(self) -> None:
         self.stop()
@@ -256,16 +264,20 @@ class HAStandaloneNode:
             )
             raise
 
-    def admin_get_response(self, path: str, **params: Any) -> requests.Response:
+    def admin_get_response(
+        self, path: str, *, request_timeout_s: float = 10.0, **params: Any
+    ) -> requests.Response:
         return self._request(
             "GET",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             params=params,
             headers=self.admin_headers(),
-            timeout=10,
+            timeout=request_timeout_s,
         )
 
-    def admin_post_response(self, path: str, payload: dict[str, Any]) -> requests.Response:
+    def admin_post_response(
+        self, path: str, payload: dict[str, Any]
+    ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
@@ -309,11 +321,15 @@ class HAStandaloneNode:
         )
         return self._check(response)
 
-    def batch_write(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def batch_write(
+        self, table_name: str, inserts: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
         response = self.batch_write_response(table_name, inserts)
         return self._check(response)
 
-    def batch_write_response(self, table_name: str, inserts: dict[str, dict[str, Any]]) -> requests.Response:
+    def batch_write_response(
+        self, table_name: str, inserts: dict[str, dict[str, Any]]
+    ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{DB_API_ROOT}/tables/{table_name}/batch",
@@ -321,7 +337,9 @@ class HAStandaloneNode:
             timeout=30,
         )
 
-    def lookup_key(self, table_name: str, key: str, *, consistency: str | None = None) -> dict[str, Any]:
+    def lookup_key(
+        self, table_name: str, key: str, *, consistency: str | None = None
+    ) -> dict[str, Any]:
         params = {"consistency": consistency} if consistency is not None else None
         response = self._request(
             "GET",
@@ -552,34 +570,68 @@ def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
     if Path(binary).name != "antfly":
         pytest.skip("HA standby e2e requires the supported Zig antfly binary")
     if not _binary_supports_ha_standalone(binary):
-        pytest.skip(f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}")
+        pytest.skip(
+            f"Antfly binary does not expose HA standalone flags; rebuild current Zig binary: {binary}"
+        )
 
     cluster = HACluster(binary)
     try:
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
-        cluster.close(test_failed=bool(report and report.failed))
+        test_failed = bool(report and report.failed)
+        if test_failed:
+            print(cluster.debug_logs())
+        cluster.close(test_failed=test_failed)
 
 
-def _wait_for_standby_applied(cluster: HACluster, lsn: int, *, timeout_s: float = 20.0) -> dict[str, Any]:
+def _wait_for_standby_applied(
+    cluster: HACluster,
+    lsn: int,
+    *,
+    timeout_s: float = 20.0,
+    require_live_replication: bool = False,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last_snapshot: dict[str, Any] | None = None
     last_error: Exception | None = None
     while time.monotonic() < deadline:
+        proc = cluster.standby.proc
+        if proc is None or proc.poll() is not None:
+            raise AssertionError(
+                f"standby exited while waiting for LSN {lsn}\n{cluster.debug_logs()}"
+            )
         try:
-            status = cluster.standby.admin_get("/standby/status", upstream_lsn=lsn)
+            response = cluster.standby.admin_get_response(
+                "/standby/status",
+                upstream_lsn=lsn,
+                request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
+            )
+            status = cluster.standby._check(response)
         except requests.RequestException as err:
             last_error = err
             time.sleep(0.25)
             continue
         snapshot = status["snapshot"]
         last_snapshot = snapshot
-        if snapshot["received_lsn"] >= lsn and snapshot["applied_lsn"] >= lsn:
+        # Bootstrap/restart restores durable LSNs before the background pull
+        # loop has contacted the primary. A successful round includes the
+        # upstream status acknowledgement; /readyz and restored progress alone
+        # cannot establish that synchronous replication is running.
+        replication_ready = not require_live_replication or (
+            (snapshot.get("last_success_ns") or 0) > 0
+            and snapshot.get("last_error") is None
+        )
+        if (
+            snapshot["received_lsn"] >= lsn
+            and snapshot["applied_lsn"] >= lsn
+            and replication_ready
+        ):
             return snapshot
         time.sleep(0.25)
     raise AssertionError(
-        f"standby did not apply through LSN {lsn}; last={last_snapshot}; last_error={last_error}\n"
+        f"standby did not apply through LSN {lsn}; require_live_replication={require_live_replication}; "
+        f"last={last_snapshot}; last_error={last_error}\n"
         f"{cluster.debug_logs()}"
     )
 
@@ -608,7 +660,9 @@ def _wait_for_promoted_write_check(
         if response.status_code not in {409, 503}:
             return cluster.standby._check(response)
         time.sleep(0.1)
-    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    exit_code = (
+        cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    )
     raise AssertionError(
         "promoted standby did not expose its write decision before the deadline; "
         f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
@@ -646,7 +700,9 @@ def _wait_for_promoted_primary_missing_lookup(
             cluster.standby._check(response)
             raise AssertionError(f"promoted primary unexpectedly contained {key!r}")
         time.sleep(0.1)
-    exit_code = cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    exit_code = (
+        cluster.standby.proc.poll() if cluster.standby.proc is not None else None
+    )
     raise AssertionError(
         "promoted standby did not publish primary read authority before the deadline; "
         f"exit_code={exit_code}; last_response={last_response}; last_error={last_error}\n"
@@ -675,7 +731,9 @@ def _wait_for_standby_lookup(
         except requests.RequestException as err:
             last_error = err
             time.sleep(0.25)
-    raise AssertionError(f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}")
+    raise AssertionError(
+        f"standby lookup for {key!r} did not become visible; last_error={last_error}\n{cluster.debug_logs()}"
+    )
 
 
 def _primary_lsn(cluster: HACluster, *, timeout_s: float = 20.0) -> int:
@@ -725,11 +783,15 @@ def _wait_for_primary_slot_applied(
     )
 
 
-def _table_identity_from_catalog(node: HAStandaloneNode, table_name: str) -> tuple[int, int]:
+def _table_identity_from_catalog(
+    node: HAStandaloneNode, table_name: str
+) -> tuple[int, int]:
     catalog = json.loads(node.catalog_path.read_text())
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
     table_id = int(table["table_id"])
-    table_range = next(record for record in catalog["ranges"] if int(record["table_id"]) == table_id)
+    table_range = next(
+        record for record in catalog["ranges"] if int(record["table_id"]) == table_id
+    )
     return int(table_range["group_id"]), table_id
 
 
@@ -881,7 +943,9 @@ def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None
     assert authorized.json()["identity"]["cluster_id"] == node.cluster_id
 
 
-def _sync_policy(mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a") -> dict[str, Any]:
+def _sync_policy(
+    mode: str, *, failure_policy: str = "block", standby_name: str = "standby-a"
+) -> dict[str, Any]:
     return {
         "mode": mode,
         "selection": "first",
@@ -899,7 +963,9 @@ def _slot_by_name(status: dict[str, Any], slot_name: str) -> dict[str, Any]:
     )
 
 
-def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: HACluster):
+def test_standby_streams_public_writes_restarts_and_rejects_writes(
+    ha_cluster: HACluster,
+):
     table_name = "ha_standby_docs"
     ha_cluster.primary.start()
     created = ha_cluster.primary.create_table(table_name)
@@ -918,7 +984,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
     bootstrapped = ha_cluster.standby.admin_post(
         "/standby/bootstrap",
-        {"manifest_path": str(seed["manifest_path"]), "content_root": str(seed["content_root"])},
+        {
+            "manifest_path": str(seed["manifest_path"]),
+            "content_root": str(seed["content_root"]),
+        },
     )
     assert bootstrapped["manifest_id"] == seed["manifest_id"]
     assert int(bootstrapped["backup_lsn"]) == seed["backup_lsn"]
@@ -932,7 +1001,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         node_id="standby-a",
     )
 
-    seeding_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    seeding_slot = _slot_by_name(
+        ha_cluster.primary.admin_get("/primary/status"), "standby-a"
+    )
     assert seeding_slot["active"] is False
     blocked_stream = requests.post(
         f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
@@ -960,7 +1031,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert activated["slot_name"] == "standby-a"
     assert int(activated["checkpoint_lsn"]) == seed["backup_lsn"]
-    activated_slot = _slot_by_name(ha_cluster.primary.admin_get("/primary/status"), "standby-a")
+    activated_slot = _slot_by_name(
+        ha_cluster.primary.admin_get("/primary/status"), "standby-a"
+    )
     assert activated_slot["active"] is True
 
     activated_retry = ha_cluster.activate_seeded_slot(seed, bootstrapped)
@@ -974,6 +1047,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
 
     ha_cluster.standby.restart()
+    _wait_for_standby_applied(
+        ha_cluster, seed["backup_lsn"], require_live_replication=True
+    )
 
     ha_cluster.primary.batch_write(table_name, {"doc:first": {"title": "first"}})
     first_lsn = _primary_lsn(ha_cluster)
@@ -1015,7 +1091,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert write_check["decision"]["action"] == "reject_read_only_standby"
 
     ha_cluster.standby.restart()
-    restarted_snapshot = _wait_for_standby_applied(ha_cluster, first_lsn)
+    restarted_snapshot = _wait_for_standby_applied(
+        ha_cluster, first_lsn, require_live_replication=True
+    )
     assert restarted_snapshot["received_lsn"] >= first_lsn
     assert restarted_snapshot["applied_lsn"] >= first_lsn
     restarted_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
@@ -1067,7 +1145,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
 
     blocked_commit = ha_cluster.primary.admin_post(
         "/commit/check",
-        {"target_lsn": second_lsn, "sync_policy": _sync_policy("remote_apply", standby_name="missing-standby")},
+        {
+            "target_lsn": second_lsn,
+            "sync_policy": _sync_policy("remote_apply", standby_name="missing-standby"),
+        },
     )
     assert blocked_commit["gate"]["action"] == "wait_for_standby"
     assert blocked_commit["gate"]["durability"]["status"] == "would_block"
@@ -1131,7 +1212,12 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
 
     assessment = ha_cluster.standby.admin_post(
         "/promotion/assess",
-        {"required_lsn": second_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+        {
+            "required_lsn": second_lsn,
+            "fencing_confirmed": False,
+            "force": False,
+            "use_current_fence": True,
+        },
     )
     _assert_action_receipt(
         assessment,
@@ -1179,8 +1265,14 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     )
     assert promoted_write_check["decision"]["role"] == "promoted_standby"
     assert promoted_write_check["decision"]["action"] == "open_promoted_primary"
-    assert promoted_write_check["decision"]["durable_lsn"] == promoted["promotion"]["switch_lsn"]
-    assert promoted_write_check["decision"]["next_lsn"] == promoted["promotion"]["switch_lsn"] + 1
+    assert (
+        promoted_write_check["decision"]["durable_lsn"]
+        == promoted["promotion"]["switch_lsn"]
+    )
+    assert (
+        promoted_write_check["decision"]["next_lsn"]
+        == promoted["promotion"]["switch_lsn"] + 1
+    )
 
     primary_fence = ha_cluster.primary.admin_post("/fence", fence_request)
     _assert_action_receipt(
@@ -1225,7 +1317,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         "retained_from_lsn": second_lsn + 1,
         "receipt": fence["receipt"],
     }
-    rejoin_assessment = ha_cluster.primary.admin_post("/rejoin/assess", reseed_rejoin_request)
+    rejoin_assessment = ha_cluster.primary.admin_post(
+        "/rejoin/assess", reseed_rejoin_request
+    )
     _assert_action_receipt(
         rejoin_assessment,
         action_id="rejoin_assess:primary-a",
@@ -1241,7 +1335,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     assert rejoin_assessment["assessment"]["target_epoch"] == 2
     assert rejoin_assessment["assessment"]["fork_lsn"] == second_lsn
 
-    rejoin_reseed = ha_cluster.primary.admin_post("/rejoin/reseed", reseed_rejoin_request)
+    rejoin_reseed = ha_cluster.primary.admin_post(
+        "/rejoin/reseed", reseed_rejoin_request
+    )
     _assert_action_receipt(
         rejoin_reseed,
         action_id="rejoin_reseed:primary-a",
@@ -1268,7 +1364,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
         # The fenced node is no longer authoritative. Ask explicitly for its
         # retained local generation to verify that the rejected write did not
         # reach storage; the default read-index mode must remain unavailable.
-        ha_cluster.primary.lookup_key(table_name, "doc:old-primary", consistency="stale")
+        ha_cluster.primary.lookup_key(
+            table_name, "doc:old-primary", consistency="stale"
+        )
     assert missing_old_primary_doc.value.response is not None
     assert missing_old_primary_doc.value.response.status_code == 404
     missing_promoted_primary_doc = _wait_for_promoted_primary_missing_lookup(
@@ -1338,7 +1436,12 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
 
     assessment = ha_cluster.standby.admin_post(
         "/promotion/assess",
-        {"required_lsn": required_lsn, "fencing_confirmed": False, "force": False, "use_current_fence": True},
+        {
+            "required_lsn": required_lsn,
+            "fencing_confirmed": False,
+            "force": False,
+            "use_current_fence": True,
+        },
     )
     _assert_action_receipt(
         assessment,

@@ -17,7 +17,8 @@
 
 const failure_abi = @import("runtime_failure_abi");
 
-pub const abi_version = failure_abi.abi_version;
+// Storage layouts evolve independently of the shared failure envelope.
+pub const abi_version: u32 = 48;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -165,60 +166,10 @@ pub const TxnStatus = enum(u32) {
     aborted = 2,
 };
 
-pub const EnrichmentStreamBeginFn = *const fn (
-    ?*anyopaque,
-    BorrowedBytes,
-    BorrowedBytes,
-    BorrowedBytes,
-) callconv(.c) Status;
-
 /// One coarse media/document extraction call. Unit delivery is batched JSON
 /// because extraction metadata is naturally textual and heterogeneous; the
 /// callback is never invoked once per store operation or index mutation.
-pub const EnrichmentExtractRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    downloaded: BorrowedBytes = .{},
-    downloaded_content_type: BorrowedBytes = .{},
-    source_url: BorrowedBytes = .{},
-    config_json: BorrowedBytes = .{},
-    raw_document_json: BorrowedBytes = .{},
-    callback_ctx: ?*anyopaque = null,
-    on_begin: ?EnrichmentStreamBeginFn = null,
-    on_units_json: ?*const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status = null,
-    max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
-    max_working_set_bytes: u64 = 96 * 1024 * 1024,
-};
-
-pub const EnrichmentRenderPdfRequest = extern struct {
-    version: u32 = abi_version,
-    _reserved0: u32 = 0,
-    pdf_bytes: BorrowedBytes = .{},
-    page_number: u64 = 1,
-    dpi: u16 = 150,
-    _reserved1: u16 = 0,
-    max_dimension: u32 = 4096,
-    max_pixels: u64 = 40_000_000,
-    max_decoded_stream_bytes: u64 = 64 * 1024 * 1024,
-    max_working_set_bytes: u64 = 96 * 1024 * 1024,
-};
-
-pub const EnrichmentRenderedPdfPage = extern struct {
-    requested_dpi: u16 = 0,
-    effective_dpi: u16 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-    _reserved0: u32 = 0,
-};
-
 /// Stable stages for failures originating in the enrichment compute unit.
-pub const EnrichmentOperation = enum(u32) {
-    extract_stream = 1,
-    render_pdf_page = 2,
-    validate_extract_response = 3,
-    validate_render_response = 4,
-};
-
 /// Selects the existing query wire dialect. Distributed/local-owner calls use
 /// the resolved internal representation; public C API and Lite calls retain
 /// public validation and translation inside the query provider.
@@ -523,6 +474,7 @@ pub const MetadataProjectionKind = enum(u32) {
     restore_job_value = 25,
     maintenance_stats = 26,
     runtime_status_protocol_activation_version = 27,
+    dense_native_storage_protocol_activation_version = 40,
     placement_version_fences = 28,
     /// Tables and ranges captured from one committed storage snapshot.
     catalog_projection = 29,
@@ -696,6 +648,8 @@ pub const DataApplyProjectionKind = enum(u32) {
     group_state_page = 2,
     split_deltas_page = 3,
     capture_verified_handoff_metadata = 4,
+    current_merge_source = 5,
+    current_merge_receiver = 6,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -931,7 +885,11 @@ pub const PromotionOwnerFn = *const fn (?*anyopaque, u64) callconv(.c) u8;
 /// Distributed resolution/promotion callbacks retained by a live owner. All
 /// bytes are borrowed only for a synchronous callback; no allocator crosses
 /// the compiled-storage boundary.
+pub const NativeAuthorityFn = *const fn (?*const anyopaque) callconv(.c) u8;
+
 pub const RuntimeHooksConfig = extern struct {
+    native_authority_ctx: ?*const anyopaque = null,
+    native_authority_fn: ?NativeAuthorityFn = null,
     resolution_candidates: ResolutionCandidateConfig = .{},
     entity_sink: EntitySinkConfig = .{},
     promotion_owner_ctx: ?*anyopaque = null,
@@ -1110,6 +1068,8 @@ pub const MaintenanceAction = enum(u32) {
     lsm_step_best_effort = 3,
     dense_posting_idle = 4,
     prepare_ha_seed_snapshot = 5,
+    publish_dense_checkpoints = 6,
+    vector_block_idle = 7,
 };
 
 pub const MaintenanceRequest = extern struct {
@@ -1120,6 +1080,9 @@ pub const MaintenanceRequest = extern struct {
 };
 
 pub const MaintenanceResult = extern struct {
+    published: u64 = 0,
+    busy: u8 = 0,
+    deferred: u8 = 0,
     version: u32 = abi_version,
     progressed: u8 = 0,
     has_next_wake_delay: u8 = 0,
@@ -1193,6 +1156,8 @@ pub const SyncLevel = enum(u32) {
 };
 
 pub const SyncRequest = extern struct {
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
     version: u32 = abi_version,
     sync_level: u32 = @intFromEnum(SyncLevel.write),
     table_name: BorrowedBytes = .{},
@@ -1255,6 +1220,8 @@ pub const SnapshotPrepareRequest = extern struct {
 pub const RestorePrepareRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    cancellation_ctx: ?*anyopaque = null,
+    cancellation_fn: ?CancellationCheckFn = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
     group_id: u64 = 0,
@@ -1473,7 +1440,13 @@ pub extern fn antfly_metadata_apply_store_projection(
 pub extern fn antfly_metadata_apply_store_add_listeners(
     store: ?*anyopaque,
     request: *const MetadataListenerRequest,
+    out_registration_id: *u64,
 ) callconv(.c) Status;
+/// Returning true proves all callbacks for this registration have drained.
+pub extern fn antfly_metadata_apply_store_remove_listeners(
+    store: ?*anyopaque,
+    registration_id: u64,
+) callconv(.c) u8;
 pub extern fn antfly_metadata_reconcile_replica_root(
     request: *const MetadataReplicaRootReconcileRequest,
     out_summary: *MetadataProvisionSummary,
@@ -1900,20 +1873,6 @@ pub extern fn antfly_storage_owner_buffer_destroy(
     buffer: *OwnedBytes,
 ) callconv(.c) void;
 
-pub extern fn antfly_enrichment_extract_stream(
-    request: *const EnrichmentExtractRequest,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-
-pub extern fn antfly_enrichment_render_pdf_page_png(
-    request: *const EnrichmentRenderPdfRequest,
-    out_png: *OwnedBytes,
-    out_page: *EnrichmentRenderedPdfPage,
-    out_failure: *FailureIdentity,
-) callconv(.c) Status;
-
-pub extern fn antfly_enrichment_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;
-
 pub extern fn antfly_local_query_execute(
     request: *const LocalQueryRequest,
     out_response: *QueryOwnedResponse,
@@ -1921,3 +1880,20 @@ pub extern fn antfly_local_query_execute(
 ) callconv(.c) Status;
 
 pub extern fn antfly_local_query_buffer_destroy(buffer: *OwnedBytes) callconv(.c) void;
+
+pub const MergeArtifactsPageRequest = extern struct {
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    range_start: BorrowedBytes = .{},
+    range_end: BorrowedBytes = .{},
+    after_key: BorrowedBytes = .{},
+};
+pub extern fn antfly_storage_owner_merge_artifacts_page(
+    owner: ?*anyopaque,
+    request: *const MergeArtifactsPageRequest,
+    out_result: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Process-wide interactive admission state, owned by physical storage.
+/// kind: 0 = embedding, 1 = generation; delta: +1 begin, -1 end, 0 observe.
+pub extern fn antfly_storage_interactive_activity(kind: u32, delta: i32) callconv(.c) u32;

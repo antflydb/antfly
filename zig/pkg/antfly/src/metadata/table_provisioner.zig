@@ -32,7 +32,7 @@ const coverage_policy = @import("../api/coverage_policy.zig");
 const table_index_config = @import("../api/table_index_config.zig");
 const indexes_api = @import("../api/indexes.zig");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-const table_reads = @import("../api/table_reads.zig");
+const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -44,6 +44,8 @@ const restore_state_contract = @import("../storage/restore_state_contract.zig");
 pub const ProvisionSummary = @import("provision_contract.zig").ProvisionSummary;
 
 pub const ReconcileReplicaRootOptions = struct {
+    drain_resolver_backfill: bool = true,
+    io: std.Io = std.Options.debug_io,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
@@ -154,6 +156,7 @@ pub fn provisioningFingerprint(
         hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
+        if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));
         hashBytes(&hasher, table.schema_json);
         hashBytes(&hasher, table.read_schema_json);
         hashBytes(&hasher, table.indexes_json);
@@ -199,34 +202,35 @@ pub fn reconcileReplicaRootWithOptions(
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var io_impl: ?std.Io.Threaded = null;
-        defer if (io_impl) |*owned| owned.deinit();
         const io = if (options.backend_runtime) |runtime|
             runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
-        else blk: {
-            io_impl = std.Io.Threaded.init(alloc, .{});
-            break :blk io_impl.?.io();
-        };
+        else
+            options.io;
         try fs_paths.createDirPathPortable(io, path);
+        var restore_open_options = options.restore_open_options;
+        if (restore_open_options.filesystem_io == null) restore_open_options.filesystem_io = io;
         try applyRestoreIntentIfNeededWithRuntime(
             alloc,
             path,
             group_id,
             table,
             range,
-            options.restore_open_options,
+            restore_open_options,
             options.backend_runtime,
         );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
         defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
         var open_options = provisioningDbOpenOptions();
+        open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
         open_options.schema_before_index_load = runtime_schema;
+        open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
         const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .drain_resolver_backfill = options.drain_resolver_backfill,
             .embedding_options = options.embedding_options,
             .source_table = table.name,
             .destination_authorizer = options.destination_authorizer,
@@ -339,9 +343,8 @@ pub fn reconcileDbIndexTargetWithOptions(
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
-    if (index_name.len == 0 or
-        std.mem.eql(u8, index_name, "resolvers") or
-        std.mem.eql(u8, index_name, "enrichments")) return error.InvalidTableIndexMetadata;
+    if (index_name.len == 0 or indexes_api.isReservedIndexMetadataEntry(index_name))
+        return error.InvalidTableIndexMetadata;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -1048,12 +1051,6 @@ pub fn applyRestoreIntentIfNeededWithRuntime(
     });
 }
 
-fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
-}
-
 fn resolveRestoreIntent(
     range: table_manager.RangeRecord,
     table: table_manager.TableRecord,
@@ -1130,8 +1127,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
         // by the index reconciler.
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
@@ -1220,7 +1216,7 @@ fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
         }
         return false;
     }
-    if (std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments")) return false;
+    if (indexes_api.isReservedIndexMetadataEntry(name)) return false;
     return object.contains(name);
 }
 
@@ -1523,7 +1519,11 @@ pub fn ensureResolversWithOptions(
     }
     for (existing) |cfg| {
         if (desiredResolverContains(desired.items, cfg.name)) continue;
-        if (try db.removeResolver(cfg.name)) summary.removed += 1;
+        const removed = if (options.drain_backfill)
+            try db.removeResolver(cfg.name)
+        else
+            try db.removeResolverWithoutDrain(cfg.name);
+        if (removed) summary.removed += 1;
     }
     return summary;
 }
@@ -2074,11 +2074,20 @@ test "target index reconciliation retires orphaned inline enrichments after dele
 }
 
 test "table provisioner durably enqueues existing corpus full text backfill" {
-    const path = "/tmp/antfly-metadata-table-provisioner-full-text-backfill";
+    try testProvisionedFullTextBackfill(false);
+}
+
+test "table provisioner full text backfill resumes after durable activation deferral" {
+    try testProvisionedFullTextBackfill(true);
+}
+
+fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backfill", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     var db = try db_mod.DB.open(std.testing.allocator, path, .{
         .start_index_workers = false,
@@ -2116,16 +2125,95 @@ test "table provisioner durably enqueues existing corpus full text backfill" {
     try std.testing.expectEqual(@as(usize, 1), repeated_state.entries.items.len);
     try std.testing.expectEqual(repair_id, repeated_state.entries.items[0].intent.repair_id);
 
+    const Deferral = struct {
+        fired: bool = false,
+
+        fn afterSnapshot(_: *anyopaque, _: *db_mod.DB, _: []const u8, _: u64) !void {}
+
+        fn afterPhase(ptr: *anyopaque, _: *db_mod.DB, _: u128, phase: @import("../storage/db/derived/index_repair_state.zig").Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (phase == .activating and !self.fired) {
+                self.fired = true;
+                // The production activation deadline returns this same error.
+                // Inject it once without depending on machine speed or sleeps.
+                return error.ShadowIndexCatchUpIncomplete;
+            }
+        }
+    };
+    var deferral = Deferral{};
+    if (inject_activation_deferral) db.shadow_index_repair_hook = .{
+        .ptr = &deferral,
+        .after_snapshot_build = Deferral.afterSnapshot,
+        .after_phase_persisted = Deferral.afterPhase,
+    };
+    defer db.shadow_index_repair_hook = null;
+
+    // This is a functional durability test, not the production 250 ms reader
+    // pause SLA. Match the storage repair tests' activation headroom, but still
+    // honor any persisted retry instead of spending a fixed number of spins.
+    const platform = @import("antfly_platform");
+    const deadline_ns = platform.time.monotonicNs() + 90 * std.time.ns_per_s;
     var repaired = false;
-    for (0..16) |_| {
-        const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+    var observed_retry = false;
+    defer if (!repaired) {
+        var state = db.loadIndexRepairState(std.testing.allocator) catch null;
+        if (state) |*snapshot| {
+            defer snapshot.deinit(std.testing.allocator);
+            for (snapshot.entries.items) |entry| {
+                if (entry.intent.repair_id != repair_id) continue;
+                std.debug.print("backfill repair did not complete: phase={s} source_replay={s} attempts={d} next_retry_at_ms={d} last_error={?s}\n", .{
+                    @tagName(entry.intent.phase),  @tagName(entry.intent.source_replay_state), entry.intent.attempt_count,
+                    entry.intent.next_retry_at_ms, entry.intent.last_error,
+                });
+            }
+        }
+    };
+    while (platform.time.monotonicNs() < deadline_ns) {
+        const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{
+            .max_activation_pause_ms = 5_000,
+        });
         if (step.repaired) {
             repaired = true;
             break;
         }
         try std.testing.expect(!step.terminal);
+        const now_ms = platform.clock.Clock.real().nowRealtimeMs();
+        const retry_delay_ms = step.next_retry_at_ms -| now_ms;
+        if (retry_delay_ms != 0) {
+            observed_retry = true;
+            var pending_state = try db.loadIndexRepairState(std.testing.allocator);
+            defer pending_state.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), pending_state.entries.items.len);
+            const pending = pending_state.entries.items[0];
+            try std.testing.expectEqual(repair_id, pending.intent.repair_id);
+            try std.testing.expectEqual(step.next_retry_at_ms, pending.intent.next_retry_at_ms);
+            // A retry must retain the admitted generation and its checkpoint.
+            if (deferral.fired) {
+                try std.testing.expect(pending.intent.candidate_relative_path != null);
+                try std.testing.expect(pending.intent.last_error != null);
+                try std.testing.expectEqualStrings("repair_attempt_incomplete", pending.intent.last_error.?);
+                // Advancing before the retry time must neither attempt work
+                // nor lose the persisted retry schedule.
+                const early = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+                try std.testing.expect(early.deferred);
+                try std.testing.expect(!early.attempted);
+                try std.testing.expectEqual(step.next_retry_at_ms, early.next_retry_at_ms);
+            }
+        }
+        // Recheck realtime periodically because the durable retry timestamp is
+        // realtime, while the test's overall bound must remain monotonic.
+        while (true) {
+            const remaining_ms = (deadline_ns -| platform.time.monotonicNs()) / std.time.ns_per_ms;
+            if (remaining_ms == 0) break;
+            const retry_ms = step.next_retry_at_ms -| platform.clock.Clock.real().nowRealtimeMs();
+            const wait_ms = @min(remaining_ms, if (retry_ms != 0) @min(retry_ms, 1_000) else @as(u64, 10));
+            try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(@intCast(wait_ms)), .awake);
+            if (platform.clock.Clock.real().nowRealtimeMs() >= step.next_retry_at_ms) break;
+        }
     }
     try std.testing.expect(repaired);
+    try std.testing.expectEqual(inject_activation_deferral, deferral.fired);
+    if (inject_activation_deferral) try std.testing.expect(observed_retry);
     try std.testing.expect(!try db.hasPendingIndexRepairIntents(std.testing.allocator));
 
     const complete = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
@@ -3246,7 +3334,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     );
@@ -3312,7 +3400,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         fake_catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var lookup = (try read_source.source().lookup(std.testing.allocator, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(std.testing.allocator);
@@ -3440,7 +3528,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         .{
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         },
     ));
@@ -3628,6 +3716,12 @@ test "table provisioner reconcile does not replay pending derived batches" {
     defer reopened.close();
     const applied = try reopened.core.loadAppliedSequence(std.testing.allocator, "embed_idx");
     try std.testing.expect(applied > 0);
+    const dense = reopened.core.index_manager.denseIndex("embed_idx") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(?u64, applied),
+        dense.index.experimentalPostingDurableAppliedSequence(),
+    );
 }
 
 test "table provisioner reports local schema progress once all local shards have the target full-text index" {

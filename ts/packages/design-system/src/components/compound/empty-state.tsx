@@ -46,7 +46,13 @@ type AntyEmptyStateProps = Omit<EmptyStateProps, "icon">;
  * float), a quiet pixel brand moment. Eyes use the `original` style so the
  * vector↔pixel cross-fade matches the logo texture.
  */
-export function AntyEmptyState({ title, description, action, className, ...props }: AntyEmptyStateProps) {
+export function AntyEmptyState({
+  title,
+  description,
+  action,
+  className,
+  ...props
+}: AntyEmptyStateProps) {
   return (
     <EmptyState
       icon={

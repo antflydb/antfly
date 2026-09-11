@@ -18,6 +18,7 @@ pub const Import = enum {
     antfly_image,
     antfly_platform,
     build_options,
+    build_info,
     jinja,
     ml,
     onnx_graph,
@@ -41,17 +42,28 @@ pub const NativeLink = enum {
 
 pub const Context = struct {
     b: *std.Build,
+    root: ?std.Build.LazyPath = null,
+    args: ?[]const []const u8 = null,
+    publish_targets: bool = true,
+    // CPU finetune roots measured under 3 GiB. Accelerator configurations keep
+    // the previous conservative aggregate allowance until measured separately.
+    test_compile_max_rss: usize = 7 * 1024 * 1024 * 1024,
+
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_info_mod: *std.Build.Module,
+    build_info_object: *std.Build.Step.Compile,
+    identities: @import("../jit_identity.zig").Modules,
     build_options_mod: *std.Build.Module,
     jinja_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
+    onnx: @import("../runtime.zig").OnnxModules,
     inference_internal_mod: *std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    pjrt_mod: ?*std.Build.Module,
+    qualification_pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
     antfly_platform_mod: *std.Build.Module,
@@ -59,31 +71,36 @@ pub const Context = struct {
     blas_root: ?[]const u8,
     enable_metal: bool,
 
+    pub fn path(ctx: Context, sub_path: []const u8) std.Build.LazyPath {
+        return (ctx.root orelse ctx.b.path(".")).path(ctx.b, sub_path);
+    }
+
     pub fn moduleFor(ctx: Context, import: Import) *std.Build.Module {
         return switch (import) {
             .antfly_image => ctx.antfly_image_mod,
             .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
+            .build_info => ctx.build_info_mod,
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
-            .onnx_graph => ctx.onnx_graph_mod,
-            .pjrt => ctx.pjrt_mod,
+            .onnx_graph => ctx.onnx.graph,
+            .pjrt => ctx.qualification_pjrt_mod,
             .protobuf => ctx.protobuf_mod,
             .termite_c_file => ctx.b.createModule(.{
-                .root_source_file = ctx.b.path("src/util/c_file.zig"),
+                .root_source_file = ctx.path("src/util/c_file.zig"),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             }),
             // These roots intentionally live directly under src/. Their
             // transitive imports need src as the Zig module boundary.
             .inference_finetune_data => ctx.b.createModule(.{
-                .root_source_file = ctx.b.path("src/finetune_data_root.zig"),
+                .root_source_file = ctx.path("src/finetune_data_root.zig"),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             }),
             .inference_finetune_tokenizer_batch => blk: {
                 const mod = ctx.b.createModule(.{
-                    .root_source_file = ctx.b.path("src/finetune_tokenizer_batch_root.zig"),
+                    .root_source_file = ctx.path("src/finetune_tokenizer_batch_root.zig"),
                     .target = ctx.target,
                     .optimize = ctx.optimize,
                 });
@@ -94,7 +111,7 @@ pub const Context = struct {
             .inference_hf_tokenizer => ctx.inference_hf_tokenizer_mod,
             .inference_internal => ctx.inference_internal_mod,
             .termite_io_compat => ctx.b.createModule(.{
-                .root_source_file = ctx.b.path("src/io/compat.zig"),
+                .root_source_file = ctx.path("src/io/compat.zig"),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             }),
@@ -109,8 +126,11 @@ pub const CommandSpec = struct {
     root_source_file: []const u8,
     description: []const u8,
     imports: []const Import = &.{},
+    assets: ?@import("assets.zig").Owner = null,
     native_link: NativeLink = .none,
     link_libc: bool = false,
+    /// This command writes a release version to its output or training manifest.
+    release_metadata: bool = false,
 };
 
 pub const TestSpec = struct {
@@ -122,31 +142,63 @@ pub const TestSpec = struct {
     filters: []const []const u8 = &.{},
 };
 
-pub fn addCommand(ctx: Context, spec: CommandSpec) void {
+pub const Command = struct {
+    executable: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+};
+
+/// Return the actual artifacts so entrypoints can compose compile checks from
+/// the same registry that publishes commands, without running model workloads.
+pub fn addCommands(ctx: Context, specs: []const CommandSpec) []const Command {
+    const commands = ctx.b.allocator.alloc(Command, specs.len) catch @panic("OOM");
+    for (specs, commands) |spec, *command| command.* = addCommand(ctx, spec);
+    return commands;
+}
+
+pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
     const b = ctx.b;
     const exe = b.addExecutable(.{
         .name = spec.name,
         .root_module = b.createModule(.{
-            .root_source_file = b.path(spec.root_source_file),
+            .root_source_file = ctx.path(spec.root_source_file),
             .target = ctx.target,
             .optimize = ctx.optimize,
         }),
     });
-    addImports(ctx, exe.root_module, spec.imports);
+    addImports(ctx, exe.root_module, spec.imports, ctx.pjrt_mod);
+    if (spec.assets) |owner| exe.root_module.addImport("inference_finetune_assets", @import("assets.zig").create(.{
+        .b = b,
+        .root = ctx.root orelse b.path("."),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .owner = owner,
+        .onnx_data = ctx.onnx.data,
+        .jinja = ctx.jinja_mod,
+        .platform = ctx.antfly_platform_mod,
+    }));
     configureNative(ctx, exe, spec.native_link, spec.imports);
+    if (spec.release_metadata) {
+        exe.root_module.addImport("build_info", ctx.build_info_mod);
+        exe.root_module.addObject(ctx.build_info_object);
+    }
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
-    const step = b.step(spec.name, spec.description);
-    step.dependOn(&run.step);
+    run.setCwd(ctx.root orelse b.path("."));
+    if (ctx.args orelse b.args) |args| run.addArgs(args);
+    if (ctx.publish_targets) {
+        const step = b.step(spec.name, spec.description);
+        step.dependOn(&run.step);
+    }
+    return .{ .executable = exe, .run = run };
 }
 
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
     const b = ctx.b;
     const test_exe = b.addTest(.{
+        .max_rss = ctx.test_compile_max_rss,
         .root_module = b.createModule(.{
-            .root_source_file = b.path(spec.root_source_file),
+            .root_source_file = ctx.path(spec.root_source_file),
             .target = ctx.target,
             .optimize = ctx.optimize,
         }),
@@ -156,24 +208,28 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
         // intentionally validated with the inference runner's explicit
         // per-test std.Io/allocator lifecycle instead.
         .test_runner = .{
-            .path = b.path("src/test_runner_filter.zig"),
+            .path = ctx.path("src/test_runner_filter.zig"),
             .mode = .simple,
         },
     });
-    addImports(ctx, test_exe.root_module, spec.imports);
+    addImports(ctx, test_exe.root_module, spec.imports, ctx.qualification_pjrt_mod);
     if (!containsImport(spec.imports, .antfly_platform))
         test_exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     configureNative(ctx, test_exe, spec.native_link, spec.imports);
 
     const run = b.addRunArtifact(test_exe);
+    run.setCwd(ctx.root orelse b.path("."));
+    if (!ctx.publish_targets) return &run.step;
     const step = b.step(spec.step_name, spec.description);
     step.dependOn(&run.step);
     return step;
 }
 
-fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import) void {
+fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, pjrt: ?*std.Build.Module) void {
     for (imports) |import| {
-        module.addImport(@tagName(import), ctx.moduleFor(import));
+        const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
+        module.addImport(@tagName(import), dependency);
+        if (import == .onnx_graph) module.addImport("onnx_data", ctx.onnx.data);
     }
 }
 
@@ -183,6 +239,7 @@ fn configureNative(
     native_link: NativeLink,
     imports: []const Import,
 ) void {
+    if (native_link != .none) ctx.identities.addImports(artifact.root_module);
     // inference_internal already owns the Metal translation unit. Adding it to
     // the importing executable as well makes Zig pass the same object to the
     // linker twice. Keep frameworks on the final artifact, but compile the
@@ -241,7 +298,7 @@ fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     if (owns_metal_kernels) {
-        module.addCSourceFile(.{ .file = ctx.b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
+        module.addCSourceFile(.{ .file = ctx.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
     }
 }
 
@@ -254,4 +311,34 @@ fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
     module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });
     module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+}
+
+pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
+    const b = ctx.b;
+    return Context{
+        .root = ctx.path("."),
+        .args = ctx.args,
+        .b = b,
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .build_info_mod = ctx.graph.build_info_mod,
+        .build_info_object = ctx.graph.build_info_object,
+        .identities = ctx.graph.identities,
+        .build_options_mod = ctx.graph.build_options_mod,
+        .jinja_mod = ctx.graph.jinja_mod,
+        .ml_mod = ctx.graph.ml_mod,
+        .onnx = ctx.graph.onnx,
+        .inference_internal_mod = ctx.graph.inference_internal_mod,
+        .inference_tokenizer_mod = ctx.graph.inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,
+        .antfly_image_mod = ctx.graph.image_mod,
+        .pjrt_mod = ctx.graph.pjrt_mod,
+        .qualification_pjrt_mod = ctx.graph.qualification_pjrt_mod,
+        .protobuf_mod = ctx.graph.protobuf_mod,
+        .inference_linalg_mod = ctx.graph.inference_linalg_mod,
+        .antfly_platform_mod = ctx.graph.platform_mod,
+        .enable_system_blas = ctx.backend.enable_system_blas,
+        .blas_root = ctx.backend.blas_root,
+        .enable_metal = ctx.backend.enable_metal,
+    };
 }

@@ -370,6 +370,15 @@ pub const Status = enum(u32) {
     wrong_table = 412,
     wrong_timeline = 413,
     unsupported_transform_operation = 414,
+    restore_runtime_repair_incomplete = 415,
+    restore_dense_artifact_rebuild_incomplete = 416,
+    restore_dense_config_proof_incomplete = 417,
+    restore_dense_counter_proof_incomplete = 418,
+    restore_dense_index_proof_incomplete = 419,
+    restore_dense_coverage_proof_incomplete = 420,
+    restore_dense_checkpoint_incomplete = 421,
+    restore_index_availability_incomplete = 422,
+    invalid_pdf_decode_limits = 423,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

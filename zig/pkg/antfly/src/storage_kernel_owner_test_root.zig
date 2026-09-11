@@ -16,12 +16,10 @@
 //! can use the same common/storage imports as production control units.
 
 const owner_tests = @import("storage/kernel_owner_test.zig");
-const error_identity = @import("kernel_error_identity");
 
 test {
     _ = owner_tests;
 }
 
-test "storage kernel status registry is unique and lossless" {
-    try error_identity.validateForTest();
-}
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_common.zig");

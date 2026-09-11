@@ -65,6 +65,7 @@ pub const CudaTensor = struct {
     quant_type: ?gguf_tensor_types.TensorType = null,
     tc_quant: ?CudaTensorCoreQuantBuffer = null,
     owns_buffer: bool = true,
+    owns_tc_quant: bool = true,
     owns_bf16_mirror: bool = true,
     owns_training_upload_host: bool = true,
     owns_shape: bool = true,
@@ -158,7 +159,9 @@ const CudaA4bLoadSlot = struct {
 };
 
 const CudaA4bLoadPipelineState = struct {
-    mutex: std.atomic.Mutex = .unlocked,
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
     plan: *const CudaA4bSourceLoadPlan,
     tasks: []const CudaA4bLoadChunk,
     slots: []CudaA4bLoadSlot,
@@ -168,7 +171,7 @@ const CudaA4bLoadPipelineState = struct {
     worker_copy_ns: u64 = 0,
 
     fn lock(self: *CudaA4bLoadPipelineState) void {
-        platform.sync.lockYielding(&self.mutex);
+        self.mutex.lockUncancelable(self.io);
     }
 
     const Observation = struct {
@@ -183,7 +186,7 @@ const CudaA4bLoadPipelineState = struct {
     /// from declaring an incomplete pipeline while completed work is waiting.
     fn observe(self: *CudaA4bLoadPipelineState) Observation {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.mutex.unlock(self.io);
         var result = Observation{ .workers_done = self.workers_done };
         for (self.slots, 0..) |slot, index| {
             switch (slot.state) {
@@ -200,12 +203,42 @@ const CudaA4bLoadPipelineState = struct {
         return result;
     }
 
+    fn waitForProgress(self: *CudaA4bLoadPipelineState, worker_count: usize) void {
+        self.lock();
+        defer self.mutex.unlock(self.io);
+        while (!self.stop and self.workers_done != worker_count) {
+            for (self.slots) |slot| {
+                if (slot.state == .ready or slot.state == .in_flight) return;
+            }
+            self.changed.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    fn startWorkers(self: *CudaA4bLoadPipelineState, futures: []std.Io.Future(void)) !void {
+        var started: usize = 0;
+        errdefer self.stopWorkers(futures[0..started]);
+        for (futures) |*future| {
+            future.* = self.io.concurrent(workerMain, .{self}) catch
+                return error.A4bCudaLoadWorkersUnavailable;
+            started += 1;
+        }
+    }
+
+    fn stopWorkers(self: *CudaA4bLoadPipelineState, futures: []std.Io.Future(void)) void {
+        self.lock();
+        self.stop = true;
+        self.changed.broadcast(self.io);
+        self.mutex.unlock(self.io);
+        for (futures) |*future| future.await(self.io);
+    }
+
     fn workerMain(self: *CudaA4bLoadPipelineState) void {
         while (true) {
             self.lock();
             if (self.stop or self.next_task >= self.tasks.len) {
                 self.workers_done += 1;
-                self.mutex.unlock();
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
                 return;
             }
             var slot_index: ?usize = null;
@@ -216,8 +249,8 @@ const CudaA4bLoadPipelineState = struct {
                 }
             }
             if (slot_index == null) {
-                self.mutex.unlock();
-                std.Thread.yield() catch std.atomic.spinLoopHint();
+                self.changed.waitUncancelable(self.io, &self.mutex);
+                self.mutex.unlock(self.io);
                 continue;
             }
             const task_index = self.next_task;
@@ -225,7 +258,7 @@ const CudaA4bLoadPipelineState = struct {
             const slot = &self.slots[slot_index.?];
             slot.state = .filling;
             slot.task_index = task_index;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
 
             const started_ns = platform.time.monotonicNs();
             const task = self.tasks[task_index];
@@ -240,12 +273,14 @@ const CudaA4bLoadPipelineState = struct {
             if (self.stop) {
                 slot.state = .empty;
                 self.workers_done += 1;
-                self.mutex.unlock();
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
                 return;
             }
             self.worker_copy_ns +|= elapsed_ns;
             slot.state = .ready;
-            self.mutex.unlock();
+            self.changed.broadcast(self.io);
+            self.mutex.unlock(self.io);
         }
     }
 };
@@ -398,6 +433,8 @@ pub const CapabilityProfile = enum {
     gliner2_training,
     florence2,
     gemma4,
+    qwen3_embedding,
+    qwen3_vl_generation,
 };
 
 pub const KernelJitRouteScope = kernels_mod.JitRouteScope;
@@ -410,7 +447,20 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .gliner2, .gliner2_training => .gliner2,
         .florence2 => .florence2,
         .gemma4 => .gemma4,
+        .qwen3_embedding => .qwen3_embedding,
+        .qwen3_vl_generation => .qwen3_vl_generation,
     };
+}
+
+fn qwen3VlAutomaticPrefillForProfile(profile: ?CapabilityProfile) bool {
+    return profile != null and profile.? == .qwen3_vl_generation;
+}
+
+test "Qwen3-VL automatic prefill is model scoped" {
+    try std.testing.expect(qwen3VlAutomaticPrefillForProfile(.qwen3_vl_generation));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.gemma4));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(.qwen3_embedding));
+    try std.testing.expect(!qwen3VlAutomaticPrefillForProfile(null));
 }
 
 fn kernelJitRouteCount(routes: kernels_mod.JitProductionRoutes) usize {
@@ -1216,7 +1266,10 @@ pub const RuntimeStats = struct {
     launch_norm_rms_bare: usize = 0,
     launch_norm_head_rope: usize = 0,
     launch_rope: usize = 0,
+    launch_qwen3vl_mrope: usize = 0,
+    launch_qwen3vl_vision_rope: usize = 0,
     launch_attention: usize = 0,
+    launch_qwen3vl_vision_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
     launch_attention_gqa_decode_generated: usize = 0,
     launch_attention_gqa_decode_splitk_online_sm89: usize = 0,
@@ -2216,7 +2269,7 @@ pub const CudaCompute = struct {
         }
         var ctx = try context_mod.CudaContext.initDefault();
         errdefer ctx.deinit();
-        const kernels = if (profile) |value|
+        var kernels = if (profile) |value|
             kernels_mod.KernelModule.loadWithKernelJitForScopeAndLoadContext(
                 &ctx,
                 allocator,
@@ -2235,6 +2288,7 @@ pub const CudaCompute = struct {
                 jit_config,
                 load_context,
             );
+        kernels.qwen3vl_automatic_prefill = qwen3VlAutomaticPrefillForProfile(profile);
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -2464,6 +2518,8 @@ pub const CudaCompute = struct {
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
+            .qwen3_embedding => self.kernels.hasQwen3EmbeddingPrimitives(),
+            .qwen3_vl_generation => self.kernels.hasQwen3VlGenerationPrimitives(),
         };
     }
 
@@ -2957,25 +3013,23 @@ pub const CudaCompute = struct {
             if (source.mmap_offset != null) c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
         }
 
+        // Staging producers depend on the upload consumer. Reserve their
+        // capacity independently of request work and retain it through drain.
+        var worker_io = std.Io.Threaded.init(self.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(worker_count),
+        });
+        defer worker_io.deinit();
         var state = CudaA4bLoadPipelineState{
+            .io = worker_io.io(),
             .plan = plan,
             .tasks = chunks.items,
             .slots = slots,
         };
-        const threads = try self.allocator.alloc(std.Thread, worker_count);
-        defer self.allocator.free(threads);
-        var spawned: usize = 0;
-        defer {
-            state.lock();
-            state.stop = true;
-            state.mutex.unlock();
-            for (threads[0..spawned]) |thread| thread.join();
-        }
-        for (threads) |*thread| {
-            thread.* = std.Thread.spawn(.{}, CudaA4bLoadPipelineState.workerMain, .{&state}) catch
-                return error.A4bCudaLoadWorkersUnavailable;
-            spawned += 1;
-        }
+        const futures = try self.allocator.alloc(std.Io.Future(void), worker_count);
+        defer self.allocator.free(futures);
+        try state.startWorkers(futures);
+        defer state.stopWorkers(futures);
 
         const transfer_started_ns = platform.time.monotonicNs();
         var completed: usize = 0;
@@ -3007,14 +3061,15 @@ pub const CudaCompute = struct {
                 try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
                 state.lock();
                 slot.state = .empty;
-                state.mutex.unlock();
+                state.changed.broadcast(state.io);
+                state.mutex.unlock(state.io);
                 completed += 1;
                 continue;
             }
 
             if (observation.workers_done == worker_count)
                 return error.A4bCudaIncompleteLoadPipeline;
-            std.Thread.yield() catch std.atomic.spinLoopHint();
+            state.waitForProgress(worker_count);
         }
         try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
         self.stats.a4b_load_host_stage_ns +|= state.worker_copy_ns;
@@ -3239,7 +3294,7 @@ pub const CudaCompute = struct {
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
-            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, storage.raw_bytes);
+            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var bf16_mirror = buffer_mod.DeviceBuffer{};
             errdefer bf16_mirror.free(&self.ctx);
@@ -3318,6 +3373,7 @@ pub const CudaCompute = struct {
         self: *CudaCompute,
         tensor_type: gguf_tensor_types.TensorType,
         shape: []const i64,
+        raw_device: buffer_mod.DeviceBuffer,
         raw_bytes: []const u8,
     ) !?CudaTensorCoreQuantBuffer {
         if (!cudaTensorCoreQuantRequested()) return null;
@@ -3336,6 +3392,46 @@ pub const CudaCompute = struct {
             if (!isQ4_0TcHmmaShape(in_dim, out_dim)) return null;
         } else if (!isTensorCoreQuantLinearShape(in_dim, out_dim)) {
             return null;
+        }
+
+        // Q8_0's tensor-core representation has the same byte count as GGUF,
+        // but separates each block's two-byte scale from its 32 quant bytes.
+        // Repacking on CUDA avoids the block-at-a-time host copy and duplicate
+        // H2D upload that otherwise dominate lazy Qwen3-VL projector setup.
+        // Keep the host implementation as a compatibility fallback for older
+        // artifact bundles that do not contain the optional repack symbol.
+        if (known == .Q8_0 and cudaDeviceQ8TensorCorePackEnabled()) device_pack: {
+            const row_blocks = in_dim / Q8_0_VALUES_PER_BLOCK;
+            const block_count = try checkedMul(out_dim, row_blocks);
+            const packed_bytes = try checkedMul(block_count, Q8_0_BLOCK_BYTES);
+            if (raw_bytes.len != packed_bytes) return error.InvalidShape;
+            var device = try allocDeviceBuffer(self, packed_bytes);
+            errdefer device.free(&self.ctx);
+            self.kernels.launchPackQ8_0TensorCore(&self.ctx, device, raw_device, block_count) catch |err| switch (err) {
+                error.CudaKernelUnavailable => {
+                    device.free(&self.ctx);
+                    break :device_pack;
+                },
+                else => return err,
+            };
+            self.dispatch_stats.note(
+                self.allocator,
+                .tc_pack,
+                .q8_0,
+                .tc_pack,
+                .none,
+                .none,
+                0,
+                in_dim,
+                out_dim,
+                packed_bytes,
+            );
+            return .{
+                .buffer = device,
+                .layout = .q8_0_hmma,
+                .row_blocks = row_blocks,
+                .bytes = packed_bytes,
+            };
         }
 
         const packed_quant = switch (known) {
@@ -4505,6 +4601,10 @@ fn cudaQ8TiledKernelsEnabled() bool {
     return !platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q8_TILED");
 }
 
+fn cudaDeviceQ8TensorCorePackEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DEVICE_Q8_TC_PACK", true);
+}
+
 fn cudaQ4FusionKernelsEnabled() bool {
     if (platform.env.getenvBool("ANTFLY_CUDA_DISABLE_Q4_FUSIONS")) return false;
     return platform.env.getenvBool("ANTFLY_CUDA_ENABLE_Q4_FUSIONS");
@@ -4823,10 +4923,12 @@ fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
-    if (cuda_tensor.tc_quant) |*tc_quant| {
-        var packed_buffer = tc_quant.buffer;
-        releaseDeviceBuffer(self, &packed_buffer);
-        cuda_tensor.tc_quant = null;
+    if (cuda_tensor.owns_tc_quant) {
+        if (cuda_tensor.tc_quant) |*tc_quant| {
+            var packed_buffer = tc_quant.buffer;
+            releaseDeviceBuffer(self, &packed_buffer);
+            cuda_tensor.tc_quant = null;
+        }
     }
     if (cuda_tensor.owns_bf16_mirror) releaseDeviceBuffer(self, &cuda_tensor.bf16_mirror);
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
@@ -4835,12 +4937,14 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
 }
 
 fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
-    if (cuda_tensor.tc_quant) |*tc_quant| {
-        if (tc_quant.buffer.ptr != 0) {
-            self.stats.device_free_calls += 1;
-            tc_quant.buffer.free(&self.ctx);
+    if (cuda_tensor.owns_tc_quant) {
+        if (cuda_tensor.tc_quant) |*tc_quant| {
+            if (tc_quant.buffer.ptr != 0) {
+                self.stats.device_free_calls += 1;
+                tc_quant.buffer.free(&self.ctx);
+            }
+            cuda_tensor.tc_quant = null;
         }
-        cuda_tensor.tc_quant = null;
     }
     if (cuda_tensor.owns_bf16_mirror and cuda_tensor.bf16_mirror.ptr != 0) {
         self.stats.device_free_calls += 1;
@@ -8221,7 +8325,7 @@ fn installCudaLazyHostPrefetch(self: *CudaCompute, store: *native_compute_mod.We
     store.prefetch_initialized = true;
     var lazy_it = store.lazy_weights.iterator();
     while (lazy_it.next()) |entry| {
-        entry.value_ptr.guard = store.prefetch.mutexPtr();
+        entry.value_ptr.guard = store.prefetch.lockHandle();
     }
     if (store.lazy_weights.count() > 0 and !disableCudaLazyHostPrefetchWorker()) {
         try native_compute_mod.startPrefetchWorker(store);
@@ -8506,6 +8610,7 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
 fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     var borrowed = tensor.*;
     borrowed.owns_buffer = false;
+    borrowed.owns_tc_quant = false;
     borrowed.owns_bf16_mirror = false;
     borrowed.owns_training_upload_host = false;
     borrowed.owns_shape = false;
@@ -8760,6 +8865,56 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         error.MissingWeight => error.WeightNotFound,
         else => err,
     };
+}
+
+fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight = tensorFromCt(try getWeight(ctx, name));
+    const handle = try self.allocator.create(CudaTensor);
+    errdefer self.allocator.destroy(handle);
+    handle.* = borrowedSlotTensor(weight);
+    // The resident/streaming store owns device storage. The graph owns only
+    // this handle and its shape, never the store's tensor metadata.
+    handle.shape = try self.allocator.dupe(i64, weight.shape);
+    handle.owns_shape = true;
+    handle.owned_by_tensor = true;
+    return @ptrCast(handle);
+}
+
+fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
+    // No driver is needed: acquired handles may free their metadata, but must
+    // never attempt to free the resident model's device allocations.
+    var self: CudaCompute = undefined;
+    self.allocator = allocator;
+    self.a4b_runtime = null;
+    self.resident_weights = .empty;
+    defer self.resident_weights.deinit(allocator);
+    self.lazy_device_epochs = .empty;
+    var shape = [_]i64{ 2, 2 };
+    try self.resident_weights.put(allocator, "weight", .{
+        .buffer = .{ .ptr = 0x1234, .len = 16 },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 4,
+        .owned_by_tensor = false,
+    });
+    const borrowed = try getWeight(&self, "weight");
+    const first = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, first);
+    const second = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, second);
+    try std.testing.expect(first != second and first != borrowed and second != borrowed);
+    const handle = tensorFromCt(second);
+    try std.testing.expect(!handle.owns_buffer and !handle.owns_tc_quant and !handle.owns_bf16_mirror and !handle.owns_training_upload_host);
+    try std.testing.expect(handle.owns_shape and handle.owned_by_tensor);
+    try std.testing.expect(handle.shape.ptr != shape[0..].ptr);
+    try std.testing.expectEqualSlices(i64, &shape, handle.shape);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1234), handle.buffer.ptr);
+}
+
+test "CUDA acquired weight handles have independent metadata and borrowed storage" {
+    try testAcquiredWeightHandle(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
 }
 
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
@@ -11884,6 +12039,18 @@ fn ensureF32F16Bf16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16) return error.UnsupportedTensorType;
 }
 
+test "CUDA biased dense linear dtype gate accepts resident BF16 weights" {
+    var shape = [_]i64{ 3072, 1024 };
+    const weight = CudaTensor{
+        .buffer = .{},
+        .dtype = .bf16,
+        .shape = &shape,
+        .elem_count = 3072 * 1024,
+    };
+    try ensureF32F16Bf16OrQuantized(&weight);
+    try std.testing.expect(isBf16Weight(&weight));
+}
+
 fn ensureF32F16OrQuantized(tensor: *const CudaTensor) !void {
     if (tensor.quant_type != null) return;
     if (tensor.dtype != .f32 and tensor.dtype != .f16) return error.UnsupportedTensorType;
@@ -12853,7 +13020,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     const weight_tensor = tensorFromCt(weight);
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
-    try ensureF32F16OrQuantized(weight_tensor);
+    try ensureF32F16Bf16OrQuantized(weight_tensor);
     try ensureF32(bias_tensor);
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) {
@@ -12889,6 +13056,14 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         const result_tensor = tensorFromCt(result);
         try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        return result;
+    }
+    if (isBf16Weight(weight_tensor)) {
+        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
+        errdefer freeTensor(ctx, result);
+        const result_tensor = tensorFromCt(result);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
         return result;
     }
 
@@ -17640,6 +17815,53 @@ fn sdpaFull(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, ba
     return try sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, attn_bias_ct, batch, seq_len, num_heads, head_dim);
 }
 
+fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.stats.launch_qwen3vl_vision_attention += 1;
+    if (!platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_QWEN3VL_VISION_ATTENTION_TC_BF16", true)) {
+        return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    const q_tensor = tensorFromCt(q_ct);
+    const k_tensor = tensorFromCt(k_ct);
+    const v_tensor = tensorFromCt(v_ct);
+    try ensureF32(q_tensor);
+    try ensureF32(k_tensor);
+    try ensureF32(v_tensor);
+    const hidden = try checkedMul(num_heads, head_dim);
+    const count = try checkedMul(try checkedMul(batch, seq_len), hidden);
+    try ensureCount(q_tensor, count);
+    try ensureCount(k_tensor, count);
+    try ensureCount(v_tensor, count);
+
+    const shape = try dupeShape(self.allocator, q_tensor.shape);
+    var shape_owned = true;
+    errdefer if (shape_owned) self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
+    var device_owned = true;
+    errdefer if (device_owned) device.free(&self.ctx);
+    const launched = try self.kernels.launchQwen3VlVisionAttentionTcBf16M32N16(
+        &self.ctx,
+        device,
+        q_tensor.buffer,
+        k_tensor.buffer,
+        v_tensor.buffer,
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+    );
+    if (!launched) {
+        device_owned = false;
+        shape_owned = false;
+        device.free(&self.ctx);
+        self.allocator.free(shape);
+        return sdpaLaunch(ctx, q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim);
+    }
+    self.stats.launch_attention += 1;
+    return createTensor(self, device, shape, count);
+}
+
 fn causalSelfAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const q_tensor = tensorFromCt(q_ct);
@@ -19646,6 +19868,96 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn mrope(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    positions: []const u32,
+    sections: [3]u32,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (token_count == 0 or head_dim == 0 or head_dim % 2 != 0 or theta <= 0) return error.InvalidShape;
+    if (positions.len != try checkedMul(3, token_count)) return error.InvalidShape;
+    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
+    const rotary_pairs = head_dim / 2;
+    if (@as(usize, sections[0]) + @as(usize, sections[1]) + @as(usize, sections[2]) != rotary_pairs) return error.InvalidShape;
+    const total_chunks = input_tensor.elem_count / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidShape;
+    const chunks_per_token = total_chunks / token_count;
+    if (chunks_per_token == 0) return error.InvalidShape;
+
+    const positions_device = try uploadTempU32(self, positions);
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
+    defer if (rope_profile_scope) |*scope| scope.end();
+    try self.kernels.launchQwen3VlMropeF32(
+        &self.ctx,
+        device,
+        input_tensor.buffer,
+        positions_device,
+        total_chunks,
+        token_count,
+        chunks_per_token,
+        head_dim,
+        theta,
+        freq_scale,
+        sections,
+    );
+    self.stats.launch_rope += 1;
+    self.stats.launch_qwen3vl_mrope += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn visionRope(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    positions: []const u32,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    try ensureF32(input_tensor);
+    if (token_count == 0 or head_dim == 0 or head_dim % 4 != 0 or theta <= 0) return error.InvalidShape;
+    if (positions.len != try checkedMul(2, token_count)) return error.InvalidShape;
+    if (input_tensor.elem_count % head_dim != 0) return error.InvalidShape;
+    const total_chunks = input_tensor.elem_count / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidShape;
+    const heads_per_token = total_chunks / token_count;
+    if (heads_per_token == 0) return error.InvalidShape;
+
+    const positions_device = try uploadTempU32(self, positions);
+    const shape = try dupeShape(self.allocator, input_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    var rope_profile_scope = beginPrefillProfile(self, .rope, token_count);
+    defer if (rope_profile_scope) |*scope| scope.end();
+    try self.kernels.launchQwen3VlVisionRopeF32(
+        &self.ctx,
+        device,
+        input_tensor.buffer,
+        positions_device,
+        total_chunks,
+        token_count,
+        heads_per_token,
+        head_dim,
+        theta,
+    );
+    self.stats.launch_rope += 1;
+    self.stats.launch_qwen3vl_vision_rope += 1;
+    return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
 fn rmsNormHeadsRope(ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (cudaDisableHeadNormRopeFusion()) {
@@ -19732,8 +20044,10 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     defer self.allocator.free(query_lengths_u32);
     const position_offsets_u32 = try usizeSliceToU32(self.allocator, position_offsets);
     defer self.allocator.free(position_offsets_u32);
-    const query_lengths_device = try uploadTempU32(self, query_lengths_u32);
-    const position_offsets_device = try uploadTempU32(self, position_offsets_u32);
+    // Both arrays remain live for the same launch. Two uploadTempU32 calls
+    // would alias temp_ids_masks and the second upload would overwrite the
+    // query lengths, collapsing every rotary position to zero.
+    const params_device = try uploadTempU32Pair(self, query_lengths_u32, position_offsets_u32);
 
     const shape = try dupeShape(self.allocator, input_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -19741,7 +20055,7 @@ fn ropePerItem(ctx: *anyopaque, input: CT, batch: usize, max_seq_len: usize, hea
     errdefer device.free(&self.ctx);
     var rope_profile_scope = beginPrefillProfile(self, .rope, row_count);
     defer if (rope_profile_scope) |*scope| scope.end();
-    self.kernels.launchRopePerItemF32(&self.ctx, device, input_tensor.buffer, query_lengths_device, position_offsets_device, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, consecutive_pairs) catch |err| {
+    self.kernels.launchRopePerItemF32(&self.ctx, device, input_tensor.buffer, params_device.first, params_device.second, batch, max_seq_len, num_heads, head_dim, rope_dim, theta, freq_scale, consecutive_pairs) catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return ropePerItemHostFallback(self, input_tensor, batch, max_seq_len, head_dim, rope_dim, theta, freq_scale, query_lengths, position_offsets, consecutive_pairs);
         }
@@ -22212,6 +22526,7 @@ const vtable = ops.ComputeBackend.VTable{
     .convertDType = &convertDTypeOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
+    .acquireWeight = &acquireWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .debugProfileCheckpoint = &debugProfileCheckpoint,
@@ -22327,6 +22642,7 @@ const vtable = ops.ComputeBackend.VTable{
     .add = &add,
     .addBiasRowsConsume = &addBiasRowsConsume,
     .scaledDotProductAttention = &sdpa,
+    .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,
     .crossAttention = &crossAttention,
@@ -22342,6 +22658,8 @@ const vtable = ops.ComputeBackend.VTable{
     .conv1d = &conv1d,
     .conv2d = &conv2d,
     .rope = &rope,
+    .mrope = &mrope,
+    .visionRope = &visionRope,
     .ropeScaled = &ropeScaled,
     .ropePerItem = &ropePerItem,
     .runAttentionResidual = &runAttentionResidualOp,
@@ -22615,4 +22933,64 @@ test "cuda dense host prefetch queue removal clears pending item" {
     try std.testing.expect(!entry.pending);
     try std.testing.expectEqual(@as(usize, 0), compute.dense_host_prefetch.items.items.len);
     try std.testing.expect(!removeDenseHostPrefetchQueueItemLocked(&compute, &entry));
+}
+
+test "CUDA A4B pipeline notification observes ready slots and stop" {
+    const Waiter = struct {
+        fn run(state: *CudaA4bLoadPipelineState, entered: *std.Io.Event, done: *std.Io.Event) void {
+            entered.set(std.testing.io);
+            state.waitForProgress(1);
+            done.set(std.testing.io);
+        }
+    };
+    for ([_]bool{ false, true }) |stop| {
+        var slots = [_]CudaA4bLoadSlot{.{}};
+        var state = CudaA4bLoadPipelineState{ .plan = undefined, .tasks = &.{}, .slots = &slots };
+        var entered: std.Io.Event = .unset;
+        var done: std.Io.Event = .unset;
+        var future = try std.testing.io.concurrent(Waiter.run, .{ &state, &entered, &done });
+        defer {
+            state.lock();
+            state.stop = true;
+            state.changed.broadcast(state.io);
+            state.mutex.unlock(state.io);
+            future.await(std.testing.io);
+        }
+        entered.waitUncancelable(std.testing.io);
+        state.lock();
+        if (stop) state.stop = true else slots[0].state = .ready;
+        state.changed.broadcast(state.io);
+        state.mutex.unlock(state.io);
+        try done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        future.await(std.testing.io);
+    }
+}
+
+test "CUDA A4B pipeline rolls back partial worker startup and drains blocked producers" {
+    for (0..3) |capacity| {
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(capacity),
+        });
+        defer io_impl.deinit();
+        // A full slot parks producers before they can access source data or
+        // GPU buffers, exercising the real startup/stop path without a device.
+        var slots = [_]CudaA4bLoadSlot{.{ .state = .in_flight }};
+        const tasks = [_]CudaA4bLoadChunk{.{ .source_index = 0, .source_offset = 0, .len = 1 }};
+        var state = CudaA4bLoadPipelineState{
+            .io = io_impl.io(),
+            .plan = undefined,
+            .tasks = &tasks,
+            .slots = &slots,
+        };
+        var futures: [2]std.Io.Future(void) = undefined;
+        if (capacity < futures.len) {
+            try std.testing.expectError(error.A4bCudaLoadWorkersUnavailable, state.startWorkers(&futures));
+        } else {
+            try state.startWorkers(&futures);
+            state.stopWorkers(&futures);
+        }
+        try std.testing.expect(state.stop);
+        try std.testing.expectEqual(capacity, state.workers_done);
+    }
 }

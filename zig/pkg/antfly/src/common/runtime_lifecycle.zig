@@ -41,7 +41,9 @@ fn sleepWatchdog(ns: u64) void {
 /// Last-resort process termination is deliberately independent of every
 /// `std.Io` executor being drained. A stuck task can consume or deadlock those
 /// executors, so scheduling the deadline on one of them would make the
-/// deadline advisory precisely when it is needed.
+/// deadline advisory precisely when it is needed. This is the sole intentional
+/// application-owned `std.Thread.spawn` exception: the hard deadline must also
+/// survive faults in Io scheduling, waiting, or executor destruction itself.
 const ShutdownWatchdog = struct {
     const State = enum(u8) { idle, armed, disarmed, expired };
     const Expiration = struct {
@@ -167,14 +169,23 @@ pub const CancellationSource = struct {
 /// One absolute monotonic shutdown deadline shared across every drain phase.
 pub const ShutdownDeadline = struct {
     deadline_ns: u64,
+    io: ?std.Io = null,
 
     pub fn afterMilliseconds(timeout_ms: u64) ShutdownDeadline {
         const now: u64 = @intCast(@max(platform_time.monotonicNs(), 0));
         return .{ .deadline_ns = now +| timeout_ms *| std.time.ns_per_ms };
     }
 
+    pub fn afterMillisecondsWithIo(io: std.Io, timeout_ms: u64) ShutdownDeadline {
+        const now: u64 = @intCast(@max(std.Io.Timestamp.now(io, .awake).toNanoseconds(), 0));
+        return .{ .deadline_ns = now +| timeout_ms *| std.time.ns_per_ms, .io = io };
+    }
+
     pub fn remainingMilliseconds(self: ShutdownDeadline) u64 {
-        const now: u64 = @intCast(@max(platform_time.monotonicNs(), 0));
+        const now: u64 = if (self.io) |io|
+            @intCast(@max(std.Io.Timestamp.now(io, .awake).toNanoseconds(), 0))
+        else
+            @intCast(@max(platform_time.monotonicNs(), 0));
         const remaining_ns = self.deadline_ns -| now;
         if (remaining_ns == 0) return 0;
         return @max(@as(u64, 1), @divFloor(remaining_ns, std.time.ns_per_ms));
@@ -218,11 +229,16 @@ pub const RuntimeSupervisor = struct {
     failure_mutex: std.atomic.Mutex = .unlocked,
     first_failure: ?Failure = null,
     shutdown_timeout_ms: u64,
+    io: ?std.Io = null,
     shutdown_deadline: ?ShutdownDeadline = null,
     shutdown_watchdog: ShutdownWatchdog = .{},
 
     pub fn init(shutdown_timeout_ms: u64) RuntimeSupervisor {
         return .{ .shutdown_timeout_ms = shutdown_timeout_ms };
+    }
+
+    pub fn initWithIo(io: std.Io, shutdown_timeout_ms: u64) RuntimeSupervisor {
+        return .{ .shutdown_timeout_ms = shutdown_timeout_ms, .io = io };
     }
 
     pub fn token(self: *const RuntimeSupervisor) CancellationToken {
@@ -300,13 +316,29 @@ pub const RuntimeSupervisor = struct {
     /// teardown watchdog. A healthy process must not be terminated merely
     /// because its listener became ready near the end of startup.
     pub fn startupDeadline(self: *const RuntimeSupervisor) ShutdownDeadline {
-        return ShutdownDeadline.afterMilliseconds(self.shutdown_timeout_ms);
+        return if (self.io) |io|
+            ShutdownDeadline.afterMillisecondsWithIo(io, self.shutdown_timeout_ms)
+        else
+            ShutdownDeadline.afterMilliseconds(self.shutdown_timeout_ms);
     }
 
     pub fn markStopped(self: *RuntimeSupervisor) void {
         self.shutdown_watchdog.disarm();
         self.cancellation.cancel();
         self.state.store(.stopped, .release);
+    }
+
+    /// Re-arms a fully stopped supervisor for an in-process service restart.
+    /// No component Futures may remain owned by the previous generation.
+    pub fn restart(self: *RuntimeSupervisor) !void {
+        if (self.currentState() != .stopped) return error.RuntimeNotStopped;
+        self.cancellation.cancelled.store(false, .release);
+        platform_sync.lockYielding(&self.failure_mutex);
+        self.first_failure = null;
+        self.failure_mutex.unlock();
+        self.shutdown_deadline = null;
+        self.shutdown_watchdog = .{};
+        self.state.store(.starting, .release);
     }
 };
 

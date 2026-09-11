@@ -862,10 +862,10 @@ fn encodeSign(
 test "encode small 4x4 codeblock produces valid output" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
 
     var result = try encodeCodeblock(
@@ -1043,10 +1043,10 @@ test "encode 2x1 coefficients round-trips through decoder" {
 test "SEGSYM encode yields different bitstream than baseline" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
 
     var baseline = try encodeCodeblock(allocator, &coefficients, 4, 4, 8, .ll, 0, 0);
@@ -1064,10 +1064,10 @@ test "SEGSYM encode yields different bitstream than baseline" {
 test "RESET encode yields different bitstream than baseline" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
 
     var baseline = try encodeCodeblock(allocator, &coefficients, 4, 4, 8, .ll, 0, 0);
@@ -1082,10 +1082,10 @@ test "RESET encode yields different bitstream than baseline" {
 test "combined SEGSYM + RESET encode differs from either alone" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
 
     var only_segsym = try encodeCodeblock(allocator, &coefficients, 4, 4, 8, .ll, cbs_segsym, 0);
@@ -1102,10 +1102,10 @@ test "combined SEGSYM + RESET encode differs from either alone" {
 test "ROI shift upshifts coefficients and changes bitstream" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
 
     var baseline = try encodeCodeblock(allocator, &coefficients, 4, 4, 8, .ll, 0, 0);
@@ -1298,10 +1298,10 @@ test "TERMALL round-trip recovers original coefficients" {
 test "PTERM encoder emits terminated stream the decoder accepts" {
     const allocator = std.testing.allocator;
     const coefficients = [_]i32{
-        10,  -5,  3,  0,
-        -7,   2,  0,  1,
-        0,    4, -6,  8,
-        1,   -3,  5, -2,
+        10, -5, 3,  0,
+        -7, 2,  0,  1,
+        0,  4,  -6, 8,
+        1,  -3, 5,  -2,
     };
     const bpc: u8 = 8;
 

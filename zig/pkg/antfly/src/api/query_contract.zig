@@ -279,6 +279,7 @@ pub fn queryHitsTotalValueToU32(total: metadata_openapi.QueryHitsTotal) !u32 {
 
 pub const QueryResponseMeta = struct {
     pub const RerankerProfile = struct {
+        provider: reranking_mod.Provider,
         model: []const u8 = "",
         documents_reranked: u32 = 0,
         duration_ms: i64 = 0,
@@ -312,9 +313,22 @@ pub const QueryResponseMeta = struct {
         index_lookup_ns: u64 = 0,
         hbc_search_ns: u64 = 0,
         hbc_runtime_txn_ns: u64 = 0,
+        hbc_admission_wait_ns: u64 = 0,
+        hbc_scan_admission_wait_ns: u64 = 0,
+        hbc_rerank_admission_wait_ns: u64 = 0,
+        hbc_admission_estimated_scan_bytes: u64 = 0,
+        hbc_admission_selected_scan_bytes: u64 = 0,
+        hbc_admission_peak_reserved_bytes: u64 = 0,
+        hbc_admission_reservations: u64 = 0,
+        hbc_admission_fallback_leaves: u64 = 0,
+        hbc_leaf_scan_bytes: u64 = 0,
+        hbc_native_leaf_lookup_ns: u64 = 0,
+        hbc_projection_completion_ns: u64 = 0,
         hbc_scratch_acquire_ns: u64 = 0,
         hbc_node_cache_lookup_ns: u64 = 0,
         hbc_quantized_cache_lookup_ns: u64 = 0,
+        hbc_child_expand_ns: u64 = 0,
+        hbc_leaf_score_ns: u64 = 0,
         hbc_filter_candidates: u64 = 0,
         hbc_filter_rejected: u64 = 0,
         hbc_filter_metadata_batches: u64 = 0,
@@ -325,6 +339,11 @@ pub const QueryResponseMeta = struct {
         hbc_traversal_bound_resolutions: u64 = 0,
         hbc_traversal_bound_fallbacks: u64 = 0,
         hbc_traversal_bound_stops: u64 = 0,
+        hbc_traversal_bound_unresolved_frontier: u64 = 0,
+        hbc_traversal_bound_incomplete_topk: u64 = 0,
+        hbc_traversal_bound_overlap: u64 = 0,
+        hbc_traversal_unresolved_posting_bounds: u64 = 0,
+        hbc_traversal_incomplete_routing_directory: u64 = 0,
         hbc_traversal_frontier_remaining: u64 = 0,
         hbc_traversal_eligible_vectors: u64 = 0,
         hbc_traversal_stop_lower_bound: f32 = 0,
@@ -360,6 +379,14 @@ pub const QueryResponseMeta = struct {
         hbc_leaves_explored: u64 = 0,
         hbc_approx_vectors_scored: u64 = 0,
         hbc_exact_vectors_scored: u64 = 0,
+        hbc_leaf_payload_stale: u64 = 0,
+        hbc_leaf_payload_missing: u64 = 0,
+        hbc_native_leaf_scan_hits: u64 = 0,
+        hbc_subgroup_leaves_scored: u64 = 0,
+        hbc_subgroup_vectors_skipped: u64 = 0,
+        hbc_subgroup_compact_groups_scored: u64 = 0,
+        hbc_subgroup_routing_ns: u64 = 0,
+        hbc_native_leaf_scan_fallbacks: u64 = 0,
         hbc_reranked_vectors: u64 = 0,
         hbc_approx_candidate_count: u64 = 0,
         hbc_rerank_candidate_count: u64 = 0,
@@ -396,6 +423,17 @@ pub const QueryResponseMeta = struct {
         hbc_rerank_artifact_distance_ns: u64 = 0,
         hbc_rerank_lsm_cache_hits: u64 = 0,
         hbc_rerank_lsm_cache_misses: u64 = 0,
+        hbc_rerank_vector_block_hits: u64 = 0,
+        hbc_rerank_vector_projection_reads: u64 = 0,
+        hbc_rerank_vector_projection_borrows: u64 = 0,
+        hbc_rerank_vector_projection_bytes: u64 = 0,
+        hbc_rerank_vector_residual_reads: u64 = 0,
+        hbc_rerank_vector_residual_bytes: u64 = 0,
+        hbc_rerank_vector_physical_reads: u64 = 0,
+        hbc_rerank_vector_physical_bytes: u64 = 0,
+        hbc_rerank_vector_location_reuses: u64 = 0,
+        hbc_rerank_vector_block_misses: u64 = 0,
+        hbc_rerank_vector_block_fallbacks: u64 = 0,
         hbc_rerank_artifact_cache_hits: u64 = 0,
         hbc_rerank_artifact_vectors_loaded: u64 = 0,
         hbc_rerank_distance_ns: u64 = 0,
@@ -2243,10 +2281,18 @@ fn applyCommonSearchRequestOptions(
             error.InvalidRerankerConfig => return error.InvalidQueryRequest,
             else => return err,
         };
+        reranking_mod.validateQueryWindow(req.reranker.?, req.offset, req.limit) catch |err| switch (err) {
+            error.InvalidRerankerConfig => return error.InvalidQueryRequest,
+            else => return err,
+        };
     }
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
-    if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
+    // Approximate vector sources cannot page independently by offset. A
+    // coordinator-owned reranker is different: component and shard retrieval
+    // are widened to the bounded candidate window, then offset/limit are
+    // applied once after global scoring.
+    if (has_semantic and req.offset > 0 and req.reranker == null) return error.UnsupportedQueryRequest;
     if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
@@ -2834,6 +2880,7 @@ pub fn isPublicQueryValidationError(err: anyerror) bool {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
         => true,
         else => false,
     };
@@ -7257,6 +7304,7 @@ fn buildProfileValue(
             .failed = 0,
         },
         .reranker = if (meta.reranker) |reranker| .{
+            .provider = reranker.provider,
             .model = if (reranker.model.len > 0) reranker.model else null,
             .documents_reranked = reranker.documents_reranked,
             .duration_ms = reranker.duration_ms,
@@ -7390,7 +7438,6 @@ fn parseMergeConfig(alloc: std.mem.Allocator, generated: indexes_openapi.MergeCo
         config.strategy = switch (strategy) {
             .rrf => .rrf,
             .rsf => .rsf,
-            .failover => return error.UnsupportedQueryRequest,
         };
     }
     if (generated.rank_constant) |rank_constant| config.rank_constant = rank_constant;
@@ -7527,6 +7574,59 @@ fn canDeferStoredProjection(fields: []const []const u8) bool {
         if (std.mem.eql(u8, field, "_embeddings") or std.mem.eql(u8, field, "_embeddings.*")) return false;
     }
     return true;
+}
+
+/// Classify canonical query capabilities using the same normalization as execution.
+/// Agent tool policy must not infer capabilities from a partial list of DSL keys.
+pub fn publicQueryCapabilities(alloc: std.mem.Allocator, request: anytype) !struct { text: bool, filter: bool } {
+    var normalized = try normalizePublicQueryBucketsAlloc(alloc, request, 10);
+    defer normalized.deinit(alloc);
+    return .{
+        .text = normalized.full_text != null,
+        .filter = normalized.filter_text != null or normalized.exclusion_text != null or normalized.filter_query_json.len > 0 or normalized.exclusion_query_json.len > 0,
+    };
+}
+
+/// Preserve the non-scoring authority of a canonical query across agent revisions.
+/// Normalize first, and use the same bool.must classifier as execution; arbitrary
+/// scoring subtrees are never heuristically rewritten.
+pub fn canonicalQueryConstraints(alloc: std.mem.Allocator, value: std.json.Value) !struct { filter: ?std.json.Value, exclusion: ?std.json.Value } {
+    const request = metadata_openapi.QueryRequest{ .query = value };
+    const capabilities = try publicQueryCapabilities(alloc, request);
+    if (!capabilities.filter) return .{ .filter = null, .exclusion = null };
+    if (value.object.get("bool")) |boolean| {
+        var filters = std.json.Array.init(alloc);
+        if (boolean.object.get("filter")) |filter| {
+            if (filter == .array) try filters.appendSlice(filter.array.items) else try filters.append(filter);
+        }
+        if (boolean.object.get("must")) |must| {
+            const children = if (must == .array) must.array.items else &.{must};
+            for (children) |child| {
+                var scoring = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+                defer deinitTextQueryArrayList(alloc, &scoring);
+                var structured = std.ArrayListUnmanaged([]u8).empty;
+                defer deinitOwnedStringArrayList(alloc, &structured);
+                var text = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
+                defer deinitTextQueryArrayList(alloc, &text);
+                try appendBoolMustClausesAlloc(alloc, child, 10, &scoring, &structured, &text);
+                if (structured.items.len > 0 or text.items.len > 0) try filters.append(child);
+            }
+        }
+        var filter: ?std.json.Value = null;
+        if (filters.items.len > 0) {
+            var root = std.json.ObjectMap.empty;
+            try root.put(alloc, "conjuncts", .{ .array = filters });
+            filter = .{ .object = root };
+        }
+        var exclusion = boolean.object.get("must_not");
+        if (exclusion != null and exclusion.? == .array) {
+            var root = std.json.ObjectMap.empty;
+            try root.put(alloc, "disjuncts", exclusion.?);
+            exclusion = .{ .object = root };
+        }
+        return .{ .filter = filter, .exclusion = exclusion };
+    }
+    return .{ .filter = if (!capabilities.text) value else null, .exclusion = null };
 }
 
 const NormalizedPublicQueryBuckets = struct {
@@ -9377,13 +9477,6 @@ fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
 }
 
 fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.Query) anyerror!db_mod.types.TextQuery {
-    const query_string_has_default_operator = comptime blk: {
-        const QueryStringType = @TypeOf((@as(query_openapi.Query, undefined)).query_string_query);
-        break :blk switch (@typeInfo(QueryStringType)) {
-            .pointer => |pointer| @hasField(pointer.child, "default_operator"),
-            else => @hasField(QueryStringType, "default_operator"),
-        };
-    };
     const query_boost = try parseGeneratedBleveQueryBoost(query);
 
     return switch (query) {
@@ -9393,18 +9486,14 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             alloc,
             query_string.query,
             query_boost,
-            if (query_string_has_default_operator)
-                try normalizeQueryStringDefaultOperator(query_string.default_operator)
-            else
-                null,
         ),
         .term_query => |term| .{ .term = .{
-            .field = try alloc.dupe(u8, term.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, term.field orelse "_all"),
             .term = try alloc.dupe(u8, term.term),
             .boost = query_boost,
         } },
         .match_query => |match| .{ .match = .{
-            .field = try alloc.dupe(u8, match.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, match.field orelse "_all"),
             .text = try alloc.dupe(u8, match.match),
             .analyzer = if (match.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
             .boost = query_boost,
@@ -9419,7 +9508,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         .match_phrase_query => |phrase| blk: {
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             break :blk .{ .match_phrase = .{
-                .field = try alloc.dupe(u8, phrase.field orelse return error.UnsupportedQueryRequest),
+                .field = try alloc.dupe(u8, phrase.field orelse "_all"),
                 .text = try alloc.dupe(u8, phrase.match_phrase),
                 .analyzer = if (phrase.analyzer) |analyzer| try alloc.dupe(u8, analyzer) else null,
                 .max_edits = fuzziness.max_edits,
@@ -9432,7 +9521,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             const field = try alloc.dupe(
                 u8,
-                phrase.field orelse return error.UnsupportedQueryRequest,
+                phrase.field orelse "_all",
             );
             errdefer alloc.free(field);
             const terms = try cloneFields(alloc, phrase.terms);
@@ -9452,7 +9541,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(phrase.fuzziness, 0);
             const field = try alloc.dupe(
                 u8,
-                phrase.field orelse return error.UnsupportedQueryRequest,
+                phrase.field orelse "_all",
             );
             errdefer alloc.free(field);
             const terms = try cloneTextMatrixAlloc(alloc, phrase.terms);
@@ -9468,7 +9557,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             const fuzziness = try parseBleveFuzziness(fuzzy.fuzziness, 1);
             const prefix_len = try parseBlevePrefixLength(fuzzy.prefix_length);
             break :blk .{ .fuzzy = .{
-                .field = try alloc.dupe(u8, fuzzy.field orelse return error.UnsupportedQueryRequest),
+                .field = try alloc.dupe(u8, fuzzy.field orelse "_all"),
                 .term = try alloc.dupe(u8, fuzzy.term),
                 .max_edits = fuzziness.max_edits,
                 .prefix_len = prefix_len,
@@ -9477,17 +9566,17 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
             } };
         },
         .prefix_query => |prefix| .{ .prefix = .{
-            .field = try alloc.dupe(u8, prefix.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, prefix.field orelse "_all"),
             .prefix = try alloc.dupe(u8, prefix.prefix),
             .boost = query_boost,
         } },
         .wildcard_query => |wildcard| .{ .wildcard = .{
-            .field = try alloc.dupe(u8, wildcard.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, wildcard.field orelse "_all"),
             .pattern = try alloc.dupe(u8, wildcard.wildcard),
             .boost = query_boost,
         } },
         .regexp_query => |regexp| .{ .regexp = .{
-            .field = try alloc.dupe(u8, regexp.field orelse return error.UnsupportedQueryRequest),
+            .field = try alloc.dupe(u8, regexp.field orelse "_all"),
             .pattern = try alloc.dupe(u8, regexp.regexp),
             .boost = query_boost,
         } },
@@ -9832,34 +9921,10 @@ fn parseQueryStringTextQuery(
     alloc: std.mem.Allocator,
     input: []const u8,
     boost: f32,
-    default_operator: ?[]const u8,
 ) !db_mod.types.TextQuery {
-    const parsed_default_operator = if (default_operator) |value|
-        if (std.ascii.eqlIgnoreCase(value, "or"))
-            public_query_string_mod.ParseOptions{ .default_operator = .or_ }
-        else if (std.ascii.eqlIgnoreCase(value, "and"))
-            public_query_string_mod.ParseOptions{ .default_operator = .and_ }
-        else
-            return error.UnsupportedQueryRequest
-    else
-        public_query_string_mod.ParseOptions{};
-
-    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, parsed_default_operator);
+    var owned = try public_query_string_mod.parseFilterAllocWithOptions(alloc, input, .{});
     defer owned.deinit(alloc);
     return try public_query_string_mod.filterToStatefulTextQueryAlloc(alloc, owned.filter, boost);
-}
-
-fn normalizeQueryStringDefaultOperator(value: anytype) !?[]const u8 {
-    const T = @TypeOf(value);
-    return switch (@typeInfo(T)) {
-        .optional => if (value) |inner| try normalizeQueryStringDefaultOperator(inner) else null,
-        .pointer => |pointer| switch (pointer.size) {
-            .slice => value,
-            else => error.UnsupportedQueryRequest,
-        },
-        .@"enum" => @tagName(value),
-        else => error.UnsupportedQueryRequest,
-    };
 }
 
 const ParsedFuzziness = struct {
@@ -9949,10 +10014,16 @@ fn buildSemanticVectorQueries(
         }
         if (request.semantic_search) |semantic_search| {
             const resolver = semantic_resolver orelse return error.UnsupportedQueryRequest;
+            const query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit);
+            errdefer alloc.free(query.vector);
+            const name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(name);
+            const owned_index_name = try alloc.dupe(u8, index_name);
+            errdefer alloc.free(owned_index_name);
             try dense_queries.append(alloc, .{
-                .name = try alloc.dupe(u8, index_name),
-                .index_name = try alloc.dupe(u8, index_name),
-                .query = try resolver.resolveDenseQuery(alloc, table_name, index_name, semantic_search, request.embedding_template, limit),
+                .name = name,
+                .index_name = owned_index_name,
+                .query = query,
             });
             continue;
         }
@@ -15545,6 +15616,7 @@ test "api query contract classifies typed filter errors as validation errors" {
         error.InvalidExclusionQueryRequest,
         error.UnsupportedFilterQueryRequest,
         error.UnsupportedExclusionQueryRequest,
+        error.RerankerCandidateLimitExceeded,
     }) |err| {
         try std.testing.expect(isPublicQueryValidationError(err));
     }
@@ -15765,6 +15837,82 @@ test "api query contract preflight rejects count with reranker" {
     defer parsed.deinit();
 
     try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+}
+
+test "api query contract enforces provider-specific reranker candidate limits" {
+    const vertex_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"vertex","model":"semantic-ranker-default@latest","field":"body"}
+        \\}
+    ;
+    try std.testing.expectError(
+        error.RerankerCandidateLimitExceeded,
+        parsePublicQueryRequest(std.testing.allocator, null, "docs", vertex_body),
+    );
+
+    const cohere_body =
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "limit": 201,
+        \\  "reranker": {"provider":"cohere","model":"rerank-v4.0-pro","field":"body"}
+        \\}
+    ;
+    var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
+    cohere.deinit(std.testing.allocator);
+}
+
+test "api query contract permits semantic offset only with coordinator reranking" {
+    const alloc = std.testing.allocator;
+    const FakeResolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            resolver_alloc: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            return .{
+                .vector = try resolver_alloc.dupe(f32, &.{ 1.0, 0.0 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_context: u8 = 0;
+    const resolver = SemanticResolver{
+        .ptr = &resolver_context,
+        .vtable = &.{ .resolve_dense_query = FakeResolver.resolve },
+    };
+    const reranked_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10,
+        \\  "reranker": {"provider":"antfly","field":"body","candidate_count":50}
+        \\}
+    ;
+    var reranked = try parseQueryRequest(alloc, resolver, "docs", reranked_body);
+    defer reranked.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), reranked.req.offset);
+    try std.testing.expectEqual(@as(u32, 10), reranked.req.limit);
+    try std.testing.expectEqual(@as(?u32, 50), reranked.req.reranker.?.candidate_count);
+
+    const approximate_only_body =
+        \\{
+        \\  "semantic_search": "raft consensus",
+        \\  "indexes": ["semantic"],
+        \\  "offset": 5,
+        \\  "limit": 10
+        \\}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseQueryRequest(alloc, resolver, "docs", approximate_only_body),
+    );
 }
 
 test "api query contract rejects count with stored sort" {
@@ -17002,4 +17150,42 @@ test "api query contract rejects legacy native doc id constraint fields" {
         \\}
     ;
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", old_arrays));
+}
+
+test "api query contract defaults omitted text fields to all" {
+    const alloc = std.testing.allocator;
+    const queries = [_][]const u8{
+        "{\"match\":\"Korean history major events\"}",
+        "{\"match\":\"Korean history\",\"analyzer\":\"standard\"}",
+        "{\"term\":\"korean\"}",
+        "{\"term\":\"korean\",\"fuzziness\":1}",
+        "{\"match_phrase\":\"Korean history\"}",
+        "{\"match_phrase\":\"Korean history\",\"analyzer\":\"standard\"}",
+        "{\"prefix\":\"kore\"}",
+        "{\"wildcard\":\"kor*\"}",
+        "{\"regexp\":\"kor.*\"}",
+        "{\"fuzzy\":\"korean\"}",
+        "{\"terms\":[\"korean\",\"history\"]}",
+        "{\"terms\":[[\"korean\"],[\"history\"]]}",
+    };
+    for (queries) |query| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s}}}", .{query});
+        defer alloc.free(body);
+        var parsed = try parsePublicQueryRequest(alloc, null, "docs", body);
+        defer parsed.deinit(alloc);
+        const text = parsed.req.full_text orelse return error.TestExpectedEqual;
+        const field = switch (text) {
+            .match => |v| v.field,
+            .term => |v| v.field,
+            .match_phrase => |v| v.field,
+            .prefix => |v| v.field,
+            .wildcard => |v| v.field,
+            .regexp => |v| v.field,
+            .fuzzy => |v| v.field,
+            .phrase => |v| v.field,
+            .multi_phrase => |v| v.field,
+            else => return error.TestExpectedEqual,
+        };
+        try std.testing.expectEqualStrings("_all", field);
+    }
 }

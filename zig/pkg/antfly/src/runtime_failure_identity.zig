@@ -376,6 +376,15 @@ const mappings = [_]Mapping{
     .{ .status = .wrong_shard, .err = error.WrongShard },
     .{ .status = .wrong_table, .err = error.WrongTable },
     .{ .status = .wrong_timeline, .err = error.WrongTimeline },
+    .{ .status = .restore_runtime_repair_incomplete, .err = error.RestoreRuntimeRepairIncomplete },
+    .{ .status = .restore_dense_artifact_rebuild_incomplete, .err = error.RestoreDenseArtifactRebuildIncomplete },
+    .{ .status = .restore_dense_config_proof_incomplete, .err = error.RestoreDenseConfigProofIncomplete },
+    .{ .status = .restore_dense_counter_proof_incomplete, .err = error.RestoreDenseCounterProofIncomplete },
+    .{ .status = .restore_dense_index_proof_incomplete, .err = error.RestoreDenseIndexProofIncomplete },
+    .{ .status = .restore_dense_coverage_proof_incomplete, .err = error.RestoreDenseCoverageProofIncomplete },
+    .{ .status = .invalid_pdf_decode_limits, .err = error.InvalidPdfDecodeLimits },
+    .{ .status = .restore_dense_checkpoint_incomplete, .err = error.RestoreDenseCheckpointIncomplete },
+    .{ .status = .restore_index_availability_incomplete, .err = error.RestoreIndexAvailabilityIncomplete },
     .{ .status = .provider_internal, .err = error.Internal },
 };
 
@@ -432,9 +441,11 @@ pub fn validateFailureEnvelope(
 ) !void {
     const zero_name: [abi.failure_error_name_capacity]u8 = @splat(0);
     if (status == .ok) {
+        // Success has no originating boundary. Its canonical empty envelope
+        // uses the shared contract default, independently of the caller ABI.
         if (failure.status != .ok or
             failure.boundary != .none or
-            failure.boundary_version != expected_boundary_version or
+            failure.boundary_version != abi.abi_version or
             failure.operation != 0 or
             failure.error_name_len != 0 or
             failure.error_name_truncated != 0 or
@@ -565,6 +576,7 @@ pub fn validateForTest() !void {
     try validateFailureEnvelope(defect.status, &defect, 8);
     const success: abi.FailureIdentity = .{};
     try validateFailureEnvelope(.ok, &success, abi.abi_version);
+    try validateFailureEnvelope(.ok, &success, abi.abi_version + 1);
     var mismatched = declared;
     mismatched.status = .busy;
     try std.testing.expectError(

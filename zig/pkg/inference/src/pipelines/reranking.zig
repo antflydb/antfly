@@ -25,10 +25,14 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Tensor = backends.Tensor;
 const runtime = @import("../runtime/root.zig");
 const session_mod = @import("../backends/session.zig");
+const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 
 pub const ScoringMode = enum {
     cross_encoder,
     late_interaction,
+    /// Conditional-generation rerankers whose binary relevance head is built
+    /// from the final active token rather than a CLS classifier position.
+    generative_yes_no,
 };
 
 pub const SingleTextEncoding = enum {
@@ -36,12 +40,25 @@ pub const SingleTextEncoding = enum {
     generation,
 };
 
+pub const GenerativePrompt = enum { qwen3_vl, qwen3_text };
+
+// Qwen3's text reranker closes an empty thinking block before the yes/no
+// decision. Qwen3-VL uses a different assistant suffix; sharing its prompt
+// would silently change the text checkpoint's scoring semantics.
+const qwen3_text_prefix = "<|im_start|>system\n" ++ qwen3vl_reranker.system_prompt ++
+    "<|im_end|>\n<|im_start|>user\n";
+const qwen3_text_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const qwen3_text_instruction = "Given a web search query, retrieve relevant passages that answer the query";
+
 pub const RerankingConfig = struct {
     max_length: usize = 512,
     batch_size: usize = 32,
     mode: ScoringMode = .cross_encoder,
     single_text_encoding: SingleTextEncoding = .encoder,
     add_bos_token: bool = false,
+    generative_instruction: []const u8 = qwen3vl_reranker.default_instruction,
+    generative_prompt: GenerativePrompt = .qwen3_vl,
+    max_prompt_bytes: usize = qwen3vl_reranker.default_max_prompt_bytes,
     /// Dynamic text encoders should execute only through the longest active
     /// pair in the batch rather than paying for max_length padding.
     trim_padding_to_batch_max: bool = true,
@@ -53,7 +70,90 @@ pub const RankedResult = struct {
     score: f32,
 };
 
+/// Tokenized reranking inputs shared by admission, usage accounting, and
+/// execution. Preparing once prevents large candidate sets from paying the
+/// tokenizer cost two or three times before the model runs.
+pub const PreparedRerankInputs = struct {
+    allocator: std.mem.Allocator,
+    mode: ScoringMode,
+    items: []tokenizer_mod.EncodeResult,
+    query: ?tokenizer_mod.EncodeResult = null,
+    owner_session_ptr: *anyopaque,
+    owner_session_vtable: *const backends.Session.VTable,
+    owner_tokenizer_ptr: *anyopaque,
+    owner_tokenizer_vtable: *const Tokenizer.VTable,
+    max_length: usize,
+    batch_size: usize,
+    single_text_encoding: SingleTextEncoding,
+    add_bos_token: bool,
+    trim_padding_to_batch_max: bool,
+    preprocess_permit: ?session_mod.RunPermit = null,
+    cross_permit: ?session_mod.RunPermit = null,
+    generative_permit: ?session_mod.RunPermit = null,
+    late_query_permit: ?session_mod.RunPermit = null,
+    late_document_permit: ?session_mod.RunPermit = null,
+    generative_instruction_hash: u64,
+    max_prompt_bytes: usize,
+    max_input_tokens_per_item: usize = 0,
+    prompt_tokens: usize = 0,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.preprocess_permit) |*permit| permit.deinit();
+        if (self.cross_permit) |*permit| permit.deinit();
+        if (self.generative_permit) |*permit| permit.deinit();
+        if (self.late_query_permit) |*permit| permit.deinit();
+        if (self.late_document_permit) |*permit| permit.deinit();
+        for (self.items) |*item| item.deinit();
+        self.allocator.free(self.items);
+        if (self.query) |*query| query.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Caller-owned evidence captured only by the offline qualification CLI. The
+/// production serving path leaves this null, so prompt/token/logit capture adds
+/// no allocations or synchronization to ordinary reranking requests.
+pub const GenerativeQualificationTrace = struct {
+    pub const Pair = struct {
+        rendered_prompt: []u8,
+        token_ids: []i32,
+    };
+
+    allocator: std.mem.Allocator,
+    pairs: std.ArrayListUnmanaged(Pair) = .empty,
+    raw_logits: std.ArrayListUnmanaged(f32) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) GenerativeQualificationTrace {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GenerativeQualificationTrace) void {
+        for (self.pairs.items) |pair| {
+            self.allocator.free(pair.rendered_prompt);
+            self.allocator.free(pair.token_ids);
+        }
+        self.pairs.deinit(self.allocator);
+        self.raw_logits.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn appendPair(self: *GenerativeQualificationTrace, prompt: []const u8, token_ids: []const i32) !void {
+        const prompt_copy = try self.allocator.dupe(u8, prompt);
+        errdefer self.allocator.free(prompt_copy);
+        const ids_copy = try self.allocator.dupe(i32, token_ids);
+        errdefer self.allocator.free(ids_copy);
+        try self.pairs.append(self.allocator, .{
+            .rendered_prompt = prompt_copy,
+            .token_ids = ids_copy,
+        });
+    }
+};
+
+/// Compatibility alias while callers migrate to the package-wide contract.
+pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
+
 pub const RerankingPipeline = struct {
+    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -61,6 +161,8 @@ pub const RerankingPipeline = struct {
     /// Optional caller-owned gate for stateful backend execution. Tokenization
     /// remains parallel; only the session forward pass is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    generative_qualification_trace: ?*GenerativeQualificationTrace = null,
+    execution_control: ?ExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -89,42 +191,431 @@ pub const RerankingPipeline = struct {
     /// Score query-document pairs using the configured reranker mode.
     /// Returns scores in the same order as documents.
     pub fn rerank(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+        try self.checkExecution();
         if (documents.len == 0) return try self.allocator.alloc(f32, 0);
+        var prepared = try self.prepareInputs(query, documents);
+        defer prepared.deinit();
+        return try self.rerankPrepared(&prepared);
+    }
 
-        return switch (self.config.mode) {
-            .cross_encoder => self.rerankCrossEncoder(query, documents),
-            .late_interaction => self.rerankLateInteraction(query, documents),
+    pub fn prepareInputs(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) !PreparedRerankInputs {
+        return self.prepareInputsInternal(query, documents, true);
+    }
+
+    fn prepareInputsInternal(self: *RerankingPipeline, query: []const u8, documents: []const []const u8, admit: bool) !PreparedRerankInputs {
+        if (self.config.mode == .generative_yes_no and
+            (self.config.max_length < qwen3vl_reranker.protected_assistant_suffix_tokens or
+                self.config.batch_size == 0))
+        {
+            return error.InvalidRerankerConfiguration;
+        }
+        var preprocess_permit: ?session_mod.RunPermit = null;
+        var cross_permit: ?session_mod.RunPermit = null;
+        var generative_permit: ?session_mod.RunPermit = null;
+        var late_query_permit: ?session_mod.RunPermit = null;
+        var late_document_permit: ?session_mod.RunPermit = null;
+        errdefer {
+            if (preprocess_permit) |*permit| permit.deinit();
+            if (cross_permit) |*permit| permit.deinit();
+            if (generative_permit) |*permit| permit.deinit();
+            if (late_query_permit) |*permit| permit.deinit();
+            if (late_document_permit) |*permit| permit.deinit();
+        }
+        if (admit and documents.len != 0) {
+            const preprocess_rows = switch (self.config.mode) {
+                .cross_encoder, .generative_yes_no => documents.len,
+                .late_interaction => std.math.add(usize, documents.len, 1) catch
+                    return error.ResourceLimitExceeded,
+            };
+            const preprocess_tokens = std.math.mul(usize, preprocess_rows, self.config.max_length) catch
+                return error.ResourceLimitExceeded;
+            preprocess_permit = try self.session.admitHostPreprocess(
+                std.math.mul(usize, preprocess_tokens, 32) catch
+                    return error.ResourceLimitExceeded,
+            );
+        }
+        const items = try self.allocator.alloc(tokenizer_mod.EncodeResult, documents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit();
+            self.allocator.free(items);
+        }
+        var prepared = PreparedRerankInputs{
+            .allocator = self.allocator,
+            .mode = self.config.mode,
+            .items = items,
+            .owner_session_ptr = self.session.ptr,
+            .owner_session_vtable = self.session.vtable,
+            .owner_tokenizer_ptr = self.tok.ptr,
+            .owner_tokenizer_vtable = self.tok.vtable,
+            .max_length = self.config.max_length,
+            .batch_size = self.config.batch_size,
+            .single_text_encoding = self.config.single_text_encoding,
+            .add_bos_token = self.config.add_bos_token,
+            .trim_padding_to_batch_max = self.config.trim_padding_to_batch_max,
+            .preprocess_permit = preprocess_permit,
+            .cross_permit = cross_permit,
+            .generative_permit = generative_permit,
+            .late_query_permit = late_query_permit,
+            .late_document_permit = late_document_permit,
+            .generative_instruction_hash = std.hash.Wyhash.hash(0, self.config.generative_instruction),
+            .max_prompt_bytes = self.config.max_prompt_bytes,
+        };
+        preprocess_permit = null;
+        cross_permit = null;
+        generative_permit = null;
+        late_query_permit = null;
+        late_document_permit = null;
+        errdefer {
+            if (prepared.preprocess_permit) |*permit| permit.deinit();
+            if (prepared.cross_permit) |*permit| permit.deinit();
+            if (prepared.generative_permit) |*permit| permit.deinit();
+            if (prepared.late_query_permit) |*permit| permit.deinit();
+            if (prepared.late_document_permit) |*permit| permit.deinit();
+            if (prepared.query) |*encoded| encoded.deinit();
+        }
+        switch (self.config.mode) {
+            .cross_encoder => for (documents, 0..) |document, index| {
+                items[index] = try self.tok.encodeForPair(self.allocator, query, document, self.config.max_length);
+                initialized += 1;
+                const active = activeTokenLength(items[index].attention_mask);
+                prepared.max_input_tokens_per_item = @max(prepared.max_input_tokens_per_item, active);
+                prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, active) catch return error.ResourceLimitExceeded;
+            },
+            .generative_yes_no => for (documents, 0..) |document, index| {
+                items[index] = try self.encodeGenerativeYesNoPair(query, document);
+                initialized += 1;
+                const active = activeTokenLength(items[index].attention_mask);
+                prepared.max_input_tokens_per_item = @max(prepared.max_input_tokens_per_item, active);
+                prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, active) catch return error.ResourceLimitExceeded;
+            },
+            .late_interaction => {
+                prepared.query = try self.encodeSingleText(query);
+                const query_tokens = activeTokenLength(prepared.query.?.attention_mask);
+                for (documents, 0..) |document, index| {
+                    items[index] = try self.encodeSingleText(document);
+                    initialized += 1;
+                    const document_tokens = activeTokenLength(items[index].attention_mask);
+                    prepared.max_input_tokens_per_item = @max(prepared.max_input_tokens_per_item, @max(query_tokens, document_tokens));
+                    prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, query_tokens) catch return error.ResourceLimitExceeded;
+                    prepared.prompt_tokens = std.math.add(usize, prepared.prompt_tokens, document_tokens) catch return error.ResourceLimitExceeded;
+                }
+            },
+        }
+        if (admit and documents.len != 0) switch (self.config.mode) {
+            .cross_encoder => {
+                const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
+                const effective_len = if (self.config.trim_padding_to_batch_max and !fixed_len)
+                    @max(@as(usize, 1), prepared.max_input_tokens_per_item)
+                else
+                    self.config.max_length;
+                prepared.cross_permit = try self.admitTextRun(
+                    @min(documents.len, @max(@as(usize, 1), self.config.batch_size)),
+                    effective_len,
+                );
+            },
+            .generative_yes_no => {
+                prepared.generative_permit = try self.admitTextRun(
+                    @min(documents.len, self.config.batch_size),
+                    @max(@as(usize, 1), prepared.max_input_tokens_per_item),
+                );
+            },
+            .late_interaction => {
+                const query_len = activeTokenLength(prepared.query.?.attention_mask);
+                var document_len: usize = 1;
+                for (prepared.items) |item| {
+                    document_len = @max(document_len, activeTokenLength(item.attention_mask));
+                }
+                const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
+                const effective_query_len = if (self.config.trim_padding_to_batch_max and !fixed_len)
+                    @max(@as(usize, 1), query_len)
+                else
+                    self.config.max_length;
+                const effective_document_len = if (self.config.trim_padding_to_batch_max and !fixed_len)
+                    document_len
+                else
+                    self.config.max_length;
+                prepared.late_query_permit = try self.admitTextRun(1, effective_query_len);
+                prepared.late_document_permit = try self.admitTextRun(
+                    @min(documents.len, @max(@as(usize, 1), self.config.batch_size)),
+                    effective_document_len,
+                );
+            },
+        };
+        return prepared;
+    }
+
+    pub fn rerankPrepared(self: *RerankingPipeline, prepared: *PreparedRerankInputs) ![]f32 {
+        if (prepared.owner_session_ptr != self.session.ptr or
+            prepared.owner_session_vtable != self.session.vtable or
+            prepared.owner_tokenizer_ptr != self.tok.ptr or
+            prepared.owner_tokenizer_vtable != self.tok.vtable or
+            prepared.mode != self.config.mode or
+            prepared.max_length != self.config.max_length or
+            prepared.batch_size != self.config.batch_size or
+            prepared.single_text_encoding != self.config.single_text_encoding or
+            prepared.add_bos_token != self.config.add_bos_token or
+            prepared.trim_padding_to_batch_max != self.config.trim_padding_to_batch_max or
+            prepared.generative_instruction_hash != std.hash.Wyhash.hash(0, self.config.generative_instruction) or
+            prepared.max_prompt_bytes != self.config.max_prompt_bytes)
+            return error.InvalidPreparedRerankInputs;
+        if (prepared.items.len == 0) return try self.allocator.alloc(f32, 0);
+        const scores = try switch (self.config.mode) {
+            .cross_encoder => self.rerankCrossEncoderPrepared(
+                prepared.items,
+                if (prepared.cross_permit) |*permit| permit else return error.InvalidPreparedRerankInputs,
+            ),
+            .generative_yes_no => self.rerankGenerativeYesNoPrepared(
+                prepared.items,
+                if (prepared.generative_permit) |*permit| permit else return error.InvalidPreparedRerankInputs,
+            ),
+            .late_interaction => self.rerankLateInteractionPrepared(
+                prepared.query orelse return error.InvalidPreparedRerankInputs,
+                prepared.items,
+                if (prepared.late_query_permit) |*permit| permit else return error.InvalidPreparedRerankInputs,
+                if (prepared.late_document_permit) |*permit| permit else return error.InvalidPreparedRerankInputs,
+            ),
+        };
+        errdefer self.allocator.free(scores);
+        try self.checkExecution();
+        return scores;
+    }
+
+    /// Returns the largest exact non-padding token footprint for a scored
+    /// query/document item using the same encoding mode as `rerank`.
+    pub fn maxInputTokensPerItem(
+        self: *RerankingPipeline,
+        query: []const u8,
+        documents: []const []const u8,
+    ) !usize {
+        var prepared = try self.prepareInputsInternal(query, documents, false);
+        defer prepared.deinit();
+        return prepared.max_input_tokens_per_item;
+    }
+
+    fn encodeGenerativeYesNoPair(
+        self: *RerankingPipeline,
+        query: []const u8,
+        document: []const u8,
+    ) !tokenizer_mod.EncodeResult {
+        const alloc = self.allocator;
+        if (self.config.generative_prompt == .qwen3_text) {
+            return self.encodeQwen3TextPair(query, document);
+        }
+        const prompt = try qwen3vl_reranker.renderTextPromptAlloc(
+            alloc,
+            self.config.generative_instruction,
+            query,
+            document,
+            self.config.max_prompt_bytes,
+        );
+        defer alloc.free(prompt);
+        const raw_ids = try self.tok.encode(alloc, prompt);
+        defer alloc.free(raw_ids);
+        if (raw_ids.len == 0) return error.InvalidRerankerSequence;
+
+        const unsigned_ids = try alloc.alloc(u32, raw_ids.len);
+        defer alloc.free(unsigned_ids);
+        const vocab_size = self.tok.vocabSize();
+        for (raw_ids, unsigned_ids) |id, *unsigned| {
+            if (id < 0 or @as(usize, @intCast(id)) >= vocab_size) {
+                return error.InvalidRerankerTokenId;
+            }
+            unsigned.* = @intCast(id);
+        }
+
+        const special_ids = try self.tok.allSpecialTokenIds(alloc);
+        defer alloc.free(special_ids);
+
+        const bounded = try qwen3vl_reranker.truncateForScoring(
+            alloc,
+            unsigned_ids,
+            self.config.max_length,
+            special_ids,
+            .strict_bounded,
+        );
+        defer alloc.free(bounded);
+        const result = try alloc.alloc(i32, bounded.len);
+        errdefer alloc.free(result);
+        for (bounded, result) |id, *out| out.* = @intCast(id);
+        const attention_mask = try alloc.alloc(i32, bounded.len);
+        errdefer alloc.free(attention_mask);
+        @memset(attention_mask, 1);
+        if (self.generative_qualification_trace) |trace| {
+            try trace.appendPair(prompt, result);
+        }
+        return .{
+            .ids = result,
+            .attention_mask = attention_mask,
+            .allocator = alloc,
         };
     }
 
-    fn rerankCrossEncoder(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+    fn encodeQwen3TextPair(self: *RerankingPipeline, query: []const u8, document: []const u8) !tokenizer_mod.EncodeResult {
+        const alloc = self.allocator;
+        const instruction = if (std.mem.eql(u8, self.config.generative_instruction, qwen3vl_reranker.default_instruction) or
+            self.config.generative_instruction.len == 0)
+            qwen3_text_instruction
+        else
+            self.config.generative_instruction;
+        var prompt_bytes = std.math.add(usize, query.len, document.len) catch return error.RerankerPromptTooLarge;
+        prompt_bytes = std.math.add(usize, prompt_bytes, instruction.len) catch return error.RerankerPromptTooLarge;
+        prompt_bytes = std.math.add(usize, prompt_bytes, qwen3_text_prefix.len + qwen3_text_suffix.len +
+            "<Instruct>: \n<Query>: \n<Document>: ".len) catch return error.RerankerPromptTooLarge;
+        if (prompt_bytes > self.config.max_prompt_bytes) return error.RerankerPromptTooLarge;
+        const body = try std.fmt.allocPrint(alloc, "<Instruct>: {s}\n<Query>: {s}\n<Document>: {s}", .{ instruction, query, document });
+        defer alloc.free(body);
+        // Tokenize each section independently, as in Qwen's reference scorer,
+        // and reserve the entire fixed prefix and suffix before truncating.
+        const prefix_ids = try self.tok.encode(alloc, qwen3_text_prefix);
+        defer alloc.free(prefix_ids);
+        const body_ids = try self.tok.encode(alloc, body);
+        defer alloc.free(body_ids);
+        const suffix_ids = try self.tok.encode(alloc, qwen3_text_suffix);
+        defer alloc.free(suffix_ids);
+        const result = try joinQwen3TextTokens(alloc, prefix_ids, body_ids, suffix_ids, self.config.max_length);
+        errdefer alloc.free(result);
+        const vocab_size = self.tok.vocabSize();
+        for (result) |id| {
+            if (id < 0 or @as(usize, @intCast(id)) >= vocab_size) return error.InvalidRerankerTokenId;
+        }
+        if (self.generative_qualification_trace) |trace| {
+            const prompt = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ qwen3_text_prefix, body, qwen3_text_suffix });
+            defer alloc.free(prompt);
+            try trace.appendPair(prompt, result);
+        }
+        const attention_mask = try alloc.alloc(i32, result.len);
+        errdefer alloc.free(attention_mask);
+        @memset(attention_mask, 1);
+        return .{
+            .ids = result,
+            .attention_mask = attention_mask,
+            .allocator = alloc,
+        };
+    }
+
+    fn rerankGenerativeYesNoPrepared(
+        self: *RerankingPipeline,
+        encoded: []const tokenizer_mod.EncodeResult,
+        run_permit: *session_mod.RunPermit,
+    ) ![]f32 {
+        const alloc = self.allocator;
+        const scores = try alloc.alloc(f32, encoded.len);
+        errdefer alloc.free(scores);
+        const chunk_limit = self.config.batch_size;
+
+        var offset: usize = 0;
+        while (offset < encoded.len) {
+            try self.checkExecution();
+            const chunk_len = @min(chunk_limit, encoded.len - offset);
+            const chunk_scores = try self.rerankGenerativeYesNoPreparedBatch(
+                encoded[offset .. offset + chunk_len],
+                run_permit,
+            );
+            defer alloc.free(chunk_scores);
+            @memcpy(scores[offset..][0..chunk_len], chunk_scores);
+            offset += chunk_len;
+        }
+        return scores;
+    }
+
+    fn rerankGenerativeYesNoPreparedBatch(
+        self: *RerankingPipeline,
+        encoded: []const tokenizer_mod.EncodeResult,
+        run_permit: *session_mod.RunPermit,
+    ) ![]f32 {
+        const alloc = self.allocator;
+        var effective_len: usize = 1;
+        for (encoded) |item| {
+            if (item.ids.len != item.attention_mask.len) return error.UnexpectedInputShape;
+            effective_len = @max(effective_len, activeTokenLength(item.attention_mask));
+        }
+        effective_len = self.batchSequenceWidth(effective_len);
+
+        const element_count = std.math.mul(usize, encoded.len, effective_len) catch
+            return error.ResourceLimitExceeded;
+        const all_ids = try alloc.alloc(i32, element_count);
+        defer alloc.free(all_ids);
+        const all_mask = try alloc.alloc(i32, element_count);
+        defer alloc.free(all_mask);
+        const all_type_ids = try alloc.alloc(i64, element_count);
+        defer alloc.free(all_type_ids);
+        @memset(all_ids, self.tok.specialTokens().pad_id);
+        @memset(all_mask, 0);
+        @memset(all_type_ids, 0);
+        for (encoded, 0..) |item, local_index| {
+            const active = activeTokenLength(item.attention_mask);
+            const row_start = local_index * effective_len;
+            @memcpy(all_ids[row_start..][0..active], item.ids[0..active]);
+            @memcpy(all_mask[row_start..][0..active], item.attention_mask[0..active]);
+        }
+
+        var run = try self.runTextEncoder(
+            all_ids,
+            all_mask,
+            all_type_ids,
+            encoded.len,
+            effective_len,
+            false,
+            run_permit,
+        );
+        defer run.deinit();
+        const output = try run.output();
+        if (self.generative_qualification_trace) |trace| {
+            const raw = output.asFloat32();
+            if (output.shape.len != 2 or
+                output.shape[0] != @as(i64, @intCast(encoded.len)) or
+                output.shape[1] != 1 or
+                raw.len != encoded.len)
+            {
+                return error.UnexpectedOutputShape;
+            }
+            try trace.raw_logits.appendSlice(trace.allocator, raw);
+        }
+        return try self.extractScores(output, encoded.len);
+    }
+
+    fn rerankCrossEncoderPrepared(
+        self: *RerankingPipeline,
+        encoded: []const tokenizer_mod.EncodeResult,
+        run_permit: *session_mod.RunPermit,
+    ) ![]f32 {
+        const scores = try self.allocator.alloc(f32, encoded.len);
+        errdefer self.allocator.free(scores);
+        const chunk_size = @max(@as(usize, 1), self.config.batch_size);
+        var offset: usize = 0;
+        while (offset < encoded.len) {
+            try self.checkExecution();
+            const chunk_len = @min(chunk_size, encoded.len - offset);
+            const chunk_scores = try self.rerankCrossEncoderPreparedBatch(
+                encoded[offset .. offset + chunk_len],
+                run_permit,
+            );
+            defer self.allocator.free(chunk_scores);
+            @memcpy(scores[offset .. offset + chunk_len], chunk_scores);
+            offset += chunk_len;
+        }
+        return scores;
+    }
+
+    fn rerankCrossEncoderPreparedBatch(
+        self: *RerankingPipeline,
+        encoded: []const tokenizer_mod.EncodeResult,
+        run_permit: *session_mod.RunPermit,
+    ) ![]f32 {
         const alloc = self.allocator;
         const max_len = self.config.max_length;
-        const batch = documents.len;
-
-        // Admission must cover tokenizer and packing buffers too. Reserve the
-        // configured upper bound before allocating them; dynamic sessions may
-        // still execute the shorter, batch-local sequence below.
-        var run_permit = try self.admitTextRun(batch, max_len);
-        defer run_permit.deinit();
-
-        const encoded = try alloc.alloc(tokenizer_mod.EncodeResult, batch);
-        defer alloc.free(encoded);
-        var encoded_count: usize = 0;
-        defer {
-            for (encoded[0..encoded_count]) |*result| result.deinit();
-        }
+        const batch = encoded.len;
 
         const fixed_len = hasFixedTextSequenceLength(self.session.inputInfo());
         const trim_padding = self.config.trim_padding_to_batch_max and !fixed_len;
         var effective_len: usize = if (trim_padding) 1 else max_len;
-        for (documents, 0..) |doc, i| {
-            encoded[i] = try self.tok.encodeForPair(alloc, query, doc, max_len);
-            encoded_count += 1;
-            if (trim_padding) {
-                effective_len = @max(effective_len, activeTokenLength(encoded[i].attention_mask));
+        if (trim_padding) {
+            for (encoded) |item| {
+                effective_len = @max(effective_len, activeTokenLength(item.attention_mask));
             }
         }
+        effective_len = self.batchSequenceWidth(effective_len);
 
         const element_count = std.math.mul(usize, batch, effective_len) catch
             return error.ResourceLimitExceeded;
@@ -156,63 +647,76 @@ pub const RerankingPipeline = struct {
             batch,
             effective_len,
             true,
-            &run_permit,
+            run_permit,
         );
         defer run.deinit();
 
         return try self.extractScores(try run.output(), batch);
     }
 
-    fn rerankLateInteraction(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
+    fn rerankLateInteractionPrepared(
+        self: *RerankingPipeline,
+        query_encoded: tokenizer_mod.EncodeResult,
+        documents: []const tokenizer_mod.EncodeResult,
+        query_permit: *session_mod.RunPermit,
+        document_permit: *session_mod.RunPermit,
+    ) ![]f32 {
+        try self.checkExecution();
         const alloc = self.allocator;
         const max_len = self.config.max_length;
+        const trim = self.config.trim_padding_to_batch_max and !hasFixedTextSequenceLength(self.session.inputInfo());
+        const query_len = if (trim) self.batchSequenceWidth(@max(@as(usize, 1), activeTokenLength(query_encoded.attention_mask))) else max_len;
+        if (query_encoded.ids.len < query_len or query_encoded.attention_mask.len < query_len) return error.UnexpectedInputShape;
         const special = self.tok.specialTokens();
         const chunk_size = @max(@as(usize, 1), self.config.batch_size);
 
-        var query_permit = try self.admitTextRun(1, max_len);
-        defer query_permit.deinit();
-        var query_encoded = try self.encodeSingleText(query);
-        defer query_encoded.deinit();
-
-        const query_type_ids = try alloc.alloc(i64, max_len);
+        const query_type_ids = try alloc.alloc(i64, query_len);
         defer alloc.free(query_type_ids);
         @memset(query_type_ids, 0);
 
         var query_run = try self.runTextEncoder(
-            query_encoded.ids,
-            query_encoded.attention_mask,
+            query_encoded.ids[0..query_len],
+            query_encoded.attention_mask[0..query_len],
             query_type_ids,
             1,
-            max_len,
+            query_len,
             false,
-            &query_permit,
+            query_permit,
         );
         defer query_run.deinit();
+        try self.checkExecution();
 
         const query_output = try query_run.output();
-        if (query_output.shape.len != 3) return error.UnexpectedOutputShape;
+        if (query_output.dtype != .f32 or query_output.shape.len != 3 or query_output.shape[0] != 1 or query_output.shape[1] != query_len or query_output.shape[2] <= 0) return error.UnexpectedOutputShape;
         const hidden: usize = @intCast(query_output.shape[2]);
 
+        if (query_output.asFloat32().len != (std.math.mul(usize, query_len, hidden) catch return error.UnexpectedOutputShape)) return error.UnexpectedOutputShape;
+
         const scores = try alloc.alloc(f32, documents.len);
+        errdefer alloc.free(scores);
 
         var offset: usize = 0;
         while (offset < documents.len) {
+            try self.checkExecution();
             const chunk_len = @min(chunk_size, documents.len - offset);
-            var doc_permit = try self.admitTextRun(chunk_len, max_len);
-            defer doc_permit.deinit();
-            const doc_ids = try alloc.alloc(i32, chunk_len * max_len);
+            var document_len: usize = if (trim) 1 else max_len;
+            if (trim) {
+                for (documents[offset..][0..chunk_len]) |encoded| document_len = @max(document_len, activeTokenLength(encoded.attention_mask));
+                document_len = self.batchSequenceWidth(document_len);
+            }
+            const elements = std.math.mul(usize, chunk_len, document_len) catch return error.ResourceLimitExceeded;
+            const doc_ids = try alloc.alloc(i32, elements);
             defer alloc.free(doc_ids);
-            const doc_mask = try alloc.alloc(i32, chunk_len * max_len);
+            const doc_mask = try alloc.alloc(i32, elements);
             defer alloc.free(doc_mask);
-            const doc_type_ids = try alloc.alloc(i64, chunk_len * max_len);
+            const doc_type_ids = try alloc.alloc(i64, elements);
             defer alloc.free(doc_type_ids);
             @memset(doc_type_ids, 0);
 
-            for (documents[offset .. offset + chunk_len], 0..) |doc, local_idx| {
-                var encoded = try self.encodeSingleText(doc);
-                defer encoded.deinit();
-                @memcpy(doc_ids[local_idx * max_len .. (local_idx + 1) * max_len], encoded.ids);
-                @memcpy(doc_mask[local_idx * max_len .. (local_idx + 1) * max_len], encoded.attention_mask);
+            for (documents[offset .. offset + chunk_len], 0..) |encoded, local_idx| {
+                if (encoded.ids.len < document_len or encoded.attention_mask.len < document_len) return error.UnexpectedInputShape;
+                @memcpy(doc_ids[local_idx * document_len .. (local_idx + 1) * document_len], encoded.ids[0..document_len]);
+                @memcpy(doc_mask[local_idx * document_len .. (local_idx + 1) * document_len], encoded.attention_mask[0..document_len]);
             }
 
             var doc_run = try self.runTextEncoder(
@@ -220,24 +724,25 @@ pub const RerankingPipeline = struct {
                 doc_mask,
                 doc_type_ids,
                 chunk_len,
-                max_len,
+                document_len,
                 false,
-                &doc_permit,
+                document_permit,
             );
             defer doc_run.deinit();
             const doc_output = try doc_run.output();
-            if (doc_output.shape.len != 3) return error.UnexpectedOutputShape;
+            if (doc_output.dtype != .f32 or doc_output.shape.len != 3 or doc_output.shape[0] != chunk_len or doc_output.shape[1] != document_len or doc_output.shape[2] != hidden) return error.UnexpectedOutputShape;
 
             const query_hidden = query_output.asFloat32();
             const doc_hidden = doc_output.asFloat32();
+            if (doc_hidden.len != (std.math.mul(usize, elements, hidden) catch return error.UnexpectedOutputShape)) return error.UnexpectedOutputShape;
             for (0..chunk_len) |local_idx| {
                 scores[offset + local_idx] = lateInteractionScore(
                     query_hidden,
-                    query_encoded.ids,
-                    query_encoded.attention_mask,
-                    doc_hidden[local_idx * max_len * hidden .. (local_idx + 1) * max_len * hidden],
-                    doc_ids[local_idx * max_len .. (local_idx + 1) * max_len],
-                    doc_mask[local_idx * max_len .. (local_idx + 1) * max_len],
+                    query_encoded.ids[0..query_len],
+                    query_encoded.attention_mask[0..query_len],
+                    doc_hidden[local_idx * document_len * hidden .. (local_idx + 1) * document_len * hidden],
+                    doc_ids[local_idx * document_len .. (local_idx + 1) * document_len],
+                    doc_mask[local_idx * document_len .. (local_idx + 1) * document_len],
                     hidden,
                     special,
                 );
@@ -247,6 +752,10 @@ pub const RerankingPipeline = struct {
         }
 
         return scores;
+    }
+
+    fn checkExecution(self: *const RerankingPipeline) !void {
+        if (self.execution_control) |control| try control.check();
     }
 
     /// Rerank and return results sorted by score descending.
@@ -420,9 +929,15 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.batch_dispatch) |dispatch| return dispatch.run(allocator, self.session, permit, self.execution_lock, inputs, self.execution_control);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, allocator);
+        return permit.runWithControl(inputs, allocator, self.execution_control);
     }
 
     fn admitTextRun(
@@ -430,16 +945,24 @@ pub const RerankingPipeline = struct {
         batch: usize,
         sequence: usize,
     ) !session_mod.RunPermit {
-        const tokens = std.math.mul(usize, batch, sequence) catch
+        try self.checkExecution();
+        const width = self.batchSequenceWidth(sequence);
+        const tokens = std.math.mul(usize, batch, width) catch
             return error.ResourceLimitExceeded;
-        return self.session.admit(.{
+        var permit = try self.session.admit(.{
             .batch = batch,
-            .sequence = sequence,
+            .sequence = width,
             .input_bytes = std.math.mul(usize, tokens, 24) catch
                 return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
-                return error.ResourceLimitExceeded,
         });
+        errdefer permit.deinit();
+        try self.checkExecution();
+        return permit;
+    }
+
+    fn batchSequenceWidth(self: *const RerankingPipeline, width: usize) usize {
+        if (self.batch_dispatch == null) return width;
+        return @import("batch_execution.zig").maskedSequenceBucket(self.session, width, self.config.max_length);
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
@@ -467,6 +990,32 @@ pub const RerankingPipeline = struct {
         }
     }
 };
+
+fn joinQwen3TextTokens(
+    allocator: std.mem.Allocator,
+    prefix: []const i32,
+    body: []const i32,
+    suffix: []const i32,
+    max_length: usize,
+) ![]i32 {
+    const reserved = std.math.add(usize, prefix.len, suffix.len) catch return error.InvalidRerankerConfiguration;
+    if (prefix.len == 0 or suffix.len == 0 or reserved >= max_length) return error.InvalidRerankerConfiguration;
+    const body_len = @min(body.len, max_length - reserved);
+    const result = try allocator.alloc(i32, reserved + body_len);
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len..][0..body_len], body[0..body_len]);
+    @memcpy(result[prefix.len + body_len ..], suffix);
+    return result;
+}
+
+test "Qwen3 text reranking truncates the body without losing its fixed scoring suffix" {
+    const allocator = std.testing.allocator;
+    const ids = try joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{ 3, 4, 5, 6 }, &.{ 7, 8, 9 }, 7);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 7, 8, 9 }, ids);
+    try std.testing.expectError(error.InvalidRerankerConfiguration, joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{3}, &.{ 7, 8, 9 }, 5));
+    try std.testing.expect(std.mem.endsWith(u8, qwen3_text_suffix, "<think>\n\n</think>\n\n"));
+}
 
 fn activeTokenLength(mask: []const i32) usize {
     var last_active: usize = 0;
@@ -500,6 +1049,10 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
         .{ .max_length = 8 },
     );
     const documents = [_][]const u8{ "first", "second" };
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try dynamic_pipeline.maxInputTokensPerItem("query", &documents),
+    );
     const dynamic_scores = try dynamic_pipeline.rerank("query", &documents);
     defer allocator.free(dynamic_scores);
     try std.testing.expectEqual(@as(usize, 2), dynamic_scores.len);
@@ -515,6 +1068,49 @@ test "cross encoder trims dynamic batches but preserves fixed input shapes" {
     const fixed_scores = try fixed_pipeline.rerank("query", &documents);
     defer allocator.free(fixed_scores);
     try std.testing.expectEqual(@as(usize, 8), fixed_session.last_sequence.load(.acquire));
+}
+
+test "cross encoder bounds working memory with configured batches" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    const documents = [_][]const u8{ "one", "two", "three", "four", "five" };
+    const scores = try pipeline.rerank("query", &documents);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, documents.len), scores.len);
+    try std.testing.expectEqual(@as(usize, 3), session_state.run_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, documents.len * 2), tokenizer_state.encode_count.load(.acquire));
+}
+
+test "cross encoder observes cancellation between bounded batches" {
+    const Control = struct {
+        runs: *std.atomic.Value(usize),
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.runs.load(.acquire) != 0) return error.Cancelled;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var control = Control{ .runs = &session_state.run_count };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8, .batch_size = 2 },
+    );
+    pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
+    try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &.{ "one", "two", "three" }));
+    try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
 
 test "cross encoder admission rejects before tokenization" {
@@ -543,6 +1139,120 @@ test "cross encoder admission rejects before tokenization" {
         pipeline.rerank("query", &.{"document"}),
     );
     try std.testing.expectEqual(@as(usize, 0), tokenizer_state.encode_count.load(.acquire));
+}
+
+test "prepared reranking inputs are bound to their pipeline generation" {
+    var first_session = FakeRerankingSession{ .fixed_sequence = false };
+    var second_session = FakeRerankingSession{ .fixed_sequence = false };
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var first = RerankingPipeline.init(
+        std.testing.allocator,
+        first_session.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var second = RerankingPipeline.init(
+        std.testing.allocator,
+        second_session.session(),
+        tokenizer_state.tokenizer(),
+        .{ .max_length = 8 },
+    );
+    var prepared = try first.prepareInputs("query", &.{"document"});
+    defer prepared.deinit();
+
+    try std.testing.expectError(
+        error.InvalidPreparedRerankInputs,
+        second.rerankPrepared(&prepared),
+    );
+    first.config.trim_padding_to_batch_max = false;
+    try std.testing.expectError(
+        error.InvalidPreparedRerankInputs,
+        first.rerankPrepared(&prepared),
+    );
+}
+
+test "late interaction materializes admitted trimmed widths and unwinds document failures" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var dynamic = FakeRerankingSession{ .fixed_sequence = false, .token_embeddings = true };
+    var pipeline = RerankingPipeline.init(allocator, dynamic.session(), tokenizer_state.tokenizer(), .{ .max_length = 8, .mode = .late_interaction });
+    var prepared = try pipeline.prepareInputs("query", &.{"document"});
+    defer prepared.deinit();
+    const scores = try pipeline.rerankPrepared(&prepared);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(prepared.max_input_tokens_per_item, dynamic.last_sequence.load(.acquire));
+    try std.testing.expect(dynamic.last_sequence.load(.acquire) < 8);
+    var fixed = FakeRerankingSession{ .fixed_sequence = true, .token_embeddings = true };
+    var exact = RerankingPipeline.init(allocator, fixed.session(), tokenizer_state.tokenizer(), .{ .max_length = 8, .mode = .late_interaction });
+    const fixed_scores = try exact.rerank("query", &.{"document"});
+    defer allocator.free(fixed_scores);
+    try std.testing.expectEqual(@as(usize, 8), fixed.last_sequence.load(.acquire));
+    try std.testing.expectEqualSlices(f32, scores, fixed_scores);
+    dynamic.run_count.store(0, .release);
+    dynamic.fail_document = true;
+    try std.testing.expectError(error.TestForwardFailure, pipeline.rerank("query", &.{"document"}));
+}
+
+test "prepared late-interaction inputs bind single-text encoding semantics" {
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var pipeline = RerankingPipeline.init(
+        std.testing.allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{
+            .max_length = 8,
+            .mode = .late_interaction,
+            .single_text_encoding = .generation,
+            .add_bos_token = true,
+        },
+    );
+    var prepared = try pipeline.prepareInputs("query", &.{"document"});
+    defer prepared.deinit();
+
+    pipeline.config.single_text_encoding = .encoder;
+    try std.testing.expectError(
+        error.InvalidPreparedRerankInputs,
+        pipeline.rerankPrepared(&prepared),
+    );
+
+    pipeline.config.single_text_encoding = .generation;
+    pipeline.config.add_bos_token = false;
+    try std.testing.expectError(
+        error.InvalidPreparedRerankInputs,
+        pipeline.rerankPrepared(&prepared),
+    );
+}
+
+test "generative yes-no reranking batches exact prompt paths without CLS extraction" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{
+            .max_length = 32,
+            .batch_size = 2,
+            .mode = .generative_yes_no,
+        },
+    );
+    var trace = GenerativeQualificationTrace.init(allocator);
+    defer trace.deinit();
+    pipeline.generative_qualification_trace = &trace;
+    const documents = [_][]const u8{ "Mars", "Venus", "Jupiter" };
+    const scores = try pipeline.rerank("red planet", &documents);
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, 3), scores.len);
+    for (scores) |score| try std.testing.expectApproxEqAbs(@as(f32, 0.5), score, 1e-6);
+    try std.testing.expectEqual(@as(usize, 2), session_state.run_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), session_state.last_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), trace.pairs.items.len);
+    try std.testing.expectEqual(@as(usize, 3), trace.raw_logits.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, trace.pairs.items[0].rendered_prompt, "<Query>:red planet") != null);
+    try std.testing.expectEqual(@as(f32, 0), trace.raw_logits.items[0]);
 }
 
 test "reranking execution gate blocks the session forward pass" {
@@ -577,13 +1287,19 @@ test "reranking execution gate blocks the session forward pass" {
     };
 
     var worker = Worker{ .pipeline = &pipeline };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    while (!worker.started.load(.acquire)) std.Thread.yield() catch {};
-    for (0..64) |_| std.Thread.yield() catch {};
+    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread_awaited = false;
+    defer if (!thread_awaited) {
+        gate.unlock();
+        thread.await(std.testing.io);
+    };
+    while (!worker.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..64) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(usize, 0), session_state.run_count.load(.acquire));
 
     gate.unlock();
-    thread.join();
+    thread.await(std.testing.io);
+    thread_awaited = true;
     try std.testing.expect(!worker.failed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
@@ -602,6 +1318,8 @@ test "reranking score extraction rejects malformed output shapes" {
 
 const FakeRerankingSession = struct {
     fixed_sequence: bool,
+    token_embeddings: bool = false,
+    fail_document: bool = false,
     run_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     last_sequence: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -610,6 +1328,7 @@ const FakeRerankingSession = struct {
             .ptr = self,
             .vtable = &.{
                 .run = run,
+                .runWithControl = runWithControl,
                 .inputInfo = inputInfo,
                 .outputInfo = outputInfo,
                 .backend = backend,
@@ -625,12 +1344,39 @@ const FakeRerankingSession = struct {
         _ = self.run_count.fetchAdd(1, .acq_rel);
         self.last_sequence.store(sequence, .release);
 
+        if (self.fail_document and self.run_count.load(.acquire) > 1) return error.TestForwardFailure;
+        if (self.token_embeddings) {
+            const values = try allocator.alloc(f32, batch * sequence * 2);
+            defer allocator.free(values);
+            @memset(values, 1);
+            const out = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(out);
+            out[0] = try Tensor.initFloat32(allocator, "last_hidden_state", &.{ @intCast(batch), @intCast(sequence), 2 }, values);
+            return out;
+        }
+
         const logits = try allocator.alloc(f32, batch);
         defer allocator.free(logits);
         @memset(logits, 0.0);
         const out = try allocator.alloc(Tensor, 1);
         out[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), 1 }, logits);
         return out;
+    }
+
+    fn runWithControl(
+        ptr: *anyopaque,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ExecutionControl,
+    ) anyerror![]Tensor {
+        try control.check();
+        const outputs = try run(ptr, inputs, allocator);
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            allocator.free(outputs);
+        }
+        try control.check();
+        return outputs;
     }
 
     fn inputInfo(ptr: *anyopaque) []const backends.TensorInfo {
@@ -647,7 +1393,9 @@ const FakeRerankingSession = struct {
             };
     }
 
-    fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+    fn outputInfo(raw: *anyopaque) []const backends.TensorInfo {
+        const self: *FakeRerankingSession = @ptrCast(@alignCast(raw));
+        if (self.token_embeddings) return &.{.{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, 2 } }};
         return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } }};
     }
 
@@ -838,9 +1586,7 @@ test "reranking score extraction handles single-logit classifier output" {
 
 test "reranking returns an empty score list for empty documents" {
     const allocator = std.testing.allocator;
-    var pipeline: RerankingPipeline = undefined;
-    pipeline.allocator = allocator;
-    pipeline.config = .{};
+    var pipeline = RerankingPipeline.init(allocator, undefined, undefined, .{});
 
     const scores = try pipeline.rerank("what is cuda", &.{});
     defer allocator.free(scores);

@@ -48,8 +48,8 @@ pub const http_routes = @import("http_routes.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 pub const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
-pub const table_reads = @import("table_reads.zig");
-pub const table_writes = @import("table_writes.zig");
+pub const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
+pub const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 pub const kernel_owner_source = @import("kernel_owner_source.zig");
 pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
@@ -333,7 +333,7 @@ test "public graph result_ref fail-closed guards are covered" {
 }
 
 test "api table reads reject distributed resolved doc filters" {
-    const db_mod = @import("../storage/db/mod.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 
     var sentinel: u8 = 0;
     var req: db_mod.types.SearchRequest = .{
@@ -467,7 +467,7 @@ test "api public table query rejects only top-level internal fields" {
 
 test "api query contract tensor program envelope preserves dictionary identity" {
     const alloc = std.testing.allocator;
-    const algebraic = @import("../storage/db/mod.zig").algebraic;
+    const algebraic = @import("antfly_source_root").antfly_sources.selected_db.algebraic;
     const dictionary = algebraic.lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
     const input_expr = algebraic.ir.TensorExpr{
         .fragment = .automaton_select,

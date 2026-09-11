@@ -1,10 +1,9 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RerankerProvider(str, Enum):
+class RerankerProvider(StrEnum):
     ANTFLY = "antfly"
     COHERE = "cohere"
-    OLLAMA = "ollama"
     VERTEX = "vertex"
 
     def __str__(self) -> str:

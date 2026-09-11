@@ -25,12 +25,13 @@ const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagn
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
-const graph_request_diagnostics = @import("graph_request_diagnostics.zig");
+const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const query_contract = @import("query_contract.zig");
 const operation = @import("operation.zig");
+const reranking_contract = @import("antfly_reranking");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
 threadlocal var last_ambiguous_batch_txn_id: ?[32]u8 = null;
@@ -138,11 +139,13 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        DistributedQueryUnavailable,
         StorageReadTemporarilyUnavailable,
         IndexRebuilding,
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        RerankerCandidateLimitExceeded,
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
         GraphMaxWeightDomainViolation,
@@ -157,10 +160,15 @@ pub const TableApi = struct {
         HierarchyCursorStale,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
+        EmbeddingIndexNotFound,
         QueryEmbeddingOverloaded,
         EmbedRateLimited,
         EmbedTransientFailure,
         EmbedUpstreamFailure,
+        RerankRateLimited,
+        RerankTransientFailure,
+        RerankUpstreamFailure,
+        Timeout,
         Canceled,
         DeadlineExceeded,
         InvalidManifest,
@@ -265,6 +273,7 @@ pub const TableApi = struct {
     pub const ExecuteCreateIndexError = error{
         Canceled,
         DeadlineExceeded,
+        MetadataMutationOutcomeUnknown,
         NotLeader,
         NotFound,
         Conflict,
@@ -286,6 +295,7 @@ pub const TableApi = struct {
     pub const ExecuteDeleteIndexError = error{
         Canceled,
         DeadlineExceeded,
+        MetadataMutationOutcomeUnknown,
         NotLeader,
         NotFound,
         Conflict,
@@ -693,17 +703,34 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
+pub const MetadataMutationOutcome = enum {
+    unknown,
+};
+
+const index_mutation_outcome_unknown_json =
+    "{\"error\":\"metadata_mutation_outcome_unknown\",\"message\":\"index mutation outcome is unknown; observe index state before retrying\",\"retryable\":false}";
+
 pub const OwnedResponse = struct {
     status: u16,
     body: []u8,
     json: bool = false,
     retry_after_seconds: ?u32 = null,
+    metadata_mutation_outcome: ?MetadataMutationOutcome = null,
 
     pub fn deinit(self: *OwnedResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
         self.* = undefined;
     }
 };
+
+fn indexMutationOutcomeUnknownResponse(alloc: std.mem.Allocator) !OwnedResponse {
+    return .{
+        .status = 409,
+        .body = try alloc.dupe(u8, index_mutation_outcome_unknown_json),
+        .json = true,
+        .metadata_mutation_outcome = .unknown,
+    };
+}
 
 pub const storage_read_temporarily_unavailable_body = "{\"code\":\"storage_read_temporarily_unavailable\",\"message\":\"storage read temporarily unavailable\",\"retryable\":true}";
 pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
@@ -714,9 +741,11 @@ pub const QueryTemporarilyUnavailableReason = enum {
     doc_identity_unavailable,
     read_requires_primary,
     standby_read_unavailable,
+    distributed_query_unavailable,
     storage_read_temporarily_unavailable,
     index_rebuilding,
     query_embedding_temporarily_unavailable,
+    reranker_temporarily_unavailable,
 };
 
 pub fn queryTemporarilyUnavailableOwnedResponse(
@@ -727,9 +756,11 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .doc_identity_unavailable => "doc identity unavailable",
         .read_requires_primary => "read requires primary",
         .standby_read_unavailable => "standby read unavailable",
+        .distributed_query_unavailable => "distributed query unavailable",
         .storage_read_temporarily_unavailable => "storage read temporarily unavailable",
         .index_rebuilding => "required index is rebuilding",
         .query_embedding_temporarily_unavailable => "query embedding temporarily unavailable",
+        .reranker_temporarily_unavailable => "reranker temporarily unavailable",
     };
     return .{
         .status = 503,
@@ -741,6 +772,55 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .json = true,
         .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
     };
+}
+
+pub fn queryDependencyErrorOwnedResponse(
+    alloc: std.mem.Allocator,
+    status: u16,
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+) !OwnedResponse {
+    return .{
+        .status = status,
+        .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .code = code,
+            .@"error" = code,
+            .message = message,
+            .retryable = retryable,
+        }, .{}),
+        .json = true,
+        .retry_after_seconds = if (retryable) 1 else null,
+    };
+}
+
+test "query dependency errors expose a stable JSON retry contract" {
+    const alloc = std.testing.allocator;
+    var response = try queryDependencyErrorOwnedResponse(
+        alloc,
+        429,
+        "reranker_rate_limited",
+        "reranker rate limited",
+        true,
+    );
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expect(response.json);
+    try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+
+    const Parsed = struct {
+        code: []const u8,
+        @"error": []const u8,
+        message: []const u8,
+        retryable: bool,
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("reranker_rate_limited", parsed.value.code);
+    try std.testing.expectEqualStrings(parsed.value.code, parsed.value.@"error");
+    try std.testing.expectEqualStrings("reranker rate limited", parsed.value.message);
+    try std.testing.expect(parsed.value.retryable);
 }
 
 pub fn storageReadTemporarilyUnavailableOwnedResponse(alloc: std.mem.Allocator) !OwnedResponse {
@@ -815,6 +895,37 @@ pub const UnsupportedQueryError = struct {
 
 pub fn unsupportedQueryBody(alloc: std.mem.Allocator) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, UnsupportedQueryError{}, .{});
+}
+
+/// Stable, non-retryable response for a reranker window that the selected
+/// provider cannot rank in one request. Vertex is currently the only public
+/// provider with a ceiling below Antfly's global 1,000-candidate bound.
+pub const RerankerCandidateLimitExceededError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "reranker_candidate_limit_exceeded",
+    message: []const u8 = "reranker candidate window exceeds the selected provider limit",
+    provider: reranking_contract.Provider,
+    maximum: u32,
+    retryable: bool = false,
+};
+
+pub fn rerankerCandidateLimitExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = reranking_contract.takeCandidateLimitDiagnostic() orelse
+        return error.MissingRerankerCandidateLimitDiagnostic;
+    return try std.json.Stringify.valueAlloc(alloc, RerankerCandidateLimitExceededError{
+        .provider = diagnostic.provider,
+        .maximum = diagnostic.maximum,
+    }, .{});
+}
+
+pub fn rerankerCandidateLimitExceededMessageAlloc(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = reranking_contract.takeCandidateLimitDiagnostic() orelse
+        return error.MissingRerankerCandidateLimitDiagnostic;
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s} reranker supports at most {d} candidates per query",
+        .{ @tagName(diagnostic.provider), diagnostic.maximum },
+    );
 }
 
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
@@ -1262,7 +1373,12 @@ pub fn handleTableBatch(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
+        error.Backpressured => return .{
+            .status = 429,
+            .body = try alloc.dupe(u8, "{\"code\":\"table_backpressured\",\"message\":\"write capacity is temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.DenseRepairBackpressure => return .{
             .status = 429,
             .body = try alloc.dupe(u8, "{\"code\":\"dense_repair_backpressure\",\"message\":\"writes are temporarily limited while a dense index rebuild catches up\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -1340,8 +1456,8 @@ pub fn handleTableQueryRequest(
     row_filter_json: ?[]const u8,
     api: TableApi,
 ) !OwnedResponse {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
 
     if (try bodyHasInternalShardQueryFields(alloc, body)) {
@@ -1350,10 +1466,7 @@ pub fn handleTableQueryRequest(
     }
 
     db_mod.resetLastSortRejectionDiagnostic();
-    graph_query_diagnostic.reset();
-    graph_distinct_budget_diagnostic.reset();
-    graph_work_budget_diagnostic.reset();
-    graph_path_weight_diagnostic.reset();
+    query_request_diagnostics.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -1420,6 +1533,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .standby_read_unavailable);
             },
+            error.DistributedQueryUnavailable => {
+                std.log.info("public table distributed query temporarily unavailable table={s}", .{table_name});
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .distributed_query_unavailable);
+            },
             error.StorageReadTemporarilyUnavailable => {
                 std.log.warn("public table query storage temporarily unavailable table={s}", .{table_name});
                 return try storageReadTemporarilyUnavailableOwnedResponse(alloc);
@@ -1435,6 +1552,10 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
+            },
+            error.RerankerCandidateLimitExceeded => {
+                std.log.warn("public table query exceeds reranker provider candidate limit table={s}", .{table_name});
+                return .{ .status = 422, .body = try rerankerCandidateLimitExceededBody(alloc), .json = true };
             },
             error.GraphWorkBudgetExceeded => {
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
@@ -1485,13 +1606,16 @@ pub fn handleTableQueryRequest(
                 };
             },
             error.QueryEmbeddingInputTooLarge => {
-                return .{ .status = 413, .body = try alloc.dupe(u8, "query embedding input too large") };
+                return try queryDependencyErrorOwnedResponse(alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false);
+            },
+            error.EmbeddingIndexNotFound => {
+                return try queryDependencyErrorOwnedResponse(alloc, 422, "embedding_index_not_found", "embedding index not found", false);
             },
             error.QueryEmbeddingOverloaded => {
-                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding overloaded") };
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true);
             },
             error.EmbedRateLimited => {
-                return .{ .status = 429, .body = try alloc.dupe(u8, "query embedding rate limited") };
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true);
             },
             error.EmbedTransientFailure => {
                 std.log.warn("public table query embedding temporarily unavailable table={s}", .{table_name});
@@ -1499,7 +1623,21 @@ pub fn handleTableQueryRequest(
             },
             error.EmbedUpstreamFailure => {
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
-                return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
+                return try queryDependencyErrorOwnedResponse(alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false);
+            },
+            error.RerankRateLimited => {
+                return try queryDependencyErrorOwnedResponse(alloc, 429, "reranker_rate_limited", "reranker rate limited", true);
+            },
+            error.RerankTransientFailure => {
+                std.log.warn("public table reranker temporarily unavailable table={s}", .{table_name});
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .reranker_temporarily_unavailable);
+            },
+            error.RerankUpstreamFailure => {
+                std.log.warn("public table reranker upstream failure table={s}", .{table_name});
+                return try queryDependencyErrorOwnedResponse(alloc, 502, "reranker_upstream_failure", "reranker provider failed", false);
+            },
+            error.Timeout => {
+                return try queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
             },
             error.IncompletePublishedSnapshot => {
                 std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});
@@ -1611,9 +1749,10 @@ pub fn handleTableBackup(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
-    return handleTableBackupExpectedFence(alloc, table_name, body, null, api, secret_store, node_config, io);
+    return handleTableBackupExpectedFence(alloc, table_name, body, null, api, secret_store, node_config, network_io, filesystem_io);
 }
 
 pub fn handleTableBackupExpectedFence(
@@ -1624,7 +1763,8 @@ pub fn handleTableBackupExpectedFence(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
@@ -1642,7 +1782,8 @@ pub fn handleTableBackupExpectedFence(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "backup.write",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -1713,7 +1854,8 @@ pub fn handleTableRestore(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
-    io: ?std.Io,
+    network_io: ?std.Io,
+    filesystem_io: ?std.Io,
 ) !OwnedResponse {
     const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -1728,7 +1870,8 @@ pub fn handleTableRestore(
         .node_config = node_config,
         .connection = parsed_req.value.connection,
         .required_capability = "restore.read",
-        .io = io,
+        .network_io = network_io,
+        .filesystem_io = filesystem_io,
     }) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
             return .{ .status = 400, .body = try alloc.dupe(u8, msg) };
@@ -1792,6 +1935,7 @@ test "public table backup and restore require named connections" {
         null,
         null,
         null,
+        null,
     );
     defer backup.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), backup.status);
@@ -1802,6 +1946,7 @@ test "public table backup and restore require named connections" {
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"s3://archive/snap\"}",
         undefined,
+        null,
         null,
         null,
         null,
@@ -1861,6 +2006,7 @@ pub fn handleTableCreateIndex(
 ) !OwnedResponse {
     const response_body = api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataMutationOutcomeUnknown => return try indexMutationOutcomeUnknownResponse(alloc),
         error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
@@ -1904,12 +2050,13 @@ pub fn handleTableDeleteIndex(
 ) !OwnedResponse {
     api.executeTableDeleteIndex(alloc, table_name, index_name) catch |err| switch (err) {
         error.Canceled, error.DeadlineExceeded => return err,
+        error.MetadataMutationOutcomeUnknown => return try indexMutationOutcomeUnknownResponse(alloc),
         error.NotLeader => return err,
-        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
-        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
-        error.DependencyConflict => return .{ .status = 409, .body = try alloc.dupe(u8, "artifact dependency prevents deletion") },
-        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"not_found\",\"message\":\"not found\",\"retryable\":false}"), .json = true },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
+        error.DependencyConflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"artifact_dependency_conflict\",\"message\":\"artifact dependency prevents deletion\",\"retryable\":false}"), .json = true },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index delete failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
@@ -2580,6 +2727,106 @@ test "public table api carries borrowed cancellation into batch execution" {
     try std.testing.expectError(error.Canceled, api.executeTableQueryView(std.testing.allocator, "docs", .published));
 }
 
+test "public index mutations preserve an explicit outcome-unknown contract" {
+    const Backend = struct {
+        delete_dependency_conflict: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = executeDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.MetadataMutationOutcomeUnknown;
+        }
+
+        fn executeDeleteIndex(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteDeleteIndexError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.delete_dependency_conflict) return error.DependencyConflict;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+
+    var backend = Backend{};
+    var create_response = try handleTableCreateIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        "{}",
+        backend.iface(),
+    );
+    defer create_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), create_response.status);
+    try std.testing.expect(create_response.json);
+    try std.testing.expectEqual(MetadataMutationOutcome.unknown, create_response.metadata_mutation_outcome.?);
+    try std.testing.expectEqual(@as(?u32, null), create_response.retry_after_seconds);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, index_mutation_outcome_unknown_json, create_response.body);
+
+    var delete_response = try handleTableDeleteIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        backend.iface(),
+    );
+    defer delete_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), delete_response.status);
+    try std.testing.expect(delete_response.json);
+    try std.testing.expectEqual(MetadataMutationOutcome.unknown, delete_response.metadata_mutation_outcome.?);
+    try std.testing.expectEqual(@as(?u32, null), delete_response.retry_after_seconds);
+    try ant_json.testing.expectEqualJsonText(std.testing.allocator, index_mutation_outcome_unknown_json, delete_response.body);
+
+    backend.delete_dependency_conflict = true;
+    var dependency_response = try handleTableDeleteIndex(
+        std.testing.allocator,
+        "docs",
+        "search",
+        backend.iface(),
+    );
+    defer dependency_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), dependency_response.status);
+    try std.testing.expect(dependency_response.json);
+    try std.testing.expect(dependency_response.metadata_mutation_outcome == null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"error\":\"artifact_dependency_conflict\",\"message\":\"artifact dependency prevents deletion\",\"retryable\":false}",
+        dependency_response.body,
+    );
+}
+
 test "public create index exposes retryable storage descriptor exhaustion" {
     const Backend = struct {
         fn iface(self: *@This()) TableApi {
@@ -2814,7 +3061,9 @@ test "public table batch handler maps backend errors" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 429), resp.status);
-    try std.testing.expectEqualStrings("table backpressured", resp.body);
+    try std.testing.expect(resp.json);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "table_backpressured") != null);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
 }
 
 test "public table batch handler returns concise dense repair backpressure" {
@@ -3264,6 +3513,64 @@ test "public table query handler maps doc identity unavailable errors" {
     );
 }
 
+test "public table query reports the selected reranker candidate ceiling" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteQueryError![]u8 {
+            const cfg = reranking_contract.Config{
+                .provider = .antfly,
+                .field = "body",
+                .candidate_count = reranking_contract.max_candidate_count + 1,
+            };
+            cfg.validate() catch |err| switch (err) {
+                error.RerankerCandidateLimitExceeded => return error.RerankerCandidateLimitExceeded,
+                else => return error.InvalidQueryRequest,
+            };
+            return error.InvalidQueryRequest;
+        }
+    };
+
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"full_text_search":{"query":"raft"},"reranker":{"provider":"antfly","model":"reranker","field":"body","candidate_count":1001}}
+    , null, Backend.iface());
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    var parsed = try std.json.parseFromSlice(
+        RerankerCandidateLimitExceededError,
+        std.testing.allocator,
+        response.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(reranking_contract.Provider.antfly, parsed.value.provider);
+    try std.testing.expectEqual(reranking_contract.max_candidate_count, parsed.value.maximum);
+}
+
 test "public table query handler preserves structured filter and hierarchy diagnostics" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
@@ -3384,6 +3691,10 @@ test "public table query handler preserves structured filter and hierarchy diagn
 }
 
 test "public table query handler preserves retryable failure status" {
+    // Corrupt persistent storage is intentionally logged at error severity;
+    // the strict CI runner requires tests to declare those exercised paths.
+    @import("../test_error_logs.zig").expectErrorLogs(2);
+
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -3422,21 +3733,23 @@ test "public table query handler preserves retryable failure status" {
         status: u16,
         body: []const u8,
         json: bool = false,
+        retry_after_seconds: ?u32 = null,
         unavailable_code: ?[]const u8 = null,
         unavailable_message: []const u8 = "",
     };
     const cases = [_]Case{
-        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "query embedding input too large" },
-        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "query embedding overloaded" },
-        .{ .err = error.EmbedRateLimited, .status = 429, .body = "query embedding rate limited" },
-        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
-        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "query embedding provider failed" },
-        .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
-        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
+        .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "{\"code\":\"query_embedding_input_too_large\",\"error\":\"query_embedding_input_too_large\",\"message\":\"query embedding input too large\",\"retryable\":false}", .json = true },
+        .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "{\"code\":\"query_embedding_overloaded\",\"error\":\"query_embedding_overloaded\",\"message\":\"query embedding overloaded\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
+        .{ .err = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "{\"code\":\"query_embedding_upstream_failure\",\"error\":\"query_embedding_upstream_failure\",\"message\":\"query embedding provider failed\",\"retryable\":false}", .json = true },
+        .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
-        .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
+        .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 
     for (cases) |tc| {
@@ -3452,10 +3765,7 @@ test "public table query handler preserves retryable failure status" {
             try std.testing.expectEqualStrings(tc.body, resp.body);
         }
         try std.testing.expectEqual(tc.json, resp.json);
-        try std.testing.expectEqual(
-            if (tc.unavailable_code != null) @as(?u32, 1) else null,
-            resp.retry_after_seconds,
-        );
+        try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
     }
 }
 
@@ -4270,8 +4580,8 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
 }
 
 test "runtime graph capability diagnostics preserve the failing named operation" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
@@ -4298,8 +4608,8 @@ test "runtime graph capability diagnostics preserve the failing named operation"
 }
 
 test "recorded graph diagnostics explain serverless legacy rejection" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
@@ -4335,8 +4645,8 @@ test "recorded graph diagnostics explain serverless legacy rejection" {
 }
 
 test "recorded graph diagnostics identify unsupported request controls" {
-    var diagnostic_context: graph_request_diagnostics.Context = .{};
-    const diagnostic_scope = graph_request_diagnostics.Scope.init(&diagnostic_context);
+    var diagnostic_context: query_request_diagnostics.Context = .{};
+    const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
     defer diagnostic_scope.deinit();
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
@@ -4721,6 +5031,7 @@ test "public table backup handler maps unsupported multi-range error" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -4774,6 +5085,7 @@ test "public table backup handler rejects an existing backup id" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -4847,6 +5159,7 @@ test "public table backup handler exposes non-retryable fenced outcomes" {
             null,
             &node_config,
             null,
+            null,
         );
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.status, resp.status);
@@ -4908,6 +5221,7 @@ test "public table backup handler accepts portable format" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -4960,6 +5274,7 @@ test "public table restore handler maps target already exists" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5010,6 +5325,7 @@ test "public table restore handler maps unsupported multi-range error" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);
@@ -5062,6 +5378,7 @@ test "public table restore handler reports artifact integrity failures" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5113,6 +5430,7 @@ test "public table restore handler reports committed durability pending" {
         null,
         &node_config,
         null,
+        null,
     );
     defer resp.deinit(std.testing.allocator);
 
@@ -5163,6 +5481,7 @@ test "public table restore handler reports confirmed durability" {
         Backend.iface(),
         null,
         &node_config,
+        null,
         null,
     );
     defer resp.deinit(std.testing.allocator);

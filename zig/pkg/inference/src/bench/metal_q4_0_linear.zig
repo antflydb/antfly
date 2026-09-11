@@ -21,6 +21,9 @@ const QuantizedStorage = metal_runtime.QuantizedStorage;
 const quant_codec = inference_internal.gguf.quant_codec;
 const ops = inference_internal.ops;
 
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
 fn q4RowBytes(in_dim: usize) u64 {
     return @intCast(((in_dim + 31) / 32) * 18);
 }
@@ -130,6 +133,10 @@ const Config = struct {
     warmup_iters: usize = 20,
     measure_iters: usize = 200,
     ops_per_frame: usize = 1,
+    q4_k: bool = false,
+    q4_k_f16_mps: bool = false,
+    q4_k_bf16: bool = false,
+    compare_q6_high_row: bool = false,
     expect_q4_route: ?Q4MmRoute = null,
     expect_q4_mmv_variant: ?Q4MmvVariant = null,
     expect_q4_mmv_auto: bool = false,
@@ -144,7 +151,7 @@ const Config = struct {
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
+        \\usage: zig build inference-metal-bench -- [--mode linear|q6-linear|q6-argmax|head-rope|pair|qkv|split-qkv|ffn|ple] [--q4-k] [--q4-k-f16-mps|--q4-k-bf16] [--compare-q6-high-row] [--rows N] [--in N] [--out N] [--kv-out N] [--warmup N] [--iters N] [--ops-per-frame N] [--expect-q4-route aligned|aligned-tail|unrolled] [--expect-q4-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-mmv-auto] [--expect-q4-mmv-fallbacks N] [--expect-q4-pair-mmv-variant nr4-nsg2|nr8-nsg2|nr4-nsg4|nr8-nsg4] [--expect-q4-pair-mmv-fallbacks N] [--expect-q4-pair-mm-route m32-n64-aligned|m32-n64-tail|m32-n32-aligned|m32-n32-tail] [--expect-q4-pair-mm-fallbacks N] [--expect-output-hash HEX] [--skip-unless-apple-m4]
         \\
     , .{});
 }
@@ -171,6 +178,24 @@ fn parseArgs(args: []const [:0]const u8) !Config {
         }
         if (std.mem.eql(u8, arg, "--skip-unless-apple-m4")) {
             cfg.skip_unless_apple_m4 = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--q4-k")) {
+            cfg.q4_k = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--q4-k-f16-mps")) {
+            cfg.q4_k = true;
+            cfg.q4_k_f16_mps = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--q4-k-bf16")) {
+            cfg.q4_k = true;
+            cfg.q4_k_bf16 = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--compare-q6-high-row")) {
+            cfg.compare_q6_high_row = true;
             continue;
         }
         if (i + 1 >= args.len) return error.InvalidArgument;
@@ -219,10 +244,14 @@ fn parseArgs(args: []const [:0]const u8) !Config {
     }
 
     if (cfg.in_dim % 32 != 0) return error.InvalidArgument;
+    if (cfg.q4_k and cfg.in_dim % 256 != 0) return error.InvalidArgument;
+    if (cfg.q4_k_f16_mps and cfg.q4_k_bf16) return error.InvalidArgument;
+    if (cfg.compare_q6_high_row and cfg.mode != .q6_linear) return error.InvalidArgument;
     if ((cfg.mode == .q6_linear or cfg.mode == .q6_argmax) and cfg.in_dim % 256 != 0) return error.InvalidArgument;
     if (cfg.mode == .head_rope and (cfg.out_dim == 0 or cfg.in_dim % cfg.out_dim != 0 or cfg.kv_out_dim > cfg.out_dim)) return error.InvalidArgument;
     if (cfg.mode != .linear and cfg.kv_out_dim == 0) return error.InvalidArgument;
-    if (cfg.rows != 1 and cfg.mode != .linear and cfg.mode != .q6_linear and cfg.mode != .ffn) return error.InvalidArgument;
+    if (cfg.rows != 1 and cfg.mode != .linear and cfg.mode != .q6_linear and cfg.mode != .ffn and
+        !(cfg.q4_k and (cfg.mode == .pair or cfg.mode == .qkv or cfg.mode == .split_qkv))) return error.InvalidArgument;
     if (cfg.expect_q4_route != null and cfg.mode != .linear) return error.InvalidArgument;
     if (cfg.expect_q4_mmv_variant != null and
         ((cfg.mode != .linear and cfg.mode != .ffn) or cfg.rows != 1)) return error.InvalidArgument;
@@ -297,6 +326,27 @@ fn fillQ6_KWeights(raw: []u8, dense_block: []f32, in_dim: usize, out_dim: usize)
                 value.* = @as(f32, @floatFromInt(signed)) / 89.0;
             }
             quant_codec.quantizeQ6_KBlock(
+                dense_block[0..values_per_block],
+                raw[row * row_bytes + block * bytes_per_block ..][0..bytes_per_block],
+            );
+        }
+    }
+}
+
+fn fillQ4_KWeights(raw: []u8, dense_block: []f32, in_dim: usize, out_dim: usize, seed: usize) void {
+    const values_per_block: usize = 256;
+    const bytes_per_block: usize = 144;
+    const row_blocks = in_dim / values_per_block;
+    const row_bytes = row_blocks * bytes_per_block;
+
+    for (0..out_dim) |row| {
+        for (0..row_blocks) |block| {
+            for (dense_block[0..values_per_block], 0..) |*value, offset| {
+                const col = block * values_per_block + offset;
+                const signed = @as(i32, @intCast((row * 31 + col * 13 + seed * 17 + 7) % 139)) - 69;
+                value.* = @as(f32, @floatFromInt(signed)) / 97.0;
+            }
+            quant_codec.quantizeQ4_KBlock(
                 dense_block[0..values_per_block],
                 raw[row * row_bytes + block * bytes_per_block ..][0..bytes_per_block],
             );
@@ -439,6 +489,85 @@ fn prepareQ6_KLinearSlot(
     return .{ .raw = raw, .shape = shape, .storage = storage, .bias = bias };
 }
 
+fn prepareQ4_KLinearSlot(
+    allocator: std.mem.Allocator,
+    provider: *metal_native_provider.MetalNativeProvider,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+    stats: *ops.NativeQuantTimingStats,
+    prefer_f16_mps: bool,
+    prefer_bf16: bool,
+) !PreparedQuantSlot {
+    if (in_dim % 256 != 0) return error.InvalidArgument;
+    const row_blocks = in_dim / 256;
+    const row_bytes = row_blocks * 144;
+    const raw = try allocator.alloc(u8, out_dim * row_bytes);
+    errdefer allocator.free(raw);
+    const dense_block = try allocator.alloc(f32, 256);
+    defer allocator.free(dense_block);
+    fillQ4_KWeights(raw, dense_block, in_dim, out_dim, slot);
+
+    const bias_data = try allocator.alloc(f32, out_dim);
+    defer allocator.free(bias_data);
+    @memset(bias_data, 0.0);
+    var bias = try MetalTensor.ownedCloneFrom(bias_data, &[_]i32{@intCast(out_dim)});
+    errdefer bias.deinit();
+
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    const shape = try allocator.alloc(i64, 2);
+    errdefer allocator.free(shape);
+    shape[0] = @intCast(out_dim);
+    shape[1] = @intCast(in_dim);
+    const storage = try allocator.create(QuantizedStorage);
+    errdefer allocator.destroy(storage);
+    storage.* = QuantizedStorage{
+        .tensor_type = .{ .known = .Q4_K },
+        .raw_bytes = raw,
+        .shape = shape,
+        .raw_owned = false,
+        .allocator = allocator,
+    };
+
+    if (!(try metal_runtime.decoderRuntimePrepareLinear(provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, storage),
+        .slot = slot,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .retain_dense_fallback = prefer_f16_mps or prefer_bf16,
+        .dense_fallback_max_bytes = if (prefer_f16_mps or prefer_bf16) @as(?usize, 32 * 1024 * 1024) else null,
+        .allow_direct_quant_fallback = prefer_f16_mps or prefer_bf16,
+        .prefer_f16_mps_fallback = prefer_f16_mps,
+        .prefer_bf16_fallback = prefer_bf16,
+    }, stats))) return error.LinearPrepareFailed;
+    if (provider.raw_linear_slot_dense_biases[slot]) |*prepared_bias| {
+        prepared_bias.deinit();
+        provider.raw_linear_slot_dense_biases[slot] = null;
+    }
+
+    return .{ .raw = raw, .shape = shape, .storage = storage, .bias = bias };
+}
+
+fn prepareQ4LinearSlot(
+    q4_k: bool,
+    q4_k_f16_mps: bool,
+    q4_k_bf16: bool,
+    allocator: std.mem.Allocator,
+    provider: *metal_native_provider.MetalNativeProvider,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+    stats: *ops.NativeQuantTimingStats,
+) !PreparedQuantSlot {
+    return if (q4_k)
+        prepareQ4_KLinearSlot(allocator, provider, slot, in_dim, out_dim, stats, q4_k_f16_mps, q4_k_bf16)
+    else
+        prepareQ4_0LinearSlot(allocator, provider, slot, in_dim, out_dim, stats);
+}
+
 fn nowNanos() u64 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
@@ -472,6 +601,26 @@ fn applyOnce(
     try metal_runtime.waitFrame(runtime);
     for (outputs) |*output| output.deinit();
     return nowNanos() - start;
+}
+
+fn captureLinearOutput(
+    provider: *metal_native_provider.MetalNativeProvider,
+    runtime: *metal_runtime.RawMetalDecodeRuntime,
+    input: MetalTensor,
+    in_dim: usize,
+    out_dim: usize,
+) !MetalTensor {
+    try metal_runtime.beginFrame(runtime);
+    var output = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
+        .slot = 0,
+        .input = input,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    })) orelse return error.LinearDispatchFailed;
+    errdefer output.deinit();
+    try metal_runtime.submitFrame(runtime);
+    try metal_runtime.waitFrame(runtime);
+    return output;
 }
 
 fn applyLinearArgmaxOnce(
@@ -600,52 +749,74 @@ fn applyQkvOnce(
     var produced: usize = 0;
     errdefer for (outputs[0..produced]) |*output| output.deinit();
     while (produced < outputs.len) : (produced += 1) {
-        outputs[produced] = switch (cfg.mode) {
-            .linear, .q6_linear, .q6_argmax, .head_rope, .pair, .ple => unreachable,
-            .qkv => qkv: {
-                const qkv = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(
-                    provider,
-                    0,
-                    1,
-                    2,
-                    input,
-                    1,
-                    cfg.in_dim,
-                    cfg.out_dim,
-                    cfg.kv_out_dim,
-                )) orelse return error.LinearDispatchFailed;
-                break :qkv .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
-            },
-            .split_qkv => split: {
-                var q = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
-                    .slot = 0,
-                    .input = input,
-                    .in_dim = cfg.in_dim,
-                    .out_dim = cfg.out_dim,
-                })) orelse return error.LinearDispatchFailed;
-                errdefer q.deinit();
-                var k = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
-                    .slot = 1,
-                    .input = input,
-                    .in_dim = cfg.in_dim,
-                    .out_dim = cfg.kv_out_dim,
-                })) orelse return error.LinearDispatchFailed;
-                errdefer k.deinit();
-                const v = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
-                    .slot = 2,
-                    .input = input,
-                    .in_dim = cfg.in_dim,
-                    .out_dim = cfg.kv_out_dim,
-                })) orelse return error.LinearDispatchFailed;
-                break :split .{ .q = q, .k = k, .v = v };
-            },
-            .ffn => unreachable,
-        };
+        outputs[produced] = try encodeQkvOutput(provider, input, cfg);
     }
     try metal_runtime.submitFrame(runtime);
     try metal_runtime.waitFrame(runtime);
     for (outputs) |*output| output.deinit();
     return nowNanos() - start;
+}
+
+fn encodeQkvOutput(
+    provider: *metal_native_provider.MetalNativeProvider,
+    input: MetalTensor,
+    cfg: Config,
+) !QkvOutput {
+    return switch (cfg.mode) {
+        .linear, .q6_linear, .q6_argmax, .head_rope, .pair, .ple => unreachable,
+        .qkv => qkv: {
+            const qkv = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(
+                provider,
+                0,
+                1,
+                2,
+                input,
+                cfg.rows,
+                cfg.in_dim,
+                cfg.out_dim,
+                cfg.kv_out_dim,
+            )) orelse return error.LinearDispatchFailed;
+            break :qkv .{ .q = qkv.first, .k = qkv.second, .v = qkv.third };
+        },
+        .split_qkv => split: {
+            var q = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
+                .slot = 0,
+                .input = input,
+                .in_dim = cfg.in_dim,
+                .out_dim = cfg.out_dim,
+            })) orelse return error.LinearDispatchFailed;
+            errdefer q.deinit();
+            var k = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
+                .slot = 1,
+                .input = input,
+                .in_dim = cfg.in_dim,
+                .out_dim = cfg.kv_out_dim,
+            })) orelse return error.LinearDispatchFailed;
+            errdefer k.deinit();
+            const v = (try metal_runtime.decoderRuntimeApplyLinear(provider, .{
+                .slot = 2,
+                .input = input,
+                .in_dim = cfg.in_dim,
+                .out_dim = cfg.kv_out_dim,
+            })) orelse return error.LinearDispatchFailed;
+            break :split .{ .q = q, .k = k, .v = v };
+        },
+        .ffn => unreachable,
+    };
+}
+
+fn captureQkvOutput(
+    provider: *metal_native_provider.MetalNativeProvider,
+    runtime: *metal_runtime.RawMetalDecodeRuntime,
+    input: MetalTensor,
+    cfg: Config,
+) !QkvOutput {
+    try metal_runtime.beginFrame(runtime);
+    var output = try encodeQkvOutput(provider, input, cfg);
+    errdefer output.deinit();
+    try metal_runtime.submitFrame(runtime);
+    try metal_runtime.waitFrame(runtime);
+    return output;
 }
 
 fn encodeFfnOutput(
@@ -662,7 +833,29 @@ fn encodeFfnOutput(
     );
     errdefer output.deinit();
     const none = std.math.maxInt(usize);
-    const rc = metal_runtime.termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_device(
+    const apply_ffn: *const fn (
+        ?*metal_runtime.RawMetalDecodeRuntime,
+        ?*anyopaque,
+        usize,
+        ?*anyopaque,
+        usize,
+        usize,
+        usize,
+        usize,
+        u32,
+        usize,
+        usize,
+        usize,
+        usize,
+        f32,
+        usize,
+        ?*anyopaque,
+        usize,
+    ) callconv(.c) c_int = if (cfg.q4_k)
+        metal_runtime.termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots_device
+    else
+        metal_runtime.termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_slots_device;
+    const rc = apply_ffn(
         runtime,
         input.deviceHandle(),
         input.deviceByteOffset(),
@@ -785,7 +978,7 @@ pub fn main(init: std.process.Init) !void {
     var stats: ops.NativeQuantTimingStats = .{};
     var slot0 = switch (cfg.mode) {
         .q6_linear, .q6_argmax => try prepareQ6_KLinearSlot(allocator, &provider, 0, cfg.in_dim, cfg.out_dim, &stats),
-        else => try prepareQ4_0LinearSlot(allocator, &provider, 0, cfg.in_dim, cfg.out_dim, &stats),
+        else => try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 0, cfg.in_dim, cfg.out_dim, &stats),
     };
     defer slot0.deinit(allocator);
     var extra_weight_slots: [64]?PreparedQuantSlot = @splat(null);
@@ -797,7 +990,7 @@ pub fn main(init: std.process.Init) !void {
         while (slot_index < cfg.weight_slots) : (slot_index += 1) {
             extra_weight_slots[slot_index] = switch (cfg.mode) {
                 .q6_linear => try prepareQ6_KLinearSlot(allocator, &provider, slot_index, cfg.in_dim, cfg.out_dim, &stats),
-                else => try prepareQ4_0LinearSlot(allocator, &provider, slot_index, cfg.in_dim, cfg.out_dim, &stats),
+                else => try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, slot_index, cfg.in_dim, cfg.out_dim, &stats),
             };
         }
     }
@@ -820,18 +1013,19 @@ pub fn main(init: std.process.Init) !void {
             }))) return error.LinearPrepareFailed;
         },
         .pair => {
-            slot1 = try prepareQ4_0LinearSlot(allocator, &provider, 1, cfg.in_dim, cfg.out_dim, &stats);
+            slot1 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 1, cfg.in_dim, cfg.out_dim, &stats);
         },
         .qkv, .split_qkv => {
-            slot1 = try prepareQ4_0LinearSlot(allocator, &provider, 1, cfg.in_dim, cfg.kv_out_dim, &stats);
-            slot2 = try prepareQ4_0LinearSlot(allocator, &provider, 2, cfg.in_dim, cfg.kv_out_dim, &stats);
+            slot1 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 1, cfg.in_dim, cfg.kv_out_dim, &stats);
+            slot2 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 2, cfg.in_dim, cfg.kv_out_dim, &stats);
         },
         .ffn => {
-            slot1 = try prepareQ4_0LinearSlot(allocator, &provider, 1, cfg.in_dim, cfg.out_dim, &stats);
-            slot2 = try prepareQ4_0LinearSlot(allocator, &provider, 2, cfg.out_dim, cfg.in_dim, &stats);
-            if (metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 0, cfg.in_dim, cfg.out_dim) != .q4_0 or
-                metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 1, cfg.in_dim, cfg.out_dim) != .q4_0 or
-                metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 2, cfg.out_dim, cfg.in_dim) != .q4_0)
+            slot1 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 1, cfg.in_dim, cfg.out_dim, &stats);
+            slot2 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 2, cfg.out_dim, cfg.in_dim, &stats);
+            const expected_kind: metal_runtime.RawQuantizedRuntimeLinearKind = if (cfg.q4_k) .q4_k else .q4_0;
+            if (metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 0, cfg.in_dim, cfg.out_dim) != expected_kind or
+                metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 1, cfg.in_dim, cfg.out_dim) != expected_kind or
+                metal_runtime.ensureQuantizedRuntimeLinearSlotPrepared(&provider, 2, cfg.out_dim, cfg.in_dim) != expected_kind)
             {
                 return error.LinearPrepareFailed;
             }
@@ -848,7 +1042,7 @@ pub fn main(init: std.process.Init) !void {
             }))) return error.LinearPrepareFailed;
         },
         .ple => {
-            slot1 = try prepareQ4_0LinearSlot(allocator, &provider, 1, cfg.out_dim, cfg.in_dim, &stats);
+            slot1 = try prepareQ4LinearSlot(cfg.q4_k, cfg.q4_k_f16_mps, cfg.q4_k_bf16, allocator, &provider, 1, cfg.out_dim, cfg.in_dim, &stats);
             if (!metal_runtime.decoderRuntimeReserveGatedFfnScratch(&provider, 1, cfg.in_dim, cfg.out_dim)) return error.LinearPrepareFailed;
             const norm_weight_data = try allocator.alloc(f32, cfg.in_dim);
             defer allocator.free(norm_weight_data);
@@ -868,6 +1062,35 @@ pub fn main(init: std.process.Init) !void {
     fillInput(input_data);
     var input = try deviceTensorFromSlice(runtime, input_data, &[_]i32{ @intCast(cfg.rows), @intCast(cfg.in_dim) });
     defer input.deinit();
+    if (cfg.compare_q6_high_row) {
+        const enable_env = "TERMITE_METAL_ENABLE_Q6_K_HIGH_ROW_MM";
+        const disable_env = "TERMITE_METAL_DISABLE_Q6_K_HIGH_ROW_MM";
+        if (unsetenv(enable_env) != 0 or setenv(disable_env, "1", 1) != 0) return error.EnvironmentUpdateFailed;
+        var baseline = try captureLinearOutput(&provider, runtime, input, cfg.in_dim, cfg.out_dim);
+        defer baseline.deinit();
+        const baseline_values = try baseline.toHostSlice();
+
+        if (unsetenv(disable_env) != 0 or setenv(enable_env, "1", 1) != 0) return error.EnvironmentUpdateFailed;
+        var candidate = try captureLinearOutput(&provider, runtime, input, cfg.in_dim, cfg.out_dim);
+        defer candidate.deinit();
+        const candidate_values = try candidate.toHostSlice();
+        if (baseline_values.len != candidate_values.len) return error.OutputShapeMismatch;
+
+        var max_abs_error: f32 = 0.0;
+        var mean_abs_error: f64 = 0.0;
+        for (baseline_values, candidate_values) |expected, actual| {
+            if (!std.math.isFinite(actual)) return error.NonFiniteCandidateOutput;
+            const abs_error = @abs(actual - expected);
+            max_abs_error = @max(max_abs_error, abs_error);
+            mean_abs_error += abs_error;
+        }
+        mean_abs_error /= @floatFromInt(@max(candidate_values.len, 1));
+        std.debug.print(
+            "q6_high_row_parity rows={d} in={d} out={d} max_abs_error={d:.7} mean_abs_error={d:.7} tolerance=0.0030000\n",
+            .{ cfg.rows, cfg.in_dim, cfg.out_dim, max_abs_error, mean_abs_error },
+        );
+        if (max_abs_error > 0.003) return error.Q6HighRowParityExceeded;
+    }
     var ple_input: ?MetalTensor = null;
     defer if (ple_input) |*tensor| tensor.deinit();
     if (cfg.mode == .ple) {
@@ -958,8 +1181,10 @@ pub fn main(init: std.process.Init) !void {
     const q4_ple_linear_f16_input = after.q4_0_ple_linear_reduce_f16_input - before.q4_0_ple_linear_reduce_f16_input;
     const q6_calls = after.q6_k_linear_reduce - before.q6_k_linear_reduce;
     const q6_f16_in = after.q6_k_linear_reduce_f16_input - before.q6_k_linear_reduce_f16_input;
+    const q6_high_row_mm = after.q6_k_high_row_mm_matrix_dispatches - before.q6_k_high_row_mm_matrix_dispatches;
     const rms_norm_add_sumsq = after.rms_norm_add_sumsq - before.rms_norm_add_sumsq;
     const total_ops = cfg.measure_iters * cfg.ops_per_frame;
+    if (cfg.compare_q6_high_row and q6_high_row_mm != total_ops) return error.ExpectedQ6HighRowRouteNotUsed;
     if (cfg.expect_q4_route) |expected_route| {
         const expected_ops: u64 = @intCast(total_ops);
         const expected_aligned: u64 = switch (expected_route) {
@@ -1079,7 +1304,7 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     std.debug.print(
-        " q4_0_linear_reduce={d} q4_0_linear_reduce_f16_input={d} q4_0_linear_reduce_f16_output={d} q4_0_linear_reduce_f16_input_f16_output={d} q4_0_linear_reduce_sumsq={d} q4_0_mmv_nr4_nsg2={d} q4_0_mmv_nr8_nsg2={d} q4_0_mmv_nr4_nsg4={d} q4_0_mmv_nr8_nsg4={d} q4_0_mmv_fallbacks={d} q4_0_mm_sg_aligned={d} q4_0_mm_sg_aligned_tail={d} q4_0_mm_sg_unrolled={d} q4_0_pair_reduce={d} q4_0_pair={d} q4_0_pair_activation_reduce={d} q4_0_pair_activation_reduce_f16_output={d} q4_0_activation_rhs_reduce={d} q4_0_activation_rhs_reduce_f16_output={d} q4_0_ple_activation_rhs_reduce_f16_output={d} q4_0_ple_linear_reduce_f16_input={d} q6_k_linear_reduce={d} q6_k_linear_reduce_f16_input={d} rms_norm_add_sumsq={d} median_gpu_ms={d:.3} last_gpu_ms={d:.3} last_compute_encoders={d} last_blit_encoders={d} last_ops={d}\n",
+        " q4_0_linear_reduce={d} q4_0_linear_reduce_f16_input={d} q4_0_linear_reduce_f16_output={d} q4_0_linear_reduce_f16_input_f16_output={d} q4_0_linear_reduce_sumsq={d} q4_0_mmv_nr4_nsg2={d} q4_0_mmv_nr8_nsg2={d} q4_0_mmv_nr4_nsg4={d} q4_0_mmv_nr8_nsg4={d} q4_0_mmv_fallbacks={d} q4_0_mm_sg_aligned={d} q4_0_mm_sg_aligned_tail={d} q4_0_mm_sg_unrolled={d} q4_0_pair_reduce={d} q4_0_pair={d} q4_0_pair_activation_reduce={d} q4_0_pair_activation_reduce_f16_output={d} q4_0_activation_rhs_reduce={d} q4_0_activation_rhs_reduce_f16_output={d} q4_0_ple_activation_rhs_reduce_f16_output={d} q4_0_ple_linear_reduce_f16_input={d} q6_k_linear_reduce={d} q6_k_linear_reduce_f16_input={d} q6_k_high_row_mm_matrix={d} rms_norm_add_sumsq={d} median_gpu_ms={d:.3} last_gpu_ms={d:.3} last_compute_encoders={d} last_blit_encoders={d} last_ops={d}\n",
         .{
             q4_calls,
             q4_f16_in,
@@ -1104,6 +1329,7 @@ pub fn main(init: std.process.Init) !void {
             q4_ple_linear_f16_input,
             q6_calls,
             q6_f16_in,
+            q6_high_row_mm,
             rms_norm_add_sumsq,
             @as(f64, @floatFromInt(median_gpu_ns)) / 1_000_000.0,
             @as(f64, @floatFromInt(metal_runtime.termite_metal_decode_runtime_last_frame_gpu_nanos(runtime))) / 1_000_000.0,
@@ -1119,8 +1345,26 @@ pub fn main(init: std.process.Init) !void {
 
     // Keep the timed loop readback-free, then fingerprint one deterministic
     // result so candidate kernels can prove bitwise parity.
-    if (cfg.mode == .linear or cfg.mode == .ffn) {
-        var output = if (cfg.mode == .linear) linear: {
+    if (cfg.mode == .qkv or cfg.mode == .split_qkv) {
+        var output = try captureQkvOutput(&provider, runtime, input, cfg);
+        defer output.deinit();
+        const q_values = try output.q.toHostSlice();
+        const k_values = try output.k.toHostSlice();
+        const v_values = try output.v.toHostSlice();
+        var output_hasher = std.hash.Wyhash.init(0);
+        output_hasher.update(std.mem.sliceAsBytes(q_values));
+        output_hasher.update(std.mem.sliceAsBytes(k_values));
+        output_hasher.update(std.mem.sliceAsBytes(v_values));
+        const output_hash = output_hasher.final();
+        if (cfg.expect_output_hash) |expected_hash| {
+            if (output_hash != expected_hash) {
+                std.debug.print("expected qkv_output_hash={x}, observed {x}\n", .{ expected_hash, output_hash });
+                return error.UnexpectedOutputHash;
+            }
+        }
+        std.debug.print("qkv_output_hash={x}\n", .{output_hash});
+    } else if (cfg.mode == .linear or cfg.mode == .q6_linear or cfg.mode == .ffn) {
+        var output = if (cfg.mode == .linear or cfg.mode == .q6_linear) linear: {
             try metal_runtime.beginFrame(runtime);
             const linear_output = (try metal_runtime.decoderRuntimeApplyLinear(&provider, .{
                 .slot = 0,

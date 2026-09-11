@@ -742,7 +742,7 @@ pub const LazyWeightEntry = struct {
     pin_count: usize = 0,
     pending_prefetch: bool = false,
     prefetch_score: u64 = 0,
-    guard: ?*std.atomic.Mutex = null,
+    guard: ?prefetch_mod.LockHandle = null,
     placement: PlacementPlan = .{
         .class = .other,
         .preferred_tier = .host,
@@ -784,6 +784,31 @@ pub const WeightStore = struct {
     quant_dequant_cache_tier_denied: u64 = 0,
     quant_dequant_cache_scratch_fallbacks: u64 = 0,
     quant_dequant_cache_scratch_denied: u64 = 0,
+
+    /// Destroy a store that owns its map keys, weights, tensor references,
+    /// and attached residency/store/admission resources. All compute users
+    /// must be drained first. `shared_prefetch` remains borrowed.
+    /// Stores with borrowed entries must retain their custom cleanup.
+    pub fn deinitOwned(self: *WeightStore) void {
+        deinitPrefetchQueue(self);
+        var resident_it = self.resident_weights.iterator();
+        while (resident_it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.resident_weights.deinit(self.allocator);
+        var lazy_it = self.lazy_weights.iterator();
+        while (lazy_it.next()) |entry| {
+            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+            entry.value_ptr.tensor_ref.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.lazy_weights.deinit(self.allocator);
+        if (self.residency) |*residency| residency.deinit();
+        if (self.tensor_store) |tensor_store| tensor_store.deinit();
+        if (self.tier_cache) |*tier_cache| tier_cache.deinitAdmission();
+        self.* = undefined;
+    }
 };
 
 /// Internal wrapper: an owned or borrowed f32 slice.
@@ -791,6 +816,8 @@ const Buf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    weight_handle_name: ?[]const u8 = null,
+    weight_handle_refs: usize = 0,
     shared_data_refcount: ?*usize = null,
     logical_shape: ?[]i64 = null,
     logical_shape_inline: bool = false,
@@ -947,6 +974,9 @@ fn getData(ct: CT) []f32 {
 
 fn ownedDenseBufWithMaxSharedRefs(ct: CT, max_shared_refs: usize) ?*Buf {
     const buf = toBuf(ct);
+    // Named weights and their views remain immutable even if the dense
+    // conversion itself is allocator-owned and has only one host reference.
+    if (buf.name.len != 0) return null;
     if (!buf.owned or buf.shared_data_refcount == null) return null;
     if (buf.shared_data_refcount.?.* == 0 or buf.shared_data_refcount.?.* > max_shared_refs) return null;
     if (buf.view_strides != null) return null;
@@ -966,9 +996,10 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
 
     if (source.owned and source.shared_data_refcount != null) {
         source.shared_data_refcount.?.* += 1;
+        errdefer source.shared_data_refcount.?.* -= 1;
 
         const alias = try self.allocator.create(Buf);
-        errdefer source.shared_data_refcount.?.* -= 1;
+        errdefer self.allocator.destroy(alias);
         alias.* = .{
             .data = source.data,
             .allocator = self.allocator,
@@ -990,6 +1021,7 @@ fn aliasDenseBufWithShape(self: *NativeCompute, input: CT, shape: []const i64) !
     }
 
     const alias = try self.allocator.create(Buf);
+    errdefer self.allocator.destroy(alias);
     alias.* = .{
         .data = source.data,
         .allocator = self.allocator,
@@ -3037,7 +3069,7 @@ fn q4q5PreparedQ8KColumnParallelMaxRowsForShape(
 }
 
 fn quantParallelDispatchAvailable(io: ?std.Io) bool {
-    return io != null or linalg.pool.have_futex;
+    return io != null or linalg.pool.supports_sync_parallelism;
 }
 
 fn quantParallelDebugRequested() bool {
@@ -3908,6 +3940,7 @@ pub const NativeCompute = struct {
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
+    weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
     /// route through linalg's Io-aware variants and parallel work is
     /// scheduled on the runtime's thread pool.  When null, sgemm uses the
@@ -3928,6 +3961,20 @@ pub const NativeCompute = struct {
     ) NativeCompute {
         initPrefetchQueue(data, allocator);
         return .{ .allocator = allocator, .data = data, .run_budget = run_budget, .io = io };
+    }
+
+    /// Release context-owned handles and reservations without destroying self.
+    /// Stack/embedded owners must call this after releasing caller-owned tensors
+    /// and before tearing down the borrowed weight store or run budget.
+    pub fn deinit(self: *NativeCompute) void {
+        deinitWeightHandles(self);
+        var it = self.weight_reservations.iterator();
+        while (it.next()) |entry| {
+            if (self.run_budget) |budget| budget.release(entry.value_ptr.reservation);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.weight_reservations.deinit(self.allocator);
+        self.weight_reservations = .empty;
     }
 
     // Dispatchers select the canonical Io API when this backend was constructed
@@ -3987,6 +4034,8 @@ pub const NativeCompute = struct {
         native.sgemmTransBF16WeightsSync(m, n, k, alpha, a, b, beta, c_out);
     }
 
+    /// Backend deinit also destroys self and requires an allocator-created
+    /// context. Stack/embedded owners instead call NativeCompute.deinit.
     pub fn computeBackend(self: *NativeCompute) ComputeBackend {
         return .{ .ptr = self, .vtable = &vtable_impl };
     }
@@ -4064,6 +4113,7 @@ pub const NativeCompute = struct {
         source_tensor: ?*const tensor_mod.Tensor,
     ) !CT {
         const b = try self.allocator.create(Buf);
+        errdefer self.allocator.destroy(b);
         var shared_data_refcount: ?*usize = null;
         errdefer if (shared_data_refcount) |refcount| self.allocator.destroy(refcount);
         if (owned) {
@@ -4184,7 +4234,7 @@ pub fn initPrefetchQueue(data: *WeightStore, allocator: std.mem.Allocator) void 
     data.prefetch_initialized = true;
     var lazy_it = data.lazy_weights.iterator();
     while (lazy_it.next()) |entry| {
-        entry.value_ptr.guard = data.prefetch.mutexPtr();
+        entry.value_ptr.guard = data.prefetch.lockHandle();
     }
 }
 
@@ -4196,9 +4246,15 @@ pub fn stopPrefetchWorker(data: *WeightStore) void {
     data.prefetch.stop();
 }
 
+/// Stops the worker and retires borrowed guards. Call before destroying
+/// lazy_weights, whose entries still refer to this queue's Io and mutex.
 pub fn deinitPrefetchQueue(data: *WeightStore) void {
+    // Stop before releasing any cache state the worker can access.
+    if (data.prefetch_initialized) data.prefetch.stop();
     deinitGlinerHeadDenseCache(data);
     if (!data.prefetch_initialized) return;
+    var lazy_it = data.lazy_weights.iterator();
+    while (lazy_it.next()) |entry| entry.value_ptr.guard = null;
     data.prefetch.deinit();
     data.prefetch_initialized = false;
 }
@@ -4388,6 +4444,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .freeTensor = &freeTensor,
     .getIo = &getIo,
     .getWeight = &getWeight,
+    .acquireWeight = &acquireWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
@@ -4416,6 +4473,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .rmsNorm = &rmsNormOp,
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
+    .geluExact = &geluExactOp,
     .geluNew = &geluNewOp,
     .relu = &reluOp,
     .silu = &siluOp,
@@ -4447,6 +4505,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .conv1d = &conv1dOp,
     .conv2d = &conv2dOp,
     .rope = &ropeOp,
+    .mrope = &mropeOp,
+    .visionRope = &visionRopeOp,
     .ropePerItem = &ropePerItemOp,
     .gqaCausalAttention = &gqaCausalAttentionOp,
     .gqaPagedAttention = &gqaPagedAttentionOp,
@@ -4501,28 +4561,25 @@ fn backendKind(_: *anyopaque) BackendKind {
 
 fn deinitBackend(ctx: *anyopaque) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (self.run_budget) |run_budget| {
-        var it = self.weight_reservations.iterator();
-        while (it.next()) |entry| {
-            run_budget.release(entry.value_ptr.reservation);
-            self.allocator.free(entry.key_ptr.*);
-        }
-    } else {
-        var it = self.weight_reservations.iterator();
-        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-    }
-    self.weight_reservations.deinit(self.allocator);
+    self.deinit();
     self.allocator.destroy(self);
 }
 
 fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const b = toBuf(tensor);
+    const handle_name = b.weight_handle_name;
+    if (handle_name) |name| {
+        std.debug.assert(b.weight_handle_refs > 0);
+        b.weight_handle_refs -= 1;
+        if (b.weight_handle_refs != 0) return;
+        std.debug.assert(self.weight_handles.remove(name));
+        b.weight_handle_name = null;
+    }
+    defer if (handle_name) |name| self.allocator.free(name);
     if (b.lazy_entry) |entry| {
         if (entry.guard) |guard| {
-            while (!guard.tryLock()) {
-                platform.time.yieldBriefly();
-            }
+            guard.lock();
             defer guard.unlock();
             releaseLazyEntryPinLocked(self.data, entry);
         } else {
@@ -4718,7 +4775,7 @@ test "native weight handles reserve and release run budget capacity" {
     };
     var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 96 });
     var compute = NativeCompute.init(allocator, &store, &budget);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
 
     try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
     try std.testing.expect((try acquireWeightReservation(&compute, "weight", 64)) != null);
@@ -4732,8 +4789,45 @@ test "native weight handles reserve and release run budget capacity" {
     try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.count());
 }
 
+fn deinitWeightHandles(self: *NativeCompute) void {
+    var it = self.weight_handles.iterator();
+    while (it.next()) |entry| {
+        toBuf(entry.value_ptr.*).weight_handle_name = null;
+        freeTensor(self, entry.value_ptr.*);
+        self.allocator.free(entry.key_ptr.*);
+    }
+    self.weight_handles.deinit(self.allocator);
+    self.weight_handles = .empty;
+}
+
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (self.weight_handles.get(name)) |tensor| {
+        toBuf(tensor).weight_handle_refs += 1;
+        return tensor;
+    }
+    try self.weight_handles.ensureUnusedCapacity(self.allocator, 1);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    // Views copy Buf.name without retaining the handle. Use the model-store
+    // key, whose lifetime also covers views after an early handle release.
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    const tensor = try loadWeight(self, stable_name);
+    toBuf(tensor).weight_handle_name = owned_name;
+    toBuf(tensor).weight_handle_refs = 1;
+    self.weight_handles.putAssumeCapacityNoClobber(owned_name, tensor);
+    return tensor;
+}
+
+fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const stable_name = self.data.resident_weights.getKey(name) orelse
+        self.data.lazy_weights.getKey(name) orelse name;
+    return loadWeight(self, stable_name);
+}
+
+fn loadWeight(self: *NativeCompute, name: []const u8) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
             try ensurePreparedKBlock(self, storage, null);
@@ -5121,6 +5215,41 @@ pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
     data.prefetch.lock();
     defer data.prefetch.unlock();
     return reclaimOneHostCacheEntryLocked(data, null);
+}
+
+test "owned native weight store teardown releases populated maps with optional prefetch" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_prefetch| {
+        var store = WeightStore{
+            .allocator = allocator,
+            .resident_weights = .empty,
+            .lazy_weights = .empty,
+        };
+        defer store.deinitOwned();
+        {
+            const key = try allocator.dupe(u8, "resident");
+            errdefer allocator.free(key);
+            var tensor = try tensor_mod.Tensor.initFloat32(allocator, "resident", &.{1}, &.{1});
+            errdefer tensor.deinit();
+            try store.resident_weights.put(allocator, key, .{ .tensor = tensor });
+        }
+        {
+            const key = try allocator.dupe(u8, "lazy");
+            errdefer allocator.free(key);
+            const name = try allocator.dupe(u8, "lazy");
+            errdefer allocator.free(name);
+            const source_name = try allocator.dupe(u8, "source.lazy");
+            errdefer allocator.free(source_name);
+            var tensor = try tensor_mod.Tensor.initFloat32(allocator, "lazy", &.{1}, &.{2});
+            errdefer tensor.deinit();
+            try store.lazy_weights.put(allocator, key, .{
+                .tensor_ref = .{ .name = name, .source_name = source_name },
+                .loaded = .{ .tensor = tensor },
+            });
+        }
+        if (with_prefetch) initPrefetchQueue(&store, allocator);
+        try std.testing.expectEqual(with_prefetch, store.lazy_weights.get("lazy").?.guard != null);
+    }
 }
 
 test "live host cache reservation reclaims only unpinned lazy weights" {
@@ -6151,6 +6280,15 @@ fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     return propagateLogicalShapeLike(self, result, input);
 }
 
+fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const output = try self.allocator.dupe(f32, getData(input));
+    activations_mod.geluExact(output);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
 fn geluNewOp(ctx: *anyopaque, input: CT) anyerror!CT {
     return geluOp(ctx, input);
 }
@@ -6679,7 +6817,7 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
     if (effective_seq_len == 0 and effective_batch > 0 and num_heads > 0 and q_rows > 0 and q_rows % (effective_batch * num_heads) == 0) {
         effective_seq_len = q_rows / (effective_batch * num_heads);
     }
-    if (effective_batch == 0 or effective_seq_len == 0 or (effective_batch > 0 and effective_seq_len > 0 and mask.len < effective_batch * effective_seq_len)) {
+    if (effective_batch == 0 or effective_seq_len == 0 or (mask.len != 0 and effective_batch > 0 and effective_seq_len > 0 and mask.len < effective_batch * effective_seq_len)) {
         std.log.warn("sdpa runtime dims batch={d} seq_len={d} mask_len={d} q_rows={d} q_len={d} num_heads={d} head_dim={d} attrs_batch={d} attrs_seq_len={d}", .{
             effective_batch,
             effective_seq_len,
@@ -6829,7 +6967,10 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
 
         for (0..effective_seq_len) |qi| {
             for (0..effective_seq_len) |ki| {
-                if (mask[b * effective_seq_len + ki] == 0) {
+                // An empty mask is the portable contract for unmasked
+                // attention (notably Qwen3-VL vision attention). Backends
+                // without a specialized route deliberately arrive here.
+                if (mask.len != 0 and mask[b * effective_seq_len + ki] == 0) {
                     scores[qi * effective_seq_len + ki] = -std.math.inf(f32);
                 }
             }
@@ -34637,7 +34778,8 @@ fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const output = try self.allocator.dupe(f32, getData(input));
     activations_mod.relu(output);
-    const result = try self.makeBuf(output, true);
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(ctx, result);
     return propagateLogicalShapeLike(self, result, input);
 }
 
@@ -35950,24 +36092,172 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     linalg.ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
 }
 
+/// Reference Qwen3-VL interleaved M-RoPE. Section counts address rotary
+/// pairs, and therefore sum to head_dim / 2.
+pub fn mropeCore(
+    output: []f32,
+    input: []const f32,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    positions: []const u32,
+    sections: [3]u32,
+) !void {
+    if (token_count == 0 or head_dim == 0 or head_dim % 2 != 0) return error.InvalidRoPEInput;
+    if (positions.len != 3 * token_count or input.len != output.len or input.len % head_dim != 0)
+        return error.InvalidRoPEInput;
+    const rotary_pairs = head_dim / 2;
+    if (@as(usize, sections[0]) + sections[1] + sections[2] != rotary_pairs)
+        return error.InvalidRoPEInput;
+    const total_chunks = input.len / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidRoPEInput;
+    const chunks_per_token = total_chunks / token_count;
+    if (chunks_per_token == 0) return error.InvalidRoPEInput;
+
+    for (0..total_chunks) |chunk| {
+        const token = chunk / chunks_per_token;
+        const base = chunk * head_dim;
+        for (0..rotary_pairs) |pair| {
+            const axis: usize = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
+                1
+            else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3)
+                2
+            else
+                0;
+            const position = positions[axis * token_count + token];
+            const exponent = @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(head_dim));
+            const frequency = 1.0 / std.math.pow(f32, theta, exponent);
+            const angle = @as(f32, @floatFromInt(position)) * freq_scale * frequency;
+            const cosine = @cos(angle);
+            const sine = @sin(angle);
+            const left = input[base + pair];
+            const right = input[base + rotary_pairs + pair];
+            output[base + pair] = left * cosine - right * sine;
+            output[base + rotary_pairs + pair] = left * sine + right * cosine;
+        }
+    }
+}
+
+fn mropeOp(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    freq_scale: f32,
+    positions: []const u32,
+    sections: [3]u32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const data = getData(input);
+    const output = try self.allocator.alloc(f32, data.len);
+    errdefer self.allocator.free(output);
+    try mropeCore(output, data, token_count, head_dim, theta, freq_scale, positions, sections);
+    const result = try self.makeBuf(output, true);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+/// Reference implementation of Qwen3-VL vision RoPE. The first half of
+/// frequency pairs uses height and the second half uses width. Frequencies
+/// restart at zero for each axis, matching the concatenated HF embedding.
+pub fn visionRopeCore(
+    output: []f32,
+    input: []const f32,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    positions: []const u32,
+) !void {
+    if (token_count == 0 or head_dim == 0 or head_dim % 4 != 0 or theta <= 0) {
+        return error.InvalidRoPEInput;
+    }
+    if (positions.len != 2 * token_count or input.len != output.len or input.len % head_dim != 0) {
+        return error.InvalidRoPEInput;
+    }
+    const total_chunks = input.len / head_dim;
+    if (total_chunks % token_count != 0) return error.InvalidRoPEInput;
+    const heads_per_token = total_chunks / token_count;
+    if (heads_per_token == 0) return error.InvalidRoPEInput;
+    const rotary_pairs = head_dim / 2;
+    const pairs_per_axis = rotary_pairs / 2;
+    for (0..total_chunks) |chunk| {
+        const token = chunk / heads_per_token;
+        const base = chunk * head_dim;
+        for (0..rotary_pairs) |pair| {
+            const axis: usize = if (pair < pairs_per_axis) 0 else 1;
+            const local_pair = pair % pairs_per_axis;
+            const exponent = @as(f32, @floatFromInt(2 * local_pair)) /
+                @as(f32, @floatFromInt(head_dim / 2));
+            const frequency = 1.0 / std.math.pow(f32, theta, exponent);
+            const angle = @as(f32, @floatFromInt(positions[axis * token_count + token])) * frequency;
+            const cosine = @cos(angle);
+            const sine = @sin(angle);
+            const left = input[base + pair];
+            const right = input[base + rotary_pairs + pair];
+            output[base + pair] = left * cosine - right * sine;
+            output[base + rotary_pairs + pair] = left * sine + right * cosine;
+        }
+    }
+}
+
+fn visionRopeOp(
+    ctx: *anyopaque,
+    input: CT,
+    token_count: usize,
+    head_dim: usize,
+    theta: f32,
+    positions: []const u32,
+) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const data = getData(input);
+    const output = try self.allocator.alloc(f32, data.len);
+    errdefer self.allocator.free(output);
+    try visionRopeCore(output, data, token_count, head_dim, theta, positions);
+    const result = try self.makeBuf(output, true);
+    return propagateLogicalShapeLike(self, result, input);
+}
+
+/// Return the number of RoPE head chunks belonging to one token. Encoder
+/// Q/K linears preserve the token-major `[batch * sequence, hidden]` shape,
+/// so each token owns `hidden / head_dim` consecutive chunks. Falling back to
+/// the historical layout inference keeps callers without that shape metadata
+/// working, while preventing a batch-sized position stride for encoders.
+pub fn ropeChunksPerToken(logical_shape: ?[]const i64, total_chunks: usize, seq_len: usize, head_dim: usize) usize {
+    if (logical_shape) |shape| {
+        if (shape.len == 2 and shape[0] > 0 and shape[1] > 0 and
+            @as(usize, @intCast(shape[0])) % seq_len == 0 and
+            @as(usize, @intCast(shape[1])) % head_dim == 0)
+        {
+            const chunks_per_token = @as(usize, @intCast(shape[1])) / head_dim;
+            if (chunks_per_token > 0 and chunks_per_token * @as(usize, @intCast(shape[0])) == total_chunks) {
+                return chunks_per_token;
+            }
+        }
+    }
+    return total_chunks / seq_len;
+}
+
 fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const data = getData(input);
     const total_chunks = data.len / head_dim;
     if (seq_len == 0) return error.InvalidRoPEInput;
     if (total_chunks % seq_len != 0) return error.InvalidRoPEInput;
-    const chunks_per_position = total_chunks / seq_len;
-    if (chunks_per_position == 0) return error.InvalidRoPEInput;
+    const chunks_per_token = ropeChunksPerToken(toBuf(input).logical_shape, total_chunks, seq_len, head_dim);
+    if (chunks_per_token == 0) return error.InvalidRoPEInput;
     const output = try self.allocator.dupe(f32, data);
     errdefer self.allocator.free(output);
 
     // Build flat position array: one position per head-sized chunk.
     // Layout is [batch * seq_len, num_heads], flattened by rows, so each token
-    // position must repeat for all heads in that row.
+    // position must repeat for all heads in that row. Do not include the batch
+    // in this stride: doing so rotates every group of `batch * heads` chunks
+    // as one token and makes single-item and batched encoder results diverge.
     const positions = try self.allocator.alloc(usize, total_chunks);
     defer self.allocator.free(positions);
     for (0..total_chunks) |tok| {
-        positions[tok] = position_offset + ((tok / chunks_per_position) % seq_len);
+        positions[tok] = position_offset + ((tok / chunks_per_token) % seq_len);
     }
 
     ropeCore(output, positions, head_dim, rope_dim, theta, freq_scale, consecutive_pairs);
@@ -40686,6 +40976,7 @@ test "ComputeBackend linearTriple matches three biased linears" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     var input_data = [_]f32{
@@ -40755,6 +41046,7 @@ test "quantized linearTriple propagates token-major shape into sdpa" {
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer deinitPrefetchQueue(&weight_store);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const input_data = try allocator.alloc(f32, rows * in_dim);
@@ -40835,6 +41127,7 @@ test "ComputeBackend linearPair matches two biased linears" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     var input_data = [_]f32{
@@ -41789,6 +42082,7 @@ test "native mulMatId supports ggml expert-last dense layout" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const input_ct = try fromFloat32ShapeOp(&compute, &.{ 1.0, 2.0, 3.0, 4.0 }, &.{ 2, 2 });
@@ -41834,6 +42128,7 @@ test "native mulMatId keeps ggml expert-last q8_0 layout quantized" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     var input_data: [64]f32 = [_]f32{1.0} ** 64;
@@ -44100,6 +44395,7 @@ fn expectNativeQuantDispatchBucket(
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer deinitPrefetchQueue(&weight_store);
+    defer compute.deinit();
     const dispatched = try allocator.alloc(f32, rows * out_dim);
     defer allocator.free(dispatched);
     @memset(dispatched, 0.0);
@@ -44192,6 +44488,7 @@ test "q4 q5 unmeasured recognizer shapes use cached dense dequant sgemm" {
         var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
         defer deinitPrefetchQueue(&weight_store);
         var compute = NativeCompute.init(allocator, &weight_store, null);
+        defer compute.deinit();
 
         const output = try allocator.alloc(f32, rows * out_dim);
         defer allocator.free(output);
@@ -44272,6 +44569,7 @@ test "q4 q5 gliner encoder shapes use cached dense dequant sgemm" {
         var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
         defer deinitPrefetchQueue(&weight_store);
         var compute = NativeCompute.init(allocator, &weight_store, null);
+        defer compute.deinit();
 
         const output = try allocator.alloc(f32, rows * out_dim);
         defer allocator.free(output);
@@ -44328,6 +44626,7 @@ test "native linearNoBiasWithPlan routes quantized storage through planned op" {
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer deinitPrefetchQueue(&weight_store);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     try std.testing.expect(vtable_impl.linearNoBiasPlanned != null);
 
@@ -44762,6 +45061,7 @@ test "dequant sgemm cache denial falls back without transient scratch by default
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     setQuantizedDequantSgemmOverrideForBench(true);
     setQuantizedDequantSgemmScratchOverrideForBench(false);
@@ -45214,6 +45514,20 @@ test "ropeCore repeats positions across heads within a row" {
     try std.testing.expectApproxEqAbs(output[11], output[15], 1e-6);
 }
 
+test "RoPE token-major positions repeat per item across a batch" {
+    // [batch * sequence, hidden] with two heads per token. The first and
+    // third rows are both position zero; the second and fourth are position
+    // one. This is the layout produced by encoder QKV linears.
+    const logical_shape = [_]i64{ 4, 8 };
+    const chunks_per_token = ropeChunksPerToken(&logical_shape, 8, 2, 4);
+    try std.testing.expectEqual(@as(usize, 2), chunks_per_token);
+
+    const expected = [_]usize{ 0, 0, 1, 1, 0, 0, 1, 1 };
+    for (expected, 0..) |position, chunk| {
+        try std.testing.expectEqual(position, (chunk / chunks_per_token) % 2);
+    }
+}
+
 test "ropePerItem leaves padded positions unchanged" {
     const head_dim: usize = 4;
     const num_heads: usize = 1;
@@ -45250,6 +45564,43 @@ test "ropePerItem leaves padded positions unchanged" {
         if (@abs(original[3 * head_dim + i] - output[3 * head_dim + i]) > 1e-6) any_differ = true;
     }
     try std.testing.expect(any_differ);
+}
+
+test "Qwen3-VL interleaved M-RoPE selects temporal height and width lanes" {
+    const input = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var output: [input.len]f32 = undefined;
+    try mropeCore(&output, &input, 1, 6, 10_000.0, 1.0, &.{ 1, 2, 3 }, .{ 1, 1, 1 });
+
+    const positions = [_]f32{ 1, 2, 3 };
+    for (0..3) |pair| {
+        const exponent = @as(f32, @floatFromInt(2 * pair)) / 6.0;
+        const angle = positions[pair] / std.math.pow(f32, 10_000.0, exponent);
+        const cosine = @cos(angle);
+        const sine = @sin(angle);
+        try std.testing.expectApproxEqAbs(input[pair] * cosine - input[3 + pair] * sine, output[pair], 1e-6);
+        try std.testing.expectApproxEqAbs(input[pair] * sine + input[3 + pair] * cosine, output[3 + pair], 1e-6);
+    }
+
+    try std.testing.expectError(
+        error.InvalidRoPEInput,
+        mropeCore(&output, &input, 1, 6, 10_000.0, 1.0, &.{ 1, 2, 3 }, .{ 1, 1, 0 }),
+    );
+}
+
+test "Qwen3-VL vision RoPE restarts frequencies for height and width" {
+    const input = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var output: [input.len]f32 = undefined;
+    try visionRopeCore(&output, &input, 1, 8, 10_000.0, &.{ 2, 3 });
+    const expected_positions = [_]f32{ 2, 3 };
+    for (0..4) |pair| {
+        const axis = pair / 2;
+        const local = pair % 2;
+        const exponent = @as(f32, @floatFromInt(2 * local)) / 4.0;
+        const angle = expected_positions[axis] / std.math.pow(f32, 10_000.0, exponent);
+        try std.testing.expectApproxEqAbs(input[pair] * @cos(angle) - input[4 + pair] * @sin(angle), output[pair], 1e-6);
+        try std.testing.expectApproxEqAbs(input[pair] * @sin(angle) + input[4 + pair] * @cos(angle), output[4 + pair], 1e-6);
+    }
+    try std.testing.expectError(error.InvalidRoPEInput, visionRopeCore(&output, &input, 1, 6, 10_000.0, &.{ 2, 3 }));
 }
 
 test "flash attention matches reference SDPA for long context" {
@@ -45289,6 +45640,7 @@ test "flash attention matches reference SDPA for long context" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const flash_output = try flashCausalAttentionHost(
         allocator,
         Q,
@@ -45412,6 +45764,7 @@ test "gqa causal attention matches naive reference" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const flash_ct = try gqaAttentionSlices(&compute, Q, K, V, null, null, 0, null, seq_len, batch, seq_len, seq_len, 0, 0, num_heads, num_kv_heads, head_dim);
     defer freeTensor(&compute, flash_ct);
     const flash_output = getData(flash_ct);
@@ -45531,6 +45884,7 @@ fn testCompressedKeyPagedAttention(dtype: runtime.kv.pool.KvDType) !void {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const attention: AttentionContext = .{
         .mode = .paged_decode,
@@ -45665,6 +46019,7 @@ test "linearNoBias source tensor chunked matches dense f16 weight" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const input_ct = try compute.makeBuf(input[0..], false);
     defer freeTensor(&compute, input_ct);
@@ -45707,6 +46062,7 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
         .lazy_weights = .{},
     };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const weight_ct = try compute.makeBufWithEntry(empty_f32[0..], false, "token_embd.weight", null, &storage, null);
@@ -45759,6 +46115,111 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
     }
 }
 
+test "native stack teardown releases empty lookup caches and outstanding reservations" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.prefetch.deinit();
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 96 });
+    var compute = NativeCompute.init(allocator, &store, &budget);
+    defer compute.deinit();
+    try std.testing.expectError(error.MissingWeight, compute.computeBackend().getWeight("missing"));
+    try std.testing.expect(compute.weight_handles.capacity() > 0);
+    _ = try acquireWeightReservation(&compute, "reserved", 64);
+    try std.testing.expectEqual(@as(usize, 64), budget.host_weight_bytes);
+
+    compute.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.capacity());
+    try std.testing.expectEqual(@as(usize, 0), compute.weight_reservations.capacity());
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    // The context teardown leaves the shared model store's lifetime to its owner.
+    try std.testing.expect(store.prefetch_initialized);
+}
+
+fn testWeightHandleLifetime(allocator: std.mem.Allocator, lazy: bool, stack_owned: bool) !void {
+    var bytes = [_]u8{ 0x80, 0x3f, 0x20, 0xc0, 0x00, 0x3f, 0x40, 0x40 };
+    var shape = [_]i64{ 2, 2 };
+    const weight = LoadedWeight{ .tensor = .{
+        .data = &bytes,
+        .shape = &shape,
+        .dtype = .bf16,
+        .name = "weight",
+        .allocator = allocator,
+        .owns_data = false,
+        .owns_shape = false,
+    } };
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.resident_weights.deinit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    if (lazy) {
+        try store.lazy_weights.put(allocator, "weight", .{
+            .tensor_ref = .{ .name = "weight" },
+            .loaded = weight,
+            .loaded_bytes = bytes.len,
+        });
+    } else {
+        try store.resident_weights.put(allocator, "weight", weight);
+    }
+    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 64 });
+    {
+        var stack_compute: NativeCompute = undefined;
+        const compute = if (stack_owned) &stack_compute else try allocator.create(NativeCompute);
+        compute.* = NativeCompute.init(allocator, &store, &budget);
+        defer store.prefetch.deinit();
+        defer if (stack_owned) compute.deinit() else deinitBackend(compute);
+        const first = try getWeight(compute, "weight");
+        {
+            const owned = try acquireWeight(compute, "weight");
+            defer freeTensor(compute, owned);
+            const other = try acquireWeight(compute, "weight");
+            defer freeTensor(compute, other);
+            try std.testing.expect(first != owned and owned != other and first != other);
+            try std.testing.expectEqualSlices(f32, getData(first), getData(owned));
+            if (lazy) try std.testing.expectEqual(@as(usize, 3), store.lazy_weights.get("weight").?.pin_count);
+            try std.testing.expectEqual(@as(usize, 3), compute.weight_reservations.get("weight").?.count);
+            try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, owned));
+        }
+        const alias = if (!lazy) try aliasDenseBufWithShape(compute, first, &.{4}) else null;
+        defer if (alias) |view| freeTensor(compute, view);
+        for (0..1000) |_| try std.testing.expectEqual(first, try getWeight(compute, "weight"));
+        try std.testing.expectEqual(@as(usize, 1), compute.weight_handles.count());
+        try std.testing.expectEqual(@as(usize, 1), compute.weight_reservations.count());
+        if (lazy) try std.testing.expectEqual(@as(usize, 1), store.lazy_weights.get("weight").?.pin_count);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(first));
+        try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, first));
+        // Releasing one caller must not invalidate the other borrowers.
+        for (0..1000) |_| freeTensor(compute, first);
+        try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(first));
+        freeTensor(compute, first);
+        if (alias) |view| {
+            try std.testing.expectEqualSlices(f32, &.{ 1, -2.5, 0.5, 3 }, getData(view));
+            try std.testing.expectEqualStrings("weight", toBuf(view).name);
+            try std.testing.expectEqual(@as(?CT, null), try unaryConsumeOp(compute, .relu, view));
+        }
+        try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.count());
+        try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+        if (lazy) try std.testing.expectEqual(@as(usize, 0), store.lazy_weights.get("weight").?.pin_count);
+        // Florence-style callers leave their lookups to backend teardown.
+        _ = try getWeight(compute, "weight");
+        _ = try getWeight(compute, "weight");
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.host_weight_bytes);
+    if (lazy) try std.testing.expectEqual(@as(usize, 0), store.lazy_weights.get("weight").?.pin_count);
+}
+
+test "native weight handle lifetime is bounded and releases reservations and lazy pins" {
+    inline for (.{ false, true }) |stack_owned| {
+        try testWeightHandleLifetime(std.testing.allocator, false, stack_owned);
+        try testWeightHandleLifetime(std.testing.allocator, true, stack_owned);
+    }
+}
+
+test "native weight handle lifetime unwinds allocation failures" {
+    inline for (.{ false, true }) |stack_owned| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ false, stack_owned });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ true, stack_owned });
+    }
+}
+
 test "getWeight preserves resident dense tensor shape metadata" {
     const allocator = std.testing.allocator;
 
@@ -45802,7 +46263,7 @@ test "getWeight preserves resident dense tensor shape metadata" {
     };
     var run_budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024 });
     var compute = NativeCompute.init(allocator, &weight_store, &run_budget);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     const weight = try cb.getWeight(name);
@@ -45869,6 +46330,7 @@ test "whereSelect handles equal-length operands" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var c = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
     var t = [_]f32{ 10.0, 20.0, 30.0, 40.0 };
@@ -45894,6 +46356,7 @@ test "whereSelect resolves concrete imported bert mask against flat sequence ope
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 3 * 512;
     const cond_data = try allocator.alloc(f32, elem_count);
@@ -45935,6 +46398,7 @@ test "whereSelect rejects concrete same-numel transpose mismatch" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1, 0, 1, 0, 1, 0 };
     var true_data = [_]f32{ 10, 20, 30, 40, 50, 60 };
@@ -45961,6 +46425,7 @@ test "whereSelect rejects symbolic same-numel transpose mismatch" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1, 0, 1, 0, 1, 0 };
     var true_data = [_]f32{ 10, 20, 30, 40, 50, 60 };
@@ -45993,6 +46458,7 @@ test "whereSelect broadcasts scalar on_true and on_false" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var c = [_]f32{ 1.0, 0.0, 1.0 };
     var t = [_]f32{99.0}; // scalar
@@ -46017,6 +46483,7 @@ test "whereSelect broadcasts condition across leading dimension" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var c = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
     var t = [_]f32{ 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0 };
@@ -46055,6 +46522,7 @@ test "whereSelect resolves symbolic condition dims from broadcast context" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 1 * 8 * 4 * 4;
     const cond_data = try allocator.alloc(f32, elem_count);
@@ -46100,6 +46568,7 @@ test "whereSelect reads broadcast view condition without materializing it first"
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const cond_owned = try allocator.dupe(f32, &.{ 1.0, 0.0, 1.0 });
     const true_owned = try allocator.dupe(f32, &.{ 10.0, 20.0, 30.0, 40.0, 50.0, 60.0 });
@@ -46130,6 +46599,7 @@ test "addConsumeLeft reads broadcast view rhs without materializing it first" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const rhs_owned = try allocator.dupe(f32, &.{ 10, 20, 30 });
@@ -46155,6 +46625,7 @@ test "addConsumeLeft handles repeated suffix broadcast blocks without stepping e
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.alloc(f32, 2 * 3 * 4);
     for (0..lhs_owned.len) |i| lhs_owned[i] = @floatFromInt(i);
@@ -46191,6 +46662,7 @@ test "multiply reads repeated suffix broadcast blocks without stepping every ele
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.alloc(f32, 2 * 3 * 4);
     for (0..lhs_owned.len) |i| lhs_owned[i] = @floatFromInt(i + 1);
@@ -46226,6 +46698,7 @@ test "lessThan reads repeated suffix broadcast blocks without stepping every ele
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.alloc(f32, 2 * 3 * 4);
     for (0..lhs_owned.len) |i| lhs_owned[i] = @floatFromInt(i);
@@ -46279,6 +46752,7 @@ test "transpose resolves clip text attention shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 8 * 77 * 64;
     const input_data = try allocator.alloc(f32, elem_count);
@@ -46308,6 +46782,7 @@ test "transpose resolves zero metadata shape from view strides" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const batch = 2;
     const seq = 3;
@@ -46344,6 +46819,7 @@ test "materialize view resolves symbolic logical shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 8 * 77 * 64;
     const input_data = try allocator.alloc(f32, elem_count);
@@ -46371,6 +46847,7 @@ test "whereSelect preserves inferred attention cube shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 3 * 8 * 3 * 3;
     const cond_data = try allocator.alloc(f32, elem_count);
@@ -46416,6 +46893,7 @@ test "whereSelect handles repeated suffix broadcast blocks without stepping ever
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const cond_owned = try allocator.dupe(f32, &.{
         1, 0, 1, 0,
@@ -46455,6 +46933,7 @@ test "whereSelectConsumeTrue handles repeated suffix broadcast condition blocks"
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const cond_owned = try allocator.dupe(f32, &.{
         1, 0, 1, 0,
@@ -46499,6 +46978,7 @@ test "whereSelect handles repeated suffix blocks for condition and false branch 
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const cond_owned = try allocator.dupe(f32, &.{
         1, 0, 1, 0,
@@ -46544,6 +47024,7 @@ test "add preserves symbolic broadcasted logical shape from the larger operand" 
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const elem_count = 1 * 8 * 4 * 4;
     const lhs_data = try allocator.alloc(f32, elem_count);
@@ -46574,6 +47055,7 @@ test "reshape preserves symbolic target shape when dims remain unresolved" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var data = [_]f32{0.0} ** (76 * 8 * 76 * 64);
     const in_ct = try compute.makeBuf(data[0..], false);
@@ -46604,6 +47086,7 @@ test "reshape resolves symbolic source dims using data len" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var data = [_]f32{0.0} ** (77 * 512);
     const raw = try compute.makeBuf(data[0..], false);
@@ -46636,6 +47119,7 @@ test "reshape aliases owned backing storage" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46655,6 +47139,7 @@ test "broadcast_in_dim aliases reshape-only dense buffer" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46673,6 +47158,7 @@ test "transpose aliases singleton-axis shuffles" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46691,6 +47177,7 @@ test "transpose creates lazy dense view for non-singleton permutation" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46710,6 +47197,7 @@ test "broadcast_in_dim creates lazy dense view for repeated expansion" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46729,6 +47217,7 @@ test "broadcast_in_dim resolves zero target dims from mapped input axes" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46746,6 +47235,7 @@ test "broadcast_in_dim materializes tiled mapped dimensions" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46769,6 +47259,7 @@ test "scatterAdd uses indices_shape for output rows" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     // input [2, 3], indices [2] pointing to rows 0 and 1, output shape [3] (3 output rows)
     var in_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
@@ -46796,6 +47287,7 @@ test "scatterAdd rejects out-of-bounds indices" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var in_data = [_]f32{ 1, 2, 3 };
     var idx_data = [_]f32{5.0}; // points to row 5, but output only has 2 rows
@@ -46814,6 +47306,7 @@ test "softmax produces correct row-wise probabilities" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     // 2 rows of 3 elements each, last_dim_size = 3
     var data = [_]f32{ 1.0, 2.0, 3.0, 1.0, 2.0, 3.0 };
@@ -46836,6 +47329,7 @@ test "softmax resolves dynamic last dimension from logical shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var data = [_]f32{ 1.0, 2.0, 3.0, 1.0, 2.0, 3.0 };
     const raw_ct = try compute.makeBuf(data[0..], false);
@@ -46856,6 +47350,7 @@ test "softmaxConsume reuses uniquely owned dense buffer" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 1.0, 2.0, 3.0, 0.5, 1.5, 2.5 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -46872,6 +47367,7 @@ test "addConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{ 0.5, -1.0, 2.0 };
@@ -46889,6 +47385,7 @@ test "multiplyConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{ 2.0, -1.0, 0.5 };
@@ -46906,6 +47403,7 @@ test "addConsumeRight reuses uniquely owned rhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var lhs_data = [_]f32{ 0.5, -1.0, 2.0 };
     const rhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
@@ -46923,6 +47421,7 @@ test "multiplyConsumeRight reuses uniquely owned rhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var lhs_data = [_]f32{ 2.0, -1.0, 0.5 };
     const rhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
@@ -46940,6 +47439,7 @@ test "subtractConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{ 0.5, -1.0, 2.0 };
@@ -46957,6 +47457,7 @@ test "divideConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{ 2.0, -1.0, 0.5 };
@@ -46974,6 +47475,7 @@ test "lessThanConsumeLeft reuses uniquely owned lhs buffer with broadcast" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{ 3.0, 2.0, 4.0 };
@@ -46991,6 +47493,7 @@ test "whereSelectConsumeTrue reuses uniquely owned true branch with exact output
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
     const true_owned = try allocator.dupe(f32, &.{ 10.0, 20.0, 30.0, 40.0 });
@@ -47011,6 +47514,7 @@ test "whereSelectConsumeFalse reuses uniquely owned false branch with exact outp
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
     var true_data = [_]f32{10.0};
@@ -47031,6 +47535,7 @@ test "whereSelectConsumeTrue reuses reshaped true branch alias on last-use path"
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1.0, 0.0, 1.0, 0.0, 0.0, 1.0 };
     const true_owned = try allocator.dupe(f32, &.{ 10.0, 20.0, 30.0, 40.0, 50.0, 60.0 });
@@ -47056,6 +47561,7 @@ test "whereSelectConsumeFalse reuses reshaped false branch alias on last-use pat
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var cond_data = [_]f32{ 1.0, 0.0, 1.0, 0.0, 0.0, 1.0 };
     var true_data = [_]f32{10.0};
@@ -47081,6 +47587,7 @@ test "unaryConsume reuses uniquely owned dense buffer for relu" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ -1.0, 2.0, -3.0, 4.0 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -47095,6 +47602,7 @@ test "unaryConsume reuses uniquely owned dense buffer for exp" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const owned = try allocator.dupe(f32, &.{ 0.0, 1.0, -1.0 });
     const in_ct = try compute.makeBuf(owned, true);
@@ -47111,6 +47619,7 @@ test "layerNormConsumeInput reuses uniquely owned dense buffer" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const input_owned = try allocator.dupe(f32, &.{ 1.0, 2.0, 3.0, 4.0 });
     var gamma_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
@@ -47135,6 +47644,7 @@ test "rmsNormConsumeInput reuses uniquely owned dense buffer" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const input_owned = try allocator.dupe(f32, &.{ 1.0, 2.0, 3.0, 4.0 });
     var weight_data = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
@@ -47156,6 +47666,7 @@ test "sdpaOp respects flattened batch-head layout" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const batch: usize = 2;
     const seq_len: usize = 3;
@@ -47271,6 +47782,7 @@ test "sdpaOp preserves 4d logical shape from query input" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const batch: usize = 1;
     const seq_len: usize = 3;
@@ -47569,6 +48081,7 @@ test "sdpa token-major 2d layout matches head-major reference" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
 
     // seq 40 exercises the flash path, seq 8 the legacy materialized path.
@@ -47624,6 +48137,7 @@ test "sdpa rejects mixed token-major and head-major layouts" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var data = [_]f32{0} ** 8;
     const q_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 2, 4 });
@@ -47643,6 +48157,7 @@ test "ComputeBackend masked BCE with logits forward and backward" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
 
     var logits_data = [_]f32{ -2.0, 0.0, 3.0, 1.0 };
@@ -47715,6 +48230,7 @@ test "ComputeBackend scaledDotProductAttention call site exercises flash layout"
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
 
     const batch: usize = 2;
@@ -47761,10 +48277,33 @@ test "ComputeBackend scaledDotProductAttention call site exercises flash layout"
     try expectApproxEqSlice(ref, getData(out_ct), 1e-4);
 }
 
+test "Qwen3-VL vision attention portable fallback treats an empty mask as unmasked" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+
+    var q_data = [_]f32{ 0.0, 0.0 };
+    var k_data = [_]f32{ 0.0, 0.0 };
+    var v_data = [_]f32{ 2.0, 4.0 };
+    const q = try compute.makeBuf(&q_data, false);
+    defer freeTensor(&compute, q);
+    const k = try compute.makeBuf(&k_data, false);
+    defer freeTensor(&compute, k);
+    const v = try compute.makeBuf(&v_data, false);
+    defer freeTensor(&compute, v);
+
+    const output = try cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, 2, 1, 1);
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 3.0 }, getData(output));
+}
+
 test "ComputeBackend causalSelfAttention call site matches naive reference" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
 
     const batch: usize = 1;
@@ -47805,6 +48344,7 @@ test "ComputeBackend crossAttention call site matches masked reference" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
 
     const batch: usize = 2;
@@ -47847,6 +48387,7 @@ test "dot_general flattens lhs suffix for shared rhs source tensor" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_len = 3 * 8 * 64;
     const rhs_k = 8 * 64;
@@ -47908,6 +48449,7 @@ test "dot_general handles rank1 outer product without contracting axes" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     var lhs_data = [_]f32{ 1, 2, 3 };
     var rhs_data = [_]f32{ 10, 20, 30, 40 };
@@ -47935,6 +48477,7 @@ test "dot_general handles rank2 lhs transpose view without materializing input f
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_owned = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
     var rhs_data = [_]f32{
@@ -47969,6 +48512,7 @@ test "dot_general handles flattened lhs transpose view for shared rhs linear" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_len = 2 * 3 * 4;
     const rhs_k = 4;
@@ -48023,6 +48567,7 @@ test "dot_general resolves symbolic batched output from peer dimensions" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_data = try allocator.alloc(f32, 2 * 3 * 4);
     defer allocator.free(lhs_data);
@@ -48053,6 +48598,7 @@ test "dot_general resolves rhs symbolic batch and free dims from lhs peer" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_data = try allocator.alloc(f32, 2 * 3 * 4 * 5);
     defer allocator.free(lhs_data);
@@ -48081,6 +48627,7 @@ test "dot_general keeps concrete flattened batch extent with repeated per-head r
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_data = try allocator.alloc(f32, 4 * 3 * 2);
     defer allocator.free(lhs_data);
@@ -48139,6 +48686,7 @@ test "dot_general handles batched rhs free-before-contract layout" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const batch = 1;
     const heads = 2;
@@ -48207,6 +48755,7 @@ test "dot_general handles clip vision attention score shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const batch = 1;
     const heads = 12;
@@ -48252,6 +48801,7 @@ test "dot_general preserves declared symbolic batch factorization" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_data = try allocator.alloc(f32, 64 * 4 * 64 * 32);
     defer allocator.free(lhs_data);
@@ -48290,6 +48840,7 @@ test "dot_general preserves partially resolved symbolic output shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const lhs_data = try allocator.alloc(f32, 2 * 3 * 4);
     defer allocator.free(lhs_data);
@@ -48327,6 +48878,7 @@ test "slice aliases full-range symbolic tensors" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const raw = try allocator.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 });
@@ -48351,6 +48903,7 @@ test "native conv ops preserve runtime logical shape" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     var conv1_input = [_]f32{
@@ -48396,6 +48949,7 @@ test "native rejects mismatched shaped buffers before conv2d" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     try std.testing.expectError(error.InvalidShape, cb.fromFloat32Shape(&.{1}, &.{2}));
@@ -48420,6 +48974,7 @@ test "argmax reduces axis with keepdims" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const raw = try allocator.dupe(f32, &.{
         1, 5, 3, 4,
@@ -48442,6 +48997,7 @@ test "argmax drops reduced axis when keepdims is false" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const raw = try allocator.dupe(f32, &.{
         1, 3, 2,
@@ -48464,6 +49020,7 @@ test "gather supports scalar index on nonzero axis" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const data = try allocator.dupe(f32, &.{
         1,  2,
@@ -48497,6 +49054,7 @@ test "gather preserves multi-dimensional index shape for 2d tables" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const data = try allocator.dupe(f32, &.{
         1, 2,
@@ -48530,6 +49088,7 @@ test "gather supports arbitrary axis with singleton index tensor" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const data = try allocator.dupe(f32, &.{
         1,  2,  3,  4,
@@ -48568,6 +49127,7 @@ test "gather_nd infers symbolic 2d source shape from coordinate indices" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const data = try allocator.dupe(f32, &.{
         1, 2, 3,
@@ -48595,6 +49155,7 @@ test "concat broadcasts symbolic view tensors across non-axis dims" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const a_raw = try allocator.dupe(f32, &.{ 10, 20 });
     defer allocator.free(a_raw);
@@ -48626,6 +49187,7 @@ test "concat expands stale concrete axis shape from runtime length" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const a_raw = try allocator.dupe(f32, &.{ 1, 2, 3 });
     defer allocator.free(a_raw);
@@ -48650,6 +49212,7 @@ test "transpose materializes source-backed tensors" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const tensor = try tensor_mod.Tensor.initFloat32(allocator, "weight", &.{ 2, 3 }, &.{
         1, 2, 3,
@@ -48674,6 +49237,7 @@ test "exportTensorData rejects source tensors with inconsistent byte length" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const tensor = tensor_mod.Tensor{
@@ -48696,6 +49260,7 @@ test "exportTensorData allows zero-sized source tensors" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const tensor = tensor_mod.Tensor{
@@ -48810,6 +49375,7 @@ test "toFloat32Op returns valid empty temporary tensor data" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const empty = try allocator.alloc(f32, 0);
     const ct = try compute.makeBuf(empty, true);
@@ -48824,6 +49390,7 @@ test "reduce mean materializes source-backed tensors" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const tensor = try tensor_mod.Tensor.initFloat32(allocator, "weight", &.{ 2, 3 }, &.{
         1, 2, 3,
@@ -48844,6 +49411,7 @@ test "gather source-backed 2d table with unshaped vector indices" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
 
     const tensor = try tensor_mod.Tensor.initFloat32(allocator, "embedding", &.{ 4, 2 }, &.{
         1, 2,

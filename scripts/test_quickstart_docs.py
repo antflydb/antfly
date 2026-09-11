@@ -12,6 +12,25 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
+# Pages on the launch path (home -> install -> docs). Their fenced blocks and
+# cURL payloads get the same static checks as the quickstart.
+LAUNCH_PAGES = (
+    REPO / "docs" / "introduction.mdx",
+    REPO / "docs" / "downloads.mdx",
+    REPO / "docs" / "guides" / "inference.mdx",
+    REPO / "docs" / "guides" / "hybrid-search.mdx",
+)
+DOCS_DIR = REPO / "docs"
+# Terminology is fixed, not decorative. Prose must not use these forms.
+BANNED_PHRASES = {
+    "swarm": "say `antfly standalone` or `cluster`; the word swarm does not appear in prose",
+    "pre-alpha": "no release hedges next to a download",
+    "coming soon": "no scarcity phrasing; say invite-only or say nothing",
+    "cutting-edge": "no marketing adjectives in docs",
+    "Search AF": "SearchAF is one word",
+    "Antfly inference": "the ML engine is `Antfly Inference` (capital I)",
+    "Termite": "the ML engine is Antfly Inference, not a separate product",
+}
 GO_EXAMPLE = REPO / "go" / "pkg" / "sdk" / "examples" / "quickstart" / "main.go"
 QUICKSTART_TAPE = REPO / "quickstart.tape"
 
@@ -45,7 +64,7 @@ def check_component_balance(source: str) -> None:
             fail(f"unbalanced <{component}> components: {opened} open, {closed} close")
 
 
-def check_shell(block: str, index: int) -> None:
+def check_shell(block: str, index: object) -> None:
     result = subprocess.run(
         ["bash", "-n"],
         input=block,
@@ -68,7 +87,46 @@ def check_json_payloads(source: str) -> None:
             fail(f"cURL JSON payload {index} is invalid: {error}")
 
 
+def check_page_blocks(path: Path) -> None:
+    source = path.read_text(encoding="utf-8")
+    check_component_balance(source)
+    for index, (language, block) in enumerate(fenced_blocks(source), start=1):
+        if language in {"bash", "sh", "shell"}:
+            check_shell(block, f"{path.name}#{index}")
+        elif language == "python":
+            try:
+                ast.parse(block)
+            except SyntaxError as error:
+                fail(f"{path.name} Python block {index} does not parse: {error}")
+    for index, payload in enumerate(
+        re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL), start=1
+    ):
+        try:
+            json.loads(payload)
+        except json.JSONDecodeError as error:
+            fail(f"{path.name} cURL JSON payload {index} is invalid: {error}")
+
+
+def check_terminology() -> None:
+    # `antfly inference <cmd>` (the CLI) is fine; the banned form is the prose name.
+    cli_form = re.compile(
+        r"`[^`]*antfly inference[^`]*`|^\s*antfly inference\b", re.MULTILINE
+    )
+    for path in sorted(DOCS_DIR.rglob("*.md*")):
+        source = cli_form.sub("", path.read_text(encoding="utf-8"))
+        for phrase, reason in BANNED_PHRASES.items():
+            for line_number, line in enumerate(source.splitlines(), start=1):
+                if phrase in line:
+                    fail(
+                        f"{path.relative_to(REPO)}:{line_number}: {phrase!r}: {reason}"
+                    )
+
+
 def main() -> int:
+    for page in LAUNCH_PAGES:
+        check_page_blocks(page)
+    check_terminology()
+
     source = QUICKSTART.read_text(encoding="utf-8")
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
     quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
@@ -97,6 +155,10 @@ def main() -> int:
         "QueryWithResponse(": "Go snippets must use the high-level SDK",
         "wiki-articles.json ": "the downloaded fixture must be identified as JSONL",
         "--streaming=false": "the retrieval CLI uses the --no-streaming switch",
+        "eligible-source-covered": "source-covered already excludes skipped documents",
+        "Q4_K_M": "the Gemma quickstart must use the published Q4_0 variant",
+        "--followup": "the quickstart should request only the grounded answer",
+        "--reasoning": "the quickstart should request only the grounded answer",
     }
     for token, message in forbidden.items():
         if token in source:
@@ -106,15 +168,18 @@ def main() -> int:
         'export PATH="$HOME/.local/bin:$PATH"',
         "wiki-articles.jsonl",
         "2,446 of the 10,000",
-        "--tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2",
+        "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
-        "--until searchable-artifacts=1",
-        "physical chunks or vector",
+        "--until source-covered=10%",
+        "Articles can produce multiple chunks",
         "## Troubleshooting",
         "standalone inference paths",
         "--inference-host-budget-mb 8192",
         "--no-streaming",
+        "antfly agents query-builder --table wikipedia",
+        "--max-internal-iterations 8",
+        "Add `--execute`",
     )
     for token in required:
         if token not in source:
@@ -139,18 +204,35 @@ def main() -> int:
         for language, block in blocks
         if language in {"bash", "sh", "shell"} and "antfly index wait" in block
     ]
-    if len(wait_blocks) < 2 or any(
-        "--until searchable-artifacts=1" not in block for block in wait_blocks
-    ):
-        fail("every quickstart index wait must require a published searchable artifact")
+    expected_waits = {
+        "title_body": "--until source-covered=10%",
+        "thumbnail": "--until searchable-artifacts=250",
+    }
+    if len(wait_blocks) != len(expected_waits):
+        fail("the quickstart must have one text wait and one image wait")
+    for index, condition in expected_waits.items():
+        matching = [block for block in wait_blocks if f"--index {index}" in block]
+        if (
+            len(matching) != 1
+            or condition not in matching[0]
+            or "--timeout 45m" not in matching[0]
+        ):
+            fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
-    if "--until searchable-artifacts=1" not in quickstart_tape:
-        fail("the quickstart recording must wait for a searchable artifact")
-    if "Wait@1200s /reached searchable-artifacts=1:/" not in quickstart_tape:
-        fail(
-            "the quickstart recording must match the searchable-artifact success message"
-        )
+    if "--until source-covered=10%" not in quickstart_tape:
+        fail("the quickstart recording must wait for 10% source coverage")
+    if (
+        "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape
+        or "--timeout 45m" not in quickstart_tape
+    ):
+        fail("the quickstart recording must match the source-coverage success message")
+    if "--until searchable-artifacts=1" in quickstart_tape:
+        fail("the quickstart recording must not retain the legacy single-artifact wait")
+    if "wiki-articles.jsonl" not in quickstart_tape:
+        fail("the quickstart recording must load the documented JSONL fixture")
+    if "--sync-level full_text" not in quickstart_tape:
+        fail("the quickstart recording must fence full-text visibility before waiting")
     if "Wait@1200s /ready/" in quickstart_tape:
         fail("the quickstart recording must not wait for the complete-only ready state")
 

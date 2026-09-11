@@ -19,9 +19,16 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 
 test {
+    _ = @import("standalone/inference_worker_rpc.zig");
+    _ = @import("standalone/inference_worker_wire.zig");
+    _ = @import("standalone/inference_worker.zig");
+    _ = @import("standalone/provider_failure.zig");
     _ = runtime;
     _ = inference_host;
     _ = inference_client;
     _ = storage_backend_erased;
     _ = lsm_backend;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

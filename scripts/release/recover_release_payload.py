@@ -119,8 +119,8 @@ def main() -> int:
             readers.append(
                 (
                     source,
-                    lambda repo=args.repo, tag=args.tag, token=token: GitHubReleaseReader(
-                        repo, tag, token
+                    lambda repo=args.repo, tag=args.tag, token=token: (
+                        GitHubReleaseReader(repo, tag, token)
                     ),
                 )
             )

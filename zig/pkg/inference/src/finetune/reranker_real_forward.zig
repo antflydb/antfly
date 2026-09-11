@@ -292,8 +292,8 @@ pub fn computeLossAndGrads(
 /// `query_proj`/`key_proj`/`value_proj`/`out_proj` naming, which is also fine
 /// — only string matching is used here).
 const candidate_lora_modules = [_][]const u8{
-    "query",         "key",          "value",        "attention.output.dense",
-    "query_proj",    "key_proj",     "value_proj",   "out_proj",
+    "query",      "key",      "value",      "attention.output.dense",
+    "query_proj", "key_proj", "value_proj", "out_proj",
 };
 
 const lora_grad_helpers = @import("lora_grad_helpers.zig");

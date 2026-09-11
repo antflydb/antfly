@@ -97,7 +97,9 @@ class MemoryStore:
         channel = (
             "nightly"
             if gc.NIGHTLY_PATTERN.fullmatch(tag)
-            else "next" if "-" in tag else "stable"
+            else "next"
+            if "-" in tag
+            else "stable"
         )
         if with_container_identity:
             self.put(

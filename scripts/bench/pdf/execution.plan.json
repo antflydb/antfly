@@ -1,0 +1,114 @@
+{
+  "schema": "antfly.pdf.qualification_plan.v1",
+  "limitations": [
+    "Contract-only lane: fake providers do not qualify real models, native fusion, accelerator memory or hardware performance."
+  ],
+  "gates": [
+    {
+      "id": "inference-scheduler-contracts",
+      "layer": "execution",
+      "kind": "contract",
+      "scope": "Existing hermetic inference scheduler, task pipeline and backend contract tests; not real-model fused execution evidence.",
+      "cwd": "${repo}/zig/pkg/inference",
+      "command": ["zig", "build", "test", "-Doptimize=Debug", "-Dmetal=false", "-Dcuda=false", "-j1"],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "invocation-contracts",
+      "layer": "execution",
+      "kind": "contract",
+      "scope": "Task-specific capability, per-item identity, admission, cancellation and borrowed-media contracts using fake providers.",
+      "cwd": "${repo}/zig",
+      "command": [
+        "zig",
+        "build",
+        "antfly-generating-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "worker-transport",
+      "layer": "execution",
+      "kind": "contract",
+      "scope": "Linked and worker-process ABI ownership, cancellation, capacity and borrowed payload isolation; no model correctness claim.",
+      "cwd": "${repo}/zig",
+      "command": [
+        "zig",
+        "build",
+        "antfly-standalone-runtime-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "embedding-contracts",
+      "layer": "execution",
+      "kind": "contract",
+      "scope": "Provider request boundaries, task roles, credentials, batching cardinality and cancellation; fake provider results.",
+      "cwd": "${repo}/zig",
+      "command": [
+        "zig",
+        "build",
+        "antfly-inference-managed-embedder-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "pdf-renderer",
+      "layer": "document",
+      "kind": "contract",
+      "scope": "Native PDF parsing/rendering, bounded row decoding and production coordinator with a model-free reader.",
+      "cwd": "${repo}/zig",
+      "command": [
+        "zig",
+        "build",
+        "lib-pdf-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "document-replay",
+      "layer": "document",
+      "kind": "contract",
+      "scope": "Precommit/replay publication, shared windows, provenance and admission recovery under deterministic test pressure.",
+      "cwd": "${repo}/zig",
+      "command": [
+        "zig",
+        "build",
+        "antfly-storage-db-enrichment-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 1800
+    },
+    {
+      "id": "distributed-routing",
+      "layer": "execution",
+      "kind": "contract",
+      "scope": "Inference route discovery, advertised capabilities and proxy routing contracts; not a real multinode model run.",
+      "cwd": "${repo}/go/pkg/proxy",
+      "command": [
+        "env",
+        "GOWORK=off",
+        "go",
+        "test",
+        "./inference"
+      ],
+      "legacy_exit_code": true,
+      "timeout_seconds": 300
+    }
+  ]
+}

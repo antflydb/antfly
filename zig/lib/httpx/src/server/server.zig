@@ -34,6 +34,7 @@ const Allocator = mem.Allocator;
 const Io = std.Io;
 const milliTimestamp = @import("../util/common.zig").milliTimestamp;
 const encoding = @import("../util/encoding.zig");
+const attachment_envelope = @import("../util/attachment_envelope.zig");
 
 const types = @import("../core/types.zig");
 const Request = @import("../core/request.zig").Request;
@@ -99,6 +100,18 @@ pub const H1DisconnectCancellation = enum {
     disabled,
 };
 
+/// Backend-neutral hard-disconnect observation for virtual or embedded
+/// transports whose socket handles are not native process descriptors.
+/// Orderly half-close must return false; only a reset/abort is cancellation.
+pub const H1DisconnectProbe = struct {
+    ptr: ?*const anyopaque,
+    is_hard_disconnected: *const fn (?*const anyopaque, std.Io.net.Socket.Handle) bool,
+
+    pub fn requested(self: H1DisconnectProbe, handle: std.Io.net.Socket.Handle) bool {
+        return self.is_hard_disconnected(self.ptr, handle);
+    }
+};
+
 pub const ConnectionExecution = enum {
     /// Every accepted connection is submitted to HttpRuntime's bounded
     /// connection lane. Saturation rejects it without blocking accept.
@@ -134,7 +147,15 @@ pub const ServerConfig = struct {
     /// the Server owns a private runtime whose listener, connection, and
     /// request-task lanes are sized to this configuration.
     http_runtime: ?*HttpRuntime = null,
+    /// Make that private runtime borrow `Server.io` for all execution lanes.
+    /// Deterministic/cooperative callers use this to prevent listener and
+    /// request work from escaping into hidden native Threaded executors. Such
+    /// callers must disable H1 disconnect cancellation or supply a probe.
+    borrow_http_runtime_io: bool = false,
     h1_disconnect_cancellation: H1DisconnectCancellation = .required,
+    /// Required when disconnect cancellation runs on borrowed std.Io lanes.
+    /// Native runtimes leave this null and use their descriptor observer.
+    h1_disconnect_probe: ?H1DisconnectProbe = null,
     /// Maximum H1 requests allowed to wait for a body after headers have been
     /// parsed. 0 inherits max_connections. This preserves connection capacity
     /// for control/recovery traffic during slow uploads.
@@ -190,6 +211,25 @@ pub const ServerConfig = struct {
         resolved.accept_error_backoff_initial_ms = @max(resolved.accept_error_backoff_initial_ms, 1);
         resolved.accept_error_backoff_max_ms = @max(resolved.accept_error_backoff_max_ms, resolved.accept_error_backoff_initial_ms);
         return resolved;
+    }
+};
+
+const H1DisconnectProbeContext = struct {
+    probe: H1DisconnectProbe,
+    handle: std.Io.net.Socket.Handle,
+    cancellation: *std.atomic.Value(bool),
+    runtime: *HttpRuntime,
+    recorded: bool = false,
+
+    fn requested(raw: ?*const anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw orelse return false)));
+        if (!self.probe.requested(self.handle)) return false;
+        self.cancellation.store(true, .release);
+        if (!self.recorded) {
+            self.runtime.recordBorrowedH1HardDisconnect();
+            self.recorded = true;
+        }
+        return true;
     }
 };
 
@@ -298,6 +338,9 @@ pub const Context = struct {
     data: ?std.StringHashMap(DataEntry) = null,
     decoded_query_values: std.ArrayListUnmanaged([]u8) = .empty,
     max_file_size: usize = types.default_max_body_size,
+    /// Expanded application request-body ceiling for the matched route.
+    /// Transport admission enforces the same limit on encoded bytes.
+    max_request_body_size: usize = types.default_max_body_size,
 
     // H1 streaming field (set by the server, null for HTTP/2).
     h1_sock: ?*Socket = null,
@@ -310,6 +353,10 @@ pub const Context = struct {
     /// Set to true when a streaming response has been sent via `streamResponse()`.
     /// When true, the connection loop skips the normal response serialization.
     h1_stream_sent: bool = false,
+    /// Connection policy established before dispatch, then narrowed by the
+    /// streaming response headers. Committed headers and socket retirement
+    /// must agree so clients do not reuse a connection the server will close.
+    h1_keep_alive: bool = true,
 
     // H2 streaming fields (set by the server for H2 streams, null for HTTP/1.1).
     h2: ?*H2Connection = null,
@@ -325,6 +372,9 @@ pub const Context = struct {
     /// Optional application-owned absolute monotonic deadline established by
     /// ingress middleware. The HTTP library carries but does not interpret it.
     application_deadline_ns: ?u64 = null,
+    /// Clock authority paired with the application deadline. Null leaves
+    /// interpretation to an application's native-clock contract.
+    application_deadline_io: ?Io = null,
     /// Records malformed application deadline metadata so authentication can
     /// run before an application-specific validation response is disclosed.
     application_deadline_invalid: bool = false,
@@ -338,6 +388,7 @@ pub const Context = struct {
     /// use this to retain transport ownership while application admission runs
     /// before a streaming upload is buffered.
     body_delegate: ?BodyDelegate = null,
+    body_read_offset: usize = 0,
 
     /// Streaming body reader for HTTP/2 requests where the body arrives
     /// incrementally (dispatch-on-HEADERS mode). Null for HTTP/1.1 or
@@ -371,7 +422,16 @@ pub const Context = struct {
     pub const BodyDelegate = struct {
         ptr: ?*anyopaque,
         read_all: *const fn (?*anyopaque) anyerror!?[]const u8,
+        read: ?*const fn (?*anyopaque, []u8) anyerror!usize = null,
         streaming: bool,
+    };
+
+    pub const RequestBodyReader = struct {
+        context: *Self,
+
+        pub fn read(self: *@This(), dest: []u8) !usize {
+            return self.context.readBodyChunk(dest);
+        }
     };
 
     /// Creates a new context for a request.
@@ -605,6 +665,65 @@ pub const Context = struct {
         return self.response.build();
     }
 
+    /// Reader for fixed-length HTTP/1 request bodies dispatched immediately
+    /// after headers. It consumes already-buffered body bytes first and never
+    /// reads beyond Content-Length, preserving a pipelined next request.
+    pub const H1StreamReader = struct {
+        allocator: Allocator,
+        io: Io,
+        sock: *Socket,
+        buffer: *[8192]u8,
+        leftover: *usize,
+        remaining: u64,
+        deadline_ms: i64,
+        owned_body: ?[]u8 = null,
+
+        pub fn deinit(self: *H1StreamReader) void {
+            if (self.owned_body) |body_bytes| self.allocator.free(body_bytes);
+            self.owned_body = null;
+        }
+
+        pub fn read(self: *H1StreamReader, dest: []u8) !usize {
+            if (dest.len == 0 or self.remaining == 0) return 0;
+            const requested = @min(dest.len, std.math.cast(usize, self.remaining) orelse dest.len);
+            if (self.leftover.* > 0) {
+                const n = @min(requested, self.leftover.*);
+                @memcpy(dest[0..n], self.buffer[0..n]);
+                if (n < self.leftover.*)
+                    std.mem.copyForwards(u8, self.buffer[0 .. self.leftover.* - n], self.buffer[n..self.leftover.*]);
+                self.leftover.* -= n;
+                self.remaining -= n;
+                return n;
+            }
+            try applyReadDeadline(self.sock, self.io, self.deadline_ms);
+            const n = try self.sock.recv(dest[0..requested]);
+            if (n == 0) return error.EndOfStream;
+            self.remaining -= n;
+            return n;
+        }
+
+        fn readErased(ptr: ?*anyopaque, dest: []u8) anyerror!usize {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            return self.read(dest);
+        }
+
+        fn readAllErased(ptr: ?*anyopaque) anyerror!?[]const u8 {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            if (self.owned_body != null) return self.owned_body.?;
+            const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
+            const body_bytes = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(body_bytes);
+            var offset: usize = 0;
+            while (offset < body_bytes.len) {
+                const n = try self.read(body_bytes[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            self.owned_body = body_bytes;
+            return body_bytes;
+        }
+    };
+
     /// Reader for server-side HTTP/2 streaming request bodies.
     /// Reads incrementally from the stream's data_buf mailbox, waiting
     /// on data_event when no data is available. Returns 0 (EOF) when
@@ -672,9 +791,9 @@ pub const Context = struct {
         }
     };
 
-    /// Returns the request body, buffering from the streaming H2 reader if needed.
-    /// For HTTP/1.1 this returns request.body directly. For HTTP/2 streaming,
-    /// reads the entire body on first call.
+    /// Returns the request body, materializing an incremental transport reader
+    /// when needed. Ordinary HTTP/1 requests return request.body directly;
+    /// opted-in fixed-length HTTP/1 and streaming HTTP/2 bodies are read once.
     pub fn body(self: *Self) !?[]const u8 {
         if (self.request.body != null) return self.request.body;
         if (self.body_delegate) |delegate| {
@@ -699,6 +818,46 @@ pub const Context = struct {
             return self.request.body;
         }
         return null;
+    }
+
+    /// Return an incremental reader over whichever transport owns the request
+    /// body. Buffered H1 requests borrow their existing slice; H2 and linked
+    /// delegates can release transport chunks as the application consumes
+    /// them. Calling code must choose either this reader or body(), not both.
+    pub fn requestBodyReader(self: *Self) RequestBodyReader {
+        return .{ .context = self };
+    }
+
+    fn readBodyChunk(self: *Self, dest: []u8) !usize {
+        if (dest.len == 0) return 0;
+        if (self.request.body) |body_bytes| {
+            if (self.body_read_offset >= body_bytes.len) return 0;
+            const n = @min(dest.len, body_bytes.len - self.body_read_offset);
+            @memcpy(dest[0..n], body_bytes[self.body_read_offset..][0..n]);
+            self.body_read_offset += n;
+            return n;
+        }
+        if (self.body_delegate) |delegate| {
+            if (delegate.read) |read| return read(delegate.ptr, dest);
+            const data = (try delegate.read_all(delegate.ptr)) orelse return 0;
+            self.request.body = data;
+            self.request.body_owned = false;
+            self.body_delegate = null;
+            return self.readBodyChunk(dest);
+        }
+        if (self.h2_body_reader) |reader| return reader.read(dest);
+        return 0;
+    }
+
+    /// Charge transformed request-body capacity to the server-wide body
+    /// budget. Middleware must reserve before allocating and may release
+    /// excess capacity after an in-place shrink or replacement.
+    pub fn tryReserveRequestBodyBuffer(self: *Self, amount: usize) bool {
+        return self.request.tryReserveBodyBuffer(amount);
+    }
+
+    pub fn releaseRequestBodyBuffer(self: *Self, amount: usize) void {
+        self.request.releaseBodyBuffer(amount);
     }
 
     /// True when reading the body can still block on peer-controlled input.
@@ -950,12 +1109,20 @@ pub const Context = struct {
             try delegate.start(delegate.ptr, status_code);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
+        // Middleware has already established response policy (e.g. CORS).
+        // Copy it before committing headers, then let the transport own SSE
+        // content type and framing. Never reuse a buffered Content-Length.
+        var headers = try self.response.headers.clone(self.allocator);
+        defer headers.deinit();
+        _ = headers.remove(HeaderName.CONTENT_LENGTH);
+        _ = headers.remove(HeaderName.TRANSFER_ENCODING);
+        try headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
+        if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {
-            // HTTP/2 path — delegate to existing streamH2
-            const h2w = try self.streamH2(status_code, &.{
-                .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-                .{ .name = "cache-control", .value = "no-cache" },
-            });
+            var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
+            defer extra.deinit(self.allocator);
+            try appendH2ResponseHeaders(self.allocator, &extra, &headers);
+            const h2w = try self.streamH2(status_code, extra.items);
             return .{ .h1_sock = null, .h2_writer = h2w };
         }
 
@@ -965,9 +1132,13 @@ pub const Context = struct {
         // Build and send headers-only response
         var resp = Response.init(self.allocator, status_code);
         defer resp.deinit();
-        try resp.headers.set(HeaderName.CONTENT_TYPE, "text/event-stream; charset=utf-8");
-        try resp.headers.set(HeaderName.CACHE_CONTROL, "no-cache");
-        try resp.headers.set(HeaderName.CONNECTION, "keep-alive");
+        resp.headers.deinit();
+        resp.headers = headers;
+        headers = Headers.init(self.allocator);
+        self.h1_keep_alive = self.h1_keep_alive and
+            self.request.headers.isKeepAlive(self.request.version) and
+            resp.headers.isKeepAlive(self.request.version);
+        try resp.headers.set(HeaderName.CONNECTION, if (self.h1_keep_alive) "keep-alive" else "close");
         try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
 
         // Serialize headers only (no body)
@@ -1159,6 +1330,10 @@ pub const Server = struct {
     /// Acquired before publishing a bound socket so transport cancellation is
     /// startable whenever callers advertise the listener as ready.
     http_runtime_lease: HttpRuntime.ListenerLease = .{},
+    /// Immutable after bind and published before `listen_started`. Stop paths
+    /// use this copy so observing a running listener pins no mutable lease that
+    /// the listener thread may concurrently release.
+    listener_wake_io: ?Io = null,
 
     const Self = @This();
 
@@ -1331,6 +1506,10 @@ pub const Server = struct {
                 .max_active_h1_requests = cfg.max_connections,
                 .max_active_connections = cfg.max_connections,
                 .max_active_requests = cfg.max_request_tasks,
+                .borrowed_io = if (cfg.borrow_http_runtime_io)
+                    .{ .listener = io, .connection = io, .request = io }
+                else
+                    null,
             }),
         };
     }
@@ -1402,6 +1581,13 @@ pub const Server = struct {
         try self.router.addWithBodyLimit(method, path, handler, max_body_size);
     }
 
+    /// Register a route whose fixed-length body may be consumed incrementally
+    /// after header parsing. Transport-specific framing still decides whether
+    /// a particular request is safe to stream.
+    pub fn routeStreaming(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
+        try self.router.addStreaming(method, path, handler);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -1415,6 +1601,10 @@ pub const Server = struct {
     /// Registers a POST route.
     pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.POST, path, handler);
+    }
+
+    pub fn postStreaming(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.routeStreaming(.POST, path, handler);
     }
 
     pub fn postWithBodyLimit(self: *Self, path: []const u8, max_body_size: usize, handler: anytype) !void {
@@ -1465,7 +1655,15 @@ pub const Server = struct {
     /// (useful when port 0 is used for OS-assigned ports).
     pub fn bind(self: *Self) !void {
         if (self.listener != null) return;
-        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required)
+        if ((self.config.tls_cert_path == null) != (self.config.tls_key_path == null))
+            return error.InvalidServerTlsConfiguration;
+        // Direct server TLS is not implemented. Reject it before reserving
+        // runtime or socket capacity so deployments cannot accidentally serve
+        // plaintext on a port configured as HTTPS. The supported boundary is
+        // explicit TLS termination in a reverse proxy/load balancer.
+        if (self.config.tls_cert_path != null) return error.ServerTlsUnsupported;
+        const observer_capacity = if (self.config.h1_disconnect_cancellation == .required and
+            self.config.h1_disconnect_probe == null)
             self.config.max_connections
         else
             0;
@@ -1478,7 +1676,8 @@ pub const Server = struct {
         const addr = try Address.parse(self.config.host, self.config.port);
         const backlog_u32: u32 = @max(self.config.max_connections, 1);
         const backlog: u31 = @intCast(@min(backlog_u32, @as(u32, std.math.maxInt(u31))));
-        var listener = try TcpListener.initWithOptions(addr, http_runtime_lease.connectionIo(), .{
+        const socket_io = listenerSocketIo(&http_runtime_lease);
+        var listener = try TcpListener.initWithOptions(addr, socket_io, .{
             .kernel_backlog = backlog,
             .reuse_address = self.config.reuse_address,
             .reuse_port = self.config.reuse_port,
@@ -1491,6 +1690,7 @@ pub const Server = struct {
         };
         self.wake_port.store(port, .release);
         self.http_runtime_lease = http_runtime_lease;
+        self.listener_wake_io = socket_io;
         self.listener = listener;
     }
 
@@ -1520,10 +1720,6 @@ pub const Server = struct {
         if (self.shutdown_mode.load(.acquire) != 0) {
             self.running = false;
             return;
-        }
-
-        if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
-            std.debug.print("Warning: tls_cert_path/tls_key_path are set but server TLS is not yet supported (Zig 0.16). Use a TLS-terminating reverse proxy.\n", .{});
         }
 
         var accept_error_backoff_ms = self.config.accept_error_backoff_initial_ms;
@@ -1652,11 +1848,18 @@ pub const Server = struct {
     }
 
     fn wakeListener(self: *Self) void {
+        // Before listen() publishes ownership there is no accept/admission wait
+        // to wake and the runtime lease may not exist yet (or may already have
+        // been released after listen returned). A concurrent stop still wins:
+        // listen() checks shutdown_mode on both sides of bind/startup.
+        if (!self.listen_started.load(.acquire)) return;
+        const wake_io = self.listener_wake_io orelse return;
+
         // Only publish a permit when the listener has announced that it may
         // block in the admission gate. The listener consumes this permit before
         // leaving, so repeated stop/listen cycles cannot inflate capacity.
         if (self.waiting_for_connection_permit.swap(false, .acq_rel)) {
-            self.conn_semaphore.post(self.connectionIo());
+            self.conn_semaphore.post(wake_io);
         }
 
         const published_port = self.wake_port.load(.acquire);
@@ -1671,7 +1874,9 @@ pub const Server = struct {
                 addr = .{ .ip6 = .loopback(ip6.port) };
             },
         }
-        const wake_io = std.Io.Threaded.global_single_threaded.io();
+        // The listener socket is created in the connection lane. Borrowed I/O
+        // lanes may have disjoint virtual handle spaces, so its wakeup must use
+        // that same lane even though the accept task runs on listenerIo().
         var wake_socket = Socket.connect(addr, wake_io) catch return;
         wake_socket.close();
     }
@@ -1772,22 +1977,22 @@ pub const Server = struct {
 
         var allow_methods: [16]types.Method = undefined;
         const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
-        if (req.method == .OPTIONS and allow_count > 0) {
-            var response = Response.init(self.allocator, 204);
-            errdefer response.deinit();
-            try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            return .{ .response = response };
-        }
         if (allow_count > 0) {
-            var response = Response.init(self.allocator, 405);
-            errdefer response.deinit();
-            try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            return .{ .response = response };
+            return .{ .response = try self.executeMiddleware(ctx, Handler.bind(self, automaticMethodResponse)) };
         }
         if (self.global_handler) |global_handler| {
             return .{ .response = try self.executeMiddleware(ctx, global_handler) };
         }
         return .{ .status = 404 };
+    }
+
+    /// Automatic OPTIONS/405 responses are application responses too. Run
+    /// them through middleware so preflight authorization cannot be bypassed.
+    fn automaticMethodResponse(self: *Self, ctx: *Context) !Response {
+        var methods: [16]types.Method = undefined;
+        const count = self.router.allowedMethods(ctx.request.uri.path, &methods);
+        try self.setAllowHeader(&ctx.response.headers, methods[0..count]);
+        return ctx.status(if (ctx.request.method == .OPTIONS) 204 else 405).response.build();
     }
 
     /// Handles a single connection.
@@ -1829,6 +2034,8 @@ pub const Server = struct {
             parser.request_body_limit_context = self;
             parser.request_body_limit_resolver = resolveRequestBodyLimit;
         }
+        parser.request_body_streaming_context = self;
+        parser.request_body_streaming_resolver = resolveRequestBodyStreaming;
 
         var first_request = true;
         var request_active = false;
@@ -1906,12 +2113,9 @@ pub const Server = struct {
                     first_recv_done = false;
                     break :blk first_n;
                 } else blk: {
-                    applyReadDeadline(&sock, self.io, deadline_ms) catch |err| switch (err) {
-                        error.Timeout => {
-                            if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
-                            return;
-                        },
-                        else => return err,
+                    applyReadDeadline(&sock, self.io, deadline_ms) catch {
+                        if (!waiting_for_request_bytes) try self.sendError(&sock, 408);
+                        return;
                     };
                     const received = sock.recv(&buffer) catch |err| switch (err) {
                         error.Timeout => {
@@ -1965,7 +2169,7 @@ pub const Server = struct {
                 }
             }
 
-            if (h1_body_reserved) {
+            if (h1_body_reserved and !parser.headers_only) {
                 self.h1_body_budget.release(1);
                 h1_body_reserved = false;
             }
@@ -2028,7 +2232,32 @@ pub const Server = struct {
 
             var ctx = Context.init(self.allocator, self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
+            ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
+            req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
+            var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and parser.content_length.? > 0) .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .sock = &sock,
+                .buffer = &buffer,
+                .leftover = &leftover,
+                .remaining = parser.content_length.?,
+                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
+            } else null;
+            defer if (h1_stream_reader) |*reader| reader.deinit();
+            if (h1_stream_reader) |*reader| {
+                ctx.body_delegate = .{
+                    .ptr = reader,
+                    .read_all = Context.H1StreamReader.readAllErased,
+                    .read = Context.H1StreamReader.readErased,
+                    .streaming = true,
+                };
+            }
+            const reaches_request_limit = self.config.max_requests_per_connection > 0 and
+                request_count + 1 >= self.config.max_requests_per_connection;
+            ctx.h1_keep_alive = self.config.keep_alive and
+                req.headers.isKeepAlive(req.version) and !reaches_request_limit and
+                self.shutdown_mode.load(.acquire) == 0;
             // A non-empty suffix is not necessarily a pipelined request: it
             // can be a partial or malformed request line. Preserve this fact
             // for handlers without mutating the live parser or buffer.
@@ -2036,14 +2265,28 @@ pub const Server = struct {
             connection.h1_request_cancellation.store(false, .release);
             ctx.cancellation = &connection.h1_request_cancellation;
             var cancellation_registration: CancellationObserver.Registration = .{};
+            var disconnect_probe_context: H1DisconnectProbeContext = undefined;
             if (self.config.h1_disconnect_cancellation == .required) {
-                cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
-                    sock.handle,
-                    &connection.h1_request_cancellation,
-                ) catch {
-                    try self.sendError(&sock, 503);
-                    return;
-                };
+                if (self.config.h1_disconnect_probe) |probe| {
+                    disconnect_probe_context = .{
+                        .probe = probe,
+                        .handle = sock.handle,
+                        .cancellation = &connection.h1_request_cancellation,
+                        .runtime = self.config.http_runtime orelse &self.owned_http_runtime,
+                    };
+                    ctx.cancellation_probe = .{
+                        .ptr = &disconnect_probe_context,
+                        .is_cancelled = H1DisconnectProbeContext.requested,
+                    };
+                } else {
+                    cancellation_registration = (self.config.http_runtime orelse &self.owned_http_runtime).registerH1Request(
+                        sock.handle,
+                        &connection.h1_request_cancellation,
+                    ) catch {
+                        try self.sendError(&sock, 503);
+                        return;
+                    };
+                }
             }
             defer cancellation_registration.deinit();
             defer ctx.deinit();
@@ -2082,17 +2325,11 @@ pub const Server = struct {
                 ctx.h1_stream_sent = false;
                 self.finishRequest();
                 request_active = false;
-                // Check if the client wants keep-alive
-                const stream_keep_alive = self.config.keep_alive and
-                    req.headers.isKeepAlive(req.version) and
+                const stream_keep_alive = ctx.h1_keep_alive and
                     self.shutdown_mode.load(.acquire) == 0;
                 if (!stream_keep_alive) return;
 
                 request_count += 1;
-                if (self.config.max_requests_per_connection > 0 and
-                    request_count >= self.config.max_requests_per_connection)
-                    return;
-
                 if (first_request) first_request = false;
                 self.io.sleep(Io.Duration.zero, .awake) catch {};
                 continue;
@@ -2106,16 +2343,13 @@ pub const Server = struct {
                 response.body = null;
             }
 
-            const request_wants_keep_alive = req.headers.isKeepAlive(req.version);
             // Handlers may deliberately shed an overloaded request and ask the
             // peer to reconnect later. Honor a response-side Connection: close
             // instead of advertising closure while retaining the socket and its
             // connection-admission permit until the keep-alive timeout.
             const response_wants_keep_alive = response.headers.isKeepAlive(req.version);
-            const reaches_request_limit = self.config.max_requests_per_connection > 0 and
-                request_count + 1 >= self.config.max_requests_per_connection;
-            const keep_alive = self.config.keep_alive and request_wants_keep_alive and response_wants_keep_alive and
-                !reaches_request_limit and self.shutdown_mode.load(.acquire) == 0;
+            const keep_alive = ctx.h1_keep_alive and response_wants_keep_alive and
+                self.shutdown_mode.load(.acquire) == 0;
             if (!keep_alive) {
                 try response.headers.set(HeaderName.CONNECTION, "close");
             }
@@ -2134,13 +2368,22 @@ pub const Server = struct {
             // for the next request, similar to Go's net/http finishRequest.
             if (parser.content_length) |cl| {
                 const body_read = parser.getBody().len;
-                var remaining: u64 = if (cl > body_read) cl - body_read else 0;
+                var remaining: u64 = if (h1_stream_reader) |reader|
+                    reader.remaining
+                else if (cl > body_read)
+                    cl - body_read
+                else
+                    0;
                 const max_drain: u64 = 256 * 1024; // Match Go's 256 KB limit.
                 if (remaining > max_drain) return; // Too much to drain; close.
                 var drain_buf: [8192]u8 = undefined;
                 while (remaining > 0) {
-                    const to_read = @min(remaining, drain_buf.len);
-                    const n = sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    const n = if (h1_stream_reader) |*reader|
+                        reader.read(&drain_buf) catch return
+                    else blk: {
+                        const to_read = @min(remaining, drain_buf.len);
+                        break :blk sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
+                    };
                     if (n == 0) return;
                     remaining -= n;
                 }
@@ -2161,7 +2404,9 @@ pub const Server = struct {
     /// Admit an HTTP/1 request body as soon as headers identify it, rather
     /// than after the parser has waited for an attacker-controlled upload.
     fn reserveH1BodyAfterHeaders(self: *Self, parser: *const Parser, reserved: *bool) bool {
-        if (reserved.* or !parser.hasCompleteHeaders() or parser.isComplete()) return true;
+        if (reserved.* or !parser.hasCompleteHeaders()) return true;
+        if (parser.isComplete() and !parser.headers_only) return true;
+        if (parser.content_length == null and !parser.chunked) return true;
         if (!self.h1_body_budget.tryReserve(1)) return false;
         reserved.* = true;
         return true;
@@ -2172,6 +2417,19 @@ pub const Server = struct {
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
         const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
         return @min(route_limit, self.config.max_body_size);
+    }
+
+    fn resolveRequestBodyStreaming(ptr: *anyopaque, method: types.Method, request_target: []const u8, content_type_value: ?[]const u8) bool {
+        if (method != .POST and method != .PUT and method != .PATCH) return false;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const query_start = mem.indexOfScalar(u8, request_target, '?') orelse request_target.len;
+        if (!self.router.streamsRequestBody(method, request_target[0..query_start])) return false;
+        const content_type = content_type_value orelse return false;
+        const separator = mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+        return std.ascii.eqlIgnoreCase(
+            mem.trim(u8, content_type[0..separator], " \t"),
+            attachment_envelope.content_type,
+        );
     }
 
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
@@ -2744,6 +3002,8 @@ pub const Server = struct {
     fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request, body_reader: ?*Context.H2StreamReader) !void {
         var ctx = Context.init(self.allocator, self.io, req);
         ctx.max_file_size = self.config.max_file_size;
+        ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
+        req.body_budget = &self.body_budget;
         ctx.h2 = h2;
         ctx.h2_sock = sock;
         ctx.h2_body_reader = body_reader;
@@ -2793,14 +3053,15 @@ pub const Server = struct {
             // 204 for OPTIONS, 404 otherwise.
             var allow_methods: [16]types.Method = undefined;
             const allow_count = self.router.allowedMethods(req.uri.path, &allow_methods);
-            if (req.method == .OPTIONS and allow_count > 0) {
-                response = Response.init(self.allocator, 204);
-                errdefer response.deinit();
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
-            } else if (allow_count > 0) {
-                response = Response.init(self.allocator, 405);
-                errdefer response.deinit();
-                try self.setAllowHeader(&response.headers, allow_methods[0..allow_count]);
+            if (allow_count > 0) {
+                response = self.executeMiddleware(&ctx, Handler.bind(self, automaticMethodResponse)) catch |err| {
+                    const status = self.routeErrorResponseStatus(err) orelse {
+                        cancelH2Stream(h2, sock, stream_id);
+                        return;
+                    };
+                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    return;
+                };
             } else if (self.global_handler) |global_handler| {
                 response = self.executeMiddleware(&ctx, global_handler) catch |err| {
                     const status = self.routeErrorResponseStatus(err) orelse {
@@ -3125,6 +3386,13 @@ pub const Server = struct {
         return MiddlewareExecState.advance(ctx, &state);
     }
 };
+
+/// Socket creation and listener wakeups must share an I/O handle namespace.
+/// Keep this selection in one place so execution-lane changes cannot split
+/// the bind and wake paths again.
+fn listenerSocketIo(lease: *const HttpRuntime.ListenerLease) Io {
+    return lease.connectionIo();
+}
 
 /// RFC 7540 §8.1.2.2: Connection-specific headers are forbidden in HTTP/2.
 /// Returns true if the header must be rejected.
@@ -3591,6 +3859,37 @@ test "route body limits resolve before transport body admission" {
     try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
 }
 
+test "attachment body streaming requires route opt-in and framed content type" {
+    var server = Server.init(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postStreaming("/stream/:id", handler);
+    try server.post("/buffered", handler);
+
+    try std.testing.expect(Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7?x=1",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/buffered",
+        attachment_envelope.content_type,
+    ));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(
+        &server,
+        .POST,
+        "/stream/7",
+        "application/json",
+    ));
+}
+
 test "Context queryDecoded decodes percent escapes exactly once" {
     const allocator = std.testing.allocator;
     var req = try Request.init(
@@ -3813,16 +4112,16 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("deadline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -3840,6 +4139,75 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     const n = try client.recv(&response);
     try std.testing.expect(mem.indexOf(u8, response[0..n], " 408 ") != null);
     try std.testing.expect(!State.handled.load(.acquire));
+}
+
+test "H1 opted-in framed route dispatches before the full body arrives" {
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            var reader = ctx.requestBodyReader();
+            var body: [3]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < body.len) {
+                const n = try reader.read(body[offset..]);
+                if (n == 0) return error.EndOfStream;
+                offset += n;
+            }
+            if (!mem.eql(u8, &body, "xyz")) return error.TestUnexpectedResult;
+            return ctx.text("streamed");
+        }
+    };
+    State.started.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .body_read_timeout_ms = 2_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.postStreaming("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("streaming-body listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Type: application/vnd.antfly.attachments.v1\r\n" ++
+            "Content-Length: 3\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "x",
+    );
+
+    const start_deadline = milliTimestamp(client_io) + 1_000;
+    while (!State.started.load(.acquire) and milliTimestamp(client_io) < start_deadline)
+        std.Thread.yield() catch {};
+    const dispatched_before_full_body = State.started.load(.acquire);
+    try client.sendAll("yz");
+    try std.testing.expect(dispatched_before_full_body);
+
+    var response: [1024]u8 = undefined;
+    const n = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..n], "streamed") != null);
 }
 
 test "H1 oversized content length returns 413 before handler admission" {
@@ -3867,16 +4235,16 @@ test "H1 oversized content length returns 413 before handler admission" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("oversized-body listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
 
@@ -3929,6 +4297,189 @@ test "H1 oversized content length returns 413 before handler admission" {
     }
 }
 
+test "HTTP streaming headers and automatic preflight preserve middleware policy" {
+    const State = struct {
+        fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8) !Response {
+            if (!http2) {
+                var client = @import("../client/client.zig").Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .uniform(5000) });
+                defer client.deinit();
+                const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/stream", .{address.getPort()});
+                defer alloc.free(url);
+                const headers = [_][2][]const u8{.{ "Origin", origin orelse "" }};
+                return client.request(method, url, .{ .headers = if (origin != null) &headers else null });
+            }
+            // A synchronous frame peer keeps this server regression independent
+            // of the production client's pooled H2 receive-fiber lifecycle.
+            var socket = try Socket.connect(address, io);
+            defer socket.close();
+            try socket.setRecvTimeout(5000);
+            try socket.setSendTimeout(5000);
+            var h2 = H2Connection.initClient(alloc, io);
+            defer h2.deinit();
+            try h2.sendClientPreface(&socket);
+            const stream = try h2.stream_manager.createStream();
+            const extra = [_]hpack.HeaderEntry{.{ .name = "origin", .value = origin orelse "" }};
+            const headers = try H2Connection.buildRequestHeaders(method.toString(), "/stream", "http", "localhost", if (origin != null) &extra else &.{}, alloc);
+            defer alloc.free(headers);
+            try h2.sendHeaders(&socket, stream.id, headers, true);
+            while (!stream.completed) _ = try h2.processOneFrame(&socket, &socket);
+            if (stream.stream_error) |err| return err;
+            var response = Response.init(alloc, 200);
+            errdefer response.deinit();
+            for (stream.request_headers orelse return error.MissingHeaders) |header| {
+                if (mem.eql(u8, header.name, ":status")) {
+                    response.status = @TypeOf(response.status).fromCode(try std.fmt.parseInt(u16, header.value, 10));
+                } else {
+                    try response.headers.append(header.name, header.value);
+                }
+            }
+            response.body = try alloc.dupe(u8, stream.data_buf.items);
+            response.body_owned = true;
+            return response;
+        }
+
+        fn policy(ctx: *Context, next: *middleware_mod.Next) anyerror!Response {
+            const origin = ctx.header("Origin") orelse return next.call(ctx);
+            if (!mem.eql(u8, origin, "https://allowed.example")) return ctx.status(403).text("denied");
+            try ctx.setHeader("Access-Control-Allow-Origin", origin);
+            try ctx.setHeader("Access-Control-Allow-Credentials", "true");
+            try ctx.setHeader("Vary", "Origin");
+            try ctx.setHeader("X-Request-ID", "stream-request");
+            if (ctx.request.method == .OPTIONS) {
+                try ctx.setHeader("Access-Control-Allow-Methods", "GET");
+                return ctx.status(204).text("");
+            }
+            return next.call(ctx);
+        }
+        fn handler(ctx: *Context) anyerror!Response {
+            // Streaming owns framing even if a handler used a JSON builder
+            // before selecting SSE. Repeated headers must remain repeated.
+            try ctx.setHeader("Content-Length", "999");
+            try ctx.setHeader("Content-Type", "application/json");
+            try ctx.response.headers.append("Set-Cookie", "one=1");
+            try ctx.response.headers.append("Set-Cookie", "two=2");
+            var writer = try ctx.streamResponse(200);
+            try writer.writeEvent("done", "{}");
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(alloc, io_impl.io(), .{ .host = "127.0.0.1", .port = 0, .h1_disconnect_cancellation = .disabled });
+    defer server.deinit();
+    try server.use(.{ .name = "policy", .handler = State.policy });
+    try server.get("/stream", State.handler);
+    try server.bind();
+    var thread = try std.testing.io.concurrent(struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("header test listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        thread.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for ([_]bool{ false, true }) |http2| {
+        var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example");
+        defer stream.deinit();
+        try std.testing.expectEqualStrings("https://allowed.example", stream.headers.get("Access-Control-Allow-Origin").?);
+        try std.testing.expectEqualStrings("true", stream.headers.get("Access-Control-Allow-Credentials").?);
+        try std.testing.expectEqualStrings("Origin", stream.headers.get("Vary").?);
+        try std.testing.expectEqualStrings("stream-request", stream.headers.get("X-Request-ID").?);
+        try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", stream.contentType().?);
+        try std.testing.expectEqualStrings("event: done\ndata: {}\n\n", stream.body.?);
+        var cookies: usize = 0;
+        for (stream.headers.iterator()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Set-Cookie")) cookies += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), cookies);
+        var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example");
+        defer preflight.deinit();
+        try std.testing.expectEqual(@as(u16, 204), preflight.status.code);
+        try std.testing.expectEqualStrings("GET", preflight.headers.get("Access-Control-Allow-Methods").?);
+        var denied = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://denied.example");
+        defer denied.deinit();
+        try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+        try std.testing.expect(denied.headers.get("Access-Control-Allow-Origin") == null);
+        var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null);
+        defer automatic.deinit();
+        try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
+        try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);
+    }
+}
+
+test "H1 streaming advertises and honors connection retirement" {
+    const State = struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            if (mem.eql(u8, ctx.request.uri.path, "/close")) try ctx.setHeader(HeaderName.CONNECTION, "close");
+            var writer = try ctx.streamResponse(200);
+            try writer.writeEvent("done", "{}");
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const Case = struct { keep_alive: bool = true, limit: u32 = 0, request_close: bool = false, handler_close: bool = false };
+    for ([_]Case{
+        .{ .limit = 2 },
+        .{ .keep_alive = false },
+        .{ .request_close = true },
+        .{ .handler_close = true },
+    }) |case| {
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .keep_alive = case.keep_alive,
+            .max_requests_per_connection = case.limit,
+            .h1_disconnect_cancellation = .disabled,
+        });
+        defer server.deinit();
+        try server.get("/stream", State.handler);
+        try server.get("/close", State.handler);
+        try server.bind();
+        const thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: *Server) void {
+                s.listen() catch |err| std.debug.panic("stream retirement listener failed: {}", .{err});
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            thread.join();
+        }
+        while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+        var client = try Socket.connect(server.boundAddress().?, std.Io.Threaded.global_single_threaded.io());
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        const count: u32 = if (case.limit > 0) case.limit else 1;
+        for (0..count) |index| {
+            const request = if (case.request_close)
+                "GET /stream HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+            else if (case.handler_close)
+                "GET /close HTTP/1.1\r\nHost: test\r\n\r\n"
+            else
+                "GET /stream HTTP/1.1\r\nHost: test\r\n\r\n";
+            try client.sendAll(request);
+            var response: [2048]u8 = undefined;
+            var len: usize = 0;
+            while (!mem.endsWith(u8, response[0..len], "0\r\n\r\n")) {
+                if (len == response.len) return error.TestUnexpectedResult;
+                const n = try client.recv(response[len..]);
+                if (n == 0) return error.TestUnexpectedResult;
+                len += n;
+            }
+            const close = index + 1 == count;
+            const expected = if (close) "Connection: close\r\n" else "Connection: keep-alive\r\n";
+            try std.testing.expect(mem.indexOf(u8, response[0..len], expected) != null);
+            if (close) try std.testing.expectEqual(@as(usize, 0), try client.recv(&response));
+        }
+    }
+}
+
 test "H1 handler failure after stream commit closes without a second response" {
     const State = struct {
         fn handler(ctx: *Context) anyerror!Response {
@@ -3950,16 +4501,16 @@ test "H1 handler failure after stream commit closes without a second response" {
     try server.get("/stream", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("stream failure listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4425,6 +4976,55 @@ test "requestStop only publishes synchronized listener-thread work" {
     try std.testing.expect(server.listener == null);
 }
 
+test "listener wake does not dereference a concurrently released lease" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 1,
+    });
+    defer server.deinit();
+
+    // Model a stopper that observed listen_started before the listener's
+    // deferred lease release. The immutable wake lane remains usable after the
+    // lease itself has been cleared.
+    server.listener_wake_io = std.testing.io;
+    server.listen_started.store(true, .release);
+    server.waiting_for_connection_permit.store(true, .release);
+    server.http_runtime_lease.release();
+    server.requestStop();
+    try std.testing.expect(!server.waiting_for_connection_permit.load(.acquire));
+}
+
+test "listener bind and wake share the borrowed connection lane" {
+    if (builtin.os.tag == .freestanding) return;
+
+    var listener_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer listener_io_impl.deinit();
+    var connection_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer connection_io_impl.deinit();
+    var runtime = HttpRuntime.init(std.testing.allocator, .{
+        .max_active_h1_requests = 0,
+        .max_active_connections = 1,
+        .max_active_requests = 1,
+        .borrowed_io = .{
+            .listener = listener_io_impl.io(),
+            .connection = connection_io_impl.io(),
+        },
+    });
+    defer runtime.deinit();
+    var lease = try runtime.acquireListener(.{
+        .max_h1_requests = 0,
+        .max_connections = 1,
+        .max_requests = 1,
+    });
+    defer lease.release();
+
+    const socket_io = listenerSocketIo(&lease);
+    try std.testing.expect(socket_io.userdata == connection_io_impl.io().userdata);
+    try std.testing.expect(socket_io.vtable == connection_io_impl.io().vtable);
+    try std.testing.expect(socket_io.userdata != listener_io_impl.io().userdata);
+}
+
 test "repeated stop requests do not inflate connection admission permits" {
     var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
         .host = "127.0.0.1",
@@ -4483,14 +5083,14 @@ test "cross-thread stop wakes an ephemeral listener" {
     try server.bind();
     try std.testing.expect(server.wake_port.load(.acquire) != 0);
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("ephemeral listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     server.stop();
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     try std.testing.expect(!server.running);
 }
 
@@ -4518,24 +5118,32 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     });
     defer second.deinit();
 
-    const first_thread = try std.Thread.spawn(.{}, struct {
+    var first_thread = try std.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("first shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, struct {
+    defer {
+        first.stop();
+        first_thread.await(std.testing.io);
+    }
+    var second_thread = try std.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("second shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&second});
+    defer {
+        second.stop();
+        second_thread.await(std.testing.io);
+    }
     while (!first.listen_started.load(.acquire) or !second.listen_started.load(.acquire))
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     try std.testing.expectEqual(@as(usize, 2), http_runtime.stats().active_listener_leases);
     first.stop();
     second.stop();
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
 }
 
@@ -4657,16 +5265,16 @@ test "bounded control listener serves without H1 observer capacity" {
     }.handle);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("control listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4711,14 +5319,14 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
     var application_task = try io_impl.io().concurrent(struct {
         fn run(started: *std.atomic.Value(bool), release: *const std.atomic.Value(bool)) void {
             started.store(true, .release);
-            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            while (!release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }.run, .{ &application_task_started, &release_application_task });
     defer {
         release_application_task.store(true, .release);
         application_task.await(io_impl.io());
     }
-    while (!application_task_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!application_task_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4739,7 +5347,7 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -4763,7 +5371,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         fn handler(ctx: *Context) anyerror!Response {
             _ = handler_calls.fetchAdd(1, .acq_rel);
             first_started.store(true, .release);
-            while (!release_first.load(.acquire)) std.Thread.yield() catch {};
+            while (!release_first.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             return ctx.text("complete");
         }
     };
@@ -4790,15 +5398,23 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire))
+        io_impl.io().sleep(.fromMilliseconds(1), .awake) catch {};
     defer State.release_first.store(true, .release);
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    // Give the network clients their own concurrency domain. The timeout
+    // implementation races reads against a deadline, so the process-global
+    // single-threaded backend is deliberately the wrong fixture here and can
+    // turn a valid rejection response into a timeout EOF after other tests.
+    var client_io_impl = std.Io.Threaded.init(allocator, .{});
+    defer client_io_impl.deinit();
+    const client_io = client_io_impl.io();
     var first_client = try Socket.connect(server.boundAddress().?, client_io);
     defer first_client.close();
     try first_client.setRecvTimeout(5_000);
     try first_client.sendAll("GET /work HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    while (!State.first_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!State.first_started.load(.acquire))
+        client_io.sleep(.fromMilliseconds(1), .awake) catch {};
 
     var second_client = try Socket.connect(server.boundAddress().?, client_io);
     defer second_client.close();
@@ -4864,7 +5480,7 @@ test "canceled route is a response-free terminal transport outcome" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -5003,21 +5619,21 @@ test "cross-thread graceful shutdown is listener-owned" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("graceful listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     // An idle keep-alive connection is not an active request and must not
     // consume the graceful request deadline.
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
     defer client.close();
-    while (server.active_connections.load(.acquire) == 0) std.Thread.yield() catch {};
+    while (server.active_connections.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const started = Io.Clock.awake.now(client_io).nanoseconds;
     server.shutdown(5000);
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     const elapsed = Io.Clock.awake.now(client_io).nanoseconds - started;
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
@@ -5056,16 +5672,16 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
@@ -5120,16 +5736,16 @@ test "H1 orderly half close does not cancel an active response" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
@@ -5179,24 +5795,24 @@ test "H1 hard disconnect remains observable behind pipelined input" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("hard-disconnect listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     var client_open = true;
     defer if (client_open) client.close();
     try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n");
-    while (!State.started.load(.acquire)) std.Thread.yield() catch {};
-    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.Thread.yield() catch {};
+    while (!State.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     // Leave a partial next request unread while the active handler owns the
     // connection, then abort. Readability must be suppressed without dropping
@@ -5249,16 +5865,16 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const client_io = std.Io.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
@@ -5310,7 +5926,7 @@ test "immediate stop preempts graceful request drain" {
     server.active_requests.store(1, .release);
     server.shutdown(10_000);
 
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("draining listener failed: {}", .{err});
         }
@@ -5319,7 +5935,7 @@ test "immediate stop preempts graceful request drain" {
     caller_io.sleep(Io.Duration.fromMilliseconds(20), .awake) catch {};
     const started = Io.Clock.awake.now(caller_io).nanoseconds;
     server.stop();
-    listener_thread.join();
+    listener_thread.await(std.testing.io);
     const elapsed = Io.Clock.awake.now(caller_io).nanoseconds - started;
     server.active_requests.store(0, .release);
     try std.testing.expect(elapsed < std.time.ns_per_s);

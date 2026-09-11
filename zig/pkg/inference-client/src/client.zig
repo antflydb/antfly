@@ -101,7 +101,6 @@ pub const Client = struct {
     pub fn listModels(self: *Client) !api.client.ApiResponse(Types.ModelsResponse) {
         return try self.raw.listModels();
     }
-
 };
 
 test "client module compiles" {

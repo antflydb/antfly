@@ -50,7 +50,7 @@ The target rebuild shape is:
 
 ### Phase 5: Benchmarks and Rollout
 
-- Add `hbc-write-bench` coverage for `.kmeans`.
+- Add `storage_bench hbc-write` coverage for `.kmeans`.
 - Compare `.hilbert_seeded`, `.doc_key_seeded`, `.recursive`, and `.kmeans`.
 - Track:
   - bulk tree build time,
@@ -66,5 +66,5 @@ The target rebuild shape is:
 - K-means assignment/update code is factored into `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/kmeans.zig`.
 - Phase 3 has an initial macOS Metal FlashAssign backend for assignment in `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/kmeans_metal.{zig,m}`. It supports `l2_squared`, cosine, and inner product distances. CPU still handles seeding, centroid updates, sorting, and HBC tree construction. `auto` uses Metal only for large jobs when a Metal device is available; `metal` forces the backend. A K-means run now creates one Metal context and reuses the uploaded point buffer plus assignment/distance buffers across Lloyd iterations.
 - Phase 4 has a CPU segmented-update path and an initial unit-weight Metal centroid-update path behind `HBCConfig.kmeans_update_strategy`: `auto`, `scatter`, `segmented`, or `metal`. `auto` stays conservative and uses the CPU update strategies; `metal` requires a Metal assignment context unless `kmeans_backend` is explicitly `cpu`, then uses a two-stage Metal partial-sum/finalize update path for leaf-level unit-weight K-means while weighted parent levels fall back to CPU update strategies. Metal update only runs in iterations where assignment also ran on Metal, so auto-mode assignment fallback cannot feed stale GPU assignment buffers into the update step.
-- HBC bench CLIs accept `--kmeans-backend auto|cpu|metal` and `--kmeans-update-strategy auto|scatter|segmented|metal` for comparing backends and update strategies. `hbc-write-bench` also reports K-means assignment/update call counts, point totals, and CPU/Metal nanoseconds.
+- HBC bench CLIs accept `--kmeans-backend auto|cpu|metal` and `--kmeans-update-strategy auto|scatter|segmented|metal` for comparing backends and update strategies. `storage_bench hbc-write` also reports K-means assignment/update call counts, point totals, and CPU/Metal nanoseconds.
 - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/kmeans.zig` has focused tests for CPU scatter stats, explicit CPU fallback with `update_strategy = .metal`, required Metal context failures under test builds, and forced-Metal dense-vector validation.

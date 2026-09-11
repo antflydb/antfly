@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceRewriteObjectObject(str, Enum):
+class InferenceRewriteObjectObject(StrEnum):
     REWRITE = "rewrite"
 
     def __str__(self) -> str:

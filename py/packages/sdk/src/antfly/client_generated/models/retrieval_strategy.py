@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RetrievalStrategy(str, Enum):
+class RetrievalStrategy(StrEnum):
     BM25 = "bm25"
     GRAPH = "graph"
     HYBRID = "hybrid"

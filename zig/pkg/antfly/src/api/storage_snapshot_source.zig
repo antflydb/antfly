@@ -31,6 +31,7 @@ pub const PrepareRequest = struct {
 };
 
 pub const RestoreRequest = struct {
+    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
     path: []const u8,
     table_name: []const u8,
     group_id: u64,

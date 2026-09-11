@@ -54,6 +54,23 @@ const RetryPolicy = enum {
 pub const RequestBudget = struct {
     deadline_ns: u64,
     cancellation: ?*const http_common.RequestCancellation = null,
+    /// Clock and sleep authority for this deadline. Deterministic callers must
+    /// supply the same borrowed `std.Io` that created `deadline_ns`; native
+    /// callers retain the platform-clock fallback for compatibility.
+    io: ?std.Io = null,
+
+    pub fn nowNs(self: RequestBudget) u64 {
+        const io = self.io orelse return platform_time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
+    }
+
+    pub fn sleepNs(self: RequestBudget, duration_ns: u64) !void {
+        const io = self.io orelse {
+            platform_time.sleepNs(duration_ns);
+            return;
+        };
+        try io.sleep(.fromNanoseconds(duration_ns), .awake);
+    }
 };
 
 fn ensureRequestBudget(budget: ?RequestBudget) !void {
@@ -61,7 +78,7 @@ fn ensureRequestBudget(budget: ?RequestBudget) !void {
         if (value.cancellation) |signal| {
             if (signal.isCancelled()) return error.Cancelled;
         }
-        if (platform_time.monotonicNs() >= value.deadline_ns) return error.Timeout;
+        if (value.nowNs() >= value.deadline_ns) return error.Timeout;
     }
 }
 
@@ -329,7 +346,7 @@ pub const MetadataHttpClient = struct {
             request.content_type = "application/json";
         }
         if (budget) |value| {
-            const now_ns = platform_time.monotonicNs();
+            const now_ns = value.nowNs();
             if (now_ns >= value.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
             const remaining_ns = value.deadline_ns - now_ns;
             const remaining_ms = @max(
@@ -365,7 +382,7 @@ pub const MetadataHttpClient = struct {
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_routing_authority);
         defer self.alloc.free(uri);
 
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = budget.nowNs();
         if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         const remaining_ns = budget.deadline_ns - now_ns;
         const remaining_ms = @max(
@@ -411,7 +428,7 @@ pub const MetadataHttpClient = struct {
     ) !std.json.Parsed(metadata_api.CatalogRouteResolveResult) {
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_await_route);
         defer self.alloc.free(uri);
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = budget.nowNs();
         if (now_ns >= budget.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         const remaining_ms = @max(
             @as(u64, 1),
@@ -987,6 +1004,64 @@ pub const MetadataHttpClient = struct {
         try self.requestWithBody(base_uri, .PUT, path, schema_json, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.TableTransitionActive);
     }
 
+    pub fn mutateSchema(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_schema_mutation_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var expected_buf: [16]u8 = undefined;
+        const expected_text = if (expected_version) |version|
+            try std.fmt.bufPrint(&expected_buf, "{d}", .{version})
+        else
+            null;
+        var headers_buf: [2]http_common.RequestHeader = undefined;
+        var header_count: usize = 1;
+        headers_buf[0] = .{
+            .name = "X-Antfly-Schema-Mutation-Mode",
+            .value = if (mode == .replace) "replace" else "merge-patch",
+        };
+        if (expected_text) |value| {
+            headers_buf[1] = .{ .name = "X-Antfly-Expected-Schema-Version", .value = value };
+            header_count = 2;
+        }
+
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = headers_buf[0..header_count],
+            .body = body,
+            .content_type = if (mode == .merge_patch) "application/merge-patch+json" else "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        mapResponseStatus(resp, error.InvalidSchemaUpdateRequest, error.TableNotFound, error.SchemaVersionChanged) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        const WireResult = struct { version: u32, schema_json: []const u8 };
+        var parsed = try parseJson(WireResult, self.alloc, resp.body);
+        defer parsed.deinit();
+        return .{
+            .version = parsed.value.version,
+            .schema_json = try self.alloc.dupe(u8, parsed.value.schema_json),
+        };
+    }
+
     pub fn replaceTableDefinition(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -999,7 +1074,90 @@ pub const MetadataHttpClient = struct {
             routes.Routes.internal_table_definition_suffix,
         });
         defer self.alloc.free(path);
-        try self.requestWithBody(base_uri, .PUT, path, body, error.InvalidTableDefinitionReplacement, error.TableNotFound, error.TableGenerationChanged);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .PUT,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        mapResponseStatus(
+            resp,
+            error.InvalidTableDefinitionReplacement,
+            error.TableNotFound,
+            error.TableGenerationChanged,
+        ) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+    }
+
+    pub fn replaceTableDefinitionStamped(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?metadata_api.CatalogMutationStamp {
+        if (try self.tryReplaceTableDefinitionStamped(base_uri, table_name, body)) |stamp|
+            return stamp;
+        try self.replaceTableDefinition(base_uri, table_name, body);
+        return null;
+    }
+
+    /// Attempt only the receipt-capable route. A null result proves the peer
+    /// lacks the capability and, critically, that no legacy mutation was
+    /// admitted. Proxies use this form so they can advertise 405 safely.
+    pub fn tryReplaceTableDefinitionStamped(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?metadata_api.CatalogMutationStamp {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+            routes.Routes.internal_table_definition_stamped_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = self.executeWithRetryPolicy(.{
+            .method = .PUT,
+            .uri = uri,
+            .body = body,
+            .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
+        }, null, .at_most_once) catch |err| switch (err) {
+            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405) {
+            // Capability handlers reject before mutation admission. The
+            // caller decides whether it owns a safe legacy fallback.
+            return null;
+        }
+        mapResponseStatus(
+            resp,
+            error.InvalidTableDefinitionReplacement,
+            error.TableNotFound,
+            error.TableGenerationChanged,
+        ) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => return error.MetadataMutationOutcomeUnknown,
+            else => return err,
+        };
+        var parsed = parseJson(metadata_api.CatalogMutationStamp, self.alloc, resp.body) catch
+            // A successful status means the compare-and-swap may already be
+            // committed. A malformed receipt cannot be retried safely.
+            return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     pub fn restoreTable(
@@ -1408,7 +1566,7 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
         cancellation: ?*const http_common.RequestCancellation,
     ) !void {
-        const started_ns = platform_time.monotonicNs();
+        const started_ns = if (budget) |value| value.nowNs() else platform_time.monotonicNs();
         var delay_ns = requested_delay_ns;
         if (budget) |value| {
             if (started_ns >= value.deadline_ns) return error.Timeout;
@@ -1421,7 +1579,10 @@ pub const MetadataHttpClient = struct {
                 if (signal.isCancelled()) return error.Cancelled;
             }
             const slice_ns = @min(remaining_ns, mutation_authority_retry_cancellation_slice_ns);
-            platform_time.sleepNs(slice_ns);
+            if (budget) |value|
+                try value.sleepNs(slice_ns)
+            else
+                platform_time.sleepNs(slice_ns);
             remaining_ns -= slice_ns;
         }
     }
@@ -1462,7 +1623,7 @@ fn applyRequestBudget(req: http_common.HttpRequest, budget: ?RequestBudget) !htt
     if (cancellation) |signal| {
         if (signal.isCancelled()) return error.Cancelled;
     }
-    const now_ns = platform_time.monotonicNs();
+    const now_ns = value.nowNs();
     if (now_ns >= value.deadline_ns) return error.Timeout;
     const remaining_ns = value.deadline_ns - now_ns;
     const remaining_ms = (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
@@ -1495,6 +1656,40 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
         parsed.value.store_id,
         routes.Routes.internal_node_status_suffix,
     });
+}
+
+test "metadata routing clients preserve the borrowed clock in every relative deadline" {
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+    defer sim.deinit();
+    const Executor = struct {
+        calls: usize = 0,
+        expected_ms: []const u8 = "1501",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(self.expected_ms, req.header(routes.routing_remaining_ms_header).?);
+            self.calls += 1;
+            return .{
+                .status = 504,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "deadline exceeded"),
+            };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const budget = RequestBudget{ .io = sim.io(), .deadline_ns = 18 * std.time.ns_per_s + 501 * std.time.ns_per_ms };
+    const uri = "http://metadata.test";
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchLinearizableRoutingSnapshot(uri, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.waitForRoutingChange(uri, .{}, false, budget));
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.awaitCatalogRoute(uri, .{ .query = .{ .table_name = "docs", .selector = .table } }, budget));
+    sim.monotonic_ns += 500 * std.time.ns_per_ms;
+    executor.expected_ms = "1001";
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    sim.monotonic_ns = budget.deadline_ns;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
 }
 
 test "metadata routing client forwards relative deadline and preserves timeout" {
@@ -1941,6 +2136,45 @@ test "metadata http client does not replay reallocation after ambiguous transpor
     }
 }
 
+test "metadata http client does not replay schema mutations after ambiguous transport failures" {
+    const AmbiguousExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                "/internal/v1/tables/docs/schema:mutate",
+            ));
+            self.attempts += 1;
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var executor = AmbiguousExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        client.mutateSchema(
+            "http://127.0.0.1:9000",
+            "docs",
+            .merge_patch,
+            "{\"description\":\"patched\"}",
+            1,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+}
+
 test "metadata http client retries reallocation only before connection admission" {
     const PreAdmissionExecutor = struct {
         attempts: usize = 0,
@@ -2177,6 +2411,100 @@ test "metadata http client fetches one bounded linearizable snapshot" {
     try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
     try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "stamped definition replacement falls back to v0.2 text route" {
+    const LegacyExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(http_common.Method.PUT, req.method);
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition:stamped"));
+                return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+            }
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition"));
+            return .{ .status = 202, .body = try alloc.dupe(u8, "accepted") };
+        }
+    };
+
+    var probe_executor = LegacyExecutor{};
+    var probe_client = MetadataHttpClient.init(std.testing.allocator, probe_executor.executor());
+    try std.testing.expect((try probe_client.tryReplaceTableDefinitionStamped(
+        "http://127.0.0.1:9000",
+        "docs",
+        "{}",
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), probe_executor.calls);
+
+    var executor = LegacyExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expect((try client.replaceTableDefinitionStamped(
+        "http://127.0.0.1:9000",
+        "docs",
+        "{}",
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "definition replacement does not replay an ambiguous admitted request" {
+    const AmbiguousExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.ConnectionResetByPeer;
+        }
+    };
+
+    var stamped_executor = AmbiguousExecutor{};
+    var stamped_client = MetadataHttpClient.init(std.testing.allocator, stamped_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        stamped_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), stamped_executor.calls);
+
+    var legacy_executor = AmbiguousExecutor{};
+    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        legacy_client.replaceTableDefinition("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), legacy_executor.calls);
+
+    const MalformedReceiptExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .status = 202, .body = try alloc.dupe(u8, "not-a-receipt") };
+        }
+    };
+
+    var malformed_executor = MalformedReceiptExecutor{};
+    var malformed_client = MetadataHttpClient.init(std.testing.allocator, malformed_executor.executor());
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        malformed_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), malformed_executor.calls);
 }
 
 test "metadata http client treats missing linearizable snapshot route as unsupported" {
@@ -3244,14 +3572,14 @@ test "metadata http client round-trips server endpoints" {
     defer listener.deinit();
     try server.registerRoutes(&listener);
     try listener.bind();
-    const listener_thread = try std.Thread.spawn(.{}, struct {
+    var listener_thread = try std.testing.io.concurrent(struct {
         fn listen(http_server: *httpx.Server) void {
             http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
         }
     }.listen, .{&listener});
     defer {
         listener.stop();
-        listener_thread.join();
+        listener_thread.await(std.testing.io);
     }
 
     const address = listener.boundAddress() orelse return error.AddressNotAvailable;

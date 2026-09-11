@@ -15,13 +15,18 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+/// The store understands native HBC authority markers, WAL recovery, and the
+/// fail-closed placement contract used during rolling upgrades.
+pub const dense_native_storage_protocol_version: u16 = 1;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 
 pub const PlacementClass = enum {
     data,
@@ -39,7 +44,8 @@ pub const TableRecord = topology_records.TableRecord;
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.table_id == rhs.table_id and
+    return lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
@@ -65,6 +71,9 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    // Preserve fingerprints of existing default-mode tables.
+    if (table.storage.dense_embeddings != .primary_lsm)
+        hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, table.table_id, .little);
     hasher.update(&encoded);
@@ -441,6 +450,7 @@ pub const StoreRecord = struct {
     /// not-yet-observed reporter and therefore fails cluster admission closed.
     artifact_sources_protocol_version: u16 = 0,
     native_generation_restore_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -799,6 +809,7 @@ pub const StoreStatusReport = struct {
     /// Monotonic snapshot generation within `reporter_incarnation`.
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -869,6 +880,17 @@ pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_vers
         artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 
+pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= dense_native_storage_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+pub fn denseNativeStorageProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and
+        protocol_version >= dense_native_storage_protocol_version and
+        denseNativeStorageProtocolValid(reporter_incarnation, protocol_version);
+}
+
 /// Store roles are placement classes, not process kinds. Data runtimes may use
 /// custom roles such as `hot` or `cold`; only the metadata-only role is known
 /// not to host table shards.
@@ -922,6 +944,7 @@ pub const RuntimeEnrichmentStatusReport = struct {
     projection_checkpoint_applied_sequence: u64 = 0,
     projection_checkpoint_generation: u64 = 0,
     projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
     checkpoint_replay_tail_sequence_count: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -933,6 +956,16 @@ pub const RuntimeEnrichmentStatusReport = struct {
     worker_failed: bool = false,
     worker_started: bool = false,
     stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "",
+    active_model: []const u8 = "",
+    active_backend: []const u8 = "",
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -1119,6 +1152,8 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    dense_vector_projection_pending: bool = false,
+    dense_native_storage_phase: DenseNativeStoragePhase = .legacy,
     /// True when the owner observed `embedding_activity` at a stable lifecycle
     /// boundary. False means unavailable for this heartbeat, not idle.
     embedding_activity_observed: bool = false,
@@ -1158,6 +1193,15 @@ pub fn storeRequiresCurrentRuntimeStatusProfile(record: StoreRecord) bool {
         }
     }
     return false;
+}
+
+pub fn runtimeEnrichmentHasInferenceDiagnostics(enrichment: RuntimeEnrichmentStatusReport) bool {
+    return !enrichment.projection_checkpoint_identity_consistent or
+        enrichment.stall_reason.len > 0 or enrichment.active_phase.len > 0 or
+        enrichment.active_model.len > 0 or enrichment.active_backend.len > 0 or
+        enrichment.active_deadline_ms != 0 or enrichment.last_progress_ms != 0 or
+        enrichment.active_progress_completed != 0 or enrichment.active_progress_total != 0 or
+        enrichment.inference_timeout_count != 0 or enrichment.inference_cancel_count != 0;
 }
 
 pub const RuntimeIndexSourceReplayStatusReport = struct {
@@ -2065,6 +2109,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const restore_location = try alloc.dupe(u8, record.restore_location);
     errdefer alloc.free(restore_location);
     return .{
+        .storage = record.storage,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2433,6 +2478,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
+        .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2528,6 +2574,28 @@ test "raft voter set fingerprint is canonical and includes required local voter"
     try std.testing.expectEqual(@as(usize, 3), normalizedVoterCount(&.{ 101, 102 }, 104));
 }
 
+pub fn cloneRuntimeEnrichmentStatusReport(alloc: std.mem.Allocator, record: RuntimeEnrichmentStatusReport) !RuntimeEnrichmentStatusReport {
+    var result = record;
+    result.projection_checkpoint_status = try alloc.dupe(u8, record.projection_checkpoint_status);
+    errdefer alloc.free(result.projection_checkpoint_status);
+    result.stall_reason = try alloc.dupe(u8, record.stall_reason);
+    errdefer alloc.free(result.stall_reason);
+    result.active_phase = try alloc.dupe(u8, record.active_phase);
+    errdefer alloc.free(result.active_phase);
+    result.active_model = try alloc.dupe(u8, record.active_model);
+    errdefer alloc.free(result.active_model);
+    result.active_backend = try alloc.dupe(u8, record.active_backend);
+    return result;
+}
+
+pub fn freeRuntimeEnrichmentStatusReport(alloc: std.mem.Allocator, record: RuntimeEnrichmentStatusReport) void {
+    alloc.free(record.projection_checkpoint_status);
+    if (record.stall_reason.len > 0) alloc.free(record.stall_reason);
+    if (record.active_phase.len > 0) alloc.free(record.active_phase);
+    if (record.active_model.len > 0) alloc.free(record.active_model);
+    if (record.active_backend.len > 0) alloc.free(record.active_backend);
+}
+
 pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGroupStatusReport) !RuntimeGroupStatusReport {
     const table_name = try alloc.dupe(u8, record.table_name);
     errdefer alloc.free(table_name);
@@ -2535,11 +2603,11 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, record.freshness);
     errdefer alloc.free(freshness);
-    const projection_checkpoint_status = try alloc.dupe(u8, record.enrichment.projection_checkpoint_status);
-    errdefer alloc.free(projection_checkpoint_status);
+    const enrichment = try cloneRuntimeEnrichmentStatusReport(alloc, record.enrichment);
+    errdefer freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     const indexes = try cloneRuntimeIndexStatusReports(alloc, record.indexes);
     errdefer freeRuntimeIndexStatusReports(alloc, indexes);
-    var result: RuntimeGroupStatusReport = .{
+    const result: RuntimeGroupStatusReport = .{
         .table_id = record.table_id,
         .table_name = table_name,
         .group_id = record.group_id,
@@ -2558,7 +2626,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .disk_bytes_known = record.disk_bytes_known,
         .created_at_millis = record.created_at_millis,
         .index_count = record.index_count,
-        .enrichment = record.enrichment,
+        .enrichment = enrichment,
         .async_indexing_active = record.async_indexing_active,
         .async_startup_active = record.async_startup_active,
         .async_dense_catch_up_active = record.async_dense_catch_up_active,
@@ -2567,7 +2635,6 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .doc_set_planning = record.doc_set_planning,
         .indexes = indexes,
     };
-    result.enrichment.projection_checkpoint_status = projection_checkpoint_status;
     return result;
 }
 
@@ -2575,7 +2642,7 @@ pub fn freeRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGro
     alloc.free(record.table_name);
     alloc.free(record.source);
     alloc.free(record.freshness);
-    alloc.free(record.enrichment.projection_checkpoint_status);
+    freeRuntimeEnrichmentStatusReport(alloc, record.enrichment);
     freeRuntimeIndexStatusReports(alloc, record.indexes);
 }
 
@@ -2644,6 +2711,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .dense_vector_projection_pending = record.dense_vector_projection_pending,
+        .dense_native_storage_phase = record.dense_native_storage_phase,
         .embedding_activity_observed = record.embedding_activity_observed,
         .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,

@@ -15,7 +15,7 @@ embedding pipelines. Only the fetch step in `main.py` is Pinecone-specific.
 ## Prerequisites
 
 - A running Antfly server (`antfly standalone`)
-- Python 3.9+
+- Python 3.11+
 - Your Pinecone API key
 
 ```bash

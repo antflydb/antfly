@@ -23,6 +23,9 @@ jobs:
     outputs:
       tag: ${{ steps.request.outputs.tag }}
       source_commit: ${{ steps.request.outputs.source_commit }}
+      release_line: ${{ steps.request.outputs.release_line }}
+      source_ref: ${{ steps.request.outputs.source_ref }}
+      source_ref_head: ${{ steps.request.outputs.source_ref_head }}
       channel: ${{ steps.request.outputs.channel }}
       build_controller_commit: ${{ steps.request.outputs.build_controller_commit }}
     steps:
@@ -54,10 +57,37 @@ jobs:
           source_commit="$(jq -r .source_commit "$request")"
           channel="$(jq -r .channel "$request")"
           [[ "$tag" =~ ^v[0-9]+(\.[0-9]+){2}(-[0-9A-Za-z.-]+)?$ ]]
+          build_controller_commit="$(git rev-parse HEAD)"
+          test "$build_controller_commit" = "$GITHUB_SHA"
+          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH"
+          current_default_head="$(git rev-parse FETCH_HEAD)"
+          policy_paths=(
+            .github/workflows/antfly-release-build-controller.yml
+            scripts/release/release-lines.json
+            scripts/release/release_lines.py
+            scripts/release/release_channels.py
+          )
+          for path in "${policy_paths[@]}"; do
+            controller_blob="$(git rev-parse "$build_controller_commit:$path")"
+            current_blob="$(git rev-parse "$current_default_head:$path")"
+            if [ "$controller_blob" != "$current_blob" ]; then
+              echo "release-line policy changed after this controller was queued: $path" >&2
+              exit 2
+            fi
+          done
           case "$TRIGGER_WORKFLOW:$TRIGGER_EVENT:$request_kind" in
             "Release request:push:tag")
               test "$channel" = auto
               test "$source_commit" = "$TRIGGER_HEAD_SHA"
+              resolved="$(python scripts/release/release_lines.py resolve --tag "$tag")"
+              release_line="$(jq -r .release_line <<<"$resolved")"
+              source_ref="$(jq -r .source_ref <<<"$resolved")"
+              if [ "$source_ref" = "refs/heads/$DEFAULT_BRANCH" ]; then
+                source_ref_head="$current_default_head"
+              else
+                git fetch --no-tags origin "$source_ref"
+                source_ref_head="$(git rev-parse FETCH_HEAD)"
+              fi
               git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
               test "$(git rev-parse "$tag^{commit}")" = "$source_commit"
               ;;
@@ -65,6 +95,15 @@ jobs:
               test "$TRIGGER_HEAD_BRANCH" = "$DEFAULT_BRANCH"
               test "$channel" = nightly
               test "$tag" = "v0.0.0-dev.${TRIGGER_RUN_ID}"
+              resolved="$(python scripts/release/release_lines.py nightly)"
+              release_line="$(jq -r .release_line <<<"$resolved")"
+              source_ref="$(jq -r .source_ref <<<"$resolved")"
+              if [ "$source_ref" = "refs/heads/$DEFAULT_BRANCH" ]; then
+                source_ref_head="$current_default_head"
+              else
+                git fetch --no-tags origin "$source_ref"
+                source_ref_head="$(git rev-parse FETCH_HEAD)"
+              fi
               if [ -z "$source_commit" ]; then
                 source_commit="$TRIGGER_HEAD_SHA"
               fi
@@ -75,13 +114,15 @@ jobs:
               ;;
           esac
           [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$source_ref_head" =~ ^[0-9a-f]{40}$ ]]
           git cat-file -e "$source_commit^{commit}"
-          git merge-base --is-ancestor "$source_commit" "origin/$DEFAULT_BRANCH"
-          build_controller_commit="$(git rev-parse HEAD)"
-          test "$build_controller_commit" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$source_commit" "$source_ref_head"
           {
             echo "tag=$tag"
             echo "source_commit=$source_commit"
+            echo "release_line=$release_line"
+            echo "source_ref=$source_ref"
+            echo "source_ref_head=$source_ref_head"
             echo "channel=$channel"
             echo "build_controller_commit=$build_controller_commit"
           } >> "$GITHUB_OUTPUT"
@@ -94,5 +135,8 @@ jobs:
     with:
       tag_name: ${{ needs.resolve.outputs.tag }}
       source_commit: ${{ needs.resolve.outputs.source_commit }}
+      release_line: ${{ needs.resolve.outputs.release_line }}
+      source_ref: ${{ needs.resolve.outputs.source_ref }}
+      source_ref_head: ${{ needs.resolve.outputs.source_ref_head }}
       channel: ${{ needs.resolve.outputs.channel }}
       build_controller_commit: ${{ needs.resolve.outputs.build_controller_commit }}

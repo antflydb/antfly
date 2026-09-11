@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CreateGraphIndexRequestType(str, Enum):
+class CreateGraphIndexRequestType(StrEnum):
     GRAPH = "graph"
 
     def __str__(self) -> str:

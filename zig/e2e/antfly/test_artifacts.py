@@ -472,7 +472,9 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
                     >= (
                         4
                         if doc_key in {"pdf-inline", "pdf-url"}
-                        else 2 if doc_key == "pdf-scanned-table" else 1
+                        else 2
+                        if doc_key == "pdf-scanned-table"
+                        else 1
                     )
                 )
                 else None
@@ -810,10 +812,7 @@ def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
     def distributed_index_status() -> dict | None:
         detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
-        counts = [
-            int(status.get("total_indexed", 0))
-            for status in shards.values()
-        ]
+        counts = [int(status.get("total_indexed", 0)) for status in shards.values()]
         if len(counts) != 3 or not all(count > 0 for count in counts):
             return None
         return detail
@@ -881,11 +880,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     while generated_chunks < target_chunks:
         batch_slot = parent_number % 6
         cycle = parent_number // 6
-        prefix = (
-            lane_prefixes[0]
-            if batch_slot < 5
-            else lane_prefixes[1 + cycle % 2]
-        )
+        prefix = lane_prefixes[0] if batch_slot < 5 else lane_prefixes[1 + cycle % 2]
         parent_key = f"{prefix}scale-{parent_number:08d}"
 
         def ready_parent() -> dict | None:
@@ -949,10 +944,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     def million_chunks_visible_on_every_shard() -> dict | None:
         detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
-        counts = [
-            int(status.get("total_indexed", 0))
-            for status in shards.values()
-        ]
+        counts = [int(status.get("total_indexed", 0)) for status in shards.values()]
         if len(counts) != 3 or not all(count > 0 for count in counts):
             return None
         if sum(counts) < target_chunks:
@@ -1274,24 +1266,41 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
                 "filename": "canary.txt",
                 "mime_type": "text/plain",
                 "version": "1",
-                "url": "data:text/plain;base64,"
-                + base64.b64encode(source).decode(),
+                "url": "data:text/plain;base64," + base64.b64encode(source).decode(),
             }
         },
         sync_level="full_index",
     )
     assert merged["inserted"] == 1
 
+    text_observation: dict = {}
+
     def text_projection_intact() -> dict | None:
         detail = stateful_api.get_index(table_name, "document_text")
-        result = stateful_api.query_table(
-            table_name,
-            {
-                "full_text_index": "document_text",
-                "full_text_search": {"field": "text", "match": canary},
-                "limit": 5,
-            },
-        )
+        text_observation["detail"] = detail
+        # Probe the data plane: conservative source-observation status can
+        # remain pending even while the existing text projection is serving.
+        try:
+            result = stateful_api.query_table(
+                table_name,
+                {
+                    "full_text_index": "document_text",
+                    "full_text_search": {"field": "text", "match": canary},
+                    "limit": 5,
+                },
+            )
+        except requests.HTTPError as err:
+            # A status read and query are not atomic with reconciliation.
+            # Retry only this explicit admission fence; unrelated failures
+            # must still fail the test immediately.
+            response = err.response
+            if response is not None and response.status_code == 503:
+                body = response.json()
+                if body.get("code") == "index_rebuilding" and body.get("retryable"):
+                    text_observation["query_error"] = body
+                    return None
+            raise
+        text_observation["result"] = result
         if detail.get("status", {}).get("doc_count") != 1:
             return None
         if doc_key not in _query_hit_ids(result):
@@ -1303,7 +1312,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert before_restart is not None
+    assert before_restart is not None, json.dumps(text_observation, indent=2)
     text_incarnation = before_restart["detail"]["status"]["readiness"]["incarnation"]
 
     stateful_api.restart_server()
@@ -1312,7 +1321,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert baseline_restart is not None
+    assert baseline_restart is not None, json.dumps(text_observation, indent=2)
     assert (
         baseline_restart["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation
@@ -1387,8 +1396,15 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         is not None
     )
 
-    after_embedding_add = text_projection_intact()
-    assert after_embedding_add is not None
+    # Vector readiness does not prove the sibling text projection has finished
+    # reconciliation. Require its own query-visible result, without changing
+    # the original incarnation/cardinality/content invariants.
+    after_embedding_add = wait_until(
+        text_projection_intact,
+        timeout_s=60.0,
+        interval_s=0.25,
+    )
+    assert after_embedding_add is not None, json.dumps(text_observation, indent=2)
     assert (
         after_embedding_add["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation
@@ -1400,7 +1416,7 @@ def test_adding_artifact_embedding_index_preserves_populated_full_text_across_re
         timeout_s=60.0,
         interval_s=0.25,
     )
-    assert after_final_restart is not None
+    assert after_final_restart is not None, json.dumps(text_observation, indent=2)
     assert (
         after_final_restart["detail"]["status"]["readiness"]["incarnation"]
         == text_incarnation
@@ -1428,7 +1444,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert orphan_error.value.response.status_code == 400
-    assert "embedding enrichment producer is not runnable" in orphan_error.value.response.text
+    assert (
+        "embedding enrichment producer is not runnable"
+        in orphan_error.value.response.text
+    )
 
     owner_table = f"embedding_owned_producer_{time.time_ns()}"
     stateful_api.post(
@@ -1498,7 +1517,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
             },
         )
     assert mismatch_error.value.response.status_code == 400
-    assert "embedding enrichment producer is not runnable" in mismatch_error.value.response.text
+    assert (
+        "embedding enrichment producer is not runnable"
+        in mismatch_error.value.response.text
+    )
 
     # A matching durable identity may be registered at table scope, but doing
     # so makes the executable index an authoritative owner that cannot be
@@ -1518,7 +1540,10 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     with pytest.raises(requests.HTTPError) as owner_delete_error:
         stateful_api.delete_index(owner_table, "document_vectors")
     assert owner_delete_error.value.response.status_code == 409
-    assert stateful_api.get_index(owner_table, "document_vectors")["config"]["type"] == "embeddings"
+    assert (
+        stateful_api.get_index(owner_table, "document_vectors")["config"]["type"]
+        == "embeddings"
+    )
 
     # Failed replacement is atomic: the original owner and its artifact remain.
     detail = stateful_api.get_index(owner_table, "document_vectors")
@@ -1556,7 +1581,11 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
         lambda: (
             current
             if (
-                (current := stateful_api.get_index(owner_table, "document_artifact_vectors"))
+                (
+                    current := stateful_api.get_index(
+                        owner_table, "document_artifact_vectors"
+                    )
+                )
                 .get("status", {})
                 .get("total_indexed")
                 == 1
@@ -1601,8 +1630,9 @@ def test_embedding_producer_registry_rejects_orphans_and_owner_mismatches(
     assert doc_key in _query_hit_ids(artifact_semantic)
 
 
+@pytest.mark.parametrize("dense_embeddings", ["primary_lsm", "vector_store"])
 def test_executable_embedding_artifact_producer_survives_restart(
-    stateful_api, openai_embedder
+    stateful_api, openai_embedder, dense_embeddings
 ):
     """Exercise a public chunk/embedding chain without an embedding-index owner."""
 
@@ -1613,7 +1643,13 @@ def test_executable_embedding_artifact_producer_survives_restart(
     doc_key = "artifact-registry-doc"
     restarted_doc_key = "artifact-registry-doc-after-restart"
 
-    stateful_api.create_table(table_name, num_shards=1)
+    stateful_api.create_table(
+        table_name, num_shards=1, storage={"dense_embeddings": dense_embeddings}
+    )
+    assert (
+        stateful_api.get_table(table_name)["storage"]["dense_embeddings"]
+        == dense_embeddings
+    )
     stateful_api.put(
         f"{_table_artifact_path(table_name, chunk_name)}/enrichment",
         {

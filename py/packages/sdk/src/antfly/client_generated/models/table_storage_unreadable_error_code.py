@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class TableStorageUnreadableErrorCode(str, Enum):
+class TableStorageUnreadableErrorCode(StrEnum):
     TABLE_STORAGE_UNREADABLE = "table_storage_unreadable"
 
     def __str__(self) -> str:

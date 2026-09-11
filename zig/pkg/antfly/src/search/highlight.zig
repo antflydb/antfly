@@ -175,7 +175,7 @@ test "highlight exact terms" {
     const alloc = std.testing.allocator;
 
     const text = "the quick brown fox jumps over the lazy dog";
-    const terms = &[_][]const u8{"quick", "fox"};
+    const terms = &[_][]const u8{ "quick", "fox" };
     // Use simple analyzer (lowercase only, no stemming/stop words)
     const analyzer = &analysis_mod.simple_analyzer;
 

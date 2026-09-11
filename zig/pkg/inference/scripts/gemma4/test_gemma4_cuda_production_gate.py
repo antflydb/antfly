@@ -17,7 +17,10 @@ GATE = pathlib.Path(__file__).resolve().with_name("gemma4_cuda_production_gate.s
 class Gemma4CudaProductionGateTest(unittest.TestCase):
     def test_mtp_is_off_by_default(self) -> None:
         gate = GATE.read_text(encoding="utf-8")
-        self.assertIn("RUN_MTP                       auto|required|off (default: off; --mtp-only: required)", gate)
+        self.assertIn(
+            "RUN_MTP                       auto|required|off (default: off; --mtp-only: required)",
+            gate,
+        )
         self.assertIn('default_run_mtp="off"', gate)
 
     def setUp(self) -> None:
@@ -29,7 +32,8 @@ class Gemma4CudaProductionGateTest(unittest.TestCase):
         self.target.write_bytes(b"target")
         self.draft.write_bytes(b"draft")
         self.antfly = self.root / "fake-antfly.py"
-        self.antfly.write_text(textwrap.dedent("""
+        self.antfly.write_text(
+            textwrap.dedent("""
             #!/usr/bin/env python3
             import json
             import os
@@ -58,24 +62,28 @@ class Gemma4CudaProductionGateTest(unittest.TestCase):
             output = pathlib.Path(sys.argv[sys.argv.index("--json-timing") + 1])
             output.write_text(json.dumps(payload), encoding="utf-8")
             print("token_ids:", *token_ids)
-        """).lstrip(), encoding="utf-8")
+        """).lstrip(),
+            encoding="utf-8",
+        )
         self.antfly.chmod(0o755)
 
     def run_gate(self, mtp_ids: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("RUN_MTP", None)
-        env.update({
-            "ANTFLY_BIN": str(self.antfly),
-            "OUT_DIR": str(self.root / f"out-{mtp_ids.replace(',', '-') }"),
-            "RUN_RESIDENT": "off",
-            "MTP_TARGET_MODEL": str(self.target),
-            "MTP_DRAFT_MODEL": str(self.draft),
-            "MTP_TOKENS": "3",
-            "MTP_MIN_ACTIVE_SPEED_RATIO": "0",
-            "ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT": "0",
-            "FAKE_TARGET_IDS": "11,22,33",
-            "FAKE_MTP_IDS": mtp_ids,
-        })
+        env.update(
+            {
+                "ANTFLY_BIN": str(self.antfly),
+                "OUT_DIR": str(self.root / f"out-{mtp_ids.replace(',', '-')}"),
+                "RUN_RESIDENT": "off",
+                "MTP_TARGET_MODEL": str(self.target),
+                "MTP_DRAFT_MODEL": str(self.draft),
+                "MTP_TOKENS": "3",
+                "MTP_MIN_ACTIVE_SPEED_RATIO": "0",
+                "ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT": "0",
+                "FAKE_TARGET_IDS": "11,22,33",
+                "FAKE_MTP_IDS": mtp_ids,
+            }
+        )
         return subprocess.run(
             [str(GATE), "--mtp-only"],
             env=env,
@@ -92,7 +100,9 @@ class Gemma4CudaProductionGateTest(unittest.TestCase):
     def test_rejects_mtp_token_divergence(self) -> None:
         completed = self.run_gate("11,22,44")
         self.assertEqual(1, completed.returncode)
-        self.assertIn("MTP token_ids differ from target-only greedy token_ids", completed.stderr)
+        self.assertIn(
+            "MTP token_ids differ from target-only greedy token_ids", completed.stderr
+        )
 
 
 if __name__ == "__main__":

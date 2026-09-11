@@ -65,6 +65,42 @@ pub const ValidatedReceipt = struct {
     }
 };
 
+/// Re-hash an artifact that has already passed receipt path and size
+/// validation against a pinned SHA-256 identity.
+///
+/// This deliberately opens the canonical artifact path and hashes through the
+/// file handle rather than trusting the digest declared in the receipt.  A
+/// receipt describes a completed download; it does not prove that a local
+/// artifact was not replaced afterwards with a same-size file.
+pub fn verifyValidatedArtifactSha256(
+    io: std.Io,
+    artifact: *const ValidatedArtifact,
+    expected_hex: []const u8,
+) !void {
+    if (expected_hex.len != 64) return error.ChecksumMismatch;
+
+    var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{buf[0..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual_hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
+}
+
 const ReceiptSource = enum {
     completion,
     plan,
@@ -354,6 +390,36 @@ pub fn loadValidatedPlan(
 ) !ValidatedReceipt {
     return (try loadValidatedSource(allocator, io, dest_dir, .plan)) orelse
         error.IncompleteManagedDownload;
+}
+
+test "validated artifact checksum rehashes the opened file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = "payload" });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "payload.bin" });
+    defer allocator.free(path);
+    const artifact = ValidatedArtifact{
+        .path = "payload.bin",
+        .canonical_path = path,
+        .size = 7,
+        .sha256 = null,
+    };
+    try verifyValidatedArtifactSha256(
+        io,
+        &artifact,
+        "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+    );
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        verifyValidatedArtifactSha256(
+            io,
+            &artifact,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
 }
 
 test "artifact receipt paths reject ambiguous and platform-specific forms" {

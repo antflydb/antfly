@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceRerankResponseObject(str, Enum):
+class InferenceRerankResponseObject(StrEnum):
     LIST = "list"
 
     def __str__(self) -> str:

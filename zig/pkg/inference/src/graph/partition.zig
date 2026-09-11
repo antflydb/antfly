@@ -236,6 +236,15 @@ pub const PartitionExecutor = struct {
         pair_second: ?*?CT = null,
         embedding_ids: ?[]const i64 = null,
         runtime_shape_tracker: ?*interpreter.RuntimeShapeTracker = null,
+
+        /// Every partition backend shares this checkpoint contract. Compiled
+        /// executors additionally wire the control into their native runtime
+        /// when that runtime exposes an interrupt mechanism.
+        pub fn check(self: @This()) !void {
+            const options = self.options orelse return;
+            const control = options.execution_control orelse return;
+            try control.check();
+        }
     };
 
     pub const VTable = struct {
@@ -262,7 +271,9 @@ pub const PartitionExecutor = struct {
         device_id: DeviceId,
         exec_ctx: ExecutionContext,
     ) !void {
-        return self.vtable.execute(self.ptr, values, value_device, node_ids, device_id, exec_ctx);
+        try exec_ctx.check();
+        try self.vtable.execute(self.ptr, values, value_device, node_ids, device_id, exec_ctx);
+        try exec_ctx.check();
     }
 
     pub fn deinitExecutor(self: *const PartitionExecutor) void {
@@ -1855,4 +1866,52 @@ test "mock partition executor dispatches correctly" {
     // Test deinit dispatch.
     exec.deinitExecutor();
     try std.testing.expect(!mock.called); // deinit resets the flag
+}
+
+test "partition executor enforces execution control around backend dispatch" {
+    const Probe = struct {
+        called: bool = false,
+        checks: usize = 0,
+        cancel_on_check: usize,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == self.cancel_on_check) return error.Cancelled;
+        }
+
+        fn execute(
+            raw: *anyopaque,
+            _: []?CT,
+            _: []DeviceId,
+            _: []const NodeId,
+            _: DeviceId,
+            _: PartitionExecutor.ExecutionContext,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+
+        fn executor(self: *@This()) PartitionExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute, .deinit = deinitFn } };
+        }
+
+        fn context(self: *@This()) PartitionExecutor.ExecutionContext {
+            return .{ .options = .{ .execution_control = .{ .ptr = self, .check_fn = check } } };
+        }
+    };
+
+    var values: [0]?CT = .{};
+    var devices: [0]DeviceId = .{};
+    const node_ids: [0]NodeId = .{};
+
+    var before = Probe{ .cancel_on_check = 1 };
+    try std.testing.expectError(error.Cancelled, before.executor().execute(&values, &devices, &node_ids, 0, before.context()));
+    try std.testing.expect(!before.called);
+
+    var after = Probe{ .cancel_on_check = 2 };
+    try std.testing.expectError(error.Cancelled, after.executor().execute(&values, &devices, &node_ids, 0, after.context()));
+    try std.testing.expect(after.called);
 }

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexReadinessReason(str, Enum):
+class IndexReadinessReason(StrEnum):
     BACKFILL = "backfill"
     COVERAGE = "coverage"
     ENRICHMENT_FAILURE = "enrichment_failure"

@@ -47,5 +47,4 @@ pub fn main(init: std.process.Init) !void {
     };
     std.debug.print("  Max age: {d}s\n", .{cors_config.max_age});
     std.debug.print("  Allow credentials: {}\n", .{cors_config.allow_credentials});
-
 }

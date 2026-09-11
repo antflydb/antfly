@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class HierarchyCursorStaleErrorError(str, Enum):
+class HierarchyCursorStaleErrorError(StrEnum):
     HIERARCHY_CURSOR_STALE = "hierarchy_cursor_stale"
 
     def __str__(self) -> str:

@@ -17,7 +17,7 @@
 //! orchestration.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("enrichment_compute_abi");
 const error_identity = @import("kernel_error_identity");
 const extraction = @import("db/enrichment/document_extraction.zig");
 
@@ -155,7 +155,8 @@ pub fn extractStream(
         return fail(error.InvalidAbiVersion, .extract_stream, out_failure);
     if (request.on_begin == null or request.on_units_json == null)
         return fail(error.InvalidArgument, .extract_stream, out_failure);
-    const alloc = std.heap.c_allocator;
+    if (request.allocator) |allocator| if (!allocator.valid()) return fail(error.InvalidArgument, .extract_stream, out_failure);
+    const alloc = if (request.allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
     var config = extraction.parseConfig(alloc, request.config_json.slice()) catch |err| {
         return fail(err, .extract_stream, out_failure);
     };
@@ -193,13 +194,17 @@ pub fn renderPdfPagePng(
         return fail(error.InvalidAbiVersion, .render_pdf_page, out_failure);
     const page_number = std.math.cast(usize, request.page_number) orelse
         return fail(error.InvalidArgument, .render_pdf_page, out_failure);
-    var session = extraction.PdfRenderSession.initWithDecodeLimits(std.heap.c_allocator, request.pdf_bytes.slice(), .{
+    if (request.allocator) |allocator| if (!allocator.valid()) return fail(error.InvalidArgument, .render_pdf_page, out_failure);
+    const decoder_alloc = if (request.allocator) |allocator| allocator.asStd() else std.heap.c_allocator;
+    var deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
+    var session = extraction.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, request.pdf_bytes.slice(), .{
         .max_decoded_stream_bytes = std.math.cast(usize, request.max_decoded_stream_bytes) orelse
             return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
         .max_working_set_bytes = std.math.cast(usize, request.max_working_set_bytes) orelse
             return fail(error.InvalidPdfDecodeLimits, .render_pdf_page, out_failure),
-    }) catch |err| return fail(err, .render_pdf_page, out_failure);
+    }, if (request.render_timeout_ms == 0) .{} else deadline.probe()) catch |err| return fail(err, .render_pdf_page, out_failure);
     defer session.deinit();
+    deadline = extraction.PdfRenderDeadline.init(request.render_timeout_ms);
     const rendered = session.renderPagePngAdaptiveAlloc(
         std.heap.c_allocator,
         page_number,

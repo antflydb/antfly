@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IncompleteDetailsReason(str, Enum):
+class IncompleteDetailsReason(StrEnum):
     CLARIFICATION_REQUIRED = "clarification_required"
     MAX_INTERNAL_ITERATIONS = "max_internal_iterations"
     MAX_TOKENS = "max_tokens"

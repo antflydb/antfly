@@ -63,7 +63,10 @@ pub const MaintenanceStats = struct {
 pub const CatalogProjectionSnapshot = contract.CatalogProjectionSnapshot;
 pub const CatalogCursor = contract.CatalogCursor;
 
+pub const LifecycleListenerRegistration = @import("../metadata/storage/raft_apply_contract.zig").LifecycleListenerRegistration;
+
 const ListenerRegistration = struct {
+    id: u64 = 0,
     projection: ?ProjectionListener = null,
     committed_key: ?CommittedKeyListener = null,
 };
@@ -72,6 +75,7 @@ pub const RaftApplyStore = struct {
     alloc: std.mem.Allocator,
     handle: ?*anyopaque,
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
+    listeners_mutex: std.Io.Mutex = .init,
     latest_batches: std.AutoHashMapUnmanaged(u64, AppliedMetadataBatch) = .empty,
     latest_batches_mutex: std.Io.Mutex = .init,
 
@@ -246,6 +250,10 @@ pub const RaftApplyStore = struct {
 
     pub fn getMetadataIncarnation(self: *RaftApplyStore, group_id: u64) !?metadata_incarnation.MetadataClusterIncarnation {
         return try self.projection(?metadata_incarnation.MetadataClusterIncarnation, .{ .kind = .metadata_incarnation, .group_id = group_id });
+    }
+
+    pub fn getDenseNativeStorageProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
+        return try self.projection(u16, .{ .kind = .dense_native_storage_protocol_activation_version, .group_id = group_id });
     }
 
     pub fn getRuntimeStatusProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
@@ -629,8 +637,10 @@ pub const RaftApplyStore = struct {
         listener.onCommittedKey(.{ .metadata_group_id = group_id, .key = key.slice() });
     }
 
-    fn addListeners(self: *RaftApplyStore, projection_listener: ?ProjectionListener, committed_listener: ?CommittedKeyListener) !void {
+    fn addListeners(self: *RaftApplyStore, projection_listener: ?ProjectionListener, committed_listener: ?CommittedKeyListener) !LifecycleListenerRegistration {
         if (projection_listener) |listener| try listener.validate();
+        self.listeners_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.listeners_mutex.unlock(std.Options.debug_io);
         try self.listeners.ensureUnusedCapacity(self.alloc, 1);
         const registration = try self.alloc.create(ListenerRegistration);
         errdefer self.alloc.destroy(registration);
@@ -658,20 +668,33 @@ pub const RaftApplyStore = struct {
             .has_commit_barrier_kind = @intFromBool(commit_barrier_kind != null),
             .before_projection_commit_fn = if (commit_barrier_kind != null) beforeProjectionCommitCallback else null,
             .after_projection_commit_fn = if (commit_barrier_kind != null) afterProjectionCommitCallback else null,
-        }));
+        }, &registration.id));
         self.listeners.appendAssumeCapacity(registration);
+        return .{ .id = registration.id };
     }
 
     pub fn addProjectionListener(self: *RaftApplyStore, listener: ProjectionListener) !void {
-        try self.addListeners(listener, null);
+        _ = try self.addListeners(listener, null);
     }
 
     pub fn addCommittedKeyListener(self: *RaftApplyStore, listener: CommittedKeyListener) !void {
-        try self.addListeners(null, listener);
+        _ = try self.addListeners(null, listener);
     }
 
-    pub fn addLifecycleListeners(self: *RaftApplyStore, projection_listener: ProjectionListener, committed_listener: CommittedKeyListener) !void {
-        try self.addListeners(projection_listener, committed_listener);
+    pub fn addLifecycleListeners(self: *RaftApplyStore, projection_listener: ProjectionListener, committed_listener: CommittedKeyListener) !LifecycleListenerRegistration {
+        return try self.addListeners(projection_listener, committed_listener);
+    }
+    pub fn removeLifecycleListeners(self: *RaftApplyStore, token: LifecycleListenerRegistration) bool {
+        self.listeners_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.listeners_mutex.unlock(std.Options.debug_io);
+        for (self.listeners.items, 0..) |registration, index| {
+            if (registration.id != token.id) continue;
+            if (abi.antfly_metadata_apply_store_remove_listeners(self.handle, token.id) == 0) return false;
+            _ = self.listeners.orderedRemove(index);
+            self.alloc.destroy(registration);
+            return true;
+        }
+        return false;
     }
 };
 

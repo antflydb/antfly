@@ -38,26 +38,31 @@ from collections import defaultdict
 # Valid next events for each TLA+ txnStatus state.
 # AbortTransaction from predicatesChecked/preparing is allowed (DirectAbort).
 VALID_TRANSITIONS = {
-    "idle":              {"InitTransaction"},
-    "preparing":         {"CheckPredicates", "AbortTransaction"},
-    "predicatesChecked": {"WriteIntentOnShard", "WriteIntentFails", "CommitTransaction", "AbortTransaction"},
-    "aborting":          {"AbortTransaction"},
-    "committed":         {"ResolveIntentsOnShard"},
-    "aborted":           {"ResolveIntentsOnShard"},
-    "resolving":         {"ResolveIntentsOnShard", "CleanupTxnRecord"},
-    "done":              {"CleanupTxnRecord"},
+    "idle": {"InitTransaction"},
+    "preparing": {"CheckPredicates", "AbortTransaction"},
+    "predicatesChecked": {
+        "WriteIntentOnShard",
+        "WriteIntentFails",
+        "CommitTransaction",
+        "AbortTransaction",
+    },
+    "aborting": {"AbortTransaction"},
+    "committed": {"ResolveIntentsOnShard"},
+    "aborted": {"ResolveIntentsOnShard"},
+    "resolving": {"ResolveIntentsOnShard", "CleanupTxnRecord"},
+    "done": {"CleanupTxnRecord"},
 }
 
 # State transitions caused by each event
 NEXT_STATE = {
-    "InitTransaction":       "preparing",
-    "CheckPredicates":       "predicatesChecked",
-    "WriteIntentOnShard":    "predicatesChecked",  # no change
-    "WriteIntentFails":      "aborting",
-    "CommitTransaction":     "committed",
-    "AbortTransaction":      "aborted",
+    "InitTransaction": "preparing",
+    "CheckPredicates": "predicatesChecked",
+    "WriteIntentOnShard": "predicatesChecked",  # no change
+    "WriteIntentFails": "aborting",
+    "CommitTransaction": "committed",
+    "AbortTransaction": "aborted",
     "ResolveIntentsOnShard": "resolving",
-    "CleanupTxnRecord":      "done",
+    "CleanupTxnRecord": "done",
 }
 
 

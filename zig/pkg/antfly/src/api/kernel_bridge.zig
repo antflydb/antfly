@@ -22,8 +22,8 @@ const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
-const table_reads = @import("table_reads.zig");
-const table_writes = @import("table_writes.zig");
+const table_reads = @import("table_read_source.zig");
+const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
@@ -413,6 +413,7 @@ const OpaqueHttpxHandler = struct {
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
+                .patch => .PATCH,
             }, path, runtimeApiHttpHandler, route);
         }
     }
@@ -464,6 +465,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
+            .PATCH => .patch,
             else => return error.MethodNotAllowed,
         },
         .path = abi.Bytes.init(context.request.uri.path),

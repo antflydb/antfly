@@ -28,10 +28,12 @@
 const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const c_file = @import("../util/c_file.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const manifest_mod = @import("../models/manifest.zig");
 
 /// Configuration parsed from config.json for the decoder architecture.
 pub const DecoderConfig = struct {
+    hidden_size: ?usize = null,
     num_layers: usize = 6,
     num_heads: usize = 8,
     head_dim: usize = 64,
@@ -57,21 +59,80 @@ pub const EncoderDecoderResult = struct {
 /// Encoder-decoder pipeline that orchestrates encode → decode → generate.
 /// Backend-agnostic: works with any pair of Sessions (ONNX, native).
 pub const EncoderDecoderPipeline = struct {
+    /// Cached composite runtimes lend sessions for a handle-scoped invocation.
+    owns_sessions: bool = true,
+    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
     decoder: backends.Session,
     config: DecoderConfig,
+    execution_control: ?InferenceExecutionControl = null,
+
+    /// Plan before allocating a window. Include both stages, retained encoder
+    /// output and the full-prefix decoder's worst step. This conservative bound
+    /// also covers workers arriving at different stages and unfused fallbacks.
+    /// Admission at execution remains authoritative under concurrent pressure.
+    pub fn fitsWindow(self: *const EncoderDecoderPipeline, count: usize, width: usize, preprocess_bytes: usize) !bool {
+        const session_mod = @import("../backends/session.zig");
+        const memory = @import("../runtime/tier/memory.zig");
+        if (count <= 1) return true; // Preserve the existing singleton policy.
+        const enc = self.encoder.run_admission orelse return self.decoder.run_admission == null;
+        const dec = self.decoder.run_admission orelse return false;
+        // Independently owned resource domains need explicit multi-domain
+        // scheduling, not an invented credit between unrelated controllers.
+        if (enc.controller != dec.controller or enc.backend_class != dec.backend_class) return false;
+        const mul = std.math.mul;
+        const add = std.math.add;
+        const input_shape = [_]i64{ @intCast(count), std.math.cast(i64, width) orelse return error.ResourceLimitExceeded };
+        var enc_request = try self.encoder.planShapes(&.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &input_shape },
+            .{ .name = "attention_mask", .dtype = .i64, .shape = &input_shape },
+        }, count);
+        const hidden_bytes = enc_request.output_bytes orelse try session_mod.estimatedOutputBytes(&input_shape, self.encoder.outputInfo());
+        const hidden_width = (if (enc_request.output_bytes != null) hidden_bytes -| 24 else hidden_bytes) / count / width / 4;
+        if (hidden_width == 0) return false;
+        const hidden_shape = [_]i64{ @intCast(count), @intCast(width), @intCast(hidden_width) };
+        const decoder_shape = [_]i64{ @intCast(count), std.math.cast(i64, self.config.max_length) orelse return error.ResourceLimitExceeded };
+        var dec_request = try self.decoder.planShapes(&.{
+            .{ .name = "input_ids", .dtype = .i64, .shape = &decoder_shape },
+            .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &hidden_shape },
+            .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &input_shape },
+        }, count);
+        enc_request.host_preprocess_bytes = enc_request.input_bytes;
+        dec_request.host_preprocess_bytes = dec_request.input_bytes;
+        const enc_peak = try enc.estimateRequest(enc_request, self.encoder.outputInfo());
+        const incremental = @import("seq2seq_decode.zig");
+        const cache_bytes = if (incremental.qualified(self.decoder)) try incremental.cacheBound(self.decoder, count, self.config.max_length, width) else 0;
+        if (cache_bytes > 0) {
+            dec_request.input_bytes = try add(usize, dec_request.input_bytes, cache_bytes);
+            dec_request.output_kv_bytes = cache_bytes;
+            dec_request.output_bytes = try add(usize, cache_bytes, try mul(usize, count, try add(usize, try mul(usize, self.config.vocab_size, 4), 24)));
+        }
+        var dec_peak = try dec.estimateRequest(dec_request, self.decoder.outputInfo());
+        // Previous cache and replacement coexist. Classify retained input K/V
+        // against the KV ceiling without counting it twice against host memory.
+        dec_peak.host_scratch_bytes -= cache_bytes;
+        dec_peak.host_kv_bytes = try add(usize, dec_peak.host_kv_bytes, cache_bytes);
+        // The stage gate covers admission and packing as well as execution:
+        // at most one physical workspace per session can be resident. Different
+        // encoder/decoder gates may overlap, so retain both physical peaks.
+        const peak = try (memory.AdmissionAmounts{ .host_scratch_bytes = preprocess_bytes }).merge(try enc_peak.merge(dec_peak));
+        return try peak.fitsLimits(enc.limits) and try peak.fitsLimits(dec.limits);
+    }
 
     /// Run the encoder on input_ids, returning hidden state tensors.
     pub fn encode(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize) ![]backends.Tensor {
-        const batch: i64 = 1;
-        const seq: i64 = @intCast(seq_len);
-        const shape = &[_]i64{ batch, seq };
-
-        // Build attention mask (all 1s)
         const mask = try allocator.alloc(i64, seq_len);
         defer allocator.free(mask);
         @memset(mask, 1);
+        return self.encodeMasked(allocator, input_ids, mask);
+    }
+
+    /// Caller-owned masks allow bounded request windows to pad compatible
+    /// encoder stages without changing the meaning of individual inputs.
+    pub fn encodeMasked(self: *EncoderDecoderPipeline, allocator: std.mem.Allocator, input_ids: []const i64, mask: []const i64) ![]backends.Tensor {
+        if (input_ids.len == 0 or input_ids.len != mask.len) return error.InvalidInputShape;
+        const shape = &[_]i64{ 1, @intCast(input_ids.len) };
 
         var input_ids_tensor = try backends.Tensor.initInt64(allocator, "input_ids", shape, input_ids);
         defer input_ids_tensor.deinit();
@@ -79,10 +140,12 @@ pub const EncoderDecoderPipeline = struct {
         var mask_tensor = try backends.Tensor.initInt64(allocator, "attention_mask", shape, mask);
         defer mask_tensor.deinit();
 
-        return try self.encoder.run(&.{ input_ids_tensor, mask_tensor }, allocator);
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        if (self.batch_dispatch) |dispatch| return dispatch.run(allocator, self.encoder, null, null, &.{ input_ids_tensor, mask_tensor }, self.execution_control);
+        return try self.encoder.runWithControl(&.{ input_ids_tensor, mask_tensor }, allocator, self.execution_control);
     }
 
-    /// Run one decoder step, returning logits for the last token position.
+    /// Run one decoder step, selecting directly from borrowed backend logits.
     fn decoderStep(
         self: *EncoderDecoderPipeline,
         allocator: std.mem.Allocator,
@@ -91,27 +154,29 @@ pub const EncoderDecoderPipeline = struct {
         encoder_hidden: *const backends.Tensor,
         encoder_attention_mask: []const i64,
         encoder_seq_len: usize,
-    ) ![]f32 {
+    ) !i32 {
         const dec_seq: i64 = @intCast(dec_seq_len);
         const dec_shape = &[_]i64{ 1, dec_seq };
 
-        var dec_input_ids = try backends.Tensor.initInt64(allocator, "input_ids", dec_shape, dec_ids);
-        defer dec_input_ids.deinit();
+        const dec_input_ids = backends.Tensor{ .data = @constCast(std.mem.sliceAsBytes(dec_ids)), .dtype = .i64, .shape = dec_shape, .name = "input_ids", .allocator = allocator, .owns_data = false, .owns_shape = false };
 
         const enc_seq: i64 = @intCast(encoder_seq_len);
         const enc_mask_shape = &[_]i64{ 1, enc_seq };
-        var enc_mask_tensor = try backends.Tensor.initInt64(allocator, "encoder_attention_mask", enc_mask_shape, encoder_attention_mask);
-        defer enc_mask_tensor.deinit();
+        const enc_mask_tensor = backends.Tensor{ .data = @constCast(std.mem.sliceAsBytes(encoder_attention_mask)), .dtype = .i64, .shape = enc_mask_shape, .name = "encoder_attention_mask", .allocator = allocator, .owns_data = false, .owns_shape = false };
 
         // Rename encoder hidden state for decoder input compatibility
         // (encoder outputs "last_hidden_state", decoder expects "encoder_hidden_states")
         const enc_hidden_renamed = encoder_hidden.borrowedView("encoder_hidden_states");
 
-        var decoder_outputs = try self.decoder.run(&.{
+        const inputs = &[_]backends.Tensor{
             dec_input_ids,
             enc_mask_tensor,
             enc_hidden_renamed,
-        }, allocator);
+        };
+        var decoder_outputs = if (self.batch_dispatch) |dispatch|
+            try dispatch.run(allocator, self.decoder, null, null, inputs, self.execution_control)
+        else
+            try self.decoder.runWithControl(inputs, allocator, self.execution_control);
         defer {
             for (decoder_outputs) |*o| o.deinit();
             allocator.free(decoder_outputs);
@@ -119,17 +184,20 @@ pub const EncoderDecoderPipeline = struct {
 
         if (decoder_outputs.len == 0) return error.NoDecoderOutput;
         const logits_tensor = &decoder_outputs[0];
+        if (logits_tensor.dtype != .f32) return error.LogitsSizeMismatch;
         const logits = logits_tensor.asFloat32();
 
         // Extract logits for the last token position
         const vocab_size = self.config.vocab_size;
-        if (logits.len < vocab_size) return error.LogitsSizeMismatch;
-        const last_pos_start = (dec_seq_len - 1) * vocab_size;
-
-        // Copy because decoder_outputs are freed by defer
-        const result = try allocator.alloc(f32, vocab_size);
-        @memcpy(result, logits[last_pos_start .. last_pos_start + vocab_size]);
-        return result;
+        if (vocab_size == 0 or dec_seq_len == 0) return error.LogitsSizeMismatch;
+        const end = std.math.mul(usize, dec_seq_len, vocab_size) catch return error.LogitsSizeMismatch;
+        if (logits.len < end) return error.LogitsSizeMismatch;
+        const last = logits[end - vocab_size .. end];
+        var best: usize = 0;
+        for (last[1..], 1..) |value, index| if (value > last[best]) {
+            best = index;
+        };
+        return std.math.cast(i32, best) orelse error.LogitsSizeMismatch;
     }
 
     /// Greedy autoregressive decode from encoder outputs.
@@ -146,44 +214,41 @@ pub const EncoderDecoderPipeline = struct {
 
         // Start with decoder_start_token_id
         try output_ids.append(allocator, self.config.decoder_start_token_id);
+        const dec_ids_i64 = try allocator.alloc(i64, std.math.add(usize, max_len, 1) catch return error.ResourceLimitExceeded);
+        defer allocator.free(dec_ids_i64);
+        dec_ids_i64[0] = self.config.decoder_start_token_id;
 
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
         const encoder_hidden = &encoder_outputs[0];
+        var incremental = @import("seq2seq_decode.zig").State.init(allocator, self.decoder, encoder_hidden.*, encoder_attention_mask, self.config.vocab_size);
+        defer if (incremental) |*state| state.deinit();
 
-        for (0..max_len) |_| {
+        for (0..max_len) |step| {
+            if (self.execution_control) |control|
+                try control.update(.executing, @intCast(step), @intCast(max_len));
             const dec_seq_len: usize = output_ids.items.len;
 
-            // Convert output_ids (i32) to i64 for the decoder
-            const dec_ids_i64 = try allocator.alloc(i64, dec_seq_len);
-            defer allocator.free(dec_ids_i64);
-            for (output_ids.items, 0..) |id, i| {
-                dec_ids_i64[i] = @intCast(id);
-            }
-
             // Run one decoder step
-            const last_logits = try self.decoderStep(
+            const next_token = if (incremental) |*state| blk: {
+                var logits = try state.step(dec_ids_i64[0..dec_seq_len], self.batch_dispatch, self.execution_control);
+                defer logits.deinit();
+                const values = logits.asFloat32();
+                const last = values[values.len - self.config.vocab_size ..];
+                var best: usize = 0;
+                for (last[1..], 1..) |value, index| if (value > last[best]) {
+                    best = index;
+                };
+                break :blk std.math.cast(i32, best) orelse return error.LogitsSizeMismatch;
+            } else try self.decoderStep(
                 allocator,
-                dec_ids_i64,
+                dec_ids_i64[0..dec_seq_len],
                 dec_seq_len,
                 encoder_hidden,
                 encoder_attention_mask,
                 encoder_seq_len,
             );
-            defer allocator.free(last_logits);
-
-            // Greedy: pick argmax
-            var max_idx: usize = 0;
-            var max_val: f32 = last_logits[0];
-            for (last_logits[1..], 1..) |v, i| {
-                if (v > max_val) {
-                    max_val = v;
-                    max_idx = i;
-                }
-            }
-
-            const next_token: i32 = @intCast(max_idx);
             if (next_token == self.config.eos_token_id) break;
-
+            dec_ids_i64[dec_seq_len] = next_token;
             try output_ids.append(allocator, next_token);
         }
 
@@ -194,6 +259,7 @@ pub const EncoderDecoderPipeline = struct {
     }
 
     pub fn deinit(self: *EncoderDecoderPipeline) void {
+        if (!self.owns_sessions) return;
         self.encoder.close();
         self.decoder.close();
     }
@@ -214,6 +280,12 @@ const decoder_candidates = &[_][]const u8{
     "decoder_model_merged.onnx",
     "decoder_with_past_model.onnx",
 };
+
+/// Discovery only. The runtime qualifies the loaded graph before choosing it;
+/// filename presence is not a cache capability declaration.
+pub fn findMergedDecoder(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
+    return findModelFile(allocator, model_dir, &.{"decoder_model_merged.onnx"});
+}
 
 /// Check if a model directory contains encoder-decoder ONNX files.
 pub fn isEncoderDecoderModel(model_dir: []const u8) bool {
@@ -237,7 +309,10 @@ pub const EncoderDecoderPaths = struct { encoder: []const u8, decoder: []const u
 
 pub fn findEncoderDecoderPaths(allocator: std.mem.Allocator, model_dir: []const u8) !EncoderDecoderPaths {
     const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
-    const decoder_path = try findModelFile(allocator, model_dir, decoder_candidates);
+    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch |err| {
+        if (encoder_path) |path| allocator.free(path);
+        return err;
+    };
 
     if (encoder_path != null and decoder_path != null) {
         return .{ .encoder = encoder_path.?, .decoder = decoder_path.? };
@@ -267,8 +342,10 @@ pub fn nativeFlorenceEncoderDecoderPaths(
         manifestHasNativeAssets(manifest) and
         manifest.visual_model_path != null)
     {
+        const encoder = try allocator.dupe(u8, manifest.visual_model_path.?);
+        errdefer allocator.free(encoder);
         return .{
-            .encoder = try allocator.dupe(u8, manifest.visual_model_path.?),
+            .encoder = encoder,
             .decoder = try allocator.dupe(u8, model_dir),
         };
     }
@@ -276,24 +353,20 @@ pub fn nativeFlorenceEncoderDecoderPaths(
     return error.EncoderModelNotFound;
 }
 
-/// Whether `findEncoderDecoderPaths` would succeed, without allocating the paths.
+/// Probe paths without loading model weights or tokenizer metadata.
 pub fn hasEncoderDecoderPaths(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     manifest: manifest_mod.ModelManifest,
-) bool {
-    const encoder_path = findModelFile(allocator, model_dir, encoder_candidates) catch null;
+) !bool {
+    const encoder_path = try findModelFile(allocator, model_dir, encoder_candidates);
     defer if (encoder_path) |path| allocator.free(path);
-    const decoder_path = findModelFile(allocator, model_dir, decoder_candidates) catch null;
+    const decoder_path = try findModelFile(allocator, model_dir, decoder_candidates);
     defer if (decoder_path) |path| allocator.free(path);
     if (encoder_path != null and decoder_path != null) return true;
 
-    if (nativeFlorenceEncoderDecoderPaths(allocator, model_dir, manifest)) |paths| {
-        allocator.free(paths.encoder);
-        allocator.free(paths.decoder);
-        return true;
-    } else |_| {}
-    return false;
+    return manifest.native_arch_hint == .florence and
+        manifestHasNativeAssets(manifest) and manifest.visual_model_path != null;
 }
 
 fn manifestHasNativeAssets(manifest: manifest_mod.ModelManifest) bool {
@@ -315,6 +388,11 @@ pub fn loadDecoderConfigFile(allocator: std.mem.Allocator, path: []const u8) !De
     defer allocator.free(data);
 
     var config = DecoderConfig{};
+    const hidden_width = jsonGetInt(data, "d_model") orelse jsonGetInt(data, "hidden_size");
+    if (hidden_width) |value| {
+        if (value <= 0) return error.InvalidDecoderConfig;
+        config.hidden_size = std.math.cast(usize, value) orelse return error.InvalidDecoderConfig;
+    }
 
     if (jsonGetInt(data, "decoder_layers")) |v| config.num_layers = @intCast(v);
     if (jsonGetInt(data, "num_decoder_layers")) |v| config.num_layers = @intCast(v);
@@ -364,9 +442,10 @@ fn findModelFile(allocator: std.mem.Allocator, model_dir: []const u8, candidates
 
         for (candidates) |name| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, name });
+            errdefer allocator.free(path);
             const path_z = try allocator.dupeZ(u8, path);
             defer allocator.free(path_z);
-            if (c_file.fileExistsZ(path_z)) {
+            if (try c_file.fileExistsZChecked(path_z)) {
                 return path;
             }
             allocator.free(path);

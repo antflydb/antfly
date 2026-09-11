@@ -14,24 +14,17 @@
 
 //! Focused executable entry point for measuring and packaging server runtimes.
 
-const builtin = @import("builtin");
 const std = @import("std");
-const platform = @import("antfly_platform");
+const bridge = @import("runtime_bridge.zig");
 const role_options = @import("runtime_artifact_options");
 const structlog = @import("structlog");
+const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
-const runtime = switch (role_options.role) {
-    .cli => @import("cli_runtime.zig"),
-    .data => @import("data/runtime.zig"),
-    .inference => @import("inference_runtime/runtime.zig"),
-    .metadata => @import("metadata/runtime.zig"),
-    .standalone => @import("standalone/runtime.zig"),
-};
-
-// The user-manager storage adapter deliberately imports these through the
-// compilation root so it shares their exact Zig type identity.
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
+extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_inference(context: *const bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_metadata(context: *const bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone(context: *const bridge.Context) callconv(.c) c_int;
 
 pub const std_options: std.Options = .{
     .logFn = structlog.logFn,
@@ -50,34 +43,61 @@ pub fn main(init: std.process.Init) void {
     };
 }
 
-fn mainImpl(init: std.process.Init) !void {
+fn mainImpl(init: std.process.Init) anyerror!void {
     structlog.init(.{ .formatter = .json, .level = .info });
+
+    var worker_lifetime = inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (comptime role_options.role == .inference) {
+        if (try inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
+    }
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.next();
 
-    const runtime_init = runtimeInit(init);
-    if (comptime role_options.role == .cli) {
-        const command = args.next() orelse return error.InvalidArguments;
-        return runtime.runFromIterator(runtime_init, command, &args);
+    var command: []const u8 = if (comptime role_options.role == .cli)
+        args.next() orelse return error.InvalidArguments
+    else
+        @tagName(role_options.role);
+    var argument_views: std.ArrayListUnmanaged(bridge.Bytes) = .empty;
+    defer argument_views.deinit(init.gpa);
+    while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
+
+    // The standalone artifact re-executes itself with the same private worker
+    // invocation as the full CLI. Dispatch across the existing inference ABI
+    // before standalone parsing; this worker is supervised by its RPC pipes.
+    const worker_invocation = if (comptime role_options.role == .standalone)
+        argument_views.items.len == 2 and
+            std.mem.eql(u8, argument_views.items[0].slice(), "inference") and
+            std.mem.eql(u8, argument_views.items[1].slice(), "_worker")
+    else
+        false;
+    if (worker_invocation) command = "inference";
+    const runtime_arguments = if (worker_invocation) argument_views.items[1..] else argument_views.items;
+
+    const environment_names = init.environ_map.keys();
+    const environment_values = init.environ_map.values();
+    std.debug.assert(environment_names.len == environment_values.len);
+    const environment = try init.gpa.alloc(bridge.EnvironmentEntry, environment_names.len);
+    defer init.gpa.free(environment);
+    for (environment, environment_names, environment_values) |*entry, name, value| {
+        entry.* = .{ .name = .init(name), .value = .init(value) };
     }
-    const argv0 = "antfly";
-    return runtime.runFromIterator(runtime_init, argv0, &args);
-}
 
-fn runtimeInit(init: std.process.Init) std.process.Init {
-    return .{
-        .minimal = init.minimal,
-        .arena = init.arena,
-        .gpa = runtimeAllocator(init),
-        .io = init.io,
-        .environ_map = init.environ_map,
-        .preopens = init.preopens,
+    const context = bridge.Context{
+        .command = .init(command),
+        .arguments_ptr = if (runtime_arguments.len == 0) null else runtime_arguments.ptr,
+        .arguments_len = runtime_arguments.len,
+        .environment_ptr = if (environment.len == 0) null else environment.ptr,
+        .environment_len = environment.len,
     };
-}
-
-fn runtimeAllocator(init: std.process.Init) std.mem.Allocator {
-    const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else init.gpa;
-    return platform.allocator.processAllocator(fallback);
+    const code = switch (role_options.role) {
+        .cli => antfly_runtime_cli(&context),
+        .data => antfly_runtime_data(&context),
+        .inference => antfly_runtime_inference(&context),
+        .metadata => antfly_runtime_metadata(&context),
+        .standalone => if (worker_invocation) antfly_runtime_inference(&context) else antfly_runtime_standalone(&context),
+    };
+    if (code != 0) std.process.exit(@intCast(code));
 }

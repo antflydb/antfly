@@ -1,5 +1,6 @@
 ---
 title: Glossary
+unlisted: true
 description: Key terms and concepts used in AntflyDB and the broader AI/search ecosystem
 ---
 
@@ -13,13 +14,13 @@ See: [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.
 
 ### Chunking
 
-The process of splitting large documents into smaller, semantically meaningful pieces for indexing and retrieval. Effective chunking preserves context while creating appropriately sized segments for [embedding](#embeddings). Antfly's Antfly inference service provides semantic chunking with multi-tier caching.
+The process of splitting large documents into smaller, semantically meaningful pieces for indexing and retrieval. Effective chunking preserves context while creating appropriately sized segments for [embedding](#embeddings). Antfly Inference provides semantic chunking with multi-tier caching.
 
 See: [Chunking Strategies for LLM Applications](https://www.pinecone.io/learn/chunking-strategies/)
 
 ### Embeddings
 
-Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Antfly supports multiple embedding providers (Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic) and manages embedding lifecycle automatically. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search.
+Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Managed index creation supports Antfly Inference, Ollama, OpenAI, and AWS Bedrock; broader inference APIs expose additional providers without implying managed-index support. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search.
 
 See: [Word2Vec](https://arxiv.org/abs/1301.3781) | [Sentence-BERT](https://arxiv.org/abs/1908.10084) | [MTEB Leaderboard](https://huggingface.co/spaces/mteb/leaderboard)
 
@@ -233,7 +234,7 @@ See: [JSON Schema](https://json-schema.org/) | [Understanding JSON Schema](https
 
 ### ONNX (Open Neural Network Exchange)
 
-A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly's Antfly inference service uses ONNX for local model inference, providing [embedding](#embeddings), [chunking](#chunking), and [reranking](#rerankers) without external API calls.
+A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference uses ONNX for local model inference, providing [embedding](#embeddings), [chunking](#chunking), and [reranking](#rerankers) without external API calls.
 
 See: [ONNX](https://onnx.ai/) | [ONNX Runtime](https://onnxruntime.ai/)
 

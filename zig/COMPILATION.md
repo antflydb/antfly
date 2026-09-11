@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-08-23
+Last updated: 2026-09-11
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -9,46 +9,27 @@ probes and superseded measurements, is preserved in
 
 ## Status at a glance
 
-The production build uses a six-unit architecture. It builds the
-complete product as one statically linked `antfly` executable, always includes
-embedded standalone inference, compiles production without LMDB, and reuses the
-same compiled storage implementation in the executable and `libantfly` C API.
+Production builds seven static runtime archives and links them into one Antfly
+executable. The executable and `libantfly` reuse the physical storage archive.
+The source roots are explicit: selecting one archive does not declare the other
+archives' entry files through inactive imports.
 
-The architecture and reliability gates pass on the normal runner. The build-time
-goal is not complete: storage/local query and inference remain above the
-380-second per-unit runner target.
+The current verification separates three questions:
 
-The authoritative per-unit baseline is GitHub Actions run `31643584514`, job
-`94271808409`, at commit `42b494546`:
+- Does a Debug product preserve storage, lifecycle, and API behavior?
+- Does changing one owner's implementation reuse unrelated compiled archives?
+- Does a clean release build improve wall time, memory, and artifact size on the
+  same runner and settings as its baseline?
 
-| Compilation unit | Normal-runner time | LLVM | Zig MaxRSS | 380 s gate |
-|---|---:|---:|---:|---|
-| Storage + local query | 482.880 s | 473.049 s | 8 GiB | Over by 102.880 s |
-| Inference + standalone inference host | 444.092 s | 393.655 s | 7 GiB | Over by 64.092 s |
-| Data/metadata/HA + standalone | 297.394 s | 289.441 s | 5 GiB | Pass |
-| API kernel | 244.981 s | 238.614 s | 5 GiB | Pass |
-| Serverless + remote CLI | 211.154 s | 204.531 s | 4 GiB | Pass |
-| Enrichment compute | 32.552 s | 30.050 s | 1 GiB | Pass |
+`tools/check_storage_compilation.py` answers the second question with real
+production artifacts. The smaller `tools/test_runtime_cache.py` fixtures check
+build options and generators. Neither establishes release performance.
 
-That build completed in 16:14.57 with 7,968,692 KiB process-tree peak RSS and
-zero swap. It produced a 72,995,616-byte static executable and an
-18,910,408-byte `libantfly.so`.
-
-The exact current head was confirmed again by GitHub Actions run `31645335108`,
-job `94277464595`. It completed all 43 steps in 19:42.13 with 8,156,880 KiB
-process-tree peak RSS, zero swap, the same 72,995,616-byte executable, and the
-same 18,910,408-byte `libantfly.so`. Its rounded unit summary reproduced the
-same shape: storage and inference at about nine minutes, distributed and API at
-about five minutes, serverless at about four minutes, and enrichment at about
-40 seconds.
-
-Current decision:
-
-- Ship the six-unit composition as the production architecture.
-- Work on storage first and inference second. API, distributed/standalone,
-  serverless/CLI, and enrichment no longer need top-level composition changes.
-- Do not substitute a larger runner, swap, cache priming, `-j1`, or merging
-  inference back into application code for the remaining architecture work.
+The earlier six-unit release baseline is recorded in
+[COMPILATION_EXPERIMENTS.md](COMPILATION_EXPERIMENTS.md), including Actions runs
+`31643584514` and `31645335108`. Those runs predate this integration; their
+compiler timings and memory reservations are historical, not measurements of
+the current source roots. Release performance must be remeasured in CI.
 
 ## Main goal
 
@@ -90,7 +71,7 @@ The work has two related objectives:
 
 ## Current compilation architecture
 
-The production topology produces six independently code-generated static
+The production topology produces seven independently code-generated static
 libraries and links them into one executable:
 
 ```text
@@ -106,7 +87,8 @@ thin linked antfly executable
 ├── antfly-runtime-api_kernel
 │   └── HTTP, auth, public validation and API protocol handlers
 ├── antfly-runtime-serverless
-│   ├── serverless orchestration over published artifacts
+│   └── serverless orchestration over published artifacts
+├── antfly-runtime-cli
 │   └── remote/client CLI commands
 ├── antfly-runtime-inference
 │   ├── model lifecycle and inference execution
@@ -115,7 +97,7 @@ thin linked antfly executable
     └── bounded document and media extraction compute
 ```
 
-These are compiled libraries, not processes or internal services. Calls remain
+These are compiled libraries within one process. Calls remain
 direct in-process ABI calls. The executable retains one command dispatcher and
 one implementation of each owned subsystem.
 
@@ -129,7 +111,8 @@ history for comparison; it is no longer a supported build topology.
 | Storage/local query | Physical table and shard handles, DB/LSM/index execution, local planning, batches, transaction participants, snapshots, restore publication, maintenance, Lite and CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
 | Distributed/standalone | Table routing, topology, leadership, fanout, merge, distributed transactions, HA control, standalone startup/shutdown | Physical DB, index-manager, LSM, enrichment implementation or a second inference implementation |
 | API kernel | HTTP, auth, public validation, request translation and protocol handlers | Provisioned DB ownership, physical query execution or Raft apply |
-| Serverless/CLI | Published-artifact orchestration, serverless requests and remote administration | Provisioned storage ownership, physical index execution or cluster Raft apply |
+| Serverless | Published-artifact orchestration and serverless requests | Provisioned storage ownership, physical index execution or cluster Raft apply |
+| CLI | Remote administration and restore staging through the storage ABI | Local DB implementation or server startup |
 | Inference | Model lifecycle, tokenizer/model/graph execution and standalone inference host | Table or storage ownership |
 | Enrichment compute | Bounded extraction, media decode and PDF/image compute | Durable storage state, replay, manifests or index ownership |
 | Main | Command dispatch and hidden linked-unit invocation | Domain implementations |
@@ -139,21 +122,77 @@ Raft leadership, routing, and distributed transaction coordination are control
 concerns. Raft apply, local transaction participation, physical WAL state, and
 snapshot publication execute through the storage owner.
 
-### Scheduling
+### Compilation and source ownership
 
-Zig 0.16 randomizes dependency traversal, so source or enum order cannot define
-a reliable memory-safe launch group. Explicit build dependencies preserve
-useful overlap while `max_rss` claims let the build runner admit all work that
-fits:
+The storage archive owns `storage/db/db.zig`, `storage/local_query.zig`, and
+`storage/local_write.zig`. Serving coordination in `api/table_reads.zig` and
+`api/table_writes.zig` uses opaque owners. Shared request and result helpers
+live in `api/local_query_contract.zig` and `api/local_write_contract.zig`;
+physical resource setup lives under `storage/`.
 
-1. Storage and distributed/standalone form the initial group.
-2. Inference starts when distributed completes and may overlap the storage
-   tail.
-3. API, serverless/CLI, and enrichment wait for storage, then overlap inference
-   as memory claims permit.
-4. Final executable and `libantfly` links reuse completed PIC objects.
+The executable dispatches Lite administration to storage and `lite serve` to
+the distributed runtime. Storage never links back to a server entry point.
+Storage owner tests link the same production archives and are included in the
+storage and integration aggregates, using module-name test filters.
 
-This is normally concurrent compilation, not serialized compilation.
+`max_rss` claims govern compilation admission. There are no artificial archive
+ordering dependencies; independent compilations can run concurrently when the
+runner has sufficient memory. Release memory measurements from the earlier
+layout below are historical baselines, not measurements of this revision.
+
+`python3 tools/check_storage_compilation.py --report storage-compilation.json`
+checks the real compiler in an isolated source overlay. It measures cold and
+warm builds, then verifies these source changes:
+
+| Changed source | Required rebuild | Required reuse |
+|---|---|---|
+| Read/write coordination | Distributed runtime and source integration tests | Every other runtime archive and the other owner tests |
+| Physical DB/local query | Storage archive and its linked storage tests | Every other runtime archive |
+| Owner integration test | Its test binary | Every runtime archive |
+| Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
+
+This expensive check runs with `zig-full / build-cache`. The lightweight
+configuration fixtures remain useful for option and generator dependencies.
+
+A native Darwin Debug run on 2026-09-11 completed the seven-archive and
+three-test-binary matrix. Cold compilation took 244 seconds and the warm build
+1.4 seconds. Read/write coordination edits took 54/59 seconds; DB/local-query
+edits took 91/83 seconds; an owner-test edit took 16 seconds. These are local
+wall times under concurrent development load, not release-runner benchmarks.
+The regression asserts artifact cache states, not timing thresholds. It keeps
+prior mutations in its private overlay: restoring a file also invalidates
+Zig's latest manifest and would confound the next measurement.
+
+Explicit entry roots and source profiles prevent inactive literal imports of
+the principal implementations. The self-module `antfly_source_root` alias
+selects those sources without giving overlapping files a second Zig module
+identity. Some shared storage leaf files remain lexically reachable by control;
+the measured six-case matrix does not prove independence for every leaf file.
+
+### Boundary runtime cost
+
+The existing `antfly-storage-bench` installs `storage_boundary_bench`. Run it
+with a new directory, which it creates and removes itself:
+
+```sh
+zig build antfly-storage-bench -Doptimize=Debug
+./zig-out/bin/storage_boundary_bench /tmp/antfly-boundary-benchmark-new
+```
+
+It compares the actual internal batch encoder/parser with the production
+owner's batch operation, and the typed query-result parser with the production
+owner's query operation. Document bodies are about 500 bytes. Each JSON line
+reports ten iterations, payload size, and separate timings.
+
+In the local Debug sample, a 1,000-document batch spent 8.9 ms per iteration
+encoding and parsing; the separately measured owner batch took 46.7 ms. A
+1,000-hit query took 20.9 ms in the owner, with another 11.2 ms for consumer
+decoding. These are separate measurements, not additive phases captured from
+one request or production throughput claims. JSON transport is a material
+remaining cost. This change removes a redundant owned query-response copy;
+it does not replace the internal JSON transport. A future compact or borrowed
+transport must preserve complete-operation calls, provider-owned result
+lifetimes, request validation, and exact error/cancellation semantics.
 
 ### C API composition
 
@@ -217,7 +256,7 @@ unique files, and 943 duplicate instances. Storage dominated: 163 storage files
 accounted for 255 duplicate instances and roughly 382,000 duplicated source
 lines. HTTPX and LMDB were much smaller and did not justify separate ABIs.
 
-The accepted six-unit runner report contains:
+The historical six-unit runner report contains:
 
 - 2,305 repository-file instances;
 - 1,257 unique repository files;
@@ -306,7 +345,7 @@ shorten one of those two critical paths without unacceptable aggregate work.
 
 ### Priority 1: storage/local query
 
-Storage is the largest current compiler at 482.880 seconds. The next credible
+Storage was the largest compiler in the historical six-unit baseline at 482.880 seconds. The next credible
 experiment is inside the physical owner, not another source facade or top-level
 role split.
 
@@ -436,7 +475,7 @@ from local Apple-Silicon cross-builds.
   and operation state retain their exact contracts.
 - Graph gates prevent broad implementation imports from returning.
 
-Enabling the experiment by default, merging the architecture, increasing
+Merging the architecture, increasing
 runner cost, or accepting a larger artifact remains an explicit approval
 decision even after technical gates pass.
 
@@ -514,7 +553,7 @@ zig build antfly capi \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
-zig build capi-test capi-smoke lib-standalone-runtime-test \
+zig build capi-test capi-smoke antfly-standalone-runtime-test \
   -Doptimize=Debug \
   -Donnx=false \
   -Dmetal=false \
@@ -524,7 +563,7 @@ zig build \
   -Doptimize=Debug \
   -Dproduction-lsm-only=false
 
-zig build lmdb-test storage-lmdb-test
+zig build lmdb-test antfly-storage-lmdb-test
 ```
 
 ### Graph gates

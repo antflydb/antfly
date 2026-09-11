@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SemanticQueryMode(str, Enum):
+class SemanticQueryMode(StrEnum):
     HYPOTHETICAL = "hypothetical"
     REWRITE = "rewrite"
 

@@ -114,6 +114,7 @@ pub const AdminSource = struct {
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         create_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
+        replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -137,6 +138,7 @@ pub const AdminSource = struct {
         drop_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!void = null,
         drop_table_exact_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
+        mutate_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) anyerror!tables_api.SchemaMutationResult = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -280,6 +282,13 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, expected, replacement);
     }
 
+    pub fn replaceTableDefinitionStamped(self: AdminSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+        if (self.vtable.replace_table_definition_stamped) |fn_ptr|
+            return try fn_ptr(self.ptr, expected, replacement);
+        try self.replaceTableDefinition(expected, replacement);
+        return null;
+    }
+
     pub fn restoreTable(
         self: AdminSource,
         alloc: std.mem.Allocator,
@@ -336,6 +345,18 @@ pub const AdminSource = struct {
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const fn_ptr = self.vtable.update_schema orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema_json);
+    }
+
+    pub fn mutateSchema(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        const fn_ptr = self.vtable.mutate_schema orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, mode, body, expected_version);
     }
 
     pub fn createIndex(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -498,12 +519,14 @@ pub const AdminSource = struct {
                 .create_table = metadataServiceCreateTable,
                 .create_table_with_context = metadataServiceCreateTableWithContext,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
+                .replace_table_definition_stamped = metadataServiceReplaceTableDefinitionStamped,
                 .restore_table = metadataServiceRestoreTable,
                 .restore_table_with_context = metadataServiceRestoreTableWithContext,
                 .drop_table = metadataServiceDropTable,
                 .drop_table_with_context = metadataServiceDropTableWithContext,
                 .drop_table_exact_with_context = metadataServiceDropTableExactWithContext,
                 .update_schema = metadataServiceUpdateSchema,
+                .mutate_schema = metadataServiceMutateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
                 .put_artifact_enrichment = metadataServicePutArtifactEnrichment,
@@ -559,12 +582,14 @@ pub const AdminSource = struct {
                 .create_table = metadataHttpServiceCreateTable,
                 .create_table_with_context = metadataHttpServiceCreateTableWithContext,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
+                .replace_table_definition_stamped = metadataHttpServiceReplaceTableDefinitionStamped,
                 .restore_table = metadataHttpServiceRestoreTable,
                 .restore_table_with_context = metadataHttpServiceRestoreTableWithContext,
                 .drop_table = metadataHttpServiceDropTable,
                 .drop_table_with_context = metadataHttpServiceDropTableWithContext,
                 .drop_table_exact_with_context = metadataHttpServiceDropTableExactWithContext,
                 .update_schema = metadataHttpServiceUpdateSchema,
+                .mutate_schema = metadataHttpServiceMutateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
                 .put_artifact_enrichment = metadataHttpServicePutArtifactEnrichment,
@@ -719,6 +744,14 @@ pub const AdminSource = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !void {
+        _ = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+    }
+
+    fn replaceTableDefinitionOnServiceStamped(
+        svc: anytype,
+        expected: metadata_table_manager.TableRecord,
+        replacement: metadata_table_manager.TableRecord,
+    ) !metadata_api.CatalogMutationStamp {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
@@ -731,7 +764,7 @@ pub const AdminSource = struct {
             expected,
             replacement,
         )) return error.ExtensionOwnedObject;
-        try svc.replaceTableDefinition(expected, replacement);
+        return try svc.replaceTableDefinitionStamped(expected, replacement);
     }
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -747,6 +780,13 @@ pub const AdminSource = struct {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try replaceTableDefinitionOnService(svc, expected, replacement);
         try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceReplaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        const stamp = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+        try flushMetadataServiceMutation(svc);
+        return stamp;
     }
 
     fn metadataServiceRestoreTable(
@@ -790,17 +830,58 @@ pub const AdminSource = struct {
         return try table_topology_mutations.drop(svc, alloc, request, table_name);
     }
 
-    fn metadataServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+    fn mutateSchemaOnService(
+        svc: anytype,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        mode: tables_api.SchemaMutationMode,
+        body: []const u8,
+        expected_version: ?u32,
+    ) !tables_api.SchemaMutationResult {
+        // Unconditional mutations retry a generation race against the newest
+        // authoritative document. Conditional mutations must surface the race
+        // to the caller instead of silently changing their precondition.
+        for (0..8) |_| {
+            var snapshot = try svc.adminSnapshot();
+            defer svc.freeAdminSnapshot(&snapshot);
+            const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+            if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+            if (expected_version) |expected| {
+                if (try tables_api.schemaVersion(table.schema_json) != expected)
+                    return error.SchemaVersionChanged;
+            }
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.replaceTableDefinition(table.*, updated);
+            const updated = try tables_api.applySchemaMutationRecord(alloc, table, mode, body);
+            defer metadata_table_manager.freeTable(alloc, updated);
+            svc.replaceTableDefinition(table.*, updated) catch |err| switch (err) {
+                error.TableGenerationChanged => {
+                    if (expected_version != null) return error.SchemaVersionChanged;
+                    continue;
+                },
+                else => return err,
+            };
+            return .{
+                .version = try tables_api.schemaVersion(updated.schema_json),
+                .schema_json = try alloc.dupe(u8, updated.schema_json),
+            };
+        }
+        return error.TableGenerationChanged;
+    }
+
+    fn metadataServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        var result = try metadataServiceMutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        result.deinit(alloc);
+    }
+
+    fn metadataServiceMutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        const result = try mutateSchemaOnService(svc, alloc, table_name, mode, body, expected_version);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
         try flushMetadataServiceMutation(svc);
+        return result;
     }
 
     fn metadataServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1183,6 +1264,13 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceReplaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const stamp = try replaceTableDefinitionOnServiceStamped(svc, expected, replacement);
+        try flushMetadataHttpServiceMutation(svc);
+        return stamp;
+    }
+
     fn metadataHttpServiceRestoreTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1226,16 +1314,19 @@ pub const AdminSource = struct {
     }
 
     fn metadataHttpServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableShape(&snapshot, table_name)) return error.ExtensionOwnedObject;
+        var result = try metadataHttpServiceMutateSchema(ptr, alloc, table_name, .replace, schema_json, null);
+        result.deinit(alloc);
+    }
 
-        const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
-        defer metadata_table_manager.freeTable(alloc, updated);
-        try svc.replaceTableDefinition(table.*, updated);
+    fn metadataHttpServiceMutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        const result = try mutateSchemaOnService(svc, alloc, table_name, mode, body, expected_version);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
         try flushMetadataHttpServiceMutation(svc);
+        return result;
     }
 
     fn metadataHttpServiceCreateIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1626,7 +1717,13 @@ pub const MetadataHttpServer = struct {
         try server.postWithBodyLimit(table_path, tables_api.max_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTable));
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
         try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
+        try server.put(table_path ++ routes.Routes.internal_table_definition_stamped_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinitionStamped));
         try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
+        try server.postWithBodyLimit(
+            table_path ++ routes.Routes.internal_table_schema_mutation_suffix,
+            tables_api.max_table_create_body_bytes,
+            httpx.Handler.bind(self, metadataMutateTableSchema),
+        );
         const index_path = table_path ++ routes.Routes.internal_table_indexes_infix ++ ":index_name";
         try server.put(index_path, httpx.Handler.bind(self, metadataCreateTableIndex));
         try server.delete(index_path, httpx.Handler.bind(self, metadataDropTableIndex));
@@ -2623,16 +2720,21 @@ pub const MetadataHttpServer = struct {
         return ctx.status(202).text("accepted");
     }
 
-    fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
-        return .{ .source = .{ .ptr = self, .vtable = &.{
+    fn tableOperationsVTable(comptime stamped: bool) *const table_operations.Source.VTable {
+        return &.{
             .create_table = createTableOperation,
             .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
+            .replace_definition_stamped = if (stamped)
+                replaceTableDefinitionOperationStamped
+            else
+                null,
             .restore_table = restoreTableOperation,
             .restore_table_with_context = restoreTableOperationWithContext,
             .drop_table = dropTableOperation,
             .drop_table_with_context = dropTableOperationWithContext,
             .update_schema = updateTableSchemaOperation,
+            .mutate_schema = mutateTableSchemaOperation,
             .create_index = createTableIndexOperation,
             .drop_index = dropTableIndexOperation,
             .put_enrichment = putTableEnrichmentOperation,
@@ -2642,7 +2744,19 @@ pub const MetadataHttpServer = struct {
             .validate_merge = validateTableMergeOperation,
             .request_merge = requestTableMergeOperation,
             .reseed_exact_cutover = reseedTableExactCutoverOperation,
-        } } };
+        };
+    }
+
+    fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
+        // Select between two immutable process-lifetime vtables. Building a
+        // runtime-conditional anonymous vtable here would return a pointer to
+        // stack storage and leave every subsequent operation with a dangling
+        // dispatch table.
+        const vtable = if (self.source.vtable.replace_table_definition_stamped != null)
+            tableOperationsVTable(true)
+        else
+            tableOperationsVTable(false);
+        return .{ .source = .{ .ptr = self, .vtable = vtable } };
     }
 
     fn createTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: tables_api.CreateTableRequest) !void {
@@ -2658,6 +2772,12 @@ pub const MetadataHttpServer = struct {
     fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.replaceTableDefinition(expected, replacement);
+    }
+
+    fn replaceTableDefinitionOperationStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return (try self.source.replaceTableDefinitionStamped(expected, replacement)) orelse
+            return error.UnsupportedOperation;
     }
 
     fn restoreTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: table_operations.RestoreRequest) !void {
@@ -2683,6 +2803,11 @@ pub const MetadataHttpServer = struct {
     fn updateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.updateSchema(alloc, table_name, schema_json);
+    }
+
+    fn mutateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: tables_api.SchemaMutationMode, body: []const u8, expected_version: ?u32) !tables_api.SchemaMutationResult {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.mutateSchema(alloc, table_name, mode, body, expected_version);
     }
 
     fn createTableIndexOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -2846,6 +2971,7 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             error.CreateTableRequestTooLarge => {
@@ -2872,9 +2998,32 @@ pub const MetadataHttpServer = struct {
             error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReplaceTableDefinitionStamped(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        // Capability failure must occur before the legacy mutation is
+        // admitted. A new client can then safely retry the stable v0.2 route
+        // and treat the missing receipt as generic reconciliation ownership.
+        if (self.source.vtable.replace_table_definition_stamped == null)
+            return ctx.status(405).text("method not allowed");
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        var parsed = std.json.parseFromSlice(ReplaceTableDefinitionRequest, ctx.allocator, (try ctx.body()) orelse "", .{ .allocate = .alloc_always }) catch
+            return ctx.status(400).text("invalid table definition replacement");
+        defer parsed.deinit();
+        const stamp = self.tableOperations().replaceDefinitionStamped(requestContext(ctx), table_name, parsed.value.expected, parsed.value.definition) catch |err| switch (err) {
+            error.TableNameMismatch => return ctx.status(400).text("table definition name mismatch"),
+            error.ExpectedTableNameMismatch => return ctx.status(400).text("expected table definition name mismatch"),
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject, error.UnsupportedOperation => return ctx.status(405).text("method not allowed"),
+            else => return metadataMutationError(ctx, err),
+        };
+        const committed = stamp orelse return ctx.status(405).text("method not allowed");
+        return ctx.status(202).json(committed);
     }
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -2957,6 +3106,42 @@ pub const MetadataHttpServer = struct {
             else => return metadataReadError(ctx, err),
         };
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataMutateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const mode_text = ctx.header("X-Antfly-Schema-Mutation-Mode") orelse
+            return ctx.status(400).text("missing schema mutation mode");
+        const mode: tables_api.SchemaMutationMode = if (std.mem.eql(u8, mode_text, "replace"))
+            .replace
+        else if (std.mem.eql(u8, mode_text, "merge-patch"))
+            .merge_patch
+        else
+            return ctx.status(400).text("invalid schema mutation mode");
+        const expected_version: ?u32 = if (ctx.header("X-Antfly-Expected-Schema-Version")) |raw|
+            std.fmt.parseUnsigned(u32, raw, 10) catch
+                return ctx.status(400).text("invalid expected schema version")
+        else
+            null;
+
+        var result = self.tableOperations().mutateSchema(
+            ctx.allocator,
+            requestContext(ctx),
+            table_name,
+            mode,
+            (try ctx.body()) orelse "",
+            expected_version,
+        ) catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.SchemaVersionChanged, error.TableGenerationChanged => return ctx.status(409).text("schema version changed"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => return ctx.status(400).text("invalid schema update request"),
+            else => return metadataReadError(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        return ctx.json(.{ .version = result.version, .schema_json = result.schema_json });
     }
 
     fn metadataCreateTableIndex(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -3353,6 +3538,8 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    dense_vector_projection_pending: ?bool = null,
+    dense_native_storage_phase: ?metadata_table_manager.DenseNativeStoragePhase = null,
     embedding_activity_observed: ?bool = null,
     embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
@@ -3416,6 +3603,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
         native_generation_restore_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -3445,6 +3633,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3456,6 +3648,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -3550,6 +3743,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -3578,6 +3772,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3595,6 +3793,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -3679,9 +3878,11 @@ fn cloneParsedRuntimeGroupStatus(
     errdefer alloc.free(source);
     const freshness = try alloc.dupe(u8, parsed.freshness orelse "unknown");
     errdefer alloc.free(freshness);
-    var enrichment = parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{};
-    enrichment.projection_checkpoint_status = try alloc.dupe(u8, enrichment.projection_checkpoint_status);
-    errdefer alloc.free(enrichment.projection_checkpoint_status);
+    const enrichment = try metadata_table_manager.cloneRuntimeEnrichmentStatusReport(
+        alloc,
+        parsed.enrichment orelse metadata_table_manager.RuntimeEnrichmentStatusReport{},
+    );
+    errdefer metadata_table_manager.freeRuntimeEnrichmentStatusReport(alloc, enrichment);
     return .{
         .table_id = parsed.table_id orelse 0,
         .table_name = table_name,
@@ -3787,6 +3988,8 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .dense_vector_projection_pending = parsed.dense_vector_projection_pending orelse false,
+        .dense_native_storage_phase = parsed.dense_native_storage_phase orelse .legacy,
         .embedding_activity_observed = parsed.embedding_activity_observed orelse false,
         .embedding_activity = if (parsed.embedding_activity) |activity| .{
             .epoch = activity.epoch orelse 0,
@@ -3806,10 +4009,10 @@ fn cloneParsedRuntimeIndexStatus(
     };
 }
 
-test "metadata status JSON preserves compact managed repair admission state" {
+test "metadata status JSON preserves compact managed index admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true,"dense_native_storage_phase":"native_validating"},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -3818,6 +4021,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(indexes[0].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.native_validating, indexes[0].dense_native_storage_phase);
     try std.testing.expect(indexes[0].publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
     try std.testing.expect(indexes[0].serving_snapshot_ready);
@@ -3830,6 +4035,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);
     try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
+    try std.testing.expect(!indexes[1].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.legacy, indexes[1].dense_native_storage_phase);
     // A mixed-version producer can omit both fields. Preserve that absence as
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);
@@ -5075,6 +5282,7 @@ test "metadata http server preserves extension-owned table drop conflicts" {
 test "metadata http server replaces a table definition through compare-and-swap" {
     const FakeSource = struct {
         replaced: bool = false,
+        reject_not_leader: bool = false,
 
         fn iface(self: *@This()) AdminSource {
             return .{
@@ -5084,6 +5292,7 @@ test "metadata http server replaces a table definition through compare-and-swap"
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .replace_table_definition = replaceTableDefinition,
+                    .replace_table_definition_stamped = replaceTableDefinitionStamped,
                 },
             };
         }
@@ -5108,11 +5317,22 @@ test "metadata http server replaces a table definition through compare-and-swap"
 
         fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject_not_leader) return error.NotLeader;
             if (expected.table_id != 42 or !std.mem.eql(u8, expected.description, "original")) return error.TableGenerationChanged;
             try std.testing.expectEqual(@as(u64, 42), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
             try std.testing.expectEqualStrings("restored", replacement.description);
             self.replaced = true;
+        }
+
+        fn replaceTableDefinitionStamped(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+            try replaceTableDefinition(ptr, expected, replacement);
+            return .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                .term = 2,
+                .index = 3,
+            };
         }
     };
 
@@ -5130,7 +5350,48 @@ test "metadata http server replaces a table definition through compare-and-swap"
     defer response.deinit();
 
     try std.testing.expectEqual(@as(u16, 202), response.status.code);
+    try std.testing.expectEqualStrings("accepted", response.body.?);
     try std.testing.expect(source.replaced);
+
+    source.replaced = false;
+    var stamped_response = try server.executeTypedHandlerWithBodyForTest(
+        .PUT,
+        "/internal/v1/tables/docs/definition:stamped",
+        &table_params,
+        \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+    ,
+        MetadataHttpServer.metadataReplaceTableDefinitionStamped,
+    );
+    defer stamped_response.deinit();
+    try std.testing.expectEqual(@as(u16, 202), stamped_response.status.code);
+    var stamp = try std.json.parseFromSlice(
+        metadata_api.CatalogMutationStamp,
+        std.testing.allocator,
+        stamped_response.body.?,
+        .{},
+    );
+    defer stamp.deinit();
+    try std.testing.expectEqual(@as(u64, 1), stamp.value.metadata_group_id);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &stamp.value.metadata_incarnation);
+    try std.testing.expectEqual(@as(u64, 2), stamp.value.term);
+    try std.testing.expectEqual(@as(u64, 3), stamp.value.index);
+    try std.testing.expect(source.replaced);
+
+    source.reject_not_leader = true;
+    var rejected_response = try server.executeTypedHandlerWithBodyForTest(
+        .PUT,
+        "/internal/v1/tables/docs/definition:stamped",
+        &table_params,
+        \\{"expected":{"table_id":42,"name":"docs","description":"original"},"definition":{"table_id":42,"name":"docs","description":"restored"}}
+    ,
+        MetadataHttpServer.metadataReplaceTableDefinitionStamped,
+    );
+    defer rejected_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), rejected_response.status.code);
+    try std.testing.expectEqualStrings(
+        http_common.metadata_mutation_not_admitted_value,
+        rejected_response.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+    );
 }
 
 test "metadata http server registers nodes and marks node stores draining for shutdown" {

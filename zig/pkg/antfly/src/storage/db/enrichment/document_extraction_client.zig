@@ -15,7 +15,7 @@
 //! Contract-only consumer for the separately compiled media compute unit.
 
 const std = @import("std");
-const abi = @import("kernel_owner_abi");
+const abi = @import("enrichment_compute_abi");
 const error_identity = @import("kernel_error_identity");
 const extraction = @import("document_extraction.zig");
 
@@ -225,7 +225,9 @@ pub fn extractDownloadedStreamingWithLimitsWithFailure(
     out_failure.* = .{};
     var context = Context{ .alloc = alloc, .sink = sink };
     var failure: abi.FailureIdentity = .{};
+    const allocator = abi.Allocator.fromStd(&alloc);
     const status = abi.antfly_enrichment_extract_stream(&.{
+        .allocator = &allocator,
         .downloaded = .fromSlice(downloaded.data),
         .downloaded_content_type = .fromSlice(downloaded.content_type),
         .source_url = .fromSlice(source_url),
@@ -280,14 +282,27 @@ pub fn extractDownloadedAllocWithFailure(
     raw_document_json: []const u8,
     out_failure: *abi.FailureIdentity,
 ) !extraction.Result {
+    return extractDownloadedAllocWithLimitsWithFailure(alloc, downloaded, source_url, config_json, raw_document_json, (extraction.Config{}).pdf_decode_limits, out_failure);
+}
+
+pub fn extractDownloadedAllocWithLimitsWithFailure(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    pdf_decode_limits: @TypeOf((extraction.Config{}).pdf_decode_limits),
+    out_failure: *abi.FailureIdentity,
+) !extraction.Result {
     var collector = ResultCollector{ .alloc = alloc };
     defer collector.deinit();
-    try extractDownloadedStreamingWithFailure(
+    try extractDownloadedStreamingWithLimitsWithFailure(
         alloc,
         downloaded,
         source_url,
         config_json,
         raw_document_json,
+        pdf_decode_limits,
         collector.sink(),
         out_failure,
     );
@@ -319,12 +334,31 @@ pub fn renderPdfPagePngAdaptiveAllocWithFailure(
     max_working_set_bytes: usize,
     out_failure: *abi.FailureIdentity,
 ) !extraction.RenderedPdfPage {
+    return renderPdfPagePngAdaptiveControlledAllocWithFailure(alloc, alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, 0, out_failure);
+}
+
+pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
+    alloc: Allocator,
+    decoder_alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    max_decoded_stream_bytes: usize,
+    max_working_set_bytes: usize,
+    render_timeout_ms: u64,
+    out_failure: *abi.FailureIdentity,
+) !extraction.RenderedPdfPage {
     out_failure.* = .{};
+    const allocator = abi.Allocator.fromStd(&decoder_alloc);
     var provider_png: abi.OwnedBytes = .{};
     defer abi.antfly_enrichment_buffer_destroy(&provider_png);
     var provider_page: abi.EnrichmentRenderedPdfPage = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_enrichment_render_pdf_page_png(&.{
+        .allocator = &allocator,
+        .render_timeout_ms = render_timeout_ms,
         .pdf_bytes = .fromSlice(pdf_bytes),
         .page_number = @intCast(page_number),
         .dpi = dpi,

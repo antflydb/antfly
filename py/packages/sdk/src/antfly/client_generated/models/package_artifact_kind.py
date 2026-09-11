@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class PackageArtifactKind(str, Enum):
+class PackageArtifactKind(StrEnum):
     ASSET = "asset"
     MANIFEST = "manifest"
     NATIVE_LIBRARY = "native_library"

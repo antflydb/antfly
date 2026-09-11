@@ -37,6 +37,10 @@ pub const CreateTableRequestErrorDisposition = enum {
 pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDisposition {
     return switch (err) {
         error.InvalidCreateTableRequest,
+        error.InvalidTableStorageSettings,
+        error.VectorStoreRequiresLocalSingleShardTable,
+        error.ImmutableTableStorageSettings,
+        error.VectorStoreRequiresEmptyTable,
         error.CreateTableShardCountOutOfRange,
         error.InvalidCreateTableSchemaRequest,
         error.TableEnrichmentsRequireArtifactEndpoint,
@@ -85,6 +89,11 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
+    const storage_settings = if (raw_root.get("storage")) |value|
+        try @import("../common/table_storage.zig").Settings.parse(value)
+    else
+        @import("../common/table_storage.zig").Settings{};
+
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
@@ -105,6 +114,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     defer parsed.deinit();
 
     var req: tables_api.CreateTableRequest = .{};
+    req.storage = storage_settings;
     errdefer req.deinit(alloc);
 
     if (parsed.value.num_shards) |num_shards| {
@@ -260,6 +270,31 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     // Pass the raw body directly to preserve x-antfly-* extension properties
     // that would be lost if round-tripped through the typed OpenAPI TableSchema struct.
     return try tables_api.parseSchemaUpdateRequest(alloc, body);
+}
+
+/// Apply an RFC 7396 JSON Merge Patch to a stored table schema and return the
+/// validated canonical replacement document. Both parsed trees live in one
+/// arena so values can be moved between them without per-node allocation or
+/// ownership bookkeeping.
+pub fn mergeSchemaPatchRequest(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    patch_json: []const u8,
+) ![]u8 {
+    return try tables_api.mergeSchemaPatchRequest(alloc, current_schema_json, patch_json);
+}
+
+test "schema merge patch preserves unrelated fields and removes ttl" {
+    const alloc = std.testing.allocator;
+    const merged = try mergeSchemaPatchRequest(
+        alloc,
+        "{\"version\":4,\"ttl\":{\"duration\":\"1h\"},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        "{\"ttl\":null}",
+    );
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"ttl\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"document_schemas\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "\"version\"") == null);
 }
 
 pub fn schemaUpdateRequestErrorMessage(err: anyerror, body: []const u8) []const u8 {

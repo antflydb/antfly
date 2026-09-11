@@ -1,9 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LinearMergePageStatus(str, Enum):
-    ERROR = "error"
-    PARTIAL = "partial"
+class LinearMergePageStatus(StrEnum):
     SUCCESS = "success"
 
     def __str__(self) -> str:

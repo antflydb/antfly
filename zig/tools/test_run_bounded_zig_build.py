@@ -51,13 +51,15 @@ class BoundedZigBuildTest(unittest.TestCase):
 
     def test_uncapped_build_uses_detected_host_budget(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(launcher, "detect_memory_limit", return_value=40_000):
+            with mock.patch.object(
+                launcher, "detect_memory_limit", return_value=40_000
+            ):
                 self.assertEqual(32_000, launcher.detect_max_rss())
 
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=Debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -66,7 +68,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 "zig",
                 "build",
-                "unit-test",
+                "antfly-unit-test",
                 "-Doptimize=Debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
@@ -79,7 +81,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_preserves_explicit_scheduler_options(self):
         arguments = [
             "build",
-            "unit-test",
+            "antfly-unit-test",
             "--build-runner=/tmp/ci-runner.zig",
             "--maxrss=20000",
         ]
@@ -92,7 +94,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_scheduler_options_before_runtime_arguments(self):
         command = launcher.build_command(
             "zig",
-            ["build", "unit-metadata-test", "--", "reconciler test"],
+            ["build", "antfly-metadata-test", "--", "reconciler test"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -101,7 +103,7 @@ class BoundedZigBuildTest(unittest.TestCase):
             [
                 "zig",
                 "build",
-                "unit-metadata-test",
+                "antfly-metadata-test",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",
@@ -119,7 +121,9 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "patch_build_runner",
                 side_effect=RuntimeError("unknown runner"),
             ):
-                with mock.patch.object(launcher, "zig_version", return_value=(0, 17, 0)):
+                with mock.patch.object(
+                    launcher, "zig_version", return_value=(0, 17, 0)
+                ):
                     self.assertIsNone(
                         launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
                     )
@@ -131,7 +135,9 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "patch_build_runner",
                 side_effect=RuntimeError("unknown runner"),
             ):
-                with mock.patch.object(launcher, "zig_version", return_value=(0, 16, 0)):
+                with mock.patch.object(
+                    launcher, "zig_version", return_value=(0, 16, 0)
+                ):
                     with self.assertRaisesRegex(RuntimeError, "unknown runner"):
                         launcher.prepare_build_runner("zig", Path("/tmp/patched.zig"))
 

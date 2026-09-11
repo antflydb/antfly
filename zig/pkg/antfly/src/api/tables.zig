@@ -325,6 +325,7 @@ pub const LsmStorageStatus = struct {
 };
 
 pub const TableStorageStatus = struct {
+    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
     table_name: []const u8,
     empty: bool,
     disk_usage: ?u64 = null,
@@ -797,6 +798,7 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, req.storage, .{}), .{}));
     if (req.num_shards) |num_shards| {
         try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
     }
@@ -842,6 +844,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
 
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
+
+    if (root.get("storage")) |value| req.storage = try @import("../common/table_storage.zig").Settings.parse(value);
 
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
@@ -1180,6 +1184,7 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
     const min_ranges = req.num_shards orelse 1;
     return .{
+        .storage = req.storage,
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
         .description = req.description orelse "",
@@ -1307,6 +1312,89 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     return try schema_mod.parseSchemaUpdateRequest(alloc, body);
 }
 
+pub const SchemaMutationMode = enum {
+    replace,
+    merge_patch,
+};
+
+pub const SchemaMutationResult = struct {
+    version: u32,
+    schema_json: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        self.* = undefined;
+    }
+};
+
+/// Applies RFC 7396 to the authoritative schema document. Keeping this in the
+/// metadata mutation domain ensures PATCH never merges against an eventually
+/// consistent API projection.
+pub fn mergeSchemaPatchRequest(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    patch_json: []const u8,
+) ![]u8 {
+    if (patch_json.len == 0) return error.InvalidSchemaUpdateRequest;
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var current = std.json.parseFromSliceLeaky(std.json.Value, arena, current_schema_json, .{}) catch
+        return error.InvalidSchemaUpdateRequest;
+    const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, patch_json, .{}) catch
+        return error.InvalidSchemaUpdateRequest;
+    if (current != .object or patch != .object) return error.InvalidSchemaUpdateRequest;
+    if (patch.object.get("version")) |version| {
+        if (version != .null) return error.SchemaVersionManagedByBackend;
+    }
+
+    try applyJsonMergePatch(arena, &current, patch);
+    _ = current.object.orderedRemove("version");
+    const merged = try std.json.Stringify.valueAlloc(alloc, current, .{});
+    errdefer alloc.free(merged);
+    const validated = try parseSchemaUpdateRequest(alloc, merged);
+    alloc.free(merged);
+    return validated;
+}
+
+fn applyJsonMergePatch(alloc: std.mem.Allocator, target: *std.json.Value, patch: std.json.Value) !void {
+    if (patch != .object) {
+        target.* = patch;
+        return;
+    }
+    if (target.* != .object) target.* = .{ .object = .empty };
+
+    var it = patch.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .null) {
+            _ = target.object.orderedRemove(entry.key_ptr.*);
+            continue;
+        }
+        if (entry.value_ptr.* == .object) {
+            const gop = try target.object.getOrPut(alloc, entry.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .object = .empty };
+            try applyJsonMergePatch(alloc, gop.value_ptr, entry.value_ptr.*);
+        } else {
+            try target.object.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+}
+
+pub fn applySchemaMutationRecord(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    mode: SchemaMutationMode,
+    body: []const u8,
+) !metadata_table_manager.TableRecord {
+    const schema_json = switch (mode) {
+        .replace => try parseSchemaUpdateRequest(alloc, body),
+        .merge_patch => try mergeSchemaPatchRequest(alloc, table.schema_json, body),
+    };
+    defer alloc.free(schema_json);
+    return try applySchemaUpdateRecord(alloc, table, schema_json);
+}
+
 pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !ParsedTableSchema {
     return try schema_mod.parseValidatedTableSchema(alloc, schema_json);
 }
@@ -1431,6 +1519,14 @@ fn validateNamedFullTextQueryIndexes(
     }
 }
 
+fn generatedSourceVectorStats(stats: @import("../storage/artifact_payload.zig").Stats) metadata_openapi.VectorSourceStorageStatus {
+    var out: metadata_openapi.VectorSourceStorageStatus = .{};
+    inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
+        @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
+    }
+    return out;
+}
+
 fn buildTableStatus(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -1458,6 +1554,7 @@ fn buildTableStatus(
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
+        .storage = .{ .dense_embeddings = @tagName(table.storage.dense_embeddings) },
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
         .schema = try parseOptionalTableSchema(alloc, table.schema_json),
@@ -1468,6 +1565,7 @@ fn buildTableStatus(
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
         .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
+            .source_vectors = if (storage_status) |status| if (status.source_vectors) |stats| generatedSourceVectorStats(stats) else null else null,
             .disk_usage = if (storage_status) |status|
                 if (status.disk_usage) |bytes| @intCast(@min(bytes, std.math.maxInt(i64))) else null
             else
@@ -3850,10 +3948,17 @@ test "metadata.table status encoder honors storage status overrides" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"direct_bulk_ingest_fallback_below_threshold_count\":129") != null);
 }
 
-test "metadata.table status encoder canonicalizes embeddings indexes without inline names" {
+test "metadata.table status encoder canonicalizes embeddings indexes independent of JSON key order" {
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    }};
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
-        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{\"semantic_kg\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"url\":\"http://127.0.0.1:11434/v1\"}}}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .tables = &tables,
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
         .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
         .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -3861,9 +3966,42 @@ test "metadata.table status encoder canonicalizes embeddings indexes without inl
         .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
     };
 
-    const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_kg\":{\"name\":\"semantic_kg\",\"type\":\"embeddings\"") != null);
+    const variants = [_][]const u8{
+        // The map key supplies the canonical name when there is no inline name.
+        \\{"semantic_kg":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:11434/v1"}}}
+        ,
+        // Reordering input keys must preserve all of the same public values.
+        \\{"semantic_kg":{"embedder":{"url":"http://127.0.0.1:11434/v1","model":"text-embedding-3-small","provider":"openai"},"dimension":3,"field":"body","type":"embeddings"}}
+        ,
+        // A stale inline name must not override the canonical map key.
+        \\{"semantic_kg":{"name":"stale_name","dimension":3,"type":"embeddings","field":"body","embedder":{"provider":"openai","model":"text-embedding-3-small","url":"http://127.0.0.1:11434/v1"}}}
+        ,
+    };
+    for (variants) |indexes_json| {
+        tables[0].indexes_json = indexes_json;
+        for ([_]bool{ false, true }) |list| {
+            const encoded = if (list)
+                try encodeTableList(std.testing.allocator, &snapshot, null)
+            else
+                (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
+            defer std.testing.allocator.free(encoded);
+            // CreatedEmbeddingsIndex's generated serializer emits optional fields
+            // between name and type. Assert the public object, not their adjacency.
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+            defer parsed.deinit();
+            const status = if (list) parsed.value.array.items[0] else parsed.value;
+            const indexes = status.object.get("indexes") orelse return error.TestUnexpectedResult;
+            const index = indexes.object.get("semantic_kg") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("semantic_kg", index.object.get("name").?.string);
+            try std.testing.expectEqualStrings("embeddings", index.object.get("type").?.string);
+            try std.testing.expectEqualStrings("body", index.object.get("field").?.string);
+            try std.testing.expectEqual(@as(i64, 3), index.object.get("dimension").?.integer);
+            const embedder = index.object.get("embedder").?;
+            try std.testing.expectEqualStrings("openai", embedder.object.get("provider").?.string);
+            try std.testing.expectEqualStrings("text-embedding-3-small", embedder.object.get("model").?.string);
+            try std.testing.expectEqualStrings("http://127.0.0.1:11434/v1", embedder.object.get("url").?.string);
+        }
+    }
 }
 
 fn testFieldCapabilityByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {

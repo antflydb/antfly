@@ -110,9 +110,9 @@ const BenchResult = struct {
     matches_public: bool,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.smp_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -972,37 +972,35 @@ fn freeDocIds(alloc: std.mem.Allocator, doc_ids: [][]u8) void {
     alloc.free(doc_ids);
 }
 
-fn parseArgs(args_in: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, arg);
+            cfg.docs = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--queries")) {
-            cfg.queries = try parseNextUsize(&args, arg);
+            cfg.queries = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--repeats")) {
-            cfg.repeats = try parseNextUsize(&args, arg);
+            cfg.repeats = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--filter-size")) {
-            cfg.filter_size = try parseNextUsize(&args, arg);
+            cfg.filter_size = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, arg);
+            cfg.batch_size = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--sparse-dims")) {
-            cfg.sparse_dims = try parseNextUsize(&args, arg);
+            cfg.sparse_dims = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--dense-dims")) {
-            cfg.dense_dims = try parseNextUsize(&args, arg);
+            cfg.dense_dims = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--limit")) {
-            cfg.limit = @intCast(try parseNextUsize(&args, arg));
+            cfg.limit = @intCast(try parseNextUsize(args, arg));
         } else if (std.mem.eql(u8, arg, "--body-repeat")) {
-            cfg.body_repeat = try parseNextUsize(&args, arg);
+            cfg.body_repeat = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--allow-mismatch")) {
             cfg.require_correctness = false;
         } else if (std.mem.eql(u8, arg, "--max-ordinal-ratio")) {
-            cfg.max_ordinal_ratio = try parseNextF64(&args, arg);
+            cfg.max_ordinal_ratio = try parseNextF64(args, arg);
         } else if (std.mem.eql(u8, arg, "--require-public-resolution-delta")) {
             cfg.require_public_resolution_delta = true;
         } else if (std.mem.eql(u8, arg, "--progress-every")) {
-            cfg.progress_every = try parseNextUsize(&args, arg);
+            cfg.progress_every = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--defer-full-index-load")) {
             cfg.defer_full_index_load = true;
         } else if (std.mem.eql(u8, arg, "--bulk-load")) {

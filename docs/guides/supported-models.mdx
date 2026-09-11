@@ -1,6 +1,8 @@
 ---
-title: Local model compatibility
-description: How Antfly checks local model compatibility, resource fit, and tested artifacts
+title: Local Model Compatibility
+sidebar: concepts
+order: 4
+description: How Antfly decides whether a local model artifact can load, which artifacts are verified, and which are refused
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -15,71 +17,114 @@ tags: [inference, models, embedding, reranking, generation, gguf]
 - Which thoroughly tested models should I start with?
 </Questions>
 
-Antfly is a database first and an inference engine second. It enables the model runtime
-paths needed to turn unstructured data into searchable, ranked, structured knowledge,
-without claiming compatibility with every artifact published under a model-family name.
+Antfly is a database first and an inference engine second. It runs the model paths needed to turn unstructured data into searchable, ranked, structured knowledge, and it does not claim compatibility with every artifact published under a model-family name. Compatibility is a property of the actual artifact and this Antfly build, never of a repository name: before loading weights, Antfly checks the bundle contract, the architecture runtime, required sidecars, GGUF tensor names and encodings, available backends, and resource admission. The two decisions this page settles are which model to start with for each job, and what a rejection means.
 
-Every discovered model reports `compatibility` in `/ai/v1/models`. Compatibility is a
-property of the actual artifact and this Antfly build, not a certification label attached
-to a repository name. Antfly checks the bundle contract, architecture runtime, required
-sidecars, GGUF tensor names and encodings, available backends, and resource admission before
-loading weights.
+Every discovered model reports its state:
 
-## Compatibility states
+```bash
+curl http://127.0.0.1:8080/ai/v1/models
+```
 
-| State | Meaning | Behaviour |
-|---|---|---|
-| **`compatible`** | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
-| **`unknown`** | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Rejected by default; opt in with `--allow-unknown-models`. |
-| **`incompatible`** | A required artifact/backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
+Each entry carries a `compatibility` field with one of the three states below.
 
-Resource fit is separate from compatibility. Model weights are admitted against stable host
-and accelerator limits before load; KV-cache and scratch estimates join the same shared
-reservation ledger for each request. A request that can never fit returns
-`MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. A one-shot live
-memory-pressure check protects the process without making the published compatibility state
-flap with momentary system load.
-
-Automatic backend selection may fall back to another compatible backend (for example, from
-Metal to native when a quant is not implemented on Metal). An explicitly requested backend
-is strict and never silently falls back.
-
-## Start here
+## Start Here
 
 | Role | Use this | Verified alternates |
 |---|---|---|
 | Fast text embedding | `BAAI/bge-small-en-v1.5` | `sentence-transformers/all-MiniLM-L6-v2` |
+| Quickstart text retrieval | `Qwen/Qwen3-Embedding-0.6B-GGUF` | Q8_0 bundle; Antfly applies its query instruction |
 | Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
-| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | — |
-| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | `cross-encoder/ms-marco-MiniLM-L6-v2` |
-| Multimodal (text + image + audio) | `antflydb/clipclap` | — |
+| Multilingual dense embedding | `BAAI/bge-m3` | Qualified dense checkpoint; see below |
+| Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | |
+| Text reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` | `mixedbread-ai/mxbai-rerank-base-v1`, `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Multimodal (text + image + audio) | `antflydb/clipclap` | |
 | Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
-| Entity, relation & structured extraction | `antflydb/gliner2-base-v1` | — |
-| Document reading / OCR | `antflydb/Florence-2-base` | — |
-| Transcription | `openai/whisper-tiny` | — |
-| Local generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
+| Entity, relation, and structured extraction | `antflydb/gliner2-base-v1` | |
+| Document reading and OCR | `antflydb/Florence-2-base` | |
+| Transcription | `openai/whisper-tiny` | |
+| Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
 
 Pull models by their full `owner/name` reference:
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
+antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
+antfly inference pull hf:BAAI/bge-m3 --tasks embed
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
-## Thoroughly tested artifacts (documentation certification)
+Gemma 4's automatically selected unified projector enables text, image, and audio generation inputs. Pass `--projector none` when only text generation is needed.
 
-These particular artifacts were checked for a meaningful result rather than merely a
-successful response. This is the certification matrix for operators, maintained in the
-documentation rather than baked into runtime policy. A certified artifact must still pass
-the same compatibility and resource-fit checks as every other artifact.
+The Qwen3 0.6B text reranker is publicly downloadable as a single GGUF. It uses the checkpoint's fixed text prompt, final active token, and yes/no score head. This is separate from the Qwen3-VL 2B multimodal reranker, whose Metal serving route requires its exact qualified managed bundle; community VL GGUFs cannot be substituted for that bundle solely because they share a model name or quant.
+
+Antfly treats retrieval roles as model input semantics, not model-name aliases. Semantic searches automatically use `RETRIEVAL_QUERY`; index and artifact writes use `RETRIEVAL_DOCUMENT`. Known asymmetric models load a declarative `embedding_profile` from their trusted bundle or Sentence Transformers metadata. A model that declares task-sensitive inputs but has no complete query/document profile is rejected before its weights are admitted.
+
+Provider-specific overrides are rarely needed. When they are, keep them under the embedder's `retrieval` object:
+
+```json
+{
+  "provider": "bedrock",
+  "model": "cohere.embed-v4:0",
+  "request_format": "cohere_v4",
+  "region": "us-east-1",
+  "retrieval": {
+    "query_input_type": "search_query",
+    "document_input_type": "search_document"
+  }
+}
+```
+
+The older flat `query_input_type`, `document_input_type`, and `query_instruction` fields remain read-compatible but are deprecated.
+
+Hosted generation providers (OpenAI and Gemini/Vertex), Ollama, and Antfly's generator endpoint are configured separately and are outside this matrix.
+
+## The Three Compatibility States
+
+| State | Meaning | Behavior |
+|---|---|---|
+| `compatible` | Static checks found a viable runtime path for this artifact and build. | May load, subject to resource admission. |
+| `unknown` | Antfly cannot prove compatibility or incompatibility without trying an unrecognized contract. | Attempted by default; the selected backend validates it at load time. |
+| `incompatible` | A required artifact or backend is missing, a tensor contract cannot be materialized, or the path is known unsafe or unusable. | Always rejected before load; the unknown-model opt-in cannot override it. |
+
+A known-incompatible generation request returns HTTP 400:
+
+```json
+{
+  "error": "INCOMPATIBLE_MODEL",
+  "message": "the current decoder path is known to be missing, unsafe, or to produce unusable output"
+}
+```
+
+An artifact whose compatibility cannot be determined is attempted anyway, and the backend validates it when it loads. Under a strict policy the same artifact returns `UNKNOWN_MODEL_COMPATIBILITY` instead:
+
+```bash
+antfly inference run --allow-unknown-models
+```
+
+The flag is accepted for compatibility and selects what is already the default. Nothing lifts `INCOMPATIBLE_MODEL` or resource limits.
+
+## Resource Fit Is a Separate Check
+
+Model weights are admitted against stable host and accelerator limits before load; KV-cache and scratch estimates join the same shared reservation ledger for each request. A request that can never fit returns `MODEL_RESOURCE_LIMIT`; temporary contention returns `MODEL_RESOURCE_BUSY`. A one-shot live memory-pressure check protects the process without letting the published compatibility state flap with momentary system load.
+
+Automatic backend selection may fall back to another compatible backend (for example, from Metal to native when a quant is not implemented on Metal). An explicitly requested backend is strict and never silently falls back.
+
+## Thoroughly Tested Artifacts
+
+These artifacts were checked for a meaningful result, not merely a successful response. This is the certification matrix for operators, maintained here rather than baked into runtime policy. A certified artifact still passes the same compatibility and resource-fit checks as every other artifact.
 
 | Capability | Model | Verified by |
 |---|---|---|
 | Dense embedding | `BAAI/bge-small-en-v1.5` | dim 384, unit norm; query↔relevant 0.81 vs irrelevant 0.27 |
+| Dense embedding | `nomic-ai/nomic-embed-text-v1.5` | dim 768, unit norm; Metal output parity with PyTorch MPS |
+| Dense embedding | `Qwen/Qwen3-Embedding-0.6B-GGUF` | dim 1024; qualified Qwen3-Embedding 0.6B Q8_0 bundle |
 | Dense embedding | `BAAI/bge-base-en-v1.5` | dim 768, unit norm |
 | Dense embedding | `BAAI/bge-large-en-v1.5` | dim 1024; relevant 0.86 vs irrelevant 0.35 |
 | Dense embedding | `mixedbread-ai/mxbai-embed-large-v1` | dim 1024; relevant 0.885 vs irrelevant 0.312 |
+| Dense embedding | `BAAI/bge-m3` | dim 1024, unit norm; Metal output parity with the qualified PyTorch MPS checkpoint |
 | Dense embedding | `sentence-transformers/all-MiniLM-L6-v2` | dim 384; relevant 0.824 vs irrelevant −0.007 |
 | Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | 90 non-zero terms |
 | Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | relevant 0.9997 vs irrelevant 0.0003 |
@@ -91,51 +136,30 @@ the same compatibility and resource-fit checks as every other artifact.
 | Transcription | `openai/whisper-tiny` | transcribes recorded speech |
 | Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
 
-### Generation
+`BAAI/bge-m3` resolves to the official immutable safetensors revision `84790c1a606f60d06c6932e4ecdd174b466d84ac`, because the repository's current `main` revision no longer publishes `model.safetensors`. The managed receipt and install-directory identity retain the full `safetensors@<commit>` variant. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
+
+### Generation Families
 
 | Family | Verified with |
 |---|---|
 | Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
-| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF`; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
+| Gemma 4 | Dense `ggml-org/gemma-4-E4B-it-GGUF` Q4_0; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
 | Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
 | Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
-Text generation works with the decoder artifacts listed above. Multimodal generation is
-also available when the bundle contains a compatible Antfly Gemma 3 projector or supported
-Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable
-images, audio, or both. The projector is opened only when a request contains media, so the
-same bundle continues to serve text-only requests without projector execution.
+Text generation works with the decoder artifacts listed above. Multimodal generation is available when the bundle contains a compatible Antfly Gemma 3 projector or a supported Gemma 4 CLIP projector: Gemma 3 accepts images, while Gemma 4 projector metadata can enable images, audio, or both. The projector is opened only when a request contains media, so the same bundle keeps serving text-only requests without projector execution.
 
-Gemma 4 26B-A4B support is intentionally narrower than dense Gemma 4. The GGUF
-must match the qualified 30-layer, 128-expert, top-8 Q4_0 layout. Metal supports
-bounded or resident placement. CUDA requires a 16 GiB resident A4B envelope
-and an SM89 GPU. Unsupported geometry, streamed CUDA, or unavailable kernels
-are rejected at load time rather than falling back to host MoE execution.
-Server deployments must also leave transient host/combined admission headroom
-for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains
-leased after load.
+Gemma 4 26B-A4B support is intentionally narrower than dense Gemma 4. The GGUF must match the qualified 30-layer, 128-expert, top-8 Q4_0 layout. Metal supports bounded or resident placement. CUDA requires a 16 GiB resident A4B envelope and an SM89 GPU. Unsupported geometry, streamed CUDA, or unavailable kernels are rejected at load time rather than falling back to host MoE execution. Server deployments must also leave transient host/combined admission headroom for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains leased after load.
 
-CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean
-GGUF pages remain kernel-reclaimable and shared across rolling workers unless
-`--a4b-drop-host-cache-after-load` is selected. Production images can install
-a versioned `$MODEL/a4b-cuda-pack-v2` created with `antfly-inference a4b-pack`;
-use `a4b-pack --verify` after copying it and `--a4b-prepared-pack required` to
-fail closed if that artifact is absent or stale. The default `auto` policy
-warns and uses the canonical GGUF when an optional pack is unusable. This is deliberately a
-full-model residency contract, not an `ngl`-style layer split. Cache retention
-and server `startup_strategy: "prefetch"` are deployment tools rather than a
-latency guarantee; hosts must have enough reclaimable memory for their
-checkpoint and loader working set, and should measure replacement-worker load
-time on the actual storage topology.
+CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean GGUF pages remain kernel-reclaimable and shared across rolling workers unless `--a4b-drop-host-cache-after-load` is selected. Production images can install a versioned `$MODEL/a4b-cuda-pack-v2` created with `antfly-inference a4b-pack`; use `a4b-pack --verify` after copying it and `--a4b-prepared-pack required` to fail closed if that artifact is absent or stale. The default `auto` policy warns and uses the canonical GGUF when an optional pack is unusable. This is deliberately a full-model residency contract, not an `ngl`-style layer split. Cache retention and server `startup_strategy: "prefetch"` are deployment tools rather than a latency guarantee; hosts must have enough reclaimable memory for their checkpoint and loader working set, and should measure replacement-worker load time on the actual storage topology.
 
-## Known incompatible artifacts and families
+## Known Incompatible Artifacts and Families
 
-Rejected with HTTP 400 before any load. Some of these do not merely fail — they would
-otherwise crash the server, so blocking them protects every other caller.
+Rejected with HTTP 400 before any load. Some of these do not merely fail; they would crash the server, so blocking them protects every other caller.
 
 | Model or family | Why |
 |---|---|
-| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound — about 800 MB/s to 31 GB for one 64×64 image — until the process is killed. Use `antflydb/clipclap`. |
+| Standalone CLIP (`Xenova/clip-vit-base-patch32`) | Image embedding allocates without bound, about 800 MB/s to 31 GB for one 64×64 image, until the process is killed. Use `antflydb/clipclap`. |
 | Standalone CLAP (`Xenova/clap-htsat-unfused`) | `ShapeMismatch` converting the audio encoder. Use `antflydb/clipclap`. |
 | TrOCR-style readers (`Xenova/trocr-base-printed`) | ONNX encoder/decoder readers exhaust memory the same way as CLIP. Use `antflydb/Florence-2-base`. |
 | Seq2seq rewriters (`/rewrite`) | Importing an ONNX encoder/decoder graph panics on a rank assertion. No rewriter model currently works. |
@@ -150,66 +174,24 @@ otherwise crash the server, so blocking them protects every other caller.
 | Gemma 4 12B unified exports | The unified layout has unresolved required weights. Gemma 4 E4B uses a different dense layout and remains compatible. |
 | DeepSeek V4 (`deepseek4`) | Loads and resolves all 1328 tensors, then panics on a shape mismatch in the grouped output projection. llama.cpp runs the same file, so this is ours to fix. |
 | `qwen35`, `qwen3next`, `qwen35moe` | Hybrid linear attention; the GGUF `ssm_*` tensors have no mapping. |
-| `falcon`, `opt`, `bloom` | Recognised by name only — no tensor mapping and no runtime. |
+| `falcon`, `opt`, `bloom` | Recognized by name only: no tensor mapping and no runtime. |
 | `gpt2`, `gpt_neo`, `gpt_neox`, `gptj`, `t5` | No verified generation path. T5 has an encoder-decoder implementation but no generation path. |
 
-A known-incompatible generation request returns HTTP 400:
+`Babelscape/rebel-large` is also licensed CC-BY-NC-SA, non-commercial only, and is about 3 GB. It is not part of any default bundle and must not be deployed commercially. `antflydb/gliner2-base-v1` is the extraction model to use.
 
-```json
-{
-  "error": "INCOMPATIBLE_MODEL",
-  "message": "the current decoder path is known to be missing, unsafe, or to produce unusable output"
-}
-```
+## Caveats on Compatible Models
 
-An artifact whose compatibility cannot be determined instead returns
-`UNKNOWN_MODEL_COMPATIBILITY`. To try it deliberately:
+**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template Antfly's template engine cannot yet parse. The model loads and generates correctly, but chat requests fall back to raw prompting, which produces continuation-style output instead of a reply. Affected models report `"chat_template": false` in `/ai/v1/models`.
 
-```bash
-antfly inference run --allow-unknown-models
-```
+**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops cleanly through `antfly inference generate`, but can fail to stop through `/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
 
-The flag does not bypass `INCOMPATIBLE_MODEL` or resource limits.
+**Gemma 4 artifacts and quants differ.** The current `ggml-org/gemma-4-E4B-it-GGUF` repository publishes BF16, Q4_0, and Q8_0 decoder weights; it does not publish Q4_K_M. Pull the exact Q4_0 variant shown above. Its automatically selected Q8 projector supports both image and audio inputs. Google QAT Q4_0 and tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the GGUF-over-sidecar structural fix. A tested `UD-Q4_K_XL` contains `IQ4_XS`; Metal rejects that quant before generation and automatic selection falls back to native. Keep one quant per directory rather than mixing artifacts from different variants.
 
-## Licensing
+**Mixed-variant model directories.** Pulling a second variant into a directory that already holds another leaves both in place, and different parts of a model can then resolve to different variants. ClipClap in particular fails this way. Keep one variant per directory; if in doubt, delete and re-pull.
 
-`Babelscape/rebel-large` is **CC-BY-NC-SA — non-commercial only**, and about 3 GB. Its
-relation-output parser has unit coverage, but the actual BART inference path is incompatible
-with 0.2.0. It is not part of any default bundle and must not be deployed commercially.
-`antflydb/gliner2-base-v1` is the recommended extraction model.
+**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is not larger than `overlap_tokens`; equal values fail too. Set both together when using small chunks.
 
-## Known caveats
-
-**Llama 3.x chat templates.** Llama 3.x ships a Jinja chat template Antfly's template engine
-cannot yet parse. The model loads and generates correctly, but chat requests fall back to
-raw prompting, which produces continuation-style output instead of a reply. Affected models
-report `"chat_template": false` in `/ai/v1/models`.
-
-**Small Gemma 3 models over the chat endpoint.** `gemma-3-1b` answers correctly and stops
-cleanly through `antfly inference generate`, but can fail to stop through
-`/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
-
-**Gemma 4 artifacts and quants differ.** The recommended
-`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. Google QAT Q4_0
-and tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the
-GGUF-over-sidecar structural fix. A tested `UD-Q4_K_XL` contains `IQ4_XS`; Metal rejects
-that quant before generation and automatic selection falls back to native. Keep one quant
-per directory and prefer the recommended artifact.
-
-**Mixed-variant model directories.** Pulling a second variant into a directory that already
-holds another leaves both in place, and different parts of a model can then resolve to
-different variants. ClipClap in particular fails this way. Keep one variant per directory;
-if in doubt, delete and re-pull.
-
-**Chunk overlap.** `/chunk` returns `InvalidChunkOverlap` when `target_tokens` is smaller
-than `overlap_tokens`. Set both together when using small chunks.
-
-## Not covered here
-
-Hosted generation providers (OpenAI, Gemini/Vertex, Bedrock, Cohere, OpenRouter) and Ollama
-are configured separately and are not part of this local-model matrix.
-
-## Checking a model before running it
+## Checking a Model Before Running It
 
 `smoke --inspect-only` reports what Antfly makes of a bundle without loading weights:
 
@@ -224,5 +206,10 @@ gguf path=.../Qwen3-1.7B-UD-Q4_K_XL.gguf architecture=qwen3 tensors=310 metadata
   missing_required_tensors=none
 ```
 
-`missing_required_tensors` with a non-zero count means the architecture was recognised but
-its tensor names could not be mapped — the signature of an unsupported or fused layout.
+A non-zero `missing_required_tensors` count means the architecture was recognized but its tensor names could not be mapped: the signature of an unsupported or fused layout.
+
+## Next Steps
+
+- [Antfly Inference](/docs/guides/inference): pulling, storing, and configuring the models this page certifies
+- [Quickstart](/docs/guides/quickstart): the verified embedder, reranker, and generator in one end-to-end run
+- The [models browser](/inference): every model in the registry with descriptions and sizes

@@ -11,3 +11,4 @@ pub const DynamicTemplate = types.DynamicTemplate;
 pub const FieldMappingType = types.FieldMappingType;
 pub const TableSchema = types.TableSchema;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;
+pub const TtlConfig = types.TtlConfig;

@@ -16,6 +16,8 @@ const build_options = @import("build_options");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
+pub const execution_control = @import("execution_control.zig");
+pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
     pub fn metalDeviceAvailable() bool {
         return false;
@@ -63,6 +65,7 @@ pub const finetune = struct {
     pub const graph_input_binder = @import("finetune/graph_input_binder.zig");
     pub const reranker_data = @import("finetune/reranker_data.zig");
     pub const reranker = @import("finetune/reranker.zig");
+    pub const reranker_head = @import("finetune/reranker_head.zig");
     pub const reranker_lora = @import("finetune/reranker_lora.zig");
     pub const fused_chunker_data = @import("finetune/fused_chunker_data.zig");
     pub const fused_chunker = @import("finetune/fused_chunker.zig");
@@ -73,6 +76,7 @@ pub const finetune = struct {
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");
     pub const recipe = @import("finetune/recipe.zig");
+    pub const runners = @import("finetune/runners.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {
@@ -81,6 +85,9 @@ pub const architectures = struct {
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
     pub const bert_graph = @import("architectures/bert_graph.zig");
     pub const qwen2_graph = @import("architectures/qwen2_graph.zig");
+    pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
+    pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
+    pub const qwen3vl_reranker = @import("architectures/qwen3vl_reranker.zig");
     pub const gemma_graph = @import("architectures/gemma_graph.zig");
     pub const modern_bert_graph = @import("architectures/modern_bert_graph.zig");
     pub const layoutlmv3_graph = @import("architectures/layoutlmv3_graph.zig");
@@ -90,6 +97,7 @@ pub const architectures = struct {
     pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
 };
 pub const models = struct {
+    pub const manifest = @import("models/manifest.zig");
     pub const deberta = @import("models/deberta.zig");
     pub const clip = @import("models/clip.zig");
     pub const clap = @import("models/clap.zig");

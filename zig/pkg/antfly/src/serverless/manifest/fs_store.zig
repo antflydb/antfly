@@ -452,10 +452,11 @@ test "fs manifest store compareAndSwapHead is serialized across threads" {
 
     var worker_a = Worker{ .store = &store, .target = 2 };
     var worker_b = Worker{ .store = &store, .target = 3 };
-    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
-    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});
-    thread_a.join();
-    thread_b.join();
+    var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
+    defer thread_a.await(std.testing.io);
+    var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
 
     try std.testing.expect(worker_a.result != worker_b.result);
     const head = try store.getHead("docs");

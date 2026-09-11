@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class BatchResponseStatus(str, Enum):
+class BatchResponseStatus(StrEnum):
     COMMITTED = "committed"
     COMMITTED_PENDING = "committed_pending"
     COMMITTED_REPAIR_REQUIRED = "committed_repair_required"

@@ -225,7 +225,6 @@ components:
                Omit `api_key` from config and set the appropriate env var:
                - Gemini: `GEMINI_API_KEY`
                - OpenAI: `OPENAI_API_KEY`
-               - Anthropic: `ANTHROPIC_API_KEY`
 
             See [Secrets Management](/docs/secrets) for complete documentation.
 
@@ -278,7 +277,7 @@ components:
                 ],
                 "with-inline": [
                   { "generator": "gemini-flash" },
-                  { "generator_config": { "provider": "anthropic", "model": "claude-sonnet-4-5-20250929" } }
+                  { "generator_config": { "provider": "openai", "model": "gpt-4.1" } }
                 ]
               }
             }
@@ -295,8 +294,8 @@ components:
             with-inline:
               - generator: gemini-flash
               - generator_config:
-                  provider: anthropic
-                  model: claude-sonnet-4-5-20250929
+                  provider: openai
+                  model: gpt-4.1
         rerankers:
           type: object
           additionalProperties:

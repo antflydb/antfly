@@ -19,14 +19,25 @@ pub const default_token_uri = auth.default_token_uri;
 pub const HeaderPair = auth.HeaderPair;
 pub const HttpMethod = auth.HttpMethod;
 pub const TransportResponse = auth.TransportResponse;
+pub const RequestControl = auth.RequestControl;
 pub const ServiceAccount = auth.ServiceAccount;
+pub const AuthorizedUser = auth.AuthorizedUser;
+pub const ExternalAccount = auth.ExternalAccount;
+pub const MetadataCredentials = auth.MetadataCredentials;
+pub const Credentials = auth.Credentials;
 pub const Config = auth.Config;
 pub const CachedTokenSource = auth.CachedTokenSource;
+pub const CredentialManager = auth.CredentialManager;
 pub const configFromServiceAccountAlloc = auth.configFromServiceAccountAlloc;
 pub const parseServiceAccountJsonAlloc = auth.parseServiceAccountJsonAlloc;
 pub const serviceAccountFromFileAlloc = auth.serviceAccountFromFileAlloc;
+pub const configFromFileAlloc = auth.configFromFileAlloc;
+pub const configFromFileAllocWithIo = auth.configFromFileAllocWithIo;
 pub const tokenSourceFromEnvAlloc = auth.tokenSourceFromEnvAlloc;
 pub const configFromEnvAlloc = auth.configFromEnvAlloc;
+pub const projectIdFromDefaultCredentialsAlloc = auth.projectIdFromDefaultCredentialsAlloc;
+pub const projectIdFromDefaultCredentialsAllocWithControl = auth.projectIdFromDefaultCredentialsAllocWithControl;
+pub const projectIdFromFileAlloc = auth.projectIdFromFileAlloc;
 pub const serviceAccountEnvProjectIdAlloc = auth.serviceAccountEnvProjectIdAlloc;
 pub const signedJwtAssertionAlloc = auth.signedJwtAssertionAlloc;
 
@@ -40,4 +51,5 @@ test "google module compiles" {
     _ = ServiceAccount;
     _ = Config;
     _ = CachedTokenSource;
+    _ = CredentialManager;
 }

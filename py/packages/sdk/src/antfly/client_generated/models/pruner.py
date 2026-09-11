@@ -15,12 +15,14 @@ T = TypeVar("T", bound="Pruner")
 class Pruner:
     """Configuration for pruning search results based on score quality.
     Helps filter out low-relevance results in RAG pipelines by detecting
-    score gaps or deviations from top results.
+    score gaps or deviations from top results. Pruning runs once on the
+    globally merged score domain, after reranking when a reranker is
+    configured and before offset/limit paging.
 
         Attributes:
             min_score_ratio (float | Unset): Keep only results with score >= max_score * min_score_ratio.
                 For example, 0.5 keeps results scoring at least half of the top result.
-                Applied after fusion scoring.
+                Applied to final scores after global fusion and optional reranking.
                  Example: 0.5.
             max_score_gap_percent (float | Unset): Stop returning results when the gap between consecutive scores
                 exceeds this percentage of the total score range (max - min).

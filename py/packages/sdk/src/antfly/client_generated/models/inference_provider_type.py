@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceProviderType(str, Enum):
+class InferenceProviderType(StrEnum):
     ANTFLY = "antfly"
     ANTHROPIC = "anthropic"
     BEDROCK = "bedrock"

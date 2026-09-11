@@ -97,12 +97,14 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
             route.index_name = nextRouteValue(&args, arg, &route.missing_value_arg);
         } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "--field") or
             std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
-            std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer") or
             std.mem.eql(u8, arg, "--chunker") or std.mem.eql(u8, arg, "--dimension") or
-            std.mem.eql(u8, arg, "--coverage-policy") or std.mem.eql(u8, arg, "--publication-policy"))
+            std.mem.eql(u8, arg, "--coverage-policy") or std.mem.eql(u8, arg, "--publication-policy") or
+            std.mem.eql(u8, arg, "--distance-metric"))
         {
             if (create_only_arg == null) create_only_arg = arg;
             _ = nextRouteValue(&args, arg, &route.missing_value_arg);
+        } else if (std.mem.eql(u8, arg, "--external")) {
+            if (create_only_arg == null) create_only_arg = arg;
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
             if (list_only_arg == null) list_only_arg = arg;
             _ = nextRouteValue(&args, arg, &route.missing_value_arg);
@@ -163,6 +165,11 @@ test "index route accepts flags before and after the action" {
     try std.testing.expectEqualStrings("create", policy.subcommand.?);
     try std.testing.expect(policy.unknown_arg == null);
 
+    var vector_options_argv = [_][*:0]const u8{ "create", "--table", "docs", "--external", "--distance-metric", "cosine" };
+    const vector_options = parseRoute(std.process.Args.Iterator.init(.{ .vector = vector_options_argv[0..] }));
+    try std.testing.expectEqualStrings("create", vector_options.subcommand.?);
+    try std.testing.expect(vector_options.unknown_arg == null);
+
     var wait_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--until", "searchable-artifacts=1" };
     const wait = parseRoute(std.process.Args.Iterator.init(.{ .vector = wait_argv[0..] }));
     try std.testing.expectEqualStrings("wait", wait.subcommand.?);
@@ -217,11 +224,12 @@ const IndexCreateConfigInput = struct {
     field: ?[]const u8 = null,
     template: ?[]const u8 = null,
     embedder_json: ?[]const u8 = null,
-    summarizer_json: ?[]const u8 = null,
     chunker_json: ?[]const u8 = null,
     dimension: ?i64 = null,
     coverage_policy: ?[]const u8 = null,
     publication_policy: ?[]const u8 = null,
+    distance_metric: ?[]const u8 = null,
+    external: bool = false,
 };
 
 fn isValidJsonObject(allocator: std.mem.Allocator, raw: []const u8) !bool {
@@ -250,11 +258,17 @@ fn buildIndexCreateConfig(
     if (input.publication_policy != null and !std.mem.eql(u8, input.index_type, "embeddings")) {
         return error.PublicationPolicyRequiresEmbeddingsIndex;
     }
+    if ((input.distance_metric != null or input.external) and !std.mem.eql(u8, input.index_type, "embeddings")) {
+        return error.VectorOptionRequiresEmbeddingsIndex;
+    }
+    if (input.external and input.dimension == null) return error.ExternalIndexRequiresDimension;
+    if (input.external and
+        (input.field != null or input.template != null or input.embedder_json != null or input.chunker_json != null))
+    {
+        return error.ExternalIndexHasManagedOptions;
+    }
     if (input.embedder_json) |raw| {
         if (!try isValidJsonObject(allocator, raw)) return error.InvalidEmbedderJson;
-    }
-    if (input.summarizer_json) |raw| {
-        if (!try isValidJsonObject(allocator, raw)) return error.InvalidSummarizerJson;
     }
     if (input.chunker_json) |raw| {
         if (!try isValidJsonObject(allocator, raw)) return error.InvalidChunkerJson;
@@ -268,11 +282,12 @@ fn buildIndexCreateConfig(
     if (input.field) |field| try writer.print(",\"field\":{f}", .{std.json.fmt(field, .{})});
     if (input.template) |template| try writer.print(",\"template\":{f}", .{std.json.fmt(template, .{})});
     if (input.embedder_json) |embedder| try writer.print(",\"embedder\":{s}", .{embedder});
-    if (input.summarizer_json) |summarizer| try writer.print(",\"summarizer\":{s}", .{summarizer});
     if (input.chunker_json) |chunker| try writer.print(",\"chunker\":{s}", .{chunker});
     if (input.dimension) |dimension| try writer.print(",\"dimension\":{d}", .{dimension});
     if (input.coverage_policy) |policy| try writer.print(",\"coverage_policy\":{f}", .{std.json.fmt(policy, .{})});
     if (input.publication_policy) |policy| try writer.print(",\"publication_policy\":{f}", .{std.json.fmt(policy, .{})});
+    if (input.distance_metric) |metric| try writer.print(",\"distance_metric\":{f}", .{std.json.fmt(metric, .{})});
+    if (input.external) try writer.writeAll(",\"external\":true");
     try writer.writeAll("}");
 
     return std.json.parseFromSlice(antfly_client.types.CreateIndexRequest, allocator, out.written(), .{
@@ -286,11 +301,13 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     var field: ?[]const u8 = null;
     var template: ?[]const u8 = null;
     var embedder_json: ?[]const u8 = null;
-    var summarizer_json: ?[]const u8 = null;
     var chunker_json: ?[]const u8 = null;
     var dimension: ?i64 = null;
     var coverage_policy: ?[]const u8 = null;
     var publication_policy: ?[]const u8 = null;
+    var distance_metric: ?[]const u8 = null;
+    var external = false;
+    var external_set = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "create")) continue;
@@ -309,9 +326,6 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         } else if (std.mem.eql(u8, arg, "--embedder")) {
             if (embedder_json != null) cli.fatal("--embedder may only be provided once", .{});
             embedder_json = args.next() orelse cli.fatal("--embedder requires a JSON value", .{});
-        } else if (std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer")) {
-            if (summarizer_json != null) cli.fatal("use only one of --summarizer or its legacy --generator alias", .{});
-            summarizer_json = args.next() orelse cli.fatal("{s} requires a JSON value", .{arg});
         } else if (std.mem.eql(u8, arg, "--chunker")) {
             if (chunker_json != null) cli.fatal("--chunker may only be provided once", .{});
             chunker_json = args.next() orelse cli.fatal("--chunker requires a JSON value", .{});
@@ -337,6 +351,20 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
                 cli.fatal("invalid --publication-policy value: {s}; expected progressive or atomic", .{raw});
             }
             publication_policy = raw;
+        } else if (std.mem.eql(u8, arg, "--distance-metric")) {
+            if (distance_metric != null) cli.fatal("--distance-metric may only be provided once", .{});
+            const raw = args.next() orelse cli.fatal("--distance-metric requires a value", .{});
+            if (!std.mem.eql(u8, raw, "l2_squared") and
+                !std.mem.eql(u8, raw, "inner_product") and
+                !std.mem.eql(u8, raw, "cosine"))
+            {
+                cli.fatal("invalid --distance-metric value: {s}; expected l2_squared, inner_product, or cosine", .{raw});
+            }
+            distance_metric = raw;
+        } else if (std.mem.eql(u8, arg, "--external")) {
+            if (external_set) cli.fatal("--external may only be provided once", .{});
+            external = true;
+            external_set = true;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             _ = args.next() orelse cli.fatal("{s} requires a value", .{arg}); // already parsed
         } else {
@@ -352,21 +380,28 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     if (publication_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
         cli.fatal("--publication-policy is only valid for embeddings indexes", .{});
     }
+    if ((distance_metric != null or external) and !std.mem.eql(u8, index_type, "embeddings")) {
+        cli.fatal("--distance-metric and --external are only valid for embeddings indexes", .{});
+    }
+    if (external and dimension == null) cli.fatal("--external requires --dimension", .{});
+    if (external and (field != null or template != null or embedder_json != null or chunker_json != null)) {
+        cli.fatal("--external cannot be combined with --field, --template, --embedder, or --chunker", .{});
+    }
 
     var parsed = buildIndexCreateConfig(allocator, .{
         .index_type = index_type,
         .field = field,
         .template = template,
         .embedder_json = embedder_json,
-        .summarizer_json = summarizer_json,
         .chunker_json = chunker_json,
         .dimension = dimension,
         .coverage_policy = coverage_policy,
         .publication_policy = publication_policy,
+        .distance_metric = distance_metric,
+        .external = external,
     }) catch |err| switch (err) {
         error.InvalidIndexType => cli.fatal("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
         error.InvalidEmbedderJson => cli.fatal("--embedder must be a valid JSON object", .{}),
-        error.InvalidSummarizerJson => cli.fatal("--summarizer must be a valid JSON object", .{}),
         error.InvalidChunkerJson => cli.fatal("--chunker must be a valid JSON object", .{}),
         else => cli.fatal("failed to build index config: {}", .{err}),
     };
@@ -475,6 +510,7 @@ const IndexSummary = struct {
     source_pending: ?i64 = null,
     source_skipped: ?i64 = null,
     source_failed: ?i64 = null,
+    source_observation_complete: bool = false,
     indexed: ?i64 = null,
     visible: ?i64 = null,
     publication_target: ?i64 = null,
@@ -626,6 +662,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .source_pending = source_pending,
         .source_skipped = if (source_coverage) |coverage| coverage.skipped else null,
         .source_failed = if (source_coverage) |coverage| coverage.failed else null,
+        .source_observation_complete = if (source_coverage) |coverage| coverage.observation_complete else false,
         .indexed = indexed,
         .visible = visible,
         .publication_target = if (publication) |value| value.target_vectors else null,
@@ -663,6 +700,7 @@ const WaitProgressReporter = struct {
     last_report_ns: ?u64 = null,
     activity_epoch_hash: ?u64 = null,
     embeddings_computed: i64 = 0,
+    baseline_embeddings_computed: i64 = 0,
     activity_sample_ns: ?u64 = null,
 
     fn shouldReport(self: *@This(), state: []const u8, now_ns: u64) bool {
@@ -682,12 +720,19 @@ const WaitProgressReporter = struct {
         defer {
             self.activity_epoch_hash = epoch_hash;
             self.embeddings_computed = computed;
-            self.activity_sample_ns = now_ns;
         }
-        if (self.activity_epoch_hash != epoch_hash or self.activity_sample_ns == null or computed < self.embeddings_computed) return null;
+        // Worker counters arrive in batches. Average over this observation
+        // epoch rather than reporting zero whenever two adjacent polls happen
+        // to see the same checkpoint. A restart or counter reset starts a new
+        // baseline so work from different owners is never combined.
+        if (self.activity_epoch_hash != epoch_hash or self.activity_sample_ns == null or computed < self.embeddings_computed) {
+            self.activity_sample_ns = now_ns;
+            self.baseline_embeddings_computed = computed;
+            return null;
+        }
         const elapsed_ns = now_ns -| self.activity_sample_ns.?;
         if (elapsed_ns == 0) return null;
-        return @as(f64, @floatFromInt(computed - self.embeddings_computed)) *
+        return @as(f64, @floatFromInt(computed - self.baseline_embeddings_computed)) *
             @as(f64, std.time.ns_per_s) / @as(f64, @floatFromInt(elapsed_ns));
     }
 };
@@ -834,7 +879,7 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
             writer.writeAll(" activity=unavailable") catch return;
         if (summary.chunks_created) |chunks| writer.print(" chunks_created={d}", .{chunks}) catch return;
         if (summary.embeddings_computed) |computed| writer.print(" embeddings_computed={d}", .{computed}) catch return;
-        if (embeddings_per_second) |rate| writer.print(" rate={d:.1}/s", .{rate}) catch return;
+        if (embeddings_per_second) |rate| writer.print(" avg_embeddings={d:.1}/s", .{rate}) catch return;
         if (summary.active_batch_size) |batch| writer.print(" active_batch_size={d}", .{batch}) catch return;
     } else {
         if (summary.indexed) |indexed| writer.print(" indexed={d}", .{indexed}) catch return;
@@ -877,7 +922,7 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
     const reached = switch (target) {
         .complete => summary.complete,
         .source_covered => |threshold| summary.queryable and
-            threshold.reached(summary.source_covered, summary.source_total) and
+            threshold.reached(summary.source_covered, sourceCoverageDenominator(summary)) and
             // Dense coverage can advance ahead of the query-visible HBC
             // checkpoint. When an exact publication proof is available, do
             // not claim the covered-source outcome until that snapshot has
@@ -889,6 +934,31 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
     if (reached) return .ready;
     if (waitFailureBlocksTarget(summary, target)) return .failed;
     return .waiting;
+}
+
+// Unexamined sources may still be intentional skips. Never advertise the
+// upper bound as an exact denominator or turn an incomplete observation into
+// a readiness proof. Failures remain eligible: they are not successful skips.
+fn sourceCoverageDenominator(summary: IndexSummary) ?i64 {
+    if (!summary.source_observation_complete) return null;
+    const total = summary.source_total orelse return null;
+    const covered = summary.source_covered orelse return null;
+    const skipped = summary.source_skipped orelse return null;
+    const failed = summary.source_failed orelse return null;
+    const pending = summary.source_pending orelse return null;
+    if (total < 0 or covered < 0 or skipped < 0 or failed < 0 or pending < 0) return null;
+    const sum = @as(i128, covered) + skipped + failed + pending;
+    if (sum != total) return null;
+    return total - skipped;
+}
+
+fn waitTargetUnreachable(summary: IndexSummary, target: WaitTarget) bool {
+    const denominator = sourceCoverageDenominator(summary) orelse return false;
+    const possible = summary.source_covered.? + summary.source_pending.?;
+    return switch (target) {
+        .source_covered => |threshold| !threshold.reached(possible, denominator),
+        .complete, .searchable_artifacts => false,
+    };
 }
 
 fn waitFailureBlocksTarget(summary: IndexSummary, target: WaitTarget) bool {
@@ -912,7 +982,9 @@ fn waitFailureBlocksTarget(summary: IndexSummary, target: WaitTarget) bool {
         .source_covered => |threshold| blk: {
             const covered = summary.source_covered orelse break :blk true;
             const possible = std.math.add(i64, covered, pending) catch std.math.maxInt(i64);
-            break :blk !threshold.reached(possible, summary.source_total);
+            const denominator = sourceCoverageDenominator(summary);
+            if (denominator == null and threshold == .percent_basis_points) break :blk false;
+            break :blk !threshold.reached(possible, denominator);
         },
     };
 }
@@ -1009,7 +1081,7 @@ fn writeWaitSuccess(
             try writer.writeAll(" activity=unavailable");
         if (summary.chunks_created) |chunks| try writer.print(" chunks_created={d}", .{chunks});
         if (summary.embeddings_computed) |computed| try writer.print(" embeddings_computed={d}", .{computed});
-        if (embeddings_per_second) |rate| try writer.print(" rate={d:.1}/s", .{rate});
+        if (embeddings_per_second) |rate| try writer.print(" avg_embeddings={d:.1}/s", .{rate});
     } else {
         if (summary.indexed) |indexed| try writer.print(" indexed={d}", .{indexed});
         if (summary.visible) |visible| try writer.print(" searchable={d}", .{visible});
@@ -1090,6 +1162,63 @@ fn waitTargetRequiresIncarnation(target: WaitTarget) bool {
     };
 }
 
+test "source coverage excludes skips but retains pending and failed sources" {
+    var summary = IndexSummary{
+        .index_type = "embeddings",
+        .state = "queryable_partial",
+        .queryable = true,
+        .source_total = 10000,
+        .source_covered = 285,
+        .source_skipped = 1240,
+        .source_failed = 0,
+        .source_pending = 8475,
+        .source_observation_complete = true,
+        .publication_complete = true,
+    };
+    const target = try parseWaitTarget("source-covered=10%");
+    try std.testing.expectEqual(@as(?i64, 8760), sourceCoverageDenominator(summary));
+    // The actual eligible count might be 2,446, but the pending corpus has
+    // not established that fact yet. Do not turn it into a false exact ratio.
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
+    summary.source_skipped = 7554;
+    summary.source_pending = 2161;
+    try std.testing.expectEqual(@as(?i64, 2446), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, target));
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, try parseWaitTarget("source-covered=286")));
+    summary.queryable = false;
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
+    summary.queryable = true;
+    summary.publication_complete = false;
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
+    try std.testing.expect(waitTargetUnreachable(summary, try parseWaitTarget("source-covered=2447")));
+    try std.testing.expect(!waitTargetUnreachable(summary, try parseWaitTarget("source-covered=10%")));
+    summary.source_observation_complete = false;
+    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    try std.testing.expect(!waitTargetUnreachable(summary, try parseWaitTarget("source-covered=2447")));
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
+    summary.source_observation_complete = true;
+    summary.source_pending = -1;
+    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    summary.source_pending = 0;
+    summary.source_covered = 0;
+    summary.source_skipped = 10000;
+    summary.publication_complete = true;
+    try std.testing.expect(waitTargetUnreachable(summary, target));
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
+    summary.source_skipped = 9990;
+    summary.source_failed = 10;
+    try std.testing.expectEqual(@as(?i64, 10), sourceCoverageDenominator(summary));
+    try std.testing.expect(waitTargetUnreachable(summary, target));
+    summary.source_covered = 1;
+    summary.source_failed = 9;
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, target));
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, try parseWaitTarget("source-covered=100%")));
+    summary.source_failed = 0;
+    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    summary.source_skipped = 9999;
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, try parseWaitTarget("source-covered=100%")));
+}
+
 test "index wait parses generic artifact and embedding coverage outcomes" {
     try std.testing.expectEqualDeep(
         WaitTarget{ .searchable_artifacts = 3 },
@@ -1105,6 +1234,7 @@ test "index wait parses generic artifact and embedding coverage outcomes" {
     );
     try std.testing.expectError(error.InvalidWaitTarget, parseWaitTarget("searchable-artifacts=0"));
     try std.testing.expectError(error.InvalidWaitTarget, parseWaitTarget("source-covered=101%"));
+    try std.testing.expectError(error.InvalidWaitTarget, parseWaitTarget("eligible-source-covered=10%"));
 
     const text = IndexSummary{
         .index_type = "full_text",
@@ -1130,7 +1260,10 @@ test "index wait parses generic artifact and embedding coverage outcomes" {
         .queryable = true,
         .source_total = 10_000,
         .source_covered = 100,
-        .source_skipped = 9_900,
+        .source_skipped = 0,
+        .source_pending = 9_900,
+        .source_failed = 0,
+        .source_observation_complete = true,
         .publication_complete = true,
         .incarnation = "g-embeddings",
     };
@@ -1274,6 +1407,8 @@ fn waitForIndexWithFetcher(
     var consecutive_failures: u32 = 0;
     var consecutive_ready: u8 = 0;
     var ready_incarnation_hash: ?u64 = null;
+    var unreachable_confirmations: u8 = 0;
+    var unreachable_incarnation_hash: ?u64 = null;
     while (true) {
         const request_timeout_ms = requestWaitTimeoutMs(started_ns, timeout_ns, clock.now()) orelse
             return timedOut(progress_reporter.last_state);
@@ -1285,6 +1420,8 @@ fn waitForIndexWithFetcher(
             if (!retryableWaitTransportError(err)) return err;
             consecutive_ready = 0;
             ready_incarnation_hash = null;
+            unreachable_confirmations = 0;
+            unreachable_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", now_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
@@ -1304,6 +1441,8 @@ fn waitForIndexWithFetcher(
             }
             consecutive_ready = 0;
             ready_incarnation_hash = null;
+            unreachable_confirmations = 0;
+            unreachable_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", response_ns)) {
                 std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
@@ -1323,6 +1462,19 @@ fn waitForIndexWithFetcher(
                 cli.fatal("wait condition {s} is not supported for {s} indexes", .{ target_writer.buffered(), summary.index_type });
             }
             const embeddings_per_second = progress_reporter.observeEmbeddingRate(summary, response_ns);
+            if (summary.incarnation != null and waitTargetUnreachable(summary, target)) {
+                const identity = std.hash.Wyhash.hash(0, summary.incarnation.?);
+                unreachable_confirmations = if (unreachable_incarnation_hash == identity) unreachable_confirmations +| 1 else 1;
+                unreachable_incarnation_hash = identity;
+                if (unreachable_confirmations >= ready_confirmation_observations) {
+                    cli.fatal("index {s}: requested source coverage is unreachable for the current corpus (covered={d}, pending={d}, skipped={d}, failed={d}, total={d}). Use a lower threshold or searchable-artifacts.", .{
+                        name, summary.source_covered.?, summary.source_pending.?, summary.source_skipped.?, summary.source_failed.?, summary.source_total.?,
+                    });
+                }
+            } else {
+                unreachable_confirmations = 0;
+                unreachable_incarnation_hash = null;
+            }
             switch (waitDisposition(summary, target)) {
                 .ready => {
                     if (waitTargetRequiresIncarnation(target) and summary.incarnation == null) {
@@ -1514,16 +1666,16 @@ test "index wait parses bounded human durations" {
     try std.testing.expectError(error.InvalidDuration, parseDurationMs("10"));
 }
 
-test "index create config preserves dimension escaping and summarizer" {
+test "index create config preserves dimension and escaping" {
     var parsed = try buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",
         .field = "body\"quoted",
         .template = "{{title}}\n{{body}}",
         .dimension = 512,
         .embedder_json = "{\"provider\":\"openai\",\"model\":\"embed\"}",
-        .summarizer_json = "{\"provider\":\"openai\",\"model\":\"summary\"}",
         .coverage_policy = "partial",
         .publication_policy = "atomic",
+        .distance_metric = "cosine",
     });
     defer parsed.deinit();
 
@@ -1534,9 +1686,26 @@ test "index create config preserves dimension escaping and summarizer" {
     try std.testing.expectEqual(@as(?i64, 512), config.dimension);
     try std.testing.expectEqualStrings("body\"quoted", config.field.?);
     try std.testing.expectEqualStrings("{{title}}\n{{body}}", config.template.?);
-    try std.testing.expectEqualStrings("summary", config.summarizer.?.model.?);
     try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, config.coverage_policy.?);
     try std.testing.expectEqual(antfly_client.types.IndexPublicationPolicy.atomic, config.publication_policy.?);
+    try std.testing.expectEqual(antfly_client.types.DistanceMetric.cosine, config.distance_metric.?);
+}
+
+test "index create config preserves external vector ownership" {
+    var parsed = try buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "embeddings",
+        .dimension = 768,
+        .distance_metric = "cosine",
+        .external = true,
+    });
+    defer parsed.deinit();
+
+    const config = switch (parsed.value) {
+        .create_embeddings_index_request => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(true, config.external.?);
+    try std.testing.expect(config.embedder == null);
 }
 
 test "index create config rejects malformed nested JSON and unknown types" {
@@ -1549,16 +1718,26 @@ test "index create config rejects malformed nested JSON and unknown types" {
         .index_type = "embeddings",
         .embedder_json = "{",
     }));
-    try std.testing.expectError(error.InvalidSummarizerJson, buildIndexCreateConfig(std.testing.allocator, .{
-        .index_type = "embeddings",
-        .summarizer_json = "[]",
-    }));
     try std.testing.expectError(error.InvalidChunkerJson, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "embeddings",
         .chunker_json = "null",
     }));
     try std.testing.expectError(error.InvalidIndexType, buildIndexCreateConfig(std.testing.allocator, .{
         .index_type = "typo",
+    }));
+    try std.testing.expectError(error.VectorOptionRequiresEmbeddingsIndex, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "graph",
+        .distance_metric = "cosine",
+    }));
+    try std.testing.expectError(error.ExternalIndexRequiresDimension, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "embeddings",
+        .external = true,
+    }));
+    try std.testing.expectError(error.ExternalIndexHasManagedOptions, buildIndexCreateConfig(std.testing.allocator, .{
+        .index_type = "embeddings",
+        .dimension = 3,
+        .external = true,
+        .embedder_json = "{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"}",
     }));
 }
 
@@ -1898,6 +2077,17 @@ test "index summary prefers typed embedding milestones coverage and activity" {
     var advanced = summary;
     advanced.embeddings_computed = 42;
     try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, std.time.ns_per_s).?, 0.0001);
+    // An unchanged checkpoint must retain an honest average, rather than
+    // suggesting that an active worker has stopped between publications.
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), reporter.observeEmbeddingRate(advanced, 2 * std.time.ns_per_s).?, 0.0001);
+    advanced.embeddings_computed = 62;
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, 3 * std.time.ns_per_s).?, 0.0001);
+    advanced.activity_epoch = "a-restarted";
+    try std.testing.expect(reporter.observeEmbeddingRate(advanced, 4 * std.time.ns_per_s) == null);
+    advanced.embeddings_computed = 2;
+    try std.testing.expect(reporter.observeEmbeddingRate(advanced, 5 * std.time.ns_per_s) == null);
+    advanced.embeddings_computed = 12;
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, 6 * std.time.ns_per_s).?, 0.0001);
 }
 
 test "index status distinguishes absent and explicitly unavailable embedding activity" {

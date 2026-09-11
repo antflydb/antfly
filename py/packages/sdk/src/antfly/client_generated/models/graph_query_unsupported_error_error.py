@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphQueryUnsupportedErrorError(str, Enum):
+class GraphQueryUnsupportedErrorError(StrEnum):
     GRAPH_QUERY_UNSUPPORTED = "graph_query_unsupported"
 
     def __str__(self) -> str:

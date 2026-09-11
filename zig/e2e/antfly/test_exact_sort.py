@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import time
 
-
 DOCUMENTS = {
     "a": {
         "title": "alpha note",
@@ -213,11 +212,17 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
         assert sort_profile["plan"] == "native_doc_values_top_n"
         assert sort_profile["source"] == "doc_values_collector"
         assert sort_profile["source_load"] == "projected_source_after_page"
+        assert sort_profile["sort_lifecycle_state"] == "queryable"
 
+        # Status observes whichever generation-matched handle is presently
+        # leasable without warming it. Maintenance can retire the warmed
+        # handle between requests, so only the query's own leased profile
+        # certifies execution readiness; a later cold observation is declared.
         warmed_capabilities = _capabilities_by_field(
             stateful_api.get_table(sortable_table)
         )
         assert warmed_capabilities[field]["sort_lifecycle_state"] in {
+            "declared",
             "queryable",
             "accelerated",
         }
@@ -262,10 +267,14 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
             cold_result["responses"][0]["profile"]["sort"]["plan"]
             == "native_doc_values_top_n"
         )
+        assert (
+            cold_result["responses"][0]["profile"]["sort"]["sort_lifecycle_state"]
+            == "queryable"
+        )
         warmed_capabilities = _capabilities_by_field(
             stateful_api.get_table(sortable_table)
         )
-        assert (
-            warmed_capabilities["modified_at"]["sort_lifecycle_state"]
-            == "queryable"
-        )
+        assert warmed_capabilities["modified_at"]["sort_lifecycle_state"] in {
+            "declared",
+            "queryable",
+        }

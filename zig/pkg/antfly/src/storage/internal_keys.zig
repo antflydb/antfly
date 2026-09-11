@@ -36,6 +36,23 @@ pub const document_unit_navigation_block_kind: u8 = 0x38;
 /// Private reverse ownership index for graph-edge precedence. Records are
 /// grouped by logical edge, then by the source-state that emitted it.
 pub const graph_edge_contender_kind: u8 = 0x39;
+/// Private PDF page-vector staging. Components are encoded independently so
+/// arbitrary document, artifact, embedding, and unit names cannot alias a
+/// user-visible asset-state key or another staging generation.
+pub const pdf_page_embedding_stage_kind: u8 = 0x40;
+/// Attempt-private resolved document units. Document extraction writes these
+/// records only while one source is being prepared, replays them through the
+/// materialization sinks, and removes the whole attempt prefix afterwards.
+/// Keeping the spool in its own kind prevents it from being mistaken for a
+/// user-visible artifact or from participating in artifact source indexes.
+pub const document_extraction_unit_spool_kind: u8 = 0x41;
+/// Store-local typed results produced by consumers of a shared PDF window.
+/// These attempts and their registry must stay outside document ranges: shard
+/// transfer must not copy temporary rows without their recovery metadata.
+pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
+/// of document existence and the current enrichment configuration.
+pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
@@ -87,6 +104,7 @@ pub const artifact_source_revision_kind: u8 = 0x3e;
 /// ordered by source priority and state identity so winner fallback can stop at
 /// the first surviving record.
 pub const graph_global_edge_contender_kind: u8 = 0x3f;
+pub const table_storage_settings_key = [_]u8{ replay_namespace, 0xff, 0x40 };
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
     0xff,
@@ -297,6 +315,111 @@ pub fn assetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, asset_state_kind);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, pdf_page_embedding_stage_kind);
+    try appendEncodedComponent(&list, alloc, page_artifact_name);
+    try appendEncodedComponent(&list, alloc, embedding_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
+    unit_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageAttemptRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name, attempt_id);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, unit_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageAttemptRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_extraction_unit_spool_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    attempt_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(artifact_root);
+    try list.appendSlice(alloc, artifact_root);
+    try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &.{ replay_namespace, 0xff, shared_pdf_consumer_kind });
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerAttemptKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ &shared_pdf_consumer_attempt_prefix, doc_key });
+}
+
+pub fn sharedPdfConsumerAttemptDocumentKey(key: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, key, &shared_pdf_consumer_attempt_prefix))
+        return error.InvalidSharedPdfAttemptKey;
+    return key[shared_pdf_consumer_attempt_prefix.len..];
+}
+
+pub fn documentExtractionUnitSpoolKeyAlloc(
+    alloc: Allocator,
+    root: []const u8,
+    unit_index: u64,
+) ![]u8 {
+    var key = try alloc.alloc(u8, root.len + @sizeOf(u64));
+    @memcpy(key[0..root.len], root);
+    std.mem.writeInt(u64, key[root.len..][0..@sizeOf(u64)], unit_index, .big);
+    return key;
 }
 
 pub fn graphAssetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -590,7 +713,7 @@ fn hashCanonicalJsonValue(
 fn derivedCoverageConfigKeyIsSemantic(context: CoverageFingerprintContext, key: []const u8) bool {
     if (context == .root and std.mem.eql(u8, key, "execution")) return false;
     if (context != .embedder) return true;
-    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst");
+    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst") and !std.mem.eql(u8, key, "rate_limit");
 }
 
 fn hashLengthPrefixed(hasher: *std.hash.Wyhash, bytes: []const u8) void {
@@ -629,6 +752,10 @@ test "derived coverage config fingerprint is semantic and execution independent"
     );
 
     try std.testing.expectEqual(first, reordered);
+    const limited = try derivedCoverageConfigFingerprint(alloc,
+        \\{"generator":{"source_field":"body","kind":"dense_embedding"},"embedder":{"model":"clipclap","rate_limit":{"tokens_per_minute":60000,"max_concurrency":2}},"dims":384,"field":"body"}
+    );
+    try std.testing.expectEqual(first, limited);
     try std.testing.expect(first != changed);
     try std.testing.expect(first != semantic_burst);
 }
@@ -1404,6 +1531,61 @@ pub fn matchesDerivedEmbeddingArtifactName(key: []const u8, artifact_name: []con
     return findComponentTerminator(key, pos).? + 2 == key.len;
 }
 
+/// Stable logical identity for the artifact family represented by either a
+/// document embedding key or a derived/chunk embedding key. Hash decoded name
+/// bytes so embedded NULs have the same identity as the caller's configured
+/// artifact name without allocating during a corpus scan.
+pub fn embeddingArtifactScopeHash(key: []const u8) ?u64 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len) return null;
+
+    if (key[pos] == artifact_kind) {
+        pos += 1;
+        const type_term = findComponentTerminator(key, pos) orelse return null;
+        if (componentEquals(key, pos, "embedding")) {
+            pos = type_term + 2;
+            const name_term = findComponentTerminator(key, pos) orelse return null;
+            if (name_term + 2 == key.len) return hashEncodedComponentBody(key[pos..name_term]);
+        }
+        pos = type_term + 2;
+        const name_term = findComponentTerminator(key, pos) orelse return null;
+        pos = name_term + 2;
+        if (pos == key.len) return null;
+        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return null;
+    } else return null;
+
+    if (pos >= key.len or key[pos] != derived_embedding_kind) return null;
+    pos += 1;
+    const embedding_term = findComponentTerminator(key, pos) orelse return null;
+    if (embedding_term + 2 != key.len) return null;
+    return hashEncodedComponentBody(key[pos..embedding_term]);
+}
+
+pub fn embeddingArtifactScopeHashForName(artifact_name: []const u8) u64 {
+    return std.hash.XxHash64.hash(0, artifact_name);
+}
+
+fn hashEncodedComponentBody(body: []const u8) ?u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    var pos: usize = 0;
+    var literal_start: usize = 0;
+    while (pos < body.len) {
+        if (body[pos] != 0) {
+            pos += 1;
+            continue;
+        }
+        if (pos + 1 >= body.len or body[pos + 1] != 0xff) return null;
+        if (literal_start < pos) hasher.update(body[literal_start..pos]);
+        hasher.update("\x00");
+        pos += 2;
+        literal_start = pos;
+    }
+    if (literal_start < body.len) hasher.update(body[literal_start..]);
+    return hasher.final();
+}
+
 fn skipDerivedEmbeddingBaseRecordSuffix(key: []const u8, pos: usize) ?usize {
     var cursor = pos;
     if (cursor < key.len and key[cursor] == document_unit_record_kind) {
@@ -2099,6 +2281,22 @@ test "isEmbeddingArtifactKey round trip" {
     try std.testing.expectEqualStrings("my-index", view.artifact_name);
 }
 
+test "embedding artifact scope hash is shared by direct and derived keys" {
+    const alloc = std.testing.allocator;
+    const artifact_name = "dense\x00shared";
+    const direct = try embeddingArtifactKeyForDocumentAlloc(alloc, "doc", artifact_name);
+    defer alloc.free(direct);
+    const chunk = try chunkArtifactKeyAlloc(alloc, "doc", "chunks", 4);
+    defer alloc.free(chunk);
+    const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, artifact_name);
+    defer alloc.free(derived);
+
+    const expected = embeddingArtifactScopeHashForName(artifact_name);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(direct).?);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(derived).?);
+    try std.testing.expect(embeddingArtifactScopeHash(chunk) == null);
+}
+
 test "embedding artifact key round trip with zero bytes in doc key" {
     const alloc = std.testing.allocator;
     const raw = "ab\x00cd";
@@ -2563,4 +2761,39 @@ test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
     defer alloc.free(asset);
     try std.testing.expect(!isPrimaryDocumentKey(asset));
     try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
+
+test "document extraction spool keys isolate attempts and preserve unit order" {
+    const alloc = std.testing.allocator;
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+    );
+    defer alloc.free(artifact_root);
+    const first_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "7:fingerprint-a",
+    );
+    defer alloc.free(first_root);
+    const second_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "8:fingerprint-b",
+    );
+    defer alloc.free(second_root);
+    const first = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 1);
+    defer alloc.free(first);
+    const second = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 2);
+    defer alloc.free(second);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, second, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, first_root, artifact_root));
+    try std.testing.expect(std.mem.startsWith(u8, second_root, artifact_root));
+    try std.testing.expect(!std.mem.startsWith(u8, first, second_root));
+    try std.testing.expect(std.mem.order(u8, first, second) == .lt);
 }

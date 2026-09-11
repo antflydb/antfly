@@ -13,10 +13,14 @@
 // limitations.
 
 const std = @import("std");
+const local_write = antfly.local_write;
 const raft_engine = @import("raft_engine");
-const antfly = @import("antfly_storage_root");
+const storage_root = @import("antfly_storage_root");
+const antfly = if (@hasDecl(storage_root, "runtime_impl")) storage_root.runtime_impl else storage_root;
+const TestDirectory = antfly.testing.TestDirectory;
 const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
+pub const ApiTypes = capi;
 const search_wire = @import("search_wire.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
 const kernel_error_identity = @import("kernel_error_identity");
@@ -57,7 +61,7 @@ const portable_backup = antfly.portable_backup;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const tables_api = antfly.public_api.tables;
-const table_reads_api = antfly.public_api.table_reads;
+const table_reads_api = antfly.local_query_contract;
 const distributed_graph = antfly.public_api.distributed_graph;
 const runtime_status = antfly.public_api.runtime_status;
 const shard_state_store = antfly.data_snapshot;
@@ -71,7 +75,7 @@ const backup_restore = antfly.raft.storage.backup_restore;
 const common_config = antfly.common_config;
 const common_secrets = antfly.common_secrets;
 const scraping = antfly.scraping;
-const inference_provider_client = antfly.inference_provider_client;
+const inference_provider = antfly.inference_provider;
 const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
 const Allocator = std.mem.Allocator;
@@ -80,9 +84,9 @@ const lite_abi_version: u32 = 1;
 
 const StorageOwnerContext = struct {
     alloc: Allocator,
-    resources: antfly.public_api.provisioned_storage.PhysicalStorageResources,
+    resources: antfly.physical_resources.PhysicalStorageResources,
     backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
-    inference_handle: ?*anyopaque = null,
+    inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
     remote_content: scraping.RemoteContentConfig = .{},
     lite_backend: ?lite_backend.Handle = null,
@@ -120,7 +124,8 @@ const StorageOwnerContext = struct {
     }
 
     fn antflyProvider(self: *StorageOwnerContext) ?managed_embedder.AntflyProvider {
-        return inference_provider_client.provider(self.inference_handle orelse return null);
+        const lifetime = if (self.inference_lifetime) |*value| value else return null;
+        return inference_provider.inferenceBoundaryProvider(lifetime);
     }
 
     fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
@@ -134,6 +139,7 @@ const StorageOwnerContext = struct {
             return false;
         }
         self.mutex.unlock();
+        if (self.inference_lifetime) |*lifetime| lifetime.quiesce();
         if (self.auth_casbin_store) |*store| store.deinit();
         if (self.auth_users_store) |*store| store.deinit();
         if (self.auth_backend) |*backend| backend.close();
@@ -184,6 +190,7 @@ const MetadataApplyStoreHandle = struct {
     store: metadata_raft_apply.RaftApplyStore,
     context: ?*StorageOwnerContext,
     listener_bridges: std.ArrayListUnmanaged(*MetadataListenerBridge) = .empty,
+    listener_mutex: std.Io.Mutex = .init,
 };
 
 const MetadataPreparedSnapshotHandle = struct {
@@ -191,6 +198,7 @@ const MetadataPreparedSnapshotHandle = struct {
 };
 
 const MetadataListenerBridge = struct {
+    registration_id: u64 = 0,
     request: kernel_owner_abi.MetadataListenerRequest,
 
     const projection_vtable = metadata_raft_apply.ProjectionListener.VTable{
@@ -396,6 +404,17 @@ const StorageOwnerTransactionRecovery = struct {
 };
 
 const StorageOwnerRuntimeHooks = struct {
+    fn nativeAuthorityPermitted(ptr: *const anyopaque) bool {
+        const self: *const StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        const callback = self.config.native_authority_fn orelse return false;
+        return callback(self.config.native_authority_ctx) != 0;
+    }
+
+    fn nativeMigrationPolicy(self: *const StorageOwnerRuntimeHooks) ?db_mod.DenseNativeMigrationPolicySource {
+        if (self.config.native_authority_fn == null) return null;
+        return .{ .ptr = self, .authority_permitted = nativeAuthorityPermitted };
+    }
+
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
 
@@ -600,21 +619,12 @@ fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
 
-var temp_test_path_nonce: u64 = 0;
-
-fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
-    const nonce = @atomicRmw(u64, &temp_test_path_nonce, .Add, 1, .monotonic);
-    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-{s}-{d}-{d}", .{
-        label,
-        antfly.platform_time.monotonicNs(),
-        nonce,
-    });
-    defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+fn tempTestPath(alloc: Allocator, root: []const u8, label: []const u8) ![:0]u8 {
+    return try std.fmt.allocPrintSentinel(alloc, "{s}-{s}", .{ root, label }, 0);
 }
 
-fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
-    const base = try tempTestPath(alloc, label);
+fn tempTestAflitePath(alloc: Allocator, root: []const u8, label: []const u8) ![:0]u8 {
+    const base = try tempTestPath(alloc, root, label);
     defer alloc.free(base);
     const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
     defer alloc.free(path);
@@ -632,6 +642,7 @@ const Handle = struct {
     storage_owner_path: ?[]u8 = null,
     storage_owner_table_name: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
+    storage_owner_root_generation: u64 = 0,
     storage_owner_context: ?*StorageOwnerContext = null,
     storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
     storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
@@ -737,7 +748,7 @@ fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.Sear
 }
 
 fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
-    if (comptime capi_build_options.storage_kernel_experiment) {
+    if (comptime capi_build_options.linked_storage) {
         const request_json = try table_reads_api.encodeStorageKernelQueryRequest(handle.alloc, req);
         defer handle.alloc.free(request_json);
         var failure: kernel_owner_abi.FailureIdentity = .{};
@@ -795,11 +806,11 @@ const ReadableLeaseHook = struct {
     callback_ctx: ?*anyopaque,
     callback: ReadableLeaseHookFn,
 
-    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadableLeaseRequester {
+    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadSafetyBarrier {
         return .{
             .ptr = @constCast(self),
             .vtable = &.{
-                .request_readable_lease = requestReadableLease,
+                .wait_read_safe = waitReadSafe,
             },
         };
     }
@@ -808,7 +819,7 @@ const ReadableLeaseHook = struct {
         return raft_mod.FeatureReads.init(self.requester());
     }
 
-    fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+    fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
         const self: *ReadableLeaseHook = @ptrCast(@alignCast(ptr));
         const code = self.callback(
             self.callback_ctx,
@@ -2316,7 +2327,8 @@ pub fn storageContextAttachInferenceProvider(
     owner_context.lock();
     defer owner_context.mutex.unlock();
     if (owner_context.active_owners != 0) return .busy;
-    owner_context.inference_handle = handle;
+    if (owner_context.inference_lifetime) |*lifetime| lifetime.quiesce();
+    owner_context.inference_lifetime = .{ .handle = handle };
     return .ok;
 }
 
@@ -2945,7 +2957,9 @@ pub fn metadataApplyPreparedSnapshotDestroy(prepared_ptr: ?*anyopaque) callconv(
 pub fn metadataApplyStoreAddListeners(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataListenerRequest,
+    out_registration_id: *u64,
 ) callconv(.c) kernel_owner_abi.Status {
+    out_registration_id.* = 0;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     if (request.projection_fn == null and request.committed_key_fn == null) return .invalid_argument;
     if (request.has_commit_barrier_kind > 1) return .invalid_argument;
@@ -2954,6 +2968,9 @@ pub fn metadataApplyStoreAddListeners(
         (request.after_projection_commit_fn != null) != has_commit_barrier or
         (has_commit_barrier and request.projection_fn == null)) return .invalid_argument;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const io = handle.store.io_impl.io();
+    handle.listener_mutex.lockUncancelable(io);
+    defer handle.listener_mutex.unlock(io);
     handle.listener_bridges.ensureUnusedCapacity(handle.alloc, 1) catch return .out_of_memory;
     const bridge = handle.alloc.create(MetadataListenerBridge) catch return .out_of_memory;
     errdefer handle.alloc.destroy(bridge);
@@ -2973,14 +2990,28 @@ pub fn metadataApplyStoreAddListeners(
         .ptr = bridge,
         .vtable = &MetadataListenerBridge.committed_key_vtable,
     };
-    if (request.projection_fn != null and request.committed_key_fn != null)
-        handle.store.addLifecycleListeners(projection, committed) catch |err| return storageOwnerStatusFromError(err)
-    else if (request.projection_fn != null)
-        handle.store.addProjectionListener(projection) catch |err| return storageOwnerStatusFromError(err)
-    else
-        handle.store.addCommittedKeyListener(committed) catch |err| return storageOwnerStatusFromError(err);
+    const registration = handle.store.addLifecycleListeners(projection, committed) catch |err|
+        return storageOwnerStatusFromError(err);
+    bridge.registration_id = registration.id;
+    out_registration_id.* = registration.id;
     handle.listener_bridges.appendAssumeCapacity(bridge);
     return .ok;
+}
+
+pub fn metadataApplyStoreRemoveListeners(store_ptr: ?*anyopaque, registration_id: u64) callconv(.c) u8 {
+    const handle = asMetadataApplyStore(store_ptr) orelse return 0;
+    const io = handle.store.io_impl.io();
+    handle.listener_mutex.lockUncancelable(io);
+    defer handle.listener_mutex.unlock(io);
+    for (handle.listener_bridges.items, 0..) |bridge, index| {
+        if (bridge.registration_id != registration_id) continue;
+        if (!handle.store.removeLifecycleListeners(.{ .id = registration_id })) return 0;
+        // Physical detach drains dispatch before either side releases context.
+        _ = handle.listener_bridges.orderedRemove(index);
+        handle.alloc.destroy(bridge);
+        return 1;
+    }
+    return 0;
 }
 
 pub fn metadataApplyStoreProjection(
@@ -3000,6 +3031,11 @@ pub fn metadataApplyStoreProjection(
         },
         .metadata_incarnation => blk: {
             const value = handle.store.getMetadataIncarnation(request.group_id) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .dense_native_storage_protocol_activation_version => blk: {
+            const value = handle.store.getDenseNativeStorageProtocolActivationVersion(request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
@@ -3537,6 +3573,19 @@ pub fn dataApplyStoreProjection(
     const handle = asDataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     const encoded = switch (request.kind) {
+        .current_merge_source => blk: {
+            const value = handle.store.currentMergeSourceState(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            break :blk std.json.Stringify.valueAlloc(alloc, value, .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .current_merge_receiver => blk: {
+            var value = handle.store.currentMergeReceiverState(alloc, request.group_id) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer if (value) |*state| state.deinit(alloc);
+            break :blk std.json.Stringify.valueAlloc(alloc, value, .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
         .observe_split_control => blk: {
             var observation = handle.store.observeSplitControl(alloc, request.group_id) catch |err|
                 return storageOwnerStatusFromError(err);
@@ -3660,6 +3709,9 @@ pub fn dataApplyStoreReconcileOwner(
     const active_split = apply_handle.store.currentSplitState(alloc, request.group_id) catch |err|
         return storageOwnerStatusFromError(err);
     defer if (active_split) |state| antfly.data_snapshot.freeSplitState(alloc, state);
+    const split_terminal = apply_handle.store.currentSplitTerminal(alloc, request.group_id) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer if (split_terminal) |terminal| antfly.data_snapshot.freeSplitTerminal(alloc, terminal);
     var projected_range: ?data_raft_apply.AppliedDataRange = null;
     defer if (projected_range) |range| {
         if (range.start.len > 0) alloc.free(@constCast(range.start));
@@ -3673,6 +3725,13 @@ pub fn dataApplyStoreReconcileOwner(
             .start = current.start,
             .end = state.original_range_end,
         };
+    } else if (split_terminal != null) blk: {
+        // The replicated terminal owns the final range even while the physical
+        // document delegate is still applying finalization after restart.
+        const current = apply_handle.store.currentRange(alloc, request.group_id) catch |err|
+            return storageOwnerStatusFromError(err);
+        projected_range = current;
+        break :blk current;
     } else owner.db.getRange();
 
     if (expected) |watermark| {
@@ -4161,9 +4220,12 @@ pub fn storageOwnerOpen(
         (runtime_hooks_config.entity_sink.callback_ctx == null or
             runtime_hooks_config.entity_sink.upsert_fn == null))
         return .invalid_argument;
+    if ((runtime_hooks_config.native_authority_ctx == null) != (runtime_hooks_config.native_authority_fn == null))
+        return .invalid_argument;
     if ((runtime_hooks_config.promotion_owner_ctx == null) !=
         (runtime_hooks_config.promotion_owner_fn == null))
         return .invalid_argument;
+    var success = false;
     var recovery: ?*StorageOwnerTransactionRecovery = null;
     if (recovery_config.enabled != 0) {
         recovery = alloc.create(StorageOwnerTransactionRecovery) catch return .out_of_memory;
@@ -4172,16 +4234,16 @@ pub fn storageOwnerOpen(
             return .out_of_memory;
         };
     }
-    errdefer if (recovery) |value| {
+    defer if (!success) if (recovery) |value| {
         value.deinit();
         alloc.destroy(value);
     };
     var runtime_hooks: ?*StorageOwnerRuntimeHooks = null;
-    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null) {
+    if (candidate_configured or entity_sink_configured or runtime_hooks_config.promotion_owner_fn != null or runtime_hooks_config.native_authority_fn != null) {
         runtime_hooks = alloc.create(StorageOwnerRuntimeHooks) catch return .out_of_memory;
         runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
     }
-    errdefer if (runtime_hooks) |value| alloc.destroy(value);
+    defer if (!success) if (runtime_hooks) |value| alloc.destroy(value);
     const owner_context = asStorageOwnerContext(request.context);
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
@@ -4198,37 +4260,43 @@ pub fn storageOwnerOpen(
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
+        .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
     if (owner_context) |context| if (context.lite_backend) |*backend|
         backend.configureDbOpenOptionsForNamespace(&open_options, path) catch |err|
             return storageOwnerStatusFromError(err);
-    var db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err);
-    errdefer db.close();
-    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+    const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
+    defer if (!success) alloc.free(owned_path);
+    const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
+    defer if (!success) alloc.free(owned_table_name);
+    const handle = alloc.create(Handle) catch return .out_of_memory;
+    defer if (!success) alloc.destroy(handle);
+    handle.* = .{
+        .alloc = alloc,
+        .db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err),
+        .storage_owner_path = owned_path,
+        .storage_owner_table_name = owned_table_name,
+        .storage_owner_group_id = request.group_id,
+        .storage_owner_root_generation = request.lsm_root_generation,
+        .storage_owner_context = owner_context,
+        .storage_owner_transaction_recovery = recovery,
+        .storage_owner_runtime_hooks = runtime_hooks,
+    };
+    defer if (!success) handle.db.close();
+    // Configuration can start DB-owned workers. Publish their pointers only
+    // after the DB occupies its final address, and drain them on failure.
+    local_write.configureStorageKernelOwnerDb(
         alloc,
-        &db,
+        &handle.db,
+        table_name,
         request.schema_json.slice(),
         request.indexes_json.slice(),
         if (owner_context) |context| context.backend_runtime.ptr() else null,
         if (owner_context) |context| context.antflyProvider() else null,
         if (owner_context) |context| context.remoteContent() else null,
     ) catch |err| return storageOwnerStatusFromError(err);
-    const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
-    errdefer alloc.free(owned_path);
-    const owned_table_name = alloc.dupe(u8, table_name) catch return .out_of_memory;
-    errdefer alloc.free(owned_table_name);
-    const handle = alloc.create(Handle) catch return .out_of_memory;
-    handle.* = .{
-        .alloc = alloc,
-        .db = db,
-        .storage_owner_path = owned_path,
-        .storage_owner_table_name = owned_table_name,
-        .storage_owner_group_id = request.group_id,
-        .storage_owner_context = owner_context,
-        .storage_owner_transaction_recovery = recovery,
-        .storage_owner_runtime_hooks = runtime_hooks,
-    };
+    success = true;
     out_owner.* = handle;
     context_borrowed = false;
     return .ok;
@@ -4245,9 +4313,10 @@ pub fn storageOwnerConfigure(
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+    local_write.configureStorageKernelOwnerDb(
         handle.alloc,
         &handle.db,
+        request.table_name.slice(),
         request.schema_json.slice(),
         request.indexes_json.slice(),
         if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
@@ -4272,9 +4341,10 @@ pub fn storageOwnerReconcile(
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const reconciled = antfly.public_api.table_writes.reconcileStorageKernelOwnerDb(
+    const reconciled = local_write.reconcileStorageKernelOwnerDb(
         handle.alloc,
         &handle.db,
+        request.table_name.slice(),
         request.schema_json.slice(),
         request.indexes_json.slice(),
         if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
@@ -4576,7 +4646,7 @@ const StorageOwnerDocumentChildRangeDispatch = struct {
         dispatch: db_mod.DocumentArtifactChildRangeDispatch,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const request_json = try antfly.public_api.table_writes.encodeStorageKernelArtifactChildRangeBatchRequest(
+        const request_json = try local_write.encodeStorageKernelArtifactChildRangeBatchRequest(
             alloc,
             dispatch.doc_key,
             dispatch.artifact_name,
@@ -4745,7 +4815,14 @@ pub fn storageOwnerWaitForSync(
         .propose, .write => return .ok,
         .full_text, .enrichments, .full_index => {},
     }
-    handle.db.waitForCurrentSyncLevel(sync_level) catch |err| return storageOwnerStatusFromError(err);
+    const Adapter = struct {
+        fn cancelled(ptr: *const anyopaque) bool {
+            const req: *const kernel_owner_abi.SyncRequest = @ptrCast(@alignCast(ptr));
+            const callback = req.cancellation_fn orelse return false;
+            return callback(req.cancellation_ctx) != 0;
+        }
+    };
+    handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, .{ .ptr = request, .is_cancelled_fn = Adapter.cancelled }) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -4790,7 +4867,7 @@ pub fn storageOwnerBackupJson(
     const path = handle.storage_owner_path orelse return .invalid_argument;
     if (request.backup_root.slice().len == 0 or request.backup_id.slice().len == 0)
         return .invalid_argument;
-    const shards = antfly.public_api.table_writes.backupStorageKernelOwnerDb(
+    const shards = local_write.backupStorageKernelOwnerDb(
         handle.alloc,
         &handle.db,
         path,
@@ -4802,7 +4879,7 @@ pub fn storageOwnerBackupJson(
             .portable => .portable,
         },
     ) catch |err| return storageOwnerStatusFromError(err);
-    defer antfly.public_api.table_writes.freeStorageKernelBackupShards(handle.alloc, shards);
+    defer local_write.freeStorageKernelBackupShards(handle.alloc, shards);
     const response = std.json.Stringify.valueAlloc(handle.alloc, shards, .{
         .emit_null_optional_fields = false,
     }) catch |err| return storageOwnerStatusFromError(err);
@@ -4811,6 +4888,12 @@ pub fn storageOwnerBackupJson(
 }
 
 const RestoreRequestScope = struct {
+    fn cancelled(ptr: *const anyopaque) bool {
+        const request: *const kernel_owner_abi.RestorePrepareRequest = @ptrCast(@alignCast(ptr));
+        const callback = request.cancellation_fn orelse return false;
+        return callback(request.cancellation_ctx) != 0;
+    }
+
     alloc: Allocator,
     manifest: std.json.Parsed(backups_api.TableBackupManifest),
     local_location: []u8,
@@ -4848,6 +4931,7 @@ const RestoreRequestScope = struct {
         request: *const kernel_owner_abi.RestorePrepareRequest,
     ) backup_restore.RestoreSource {
         return .{
+            .cancellation = .{ .ptr = request, .is_cancelled_fn = cancelled },
             .backup_id = request.backup_id.slice(),
             .artifact_backup_id = request.artifact_backup_id.slice(),
             .location = self.local_location,
@@ -4911,7 +4995,7 @@ fn prepareStorageRestore(
         .backend = .io_threaded,
     });
     defer backend_runtime.deinit();
-    var db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+    var db = try local_write.openStorageKernelRestoreDb(
         alloc,
         staged.path(),
         scope.manifest.value.indexes_json,
@@ -4922,12 +5006,13 @@ fn prepareStorageRestore(
     );
     var db_open = true;
     defer if (db_open) db.close();
-    try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+    try local_write.repairStorageKernelRestoreDb(
         alloc,
         &db,
         request.group_id,
         scope.manifest.value.schema_json,
         scope.manifest.value.indexes_json,
+        restore_source.cancellation,
     );
     db.close();
     db_open = false;
@@ -4939,7 +5024,7 @@ fn prepareStorageRestore(
     // its result must itself survive one more reopen.
     var durability_verified = false;
     for (0..3) |verification_attempt| {
-        var verify_db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+        var verify_db = try local_write.openStorageKernelRestoreDb(
             alloc,
             staged.path(),
             scope.manifest.value.indexes_json,
@@ -4957,12 +5042,13 @@ fn prepareStorageRestore(
             request.group_id,
             verification_attempt + 1,
         });
-        try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+        try local_write.repairStorageKernelRestoreDb(
             alloc,
             &verify_db,
             request.group_id,
             scope.manifest.value.schema_json,
             scope.manifest.value.indexes_json,
+            restore_source.cancellation,
         );
     }
     if (!durability_verified) return error.RestoreDenseArtifactRebuildIncomplete;
@@ -5084,12 +5170,13 @@ pub fn storageOwnerRestoreRepair(
         request.group_id,
         scope.source(request),
     ) catch |err| return storageOwnerStatusFromError(err);
-    antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+    local_write.repairStorageKernelRestoreDb(
         handle.alloc,
         &handle.db,
         request.group_id,
         "",
         "",
+        scope.source(request).cancellation,
     ) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
@@ -5122,9 +5209,10 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
     });
     var db_open = true;
     defer if (db_open) db.close();
-    try antfly.public_api.table_writes.configureStorageKernelOwnerDb(
+    try local_write.configureStorageKernelOwnerDb(
         alloc,
         &db,
+        table_name,
         request.schema_json.slice(),
         request.indexes_json.slice(),
         null,
@@ -5217,8 +5305,11 @@ pub fn storageSnapshotCommit(snapshot_handle: ?*anyopaque) callconv(.c) kernel_o
     const snapshot: *StorageSnapshot = @ptrCast(@alignCast(snapshot_handle orelse return .invalid_argument));
     if (!snapshot.published or snapshot.finalized) return .invalid_argument;
     snapshot.staged.commitPublication() catch |err| return storageOwnerStatusFromError(err);
-    if (snapshot.restore_live_path) |path|
-        backup_restore.cleanupSnapshotsForPublishedRestore(snapshot.alloc, path);
+    if (snapshot.restore_live_path) |path| {
+        var io_impl = std.Io.Threaded.init(snapshot.alloc, .{});
+        defer io_impl.deinit();
+        backup_restore.cleanupSnapshotsForPublishedRestore(snapshot.alloc, snapshot.staged.io orelse io_impl.io(), path);
+    }
     snapshot.finalized = true;
     return .ok;
 }
@@ -5279,7 +5370,7 @@ fn replicatedBatchStorageKernelJson(
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
 
-    antfly.public_api.table_writes.applyStorageKernelReplicatedBatch(
+    local_write.applyStorageKernelReplicatedBatch(
         handle.alloc,
         &handle.db,
         handle.storage_owner_table_name orelse return .invalid_argument,
@@ -5305,7 +5396,7 @@ fn replicatedBatchStorageKernelJsonAtRaftEntry(
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
 
-    antfly.public_api.table_writes.applyStorageKernelReplicatedBatchAtRaftEntry(
+    local_write.applyStorageKernelReplicatedBatchAtRaftEntry(
         handle.alloc,
         &handle.db,
         handle.storage_owner_table_name orelse return .invalid_argument,
@@ -5796,13 +5887,13 @@ pub fn storageOwnerArtifactOperationJson(
     switch (operation) {
         .corrupt_embedding => {
             var parsed = std.json.parseFromSlice(
-                antfly.public_api.table_writes.StorageKernelEmbeddingCorruptionRequest,
+                local_write.StorageKernelEmbeddingCorruptionRequest,
                 handle.alloc,
                 request.request_json.slice(),
                 .{},
             ) catch return .invalid_argument;
             defer parsed.deinit();
-            const handled = antfly.public_api.table_writes.corruptEmbeddingArtifactInDb(
+            const handled = local_write.corruptEmbeddingArtifactInDb(
                 handle.alloc,
                 &handle.db,
                 parsed.value.doc_key,
@@ -5813,7 +5904,7 @@ pub fn storageOwnerArtifactOperationJson(
         },
         .reprocess_document => {
             var parsed = std.json.parseFromSlice(
-                antfly.public_api.table_writes.StorageKernelArtifactDocumentRequest,
+                local_write.StorageKernelArtifactDocumentRequest,
                 handle.alloc,
                 request.request_json.slice(),
                 .{},
@@ -5828,7 +5919,7 @@ pub fn storageOwnerArtifactOperationJson(
         },
         .reprocess_document_range => {
             var parsed = std.json.parseFromSlice(
-                antfly.public_api.table_writes.StorageKernelArtifactRangeRequest,
+                local_write.StorageKernelArtifactRangeRequest,
                 handle.alloc,
                 request.request_json.slice(),
                 .{},
@@ -5882,7 +5973,7 @@ pub fn storageOwnerArtifactOperationJson(
         },
         .update_child_range_placement => {
             var parsed = std.json.parseFromSlice(
-                antfly.public_api.table_writes.StorageKernelArtifactPlacementRequest,
+                local_write.StorageKernelArtifactPlacementRequest,
                 handle.alloc,
                 request.request_json.slice(),
                 .{},
@@ -5898,7 +5989,7 @@ pub fn storageOwnerArtifactOperationJson(
         },
         .apply_child_range_batch => {
             var parsed = std.json.parseFromSlice(
-                antfly.public_api.table_writes.StorageKernelArtifactChildRangeBatchRequest,
+                local_write.StorageKernelArtifactChildRangeBatchRequest,
                 handle.alloc,
                 request.request_json.slice(),
                 .{},
@@ -5941,6 +6032,14 @@ pub fn storageOwnerRuntimeStatusJson(
         },
     };
     defer status.deinit(handle.alloc);
+    status.replaceMetadata(.{
+        .updated_at_ns = @import("antfly_platform").time.monotonicNs(),
+        .source = .live_writer_publish,
+        .freshness = .fresh,
+        .lsm_root_generation = handle.storage_owner_root_generation,
+        .target_observation_revision = runtime_status.observedSourceTargetSequence(status.stats),
+        .target_observation_complete = true,
+    });
     const response = std.json.Stringify.valueAlloc(handle.alloc, status, .{
         .emit_null_optional_fields = false,
     }) catch |err| return storageOwnerStatusFromError(err);
@@ -6104,10 +6203,36 @@ pub fn storageOwnerMaintenance(
                 return storageOwnerStatusFromError(err));
         },
         .dense_posting_idle => {
-            const steps = handle.db.runDensePostingMaintenanceForIdle() catch |err|
+            if (handle.db.hasActiveDenseBulkWork()) return .ok;
+            const started = @import("antfly_platform").time.monotonicNs();
+            var pass: usize = 0;
+            while (pass < 64 and @import("antfly_platform").time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
+                const steps = handle.db.runDensePostingReadinessMaintenanceForIdle() catch |err|
+                    return storageOwnerStatusFromError(err);
+                out_result.dense_steps += steps;
+                if (steps == 0) break;
+            }
+            out_result.progressed = @intFromBool(out_result.dense_steps != 0);
+        },
+        .publish_dense_checkpoints => {
+            const result = handle.db.publishCompletedDensePostingCheckpoints() catch |err|
                 return storageOwnerStatusFromError(err);
-            out_result.dense_steps = @intCast(steps);
-            out_result.progressed = @intFromBool(steps != 0);
+            out_result.published = result.published;
+            out_result.busy = @intFromBool(result.busy);
+            out_result.deferred = @intFromBool(result.deferred);
+            out_result.progressed = @intFromBool(result.published != 0);
+        },
+        .vector_block_idle => {
+            if (handle.db.hasActiveDenseBulkWork()) return .ok;
+            if (handle.db.finalizeDenseProjectionLifecycleForIdle() catch |err| return storageOwnerStatusFromError(err)) {
+                out_result.dense_steps = 1;
+            } else {
+                const published = handle.db.runVectorBlockMaintenanceForIdle() catch |err| return storageOwnerStatusFromError(err);
+                out_result.dense_steps = published;
+                if (published != 0 and (handle.db.finalizeDenseProjectionLifecycleForIdle() catch |err| return storageOwnerStatusFromError(err)))
+                    out_result.dense_steps += 1;
+            }
+            out_result.progressed = @intFromBool(out_result.dense_steps != 0);
         },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
@@ -6121,7 +6246,7 @@ pub fn storageOwnerMaintenance(
             handle.db.lsmMaintenanceScore(),
             handle.db.lsmMaintenanceDebtHint(),
         ),
-        .inspect_best_effort, .lsm_step_best_effort, .dense_posting_idle => handle.db.lsmMaintenanceDebtHint(),
+        .inspect_best_effort, .lsm_step_best_effort, .dense_posting_idle, .publish_dense_checkpoints, .vector_block_idle => handle.db.lsmMaintenanceDebtHint(),
     };
     if (handle.db.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
         out_result.has_next_wake_delay = 1;
@@ -6427,24 +6552,66 @@ fn openLiteHandleAlloc(
     resolved: LiteResolvedOpenOptions,
     create: bool,
 ) !*Handle {
-    const alloc = std.heap.c_allocator;
+    return try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, resolved, create, null, null);
+}
 
+/// Zig embedding seam behind the C ABI. It constructs the same opaque handle
+/// and therefore exercises the same exported request/close/callback paths, but
+/// lets an in-process host supply deterministic std.Io and runtime ownership.
+/// The runtime and I/O interface must outlive the returned handle.
+pub const HostLiteOpenOptions = struct {
+    create: bool = false,
+    read_only: bool = false,
+    hosted: bool = true,
+    no_sync: bool = false,
+};
+
+pub fn openLiteHandleWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
+    options: HostLiteOpenOptions,
+) !*anyopaque {
+    return try openLiteHandleAllocWithRuntime(alloc, path, .{
+        .open_mode = if (options.read_only) .query_readonly else .writer,
+        .profile = if (options.hosted) .hosted else .native,
+        .no_sync = options.no_sync,
+    }, options.create, io, backend_runtime);
+}
+
+pub fn closeLiteRuntimeHandle(handle_ptr: ?*anyopaque) void {
+    const handle = asHandle(handle_ptr) orelse return;
+    closeHandle(handle);
+}
+
+fn openLiteHandleAllocWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         });
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
+        .backend_runtime = backend_runtime,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -6721,7 +6888,7 @@ pub export fn antfly_lite_restore_backup_json(
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    restorePortableBackupToLiteFile(alloc, io_impl.io(), path, backup.bytes(), replace) catch |err| return capi.mapError(err);
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null) catch |err| return capi.mapError(err);
     const report = LiteRestoreReport{ .path = path };
     out.* = stringifyJson(report) catch return .internal;
     return .ok;
@@ -6860,21 +7027,36 @@ pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_b
     return .ok;
 }
 
-fn restorePortableBackupToLiteFile(
+pub fn restorePortableBackupToLiteFileWithRuntime(
     alloc: Allocator,
     io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
     dest_path: []const u8,
     backup: []const u8,
     replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
+) !void {
+    try restorePortableBackupToLiteFile(alloc, io, backend_runtime, dest_path, backup, replace, cancel);
+}
+
+fn restorePortableBackupToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    dest_path: []const u8,
+    backup: []const u8,
+    replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
     try portable_backup.validatePortable(alloc, backup);
+    if (cancel) |token| try token.check();
 
     const dest_exists = capiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
 
-    var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
+    var dest_lock = try antfly.lite.native.lockWriterPathWithIo(alloc, io, dest_path);
     defer dest_lock.close();
 
     if (!dest_exists and !replace and capiPathExists(io, dest_path)) return error.PathAlreadyExists;
@@ -6885,13 +7067,22 @@ fn restorePortableBackupToLiteFile(
     errdefer capiDeleteFilePath(io, tmp_path) catch {};
 
     {
-        var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
+        var backend = try lite_backend.Handle.createWithOptions(alloc, tmp_path, .{
+            .exclusive = true,
+            .io = io,
+        });
         defer backend.deinit();
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
             .external_derived_checkpoints = false,
+            .backend_runtime = backend_runtime,
         };
+        // A caller-supplied std.Io runtime may be cooperative (VoprIo) rather
+        // than backed by std.Io.Threaded. Restore is synchronous, so it must
+        // not select the executor variant that requires an owned Threaded
+        // implementation merely because the runtime exposes an Io interface.
+        if (backend_runtime != null) opts.executor = .{ .backend = .manual };
         try backend.configureDbOpenOptions(&opts);
 
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
@@ -6899,10 +7090,13 @@ fn restorePortableBackupToLiteFile(
         try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
+    if (cancel) |token| try token.check();
+
     capiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         capiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
+    try antfly.common.fs_paths.syncDirPortable(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
 fn capiPathExists(io: std.Io, path: []const u8) bool {
@@ -8464,7 +8658,7 @@ fn searchStorageKernelQueryJson(
     out_failure: *kernel_owner_abi.FailureIdentity,
 ) kernel_owner_abi.Status {
     out_failure.* = .{};
-    if (comptime capi_build_options.storage_kernel_experiment) {
+    if (comptime capi_build_options.linked_storage) {
         handle.prepareSearchRequest(.{}) catch |err|
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
         const response = local_query_client.executeJsonAlloc(
@@ -8551,7 +8745,7 @@ fn searchPublicQueryJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    if (comptime capi_build_options.storage_kernel_experiment) {
+    if (comptime capi_build_options.linked_storage) {
         handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
         var failure: kernel_owner_abi.FailureIdentity = .{};
         const response = local_query_client.executeJsonAlloc(
@@ -11246,8 +11440,10 @@ pub export fn antfly_db_snapshot(
 }
 
 test "capi transaction lifecycle" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -11290,8 +11486,10 @@ test "capi transaction lifecycle" {
 }
 
 test "capi batch and lookup json" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-batch-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-batch-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -11341,46 +11539,48 @@ test "capi batch and lookup json" {
 }
 
 test "capi lite opens exports imports checks and vacuums aflite" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const plain_path = try tempTestPath(alloc, "capi-lite-plain");
+    const plain_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-plain");
     defer alloc.free(plain_path);
-    const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
+    const invalid_lite_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-invalid");
     defer alloc.free(invalid_lite_path);
-    const missing_readonly_path = try tempTestAflitePath(alloc, "capi-lite-missing-readonly");
+    const missing_readonly_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-missing-readonly");
     defer alloc.free(missing_readonly_path);
-    const missing_status_path = try tempTestAflitePath(alloc, "capi-lite-missing-status");
+    const missing_status_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-missing-status");
     defer alloc.free(missing_status_path);
-    const short_lite_path = try tempTestAflitePath(alloc, "capi-lite-short");
+    const short_lite_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-short");
     defer alloc.free(short_lite_path);
-    const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
+    const src_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-src");
     defer alloc.free(src_path);
-    const remote_inference_path = try tempTestAflitePath(alloc, "capi-lite-remote-inference");
+    const remote_inference_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-remote-inference");
     defer alloc.free(remote_inference_path);
-    const local_inference_path = try tempTestAflitePath(alloc, "capi-lite-local-inference");
+    const local_inference_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-local-inference");
     defer alloc.free(local_inference_path);
-    const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
+    const dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-dst");
     defer alloc.free(dst_path);
-    const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
+    const bad_dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-bad-dst");
     defer alloc.free(bad_dst_path);
-    const schema_dst_path = try tempTestAflitePath(alloc, "capi-lite-schema-dst");
+    const schema_dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-schema-dst");
     defer alloc.free(schema_dst_path);
-    const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
+    const snapshot_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
-    const snapshot_file_path = try tempTestAflitePath(alloc, "capi-lite-snapshot-file");
+    const snapshot_file_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-snapshot-file");
     defer alloc.free(snapshot_file_path);
-    const pinned_snapshot_path = try tempTestAflitePath(alloc, "capi-lite-pinned-snapshot");
+    const pinned_snapshot_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-pinned-snapshot");
     defer alloc.free(pinned_snapshot_path);
-    const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
+    const restore_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore");
     defer alloc.free(restore_path);
-    const restore_alias_path = try tempTestAflitePath(alloc, "capi-lite-restore-alias");
+    const restore_alias_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-alias");
     defer alloc.free(restore_alias_path);
-    const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
+    const locked_restore_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-locked");
     defer alloc.free(locked_restore_path);
-    const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
+    const restore_malformed_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-malformed");
     defer alloc.free(restore_malformed_path);
-    const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
+    const invalid_snapshot_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-snapshot-invalid");
     defer alloc.free(invalid_snapshot_path);
-    const invalid_snapshot_file_path = try tempTestPath(alloc, "capi-lite-snapshot-file-invalid");
+    const invalid_snapshot_file_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-snapshot-file-invalid");
     defer alloc.free(invalid_snapshot_file_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
@@ -12158,8 +12358,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 }
 
 test "capi lite exposes hosted and status-only profiles" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestAflitePath(alloc, "capi-lite-profiles");
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-profiles");
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);
@@ -12238,8 +12440,10 @@ test "capi lite exposes hosted and status-only profiles" {
 }
 
 test "capi lite open options validate and configure ttl cleanup" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestAflitePath(alloc, "capi-lite-open-options");
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-open-options");
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);
@@ -12322,7 +12526,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     default_handle = null;
     cleanupTestFile(path);
 
-    const dir_path = try tempTestPath(alloc, "capi-generic-directory-open");
+    const dir_path = try tempTestPath(alloc, test_tmp.path(), "capi-generic-directory-open");
     defer alloc.free(dir_path);
     cleanupTestDir(dir_path);
     defer cleanupTestDir(dir_path);
@@ -12429,8 +12633,10 @@ test "capi lite open options validate and configure ttl cleanup" {
 }
 
 test "capi execute graph queries honors identity read generation" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-execute-graph-generation");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-execute-graph-generation");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -12493,8 +12699,10 @@ test "capi execute graph queries honors identity read generation" {
 }
 
 test "capi search rejects stale identity generation before readable lease hook" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-stale-generation-before-lease");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-stale-generation-before-lease");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -12565,8 +12773,10 @@ test "capi search rejects stale identity generation before readable lease hook" 
 }
 
 test "capi search json returns stamped identity generation" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-search-generation-response");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-search-generation-response");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -12654,8 +12864,10 @@ test "capi search json returns stamped identity generation" {
 }
 
 test "capi aggregate hits rejects stale identity generation before aggregation materialization" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-aggregate-stale-generation");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-aggregate-stale-generation");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -12713,8 +12925,10 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
 }
 
 test "capi request paths trigger readable lease hook" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-readable-lease");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-readable-lease");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -12903,8 +13117,10 @@ test "capi request paths trigger readable lease hook" {
 }
 
 test "capi artifact decode and lookup json" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-artifact-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-artifact-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -12970,8 +13186,10 @@ test "capi artifact decode and lookup json" {
 }
 
 test "capi dense search profile breakdown" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-dense-profile");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-dense-profile");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -13066,4 +13284,24 @@ test "capi dense search profile breakdown" {
     var final_result = try handle.db.search(alloc, req);
     defer final_result.deinit();
     try std.testing.expectEqual(@as(u32, 10), final_result.total_hits);
+}
+
+pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.MergeArtifactsPageRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner_ptr) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const rows = handle.db.mergeArtifactsPage(handle.alloc, .{ .start = request.range_start.slice(), .end = request.range_end.slice() }, if (request.after_key.len == 0) null else request.after_key.slice()) catch |err|
+        return storageOwnerStatusFromError(err);
+    defer {
+        for (rows) |row| {
+            handle.alloc.free(row.key);
+            handle.alloc.free(row.value);
+        }
+        handle.alloc.free(rows);
+    }
+    const encoded = data_raft_projection_wire.encodeGroupStatePageAlloc(handle.alloc, .{ .entries = rows, .exhausted = rows.len == 0 }) catch |err|
+        return storageOwnerStatusFromError(err);
+    out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+    return .ok;
 }

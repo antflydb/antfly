@@ -34,6 +34,9 @@ pub const Source = struct {
     pub const VTable = struct {
         run_lsm_round: *const fn (*anyopaque, bool) anyerror!RoundResult,
         run_dense_posting_round: *const fn (*anyopaque) anyerror!usize,
+        publish_dense_checkpoints: *const fn (*anyopaque) anyerror!@import("../storage/db/types.zig").NativePublicationResult,
+        run_vector_block_round: *const fn (*anyopaque) anyerror!usize,
+        publish_runtime_statuses: ?*const fn (*anyopaque) void = null,
         snapshot: *const fn (*anyopaque, bool) anyerror!Snapshot,
     };
 
@@ -43,6 +46,18 @@ pub const Source = struct {
 
     pub fn runDensePostingRound(self: Source) !usize {
         return try self.vtable.run_dense_posting_round(self.ptr);
+    }
+
+    pub fn publishDenseCheckpoints(self: Source) !@import("../storage/db/types.zig").NativePublicationResult {
+        return try self.vtable.publish_dense_checkpoints(self.ptr);
+    }
+
+    pub fn runVectorBlockRound(self: Source) !usize {
+        return try self.vtable.run_vector_block_round(self.ptr);
+    }
+
+    pub fn publishRuntimeStatuses(self: Source) void {
+        if (self.vtable.publish_runtime_statuses) |publish| publish(self.ptr);
     }
 
     pub fn maintenanceSnapshot(self: Source, best_effort: bool) !Snapshot {

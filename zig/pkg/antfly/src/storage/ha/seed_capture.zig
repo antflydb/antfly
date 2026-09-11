@@ -27,7 +27,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Crc32 = std.hash.Crc32;
+const Crc32 = @import("antfly_hash").Crc32;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
 const backup_manifest = @import("backup_manifest.zig");
@@ -1312,7 +1312,7 @@ const BarrierProbe = struct {
     fn afterHook(raw: ?*anyopaque) void {
         const self: *BarrierProbe = @ptrCast(@alignCast(raw.?));
         self.exclusive.store(true, .release);
-        while (!self.allow_copy.load(.acquire)) std.Thread.yield() catch {};
+        while (!self.allow_copy.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 };
 
@@ -1335,7 +1335,7 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
     var attempts: usize = 0;
     while (!flag.load(.acquire)) : (attempts += 1) {
         if (attempts > 1_000_000) return error.TestTimedOut;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 }
 
@@ -1360,6 +1360,8 @@ test "storage.ha seed capture waits for in-flight mutation and excludes post-che
     try writeTestFile(source_path, "before");
 
     var mutation = barrier.acquireShared();
+    var mutation_active = true;
+    defer if (mutation_active) mutation.release();
     try writeTestFile(source_path, "committed");
     const committed_lsn = try primary.append(.{ .payload = "committed" });
 
@@ -1385,17 +1387,28 @@ test "storage.ha seed capture waits for in-flight mutation and excludes post-che
             .after_exclusive = BarrierProbe.afterHook,
         } },
     };
-    const thread = try std.Thread.spawn(.{}, CaptureWorker.run, .{&worker});
+    defer if (worker.result) |*result| result.deinit(alloc);
+    var thread = try std.testing.io.concurrent(CaptureWorker.run, .{&worker});
+    defer {
+        if (mutation_active) {
+            mutation.release();
+            mutation_active = false;
+        }
+        probe.allow_copy.store(true, .release);
+        thread.await(std.testing.io);
+    }
     try waitFor(&probe.before);
     try std.testing.expect(!probe.exclusive.load(.acquire));
     mutation.release();
+    mutation_active = false;
 
     try waitFor(&probe.exclusive);
     try std.testing.expect(barrier.tryAcquireShared() == null);
     probe.allow_copy.store(true, .release);
-    thread.join();
+    thread.await(std.testing.io);
     if (worker.capture_error) |err| return err;
     var result = worker.result orelse return error.TestExpectedEqual;
+    worker.result = null;
     defer result.deinit(alloc);
 
     var post = barrier.acquireShared();

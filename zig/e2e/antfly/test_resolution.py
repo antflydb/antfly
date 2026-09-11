@@ -248,7 +248,9 @@ class _Api:
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
             try:
-                response = self.s.post(f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout)
+                response = self.s.post(
+                    f"{self.url}/tables/{table}/batch", json=payload, timeout=timeout
+                )
             except requests.RequestException as exc:
                 # A timed-out write usually means a node wedged in memory without
                 # logging anything; capture native stacks before teardown so the
@@ -308,7 +310,9 @@ class _Api:
             time.monotonic() + WRITE_OUTCOME_RECONCILE_TIMEOUT_S,
         )
         while True:
-            remaining = min(deadline.remaining(), reconcile_expires_at - time.monotonic())
+            remaining = min(
+                deadline.remaining(), reconcile_expires_at - time.monotonic()
+            )
             if remaining < 0.1:
                 return False
             try:
@@ -327,14 +331,19 @@ class _Api:
 
     def lookup(self, table: str, key: str, *, timeout: float = 10.0) -> dict | None:
         response = self.s.get(
-            f"{self.url}/tables/{table}/documents/{quote(key, safe='')}", timeout=timeout
+            f"{self.url}/tables/{table}/documents/{quote(key, safe='')}",
+            timeout=timeout,
         )
         if response.status_code == 404:
             return None
         return self._check(response)
 
     def query_table(self, table: str, payload: dict, *, timeout: float = 30.0) -> dict:
-        return self._check(self.s.post(f"{self.url}/tables/{table}/query", json=payload, timeout=timeout))
+        return self._check(
+            self.s.post(
+                f"{self.url}/tables/{table}/query", json=payload, timeout=timeout
+            )
+        )
 
     def diagnostic(self, *, graph_payload: dict | None = None) -> str:
         parts: list[str] = []
@@ -350,7 +359,9 @@ class _Api:
                 parts.append(f"[{label}] unavailable: {exc!r}")
         if graph_payload is not None:
             parts.append(self._graph_probe_diagnostic(graph_payload))
-        parts.append(f"[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}")
+        parts.append(
+            f"[metadata snapshot]\n{self._server.metadata_snapshot_diagnostic()}"
+        )
         parts.append(f"[logs]\n{self._server.debug_logs()}")
         return "\n".join(parts)
 
@@ -375,7 +386,9 @@ class _Api:
                     json=payload,
                     timeout=5,
                 )
-                parts.append(f"[data {index} graph query] {query.status_code} {query.text[:3000]}")
+                parts.append(
+                    f"[data {index} graph query] {query.status_code} {query.text[:3000]}"
+                )
             except requests.RequestException as exc:
                 parts.append(f"[data {index} graph query] unavailable: {exc!r}")
         return "\n".join(parts)
@@ -449,7 +462,9 @@ def test_retry_after_delay_uses_valid_delta_seconds_or_poll_fallback(
     expected_delay_s: float,
 ):
     headers = {"Retry-After": retry_after} if retry_after is not None else None
-    response = _test_response("http://data-a/db/v1/tables/documents", 503, headers=headers)
+    response = _test_response(
+        "http://data-a/db/v1/tables/documents", 503, headers=headers
+    )
 
     assert _retry_after_delay_s(response) == expected_delay_s
 
@@ -583,7 +598,9 @@ def test_insert_reconciles_unknown_upsert_before_retry(monkeypatch: pytest.Monke
     assert lookup_calls == ["http://data-a/db/v1/tables/documents/documents/doc%3Aa"]
 
 
-def _wait_for_entities(api: _Api, expected_names: dict[str, str], *, deadline: _Deadline) -> dict[str, dict]:
+def _wait_for_entities(
+    api: _Api, expected_names: dict[str, str], *, deadline: _Deadline
+) -> dict[str, dict]:
     pending = set(expected_names.keys())
     found: dict[str, dict] = {}
     last: dict[str, dict | None] = {}
@@ -671,7 +688,9 @@ def _wait_for_mention_hydration(
     last_error: str | None = None
     while not deadline.expired():
         try:
-            last = api.query_table("documents", payload, timeout=deadline.request_timeout())
+            last = api.query_table(
+                "documents", payload, timeout=deadline.request_timeout()
+            )
         except requests.RequestException as exc:
             if not _transient_poll_error(exc):
                 raise
@@ -704,7 +723,9 @@ def _wait_for_mention_hydration(
     )
 
 
-def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_cluster):
+def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
+    resolution_cluster,
+):
     cluster = resolution_cluster
     api = _Api(cluster.data_api_urls[0], cluster)
 
@@ -751,7 +772,11 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(resolution_
     api.insert(
         "documents",
         "doc:b",
-        {"relations": {"entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]}},
+        {
+            "relations": {
+                "entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]
+            }
+        },
         deadline=_new_e2e_deadline(),
     )
 

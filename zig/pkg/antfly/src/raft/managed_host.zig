@@ -38,8 +38,8 @@ const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
-const storage_kernel_experiment = control_only_storage_sources;
-pub const DataApplyStore = if (storage_kernel_experiment) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
+const linked_storage = control_only_storage_sources;
+pub const DataApplyStore = if (linked_storage) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 
 pub const ManagedHostConfig = struct {
     host: host_mod.HostConfig,
@@ -582,6 +582,10 @@ pub const ManagedHttpHost = struct {
         self.http_host.stop();
     }
 
+    pub fn beginTransportShutdown(self: *ManagedHttpHost) void {
+        self.http_host.beginTransportShutdown();
+    }
+
     pub fn baseUri(self: *ManagedHttpHost, alloc: std.mem.Allocator) ![]u8 {
         return try self.http_host.baseUri(alloc);
     }
@@ -659,7 +663,7 @@ pub const ManagedHttpHost = struct {
     }
 
     pub fn attachDataApplyStoreResourceManager(self: *ManagedHttpHost, manager: *resource_manager.ResourceManager) !void {
-        if (comptime storage_kernel_experiment) return;
+        if (comptime linked_storage) return;
         const store = self.owned_data_store orelse return;
         try store.attachResourceManager(manager);
     }
@@ -1054,7 +1058,7 @@ fn prepareHostDeps(
         if (effective_metadata_builder == null) {
             const owned_store = try alloc.create(metadata_storage.RaftApplyStore);
             errdefer alloc.destroy(owned_store);
-            owned_store.* = if (comptime storage_kernel_experiment)
+            owned_store.* = if (comptime linked_storage)
                 try metadata_storage.RaftApplyStore.init(alloc, .{
                     .root_dir = replica_root_dir,
                     .no_sync = replica_apply_store_no_sync,
@@ -1071,7 +1075,7 @@ fn prepareHostDeps(
         if (effective_data_builder == null) {
             const owned_store = try alloc.create(DataApplyStore);
             errdefer alloc.destroy(owned_store);
-            owned_store.* = if (comptime storage_kernel_experiment)
+            owned_store.* = if (comptime linked_storage)
                 try data_apply_client.RaftApplyStore.init(alloc, .{
                     .root_dir = replica_root_dir,
                     .no_sync = replica_apply_store_no_sync,
@@ -1081,10 +1085,11 @@ fn prepareHostDeps(
                 try data_storage.RaftApplyStore.init(alloc, .{
                     .root_dir = replica_root_dir,
                     .no_sync = replica_apply_store_no_sync,
+                    .io = if (backend_runtime) |runtime| runtime.apiIo() else null,
                     .backend_runtime = backend_runtime,
                 });
             prepared.owned_data_store = owned_store;
-            effective_data_builder = if (comptime storage_kernel_experiment)
+            effective_data_builder = if (comptime linked_storage)
                 (DataApplySnapshotBuilder{ .store = owned_store }).builder()
             else
                 owned_store.snapshotBuilder();
@@ -1430,7 +1435,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
         }
     };
 
-    const db_mod = @import("../storage/db/mod.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1525,7 +1530,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             },
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },
@@ -1560,7 +1565,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
             },
             .restore_open_options = .{
                 .node_config = &node_config,
-                .io = io_impl.io(),
+                .filesystem_io = io_impl.io(),
             },
         }, .{
             .host = .{ .descriptor_factory = factory.iface() },

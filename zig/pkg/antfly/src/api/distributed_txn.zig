@@ -24,7 +24,7 @@ const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("table_write_source.zig");
 const contract = @import("distributed_txn_contract.zig");
 
 pub const table_participant_prefix = "table:";
@@ -300,7 +300,7 @@ pub const HostedParticipantWorker = struct {
         var route = (table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader) catch |err|
             return preDecisionSetupNotProposed(group_id, "initial-route", err)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -356,7 +356,7 @@ pub const HostedParticipantWorker = struct {
         const deadline_ns = try self.preDecisionDeadlineNs();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        try ensurePreDecisionDeadline(deadline_ns);
+        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
         const attempted_node_id = switch (route) {
             .local => self.router.localNodeId(),
             .remote => |remote| remote.node_id,
@@ -404,7 +404,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -448,7 +448,7 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
             if (err == error.Timeout) return false;
             return err;
         };
@@ -507,7 +507,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        try ensurePreDecisionDeadline(deadline_ns);
+        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
         const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
         defer alloc.free(node_ids);
         var owned_body: ?[]u8 = null;
@@ -542,7 +542,7 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        try ensurePreDecisionDeadline(deadline_ns);
+        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
             const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
@@ -578,11 +578,11 @@ pub const HostedParticipantWorker = struct {
         if (self.pre_decision_timeout_ms == 0 or self.pre_decision_attempt_timeout_ms == 0)
             return error.Timeout;
         const duration_ns = @as(u64, self.pre_decision_timeout_ms) *| std.time.ns_per_ms;
-        return platform_time.monotonicNs() +| duration_ns;
+        return self.executor.monotonicNs() +| duration_ns;
     }
 
     fn remainingPreDecisionAttemptBudget(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionAttemptBudget {
-        const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns);
+        const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns, self.executor.monotonicNs());
         const client_timeout_ms = @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
         if (client_timeout_ms <= pre_decision_response_reserve_ms + contract.pre_decision_server_response_reserve_ms)
             return error.Timeout;
@@ -598,7 +598,7 @@ pub const HostedParticipantWorker = struct {
     fn localPreDecisionContext(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionContext {
         const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
         const duration_ns = @as(u64, budget.server_budget_ms) *| std.time.ns_per_ms;
-        return .{ .deadline_ns = platform_time.monotonicNs() +| duration_ns };
+        return .{ .deadline_ns = self.executor.monotonicNs() +| duration_ns, .deadline_io = self.executor.clock_io };
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -793,8 +793,8 @@ fn logPreDecisionSetupFailure(group_id: u64, node_id: u64, stage: []const u8, er
     });
 }
 
-fn ensurePreDecisionDeadline(deadline_ns: u64) !void {
-    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+fn ensurePreDecisionDeadline(deadline_ns: u64, now_ns: u64) !void {
+    if (now_ns >= deadline_ns) return error.Timeout;
 }
 
 fn ensureDecisionRecoveryDeadline(deadline_ns: u64) !void {
@@ -822,8 +822,34 @@ fn remainingDeadlineTimeoutMs(deadline_ns: u64) !u32 {
     return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
 }
 
-fn remainingPreDecisionTimeoutMs(deadline_ns: u64) !u32 {
-    return try remainingDeadlineTimeoutMs(deadline_ns);
+fn remainingPreDecisionTimeoutMs(deadline_ns: u64, now_ns: u64) !u32 {
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    return @intCast(@min(std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1, std.math.maxInt(u32)));
+}
+
+test "transaction attempt budgets follow the borrowed transport clock" {
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    const borrow = @import("../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+    const worker = HostedParticipantWorker{
+        .catalog = undefined,
+        .router = undefined,
+        .writes = undefined,
+        .executor = .{ .ptr = undefined, .vtable = undefined, .clock_io = borrow },
+        .pre_decision_timeout_ms = 4_000,
+        .pre_decision_attempt_timeout_ms = 3_000,
+    };
+    const deadline = try worker.preDecisionDeadlineNs();
+    try std.testing.expectEqual(@as(u64, 11 * std.time.ns_per_s), deadline);
+    try std.testing.expectEqual(@as(u32, 2_000), (try worker.remainingPreDecisionAttemptBudget(deadline)).server_budget_ms);
+    const local = try worker.localPreDecisionContext(deadline);
+    try std.testing.expectEqual(@as(?u64, 9 * std.time.ns_per_s), local.deadline_ns);
+    try std.testing.expect(local.deadline_io.?.userdata == borrow.userdata);
+    vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
+    try std.testing.expectEqual(@as(u32, 1_000), (try worker.remainingPreDecisionAttemptBudget(deadline)).server_budget_ms);
+    vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, worker.remainingPreDecisionAttemptBudget(deadline));
 }
 
 pub const LocalTableWriteParticipantWorker = struct {

@@ -42,8 +42,7 @@
   --font-sans:
     "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
-  --font-display:
-    "Aeonik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Aeonik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: "Roboto Mono Variable", "Roboto Mono", "Menlo", "Monaco", "Courier New", monospace;
   --font-pixel: "Silkscreen", "Roboto Mono Variable", "Roboto Mono", monospace;
 }

@@ -26,7 +26,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
     def test_mcp_result_budget_schema_matches_runtime_zero_or_minimum(self) -> None:
         config_spec = generator.ROOT / "specs/openapi/antfly/config.yaml"
         with config_spec.open(encoding="utf-8") as handle:
-            schema = yaml.safe_load(handle)["components"]["schemas"]["McpConfig"]["properties"]["max_tool_result_bytes"]
+            schema = yaml.safe_load(handle)["components"]["schemas"]["McpConfig"][
+                "properties"
+            ]["max_tool_result_bytes"]
 
         validator = Draft202012Validator(schema)
         for valid in (0, 512, 98_304, 4_294_967_295):
@@ -34,7 +36,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
         for invalid in (-1, 1, 511, 4_294_967_296):
             self.assertNotEqual([], list(validator.iter_errors(invalid)), invalid)
 
-    def test_deprecated_constraints_are_removed_without_dropping_canonical_constraints(self) -> None:
+    def test_deprecated_constraints_are_removed_without_dropping_canonical_constraints(
+        self,
+    ) -> None:
         schema = {
             "type": "object",
             "properties": {
@@ -54,10 +58,14 @@ class McpSchemaFragmentTests(unittest.TestCase):
         self.assertEqual({"canonical"}, set(compact["properties"]))
         self.assertEqual([{"not": {"required": ["canonical"]}}], compact["allOf"])
 
-    def test_query_hierarchy_keeps_the_canonical_group_ancestor_constraint(self) -> None:
+    def test_query_hierarchy_keeps_the_canonical_group_ancestor_constraint(
+        self,
+    ) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
-        fragment = next(item for item in generator.FRAGMENTS if item.component == "QueryHierarchy")
+        fragment = next(
+            item for item in generator.FRAGMENTS if item.component == "QueryHierarchy"
+        )
 
         generated = json.loads(generator.generated_content(fragment, schemas))
 
@@ -66,7 +74,11 @@ class McpSchemaFragmentTests(unittest.TestCase):
         self.assertIn("allOf", generated)
         self.assertTrue(
             any(
-                branch.get("not", {}).get("properties", {}).get("ancestors", {}).get("required") == ["source"]
+                branch.get("not", {})
+                .get("properties", {})
+                .get("ancestors", {})
+                .get("required")
+                == ["source"]
                 for branch in generated["allOf"]
             )
         )
@@ -89,13 +101,23 @@ class McpSchemaFragmentTests(unittest.TestCase):
         missing_group_fields = next(
             branch
             for branch in invalid_states
-            if branch.get("allOf", [{}])[0].get("properties", {}).get("hierarchy", {}).get("required") == ["group_by"]
+            if branch.get("allOf", [{}])[0]
+            .get("properties", {})
+            .get("hierarchy", {})
+            .get("required")
+            == ["group_by"]
         )
         self.assertEqual(["hierarchy"], missing_group_fields["allOf"][0]["required"])
-        self.assertEqual(["fields"], missing_group_fields["allOf"][1]["not"]["required"])
+        self.assertEqual(
+            ["fields"], missing_group_fields["allOf"][1]["not"]["required"]
+        )
         self.assertTrue(
             any(
-                branch.get("allOf", [{}])[0].get("properties", {}).get("hierarchy", {}).get("required") == ["children"]
+                branch.get("allOf", [{}])[0]
+                .get("properties", {})
+                .get("hierarchy", {})
+                .get("required")
+                == ["children"]
                 for branch in invalid_states
             )
         )
@@ -112,11 +134,12 @@ class McpSchemaFragmentTests(unittest.TestCase):
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
-            if branch.get("description", "").startswith("Relevance, filtering, backward/offset pagination")
+            if branch.get("description", "").startswith(
+                "Relevance, filtering, backward/offset pagination"
+            )
         )
         rejected_child_fields = {
-            item["required"][0]
-            for item in child_mode_rejection["allOf"][1]["anyOf"]
+            item["required"][0] for item in child_mode_rejection["allOf"][1]["anyOf"]
         }
         allowed_child_fields = {
             "table",
@@ -133,7 +156,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "every canonical query property must be explicitly allowed or rejected for hierarchy.children",
         )
 
-        validator = Draft202012Validator(generator.compact_query_request_schema(schemas))
+        validator = Draft202012Validator(
+            generator.compact_query_request_schema(schemas)
+        )
         valid = {
             "fields": ["unit_id", "unit_type", "text"],
             "hierarchy": {
@@ -188,7 +213,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
         )
         self.assertNotIn("default", generated["properties"]["limit"])
 
-    def test_query_tool_schema_accepts_null_optionals_but_rejects_real_mode_conflicts(self) -> None:
+    def test_query_tool_schema_accepts_null_optionals_but_rejects_real_mode_conflicts(
+        self,
+    ) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
 

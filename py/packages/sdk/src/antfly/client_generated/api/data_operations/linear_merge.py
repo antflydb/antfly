@@ -120,13 +120,15 @@ def sync_detailed(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
             2. Server upserts records that exist in your batch
             3. Server deletes Antfly records in the key range that are absent from your batch
-            4. If stopped at shard boundary, use next_cursor for next request
+            4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 
@@ -186,13 +188,15 @@ def sync(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
             2. Server upserts records that exist in your batch
             3. Server deletes Antfly records in the key range that are absent from your batch
-            4. If stopped at shard boundary, use next_cursor for next request
+            4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 
@@ -247,13 +251,15 @@ async def asyncio_detailed(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
             2. Server upserts records that exist in your batch
             3. Server deletes Antfly records in the key range that are absent from your batch
-            4. If stopped at shard boundary, use next_cursor for next request
+            4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 
@@ -311,13 +317,15 @@ async def asyncio(
             (`Content-Encoding: gzip`).
 
             Request bodies are limited to 64 MiB after decompression. Requests that
-            exceed this limit return HTTP 413.
+            exceed this limit return HTTP 413. Expanded bytes count toward the
+            server-wide request-body memory budget; temporary saturation returns
+            HTTP 503 with `Retry-After` instead of allocating outside that budget.
 
             **How it works:**
             1. Send sorted records from your external source
             2. Server upserts records that exist in your batch
             3. Server deletes Antfly records in the key range that are absent from your batch
-            4. If stopped at shard boundary, use next_cursor for next request
+            4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 

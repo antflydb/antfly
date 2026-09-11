@@ -22,10 +22,11 @@ const State = struct {
 };
 
 pub fn create(context: *const bridge.CreateContext) callconv(.c) c_int {
-    const allocator_ptr: *const std.mem.Allocator = @ptrCast(@alignCast(context.allocator));
-    const allocator = allocator_ptr.*;
+    context.result.* = .{};
+    const allocator = std.heap.c_allocator;
     const state = allocator.create(State) catch return bridge.Status.out_of_memory;
-    errdefer allocator.destroy(state);
+    var success = false;
+    defer if (!success) allocator.destroy(state);
 
     const input_path = context.input_path_ptr[0..context.input_path_len];
     const table_name = context.table_name_ptr[0..context.table_name_len];
@@ -51,6 +52,7 @@ pub fn create(context: *const bridge.CreateContext) callconv(.c) c_int {
         .table_name_ptr = state.staged.table_name.ptr,
         .table_name_len = state.staged.table_name.len,
     };
+    success = true;
     return bridge.Status.ok;
 }
 

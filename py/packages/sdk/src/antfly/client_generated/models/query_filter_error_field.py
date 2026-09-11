@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryFilterErrorField(str, Enum):
+class QueryFilterErrorField(StrEnum):
     EXCLUSION_QUERY = "exclusion_query"
     FILTER_QUERY = "filter_query"
 

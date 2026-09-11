@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ExternalIoProtocol(str, Enum):
+class ExternalIoProtocol(StrEnum):
     FILESYSTEM = "filesystem"
     GCS = "gcs"
     HTTP = "http"

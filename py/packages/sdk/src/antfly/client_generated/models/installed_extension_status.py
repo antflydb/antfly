@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InstalledExtensionStatus(str, Enum):
+class InstalledExtensionStatus(StrEnum):
     DISABLED = "disabled"
     DROPPING = "dropping"
     ERROR_STATE = "error_state"

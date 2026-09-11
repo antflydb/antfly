@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LegacyGraphSearchResultKind(str, Enum):
+class LegacyGraphSearchResultKind(StrEnum):
     LEGACY = "legacy"
 
     def __str__(self) -> str:

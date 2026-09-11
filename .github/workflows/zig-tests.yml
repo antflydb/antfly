@@ -42,7 +42,6 @@ jobs:
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
-      release_tooling: ${{ steps.detect.outputs.release_tooling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,7 +70,6 @@ jobs:
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
-              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -84,7 +82,6 @@ jobs:
                 echo "model_check=true"
                 echo "trace_validate=true"
                 echo "backup_s3=false"
-                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             else
               {
@@ -92,7 +89,6 @@ jobs:
                 echo "model_check=false"
                 echo "trace_validate=false"
                 echo "backup_s3=true"
-                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -109,7 +105,6 @@ jobs:
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
-              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -117,8 +112,29 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
-            ':(glob)scripts/ci/**' \
+            ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/check_zig_checksum_usage.py \
+            scripts/ci/test_check_zig_checksum_usage.py \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
+            scripts/run_db_query_matrix.py \
+            scripts/test_run_db_query_matrix.py \
+            scripts/test_conformance_fixtures.py \
+            ':(glob)specs/openapi/**' \
+            openapi.yaml \
+            scripts/join_openapi.py \
+            scripts/join_public_openapi.py \
+            scripts/openapi_joiner.py \
+            scripts/openapi_inputs.py \
+            scripts/public_openapi_overlays.py \
+            scripts/yaml_to_json.py \
+            scripts/generate_graph_identifier_policy.py \
+            scripts/generate_mcp_schema_fragments.py \
+            scripts/pyproject.toml \
+            scripts/uv.lock \
+            scripts/ci/test_zig_validation_scope.py \
+            ':(glob)scripts/bench/pdf/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -131,7 +147,14 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
-            ':(glob)scripts/ci/**' \
+            ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/toolchain-policy.json \
+            ':(glob)go/pkg/operator/**' \
+            ':(glob)go/pkg/sdk/admin/**' \
+            go/pkg/sdk/go.mod \
+            go/pkg/sdk/go.sum \
+            ':(glob)specs/openapi/**' \
+            .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -145,6 +168,11 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
@@ -178,66 +206,17 @@ jobs:
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             .github/workflows/zig-tests.yml
           then
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"
           else
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
-
-          if git diff --quiet "$base" "${{ github.sha }}" -- \
-            ':(glob).github/workflows/*.yml' \
-            ':(glob).github/workflows/*.yaml' \
-            .github/dependabot.yml \
-            scripts/install.sh \
-            scripts/publish-zig-runtime-dev.sh \
-            scripts/test_install_download_markers.sh \
-            scripts/test_quickstart_docs.py \
-            ':(glob)scripts/packaging/**' \
-            ':(glob)scripts/release/**' \
-            py/packages/cli/pyproject.toml \
-            ':(glob)ts/packages/cli*/**' \
-            docs/cli-packaging.md \
-            docs/guides/quickstart.mdx \
-            RELEASE.md \
-            zig/Dockerfile.runtime \
-            zig/cloudbuild.manifest.yaml \
-            zig/cloudbuild.runtime.yaml \
-            .github/workflows/zig-tests.yml
-          then
-            echo "release_tooling=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release_tooling=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  release-tooling:
-    name: release-tooling
-    needs: changes
-    if: needs.changes.outputs.release_tooling == 'true'
-    runs-on: arc-antfly-standard
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
-
-      # setup-zig downloads an .xz archive, and the release suite executes the
-      # real completion generator. Keep both dependencies explicit so a clean
-      # runner behaves the same as a developer machine.
-      - name: Install release test tools
-        run: sudo apt-get update && sudo apt-get install -y xz-utils
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
-
-      - name: Test release packaging and scripts
-        run: scripts/release/test.sh
 
   backup-s3-integration:
     name: backup-s3-integration
@@ -252,13 +231,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Run backup listing against MinIO
@@ -283,11 +266,14 @@ jobs:
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
     env:
-      ZIG_VERSION: "0.16.0"
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-arm64-codec
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache-arm64-codec
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
 
       - name: Verify native Linux ARM64 runner
         run: |
@@ -297,13 +283,17 @@ jobs:
           test "$(uname -m)" = "aarch64"
 
       - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_AARCH64_LINUX_SHA256: ${{ steps.toolchain.outputs.zig_aarch64_linux_sha256 }}
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl xz-utils
+          sudo apt-get install -y ca-certificates curl xz-utils python3 make
           curl -fsSL \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
           mkdir -p "$RUNNER_TEMP/zig"
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
             -C "$RUNNER_TEMP/zig" \
@@ -311,6 +301,8 @@ jobs:
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Verify Zig version
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
         run: test "$(zig version)" = "$ZIG_VERSION"
 
       - name: Run StreamVByte codec tests
@@ -320,6 +312,14 @@ jobs:
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/streamvbyte.zig
           zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
+
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline ARM64 checksum runtime dispatch
+        run: |
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline -lc
 
   zig-base-tests:
     name: zig-base / x86_64
@@ -338,6 +338,10 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
@@ -347,7 +351,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -361,10 +365,34 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline checksum runtime dispatch
+        working-directory: zig
+        run: |
+          zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
+          zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
+
+      - name: Test native static-musl process execution
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build lib-platform-test -Dtarget=x86_64-linux-musl --summary all 2>&1 | tee "$RUNNER_TEMP/platform-musl.log"
+          # A successful aggregate could hide a skipped process check.
+          grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
+
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Test bounded-build tooling
+      - name: Compile consolidated storage benchmark contracts
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: zig build antfly-storage-bench -Doptimize=Debug
+
+      # Keep inexpensive tooling checks beside the normal unit gate. The
+      # isolated compilation/cache matrix runs in zig-full / build-cache.
+      - name: Test build tooling
         working-directory: zig
         run: >-
           python3 -m unittest
@@ -374,10 +402,21 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+          tools/test_sync_generated.py
 
-      - name: Check inference kernel generator
-        working-directory: zig/pkg/inference
-        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Check inference kernels through the root build graph
+        working-directory: zig
+        run: >-
+          zig build inference-test -Dmetal=false -Dcuda=false --
+          --test-filter "quant kernel compiler"
+          --test-filter "metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
@@ -398,6 +437,13 @@ jobs:
             scripts.test_summarize_cuda_flash_prefill_v2 \
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
+
+      - name: Run Qwen model parity and promotion contract tests
+        working-directory: zig/pkg/inference
+        run: >-
+          uv run --with numpy==2.4.2 python
+          scripts/run_model_contract_tests.py
+          qwen3_embedding qwen3vl
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
@@ -616,6 +662,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -625,7 +675,7 @@ jobs:
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -642,7 +692,9 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Test bounded-build tooling
+      # Keep inexpensive tooling checks beside the normal unit gate. The
+      # isolated compilation/cache matrix runs in zig-full / build-cache.
+      - name: Test build tooling
         working-directory: zig
         run: >-
           python3 -m unittest
@@ -652,6 +704,14 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+          tools/test_sync_generated.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
@@ -669,7 +729,7 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
-      - name: Run full Zig unit tests
+      - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
@@ -692,7 +752,7 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           release-scale-test
-          recall-harness-build
+          recall-harness
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -708,12 +768,12 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
-      - name: Run Zig simulation tests
+      - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          sim-test
+          vopr-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -722,7 +782,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          integration-test
+          antfly-integration-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -731,7 +791,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          recall-ci-test
+          antfly-recall-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -740,9 +800,61 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          chaos-test
+          antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+  zig-build-cache-tests:
+    name: zig-full / build-cache
+    needs: changes
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 60
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Prepare ARC Zig cache dirs
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      # Each test owns its temporary source overlay and local cache. Keep
+      # those isolated; only the normal global dependency cache is shared.
+      # Verbose output identifies the individual checks in the CI log.
+      - name: Test runtime compilation and cache contracts
+        working-directory: zig
+        run: python3 -u -m unittest -v tools/test_runtime_cache.py
+
+      - name: Verify physical storage compilation ownership
+        working-directory: zig
+        run: python3 -u tools/check_storage_compilation.py --report storage-compilation.json
+
+      - name: Upload storage compilation measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-compilation
+          path: zig/storage-compilation.json
+          if-no-files-found: ignore
 
   zig-base:
     name: zig-base
@@ -771,7 +883,7 @@ jobs:
 
   zig-full:
     name: zig-full
-    needs: [changes, zig-full-tests, arm64-codec]
+    needs: [changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
     if: |
       always() &&
       (
@@ -786,11 +898,13 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-full-tests.result }}
+          BUILD_CACHE_RESULT: ${{ needs.zig-build-cache-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
+          test "$BUILD_CACHE_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base-build:
@@ -814,13 +928,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC Zig cache dirs
@@ -872,13 +990,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -916,11 +1038,44 @@ jobs:
       - name: Install E2E executable
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
+      - name: Set up Go for operator runtime contract
+        if: matrix.suite == 'inference'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+
+      # Execute the SAME reconciler-generated contract as the operator job's
+      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
+      - name: Test generated inference command against candidate runtime
+        if: matrix.suite == 'inference'
+        working-directory: go/pkg/operator
+        env:
+          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+          GOWORK: 'off'
+          GOEXPERIMENT: simd
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
+          -tags runtimeintegration ./controllers/inference
+          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+
+      - name: Run inference config contract with a real CPU model
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/inference-config-models
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          UV_PROJECT_ENVIRONMENT: /tmp/antfly-ci-venv/inference
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q
+          e2e/inference/test_run_config.py
 
       - name: Run low-FD HTTP worker ratchet regression
         if: matrix.suite == 'antfly'
@@ -984,13 +1139,17 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
 
       - name: Restore ARC cache dirs
@@ -1041,6 +1200,10 @@ jobs:
         with:
           submodules: true
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
 
@@ -1068,6 +1231,7 @@ jobs:
         if: matrix.suite == 'antfly'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
       - name: Build MemoryAF extension package
@@ -1169,7 +1333,6 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly

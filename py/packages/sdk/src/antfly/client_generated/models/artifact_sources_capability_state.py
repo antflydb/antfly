@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ArtifactSourcesCapabilityState(str, Enum):
+class ArtifactSourcesCapabilityState(StrEnum):
     AVAILABLE = "available"
     UNSUPPORTED = "unsupported"
     UPGRADE_PENDING = "upgrade_pending"

@@ -103,18 +103,16 @@ pub const buffer = @import("util/buffer.zig");
 pub const encoding = @import("util/encoding.zig");
 pub const json = @import("util/json.zig");
 pub const common = @import("util/common.zig");
+pub const attachment_envelope = @import("util/attachment_envelope.zig");
+pub const numeric_response = @import("util/numeric_response.zig");
 
 pub const testing_mod = @import("testing.zig");
 
-pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
 
 pub const RequestSpec = concurrency.RequestSpec;
 pub const RequestResult = concurrency.RequestResult;
 pub const BatchBuilder = concurrency.BatchBuilder;
-
-pub const Executor = executor.Executor;
-pub const Task = executor.Task;
 
 pub const Method = types.Method;
 pub const Version = types.Version;
@@ -198,6 +196,7 @@ pub const negotiateVersion = http.negotiateVersion;
 pub const Client = client_mod.Client;
 pub const ClientConfig = client_mod.ClientConfig;
 pub const RequestOptions = client_mod.RequestOptions;
+pub const AttemptObserver = @import("core/attempt_observer.zig").AttemptObserver;
 pub const CancellationToken = client_mod.CancellationToken;
 pub const WriterProgress = client_mod.WriterProgress;
 pub const WriterProgressCallback = client_mod.WriterProgressCallback;
@@ -215,7 +214,9 @@ pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
+pub const H1DisconnectProbe = server_mod.H1DisconnectProbe;
 pub const HttpRuntime = http_runtime.HttpRuntime;
+pub const SharedBodyBudget = @import("protocol/body_budget.zig").SharedBodyBudget;
 pub const Context = server_mod.Context;
 pub const Handler = server_mod.Handler;
 pub const RouteParam = router.RouteParam;
@@ -349,6 +350,10 @@ test "core types" {
 
 test "headers" {
     _ = headers;
+}
+
+test "numeric response" {
+    _ = numeric_response;
 }
 
 test "uri" {

@@ -32,6 +32,28 @@ pub const PositionIdMode = enum {
     roberta_padding,
 };
 
+/// Activation semantics used by Hugging Face BERT-family checkpoints.
+/// `gelu` in transformers is the exact-erf formulation; the tanh
+/// approximation is named explicitly (`gelu_new`/`gelu_pytorch_tanh`).
+pub const HiddenActivation = enum {
+    gelu_exact,
+    gelu_tanh,
+    relu,
+    silu,
+
+    /// Canonical Hugging Face/GGUF spelling. Keep this separate from the enum
+    /// tag names so round-tripping an exact GELU does not emit the internal
+    /// `gelu_exact` qualifier that upstream configs do not recognize.
+    pub fn wireName(self: HiddenActivation) []const u8 {
+        return switch (self) {
+            .gelu_exact => "gelu",
+            .gelu_tanh => "gelu_pytorch_tanh",
+            .relu => "relu",
+            .silu => "silu",
+        };
+    }
+};
+
 /// BERT model configuration loaded from config.json.
 pub const Config = struct {
     model_type: ModelType = .bert,
@@ -46,7 +68,7 @@ pub const Config = struct {
     intermediate_size: u32 = 3072,
     max_position_embeddings: u32 = 512,
     type_vocab_size: u32 = 2,
-    hidden_act: []const u8 = "gelu",
+    hidden_act: HiddenActivation = .gelu_exact,
     layer_norm_eps: f32 = 1e-12,
     num_labels: u32 = 1,
     pad_token_id: i64 = 0,
@@ -101,6 +123,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("intermediate_size")) |v| config.intermediate_size = jsonU32(v) orelse config.intermediate_size;
     if (obj.get("max_position_embeddings")) |v| config.max_position_embeddings = jsonU32(v) orelse config.max_position_embeddings;
     if (obj.get("type_vocab_size")) |v| config.type_vocab_size = jsonU32(v) orelse config.type_vocab_size;
+    if (obj.get("hidden_act") orelse obj.get("activation")) |v| {
+        if (v != .string) return error.InvalidBertActivation;
+        config.hidden_act = parseHiddenActivation(v.string) orelse return error.UnsupportedBertActivation;
+    }
     if (obj.get("layer_norm_eps")) |v| config.layer_norm_eps = jsonF32(v) orelse config.layer_norm_eps;
     if (obj.get("num_labels")) |v| config.num_labels = jsonU32(v) orelse config.num_labels;
     if (obj.get("pad_token_id")) |v| config.pad_token_id = jsonI64(v) orelse config.pad_token_id;
@@ -150,9 +176,17 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
         config.layer_norm_eps;
     config.num_labels = metaU32(view, "bert.label_count") orelse config.num_labels;
     if (view.getString("bert.hidden_act")) |value| {
-        config.hidden_act = if (std.mem.eql(u8, value, "relu")) "relu" else "gelu";
+        config.hidden_act = parseHiddenActivation(value) orelse return null;
     }
     return config;
+}
+
+fn parseHiddenActivation(value: []const u8) ?HiddenActivation {
+    if (std.mem.eql(u8, value, "gelu") or std.mem.eql(u8, value, "gelu_exact")) return .gelu_exact;
+    if (std.mem.eql(u8, value, "gelu_new") or std.mem.eql(u8, value, "gelu_pytorch_tanh")) return .gelu_tanh;
+    if (std.mem.eql(u8, value, "relu")) return .relu;
+    if (std.mem.eql(u8, value, "silu") or std.mem.eql(u8, value, "swish")) return .silu;
+    return null;
 }
 
 pub fn isXlmRobertaGgufMetadata(view: gguf_metadata.View) bool {
@@ -471,6 +505,26 @@ test "parse roberta config" {
     try std.testing.expectEqual(@as(u32, 384), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 6), config.num_hidden_layers);
     try std.testing.expectEqual(PositionIdMode.roberta_padding, config.position_id_mode);
+}
+
+test "parse BERT activation semantics without borrowing JSON storage" {
+    const allocator = std.testing.allocator;
+
+    const exact = try parseConfig(allocator,
+        \\{"model_type":"xlm-roberta","hidden_act":"gelu"}
+    );
+    try std.testing.expectEqual(HiddenActivation.gelu_exact, exact.hidden_act);
+    try std.testing.expectEqualStrings("gelu", exact.hidden_act.wireName());
+
+    const approximate = try parseConfig(allocator,
+        \\{"model_type":"bert","hidden_act":"gelu_pytorch_tanh"}
+    );
+    try std.testing.expectEqual(HiddenActivation.gelu_tanh, approximate.hidden_act);
+    try std.testing.expectEqualStrings("gelu_pytorch_tanh", approximate.hidden_act.wireName());
+
+    try std.testing.expectError(error.UnsupportedBertActivation, parseConfig(allocator,
+        \\{"model_type":"bert","hidden_act":"made_up"}
+    ));
 }
 
 test "weight mapping for bert" {

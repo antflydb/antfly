@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexRepairStatusState(str, Enum):
+class IndexRepairStatusState(StrEnum):
     FAILED = "failed"
     PAUSED = "paused"
     REBUILDING = "rebuilding"

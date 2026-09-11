@@ -21,6 +21,7 @@ const snapshot_admission_mod = @import("snapshot_admission.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
+const doc_set = @import("doc_set.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -363,6 +364,46 @@ pub const SplitIndexHandoffs = struct {
     }
 };
 
+/// Shared by serving and recovery wrappers. Summary publication is protected
+/// by the core apply lock; query-set caches also have their own locks because
+/// published-path readers need not hold the apply lock.
+pub const IdentityVisibilityState = struct {
+    alloc: Allocator,
+    summary: ?doc_identity.VisibilitySummary = null,
+    live_mutex: std.atomic.Mutex = .unlocked,
+    live_generation: ?u64 = null,
+    live_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_mutex: std.atomic.Mutex = .unlocked,
+    nonvisible_generation: ?u64 = null,
+    nonvisible_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_overflow: bool = false,
+    nonvisible_entries: std.atomic.Value(u64) = .init(0),
+
+    pub fn clearLive(self: *@This()) void {
+        while (!self.live_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.live_mutex.unlock();
+        if (self.live_set) |*cached| cached.deinit(self.alloc);
+        self.live_set = null;
+        self.live_generation = null;
+    }
+
+    pub fn clearNonvisible(self: *@This()) void {
+        while (!self.nonvisible_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.nonvisible_mutex.unlock();
+        if (self.nonvisible_set) |*cached| cached.deinit(self.alloc);
+        self.nonvisible_set = null;
+        self.nonvisible_generation = null;
+        self.nonvisible_overflow = false;
+        self.nonvisible_entries.store(0, .monotonic);
+    }
+
+    pub fn publish(self: *@This(), summary: doc_identity.VisibilitySummary) void {
+        self.summary = summary;
+        self.clearLive();
+        self.clearNonvisible();
+    }
+};
+
 pub const DBCore = struct {
     alloc: Allocator,
     path: []u8,
@@ -382,6 +423,7 @@ pub const DBCore = struct {
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
+    identity_visibility: IdentityVisibilityState,
 
     pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) DBCore {
         return .{
@@ -403,10 +445,13 @@ pub const DBCore = struct {
             .schema = opened.schema,
             .identity_namespace = opened.identity_namespace,
             .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
+            .identity_visibility = .{ .alloc = alloc },
         };
     }
 
     pub fn deinit(self: *DBCore) void {
+        self.identity_visibility.clearLive();
+        self.identity_visibility.clearNonvisible();
         if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
         self.log_mutex.* = undefined;
         self.alloc.destroy(self.log_mutex);
@@ -835,6 +880,16 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
+        // A WAL-authoritative dense index carries replay durability in its
+        // posting generation even when an upgraded legacy projection has not
+        // yet acquired config-hash readiness metadata. Do not conflate that
+        // acceleration certificate with the source sequence: doing so reports
+        // zero after a successful native commit and replays published work.
+        if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+            const dense_checkpoint = self.index_manager.denseProjectionCheckpointMetadata(index_name) orelse
+                return error.InvalidDerivedApplyState;
+            return dense_checkpoint.applied_sequence;
+        }
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
             if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
         }
@@ -904,6 +959,17 @@ pub const DBCore = struct {
         else
             0;
         if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            if (self.index_manager.densePostingWalAuthoritativeByName(index_name)) {
+                // Source mutation paths publish with their exact capture
+                // lease before reaching this generic watermark callback. A
+                // mutation-free target advance may publish coverage here, but
+                // must never consume a newer transaction it does not own.
+                try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
+                // The posting checkpoint/WAL commit boundary is the durable
+                // dense applied sequence. Lifecycle metadata is persisted only
+                // when status/generation/config identity changes.
+                return;
+            }
             const published_count = if (self.index_manager.denseIndex(index_name)) |entry|
                 entry.index.stats().active_count
             else
@@ -919,6 +985,7 @@ pub const DBCore = struct {
                 .name = index_name,
                 .kind = .dense_vector,
             });
+            try self.index_manager.ensureDensePostingCoverageByName(index_name, sequence);
         } else if (cfg) |value| {
             try self.index_manager.checkpointLsmWalForManagedIndex(.{
                 .name = index_name,

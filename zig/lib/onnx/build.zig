@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const support = @import("build_support.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -32,19 +33,20 @@ pub fn build(b: *std.Build) void {
     // consumers need the auto-generated bindings again, either restore the
     // upstream codegen helper or check in a generated `onnx_proto.zig`.
 
-    const onnx_mod = b.addModule("onnx", .{
-        .root_source_file = b.path("src/root.zig"),
+    const modules = support.create(b, .{
+        .root = b.path("."),
         .target = target,
         .optimize = optimize,
+        .protobuf = protobuf_mod,
     });
-    onnx_mod.addImport("protobuf", protobuf_mod);
+    b.modules.put(b.allocator, b.dupe("onnx_data"), modules.data) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("onnx"), modules.graph) catch @panic("OOM");
 
-    // Tests — when run standalone, proto.zig and attrs.zig tests don't
-    // need ml/protobuf imports (they only test pure logic). Files that
-    // import ml or protobuf require the parent build to inject deps.
+    // Standalone file-format tests need protobuf alone.
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&support.createDataTests(b, modules.data).step);
 
-    // Standalone-testable files (no external imports)
+    // Attribute decoding uses the same proto types as the data module.
     const standalone_tests = [_][]const u8{
         "src/attrs.zig",
     };
@@ -57,6 +59,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        t.root_module.addImport("onnx_data", modules.data);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

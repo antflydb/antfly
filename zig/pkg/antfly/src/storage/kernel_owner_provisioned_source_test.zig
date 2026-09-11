@@ -16,7 +16,7 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
 const backup_contract = @import("../api/backup_contract.zig");
-const db_mod = @import("db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const distributed_graph = @import("../api/distributed_graph.zig");
 const indexes_api = @import("../api/indexes.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -26,8 +26,8 @@ const query_api = @import("../api/query.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const table_catalog = @import("../api/table_catalog.zig");
-const table_reads = @import("../api/table_reads.zig");
-const table_writes = @import("../api/table_writes.zig");
+const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
 test "bulk callback ABI retains exact consumer error identity" {
@@ -59,6 +59,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         ;
 
         accept_publication: bool = true,
+        present: bool = true,
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -74,8 +75,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var result: metadata_api.AdminSnapshot = .{
                 .status = .{
                     .metadata_group_id = 1,
                     .metadata_incarnation = metadata_incarnation,
@@ -99,6 +101,11 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
+            if (!self.present) {
+                result.tables = &.{};
+                result.ranges = &.{};
+            }
+            return result;
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
@@ -115,14 +122,14 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         count: usize = 0,
         last_group_id: u64 = 0,
 
-        fn requester(self: *@This()) read_gate.ReadableLeaseRequester {
+        fn barrier(self: *@This()) read_gate.ReadSafetyBarrier {
             return .{
                 .ptr = self,
-                .vtable = &.{ .request_readable_lease = requestReadableLease },
+                .vtable = &.{ .wait_read_safe = waitReadSafe },
             };
         }
 
-        fn requestReadableLease(ptr: *anyopaque, group_id: u64, _: []const u8) !void {
+        fn waitReadSafe(ptr: *anyopaque, group_id: u64, _: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.count += 1;
             self.last_group_id = group_id;
@@ -159,6 +166,8 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         }
     };
 
+    var snapshot_cache = @import("../api/runtime_status.zig").TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
     var catalog = Catalog{};
     var lease_capture = LeaseCapture{};
     var generations = GenerationTracker{};
@@ -166,12 +175,14 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         alloc,
         replica_root,
         catalog.iface(),
-        lease_capture.requester(),
+        lease_capture.barrier(),
     );
     _ = owner_source.withGroupVisibleRootGeneration(generations.iface());
+    _ = owner_source.withRuntimeStatusCache(&snapshot_cache);
     var owner_source_active = true;
     defer if (owner_source_active) owner_source.deinit();
     var write_source = table_writes.ProvisionedTableWriteSource.init(replica_root, catalog.iface());
+    write_source.runtime_status_cache = &snapshot_cache;
     var write_source_active = true;
     defer if (write_source_active) write_source.deinit();
     _ = owner_source.withTransactionRecoverySource(write_source.transactionRecoverySource());
@@ -182,12 +193,24 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         catalog.iface(),
-        lease_capture.requester(),
+        lease_capture.barrier(),
     );
     _ = read_source.withLocalReadSource(owner_source.readSource());
     _ = read_source.withGroupVisibleRootGeneration(generations.iface());
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
+    // Background publication uses only existing owners and does not open a DB.
+    const owner_count = (try owner_source.maintenanceSource().maintenanceSnapshot(false)).owner_count;
+    write_source.publishCachedWriterRuntimeStatusesBestEffort(alloc);
+    try std.testing.expectEqual(owner_count, (try owner_source.maintenanceSource().maintenanceSnapshot(false)).owner_count);
+    {
+        var published = (try snapshot_cache.snapshot(alloc, "articles")).?;
+        defer published.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), published.items.len);
+        try std.testing.expectEqual(@as(u64, 7001), published.items[0].group_id);
+        try std.testing.expectEqual(@import("../api/runtime_status.zig").RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+    }
+
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
     const initial_cache_stats = owner_source.cacheStats();
     try std.testing.expect(initial_cache_stats.miss_count >= 1);
@@ -846,6 +869,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .replace_existing = true,
         };
         if (backup_index == 0) {
+            var cancelled = std.atomic.Value(bool).init(true);
+            var cancelled_plan = restore_plan;
+            cancelled_plan.cancellation = .fromAtomic(&cancelled);
+            try std.testing.expectError(error.Canceled, write_source.source().restoreTable(alloc, "articles", cancelled_plan));
             var hook = PublicationHook{ .fail_publish = true };
             var rejected_plan = restore_plan;
             rejected_plan.publication_hook = hook.iface();
@@ -997,7 +1024,18 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(abi.Status.lsm_root_writer_already_open, abi.antfly_storage_owner_open(&open_request, &duplicate));
     try std.testing.expect(duplicate == null);
 
-    try std.testing.expect((try write_source.source().dropTable(alloc, "articles", &.{7001})) != null);
+    const cleanup_contract = @import("../metadata/topology_protocol.zig").DropCleanupContract{
+        .table_id = 7,
+        .expected_transition_generation = 0,
+        .group_ids = &.{7001},
+    };
+    try std.testing.expectError(error.DropCleanupOwnershipInconclusive, write_source.source().dropTable(alloc, "articles", cleanup_contract));
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    // Physical cleanup follows the committed catalog drop; it cannot retire
+    // a group while a linearizable catalog view still assigns that owner.
+    catalog.present = false;
+    catalog.accept_publication = true;
+    try std.testing.expect((try write_source.source().dropTable(alloc, "articles", cleanup_contract)) != null);
     try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
     var path_io_impl = std.Io.Threaded.init(alloc, .{});
     defer path_io_impl.deinit();

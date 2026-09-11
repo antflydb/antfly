@@ -153,3 +153,6 @@ pub const CommittedKeyListener = struct {
         self.vtable.on_committed_key(self.ptr, signal);
     }
 };
+
+/// Process-local token used to detach and drain one registered callback pair.
+pub const LifecycleListenerRegistration = struct { id: u64 };

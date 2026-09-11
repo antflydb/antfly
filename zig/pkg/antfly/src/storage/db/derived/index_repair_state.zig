@@ -13,10 +13,10 @@
 //! never observe one without the other.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
 const storage_io = @import("../../lsm_backend/storage_io.zig");
 const types = @import("../types.zig");
 
@@ -43,11 +43,23 @@ pub const Location = struct {
     lock_key: []const u8,
     path: []const u8,
     storage: ?storage_io.Storage = null,
+    /// Native checkpoint operations borrow their caller's runtime. The
+    /// process-wide debug runtime is retained only for compatibility callers
+    /// that do not yet have an owning runtime to pass.
+    io: std.Io = std.Options.debug_io,
 
     pub fn native(path: []const u8) Location {
         return .{
             .lock_key = path,
             .path = path,
+        };
+    }
+
+    pub fn nativeWithIo(path: []const u8, io: std.Io) Location {
+        return .{
+            .lock_key = path,
+            .path = path,
+            .io = io,
         };
     }
 };
@@ -82,10 +94,13 @@ pub const Trigger = enum(u8) {
     /// Rebuild the missing coverage in a shadow while retaining query access
     /// until the replacement reaches its fenced activation boundary.
     replay_artifact_unavailable = 8,
+    /// Online physical-format upgrade. The legacy generation remains serving
+    /// while a native v2 shadow is built, caught up, validated, and promoted.
+    storage_format_migration = 9,
     /// A catalog definition was admitted over an existing corpus. The
     /// independent work class determines that this is initial materialization,
     /// not repair; the trigger preserves the exact control-plane cause.
-    catalog_admission = 9,
+    catalog_admission = 10,
 };
 
 /// Durable scheduler work and its user-visible meaning are separate from the
@@ -396,10 +411,13 @@ pub fn checkpointPathAlloc(alloc: Allocator, db_path: []const u8) ![]u8 {
 }
 
 pub fn newReplicaIdentity(alloc: Allocator, root_generation: u64) !ReplicaIdentity {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
+    return newReplicaIdentityWithIo(alloc, std.Options.debug_io, root_generation);
+}
+
+pub fn newReplicaIdentityWithIo(alloc: Allocator, io: std.Io, root_generation: u64) !ReplicaIdentity {
+    _ = alloc;
     var entropy: [32]u8 = undefined;
-    try io_impl.io().randomSecure(&entropy);
+    try io.randomSecure(&entropy);
     var db_identity = std.mem.readInt(u128, entropy[0..16], .little);
     var replica_id = std.mem.readInt(u128, entropy[16..32], .little);
     if (db_identity == 0) db_identity = 1;
@@ -412,10 +430,13 @@ pub fn newReplicaIdentity(alloc: Allocator, root_generation: u64) !ReplicaIdenti
 }
 
 pub fn newRepairId(alloc: Allocator) !u128 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
+    return newRepairIdWithIo(alloc, std.Options.debug_io);
+}
+
+pub fn newRepairIdWithIo(alloc: Allocator, io: std.Io) !u128 {
+    _ = alloc;
     var entropy: [16]u8 = undefined;
-    try io_impl.io().randomSecure(&entropy);
+    try io.randomSecure(&entropy);
     const value = std.mem.readInt(u128, &entropy, .little);
     return if (value == 0) 1 else value;
 }
@@ -429,7 +450,7 @@ pub fn loadOrCreateAt(alloc: Allocator, location: Location, root_generation: u64
     defer guard.release();
     return loadUnlockedAt(alloc, location) catch |err| switch (err) {
         error.FileNotFound => blk: {
-            var state = State{ .identity = try newReplicaIdentity(alloc, root_generation) };
+            var state = State{ .identity = try newReplicaIdentityWithIo(alloc, location.io, root_generation) };
             errdefer state.deinit(alloc);
             try writeUnlockedAt(alloc, location, &state);
             break :blk state;
@@ -493,7 +514,7 @@ pub fn resetForRootGenerationWithIntentsAt(
     defer old.deinit(alloc);
     if (!old.identity.eql(expected_identity)) return error.ReplicaIdentityMismatch;
     var replacement = State{
-        .identity = try newReplicaIdentity(alloc, root_generation),
+        .identity = try newReplicaIdentityWithIo(alloc, location.io, root_generation),
         .control_revision = 1,
     };
     errdefer replacement.deinit(alloc);
@@ -716,9 +737,7 @@ fn loadUnlockedAt(alloc: Allocator, location: Location) !State {
         return try decode(alloc, raw);
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), location.path, alloc, .limited(max_file_bytes));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(location.io, location.path, alloc, .limited(max_file_bytes));
     defer alloc.free(raw);
     return try decode(alloc, raw);
 }
@@ -740,15 +759,13 @@ fn writeUnlockedAt(alloc: Allocator, location: Location, state: *const State) !v
     }
 
     if (std.fs.path.dirname(location.path)) |parent| {
-        var io_parent = std.Io.Threaded.init(alloc, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
+        try fs_paths.createDirPathPortable(location.io, parent);
     }
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ location.path, platform_time.monotonicNs() });
+    // Access is serialized by the per-location checkpoint lock, so one stable
+    // sibling is sufficient and avoids hidden clock/entropy dependencies.
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-index-repair", .{location.path});
     defer alloc.free(tmp_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    const io = location.io;
     {
         var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
         defer file.close(io);
@@ -834,7 +851,7 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
             try appendInt(alloc, &out, u64, pin.retain_after_sequence);
         }
     }
-    try appendInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    try appendInt(alloc, &out, u32, Crc32.hash(out.items));
     if (out.items.len > max_file_bytes) return error.IndexRepairStateTooLarge;
     return try out.toOwnedSlice(alloc);
 }
@@ -843,7 +860,7 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
     if (raw.len < magic.len + 4 + 4 or !std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidIndexRepairState;
     const payload_end = raw.len - 4;
     const expected_crc = std.mem.readInt(u32, raw[payload_end..][0..4], .little);
-    if (std.hash.Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidIndexRepairState;
+    if (Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidIndexRepairState;
     var pos: usize = magic.len;
     const decoded_format_version = try readInt(raw[0..payload_end], &pos, u32);
     if (decoded_format_version < 1 or decoded_format_version > format_version) return error.InvalidIndexRepairState;

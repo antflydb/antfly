@@ -30,6 +30,7 @@ test "data storage module tests are reachable" {
     std.testing.refAllDecls(storage.shard_state_store);
     std.testing.refAllDecls(storage.raft_apply_store);
     std.testing.refAllDecls(db_split_handoff);
+    std.testing.refAllDecls(raft_state_machine.data);
     std.testing.refAllDecls(raft_storage.catalog);
     std.testing.refAllDecls(raft_storage.snapshot_payload_store);
     std.testing.refAllDecls(raft_storage.replica_state);
@@ -118,3 +119,6 @@ test "db merge coordinator reapplies target namespace for persisted reassignment
     try std.testing.expectEqual(target_namespace.shard_id, after.doc_identity.namespace_shard_id);
     try std.testing.expectEqual(target_namespace.range_id, after.doc_identity.namespace_range_id);
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class EmbeddingIndexActivityPhase(str, Enum):
+class EmbeddingIndexActivityPhase(StrEnum):
     EMBEDDING = "embedding"
     IDLE = "idle"
     PREPARING = "preparing"

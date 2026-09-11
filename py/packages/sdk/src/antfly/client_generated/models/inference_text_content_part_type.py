@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceTextContentPartType(str, Enum):
+class InferenceTextContentPartType(StrEnum):
     TEXT = "text"
 
     def __str__(self) -> str:

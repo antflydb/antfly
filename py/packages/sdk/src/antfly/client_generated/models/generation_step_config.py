@@ -22,7 +22,8 @@ class GenerationStepConfig:
     response from retrieved documents using the reasoning as context.
 
         Attributes:
-            enabled (bool | Unset): Enable generation from retrieved documents Default: False.
+            enabled (bool | Unset): Compatibility switch. The step is enabled when this object is present; omit the step to
+                disable it.
             generator (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
                  Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
             chain (list[ChainLink] | Unset): Chain of generators to try in order. Mutually exclusive with 'generator'.
@@ -31,7 +32,7 @@ class GenerationStepConfig:
                 concise and technical. Include code examples where relevant..
     """
 
-    enabled: bool | Unset = False
+    enabled: bool | Unset = UNSET
     generator: GeneratorConfig | Unset = UNSET
     chain: list[ChainLink] | Unset = UNSET
     system_prompt: str | Unset = UNSET

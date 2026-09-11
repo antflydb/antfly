@@ -44,11 +44,11 @@ const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_read_source = @import("table_read_source.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("local_query_contract.zig");
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
-const table_writes = @import("table_writes.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("../common/config.zig");
 const scraping = @import("antfly_scraping");
@@ -57,12 +57,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
-    requester: read_gate.ReadableLeaseRequester,
+    read_safety_barrier: read_gate.ReadSafetyBarrier,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
+    runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
+    native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
     ha_write_gate: ?ha_contract.WriteGate = null,
     ha_async_mirror: ?ha_contract.AsyncEffectMirror = null,
@@ -121,6 +123,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         exclusive_pending: bool = false,
         exclusive_active: bool = false,
         retired: bool = false,
+        closing: bool = false,
         bulk_ingest_active: std.atomic.Value(bool) = .init(false),
     };
 
@@ -146,13 +149,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         replica_root_dir: []const u8,
         catalog: table_catalog.CatalogSource,
-        requester: read_gate.ReadableLeaseRequester,
+        read_safety_barrier: read_gate.ReadSafetyBarrier,
     ) ProvisionedKernelOwnerSource {
         return .{
             .alloc = alloc,
             .replica_root_dir = replica_root_dir,
             .catalog = catalog,
-            .requester = requester,
+            .read_safety_barrier = read_safety_barrier,
         };
     }
 
@@ -164,11 +167,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
-    pub fn withRequester(
+    pub fn withReadSafetyBarrier(
         self: *ProvisionedKernelOwnerSource,
-        requester: read_gate.ReadableLeaseRequester,
+        read_safety_barrier: read_gate.ReadSafetyBarrier,
     ) *ProvisionedKernelOwnerSource {
-        self.requester = requester;
+        self.read_safety_barrier = read_safety_barrier;
         return self;
     }
 
@@ -260,17 +263,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// operation families for its full group lifecycle.
     pub fn deinit(self: *ProvisionedKernelOwnerSource) void {
         lock(&self.mutex);
-        defer self.mutex.unlock();
         for (self.entries.items) |entry| {
-            std.debug.assert(entry.active_users == 0);
-            entry.owner.deinit();
-            self.alloc.free(entry.table_name);
-            self.alloc.free(entry.schema_json);
-            self.alloc.free(entry.indexes_json);
-            self.alloc.destroy(entry);
+            std.debug.assert(entry.active_users == 0 and !entry.closing);
+            entry.retired = true;
         }
+        self.drainRetiredLocked(null, null);
         self.entries.deinit(self.alloc);
         self.entries = .empty;
+        self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
     }
 
@@ -371,7 +371,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .run_lsm_round = runLsmMaintenanceRound,
                 .run_dense_posting_round = runDensePostingMaintenanceRound,
+                .publish_dense_checkpoints = publishDenseCheckpoints,
+                .run_vector_block_round = runVectorBlockRound,
                 .snapshot = maintenanceSnapshot,
+                .publish_runtime_statuses = publishRuntimeStatuses,
             },
         };
     }
@@ -426,6 +429,42 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Run one bounded projection reconciliation while borrowing the same
     /// resident physical owner used by table reads and writes.
+    /// Holds a generation for an admitted transition without exposing its DB.
+    pub const TransitionLease = struct {
+        lease: Lease,
+
+        pub fn deinit(self: *TransitionLease) void {
+            self.lease.deinit();
+        }
+
+        pub fn reconcile(self: *TransitionLease, apply_store: *data_apply_client.RaftApplyStore, alloc: std.mem.Allocator, expected: ?data_apply_client.AppliedDataBatch) !data_apply_client.RaftApplyStore.ReconcileResult {
+            return try apply_store.reconcileAuthoritativeOwner(alloc, self.lease.owner().handle, self.lease.entry.group_id, expected, false, 256, 2 * 1024 * 1024);
+        }
+
+        pub fn mergeArtifactsPage(self: *TransitionLease, alloc: std.mem.Allocator, range: db_types.ByteRange, after_key: ?[]const u8) ![]db_types.BatchWrite {
+            var response: abi.OwnedBytes = .{};
+            try @import("kernel_error_identity").statusToError(abi.antfly_storage_owner_merge_artifacts_page(self.lease.owner().handle, &.{
+                .table_name = .fromSlice(self.lease.entry.table_name),
+                .range_start = .fromSlice(range.start),
+                .range_end = .fromSlice(range.end),
+                .after_key = .fromSlice(after_key orelse ""),
+            }, &response));
+            defer abi.antfly_storage_owner_buffer_destroy(&response);
+            var page = try @import("../storage/data_raft_projection_wire.zig").decodeGroupStatePageAlloc(alloc, response.slice());
+            errdefer page.deinit(alloc);
+            const rows = try alloc.alloc(db_types.BatchWrite, page.entries.len);
+            for (page.entries, 0..) |entry, i| rows[i] = .{ .key = entry.key, .value = entry.value };
+            alloc.free(page.entries);
+            return rows;
+        }
+    };
+
+    pub fn leaseTransitionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !TransitionLease {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer self.alloc.free(path);
+        return .{ .lease = try self.acquireDescriptor(group_id, table_name, path, descriptor) };
+    }
+
     pub fn reconcileDataRaftProjection(
         self: *ProvisionedKernelOwnerSource,
         apply_store: *data_apply_client.RaftApplyStore,
@@ -541,53 +580,50 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn retireAll(self: *ProvisionedKernelOwnerSource) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        var retired_count: usize = 0;
-        var i = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.entries.items[i];
-            retired_count += 1;
-            entry.retired = true;
-            if (entry.active_users == 0) self.destroyEntryAtIndexLocked(i);
-        }
-        return retired_count;
+        const count = self.entries.items.len;
+        for (self.entries.items) |entry| entry.retired = true;
+        self.drainRetiredLocked(null, null);
+        return count;
     }
 
-    /// Retire every resident generation for a table. Active calls retain their
-    /// old owner until their lease drains; the next call then opens the catalog
-    /// descriptor that won the outer structural transition.
+    /// Existing leases keep their owner alive; retirement prevents admission
+    /// while close drains storage workers outside the registry mutex.
     pub fn retireTable(self: *ProvisionedKernelOwnerSource, table_name: []const u8) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        var retired_count: usize = 0;
-        var i = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.entries.items[i];
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-            retired_count += 1;
+            count += 1;
             entry.retired = true;
-            if (entry.active_users == 0) self.destroyEntryAtIndexLocked(i);
         }
-        return retired_count;
+        self.drainRetiredLocked(null, table_name);
+        return count;
     }
 
-    fn retireGroupForPublication(
-        ptr: *anyopaque,
-        group_id: u64,
-        table_name: []const u8,
-    ) !void {
+    fn retireGroupForPublication(ptr: *anyopaque, group_id: u64, table_name: []const u8) !void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         lock(&self.mutex);
         defer self.mutex.unlock();
-        var i = self.entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            const entry = self.entries.items[i];
+        for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (entry.active_users != 0) return error.StorageBusy;
-            entry.retired = true;
-            self.destroyEntryAtIndexLocked(i);
+            if (entry.active_users != 0 or entry.closing) return error.StorageBusy;
+        }
+        for (self.entries.items) |entry| {
+            if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) entry.retired = true;
+        }
+        self.drainRetiredLocked(group_id, table_name);
+    }
+
+    fn drainRetiredLocked(self: *ProvisionedKernelOwnerSource, group_id: ?u64, table_name: ?[]const u8) void {
+        while (true) {
+            const index = for (self.entries.items, 0..) |entry, i| {
+                if (!entry.retired or entry.closing or entry.active_users != 0) continue;
+                if (group_id) |id| if (entry.group_id != id) continue;
+                if (table_name) |name| if (!std.mem.eql(u8, entry.table_name, name)) continue;
+                break i;
+            } else return;
+            self.destroyEntryAtIndexLocked(index);
         }
     }
 
@@ -631,17 +667,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             {
                 lock(&self.mutex);
                 defer self.mutex.unlock();
-                var i = self.entries.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    const entry = self.entries.items[i];
-                    if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-                    entry.retired = true;
-                    if (entry.active_users == 0) {
-                        self.destroyEntryAtIndexLocked(i);
-                    } else {
-                        active = true;
-                    }
+                for (self.entries.items) |entry| {
+                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) entry.retired = true;
+                }
+                self.drainRetiredLocked(group_id, table_name);
+                for (self.entries.items) |entry| {
+                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) active = true;
                 }
             }
             if (!active) return;
@@ -674,6 +705,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         manifest_json: []u8,
         request: abi.RestorePrepareRequest,
+        cancellation: db_types.CancellationToken,
+
+        fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+            const token: *const db_types.CancellationToken = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(token.isCancelled());
+        }
+
+        fn bindCancellation(self: *EncodedRestoreRequest) void {
+            self.request.cancellation_ctx = &self.cancellation;
+            self.request.cancellation_fn = cancelled;
+        }
 
         fn deinit(self: *EncodedRestoreRequest) void {
             self.alloc.free(self.manifest_json);
@@ -691,6 +733,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .alloc = self.alloc,
             .manifest_json = manifest_json,
+            .cancellation = request.cancellation,
             .request = .{
                 .path = .fromSlice(request.path),
                 .table_name = .fromSlice(request.table_name),
@@ -721,6 +764,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var encoded = try self.encodeRestoreRequest(request);
         defer encoded.deinit();
+        encoded.bindCancellation();
         return switch (try client.Snapshot.prepareRestore(encoded.request)) {
             .prepared => |snapshot| .{ .prepared = .{
                 .source = self.snapshotSource(),
@@ -737,6 +781,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var encoded = try self.encodeRestoreRequest(request);
         defer encoded.deinit();
+        encoded.bindCancellation();
         try client.Snapshot.reconcileRestore(encoded.request);
     }
 
@@ -747,6 +792,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var encoded = try self.encodeRestoreRequest(request);
         defer encoded.deinit();
+        encoded.bindCancellation();
         var lease = try self.acquire(request.group_id, request.table_name);
         defer lease.deinit();
         try lease.owner().repairRestore(&encoded.request);
@@ -849,6 +895,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         sync_level: db_types.SyncLevel,
     ) !void {
+        return try self.waitForCurrentSyncGroupLocalWithCancellation(group_id, table_name, sync_level, .none);
+    }
+
+    pub fn waitForCurrentSyncGroupLocalWithCancellation(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        sync_level: db_types.SyncLevel,
+        cancellation: db_types.CancellationToken,
+    ) !void {
         switch (sync_level) {
             .propose, .write => return,
             .full_text, .enrichments, .full_index => {},
@@ -862,7 +918,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
-        try lease.owner().waitForSync(table_name, owner_sync_level);
+        try lease.owner().waitForSyncWithCancellation(table_name, owner_sync_level, cancellation);
     }
 
     pub fn applyHAReplicationRecordGroupLocal(
@@ -1272,10 +1328,22 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn destroyEntryAtIndexLocked(self: *ProvisionedKernelOwnerSource, index: usize) void {
-        const entry = self.entries.orderedRemove(index);
-        std.debug.assert(entry.active_users == 0);
-        std.debug.assert(!entry.exclusive_active);
+        const entry = self.entries.items[index];
+        std.debug.assert(entry.active_users == 0 and !entry.exclusive_active and !entry.closing);
+        entry.retired = true;
+        entry.closing = true;
+        // Keep the closing owner registered until all storage work has drained.
+        // A concurrent open or cleanup must not mistake a removed pointer for
+        // permission to reopen, move, or delete the same physical root.
+        self.mutex.unlock();
         entry.owner.deinit();
+        lock(&self.mutex);
+        for (self.entries.items, 0..) |candidate, current_index| {
+            if (candidate == entry) {
+                _ = self.entries.orderedRemove(current_index);
+                break;
+            }
+        } else unreachable;
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
@@ -1401,6 +1469,59 @@ pub const ProvisionedKernelOwnerSource = struct {
                 std.math.maxInt(usize);
         }
         return total_steps;
+    }
+
+    pub fn withRuntimeStatusCache(self: *ProvisionedKernelOwnerSource, cache: *runtime_status.TableRuntimeSnapshotCache) *ProvisionedKernelOwnerSource {
+        self.runtime_status_cache = cache;
+        return self;
+    }
+
+    fn publishRuntimeStatuses(ptr: *anyopaque) void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (self.runtime_status_cache == null) return;
+        const leases = (self.snapshotOwnerLeases(true, true) catch return) orelse return;
+        defer self.releaseMaintenanceLeases(leases);
+        for (leases) |*lease| self.refreshMaintenanceStatus(lease);
+    }
+
+    fn refreshMaintenanceStatus(self: *ProvisionedKernelOwnerSource, lease: *Lease) void {
+        const cache = self.runtime_status_cache orelse return;
+        // Capture the table fence before observing the pinned generation.
+        const token = cache.capturePublicationToken(lease.entry.table_name) catch return;
+        var response = lease.owner().runtimeStatusJson(lease.entry.table_name) catch return;
+        defer response.deinit();
+        var parsed = std.json.parseFromSlice(runtime_status.LocalTableRuntimeStatus, self.alloc, response.bytes(), .{}) catch return;
+        defer parsed.deinit();
+        _ = cache.publishGroups(token, lease.entry.table_name, &.{parsed.value}) catch return;
+    }
+
+    fn publishDenseCheckpoints(ptr: *anyopaque) !db_types.NativePublicationResult {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const leases = (try self.snapshotOwnerLeases(true, true)) orelse return .{ .busy = true };
+        defer self.releaseMaintenanceLeases(leases);
+        var combined: db_types.NativePublicationResult = .{};
+        for (leases) |*lease| {
+            const result = try lease.owner().maintenance(lease.entry.table_name, .publish_dense_checkpoints);
+            if (result.published != 0) self.refreshMaintenanceStatus(lease);
+            combined.published += @intCast(result.published);
+            combined.busy = combined.busy or result.busy != 0;
+            combined.deferred = combined.deferred or result.deferred != 0;
+        }
+        return combined;
+    }
+
+    fn runVectorBlockRound(ptr: *anyopaque) !usize {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const leases = (try self.snapshotOwnerLeases(true, true)) orelse return 0;
+        defer self.releaseMaintenanceLeases(leases);
+        var steps: usize = 0;
+        for (leases) |*lease| {
+            self.refreshMaintenanceStatus(lease);
+            defer self.refreshMaintenanceStatus(lease);
+            const result = try lease.owner().maintenance(lease.entry.table_name, .vector_block_idle);
+            steps += @intCast(result.dense_steps);
+        }
+        return steps;
     }
 
     fn maintenanceSnapshot(
@@ -1603,8 +1724,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return @intFromBool(source.isLocalLeader(group_id));
     }
 
+    pub fn withNativeMigrationPolicy(self: *ProvisionedKernelOwnerSource, policy: runtime_callbacks.DenseNativeMigrationPolicySource) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.native_migration_policy = policy;
+        return self;
+    }
+
+    fn nativeAuthorityPermitted(ptr: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr.?));
+        return @intFromBool(self.native_migration_policy.?.authorityPermitted());
+    }
+
     fn runtimeHooksConfig(self: *ProvisionedKernelOwnerSource) abi.RuntimeHooksConfig {
         return .{
+            .native_authority_ctx = if (self.native_migration_policy != null) self else null,
+            .native_authority_fn = if (self.native_migration_policy != null) nativeAuthorityPermitted else null,
             .resolution_candidates = if (self.resolution_candidate_source != null) .{
                 .callback_ctx = self,
                 .get_fn = resolutionCandidateGet,
@@ -1840,6 +1974,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity)) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
@@ -1867,7 +2002,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .created = false, .exclusive = exclusive };
         }
-        if (stale_index) |index| self.destroyEntryAtIndexLocked(index);
+        if (stale_index) |index| {
+            self.destroyEntryAtIndexLocked(index);
+            // Closing releases the registry mutex. Recheck the descriptor on
+            // retry in case another caller installed its replacement.
+            return error.StorageKernelOwnerTransitionRequired;
+        }
 
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         const owned_table_name = try self.alloc.dupe(u8, table_name);
@@ -1918,7 +2058,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        const reads = feature_reads.FeatureReads.init(self.requester);
+        const reads = feature_reads.FeatureReads.init(self.read_safety_barrier);
         reads.prepareSearchWithConsistency(group_id, req, consistency) catch |err| switch (err) {
             error.NotLeader => if (consistency == .stale)
                 return err
@@ -1935,7 +2075,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        const reads = feature_reads.FeatureReads.init(self.requester);
+        const reads = feature_reads.FeatureReads.init(self.read_safety_barrier);
         reads.prepareLookupWithConsistency(group_id, key, opts, consistency) catch |err| switch (err) {
             error.NotLeader => if (consistency == .stale)
                 return err
@@ -1953,7 +2093,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        const reads = feature_reads.FeatureReads.init(self.requester);
+        const reads = feature_reads.FeatureReads.init(self.read_safety_barrier);
         reads.prepareScanWithConsistency(group_id, from_key, to_key, opts, consistency) catch |err| switch (err) {
             error.NotLeader => if (consistency == .stale)
                 return err
@@ -3169,12 +3309,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer parsed.deinit();
             items[initialized] = try parsed.value.clone(alloc);
             items[initialized].group_id = group_id;
-            items[initialized].metadata = .{
-                .updated_at_ns = platform_time.monotonicNs(),
-                .source = .live_writer_publish,
-                .freshness = .fresh,
-                .lsm_root_generation = lease.entry.generation,
-            };
+            items[initialized].metadata.lsm_root_generation = lease.entry.generation;
             initialized += 1;
         }
         return .{ .items = items };
@@ -3200,12 +3335,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer parsed.deinit();
         var observed = try parsed.value.clone(alloc);
         observed.group_id = group_id;
-        observed.metadata = .{
-            .updated_at_ns = platform_time.monotonicNs(),
-            .source = .live_writer_publish,
-            .freshness = .fresh,
-            .lsm_root_generation = lease.entry.generation,
-        };
+        observed.metadata.lsm_root_generation = lease.entry.generation;
         return observed;
     }
 

@@ -62,6 +62,7 @@ pub const ReadOptions = struct {
     max_tokens: ?usize = null,
     cache_dtype: ?[]const u8 = null,
     source_fingerprint: ?[]const u8 = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 };
 
 pub fn flattenStructuredToFields(allocator: std.mem.Allocator, value: *const StructuredValue) ![]Field {

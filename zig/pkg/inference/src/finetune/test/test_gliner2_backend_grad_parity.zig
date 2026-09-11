@@ -858,6 +858,7 @@ fn runBackendGradParity(
         var store = try NativeStore.init(allocator, specs);
         defer store.deinit();
         var compute = NativeCompute.init(allocator, &store.store, null);
+        defer compute.deinit();
         var cb = compute.computeBackend();
         break :blk try runOneStep(allocator, &cb, config, batch.inputs());
     };
@@ -1060,6 +1061,7 @@ fn runCudaGradParity(
         var store = try NativeStore.init(allocator, specs);
         defer store.deinit();
         var compute = NativeCompute.init(allocator, &store.store, null);
+        defer compute.deinit();
         var cb = compute.computeBackend();
         const started_ns = monotonicNowNs();
         const run = try runOneStep(allocator, &cb, config, batch.inputs());
@@ -1236,6 +1238,7 @@ test "GLiNER2 CUDA packed DeBERTa attention forward and VJP match native" {
     var native_store = try NativeStore.init(allocator, &.{});
     defer native_store.deinit();
     var native_compute_instance = NativeCompute.init(allocator, &native_store.store, null);
+    defer native_compute_instance.deinit();
     var native_cb = native_compute_instance.computeBackend();
     const token_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
     const rel_shape = [_]i32{ @intCast(2 * seq_len - 1), @intCast(hidden) };

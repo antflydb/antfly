@@ -3,6 +3,187 @@
 The root build exposes a default test aggregate plus package-scoped and
 special-purpose test tiers.
 
+## Build ownership
+
+`build.zig` resolves public options and connects owner constructors. Substantial
+library definitions live in `lib/<owner>/build_support.zig`. Antfly's runtime,
+embedded artifacts, benchmarks, generators, and test suites live in
+`pkg/antfly/build/`; inference constructors live in `pkg/inference/build/` and
+serve both package and root entrypoints. Small library definitions stay inline.
+
+Give library constructors an explicit owner path and compatible dependency modules.
+Constructors return artifacts and runs; entrypoints publish target names and connect
+aggregates. Native and WASM configurations remain separate. Runtime archive boundaries, link order, and
+test selections belong to their owners; moving a definition does not change them.
+
+The unified browser runtime in `pkg/antfly/build/wasm.zig` owns a fixed WASM32
+ReleaseSafe configuration, including HTTPX, JSON, OpenAPI, and storage modules.
+Native optimization, target, and storage flags do not configure those modules.
+Native and WASM OpenAPI modules use one wiring constructor with separate module
+instances; SentencePiece modules share the same generated source output.
+
+Python process-lifecycle checks run only when Zig's executor resolver identifies a
+native target. Foreign Linux/macOS fixtures still compile, and the build summary
+reports those process checks as skipped. Ordinary Zig test executables keep Zig's
+normal foreign-execution and emulator handling. Run the process suites natively
+on Linux/macOS to qualify signal, process-group, and cancellation behavior.
+
+OpenAPI generators run on the host and write formatted Zig files into declared
+cache outputs. `make openapi-generate` (from `zig/`) synchronizes those outputs and
+the joined public schema into the checked-in trees, including removal of obsolete
+generated files. `make openapi-check` compares them without modifying source files.
+Both use the normal Zig cache; source files, generator options, Python dependency
+locks, and the schema tree supply the inputs. No Git-derived cache key is needed.
+Schema joins resolve references to deterministic owner paths and report the files
+they read through depfiles. Missing required schemas fail the join; generated
+bundles and same-named files elsewhere cannot substitute for them.
+The HTTP API embeds the source schemas through a dedicated module with tracked
+`@embedFile` inputs. The API kernel and HTTP-serving test/benchmark roots attach
+that module explicitly; shared imports and build options carry no schema inputs.
+Editing an embedded schema leaves the CLI, distributed, serverless, and inference
+runtime archives cached.
+
+Runtime dependency and cache contracts are checked in CI with
+`python3 -m unittest tools.test_runtime_cache` from `zig/`, with Zig and uv on
+`PATH` and `zig/deps/snowball` initialized (`git submodule update --init
+zig/deps/snowball` from the repository root). The fixtures call the real root and
+standalone inference compositions and replace expensive runtime, test, benchmark,
+and WASM entry bodies. They
+keep external modules, options, generated assets, backend inputs, and final link
+edges; the inference probe also loads the real inference module. Native training
+and paged-attention benchmarks retain their actual entry bodies and execute small
+workloads. Finetune command checks also retain every registered executable's real
+entry body and final link. The existing `inference-finetune-test` aggregate (or
+standalone `test-finetune`) compiles these commands without running model workloads;
+the command registries supply the coverage without a second command inventory.
+The checks cover:
+
+- Finetune commands compile with valid module boundaries. Recipe dispatch and
+  standalone training entrypoints share their implementation owner. Dataset
+  generators use standard I/O, while converters and inspectors import the data
+  owner without the inference runtime. Actual bounded generators and converters
+  stay cached across Metal, CUDA, PJRT, ONNX, and release-version changes in both
+  entrypoints, even with ONNX enabled and its installation absent. Generated data
+  remains unchanged; editing a generator rebuilds it and changes its output.
+
+- The normal finetune unit aggregate compiles every registered command once in
+  its regular build cache. A configuration-only regression checks aggregate
+  membership against the command registries and detects a removed dependency;
+  it does not repeat those compilations in a disposable cache.
+- Offline adapter/checkpoint commands use roots scoped to their asset owner.
+  Checkpoint operations and shared types live in `pkg/inference/src/finetune/assets/`;
+  training imports those implementations. Bundle inspection and cached entity
+  cleanup also have explicit offline owners. ONNX file parsing and tensor-byte
+  access use `onnx_data`, independently of graph conversion and optimizers.
+  One library constructor returns the configured data and graph modules for
+  native and browser consumers.
+  Actual executables from every owner check these boundaries in both entrypoints;
+  composition, inspection, and head materialization also run on tiny SafeTensors
+  inputs. The cleanup tools prepare two mentions per split and train one epoch;
+  their reports and saved head are checked. Backend flags, release metadata,
+  unrelated training code, CUDA kernels, and optimizer edits leave all sampled tools cached. A head-format edit rebuilds
+  only its owning command and changes its output; a PEFT edit rebuilds its
+  consumers and changes the composed weights. A cleanup-cache format edit
+  rebuilds only the two cleanup tools and changes the emitted cache. Invalid
+  input after a valid adapter returns an error with correct cleanup.
+- ONNX data and graph tests both participate in `lib-onnx-test`, `lib-test`,
+  and standalone inference's `test-onnx-graph`. The coverage regression executes
+  the actual parser test artifact, verifies that a failing parser test fails
+  the run, and rejects a removed aggregate dependency.
+- All six served schemas invalidate only the API kernel; the other archives can
+  build with a schema missing.
+- The remote CLI has no transitive tokenizer, storage-engine, or inference
+  implementation imports. Tokenizer data and generator changes invalidate their
+  local consumers while the CLI remains cached.
+- Audio carries no inference options. GPU identities belong to enabled backends;
+  CPU builds configure and compile with the disabled Metal `.m` and CUDA `.cu`
+  kernel source files absent.
+  Enabled fingerprints match an independent implementation of the qualification
+  identity format and change when their source inputs change.
+- ONNX headers and libraries are dependencies of their consuming modules. A
+  missing installation fails those compile/link steps; root and standalone
+  inference help and unrelated library targets still work with ONNX enabled.
+- Production runtime archives have no transitive VOPR imports. Editing or removing
+  VOPR source leaves all five archives cached, while the actual API simulation
+  test recompiles on an edit and fails when its dependency is missing. Test
+  constructors receive VOPR explicitly; the full Antfly package retains its
+  public simulation exports.
+- Production archives have no transitive LMDB engine imports, and disabled LMDB
+  settings are normalized. Backend/async options and engine edits leave those
+  archives cached; the actual LMDB wrapper test probe rebuilds and reports the
+  selected settings. Removing the engine still allows production builds but
+  fails its test consumer. Embedded, test, and benchmark constructors receive
+  LMDB explicitly.
+- Disabled PJRT has no production import edge in either entrypoint. PJRT edits
+  and removal leave CPU products cached. Enabled products and explicit
+  qualification tests still rebuild on source edits and fail for missing source.
+- Storage, API, and serverless archives declare their own imports. MCP/A2A edits
+  rebuild only the API archive; Raft edits leave serverless cached. Required
+  dependencies still invalidate their consumers and fail when removed. Tests
+  and the full public package retain their broader interfaces.
+- Lite capability settings live in a dedicated module attached to storage/Lite
+  consumers. Toggling local inference advertising changes the actual capability
+  result and rebuilds storage; API, serverless, CLI, and inference remain cached.
+- Both entrypoints explicitly supply inference's metrics and logging modules.
+  Editing those modules rebuilds inference; removing them fails its compilation
+  while help and unrelated audio targets still work. Compatibility source edits
+  do not affect production or silently change the selected implementation.
+- Native training and paged-attention benchmarks own CPU options and dependencies.
+  Both entrypoints run bounded attention, optimizer, and training workloads and
+  check finite measurements/losses. Accelerator flags, missing GPU kernel files,
+  unavailable ONNX installations, and release versions leave these binaries
+  cached; edits to their math implementation still rebuild them.
+- Release versions live in a small `lib/build_info` object. Archives see only a
+  stable accessor module; final links attach the object only for version consumers.
+  Tests use stable test metadata. Version-only changes leave the five runtime
+  archives cached while the resulting binary reports the updated version. The
+  unchanged dataset generator compiles, runs, and stays cached across version
+  changes; a training-command probe still links and reports the updated version.
+  ABI constants remain at their interface declarations.
+- Storage options do not invalidate the CLI or inference archives. A real shared
+  implementation edit does invalidate its consumers and changes linked behavior;
+  an unchanged rebuild reuses compilation and generated outputs.
+- Host generators stay cached across product targets and optimization settings.
+  HTTPX runtime edits do not invalidate the OpenAPI compiler.
+- Every published native artifact's runtime imports match its target and
+  optimization profile in both build entrypoints, including benchmark-specific
+  profiles. Compiled audio and linalg probes verify Debug and ReleaseFast reach
+  the actual library modules and stay cached across version changes. Graph checks
+  also cover foreign targets and a separate PDF optimization override.
+- WASM runtime imports retain their target and ReleaseSafe profile. Compiled
+  HTTPX/JSON probes and the WASM artifact remain cached when native target,
+  optimization, or storage options change. Inference's browser profile also
+  ignores native diagnostics and server settings; WebGPU and memory-model
+  changes still rebuild its artifact. The inference probe retains production
+  dependencies and replaces only the entry body.
+- Schema joins detect removed and restored inputs, new references, and retargeted
+  symlinks. Warm outputs match a fresh join; unrelated files do not invalidate it.
+- SQL and Snowball checks and regeneration reuse the same final formatted
+  outputs. Checks report drift without repairing source files; neither operation
+  rewrites cached generator outputs. Schema and Python codegen input changes
+  select these generated-source and cache checks in CI.
+
+Tokenizer constructors and SentencePiece generation live under `lib/tokenizer`.
+Entrypoints supply the same compatible tokenizer modules to inference and Antfly;
+the inference owner receives the modules rather than reconstructing them. GPU
+source identities use cached host generation with declared file arguments,
+including their original ordered bundle hashing format. There is no eager source
+hashing or separately maintained dependency inventory.
+
+Zig still reads relative `.zig` imports inside disabled branches. Consequently,
+edits to the Metal/CUDA Zig implementations can invalidate the CPU inference
+archive, even though no GPU identity generator runs. Removing that dependency
+requires separate backend modules with shared inference types; the cache contract
+above applies to the kernel source inputs and build graph, not every source file
+inside the inference module.
+
+These checks establish cache boundaries; they do not substitute for production
+compilation or runtime tests. For timing comparisons, hold Zig version, target,
+optimization, backend flags, job limit, and cache policy fixed. Measure cold,
+unchanged, and representative edit builds separately, recording compiler step
+status, elapsed/CPU time, and peak RSS. A smaller import graph primarily improves
+incremental invalidation; the expensive runtime code still dominates clean builds.
+
 ## Default Tests
 
 Run the default test suite from the repository root:
@@ -13,8 +194,10 @@ make zig-test
 
 `zig build test` depends on the default package aggregates:
 
+- `zig build lib-test`
 - `zig build antfly-test`
 - `zig build inference-test`
+- `zig build inference-finetune-test`
 
 The default aggregate is intended to be the normal local and CI confidence
 target. It does not fetch external corpora and does not run benchmark or soak
@@ -51,12 +234,12 @@ zig build antfly-test
 
 `antfly-test` includes:
 
-- `unit-test`
-- `sim-test`
-- `integration-test`
-- `recall-test`
+- `antfly-unit-test`
+- `vopr-test`
+- `antfly-integration-test`
+- `antfly-recall-test`
 - the default recall harness over `testdata/vectorsets`
-- `chaos-test`
+- `antfly-chaos-test`
 
 Run only the inference package tests:
 
@@ -64,8 +247,17 @@ Run only the inference package tests:
 zig build inference-test
 ```
 
-`inference-test` delegates to `pkg/inference` by running `zig build test` in that
-package with the root build's relevant backend options forwarded.
+`inference-test` uses the same constructors as `zig build test` inside
+`pkg/inference`. Inference and platform checks participate directly in the root
+build graph, so the root scheduler, memory budget, and build runner govern them.
+Root inference targets use the root's resolved backend options and shared modules;
+package-local commands retain the standalone defaults. Runtime arguments follow
+`--`, and package-relative fixtures run with an explicit package working directory.
+
+Root inference installs use `zig/zig-out` (or the root `--prefix`). Package-local
+installs continue to use `pkg/inference/zig-out`. The root default install remains
+Antfly and its assets; constructing inference targets does not build or install
+the standalone inference CLI.
 
 ## Antfly Tiers
 
@@ -75,10 +267,29 @@ Run the hermetic unit and focused integration bucket:
 make zig-unit-test
 ```
 
-`unit-test` is where default, no-fetch Antfly, storage, and shared-library unit
-coverage belongs. Focused aliases such as `lib-json-test`, `db-test`, and
-`wal-test` remain available for narrower iteration, but broad module suites are
-wired into `unit-test` once.
+`antfly-unit-test` owns Antfly unit and focused integration coverage. `lib-test`
+owns the existing default standalone library checks, including platform tests.
+The repository's `make zig-unit-test` gate runs `lib-test antfly-unit-test
+inference-test inference-finetune-test`, preserving its previous coverage.
+Use `zig build antfly-unit-test` for Antfly alone. All `zig build` commands here
+run from `zig/`; `lib-*` names refer to code in `zig/lib/`, and `antfly-*` names
+follow the subsystem path beneath `pkg/antfly/src/`.
+
+`antfly-storage-db-test` uses the focused DB root, whose inventory contains all
+former full-root DB and result-shape selections plus its own unique cases. It
+runs that union once. Focused subsystem suites remain available for iteration.
+
+Enable progress labels on the same run nodes with `-Dtest-progress=true`; this
+changes neither the selected tests nor scheduling. Regressions formerly exclusive
+to the progress shortcut now belong to the metadata and data-storage suites.
+
+The single `antfly-storage-db-enrichment-test` compiles the former selections once.
+Narrow its curated suite with runtime filters; unmatched selections fail:
+
+```sh
+zig build antfly-storage-db-enrichment-test -- --test-filter "split cutover"
+zig build antfly-storage-db-enrichment-test -- --list-tests
+```
 
 The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 0.16 build runner so ready steps retain their declared RSS reservations. Set
@@ -86,61 +297,53 @@ The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 From the `zig/` directory, the equivalent targets are `make test` and
 `make unit-test`.
 
-Run mocked-time and modeled simulation checks:
+Run fast deterministic VOPR checks, including production HTTP on `VoprIo`:
 
 ```sh
-zig build sim-test
+zig build vopr-test
 ```
 
 Run focused real HTTP and public API integration checks:
 
 ```sh
-zig build integration-test
+zig build antfly-integration-test
 ```
 
 Run bounded generated chaos campaigns:
 
 ```sh
-zig build chaos-test
+zig build antfly-chaos-test
 ```
 
 Run recall checks:
 
 ```sh
-zig build recall-test
-zig build recall-harness
+zig build antfly-storage-vectorindex-recall-test
+zig build recall-harness && ./zig-out/bin/recall_harness
 ```
 
 ## Conformance And Soak
 
-Fetch and run the conformance suites:
+Conformance targets fetch missing external fixtures, reuse cached corpora, and run
+the suite. Setup failures fail the target. These suites remain opt-in; ordinary
+library tests do not download external corpora.
 
 ```sh
 zig build conformance-test
-```
-
-`conformance-test` is intentionally outside `zig build test` and may download
-or refresh external corpora under local paths such as `/tmp`. It keeps
-successful corpus output quiet. Use the suite-specific run-only steps when you
-want verbose per-fixture output, or when you want to avoid fetches and use
-already present local corpora:
-
-```sh
-zig build lib-toon-conformance-run
-zig build lib-image-conformance-run
-zig build lib-audio-conformance-run
-zig build image-jpeg-seed-corpora-e2e-run
-```
-
-The suite-specific fetch and fetch-and-run steps remain available:
-
-```sh
-zig build lib-toon-conformance-fetch
 zig build lib-toon-conformance
-zig build lib-image-conformance-fetch
 zig build lib-image-conformance
-zig build lib-audio-conformance-fetch
 zig build lib-audio-conformance
+```
+
+Library suite names follow `lib-<library>-conformance`, alongside
+`lib-<library>-test` and `lib-<library>-bench`.
+
+Fixtures are cached under `/tmp` by default. Use
+`-Dconformance-fixtures=/absolute/path` to choose another cache directory.
+For offline runs, disable fixture fetching explicitly (missing fixtures fail):
+
+```sh
+zig build conformance-test -Dconformance-fetch=false -Dconformance-fixtures=/absolute/path
 ```
 
 Run long-running soak aggregates:
@@ -340,10 +543,10 @@ The build still exposes focused steps for narrow iteration. Examples:
 
 ```sh
 zig build lib-httpx-test
-zig build lib-metadata-test
+zig build antfly-metadata-test
 zig build lsm-backend-test
 zig build persistent-test
-zig build db-test
+zig build antfly-storage-db-test
 zig build sparse-test
 ```
 
@@ -352,3 +555,11 @@ List all available steps with:
 ```sh
 zig build --help
 ```
+
+## DB analytics and planner coverage
+
+Algebraic behavior uses the normal DB, API, metadata, and graph owner suites.
+`antfly-storage-db-test` includes the planner-ownership regression, and
+`antfly-unit-test` retains the dynamic-template/cardinality-cache selections.
+There are no separate algebraic test or guardrail targets. Benchmark sweeps use
+`scripts/run_db_query_matrix.py --suite analytics`; see [BENCHMARKS.md](BENCHMARKS.md#analytics-comparisons).

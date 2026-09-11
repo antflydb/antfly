@@ -130,7 +130,9 @@ def sha256_file(path: pathlib.Path) -> str:
 
 
 def canonical_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -140,20 +142,19 @@ def build_evidence_manifest(
     exclude: Iterable[pathlib.Path | str] = (),
 ) -> dict[str, Any]:
     root = root.resolve()
-    excluded = {
-        pathlib.PurePosixPath(path).as_posix()
-        for path in exclude
-    }
+    excluded = {pathlib.PurePosixPath(path).as_posix() for path in exclude}
     files: list[dict[str, Any]] = []
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         relative = path.relative_to(root).as_posix()
         if relative in excluded:
             continue
-        files.append({
-            "path": relative,
-            "bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        })
+        files.append(
+            {
+                "path": relative,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
     identity = {"schema": MANIFEST_SCHEMA, "files": files}
     return {
         **identity,
@@ -171,7 +172,9 @@ def write_evidence_manifest(
     try:
         relative_output = output.relative_to(root).as_posix()
     except ValueError as exc:
-        raise ValueError("evidence manifest must be written inside its evidence root") from exc
+        raise ValueError(
+            "evidence manifest must be written inside its evidence root"
+        ) from exc
     manifest = build_evidence_manifest(root, exclude=(relative_output,))
     output.write_text(
         json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",

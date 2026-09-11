@@ -1,6 +1,8 @@
 ---
-title: Antfly inference
-description: Use Antfly inference for local ML inference — embeddings, chunking, and reranking
+title: Antfly Inference
+sidebar: concepts
+order: 3
+description: The model runtime inside Antfly, what it runs, and how to pull and configure models for it
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -9,153 +11,207 @@ tags: [inference, embeddings, reranking, models]
 ---
 
 <Questions>
-- What is Antfly inference?
-- How do I download models for Antfly inference?
+- What is Antfly Inference?
+- How do I download models for Antfly Inference?
 - What models are available?
-- How do I use Antfly inference for embeddings, chunking, and reranking?
+- How do I use Antfly Inference for embeddings, chunking, reranking, and generation?
+- Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly inference is Antfly's local ML inference service for embeddings, chunking, and reranking. It runs ONNX-optimized models for fast CPU inference without external API dependencies.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) in the same process as the database, so index enrichers and query processors call it without a network hop and nothing leaves the machine. It executes optimized ONNX and native GGUF artifacts without external API dependencies. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
-## Features
-
-- **Embedding Generation** - Text and multimodal (CLIP) embedding models
-- **Text Chunking** - Semantic chunking with ONNX models or fixed-size fallback
-- **Reranking** - Relevance re-scoring for search results
-- **Privacy** - Data never leaves your infrastructure
-
-## Model Management
-
-### List Available Models
-
-View all available models in the registry:
+Pull a model, then embed a sentence through the running engine:
 
 ```bash
-antfly inference list --remote
+antfly inference pull antflydb/clipclap:gguf:Q4_K
+
+curl -X POST http://127.0.0.1:8080/ai/v1/embed \
+  -H "Content-Type: application/json" \
+  -d '{"model":"antflydb/clipclap","input":["a photograph of a lighthouse"]}'
 ```
 
-### Download Models
+The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object":"list","data":[{"embedding":[...]}]}`).
 
-Models are pulled from HuggingFace by their full `owner/name` reference. A bare name
-without an owner is rejected.
+## Where It Listens
+
+In standalone mode the runtime is served on the API port under `/ai/v1`, beside `/db/v1`. Run as its own process with `antfly inference run`, it listens on `127.0.0.1:8090` by default, and a database points at it with the `inference.api_url` config key. External providers (Ollama, OpenAI, Bedrock) plug into the same embedder, reranker, and generator interfaces, so an index config names a provider and a model and never cares which process answers.
+
+## Configuring a Separate Inference Process
+
+`antfly inference run --config inference.json` reads admission settings and the
+model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`:
+
+```json
+{
+  "inference": {
+    "models_dir": "/models",
+    "ml_dir": "/ml",
+    "max_loaded_models": 3,
+    "preload": [
+      {"kind": "embedder", "name": "BAAI/bge-small-en-v1.5", "backend": "native"}
+    ]
+  }
+}
+```
+
+Pull the referenced models into that directory before starting the process.
+The operator's flat config spelling (those four fields at the top level) is
+also accepted. If both spellings exist, the nested `inference` value wins for
+each field, including an explicit empty `preload` list. No `api_url` is required
+to start the server; configure the listener with `--host` and `--port`.
+
+Explicit CLI options override config regardless of argument order. Supplying
+one or more `--preload-model` flags replaces the config preload list rather than
+appending to it. For an exact match of kind, model reference (including artifact
+variant), and backend, config-only `residency_mode` and `memory_budget_mb`
+policies are retained; unrelated config models are not loaded. Duplicate config
+entries matching the same CLI selection are rejected as ambiguous.
+A model-count limit of zero disables that limit. When paths are
+absent from both CLI and config, the usual environment/home defaults apply.
+Preload entries retain their backend, artifact format/quantization, and optional
+residency/memory-budget choices.
+An unqualified preload name with `format`/`quantization` is expanded to an
+explicit artifact reference (for example, `owner/model:gguf:Q4_K`) before
+resolution. Conflicts between preferences and already-qualified references are
+rejected rather than silently selecting another installed artifact.
+
+This config support is for the next runtime release; v0.2.1 requires explicit
+model CLI flags. The operator continues passing those flags so its fix can be
+released independently of the runtime update.
+For that compatibility, the operator resolves nested model overrides into the
+flat config spelling before emitting JSON or CLI arguments. It writes default
+model kinds (`generator` when omitted in `spec.config.preload`) and normalized
+artifact references into both outputs. Remaining non-model nested settings are
+preserved with the client URL field required by the legacy schema; admission
+settings and flat per-model policies remain intact.
+Config-only per-model policies require the new runtime; releasing the operator
+does not add those capabilities to v0.2.1.
+
+For operator-generated eager preloads (the default loading strategy), specify a
+recognized task such as `tasks: [embed]` or `tasks: [generate]` on each model.
+The v0.2.1 warm CLI needs a model kind; an omitted or unrecognized task hint
+does not imply a generator. The operator reports a configuration validation
+failure before creating or updating the workload when that kind is ambiguous.
+Alternatively, supply `spec.config.preload` with an explicit `kind`, or use
+lazy/bounded loading to discover the model task at request time. Per-model
+eager strategy overrides have the same requirement.
+
+Empty or null optional `backend`, `format`, and `quantization` fields in operator
+preload configuration are treated as unspecified in both JSON and CLI output.
+
+## Pulling Models
+
+Models come from HuggingFace by their full `owner/name` reference; a bare name without an owner is rejected. The `hf:` prefix is accepted.
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
-antfly inference pull hf:mixedbread-ai/mxbai-rerank-base-v1 --tasks rerank
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
-Use `--tasks` to record what the model is for, which determines where it is discovered
-and which endpoints will serve it.
+`--tasks` records what the model is for, which decides where it is discovered and which endpoints serve it. Text generation supports a specific set of decoder architectures, so check [Local Model Compatibility](/docs/guides/supported-models) before pulling a generator.
 
-Verified starting points:
-- **Embedders**: `BAAI/bge-small-en-v1.5`, `antflydb/clipclap` (text + image + audio)
-- **Rerankers**: `mixedbread-ai/mxbai-rerank-base-v1`
-- **Generators**: `ggml-org/gemma-4-E4B-it-GGUF` — see [Supported models](/docs/guides/supported-models)
-- **Transcribers**: `openai/whisper-tiny`
-- **Readers**: `antflydb/Florence-2-base`
-- **Extractors**: `antflydb/gliner2-base-v1:gguf:Q4_K`
+`--projector auto` is the default. Gemma 4's unified projector enables image and audio inputs and is recorded in the generated model manifest. Use `--projector none` for a text-only installation.
 
-### List Local Models
+Verified starting points, one per job:
 
-View models you've downloaded:
+| Job | Model |
+|-----|-------|
+| Text embedding | `BAAI/bge-small-en-v1.5` |
+| Multimodal embedding (text, image, audio) | `antflydb/clipclap` |
+| Reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` |
+| Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
+| Transcription | `openai/whisper-tiny` |
+| Reading and OCR | `antflydb/Florence-2-base` |
+| Extraction | `antflydb/gliner2-base-v1:gguf:Q4_K` |
+
+See what is installed:
 
 ```bash
 antfly inference list
 ```
 
-### Model Variants
+The full registry, with descriptions and sizes, is the [models browser](/inference).
 
-Models support different quantization variants:
+## Variants
 
-| Variant | Description |
-|---------|-------------|
-| `f32` | Full precision (largest, most accurate) |
-| `i8` | INT8 quantized (smaller, faster, recommended) |
-
-Append the variant to the reference to select one:
+A variant appended to the reference selects an artifact format or quantization. The advertised variants are `gguf`, `gguf:<quant>` (for example `gguf:Q4_K`), `onnx`, `hybrid`, and `safetensors`; `i8` and `f32` are still recognized and select among the ONNX artifacts:
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5:i8 --tasks embed
 ```
 
+With no variant the pull is `auto`. Keep one variant per model directory: a second variant pulled beside the first leaves both in place, and different parts of a model can then resolve to different variants. If a model misbehaves after a second pull, delete the directory and pull once.
+
 ## Model Storage
 
-Models are stored in `~/.antfly/inference/models/` by default, organized by type:
-- `~/.antfly/inference/models/embedders/` - Embedding models
-- `~/.antfly/inference/models/chunkers/` - Chunking models
-- `~/.antfly/inference/models/rerankers/` - Reranking models
-- `~/.antfly/inference/models/generators/` - Generation models
+Models live under `$ANTFLY_INFERENCE_MODELS_DIR`, else `~/.antfly/inference/models`; `--models-dir` overrides both. A variant-less pull installs flat under the HuggingFace owner and repository name:
 
-Antfly inference auto-discovers and loads models from these directories when Antfly starts in standalone mode. Use `--models-dir` to override the default location.
-
-For text generation, only a specific set of model architectures is supported. See
-[Supported models](/docs/guides/supported-models) before pulling a generator.
-
-## Configuration
-
-Antfly inference models can be used in index and query configurations:
-
-### Embedder Configuration
-
-```json
-{
-  "provider": "antfly",
-  "model": "BAAI/bge-small-en-v1.5"
-}
+```text
+~/.antfly/inference/models/
+  BAAI/bge-small-en-v1.5/
 ```
 
-### Chunker Configuration
+An explicit variant gets its own distinct leaf directory beside the plain one, so quantizations cannot be mixed accidentally. Older per-task subdirectories (`embedders/`, `chunkers/`, `rerankers/`, `generators/`) are still discovered. Antfly Inference loads what it finds there when standalone mode starts.
 
-`fixed_bert` and `fixed_bpe` are built in and need no download.
+Traditional ML predictors use the parallel `~/.antfly/inference/ml/` directory; `--ml-dir` overrides it. Neither inference asset directory follows the database `--data-dir` implicitly.
 
-```json
-{
-  "provider": "antfly",
-  "model": "fixed_bert",
-  "target_tokens": 512,
-  "overlap_tokens": 50
-}
-```
+## Naming a Model in an Index or Query
 
-### Reranker Configuration
+The provider name is `antfly`. The same three shapes appear in table, index, and query configs:
 
 ```json
-{
-  "provider": "antfly",
-  "model": "mixedbread-ai/mxbai-rerank-base-v1",
-  "field": "body"
-}
+{ "provider": "antfly", "model": "BAAI/bge-small-en-v1.5" }
 ```
 
-## Troubleshooting an enrichment backlog
+The API uses one `EmbedderProvider` and one canonical `EmbedderConfig` across inference features. Index creation accepts the purpose-specific `IndexEmbedderConfig` subset (`antfly`, `ollama`, `openai`, or `bedrock`), so generated clients cannot advertise providers that the indexing runtime cannot execute.
 
-Inspect an embeddings index while enrichment is pending:
+```json
+{ "provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0", "field": "body" }
+```
+
+Reranking supports `antfly`, `cohere`, and `vertex`. Ollama reranking is not advertised because Antfly does not implement a compatible Ollama rerank API.
+
+```json
+{ "provider": "antfly", "model": "fixed_bert", "text": { "target_tokens": 512, "overlap_tokens": 50 } }
+```
+
+The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chunk sizing nests under `text`, and `target_tokens` must be larger than `overlap_tokens` or the request fails with `InvalidChunkOverlap`.
+
+## When Enrichment Falls Behind
+
+An embeddings index reports its own backlog. Inspect it while enrichment is pending:
 
 ```bash
-curl http://localhost:8080/db/v1/tables/TABLE/indexes/INDEX
+curl http://127.0.0.1:8080/db/v1/tables/TABLE/indexes/INDEX
 ```
 
-The `enrichment_runtime` object reports sequence progress, retry and failure
-counters, active batch information, and worker lifecycle state.
-`worker_started` says whether the background worker is running. `stalled` is
-the narrower condition where work is pending but no worker is running and no
-retry or terminal failure already explains the backlog.
+The `enrichment_runtime` object carries sequence progress, retry and failure counters, the active batch, and worker lifecycle state. `worker_started` says whether the background worker is running. `stalled` is the narrower condition: work is pending, no retry or terminal failure already explains the backlog, and either no worker is running or the active batch has passed its deadline without progress. `stall_reason` says which (`worker_missing`, `model_loading`, `embedding_overdue`, or `publishing_overdue`).
 
-For exact keys that have reached Antfly's durable artifact or index repair
-queues, use the bounded operator endpoint:
+For keys that have reached the durable repair queues, ask the bounded operator endpoint:
 
 ```bash
-curl -X POST http://localhost:8080/db/v1/tables/TABLE/repair/issues \
+curl -X POST http://127.0.0.1:8080/db/v1/tables/TABLE/repair/issues \
   -H 'Content-Type: application/json' \
   -d '{"target":"artifact","limit":100}'
 ```
 
-This repair endpoint does not enumerate every document in the pending
-enrichment tail. If pending work is reported but no durable repair issue is
-listed, use the runtime counters and server logs to distinguish a worker
-lifecycle problem from retrying inference.
+It lists durable repair issues, not every document in the pending tail. Pending work with no listed issue means the cause is a worker lifecycle problem or inference that is still retrying; the runtime counters and server logs tell those apart.
 
-## API Reference
+## Use Agent Skills
 
-See the [Inference API documentation](/inference/api) for details on the HTTP endpoints.
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Set up local embeddings and reranking with Antfly Inference and wire them into my table's index", and use this page to judge the result.
+
+## Next Steps
+
+- [Local Model Compatibility](/docs/guides/supported-models): which artifacts load, which are rejected, and why
+- [Multimodal Embeddings](/docs/guides/multimodal): the ClipClap embedder on an image index
+- [Tune Hybrid Search](/docs/guides/hybrid-search): the reranker in a query pipeline
+- [Inference API reference](/inference/api): the HTTP surface

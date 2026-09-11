@@ -16,8 +16,8 @@
 //!
 //! This is intentionally not an artifact certification system. Compatibility is derived
 //! from the artifact contract and the runtime paths compiled into this build. Unknown
-//! contracts require an explicit server opt-in. Known unsafe or invalid contracts remain
-//! blocked even when that opt-in is set.
+//! contracts are attempted by default. Known unsafe or invalid contracts remain
+//! blocked; repository names, published receipts, and qualification lists are not admission policy.
 
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
@@ -59,7 +59,7 @@ pub const Assessment = struct {
 };
 
 pub const Policy = struct {
-    allow_unknown: bool = false,
+    allow_unknown: bool = true,
 };
 
 pub const Inspection = struct {
@@ -149,7 +149,7 @@ pub fn assessInspection(
         return makeUnknown(
             inspection.architecture,
             .artifact_unreadable,
-            "GGUF compatibility metadata could not be inspected; start the server with --allow-unknown-models to opt in",
+            "GGUF compatibility metadata could not be inspected",
         );
     }
     return assessWithRuntimeFacts(
@@ -177,13 +177,40 @@ fn assessWithRuntimeFacts(
     if (man.hasIncompleteGlinerBundle() or
         man.hasIncompleteColqwenBundle() or
         man.hasIncompleteClipclapGgufBundle() or
-        man.hasIncompleteFlorence2GgufBundle())
+        man.hasIncompleteFlorence2GgufBundle() or
+        man.hasIncompleteQwen3VlGgufBundle())
     {
         return makeIncompatible(
             architecture,
             .incomplete_bundle,
             "the model bundle is missing required artifacts or sidecars",
         );
+    }
+
+    if (man.isQwen3VlBundle()) {
+        // The CUDA generation route uses the official integrated BF16
+        // safetensors bundle instead of the split GGUF decoder/projector
+        // promotion used by Metal.
+        if (man.isQwen3VlGenerationSafetensorsBundle()) {
+            if (man.model_type == .generator and stringIn(architecture, &.{ "qwen3_vl", "qwen3vl" })) {
+                return makeCompatible(
+                    architecture,
+                    "declared Qwen3-VL integrated BF16 safetensors generation bundle",
+                );
+            }
+            return makeIncompatible(
+                architecture,
+                .unsupported_backend,
+                "Qwen3-VL BF16 safetensors bundle does not match the declared generation role",
+            );
+        }
+        if (stringIn(architecture, &.{ "qwen3vl", "qwen3_vl" }) and
+            ((man.model_type == .generator and std.mem.eql(u8, man.inference_bundle_family, manifest_mod.qwen3_vl_gguf_bundle_family)) or
+                (man.model_type == .reranker and man.isQwen3VlRerankerGgufBundle())))
+        {
+            return makeCompatible(architecture, "Qwen3-VL decoder/projector runtime");
+        }
+        return makeIncompatible(architecture, .unsupported_backend, "the Qwen3-VL artifact route does not implement the declared serving role");
     }
 
     if (man.model_type == .generator)
@@ -240,7 +267,17 @@ fn assessWithRuntimeFacts(
                 .unsupported_backend,
                 "standalone CLAP graph conversion is not compatible; use ClipClap",
             ),
-            else => {},
+            else => {
+                // Qwen3-Embedding checkpoints resolve to the qwen3 decoder
+                // arch (unknown to the encoder list below) but serve through
+                // the resident last-token embedding runtime.
+                if (std.mem.eql(u8, architecture, "qwen3") and
+                    man.embedding_style == .qwen3_embedding and
+                    man.isLastTokenDecoderEmbedder())
+                {
+                    return makeCompatible(architecture, "Qwen3 last-token embedding runtime");
+                }
+            },
         },
         .classifier => {
             if (man.native_arch_hint == .layoutlmv3) {
@@ -251,17 +288,15 @@ fn assessWithRuntimeFacts(
                 );
             }
         },
-        .reranker, .chunker, .recognizer, .transcriber => {},
+        .reranker => {
+            if (std.mem.eql(u8, architecture, "qwen3") and man.usesGgufWeights()) {
+                return makeCompatible(architecture, "Qwen3 GGUF final-token yes/no reranking runtime");
+            }
+        },
+        .chunker, .recognizer, .transcriber => {},
         .generator => unreachable,
     }
 
-    if (std.mem.eql(u8, architecture, "nomic-bert")) {
-        return makeIncompatible(
-            architecture,
-            .unsupported_backend,
-            "the published GGUF tokenizer is not supported by the current loader",
-        );
-    }
     if (std.mem.eql(u8, architecture, "bart")) {
         return makeIncompatible(
             architecture,
@@ -276,7 +311,7 @@ fn assessWithRuntimeFacts(
     return makeUnknown(
         architecture,
         .unknown_architecture,
-        "unrecognized model architecture; start the server with --allow-unknown-models to opt in",
+        "unrecognized model architecture; the selected backend will validate it at load time",
     );
 }
 
@@ -370,6 +405,11 @@ fn assessGenerator(
         "qwen35",
         "qwen3next",
         "qwen35moe",
+        "qwen3_vl",
+        "qwen3_vl_text",
+        "qwen3_vl_moe",
+        "qwen3vl",
+        "qwen3vlmoe",
         "gpt2",
         "gpt_neo",
         "gpt_neox",
@@ -389,7 +429,7 @@ fn assessGenerator(
     return makeUnknown(
         architecture,
         .unknown_architecture,
-        "unrecognized generator architecture; start the server with --allow-unknown-models to opt in",
+        "unrecognized generator architecture; the selected backend will validate it at load time",
     );
 }
 
@@ -404,6 +444,8 @@ fn knownEncoderArchitecture(architecture: []const u8) bool {
         "deberta_v2",
         "modernbert",
         "modern_bert",
+        "nomic-bert",
+        "nomic_bert",
         "mmbert",
         "gliner",
         "gliner2",
@@ -435,13 +477,41 @@ pub fn makeIncompatible(architecture: []const u8, code: Code, message: []const u
     return .{ .level = .incompatible, .code = code, .message = message, .architecture = architecture };
 }
 
-test "unknown generators are unknown and require opt in" {
+test "qwen3 embedding accepts the executable contract without a catalog receipt" {
+    var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    man.model_type = .embedder;
+    man.pooling = .last;
+    man.embedding_style = .qwen3_embedding;
+    const result = assess(&man, "qwen3");
+    try std.testing.expectEqual(Level.compatible, result.level);
+
+    var promoted = Inspection{
+        .architecture = try std.testing.allocator.dupe(u8, "qwen3"),
+    };
+    defer promoted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Level.compatible, assessInspection(&man, promoted).level);
+
+    // The manifest style is metadata, not authority to bypass architecture
+    // safety policy for an unrelated unsafe family. NomicBERT is now a
+    // supported encoder and therefore is deliberately not part of this gate.
+    const spoofed_result = assess(&man, "bart");
+    try std.testing.expectEqual(Level.incompatible, spoofed_result.level);
+    try std.testing.expect(!spoofed_result.allowed(true));
+
+    // A bare qwen3 embedder without the resolved style stays unknown.
+    var bare = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    bare.model_type = .embedder;
+    const bare_result = assess(&bare, "qwen3");
+    try std.testing.expectEqual(Level.unknown, bare_result.level);
+}
+
+test "unknown architectures are attempted by default with optional strict policy" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .generator;
     const result = assess(&man, "brand_new_decoder");
     try std.testing.expectEqual(Level.unknown, result.level);
     try std.testing.expect(!result.allowed(false));
-    try std.testing.expect(result.allowed(true));
+    try std.testing.expect(result.allowed((Policy{}).allow_unknown));
 }
 
 test "known unsafe generators cannot be enabled by unknown opt in" {
@@ -495,6 +565,27 @@ test "qualified Gemma4 A4B architecture is enabled while unified layout is block
 
     qualified.qualified_gemma4_a4b = false;
     try std.testing.expectEqual(Level.incompatible, assessInspection(&man, qualified).level);
+}
+
+test "Qwen3 text reranker uses selected GGUF without enabling unqualified VL bundles" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .model_type_origin = .tasks,
+        .config_model_arch = "qwen3",
+        .gguf_path = "qwen3-reranker-0.6b-q8_0.gguf",
+    };
+    try std.testing.expect(man.isQwen3TextReranker());
+    try std.testing.expectEqual(Level.compatible, assessWithFacts(&man, "qwen3", 0).level);
+    man.config_model_arch = "qwen3_vl";
+    man.inference_bundle_family = manifest_mod.qwen3_vl_reranker_gguf_bundle_family;
+    try std.testing.expect(!man.isQwen3TextReranker());
+    try std.testing.expectEqual(Level.incompatible, assessWithFacts(&man, "qwen3_vl", 0).level);
+    man.config_model_arch = "qwen3";
+    man.inference_bundle_family = "";
+    man.gguf_path = null;
+    try std.testing.expect(!man.isQwen3TextReranker());
+    try std.testing.expect(assessWithFacts(&man, "qwen3", 0).level != .compatible);
 }
 
 test "standalone GGUF decoder architecture does not depend on directory taxonomy" {
@@ -552,11 +643,13 @@ test "listing inspection recognizes standalone GGUF decoder outside taxonomy" {
     defer allocator.free(model_dir);
     var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
     defer listing_man.deinit();
-    try expectLoadedGgufAssessment(allocator, &listing_man, .default, .compatible);
+    // Listing intentionally avoids opening multi-gigabyte GGUFs; compatibility
+    // inspection still recognizes the decoder architecture when requested.
+    try expectLoadedGgufAssessment(allocator, &listing_man, .embedder, .default, .compatible);
 
     var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
     defer full_man.deinit();
-    try expectLoadedGgufAssessment(allocator, &full_man, .default, .compatible);
+    try expectLoadedGgufAssessment(allocator, &full_man, .generator, .config, .compatible);
 }
 
 test "loader-derived embedder roles cannot be relabeled by GGUF architecture" {
@@ -612,21 +705,22 @@ test "loader-derived embedder roles cannot be relabeled by GGUF architecture" {
         defer allocator.free(model_dir);
         var listing_man = try manifest_mod.loadListingFromDir(allocator, model_dir);
         defer listing_man.deinit();
-        try expectLoadedGgufAssessment(allocator, &listing_man, case.origin, .unknown);
+        try expectLoadedGgufAssessment(allocator, &listing_man, .embedder, case.origin, .unknown);
 
         var full_man = try manifest_mod.loadFromDir(allocator, model_dir);
         defer full_man.deinit();
-        try expectLoadedGgufAssessment(allocator, &full_man, case.origin, .unknown);
+        try expectLoadedGgufAssessment(allocator, &full_man, .embedder, case.origin, .unknown);
     }
 }
 
 fn expectLoadedGgufAssessment(
     allocator: std.mem.Allocator,
     man: *const manifest_mod.ModelManifest,
+    expected_type: manifest_mod.ModelType,
     expected_origin: manifest_mod.ModelTypeOrigin,
     expected_level: Level,
 ) !void {
-    try std.testing.expectEqual(manifest_mod.ModelType.embedder, man.model_type);
+    try std.testing.expectEqual(expected_type, man.model_type);
     try std.testing.expectEqual(expected_origin, man.model_type_origin);
     try std.testing.expect(man.usesGgufWeights());
     var inspection = try inspectAlloc(allocator, man);
@@ -660,15 +754,63 @@ test "release encoder contracts cover DeBERTa reranking and GLiNER2" {
     try std.testing.expectEqual(Level.compatible, assess(&gliner, "extractor").level);
 }
 
-test "known Qwen hybrid variants and incompatible Nomic GGUF stay blocked" {
+test "known Qwen hybrid variants and NomicBERT stay classified" {
     var generator = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     generator.model_type = .generator;
     try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_5_moe").level);
     try std.testing.expectEqual(Level.incompatible, assess(&generator, "qwen3_next").level);
+    const qwen3_vl = assess(&generator, "qwen3vl");
+    try std.testing.expectEqual(Level.incompatible, qwen3_vl.level);
+    try std.testing.expect(!qwen3_vl.allowed(true));
+    const qwen3_vl_moe = assess(&generator, "qwen3vlmoe");
+    try std.testing.expectEqual(Level.incompatible, qwen3_vl_moe.level);
+    try std.testing.expect(!qwen3_vl_moe.allowed(true));
 
     var embedder = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     embedder.model_type = .embedder;
-    try std.testing.expectEqual(Level.incompatible, assess(&embedder, "nomic-bert").level);
+    try std.testing.expectEqual(Level.compatible, assess(&embedder, "nomic-bert").level);
+    try std.testing.expectEqual(Level.compatible, assess(&embedder, "nomic_bert").level);
+}
+
+test "Qwen3-VL admission checks required artifacts and implemented serving roles" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_gguf_bundle_family),
+        .gguf_path = try allocator.dupe(u8, "decoder.gguf"),
+        .gguf_projector_path = try allocator.dupe(u8, "mmproj.gguf"),
+    };
+    defer manifest.deinit();
+
+    var assessment = assess(&manifest, "qwen3vl");
+    try std.testing.expectEqual(Code.incomplete_bundle, assessment.code);
+    try std.testing.expect(!assessment.allowed(true));
+
+    manifest.config_path = try allocator.dupe(u8, "config.json");
+    manifest.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    manifest.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    manifest.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    assessment = assess(&manifest, "qwen3vl");
+    try std.testing.expectEqual(Level.compatible, assessment.level);
+    try std.testing.expect(assessment.allowed(true));
+
+    var reranker = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .reranker,
+        .model_type_origin = .bundle,
+        .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_reranker_safetensors_bundle_family),
+        .safetensors_path = try allocator.dupe(u8, "model.safetensors"),
+        .config_path = try allocator.dupe(u8, "config.json"),
+        .tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json"),
+        .tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json"),
+        .preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json"),
+    };
+    defer reranker.deinit();
+    assessment = assess(&reranker, "qwen3_vl");
+    try std.testing.expectEqual(Code.unsupported_backend, assessment.code);
+    try std.testing.expect(!assessment.allowed(true));
 }
 
 test "known unsafe local site models stay blocked even with unknown opt in" {

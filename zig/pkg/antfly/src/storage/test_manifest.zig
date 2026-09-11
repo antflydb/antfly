@@ -9,6 +9,14 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("admission_waiter.zig");
+    _ = @import("artifact_payload.zig");
+    _ = @import("dense_work_admission.zig");
+    _ = @import("maintenance_signal.zig");
+    _ = @import("projection_page_cache.zig");
+    _ = @import("projection_read_trace.zig");
+    _ = @import("vector_payload_store.zig");
+    _ = @import("vector_wal_view.zig");
     _ = @import("backend_adapter.zig");
     _ = @import("backend_conformance_test.zig");
     _ = @import("backend_erased.zig");
@@ -20,6 +28,7 @@ comptime {
     _ = @import("backup_repository.zig");
     _ = @import("coverage_identity.zig");
     _ = @import("data_raft_projection_wire.zig");
+    _ = @import("db_split_vopr.zig");
     _ = @import("db/aggregations.zig");
     _ = @import("db/aggregations_contract.zig");
     _ = @import("db/algebraic/adaptive.zig");
@@ -35,6 +44,7 @@ comptime {
     _ = @import("db/algebraic/law.zig");
     _ = @import("db/algebraic/lexical.zig");
     _ = @import("db/algebraic/mod.zig");
+    _ = @import("db/algebraic/ownership_test.zig");
     _ = @import("db/algebraic/path.zig");
     _ = @import("db/algebraic/pathfact.zig");
     _ = @import("db/algebraic/planner.zig");
@@ -52,10 +62,9 @@ comptime {
     _ = @import("db/catalog/index_manager.zig");
     _ = @import("db/catalog/resolver_catalog.zig");
     _ = @import("db/config.zig");
-    _ = @import("db/db.zig");
+    _ = @import("antfly_source_root").antfly_sources.physical_db;
     _ = @import("db/dense_exact.zig");
     _ = @import("db/derived/apply_state.zig");
-    _ = @import("db/derived/async_runtime.zig");
     _ = @import("db/derived/backlog_tracker.zig");
     _ = @import("db/derived/catch_up_policy.zig");
     _ = @import("db/derived/change_journal.zig");
@@ -94,12 +103,14 @@ comptime {
     _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
-    _ = @import("db/mod.zig");
+    _ = @import("db/merge_state.zig");
+    _ = @import("antfly_source_root").antfly_sources.selected_db;
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_bindings.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
+    _ = @import("db/publication.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
     _ = @import("db/query/result_shape.zig");
@@ -121,6 +132,7 @@ comptime {
     _ = @import("docstore.zig");
     _ = @import("enrichment.zig");
     _ = @import("filesystem_capacity.zig");
+    _ = @import("generation_publication.zig");
     _ = @import("ha/admin.zig");
     _ = @import("ha/admin_cli.zig");
     _ = @import("ha/admin_exec.zig");
@@ -162,12 +174,14 @@ comptime {
     _ = @import("ha/standby.zig");
     _ = @import("ha/status.zig");
     _ = @import("ha/validation.zig");
+    _ = @import("ha/vopr.zig");
     _ = @import("ha/write_gate.zig");
     _ = @import("hbc_adapter.zig");
     _ = @import("hierarchy_navigation.zig");
     _ = @import("internal_keys.zig");
     _ = @import("kernel_owner_client.zig");
     _ = @import("kernel_wal_wire.zig");
+    _ = @import("index_manager_vopr.zig");
     _ = @import("lite/backend.zig");
     _ = @import("lite/bridge.zig");
     _ = @import("lite/conformance_test.zig");
@@ -180,6 +194,7 @@ comptime {
     _ = @import("lite/restore_staging.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
+    _ = @import("lmdb_vopr.zig");
     _ = @import("lsm/binary_search.zig");
     _ = @import("lsm/k_way_merge.zig");
     _ = @import("lsm/manifest.zig");
@@ -202,11 +217,14 @@ comptime {
     _ = @import("lsm_backend/storage_io.zig");
     _ = @import("lsm_backend/wal.zig");
     _ = @import("lsm_backend_sim_test.zig");
+    _ = @import("lsm_vopr.zig");
     _ = @import("maintenance.zig");
     _ = @import("mem_backend.zig");
     _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
+    _ = @import("posting_segment_store.zig");
+    _ = @import("persistent_vopr.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
     _ = @import("rowsource/external.zig");
@@ -217,6 +235,10 @@ comptime {
     _ = @import("shard.zig");
     _ = @import("sim_runtime.zig");
     _ = @import("transactions.zig");
+    _ = @import("transaction_vopr.zig");
     _ = @import("ttl.zig");
+    _ = @import("vector_block_store.zig");
     _ = @import("wal.zig");
+    _ = @import("vopr_durable_job_lane.zig");
+    _ = @import("wal_vopr.zig");
 }

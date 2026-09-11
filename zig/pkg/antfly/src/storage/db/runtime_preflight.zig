@@ -494,3 +494,6 @@ fn resultDocEstimate(summary: RuntimePreflightSummary) ?u32 {
     }
     return null;
 }
+
+pub const requestBindsRootTextIndex = @import("query/control_contract.zig").requestBindsRootTextIndex;
+pub const requestBindsFilterTextIndex = @import("query/control_contract.zig").requestBindsFilterTextIndex;

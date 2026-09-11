@@ -86,10 +86,24 @@ pub const GlinerPipeline = struct {
     session: backends.Session,
     tok: Tokenizer,
     config: GlinerConfig,
+    /// Borrowed only for a synchronous invocation. The loaded model owner
+    /// installs this at the encoder boundary, shared by NER and relation passes.
+    batch_dispatch: ?BatchDispatch = null,
+    batch_observation: ?*@import("batch_execution.zig").Observation = null,
+
     /// Optional caller-owned guard for backend state shared by pipelines made
     /// from the same loaded model. Preparation and decoding stay parallel;
     /// only stateful session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+
+    pub const BatchDispatch = struct {
+        ptr: *anyopaque,
+        model: []const u8,
+        generation: usize,
+        submit: *const fn (*anyopaque, *GlinerPipeline, []const []const u8, []const []const u8, i32, f32, bool) anyerror![][]Entity,
+        submit_scores: *const fn (*anyopaque, *GlinerPipeline, []const []const u8, []const []const u8) anyerror![][]f32,
+    };
 
     fn lockedSessionRun(
         self: *GlinerPipeline,
@@ -97,9 +111,15 @@ pub const GlinerPipeline = struct {
         inputs: []const Tensor,
         alloc: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, alloc);
+        return permit.runWithControl(inputs, alloc, self.execution_control);
     }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {
@@ -132,9 +152,70 @@ pub const GlinerPipeline = struct {
         text: []const u8,
         labels: []const []const u8,
     ) !usize {
-        var prepared = try self.prepareGlinerInput(text, labels, self.config.token_e);
+        return self.encoderTokenCount(text, labels, self.config.token_e);
+    }
+
+    fn encoderTokenCount(
+        self: *GlinerPipeline,
+        text: []const u8,
+        labels: []const []const u8,
+        label_token: i32,
+    ) !usize {
+        var prepared = try self.prepareGlinerInput(text, labels, label_token);
         defer prepared.deinit(self.allocator);
         return prepared.input_ids.len;
+    }
+
+    /// Returns the largest exact classification row. Empty texts are handled
+    /// without inference by `classifySingle` and therefore contribute zero.
+    pub fn maxClassificationInputTokens(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        labels: []const []const u8,
+    ) !usize {
+        const label_token = if (self.config.token_c != 0) self.config.token_c else self.config.token_e;
+        var result: usize = 0;
+        for (texts) |text| {
+            if (text.len == 0) continue;
+            result = @max(result, try self.encoderTokenCount(text, labels, label_token));
+        }
+        return result;
+    }
+
+    /// Returns a conservative exact-token upper bound for every encoder row
+    /// this extraction can execute. Relation extraction conditionally runs a
+    /// second pass, so its composite-label row is included before inference.
+    pub fn maxExtractionInputTokens(
+        self: *GlinerPipeline,
+        texts: []const []const u8,
+        entity_labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
+    ) !usize {
+        const use_entity_labels = entity_labels orelse self.config.default_labels;
+        if (use_entity_labels.len == 0) return error.NoLabelsProvided;
+
+        var result: usize = 0;
+        for (texts) |text| {
+            result = @max(result, try self.entityEncoderTokenCount(text, use_entity_labels));
+        }
+
+        const use_relation_labels = relation_labels orelse self.config.relation_labels;
+        if (use_relation_labels.len == 0) return result;
+        var composite_labels = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (composite_labels.items) |label| self.allocator.free(label);
+            composite_labels.deinit(self.allocator);
+        }
+        try appendRelationCandidateLabels(
+            self.allocator,
+            &composite_labels,
+            use_entity_labels,
+            use_relation_labels,
+        );
+        for (texts) |text| {
+            result = @max(result, try self.entityEncoderTokenCount(text, composite_labels.items));
+        }
+        return result;
     }
 
     pub fn extractRelationsBatch(
@@ -258,6 +339,15 @@ pub const GlinerPipeline = struct {
         const alloc = self.allocator;
         if (labels.len == 0) return error.NoLabelsProvided;
 
+        const scores = if (self.supportsClassification() and self.session.backend() != .onnx)
+            try self.scoreLabelsBatch(texts, labels)
+        else
+            null;
+        defer if (scores) |rows| {
+            for (rows) |row| alloc.free(row);
+            alloc.free(rows);
+        };
+
         const results = try alloc.alloc([]ClassificationResult, texts.len);
         var initialized: usize = 0;
         errdefer {
@@ -266,7 +356,10 @@ pub const GlinerPipeline = struct {
         }
 
         for (texts, 0..) |text, i| {
-            results[i] = try self.classifySingle(text, labels, config);
+            results[i] = if (scores) |rows|
+                if (text.len == 0) try alloc.alloc(ClassificationResult, 0) else try self.classificationsFromScores(rows[i], labels, config)
+            else
+                try self.classifySingle(text, labels, config);
             initialized += 1;
         }
 
@@ -389,7 +482,7 @@ pub const GlinerPipeline = struct {
         };
     }
 
-    fn recognizeWithLabelTokenBatch(
+    pub fn recognizeWithLabelTokenBatch(
         self: *GlinerPipeline,
         texts: []const []const u8,
         labels: []const []const u8,
@@ -397,6 +490,19 @@ pub const GlinerPipeline = struct {
         threshold: f32,
         flat_ner: bool,
     ) ![][]Entity {
+        if (self.batch_dispatch) |dispatch|
+            return dispatch.submit(dispatch.ptr, self, texts, labels, label_token, threshold, flat_ner);
+        return self.encodeLabelBatch(false, texts, labels, label_token, threshold, flat_ner);
+    }
+
+    pub fn scoreLabelsBatch(self: *GlinerPipeline, texts: []const []const u8, labels: []const []const u8) ![][]f32 {
+        if (self.batch_dispatch) |dispatch| return dispatch.submit_scores(dispatch.ptr, self, texts, labels);
+        const label_token = if (self.config.token_c != 0) self.config.token_c else self.config.token_e;
+        return self.encodeLabelBatch(true, texts, labels, label_token, 0, false);
+    }
+
+    /// One bounded encoder implementation, with task-specific result decoding.
+    fn encodeLabelBatch(self: *GlinerPipeline, comptime scoring: bool, texts: []const []const u8, labels: []const []const u8, label_token: i32, threshold: f32, flat_ner: bool) ![](if (scoring) []f32 else []Entity) {
         const profile_enabled = glinerPipelineProfileEnabled();
         const total_start_ns = glinerProfileStart(profile_enabled);
         const alloc = self.allocator;
@@ -406,16 +512,16 @@ pub const GlinerPipeline = struct {
         if (self.config.token_p == 0 or label_token == 0 or self.config.token_sep_text == 0)
             return error.MissingSpecialTokenIds;
 
-        if (self.session.backend() == .onnx and texts.len > 1) {
+        if (!scoring and self.session.backend() == .onnx and texts.len > 1) {
             return self.recognizeWithLabelTokenBatchSerial(texts, labels, label_token, threshold, flat_ner);
         }
 
-        const results = try alloc.alloc([]Entity, texts.len);
+        const results = try alloc.alloc(if (scoring) []f32 else []Entity, texts.len);
         @memset(results, &.{});
         var initialized_results: usize = 0;
         errdefer {
             for (results[0..initialized_results]) |entities| {
-                for (entities) |entity| alloc.free(entity.text);
+                if (!scoring) for (entities) |entity| alloc.free(entity.text);
                 alloc.free(entities);
             }
             alloc.free(results);
@@ -447,6 +553,7 @@ pub const GlinerPipeline = struct {
         var max_num_words: usize = 0;
         const prepare_start_ns = glinerProfileStart(profile_enabled);
         for (texts, 0..) |text, i| {
+            if (self.execution_control) |control| try control.check();
             if (prepared_by_text.get(text)) |prepared_i| {
                 row_to_prepared[i] = prepared_i;
                 continue;
@@ -467,7 +574,8 @@ pub const GlinerPipeline = struct {
 
         if (max_num_words == 0 or max_seq_len == 0) {
             for (results) |*row| {
-                row.* = try alloc.alloc(Entity, 0);
+                row.* = if (scoring) try alloc.alloc(f32, labels.len) else try alloc.alloc(Entity, 0);
+                if (scoring) @memset(row.*, 0);
                 initialized_results += 1;
             }
             for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
@@ -475,7 +583,7 @@ pub const GlinerPipeline = struct {
             return results;
         }
 
-        if (self.usesOfficialOnnxGlinerContract()) {
+        if (!scoring and self.usesOfficialOnnxGlinerContract()) {
             const session_start_ns = glinerProfileStart(profile_enabled);
             for (row_to_prepared, 0..) |prepared_i, i| {
                 const row = prepared[prepared_i];
@@ -516,6 +624,29 @@ pub const GlinerPipeline = struct {
         ) catch return error.ResourceLimitExceeded;
         const input_bytes = std.math.mul(usize, input_elements, @sizeOf(i64)) catch
             return error.ResourceLimitExceeded;
+        if (texts.len > 1 and !try self.session.fitsRun(.{
+            .batch = batch,
+            .sequence = max_seq_len,
+            .input_bytes = input_bytes,
+            .host_preprocess_bytes = input_bytes,
+        })) {
+            // Split against permanent limits before a forward. Live admission
+            // pressure is still returned normally, never retried as singles.
+            // Drop the full window's prepared token buffers before preparing
+            // either child, so splitting cannot multiply retained input state.
+            for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
+            alloc.free(prepared);
+            prepared = &.{};
+            prepared_len = 0;
+            const midpoint = (texts.len + 1) / 2;
+            for ([_][]const []const u8{ texts[0..midpoint], texts[midpoint..] }) |part| {
+                const child = try self.encodeLabelBatch(scoring, part, labels, label_token, threshold, flat_ner);
+                @memcpy(results[initialized_results..][0..child.len], child);
+                initialized_results += child.len;
+                alloc.free(child);
+            }
+            return results;
+        }
         var run_permit = try self.session.admit(.{
             .batch = batch,
             .sequence = max_seq_len,
@@ -602,10 +733,16 @@ pub const GlinerPipeline = struct {
         for (row_to_prepared, 0..) |prepared_i, i| {
             const row = prepared[prepared_i];
             results[i] = if (first_result_by_prepared[prepared_i] != null)
-                try cloneEntities(alloc, results[first_result_by_prepared[prepared_i].?])
+                if (scoring) try alloc.dupe(f32, results[first_result_by_prepared[prepared_i].?]) else try cloneEntities(alloc, results[first_result_by_prepared[prepared_i].?])
             else blk: {
                 const row_start = try checkedSizeMul(i, output_layout.row_stride);
                 const row_end = try checkedSizeAdd(row_start, output_layout.row_stride);
+                if (scoring) {
+                    // Padding words in another caller's longer row must not
+                    // influence this row's maximum classification score.
+                    const real_logits = try checkedSizeMul(try checkedSizeMul(row.actual_num_words, max_width), labels.len);
+                    break :blk try scoreLabelsFromLogits(alloc, logits[row_start..][0..real_logits], labels.len);
+                }
                 break :blk try self.decodeEntitiesFromLogits(
                     row,
                     labels,
@@ -622,6 +759,7 @@ pub const GlinerPipeline = struct {
             initialized_results += 1;
         }
         const decode_ms = glinerProfileElapsedMs(decode_start_ns);
+        if (self.batch_observation) |observation| observation.record(texts.len);
         if (profile_enabled) {
             std.debug.print(
                 "gliner_pipeline_profile: batch={d} unique_texts={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} pack_ms={d:.3} session_run_ms={d:.3} decode_ms={d:.3} total_ms={d:.3}\n",
@@ -1150,6 +1288,13 @@ pub const GlinerPipeline = struct {
 
         const scores = try self.scoreLabels(text, labels);
         defer alloc.free(scores);
+
+        return self.classificationsFromScores(scores, labels, config);
+    }
+
+    fn classificationsFromScores(self: *GlinerPipeline, scores: []const f32, labels: []const []const u8, config: ClassificationConfig) ![]ClassificationResult {
+        const alloc = self.allocator;
+        if (scores.len != labels.len) return error.UnexpectedOutputShape;
 
         var filtered = std.ArrayListUnmanaged(ClassificationResult).empty;
         errdefer filtered.deinit(alloc);
@@ -1860,6 +2005,93 @@ test "scoreLabelsFromLogits returns sigmoid of max logit per label" {
 
     try std.testing.expectApproxEqAbs(sigmoid(0.7), scores[0], 1e-6);
     try std.testing.expectApproxEqAbs(sigmoid(1.2), scores[1], 1e-6);
+}
+
+test "gliner classification microbatch matches singleton scores without padded-word contamination" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn encode(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) ![]i32 {
+            return allocator.dupe(i32, &.{1});
+        }
+        fn encodeInto(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, output: *std.ArrayListUnmanaged(i32)) !void {
+            try output.append(allocator, 1);
+        }
+        fn run(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const batch: usize = @intCast(inputs[0].shape[0]);
+            const sequence: usize = @intCast(inputs[0].shape[1]);
+            const words: usize = @intCast(inputs[3].shape[1]);
+            const mask = inputs[2].asInt64();
+            const logits = try allocator.alloc(f32, batch * words * 2);
+            defer allocator.free(logits);
+            for (0..batch) |row| {
+                var actual_words: i64 = 0;
+                for (mask[row * sequence ..][0..sequence]) |word| actual_words = @max(actual_words, word);
+                for (0..words) |word| {
+                    logits[(row * words + word) * 2] = if (word < actual_words) 1 else 100;
+                    logits[(row * words + word) * 2 + 1] = if (word < actual_words) 2 else 100;
+                }
+            }
+            const output = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(output);
+            output[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), @intCast(words), 1, 2 }, logits);
+            return output;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const allocator = std.testing.allocator;
+    var probe = Probe{};
+    var pipeline = GlinerPipeline{
+        .allocator = allocator,
+        .session = .{ .ptr = &probe, .vtable = &.{ .run = Probe.run, .inputInfo = Probe.info, .outputInfo = Probe.info, .backend = Probe.backend, .close = Probe.close } },
+        .tok = .{ .ptr = &probe, .vtable = &.{ .encode = Probe.encode, .encodeInto = Probe.encodeInto, .encodeForModel = undefined, .encodeGeneration = undefined, .decode = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } },
+        .config = .{ .model_type = "gliner2", .max_width = 1, .token_p = 2, .token_e = 3, .token_c = 4, .token_sep_text = 5 },
+    };
+    const texts = [_][]const u8{ "short", "two words", "", "short" };
+    const labels = [_][]const u8{ "first", "second" };
+    const scores = try pipeline.scoreLabelsBatch(&texts, &labels);
+    defer {
+        for (scores) |row| allocator.free(row);
+        allocator.free(scores);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    for (texts, scores) |text, row| {
+        const single = try pipeline.scoreLabels(text, &labels);
+        defer allocator.free(single);
+        try std.testing.expectEqualSlices(f32, single, row);
+    }
+    const classified = try pipeline.classifyBatch(&texts, &labels, .{});
+    defer {
+        for (classified) |row| allocator.free(row);
+        allocator.free(classified);
+    }
+    try std.testing.expectEqualStrings("second", classified[0][0].label);
+    try std.testing.expectEqual(@as(usize, 0), classified[2].len);
+
+    var controller = runtime.tier.memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 6000 });
+    pipeline.session.run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 6000, .combined_limit_bytes = 6000, .scratch_limit_bytes = 6000 },
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+    };
+    const before = probe.calls;
+    const bounded = try pipeline.scoreLabelsBatch(&texts, &labels);
+    defer {
+        for (bounded) |row| allocator.free(row);
+        allocator.free(bounded);
+    }
+    try std.testing.expect(probe.calls > before + 1);
+    for (scores, bounded) |expected, row| try std.testing.expectEqualSlices(f32, expected, row);
 }
 
 test "gliner batch output validation rejects incomplete backend results" {

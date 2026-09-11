@@ -52,6 +52,22 @@ pub fn addIndexToTableIndexesJson(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    return try addIndexToTableIndexesJsonWithIo(
+        alloc,
+        std.Io.Threaded.global_single_threaded.io(),
+        current_indexes_json,
+        index_name,
+        index_json,
+    );
+}
+
+pub fn addIndexToTableIndexesJsonWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    current_indexes_json: []const u8,
+    index_name: []const u8,
+    index_json: []const u8,
+) ![]u8 {
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -64,6 +80,7 @@ pub fn addIndexToTableIndexesJson(
     if (config.value != .object) return error.InvalidCreateIndexRequest;
     const stored_config = storedIndexConfigForMutationAlloc(
         alloc,
+        io,
         index_name,
         root.get(index_name),
         config.value,
@@ -97,6 +114,7 @@ pub fn addIndexToTableIndexesJson(
 
 fn storedIndexConfigForMutationAlloc(
     alloc: std.mem.Allocator,
+    io: std.Io,
     index_name: []const u8,
     existing: ?std.json.Value,
     requested: std.json.Value,
@@ -117,7 +135,7 @@ fn storedIndexConfigForMutationAlloc(
             }
         }
     }
-    return try coverage_policy_mod.withFreshIncarnationAlloc(alloc, requested);
+    return try coverage_policy_mod.withFreshIncarnationAllocWithIo(alloc, io, requested);
 }
 
 fn equivalentDerivedOutputConfig(
@@ -974,7 +992,7 @@ fn indexesJsonSource(indexes_json: []const u8) []const u8 {
     return if (indexes_json.len > 0) indexes_json else tables_api.default_indexes_json;
 }
 
-fn isReservedIndexMetadataEntry(name: []const u8) bool {
+pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
 }
 
@@ -2017,6 +2035,8 @@ const AggregatedIndexStatus = struct {
     repair_observation_count: u64 = 0,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    dense_vector_projection_pending: bool = false,
+    dense_native_storage_phase: db_mod.types.DenseNativeStoragePhase = .legacy,
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
@@ -2197,6 +2217,255 @@ const IndexObservationAuthority = struct {
     coverage_authoritative: bool,
 };
 
+const IndexReadinessObservation = struct {
+    expected_source_observations: u64,
+    observation_available: bool,
+    observation_fresh: bool,
+    target_observation_complete: bool,
+    topology_complete: bool,
+    incarnation_current: bool,
+    sources_complete: bool,
+
+    fn completionFencesClear(self: @This()) bool {
+        return self.observation_fresh and
+            self.target_observation_complete and
+            self.topology_complete and
+            self.incarnation_current and
+            self.sources_complete;
+    }
+};
+
+const IndexCompletionFences = struct {
+    observation: IndexReadinessObservation,
+    backfill_active: bool,
+    repair_blocks_complete: bool,
+    replay_catch_up_required: bool,
+    catch_up_active: bool,
+    publication_pending: bool,
+    coverage_pending: bool,
+
+    fn blocked(self: @This()) bool {
+        if (!self.observation.completionFencesClear()) return true;
+        if (self.backfill_active) return true;
+        if (self.repair_blocks_complete) return true;
+        if (self.replay_catch_up_required) return true;
+        if (self.catch_up_active) return true;
+        if (self.publication_pending) return true;
+        return self.coverage_pending;
+    }
+};
+
+const IndexReadinessState = enum {
+    failed,
+    queryable_partial,
+    pending,
+    ready,
+};
+
+const IndexReadinessEvaluation = struct {
+    completion_blocked: bool,
+    pending: bool,
+    queryable_partial: bool,
+    queryable: bool,
+    complete: bool,
+    state: IndexReadinessState,
+
+    fn evaluate(input: struct {
+        completion_fences: IndexCompletionFences,
+        failed: bool,
+        serving_failed: bool,
+        partial_generation_serviceable: bool,
+        stale_generation_serviceable: bool,
+    }) @This() {
+        const completion_blocked = input.completion_fences.blocked();
+        const pending = !input.failed and completion_blocked;
+        const complete = !input.failed and !completion_blocked;
+        const observation = input.completion_fences.observation;
+        const queryable_partial = !input.serving_failed and (completion_blocked or input.failed) and
+            input.partial_generation_serviceable and
+            ((observation.observation_fresh and observation.topology_complete and observation.incarnation_current) or
+                input.stale_generation_serviceable);
+        const state: IndexReadinessState = if (input.failed)
+            .failed
+        else if (queryable_partial)
+            .queryable_partial
+        else if (pending)
+            .pending
+        else
+            .ready;
+        return .{
+            .completion_blocked = completion_blocked,
+            .pending = pending,
+            .queryable_partial = queryable_partial,
+            .queryable = queryable_partial or complete,
+            .complete = complete,
+            .state = state,
+        };
+    }
+};
+
+/// Produce the observation/topology portion of readiness once. Progress,
+/// readiness state, milestones, and pending reasons must not reconstruct this
+/// independently or a partial cluster observation can look 100% complete.
+fn indexReadinessObservation(
+    item: anytype,
+    authority: IndexObservationAuthority,
+    coverage_generation: u64,
+) IndexReadinessObservation {
+    const Item = @TypeOf(item);
+    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
+        @max(1, item.fresh_group_count)
+    else
+        1;
+    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
+        item.expected_group_count == item.fresh_group_count
+    else
+        true;
+    const observation_fresh = authority.freshness_authoritative;
+    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
+        const sources = if (@hasField(Item, "source_replay_count"))
+            item.source_replay[0..item.source_replay_count]
+        else
+            item.source_replay;
+        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
+    } else true;
+    return .{
+        .expected_source_observations = expected_source_observations,
+        .observation_available = authority.facts_authoritative,
+        .observation_fresh = observation_fresh,
+        .target_observation_complete = authority.convergence_authoritative,
+        .topology_complete = topology_complete,
+        .incarnation_current = coverage_generation != 0 and authority.incarnation_current,
+        .sources_complete = sources_complete,
+    };
+}
+
+test "readiness observation completion requires convergence and full topology" {
+    const authority = IndexObservationAuthority{
+        .runtime_present = true,
+        .incarnation_current = true,
+        .facts_authoritative = true,
+        .freshness_authoritative = true,
+        .readiness_authoritative = true,
+        .convergence_authoritative = true,
+        .coverage_authoritative = true,
+    };
+    const partial = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 1,
+    };
+    try std.testing.expect(!indexReadinessObservation(partial, authority, 42).completionFencesClear());
+
+    var unconverged = authority;
+    unconverged.convergence_authoritative = false;
+    const complete_topology = AggregatedIndexStatus{
+        .expected_group_count = 2,
+        .fresh_group_count = 2,
+    };
+    try std.testing.expect(!indexReadinessObservation(complete_topology, unconverged, 42).completionFencesClear());
+    try std.testing.expect(indexReadinessObservation(complete_topology, authority, 42).completionFencesClear());
+}
+
+test "readiness evaluation cannot complete while convergence work remains" {
+    var completion_fences = IndexCompletionFences{
+        .observation = .{
+            .expected_source_observations = 1,
+            .observation_available = true,
+            .observation_fresh = true,
+            .target_observation_complete = false,
+            .topology_complete = true,
+            .incarnation_current = true,
+            .sources_complete = true,
+        },
+        .backfill_active = true,
+        .repair_blocks_complete = false,
+        .replay_catch_up_required = false,
+        .catch_up_active = false,
+        .publication_pending = true,
+        .coverage_pending = true,
+    };
+    const partial = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = false,
+        .serving_failed = false,
+        .partial_generation_serviceable = true,
+        .stale_generation_serviceable = true,
+    });
+
+    try std.testing.expect(partial.completion_blocked);
+    try std.testing.expect(partial.pending);
+    try std.testing.expect(partial.queryable_partial);
+    try std.testing.expect(partial.queryable);
+    try std.testing.expect(!partial.complete);
+    try std.testing.expectEqual(IndexReadinessState.queryable_partial, partial.state);
+
+    completion_fences.observation.target_observation_complete = true;
+    completion_fences.backfill_active = false;
+    completion_fences.publication_pending = false;
+    completion_fences.coverage_pending = false;
+    const ready = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = false,
+        .serving_failed = false,
+        .partial_generation_serviceable = true,
+        .stale_generation_serviceable = true,
+    });
+
+    try std.testing.expect(!ready.completion_blocked);
+    try std.testing.expect(!ready.pending);
+    try std.testing.expect(!ready.queryable_partial);
+    try std.testing.expect(ready.queryable);
+    try std.testing.expect(ready.complete);
+    try std.testing.expectEqual(IndexReadinessState.ready, ready.state);
+}
+
+test "readiness completion fences include every observation dimension" {
+    const clear = IndexReadinessObservation{
+        .expected_source_observations = 1,
+        .observation_available = true,
+        .observation_fresh = true,
+        .target_observation_complete = true,
+        .topology_complete = true,
+        .incarnation_current = true,
+        .sources_complete = true,
+    };
+    var stale = clear;
+    stale.observation_fresh = false;
+    var unconverged = clear;
+    unconverged.target_observation_complete = false;
+    var partial_topology = clear;
+    partial_topology.topology_complete = false;
+    var stale_incarnation = clear;
+    stale_incarnation.incarnation_current = false;
+    var incomplete_sources = clear;
+    incomplete_sources.sources_complete = false;
+
+    for ([_]IndexReadinessObservation{ stale, unconverged, partial_topology, stale_incarnation, incomplete_sources }) |observation| {
+        const evaluation = IndexReadinessEvaluation.evaluate(.{
+            .completion_fences = .{
+                .observation = observation,
+                .backfill_active = false,
+                .repair_blocks_complete = false,
+                .replay_catch_up_required = false,
+                .catch_up_active = false,
+                .publication_pending = false,
+                .coverage_pending = false,
+            },
+            .failed = false,
+            .serving_failed = false,
+            .partial_generation_serviceable = false,
+            .stale_generation_serviceable = false,
+        });
+
+        try std.testing.expect(evaluation.completion_blocked);
+        try std.testing.expect(evaluation.pending);
+        try std.testing.expect(!evaluation.queryable_partial);
+        try std.testing.expect(!evaluation.queryable);
+        try std.testing.expect(!evaluation.complete);
+        try std.testing.expectEqual(IndexReadinessState.pending, evaluation.state);
+    }
+}
+
 fn indexObservationIsDerived(item: anytype) bool {
     const Item = @TypeOf(item);
     if (!@hasField(Item, "kind")) return false;
@@ -2251,8 +2520,12 @@ fn classifyIndexObservation(
         item.coverage_summary_ready
     else
         true;
+    const index_target_observation_complete = if (@hasField(Item, "runtime_target_observation_complete"))
+        item.runtime_target_observation_complete
+    else
+        true;
     const target_observation_complete = if (metadata) |value|
-        value.target_observation_complete
+        value.target_observation_complete and index_target_observation_complete
     else if (@hasField(Item, "target_observation_group_count") and @hasField(Item, "expected_group_count"))
         item.expected_group_count == 0 or item.target_observation_group_count == item.expected_group_count
     else
@@ -2415,7 +2688,7 @@ fn aggregateIndexStatusIndexed(
         // Target observation is a group-level convergence watermark, separate
         // from this index's incarnation match. A stale incarnation should
         // report config_mismatch without fabricating a second target gap.
-        if (runtime.metadata.target_observation_complete)
+        if (authority.convergence_authoritative)
             aggregate.target_observation_group_count += 1;
         const index_observation_fresh = authority.freshness_authoritative;
         if (index_observation_fresh) {
@@ -2499,7 +2772,15 @@ fn aggregateIndexStatusIndexed(
             continue;
         }
         materialization_count += 1;
+        aggregate.dense_native_storage_phase = if (materialization_count == 1)
+            item.dense_native_storage_phase
+        else
+            @enumFromInt(@min(
+                @intFromEnum(aggregate.dense_native_storage_phase),
+                @intFromEnum(item.dense_native_storage_phase),
+            ));
         const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
+        if (public_item.dense_vector_projection_pending) aggregate.dense_vector_projection_pending = true;
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
@@ -2597,6 +2878,12 @@ fn aggregateIndexStatusIndexed(
         aggregate.coverage_identity_ready = coverage_generation != 0;
     }
     aggregate.missing_group_count = aggregate.expected_group_count -| aggregate.reported_group_count;
+    // Authority is a whole-index claim. A missing, stale, or wrong-incarnation
+    // shard has no phase proof, so the distributed view must not inherit a
+    // more advanced phase from the shards that happened to answer.
+    if (@as(u64, @intCast(materialization_count)) != aggregate.expected_group_count) {
+        aggregate.dense_native_storage_phase = .legacy;
+    }
     // The public publication target is a whole-index proof. A sum over only
     // the currently observed shards is useful internally, but it must not be
     // exposed as exact when topology or incarnation authority is incomplete.
@@ -2648,6 +2935,7 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
         aggregate.remote_unknown_group_count > 0 or
         aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    if (aggregate.dense_vector_projection_pending) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
     const complete_materialization = aggregate.coverage_identity_ready and
@@ -2774,6 +3062,18 @@ fn aggregateEnrichmentStats(
     dst.worker_failed = dst.worker_failed or src.worker_failed;
     dst.worker_started = dst.worker_started or src.worker_started;
     dst.stalled = dst.stalled or src.stalled;
+    if (dst.stall_reason.len == 0 and src.stall_reason.len > 0) dst.stall_reason = src.stall_reason;
+    if (std.mem.eql(u8, dst.active_phase, "idle") and !std.mem.eql(u8, src.active_phase, "idle")) {
+        dst.active_phase = src.active_phase;
+        dst.active_model = src.active_model;
+        dst.active_backend = src.active_backend;
+        dst.active_deadline_ms = src.active_deadline_ms;
+        dst.active_progress_completed = src.active_progress_completed;
+        dst.active_progress_total = src.active_progress_total;
+    }
+    dst.last_progress_ms = @max(dst.last_progress_ms, src.last_progress_ms);
+    dst.inference_timeout_count +|= src.inference_timeout_count;
+    dst.inference_cancel_count +|= src.inference_cancel_count;
     dst.skip_by_hash_count +|= src.skip_by_hash_count;
     dst.skipped_source_count +|= src.skipped_source_count;
     dst.codec_decode_failures +|= src.codec_decode_failures;
@@ -3084,6 +3384,63 @@ test "derived coverage source totals ignore derived index fan out" {
     const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
     try std.testing.expect(!view.backfill_active);
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
+test "dense native storage status aggregates conservatively and is public" {
+    var indexes_a = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .dense_native_storage_phase = .native_authoritative,
+    }};
+    var indexes_b = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .dense_native_storage_phase = .native_building,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{ .group_id = 1, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = indexes_a[0..] } },
+        .{ .group_id = 2, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = indexes_b[0..] } },
+    };
+
+    const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{ 1, 2 }, 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        db_mod.types.DenseNativeStoragePhase.native_building,
+        aggregate.dense_native_storage_phase,
+    );
+    const missing_shard = aggregateIndexStatus(&runtimes, "visual", &.{ 1, 2, 3 }, 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        db_mod.types.DenseNativeStoragePhase.legacy,
+        missing_shard.dense_native_storage_phase,
+    );
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        0,
+        .external,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded.items,
+        "\"dense_native_storage_phase\":\"native_building\"",
+    ) != null);
 }
 
 test "dense publication target requires every expected shard observation" {
@@ -4210,6 +4567,49 @@ test "cached owner observation preserves serving authority without convergence a
     try std.testing.expectEqual(@as(u64, 0), fenced.doc_count);
 }
 
+test "index-local convergence fence does not revoke a completed sibling" {
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{
+            .name = "title_body",
+            .kind = .dense_vector,
+            .runtime_target_observation_complete = false,
+            .serving_snapshot_ready = true,
+            .doc_count = 5,
+            .coverage_produced_count = 5,
+            .coverage_generation = 10,
+            .coverage_config_hash = 100,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+        .{
+            .name = "thumbnail",
+            .kind = .dense_vector,
+            .runtime_target_observation_complete = true,
+            .serving_snapshot_ready = true,
+            .doc_count = 3,
+            .coverage_produced_count = 3,
+            .coverage_generation = 20,
+            .coverage_config_hash = 200,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        },
+    };
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .target_observation_complete = true,
+        },
+        .stats = .{ .source_doc_count = 5, .index_count = 2, .indexes = indexes[0..] },
+    }};
+    const title = aggregateIndexStatusIndexed(&runtimes, "title_body", &.{7}, 10, 100, null).?;
+    const thumbnail = aggregateIndexStatusIndexed(&runtimes, "thumbnail", &.{7}, 20, 200, null).?;
+    try std.testing.expectEqual(@as(u64, 0), title.target_observation_group_count);
+    try std.testing.expectEqual(@as(u64, 1), thumbnail.target_observation_group_count);
+    try std.testing.expectEqual(@as(u64, 3), thumbnail.doc_count);
+}
+
 test "target-scoped stale full text observation cannot publish old readiness" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "search_idx",
@@ -4871,6 +5271,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         materialization_complete;
     const all_sources_settled = !coverage_incomplete and replay_current and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+    const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
+        item.dense_vector_projection_pending;
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -4900,13 +5302,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         false;
     const merged_replay_current = view.replay_applied_sequence >= view.replay_target_sequence and
         !view.replay_catch_up_required;
-    if (readiness_complete and merged_replay_current and !enrichment_pending) {
+    if (readiness_complete and merged_replay_current and !enrichment_pending and !vector_projection_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
         return view;
     }
-    if (all_sources_settled and merged_replay_current and !enrichment_pending) {
+    if (all_sources_settled and merged_replay_current and !enrichment_pending and !vector_projection_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
@@ -4921,7 +5323,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 0.0;
         return view;
     }
-    if (readiness_complete and !enrichment_pending) {
+    if (readiness_complete and !enrichment_pending and !vector_projection_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
     } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
@@ -4936,7 +5338,74 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
                 @as(f64, @floatFromInt(table_doc_count)),
         );
     }
+    if (vector_projection_pending) {
+        view.backfill_active = true;
+        view.backfill_progress = @min(view.backfill_progress, 0.999);
+    }
     return view;
+}
+
+test "native dense vector projection remains public readiness debt after external coverage converges" {
+    const item: db_mod.types.DBIndexStats = .{
+        .name = "vec",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 7,
+        .coverage_config_hash = 41,
+        .coverage_identity_ready = true,
+        .backfill_active = true,
+        .backfill_progress = 0.999,
+        .dense_vector_projection_pending = true,
+        .replay_applied_sequence = 9,
+        .replay_target_sequence = 9,
+    };
+    const view = embeddingsRuntimeView(item, 1, .external, false, 7, 41, null, true);
+    try std.testing.expect(view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.999), view.backfill_progress);
+
+    var aggregate: AggregatedIndexStatus = .{
+        .kind = .dense_vector,
+        .backfill_active = true,
+        .backfill_progress = 0.999,
+        .dense_vector_projection_pending = true,
+        .reported_group_count = 1,
+        .expected_group_count = 1,
+        .fresh_group_count = 1,
+        .runtime_present = true,
+        .runtime_fresh = true,
+        .table_doc_count = 1,
+        .doc_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 7,
+        .coverage_config_hash = 41,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 9,
+        .replay_target_sequence = 9,
+        .catch_up_applied_sequence = 9,
+        .catch_up_target_sequence = 9,
+    };
+    normalizeReadyEmbeddingsAggregate(&aggregate);
+    try std.testing.expect(aggregate.backfill_active);
+    try std.testing.expect(aggregate.dense_vector_projection_pending);
+}
+
+test "table-wide native vector work does not block an independently ready index" {
+    const cached: db_mod.types.DBIndexStats = .{
+        .name = "vec",
+        .kind = .dense_vector,
+        .backfill_active = false,
+        .backfill_progress = 1.0,
+        .replay_applied_sequence = 501,
+        .replay_target_sequence = 501,
+    };
+    const view = publicShardIndexRuntimeView(cached, .{
+        .dense_projection_finalizing = true,
+    });
+    try std.testing.expect(!view.dense_vector_projection_pending);
+    try std.testing.expect(!view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
 }
 
 fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_generation: u64, expected_config_hash: u64) bool {
@@ -5200,6 +5669,26 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.appendSlice(alloc, if (stats.worker_started) "true" else "false");
     try out.appendSlice(alloc, ",\"stalled\":");
     try out.appendSlice(alloc, if (stats.stalled) "true" else "false");
+    try out.appendSlice(alloc, ",\"stall_reason\":");
+    try appendJsonString(alloc, out, stats.stall_reason);
+    try out.appendSlice(alloc, ",\"active_phase\":");
+    try appendJsonString(alloc, out, stats.active_phase);
+    try out.appendSlice(alloc, ",\"active_model\":");
+    try appendJsonString(alloc, out, stats.active_model.slice());
+    try out.appendSlice(alloc, ",\"active_backend\":");
+    try appendJsonString(alloc, out, stats.active_backend.slice());
+    try out.appendSlice(alloc, ",\"active_deadline_ms\":");
+    try appendIntValue(alloc, out, stats.active_deadline_ms);
+    try out.appendSlice(alloc, ",\"last_progress_ms\":");
+    try appendIntValue(alloc, out, stats.last_progress_ms);
+    try out.appendSlice(alloc, ",\"active_progress_completed\":");
+    try appendIntValue(alloc, out, stats.active_progress_completed);
+    try out.appendSlice(alloc, ",\"active_progress_total\":");
+    try appendIntValue(alloc, out, stats.active_progress_total);
+    try out.appendSlice(alloc, ",\"inference_timeout_count\":");
+    try appendIntValue(alloc, out, stats.inference_timeout_count);
+    try out.appendSlice(alloc, ",\"inference_cancel_count\":");
+    try appendIntValue(alloc, out, stats.inference_cancel_count);
     try out.appendSlice(alloc, ",\"skip_by_hash_count\":");
     try appendIntValue(alloc, out, stats.skip_by_hash_count);
     try out.appendSlice(alloc, ",\"skipped_source_count\":");
@@ -5536,6 +6025,25 @@ fn appendSingleIndexRuntimeStatus(
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
+    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
+    // Progress is a completion fraction, not merely a pulse from an active
+    // worker. Full-text runtime snapshots can legitimately retain their last
+    // cursor value after the worker settles; once the exact incarnation is
+    // authoritative and every lifecycle fence is clear, expose the completed
+    // state as 1.0. This keeps `ready`, indexed cardinality, and progress
+    // mutually consistent for CLI/UI consumers.
+    if (index_type == .full_text and
+        readiness_observation.completionFencesClear() and
+        !backfill_active and
+        !replay_catch_up_required and
+        replay_applied_sequence >= replay_target_sequence and
+        !catch_up_active and
+        catch_up_applied_sequence >= catch_up_target_sequence and
+        load_error == null and
+        !repair_blocks_readiness)
+    {
+        backfill_progress = 1.0;
+    }
     var source_coverage_complete_for_readiness = index_type != .embeddings;
     var artifact_publish_pending = false;
 
@@ -5642,6 +6150,8 @@ fn appendSingleIndexRuntimeStatus(
             true,
         );
         const coverage_complete = coverage.complete;
+        const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
+            item.dense_vector_projection_pending;
         const source_coverage_complete = source_coverage.complete;
         source_coverage_complete_for_readiness = embeddings_coverage_policy == .external or source_coverage_complete;
         // Publication is not complete until the exact resident generation is
@@ -5743,7 +6253,11 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"dense_replay_target_sequence\":");
         try appendIntValue(alloc, out, replay_target_sequence);
         try out.appendSlice(alloc, ",\"dense_publish_pending\":");
-        try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending) "true" else "false");
+        try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending or vector_projection_pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"dense_vector_projection_pending\":");
+        try out.appendSlice(alloc, if (vector_projection_pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"dense_native_storage_phase\":");
+        try appendJsonString(alloc, out, @tagName(item.dense_native_storage_phase));
         try out.appendSlice(alloc, ",\"coverage\":{");
         try appendJsonString(alloc, out, "policy");
         try out.append(alloc, ':');
@@ -5955,23 +6469,18 @@ fn appendIndexReadinessStatus(
     artifact_publish_pending: bool,
 ) !void {
     const Item = @TypeOf(item);
-    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
-        @max(1, item.fresh_group_count)
-    else
-        1;
-    const observation_available = authority.facts_authoritative;
-    const observation_fresh = authority.freshness_authoritative;
-    const target_observation_complete = authority.convergence_authoritative;
-    const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
-        item.expected_group_count == item.fresh_group_count
-    else
-        true;
+    const observation = indexReadinessObservation(item, authority, coverage_generation);
+    const expected_source_observations = observation.expected_source_observations;
+    const observation_available = observation.observation_available;
+    const observation_fresh = observation.observation_fresh;
+    const target_observation_complete = observation.target_observation_complete;
+    const topology_complete = observation.topology_complete;
     // Incarnation fencing is common to every public index kind. The catalog
     // assigns one identity per semantic definition and storage reports the
     // exact identity it installed; accepting a same-name observation without
     // comparing both would let a replaced full-text, graph, or algebraic index
     // satisfy a wait with stale cardinality.
-    const incarnation_current = coverage_generation != 0 and authority.incarnation_current;
+    const incarnation_current = observation.incarnation_current;
     const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
     const globally_failed = terminal_load_failure or repair_failed or terminal_enrichment_global_failure;
@@ -5997,16 +6506,7 @@ fn appendIndexReadinessStatus(
             !serving_snapshot_ready);
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
-    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
-        const sources = if (@hasField(Item, "source_replay_count"))
-            item.source_replay[0..item.source_replay_count]
-        else
-            item.source_replay;
-        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
-    } else true;
-    const pending = !failed and (!observation_fresh or !target_observation_complete or !topology_complete or !incarnation_current or !sources_complete or
-        backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
-        publication_pending or coverage_pending);
+    const sources_complete = observation.sources_complete;
     const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
         if (@hasField(Item, "repair_observation_count") and @hasField(Item, "expected_group_count"))
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
@@ -6019,20 +6519,22 @@ fn appendIndexReadinessStatus(
         serving_snapshot_ready
     else
         active_generation_serviceable;
-    const queryable_partial = !serving_failed and (pending or failed) and
-        partial_generation_serviceable and
-        ((observation_fresh and topology_complete and incarnation_current) or
-            stale_generation_serviceable);
-    const readiness_state = if (failed)
-        "failed"
-    else if (queryable_partial)
-        "queryable_partial"
-    else if (pending)
-        "pending"
-    else
-        "ready";
-    const queryable = queryable_partial or !pending and !failed;
-    const complete = !pending and !failed;
+    const completion_fences = IndexCompletionFences{
+        .observation = observation,
+        .backfill_active = backfill_active,
+        .repair_blocks_complete = repair_blocks_complete,
+        .replay_catch_up_required = replay_catch_up_required,
+        .catch_up_active = catch_up_active,
+        .publication_pending = publication_pending,
+        .coverage_pending = coverage_pending,
+    };
+    const readiness = IndexReadinessEvaluation.evaluate(.{
+        .completion_fences = completion_fences,
+        .failed = failed,
+        .serving_failed = serving_failed,
+        .partial_generation_serviceable = partial_generation_serviceable,
+        .stale_generation_serviceable = stale_generation_serviceable,
+    });
 
     if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
@@ -6058,10 +6560,10 @@ fn appendIndexReadinessStatus(
         }
     }.run;
     try out.appendSlice(alloc, ",\"milestones\":{\"queryable\":{\"reached\":");
-    try out.appendSlice(alloc, if (queryable) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"blockers\":[");
     var queryable_blocker_emitted = false;
-    if (!queryable) {
+    if (!readiness.queryable) {
         if (serving_failed) try appendBlocker(alloc, out, "failure", &queryable_blocker_emitted);
         if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &queryable_blocker_emitted);
         if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &queryable_blocker_emitted);
@@ -6074,10 +6576,10 @@ fn appendIndexReadinessStatus(
         }
     }
     try out.appendSlice(alloc, "]},\"complete\":{\"reached\":");
-    try out.appendSlice(alloc, if (complete) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.complete) "true" else "false");
     try out.appendSlice(alloc, ",\"blockers\":[");
     var complete_blocker_emitted = false;
-    if (!complete) {
+    if (!readiness.complete) {
         if (failed) try appendBlocker(alloc, out, "failure", &complete_blocker_emitted);
         if (!observation_available) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
         if (!target_observation_complete) try appendBlocker(alloc, out, "target_observation", &complete_blocker_emitted);
@@ -6091,11 +6593,11 @@ fn appendIndexReadinessStatus(
     try out.appendSlice(alloc, "]}}");
 
     try out.appendSlice(alloc, ",\"readiness\":{\"state\":");
-    try appendJsonString(alloc, out, readiness_state);
+    try appendJsonString(alloc, out, @tagName(readiness.state));
     try out.appendSlice(alloc, ",\"queryable\":");
-    try out.appendSlice(alloc, if (queryable) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"complete\":");
-    try out.appendSlice(alloc, if (complete) "true" else "false");
+    try out.appendSlice(alloc, if (readiness.complete) "true" else "false");
     if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
@@ -6463,6 +6965,14 @@ fn appendAppliedSequenceStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnma
     try appendIntValue(alloc, out, stats.flushed_indexes);
     try out.appendSlice(alloc, ",\"sync_ns\":");
     try appendIntValue(alloc, out, stats.sync_ns);
+    try out.appendSlice(alloc, ",\"posting_publish_ns\":");
+    try appendIntValue(alloc, out, stats.posting_publish_ns);
+    try out.appendSlice(alloc, ",\"projection_metadata_ns\":");
+    try appendIntValue(alloc, out, stats.projection_metadata_ns);
+    try out.appendSlice(alloc, ",\"checkpoint_file_ns\":");
+    try appendIntValue(alloc, out, stats.checkpoint_file_ns);
+    try out.appendSlice(alloc, ",\"status_snapshot_ns\":");
+    try appendIntValue(alloc, out, stats.status_snapshot_ns);
     try out.appendSlice(alloc, ",\"save_ns\":");
     try appendIntValue(alloc, out, stats.save_ns);
     try out.appendSlice(alloc, ",\"flush_ns\":");
@@ -6554,6 +7064,8 @@ fn appendAsyncIndexingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmana
     try appendStartupCatchUpStatus(alloc, out, stats.startup);
     try out.appendSlice(alloc, ",\"dense_catch_up\":");
     try appendDenseCatchUpStatus(alloc, out, stats.dense_catch_up);
+    try out.appendSlice(alloc, ",\"dense_projection_finalizing\":");
+    try out.appendSlice(alloc, if (stats.dense_projection_finalizing) "true" else "false");
     try out.append(alloc, '}');
 }
 
@@ -7994,6 +8506,58 @@ test "full text aggregate preserves explicit current backfill state" {
     try std.testing.expect(aggregate.replay_catch_up_required);
     try std.testing.expect(aggregate.backfill_active);
     try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
+}
+
+test "derived coverage ready full text status reports complete progress" {
+    const alloc = std.testing.allocator;
+    const config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
+
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .doc_count = 10_000,
+        .term_count = 42_000,
+        .backfill_active = false,
+        // A settled worker may retain an old/default cursor estimate. The
+        // public lifecycle must normalize this when readiness is complete.
+        .backfill_progress = 0.0,
+        .replay_applied_sequence = 10_000,
+        .replay_target_sequence = 10_000,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    }};
+    var local_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 10_000, .doc_count = 10_000, .index_count = 1, .indexes = indexes[0..] },
+    }};
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items[0..] };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
+    defer alloc.free(encoded);
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"status\":{\"total_indexed\":10000,\"backfill_progress\":1.0,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}}",
+        encoded,
+    );
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {

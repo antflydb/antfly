@@ -37,6 +37,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqualDeep(failure, forwarded);
 
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     var malformed = failure;
     malformed.operation = 0;
     var replacement: abi.FailureIdentity = .{};
@@ -87,7 +88,7 @@ const TestWalOptions = struct {
     backend: ?Backend = null,
     storage: ?*anyopaque = null,
     lsm_options: Empty = .{},
-    clock: Hook = .{},
+    clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
     commit_scheduler: Hook = .{},
     artificial_sync_delay_ns: u64 = 0,
     group_commit_window_ns: u64 = 0,
@@ -1376,6 +1377,11 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
             self.ended += 1;
         }
 
+        fn matchesKey(_: *anyopaque, _: metadata_apply_client.CommittedKeySignal) bool {
+            return false;
+        }
+        fn onKey(_: *anyopaque, _: metadata_apply_client.CommittedKeySignal) void {}
+
         fn onProjection(ptr: *anyopaque, signal: metadata_apply_client.ProjectionSignal) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.barrier_active) self.ordering_violation = true;
@@ -1392,6 +1398,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
     // ABI booleans are canonical 0/1 values. Rejecting other bit patterns
     // keeps foreign callers from accidentally selecting a different contract
     // than the storage owner installed.
+    var registration_id: u64 = 0;
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_add_listeners(
         store.handle,
         &.{
@@ -1400,6 +1407,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
             .before_projection_commit_fn = RawCallbacks.barrier,
             .after_projection_commit_fn = RawCallbacks.barrier,
         },
+        &registration_id,
     ));
 
     var capture = Capture{};
@@ -1408,7 +1416,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
         .commit_barrier_kind = .metadata_incarnation,
         .vtable = &.{ .on_projection_signal = Capture.onProjection },
     }));
-    try store.addProjectionListener(.{
+    const registration = try store.addLifecycleListeners(.{
         .ptr = &capture,
         .commit_barrier_kind = .metadata_incarnation,
         .vtable = &.{
@@ -1416,7 +1424,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
             .before_projection_commit = Capture.begin,
             .after_projection_commit = Capture.end,
         },
-    });
+    }, .{ .ptr = &capture, .vtable = &.{ .matches_key = Capture.matchesKey, .on_committed_key = Capture.onKey } });
 
     // Keep this fixture at the actual compiled-owner wire. The transition is
     // `initialize_metadata_incarnation` (tag 45), wrapped in one normal Raft
@@ -1448,4 +1456,65 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
     try std.testing.expectEqual(@as(u64, 91), capture.last_group_id);
     try std.testing.expect(!capture.barrier_active);
     try std.testing.expect(!capture.ordering_violation);
+    try std.testing.expect(store.removeLifecycleListeners(registration));
+    try std.testing.expect(!store.removeLifecycleListeners(registration));
+    // A different metadata group initializes the same incarnation after detach.
+    // No callback may retain the caller-owned capture after removal returns.
+    try store.snapshotBuilder().applyBatch(.{ .group_id = 92, .commit_index = 1, .entries_bytes = &encoded });
+    try std.testing.expectEqual(@as(usize, 1), capture.signals);
+    try std.testing.expectEqual(@as(usize, 1), capture.began);
+    try std.testing.expectEqual(@as(usize, 1), capture.ended);
+}
+
+test "storage kernel status registry is unique and lossless" {
+    try @import("kernel_error_identity").validateForTest();
+}
+
+test "failed owner configuration releases its writer and context lease" {
+    const path = "/tmp/antfly-storage-owner-failed-configuration";
+    cleanup(path);
+    defer cleanup(path);
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+    var owner: ?*anyopaque = null;
+    const failed = abi.antfly_storage_owner_open(&.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .indexes_json = .fromSlice("{"),
+    }, &owner);
+    try std.testing.expect(failed != .ok);
+    try std.testing.expect(owner == null);
+    var reopened = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+    });
+    reopened.deinit();
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_destroy(context.handle));
+    context.handle = null;
+}
+
+test "status text preserves its string wire representation and rejects oversized input" {
+    const Text = @import("db/types.zig").InlineStatusText(4);
+    const alloc = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(alloc, Text.init("test"), .{});
+    defer alloc.free(json);
+    var decoded = try std.json.parseFromSlice(Text, alloc, json, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("test", decoded.value.slice());
+    try std.testing.expectError(error.Overflow, std.json.parseFromSlice(Text, alloc, "\"large\"", .{}));
+}
+
+test "interactive admission state is shared with the physical owner" {
+    const activity = @import("db/enrichment/enrichment_types.zig");
+    const before = abi.antfly_storage_interactive_activity(0, 0);
+    _ = activity.interactive_embed_inflight.fetchAdd(1, .monotonic);
+    defer _ = activity.interactive_embed_inflight.fetchSub(1, .monotonic);
+    try std.testing.expectEqual(before + 1, abi.antfly_storage_interactive_activity(0, 0));
+    const generating = abi.antfly_storage_interactive_activity(1, 0);
+    _ = activity.interactive_generate_inflight.fetchAdd(1, .monotonic);
+    defer _ = activity.interactive_generate_inflight.fetchSub(1, .monotonic);
+    try std.testing.expectEqual(generating + 1, abi.antfly_storage_interactive_activity(1, 0));
 }

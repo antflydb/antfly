@@ -71,19 +71,6 @@ pub const Context = extern struct {
 
 pub const BorrowedBytes = Bytes;
 
-/// Reverse link used only when physical Lite administration is compiled in
-/// the storage kernel but `lite serve` enters the distributed standalone unit.
-pub const LiteServeContext = extern struct {
-    init: *const anyopaque,
-    path: BorrowedBytes,
-    host: BorrowedBytes,
-    extra_args: ?[*]const BorrowedBytes = null,
-    extra_args_len: usize = 0,
-    port: u16,
-    fsync: u8,
-    _reserved0: [5]u8 = @splat(0),
-};
-
 test "runtime process context is C-layout and rejects malformed views" {
     const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(Context).@"struct".layout);

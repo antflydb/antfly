@@ -25,8 +25,16 @@ pub const local = @import("local.zig");
 pub const openai = @import("openai.zig");
 pub const vertex = @import("vertex.zig");
 pub const managed_embedder = @import("managed_embedder.zig");
+pub const execution_context = @import("execution_context.zig");
+/// Compatibility namespace for callers compiled against the pre-unification
+/// module spelling. It aliases the canonical execution-control module.
+pub const request_context = execution_context;
 pub const list_models = @import("list_models.zig");
 pub const query_embedding_cache = @import("query_embedding_cache.zig");
+pub const work = @import("work.zig");
+pub const remote_capabilities = @import("remote_capabilities.zig");
+const credential_source_identity = @import("../common/credential_source_identity.zig");
+const google_auth = @import("antfly_google").auth;
 
 pub const Embedder = types.Embedder;
 pub const Generator = types.Generator;
@@ -36,8 +44,10 @@ pub const SparseEmbedResult = types.SparseEmbedResult;
 pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
+pub const GenerationOptions = types.GenerationOptions;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
+pub const RequestContext = execution_context.RequestContext;
 
 test "inference module compiles" {
     _ = types;
@@ -46,11 +56,21 @@ test "inference module compiles" {
     _ = openai;
     _ = vertex;
     _ = managed_embedder;
+    _ = request_context;
     _ = list_models;
     _ = query_embedding_cache;
+    _ = work;
+    _ = remote_capabilities;
+    _ = execution_context;
+}
+
+test "remote capability invalidation fences active discovery" {
+    try remote_capabilities.testCapabilityInvalidationFencesActiveFlight();
+    try remote_capabilities.testCapabilityInvalidationFencesCompletedFlight();
 }
 
 test "bedrock provider request helpers" {
+    try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
@@ -62,6 +82,7 @@ test "bedrock provider request helpers" {
     try bedrock.testSharedCredentialsProfileParser();
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();
+    try bedrock.testCredentialSourceKeysAreStructured();
     try bedrock.testRequestShapeBatchesByProviderRequest();
     try bedrock.testBedrockRequestFormatResolution();
     try bedrock.testBedrockInvokePathEscapesModelId();
@@ -70,6 +91,22 @@ test "bedrock provider request helpers" {
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
     try managed_embedder.testBedrockRequestFormatConfiguration();
+}
+
+test "embedding provider request helpers" {
+    try @import("../common/provider_limits.zig").testProviderQuotas();
+    try vertex.testEmbeddingStatusMapping();
+    try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
+    try managed_embedder.testManagedEmbeddingRequestContextProgress();
+    try google_auth.testCredentialSourceCacheKeys();
+    try credential_source_identity.testCredentialSourceIdentities();
+    try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();
+    try managed_embedder.testCohereBatchLimit();
+    try managed_embedder.testVertexEmbeddingRequestPlanning();
+    try managed_embedder.testManagedVertexCredentialManagerLifetime();
+    try managed_embedder.testCatalogSemanticIdentityRejectsProducerOnlyFields();
+    try managed_embedder.testTextOnlyManagedProvidersRejectMedia();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
@@ -86,10 +123,19 @@ test "managed embedder configured inference api url precedence" {
 
 test "managed embedder deadlines bound provider pacing and transport" {
     try managed_embedder.testEmbeddingProviderDeadlines();
+    try local.testAntflyProviderRequestControls();
+}
+
+test "managed embedder constructor releases pacing ownership on allocation failure" {
+    try managed_embedder.testManagedEmbedderConstructorAllocationFailureCleanup();
 }
 
 test "managed embedder cancels an in-flight remote embedding request" {
     try managed_embedder.testRemoteEmbeddingCancellation();
+}
+
+test "managed embedder single multimodal admission counts inline image pixels" {
+    try managed_embedder.testSingleMultimodalEmbeddingAdmission();
 }
 
 test "managed embedder rejects malformed provider vectors" {
@@ -112,6 +158,10 @@ test "managed embedder sends antfly media parts when local provider is configure
 
 test "managed embedder normalizes local admission overload across embedding modes" {
     try managed_embedder.testLocalAdmissionOverloadNormalization();
+}
+
+test "managed embedder routes query and document embedding tasks" {
+    try managed_embedder.testEmbeddingTaskRouting();
 }
 
 test "query embedding cache owns results and coalesces misses" {

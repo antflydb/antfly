@@ -1438,6 +1438,48 @@ pub const DebertaEncoderLayerRequest = struct {
     norm_eps: f32,
 };
 
+/// Prepared-slot layout for one NomicBERT encoder layer. Nomic's attention
+/// uses one packed QKV projection and its post-norm SwiGLU MLP has two input
+/// projections, so it does not share DeBERTa's six-linear layout.
+pub const NomicBertEncoderLayerSpec = struct {
+    qkv_linear_slot: usize,
+    attention_output_linear_slot: usize,
+    fc11_linear_slot: usize,
+    fc12_linear_slot: usize,
+    fc2_linear_slot: usize,
+    attention_layer_norm_slot: usize,
+    ffn_layer_norm_slot: usize,
+};
+
+/// Execute a NomicBERT encoder layer from backend-owned dense slots.
+///
+/// Backends return null before encoding when the prepared layout or device
+/// path is unavailable. Callers retain the generic attention + SwiGLU
+/// sequence as the correctness fallback.
+pub const NomicBertEncoderLayerRequest = struct {
+    layer_index: usize,
+    layer: NomicBertEncoderLayerSpec,
+    hidden: CT,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_attention_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+    norm_eps: f32,
+};
+
+pub const NomicBertPoolNormalizeRequest = struct {
+    hidden: CT,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    normalize: bool,
+};
+
 test "tensor storage classes classify host and device residency" {
     try std.testing.expect(TensorStorageClass.host_f32.isHost());
     try std.testing.expect(TensorStorageClass.host_packed_quant.isHost());

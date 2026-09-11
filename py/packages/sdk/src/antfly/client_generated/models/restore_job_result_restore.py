@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class RestoreJobResultRestore(str, Enum):
+class RestoreJobResultRestore(StrEnum):
     COMMITTED = "committed"
     TRIGGERED = "triggered"
 

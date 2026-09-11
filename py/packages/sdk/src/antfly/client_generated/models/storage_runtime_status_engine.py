@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class StorageRuntimeStatusEngine(str, Enum):
+class StorageRuntimeStatusEngine(StrEnum):
     LITE = "lite"
     LOCAL = "local"
     OBJECT = "object"

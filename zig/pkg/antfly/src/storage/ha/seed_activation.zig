@@ -494,6 +494,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     } else {
         if (try directoryExists(io, live_installing_root)) std.Io.Dir.cwd().deleteTree(io, live_installing_root) catch |err| return err;
         const materialized = try seed_materialization.materialize(alloc, .{
+            .io = io,
             .raw_generation_root = raw_root,
             .live_installing_root = live_installing_root,
             .generation = request.expected.generation,
@@ -1372,7 +1373,7 @@ fn prepareMaterializedTestStaging(
     try fs_paths.createDirPathPortable(io, source_snapshot_root);
 
     {
-        var db = try @import("../db/db.zig").DB.open(alloc, live_db_path, .{
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, live_db_path, .{
             .identity_namespace = .{
                 .table_id = identity.table_id,
                 .shard_id = identity.shard_id,
@@ -1953,7 +1954,7 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
     const live_db_path = try std.fs.path.join(alloc, &.{ expected_live_path, "data/replicas/group-1/table-db" });
     defer alloc.free(live_db_path);
     {
-        var db = try @import("../db/db.zig").DB.open(alloc, live_db_path, .{
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, live_db_path, .{
             .identity_namespace = .{ .table_id = testIdentity().table_id, .shard_id = testIdentity().shard_id, .range_id = 1 },
             .start_index_workers = false,
             .start_optional_runtimes = false,

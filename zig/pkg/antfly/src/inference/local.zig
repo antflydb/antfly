@@ -33,14 +33,272 @@ const EmbedWireRequest = struct {
     model: []const u8,
     input: std.json.Value,
     encoding_format: []const u8 = "float",
+    task_type: ?[]const u8 = null,
+    instruction: ?[]const u8 = null,
 };
+
+const DenseJsonEmbeddingObject = struct {
+    embedding: []const f32,
+};
+
+const JsonEmbeddingResponse = struct {
+    data: []const DenseJsonEmbeddingObject,
+};
+
+fn parseDenseJsonResponseAlloc(alloc: std.mem.Allocator, body: []const u8) !inference.EmbedResult {
+    var parsed = try std.json.parseFromSlice(JsonEmbeddingResponse, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.data.len == 0) return error.EmptyResponse;
+
+    const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| alloc.free(@constCast(vector));
+        alloc.free(vectors);
+    }
+    for (parsed.value.data, 0..) |item, i| {
+        vectors[i] = try alloc.dupe(f32, item.embedding);
+        initialized += 1;
+    }
+    return .{
+        .vectors = vectors,
+        .dimension = parsed.value.data[0].embedding.len,
+        .allocator = alloc,
+    };
+}
+
+fn jsonStringEncodedSize(value: []const u8) !usize {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+    var size: usize = 2;
+    for (value) |byte| {
+        const encoded: usize = switch (byte) {
+            '\\', '"', 0x08, 0x0c, '\n', '\r', '\t' => 2,
+            0x00...0x07, 0x0b, 0x0e...0x1f => 6,
+            else => 1,
+        };
+        size = std.math.add(usize, size, encoded) catch return error.OutOfMemory;
+    }
+    return size;
+}
+
+fn addRequestSize(total: *usize, amount: usize) !void {
+    total.* = std.math.add(usize, total.*, amount) catch return error.OutOfMemory;
+}
+
+fn embedPartsRequestSize(
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+) !usize {
+    var total: usize = "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len;
+    try addRequestSize(&total, try jsonStringEncodedSize(model));
+    for (parts, 0..) |part, index| {
+        if (index > 0) try addRequestSize(&total, 1);
+        switch (part) {
+            .text => |text| {
+                try addRequestSize(&total, "{\"type\":\"text\",\"text\":".len + "}".len);
+                try addRequestSize(&total, try jsonStringEncodedSize(text));
+            },
+            .media_url => |url| {
+                try addRequestSize(&total, "{\"type\":\"image_url\",\"image_url\":{\"url\":".len + "}}".len);
+                try addRequestSize(&total, try jsonStringEncodedSize(url));
+            },
+            .binary => |binary_part| {
+                try addRequestSize(&total, "{\"type\":\"media\",\"data\":\"".len + "\",\"mime_type\":".len + "}".len);
+                try addRequestSize(&total, std.base64.standard.Encoder.calcSize(binary_part.data.len));
+                try addRequestSize(&total, try jsonStringEncodedSize(binary_part.mime_type));
+            },
+        }
+    }
+    if (task_type) |value| {
+        try addRequestSize(&total, ",\"task_type\":".len);
+        try addRequestSize(&total, try jsonStringEncodedSize(value));
+    }
+    if (instruction) |value| {
+        try addRequestSize(&total, ",\"instruction\":".len);
+        try addRequestSize(&total, try jsonStringEncodedSize(value));
+    }
+    return total;
+}
+
+/// Build the remote multimodal embedding request in one allocation. Binary
+/// media is base64-encoded directly into the final JSON body, so raw page bytes
+/// never coexist with both an intermediate encoded buffer and a second JSON
+/// copy.
+fn embedPartsRequestJsonAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(
+        alloc,
+        try embedPartsRequestSize(model, parts, task_type, instruction),
+    );
+    defer output.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &output.writer };
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(model);
+    try stringify.objectField("input");
+    try stringify.beginArray();
+    for (parts) |part| {
+        try stringify.beginObject();
+        switch (part) {
+            .text => |text| {
+                try stringify.objectField("type");
+                try stringify.write("text");
+                try stringify.objectField("text");
+                try stringify.write(text);
+            },
+            .media_url => |url| {
+                try stringify.objectField("type");
+                try stringify.write("image_url");
+                try stringify.objectField("image_url");
+                try stringify.beginObject();
+                try stringify.objectField("url");
+                try stringify.write(url);
+                try stringify.endObject();
+            },
+            .binary => |binary_part| {
+                try stringify.objectField("type");
+                try stringify.write("media");
+                try stringify.objectField("data");
+                try stringify.beginWriteRaw();
+                try stringify.writer.writeByte('"');
+                const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
+                const encoded = try stringify.writer.writableSlice(encoded_len);
+                _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
+                try stringify.writer.writeByte('"');
+                stringify.endWriteRaw();
+                try stringify.objectField("mime_type");
+                try stringify.write(binary_part.mime_type);
+            },
+        }
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+    try stringify.objectField("encoding_format");
+    try stringify.write("float");
+    if (task_type) |value| {
+        try stringify.objectField("task_type");
+        try stringify.write(value);
+    }
+    if (instruction) |value| {
+        try stringify.objectField("instruction");
+        try stringify.write(value);
+    }
+    try stringify.endObject();
+    if (output.writer.end != output.writer.buffer.len) return error.InvalidEmbedRequestSize;
+    const body = output.writer.buffer;
+    output.writer.buffer = &.{};
+    output.writer.end = 0;
+    return body;
+}
+
+const SegmentedAttachmentBody = struct {
+    metadata: []u8,
+    envelope: httpx.attachment_envelope.EncodedSegments,
+
+    fn deinit(self: *SegmentedAttachmentBody, alloc: std.mem.Allocator) void {
+        self.envelope.deinit();
+        alloc.free(self.metadata);
+        self.* = undefined;
+    }
+};
+
+fn embedPartsAttachmentEnvelopeAlloc(
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template_mod.ContentPart,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+) !SegmentedAttachmentBody {
+    var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
+    defer attachments.deinit(alloc);
+    var metadata: std.Io.Writer.Allocating = .init(alloc);
+    defer metadata.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &metadata.writer };
+    try stringify.beginObject();
+    try stringify.objectField("model");
+    try stringify.write(model);
+    try stringify.objectField("input");
+    try stringify.beginArray();
+    for (parts) |part| {
+        try stringify.beginObject();
+        switch (part) {
+            .text => |text| {
+                try stringify.objectField("type");
+                try stringify.write("text");
+                try stringify.objectField("text");
+                try stringify.write(text);
+            },
+            .media_url => |url| {
+                try stringify.objectField("type");
+                try stringify.write("image_url");
+                try stringify.objectField("image_url");
+                try stringify.beginObject();
+                try stringify.objectField("url");
+                try stringify.write(url);
+                try stringify.endObject();
+            },
+            .binary => |binary_part| {
+                const attachment_index = attachments.items.len;
+                try attachments.append(alloc, .{
+                    .mime_type = binary_part.mime_type,
+                    .data = binary_part.data,
+                });
+                try stringify.objectField("type");
+                try stringify.write("attachment");
+                try stringify.objectField("attachment_index");
+                try stringify.write(attachment_index);
+            },
+        }
+        try stringify.endObject();
+    }
+    try stringify.endArray();
+    try stringify.objectField("encoding_format");
+    try stringify.write("float");
+    if (task_type) |value| {
+        try stringify.objectField("task_type");
+        try stringify.write(value);
+    }
+    if (instruction) |value| {
+        try stringify.objectField("instruction");
+        try stringify.write(value);
+    }
+    try stringify.endObject();
+    const metadata_bytes = try metadata.toOwnedSlice();
+    errdefer alloc.free(metadata_bytes);
+    return .{
+        .metadata = metadata_bytes,
+        .envelope = try httpx.attachment_envelope.encodeSegmentsAlloc(
+            alloc,
+            metadata_bytes,
+            attachments.items,
+        ),
+    };
+}
+
+fn hasBinaryPart(parts: []const template_mod.ContentPart) bool {
+    for (parts) |part| if (part == .binary) return true;
+    return false;
+}
 
 pub const Provider = struct {
     allocator: std.mem.Allocator,
     http: *httpx.Client,
+    attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     cancellation: ?CancellationToken = null,
+    request_timeout_ms: ?u64 = null,
     auth_header: ?[2][]const u8 = null,
+    source_table: ?[]u8 = null,
+    capability_token: ?[]u8 = null,
+    capability_revision: ?[]u8 = null,
+    request_header_storage: [6][2][]const u8 = undefined,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
@@ -49,6 +307,11 @@ pub const Provider = struct {
     top_k: ?i64 = null,
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
+    max_response_bytes: ?usize = null,
+    framed_attachments: bool = false,
+    /// Non-null means the caller admitted only an exact numeric result. JSON
+    /// fallback is forbidden before parsing, even if a server ignores Accept.
+    numeric_dense_dimensions: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -63,6 +326,18 @@ pub const Provider = struct {
             self.allocator.free(h[1]);
             self.auth_header = null;
         }
+        if (self.source_table) |source_table| {
+            self.allocator.free(source_table);
+            self.source_table = null;
+        }
+        if (self.capability_token) |token| {
+            self.allocator.free(token);
+            self.capability_token = null;
+        }
+        if (self.capability_revision) |revision| {
+            self.allocator.free(revision);
+            self.capability_revision = null;
+        }
     }
 
     pub fn setApiKey(self: *Provider, api_key: []const u8) !void {
@@ -74,13 +349,50 @@ pub const Provider = struct {
     pub fn setAuthorizationHeader(self: *Provider, auth_header: []const u8) !void {
         if (self.auth_header) |h| {
             if (std.mem.eql(u8, h[1], auth_header)) return;
-            self.allocator.free(h[1]);
         }
-        self.auth_header = .{ "Authorization", try self.allocator.dupe(u8, auth_header) };
+        const replacement = try self.allocator.dupe(u8, auth_header);
+        if (self.auth_header) |h| self.allocator.free(h[1]);
+        self.auth_header = .{ "Authorization", replacement };
+    }
+
+    pub fn setSourceTable(self: *Provider, source_table: []const u8) !void {
+        if (self.source_table) |existing| {
+            if (std.mem.eql(u8, existing, source_table)) return;
+        }
+        const replacement = if (source_table.len > 0)
+            try self.allocator.dupe(u8, source_table)
+        else
+            null;
+        if (self.source_table) |existing| self.allocator.free(existing);
+        self.source_table = replacement;
+    }
+
+    /// Bind execution to the distributed capability snapshot used by the
+    /// planner. The proxy rejects this token when its eligible route changes.
+    pub fn setCapabilityToken(self: *Provider, token: []const u8) !void {
+        if (self.capability_token) |existing| {
+            if (std.mem.eql(u8, existing, token)) return;
+        }
+        const replacement = try self.allocator.dupe(u8, token);
+        if (self.capability_token) |existing| self.allocator.free(existing);
+        self.capability_token = replacement;
+    }
+
+    pub fn setCapabilityRevision(self: *Provider, revision: []const u8) !void {
+        if (self.capability_revision) |existing| {
+            if (std.mem.eql(u8, existing, revision)) return;
+        }
+        const replacement = try self.allocator.dupe(u8, revision);
+        if (self.capability_revision) |existing| self.allocator.free(existing);
+        self.capability_revision = replacement;
     }
 
     pub fn setRequestCancellation(self: *Provider, cancellation: ?CancellationToken) void {
         self.cancellation = cancellation;
+    }
+
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: ?u64) void {
+        self.request_timeout_ms = timeout_ms;
     }
 
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
@@ -90,6 +402,66 @@ pub const Provider = struct {
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
+    }
+
+    pub fn setMaxResponseBytes(self: *Provider, max_response_bytes: ?usize) void {
+        self.max_response_bytes = max_response_bytes;
+    }
+
+    pub fn setFramedAttachments(self: *Provider, supported: bool) void {
+        self.framed_attachments = supported;
+    }
+
+    /// Build the task-neutral controls for every request sent to a distributed
+    /// Antfly inference node. Keeping this in one helper prevents a newly added
+    /// model family or wire encoding from silently dropping deadline,
+    /// cancellation, or response-memory enforcement.
+    fn controlledJsonRequest(
+        self: *Provider,
+        json_body: []const u8,
+        fallback_timeout_ms: ?u64,
+    ) httpx.RequestOptions {
+        return .{
+            .attempt_observer = self.attempt_observer,
+            .json = json_body,
+            .headers = self.requestHeaders(),
+            .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        };
+    }
+
+    fn controlledSegmentedBodyRequest(
+        self: *Provider,
+        body_segments: []const []const u8,
+        content_type_value: []const u8,
+        fallback_timeout_ms: ?u64,
+    ) httpx.RequestOptions {
+        const base_headers = self.requestHeaders();
+        const count = if (base_headers) |headers| headers.len else 0;
+        self.request_header_storage[count] = .{ "Content-Type", content_type_value };
+        return .{
+            .attempt_observer = self.attempt_observer,
+            .borrowed_body_segments = body_segments,
+            .headers = self.request_header_storage[0 .. count + 1],
+            .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
+            .max_response_size = self.max_response_bytes,
+            .cancellation = if (self.cancellation) |token|
+                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
+            else
+                null,
+        };
+    }
+
+    fn numericRequestOptions(self: *Provider, options: httpx.RequestOptions) httpx.RequestOptions {
+        var result = options;
+        const count = if (options.headers) |headers| headers.len else 0;
+        self.request_header_storage[count] = .{ "Accept", if (self.numeric_dense_dimensions != null) httpx.numeric_response.content_type else httpx.numeric_response.accept };
+        result.headers = self.request_header_storage[0 .. count + 1];
+        return result;
     }
 
     pub fn setSamplingOptions(
@@ -107,9 +479,25 @@ pub const Provider = struct {
         self.presence_penalty = presence_penalty;
     }
 
-    fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
-        if (self.auth_header) |*h| return @as(*const [1][2][]const u8, h);
-        return null;
+    fn requestHeaders(self: *Provider) ?[]const [2][]const u8 {
+        var count: usize = 0;
+        if (self.auth_header) |header| {
+            self.request_header_storage[count] = header;
+            count += 1;
+        }
+        if (self.source_table) |source_table| {
+            self.request_header_storage[count] = .{ "X-Antfly-Source-Table", source_table };
+            count += 1;
+        }
+        if (self.capability_token) |token| {
+            self.request_header_storage[count] = .{ "X-Antfly-Capability-Token", token };
+            count += 1;
+        }
+        if (self.capability_revision) |revision| {
+            self.request_header_storage[count] = .{ "X-Antfly-Capability-Revision", revision };
+            count += 1;
+        }
+        return if (count == 0) null else self.request_header_storage[0..count];
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {
@@ -139,23 +527,17 @@ pub const Provider = struct {
         var input_array = std.json.Array.init(alloc);
         defer input_array.deinit();
         for (inputs) |input| try input_array.append(.{ .string = input });
-        const json_body = try httpx.json.Json.stringify(self.allocator, EmbedWireRequest{
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, EmbedWireRequest{
             .model = model,
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.authHeaders(),
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, null));
         defer resp.deinit();
 
         if (!resp.ok()) {
             logEmbedFailure("sparse", url, resp.status.code, resp.body);
+            if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
             return mapEmbedStatus(resp.status.code);
         }
 
@@ -213,47 +595,47 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        // The multimodal request tree is only borrowed while embedJsonInput
-        // serializes it. Keep every nested map and encoded buffer under one
-        // request-scoped owner so success, cancellation, and construction
-        // failures all have the same cleanup path.
-        var input_arena = std.heap.ArenaAllocator.init(alloc);
-        defer input_arena.deinit();
-        const input_alloc = input_arena.allocator();
-        var values = std.json.Array.init(input_alloc);
+        return self.embedPartsWithTask(alloc, model, parts, null, null);
+    }
 
-        for (parts) |part| {
-            switch (part) {
-                .text => |text| {
-                    var obj = std.json.ObjectMap.empty;
-                    try obj.put(input_alloc, "type", .{ .string = "text" });
-                    try obj.put(input_alloc, "text", .{ .string = text });
-                    try values.append(.{ .object = obj });
-                },
-                .media_url => |url| {
-                    var image_url = std.json.ObjectMap.empty;
-                    try image_url.put(input_alloc, "url", .{ .string = url });
-
-                    var obj = std.json.ObjectMap.empty;
-                    try obj.put(input_alloc, "type", .{ .string = "image_url" });
-                    try obj.put(input_alloc, "image_url", .{ .object = image_url });
-                    try values.append(.{ .object = obj });
-                },
-                .binary => |binary_part| {
-                    const encoded_len = std.base64.standard.Encoder.calcSize(binary_part.data.len);
-                    const encoded = try input_alloc.alloc(u8, encoded_len);
-                    _ = std.base64.standard.Encoder.encode(encoded, binary_part.data);
-
-                    var obj = std.json.ObjectMap.empty;
-                    try obj.put(input_alloc, "type", .{ .string = "media" });
-                    try obj.put(input_alloc, "data", .{ .string = encoded });
-                    try obj.put(input_alloc, "mime_type", .{ .string = binary_part.mime_type });
-                    try values.append(.{ .object = obj });
-                },
-            }
+    pub fn embedPartsWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        parts: []const template_mod.ContentPart,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        if (self.framed_attachments and hasBinaryPart(parts)) {
+            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction);
+            defer body.deinit(alloc);
+            return try self.embedBody(
+                alloc,
+                self.controlledSegmentedBodyRequest(
+                    body.envelope.segments,
+                    httpx.attachment_envelope.content_type,
+                    null,
+                ),
+                parts.len,
+            );
         }
+        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);
+        defer alloc.free(json_body);
+        return try self.embedJsonBody(alloc, json_body, parts.len);
+    }
 
-        return try self.embedJsonInput(alloc, model, .{ .array = values });
+    pub fn embedWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        inputs: []const []const u8,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        var input_array = std.json.Array.init(alloc);
+        defer input_array.deinit();
+        for (inputs) |input| try input_array.append(.{ .string = input });
+        return try self.embedJsonInputWithTask(alloc, model, .{ .array = input_array }, task_type, instruction);
     }
 
     fn embedImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, inputs: []const []const u8) anyerror!inference.EmbedResult {
@@ -265,31 +647,59 @@ pub const Provider = struct {
     }
 
     fn embedJsonInput(self: *Provider, alloc: std.mem.Allocator, model: []const u8, input: std.json.Value) !inference.EmbedResult {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, EmbedWireRequest{
+        return self.embedJsonInputWithTask(alloc, model, input, null, null);
+    }
+
+    fn embedJsonInputWithTask(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        input: std.json.Value,
+        task_type: ?[]const u8,
+        instruction: ?[]const u8,
+    ) !inference.EmbedResult {
+        const json_body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
             .model = model,
             .input = input,
+            .task_type = task_type,
+            .instruction = instruction,
         });
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.authHeaders(),
-            .cancellation = if (self.cancellation) |token|
-                httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
-        });
+        defer alloc.free(json_body);
+        return try self.embedJsonBody(alloc, json_body, if (input == .array) input.array.items.len else 1);
+    }
+
+    fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8, expected_count: usize) !inference.EmbedResult {
+        return self.embedBody(alloc, self.controlledJsonRequest(json_body, null), expected_count);
+    }
+
+    fn embedBody(
+        self: *Provider,
+        alloc: std.mem.Allocator,
+        options: httpx.RequestOptions,
+        expected_count: usize,
+    ) !inference.EmbedResult {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, self.numericRequestOptions(options));
         defer resp.deinit();
 
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
+            if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
+            if (isInferenceAdmissionDenied(resp)) return error.QueueFull;
             return mapEmbedStatus(resp.status.code);
         }
 
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| {
+            if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+                const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
+                return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
+            }
+            if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
             if (std.mem.startsWith(u8, ct, "application/octet-stream")) {
+                if (body.len < 16 or std.mem.readInt(u64, body[0..8], .little) != expected_count)
+                    return error.InvalidEmbeddingResponse;
                 var result = try binary.deserializeDense(alloc, body);
                 const vectors = result.vectors;
                 const dim = result.dimension;
@@ -302,45 +712,15 @@ pub const Provider = struct {
             }
         }
 
-        const JsonEmbeddingObject = struct {
-            embedding: []const f32,
-        };
-        const JsonResponse = struct {
-            data: []const JsonEmbeddingObject,
-        };
-        var parsed = try std.json.parseFromSlice(JsonResponse, alloc, body, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        if (parsed.value.data.len == 0) return error.EmptyResponse;
-
-        const vectors = try alloc.alloc([]const f32, parsed.value.data.len);
-        errdefer alloc.free(vectors);
-        for (parsed.value.data, 0..) |item, i| {
-            vectors[i] = try alloc.dupe(f32, item.embedding);
-        }
-        return .{
-            .vectors = vectors,
-            .dimension = parsed.value.data[0].embedding.len,
-            .allocator = alloc,
-        };
+        if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
+        var result = try parseDenseJsonResponseAlloc(alloc, body);
+        errdefer result.deinit();
+        if (result.vectors.len != expected_count) return error.InvalidEmbeddingResponse;
+        return result;
     }
 
     fn generateImpl(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
-
-        const Response = struct {
-            choices: []const struct {
-                message: struct {
-                    content: ?[]const u8 = null,
-                    tool_calls: ?[]const struct {
-                        id: ?[]const u8 = null,
-                        function: struct {
-                            name: []const u8,
-                            arguments: []const u8,
-                        },
-                    } = null,
-                },
-            },
-        };
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/generate", .{self.base_url});
         defer self.allocator.free(url);
@@ -353,16 +733,28 @@ pub const Provider = struct {
             .top_k = self.top_k,
             .frequency_penalty = self.frequency_penalty,
             .presence_penalty = self.presence_penalty,
+            .enable_thinking = if (self.tools_json != null) false else null,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{
-            .json = json_body,
-            .headers = self.authHeaders(),
-            .timeout_ms = 300_000,
-        });
+        var resp = try self.http.post(url, self.controlledJsonRequest(json_body, 300_000));
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateRequestFailed;
+        if (!resp.ok()) return generationResponseError(alloc, resp);
         const body = resp.body orelse return error.EmptyResponse;
+        return parseGenerationResponse(alloc, body, self.tools_json, self.tool_choice_json);
+    }
+
+    pub fn parseGenerationResponse(alloc: std.mem.Allocator, body: []const u8, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) !inference.GenerateResult {
+        const Response = struct {
+            choices: []const struct {
+                message: struct {
+                    content: ?[]const u8 = null,
+                    tool_calls: ?[]const struct {
+                        id: ?[]const u8 = null,
+                        function: struct { name: []const u8, arguments: []const u8 },
+                    } = null,
+                },
+            },
+        };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const choices = parsed.value.choices;
@@ -371,7 +763,7 @@ pub const Provider = struct {
         errdefer freeToolCalls(alloc, tool_calls);
         const content = choices[0].message.content orelse "";
         if (tool_calls.len == 0 and content.len > 0) {
-            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+            tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, tools_json, tool_choice_json);
         }
         if (content.len == 0 and tool_calls.len == 0) return error.EmptyResponse;
 
@@ -422,10 +814,17 @@ pub const Provider = struct {
             .prompts = documents,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, self.numericRequestOptions(self.controlledJsonRequest(json_body, null)));
         defer resp.deinit();
-        if (!resp.ok()) return error.RerankRequestFailed;
+        if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
+            error.InferenceCapabilitiesStale
+        else
+            error.RerankRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
+        if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+            const view = try httpx.numeric_response.parse(body, .scores, documents.len, 1);
+            return .{ .scores = try view.scoresAlloc(alloc), .allocator = alloc };
+        };
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const scores = if (parsed.value.scores) |scores_src| blk: {
@@ -435,6 +834,9 @@ pub const Provider = struct {
             for (scores_src, 0..) |item, i| out[i] = item.score;
             break :blk out;
         } else return error.InvalidRerankerResponse;
+        errdefer alloc.free(scores);
+        if (scores.len != documents.len) return error.InvalidRerankerResponse;
+        for (scores) |score| if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
         return .{
             .scores = scores,
             .allocator = alloc,
@@ -460,6 +862,42 @@ fn mapEmbedStatus(status: u16) anyerror {
     };
 }
 
+fn isCapabilityStaleResponse(response: httpx.Response) bool {
+    if (response.status.code != 409) return false;
+    const value = response.headers.get("X-Antfly-Capability-Stale") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "true");
+}
+
+fn generationResponseError(alloc: std.mem.Allocator, response: httpx.Response) anyerror {
+    if (isCapabilityStaleResponse(response)) return error.InferenceCapabilitiesStale;
+    return inference.localGenerationStatusError(alloc, response.status.code, response.body);
+}
+
+fn isInferenceAdmissionDenied(response: httpx.Response) bool {
+    if (response.status.code != 503) return false;
+    const body = response.body orelse return false;
+    if (body.len > 4096) return false;
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const Failure = struct { reason: ?[]const u8 = null, retryable: bool = false };
+    var parsed = std.json.parseFromSlice(Failure, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.retryable and std.mem.eql(u8, parsed.value.reason orelse "", "inference_admission");
+}
+
+test "antfly provider preserves explicit distributed admission denial" {
+    var response = httpx.Response.init(std.testing.allocator, 503);
+    defer response.deinit();
+    response.body = "{\"reason\":\"inference_admission\",\"retryable\":true}";
+    try std.testing.expect(isInferenceAdmissionDenied(response));
+    response.body = "{\"reason\":\"model_loading\",\"retryable\":true}";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
+    response.body = "{\"reason\":\"inference_admission\",\"retryable\":false}";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
+    response.body = "not JSON";
+    try std.testing.expect(!isInferenceAdmissionDenied(response));
+}
+
 fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]const u8) void {
     const raw = body orelse "";
     const clipped = raw[0..@min(raw.len, 512)];
@@ -470,13 +908,62 @@ test "antfly provider compiles" {
     _ = Provider;
 }
 
-test "antfly embed request omits nullable generated fields" {
+pub fn testAntflyProviderRequestControls() !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(std.testing.allocator, io_impl.io());
+    defer http.deinit();
+    var provider = Provider.init(std.testing.allocator, &http, "http://inference");
+    defer provider.deinit();
+
+    provider.setRequestTimeoutMs(17);
+    provider.setMaxResponseBytes(23);
+    try provider.setSourceTable("docs");
+    const options = provider.controlledJsonRequest("{}", 31);
+    try std.testing.expectEqualStrings("{}", options.json orelse return error.TestExpectedJson);
+    try std.testing.expectEqual(@as(?u64, 17), options.timeout_ms);
+    try std.testing.expectEqual(@as(?usize, 23), options.max_response_size);
+    try std.testing.expect(options.headers != null);
+    try std.testing.expect(options.cancellation == null);
+
+    provider.setRequestTimeoutMs(null);
+    const fallback = provider.controlledJsonRequest("{}", 31);
+    try std.testing.expectEqual(@as(?u64, 31), fallback.timeout_ms);
+}
+
+test "antfly provider applies task-neutral request controls to every wire request" {
+    try testAntflyProviderRequestControls();
+}
+
+test "antfly provider composes authorization and capability lease headers" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(std.testing.allocator, io_impl.io());
+    defer http.deinit();
+    var provider = Provider.init(std.testing.allocator, &http, "http://inference");
+    defer provider.deinit();
+    try provider.setAuthorizationHeader("Bearer secret");
+    try provider.setSourceTable("docs");
+    try provider.setCapabilityToken("route-token");
+    try provider.setCapabilityRevision("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    const headers = provider.requestHeaders() orelse return error.TestExpectedHeaders;
+    try std.testing.expectEqual(@as(usize, 4), headers.len);
+    try std.testing.expectEqualStrings("Authorization", headers[0][0]);
+    try std.testing.expectEqualStrings("Bearer secret", headers[0][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Source-Table", headers[1][0]);
+    try std.testing.expectEqualStrings("docs", headers[1][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Token", headers[2][0]);
+    try std.testing.expectEqualStrings("route-token", headers[2][1]);
+    try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[3][0]);
+}
+
+test "antfly embed request omits absent optional fields" {
     const alloc = std.testing.allocator;
     var input = std.json.Array.init(alloc);
     defer input.deinit();
     try input.append(.{ .string = "hello" });
 
-    const body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+    const body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
         .model = "antflydb/clipclap",
         .input = .{ .array = input },
     });
@@ -484,10 +971,83 @@ test "antfly embed request omits nullable generated fields" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"encoding_format\":\"float\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"dimensions\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"task_type\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
 
-test "antfly embed parts preserves binary base64 until request serialization" {
+test "antfly embed parts request sizing is exact for escaped strings" {
+    const parts = [_]template_mod.ContentPart{
+        .{ .text = "line\nquoted \"text\"" },
+        .{ .media_url = "https://example.invalid/a\\b.png" },
+        .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
+    };
+    const body = try embedPartsRequestJsonAlloc(
+        std.testing.allocator,
+        "clip\"clap",
+        &parts,
+        "RETRIEVAL_DOCUMENT",
+        "find diagrams",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqual(
+        try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams"),
+        body.len,
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "antfly dense JSON response cleanup is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var result = try parseDenseJsonResponseAlloc(
+                alloc,
+                "{\"data\":[{\"embedding\":[1,2,3]},{\"embedding\":[4,5,6]}]}",
+            );
+            result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "antfly embed parts uses the framed attachment transport" {
+    return testEmbedPartsRequestRoundTrip(false, false);
+}
+
+test "antfly embed request carries retrieval task and instruction" {
+    const alloc = std.testing.allocator;
+    var input = std.json.Array.init(alloc);
+    defer input.deinit();
+    try input.append(.{ .string = "history of Korea" });
+
+    const body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
+        .model = "nomic-ai/nomic-embed-text-v1.5",
+        .input = .{ .array = input },
+        .task_type = "RETRIEVAL_QUERY",
+        .instruction = "retrieve relevant encyclopedia passages",
+    });
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"task_type\":\"RETRIEVAL_QUERY\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\":\"retrieve relevant encyclopedia passages\"") != null);
+}
+
+test "antfly embed parts lends raw binary through its request envelope" {
+    return testEmbedPartsRequestRoundTrip(false, false);
+}
+
+test "antfly numeric responses negotiate dense and score frames with JSON fallback" {
+    try testEmbedPartsRequestRoundTrip(false, false);
+    try testEmbedPartsRequestRoundTrip(true, false);
+    try testEmbedPartsRequestRoundTrip(true, true);
+    try testEmbedPartsRequestRoundTrip(false, true);
+    try testRerankScoresResponse(false);
+    try testRerankScoresResponse(true);
+}
+
+fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime required: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -497,16 +1057,28 @@ test "antfly embed parts preserves binary base64 until request serialization" {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqual(httpx.Method.POST, req.method);
             try std.testing.expectEqualStrings("/embed", req.path);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"type\":\"media\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"data\":\"AQID\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mime_type\":\"image/png\"") != null);
+            try std.testing.expectEqualStrings(if (required) httpx.numeric_response.content_type else httpx.numeric_response.accept, req.header("Accept") orelse return error.TestExpectedAccept);
+            try std.testing.expectEqualStrings(
+                httpx.attachment_envelope.content_type,
+                req.header("Content-Type") orelse return error.TestExpectedContentType,
+            );
+            var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+            defer envelope.deinit();
+            try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
+            try std.testing.expectEqualStrings("image/png", envelope.attachments[0].mime_type);
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, envelope.attachments[0].data);
+            try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"type\":\"attachment\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"attachment_index\":0") != null);
         }
     };
 
+    const frame = try httpx.numeric_response.allocFrame(alloc, .dense, 1, 3);
+    defer alloc.free(frame);
+    for ([_]f32{ 0.25, 0.5, 0.75 }, 0..) |value, i| try httpx.numeric_response.setValue(frame, i, value);
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
-            .body = "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
-            .content_type = "application/json",
+            .body = if (binary_response) frame else "{\"data\":[{\"embedding\":[0.25,0.5,0.75]}]}",
+            .content_type = if (binary_response) httpx.numeric_response.content_type else "application/json",
         } },
     });
     defer ts.deinit();
@@ -518,13 +1090,21 @@ test "antfly embed parts preserves binary base64 until request serialization" {
 
     const Fiber = struct {
         fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, ok_out: *bool, dim_out: *usize, err_out: *anyerror) std.Io.Cancelable!void {
-            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            var bounded = @import("work.zig").BoundedInvocationAllocator.init(a, 384 * 1024);
+            const request_alloc = if (required) bounded.allocator() else a;
+            defer std.debug.assert(bounded.live_bytes == 0);
+            var client = httpx.Client.initWithConfig(request_alloc, test_io, .{ .keep_alive = false });
             defer client.deinit();
 
-            var provider = Provider.init(a, &client, base);
+            var provider = Provider.init(request_alloc, &client, base);
             defer provider.deinit();
+            provider.setFramedAttachments(true);
+            if (required) {
+                provider.numeric_dense_dimensions = 3;
+                provider.setMaxResponseBytes(4096);
+            }
 
-            var result = provider.embedParts(a, "clipclap", &.{
+            var result = provider.embedParts(request_alloc, "clipclap", &.{
                 .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
             }) catch |e| {
                 err_out.* = e;
@@ -542,11 +1122,64 @@ test "antfly embed parts preserves binary base64 until request serialization" {
     try ts.handleOne();
     group.await(io) catch {};
 
+    if (required and !binary_response) {
+        try std.testing.expect(!result_ok);
+        try std.testing.expectEqual(error.InferenceCapabilitiesStale, result_err);
+        return;
+    }
     if (!result_ok) {
         std.debug.print("embed parts fiber error: {}\n", .{result_err});
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 3), result_dim);
+}
+
+test "generating backend local HTTP preserves retryable capacity" {
+    try testGenerationStatus(503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"reason\":\"inference_capacity\",\"retry_after_ms\":1000}", error.GenerationCapacityUnavailable);
+}
+
+test "generating backend local HTTP preserves capability refresh alongside capacity errors" {
+    var response = httpx.Response.init(std.testing.allocator, 409);
+    defer response.deinit();
+    try std.testing.expectEqual(error.GenerateRequestFailed, generationResponseError(std.testing.allocator, response));
+    try response.headers.set("X-Antfly-Capability-Stale", "true");
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, generationResponseError(std.testing.allocator, response));
+    try testGenerationStatus(409, "{}", error.GenerateRequestFailed);
+    try testGenerationStatus(504, "{}", error.Timeout);
+    try testGenerationStatus(429, "{}", error.RateLimit);
+}
+
+fn testGenerationStatus(status: u16, body: []const u8, expected: anyerror) !void {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/generate", .respond = .{
+        .status = status,
+        .body = body,
+    } }});
+    defer server.deinit();
+    var result_error: anyerror = error.TestUnexpectedResult;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    const Call = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, url: []const u8, result: *anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            var provider = Provider.init(a, &client, url);
+            defer provider.deinit();
+            var generator = provider.generator();
+            var response = generator.generate(a, "gemma", &.{.{ .role = .user, .content = .{ .text = "Hello" } }}) catch |err| {
+                result.* = err;
+                return;
+            };
+            response.deinit();
+        }
+    };
+    try group.concurrent(io, Call.run, .{ alloc, io, server.baseUrl(), &result_error });
+    try server.handleOne();
+    try group.await(io);
+    try std.testing.expectEqual(expected, result_error);
 }
 
 test "antfly generate round trip" {
@@ -610,8 +1243,21 @@ test "antfly sparse embed round trip" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqualStrings("sparse-model", obj.get("model").?.string);
+            try std.testing.expectEqualStrings("alpha body", obj.get("input").?.array.items[0].string);
+            try std.testing.expectEqualStrings("float", obj.get("encoding_format").?.string);
+            try std.testing.expect(!obj.contains("task_type"));
+            try std.testing.expect(!obj.contains("instruction"));
+        }
+    };
+
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/embed", .respond = .{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
             .content_type = "application/json",
             .body =
             \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":{"indices":[7,42],"values":[1.5,0.5]}}],"model":"sparse-model","usage":{"prompt_tokens":1,"total_tokens":1}}
@@ -721,16 +1367,23 @@ test "antfly rerank round trip" {
 }
 
 test "antfly rerank accepts scores array response" {
+    try testRerankScoresResponse(false);
+}
+
+fn testRerankScoresResponse(binary_response: bool) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const frame = try httpx.numeric_response.allocFrame(alloc, .scores, 2, 1);
+    defer alloc.free(frame);
+    try httpx.numeric_response.setValue(frame, 0, 0.8);
+    try httpx.numeric_response.setValue(frame, 1, 0.2);
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/rerank", .respond = .{
-            .body =
-            \\{"scores":[0.8,0.2]}
-            ,
+            .body = if (binary_response) frame else "{\"scores\":[0.8,0.2]}",
+            .content_type = if (binary_response) httpx.numeric_response.content_type else "application/json",
         } },
     });
     defer ts.deinit();
@@ -777,6 +1430,16 @@ test "antfly rerank accepts scores array response" {
 }
 
 test "antfly embed round trip (binary)" {
+    try testDenseEmbedRequest(null, null);
+}
+
+test "antfly embed round trip preserves supplied task and instruction" {
+    try testDenseEmbedRequest("RETRIEVAL_DOCUMENT", null);
+    try testDenseEmbedRequest("RETRIEVAL_QUERY", "");
+    try testDenseEmbedRequest("RETRIEVAL_QUERY", "retrieve relevant encyclopedia passages");
+}
+
+fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: ?[]const u8) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -792,8 +1455,29 @@ test "antfly embed round trip (binary)" {
     bin_buf[20..24].* = @bitCast(@as(f32, 1.5));
     bin_buf[24..28].* = @bitCast(@as(f32, 2.5));
 
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqualStrings("bge-small", obj.get("model").?.string);
+            try std.testing.expectEqualStrings("test input", obj.get("input").?.array.items[0].string);
+            try std.testing.expectEqualStrings("float", obj.get("encoding_format").?.string);
+            if (task_type) |value| {
+                try std.testing.expectEqualStrings(value, obj.get("task_type").?.string);
+            } else {
+                try std.testing.expect(!obj.contains("task_type"));
+            }
+            if (instruction) |value| {
+                try std.testing.expectEqualStrings(value, obj.get("instruction").?.string);
+            } else {
+                try std.testing.expect(!obj.contains("instruction"));
+            }
+        }
+    };
+
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/embed", .respond = .{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
             .body = &bin_buf,
             .content_type = "application/octet-stream",
         } },
@@ -815,7 +1499,10 @@ test "antfly embed round trip (binary)" {
             defer provider.deinit();
 
             var emb = provider.embedder();
-            var result = emb.embed(a, "bge-small", &.{"test input"}) catch return;
+            var result = (if (task_type != null or instruction != null)
+                provider.embedWithTask(a, "bge-small", &.{"test input"}, task_type, instruction)
+            else
+                emb.embed(a, "bge-small", &.{"test input"})) catch return;
             defer result.deinit();
 
             ok_out.* = true;

@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.reranker_provider import RerankerProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="RerankerProfile")
@@ -16,17 +17,22 @@ class RerankerProfile:
     """Reranking execution statistics.
 
     Attributes:
-        model (str | Unset): Reranker model that was used.
+        provider (RerankerProvider): The reranking provider to use.
+        model (str | Unset): Resolved reranker model when the provider exposes a stable model name. Omitted for
+            automatic local selection.
         documents_reranked (int | Unset): Number of documents that were reranked.
         duration_ms (int | Unset): Time spent reranking in milliseconds.
     """
 
+    provider: RerankerProvider
     model: str | Unset = UNSET
     documents_reranked: int | Unset = UNSET
     duration_ms: int | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         documents_reranked = self.documents_reranked
@@ -35,7 +41,11 @@ class RerankerProfile:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
+        field_dict.update(
+            {
+                "provider": provider,
+            }
+        )
         if model is not UNSET:
             field_dict["model"] = model
         if documents_reranked is not UNSET:
@@ -48,6 +58,8 @@ class RerankerProfile:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = RerankerProvider(d.pop("provider"))
+
         model = d.pop("model", UNSET)
 
         documents_reranked = d.pop("documents_reranked", UNSET)
@@ -55,6 +67,7 @@ class RerankerProfile:
         duration_ms = d.pop("duration_ms", UNSET)
 
         reranker_profile = cls(
+            provider=provider,
             model=model,
             documents_reranked=documents_reranked,
             duration_ms=duration_ms,

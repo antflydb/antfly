@@ -20,14 +20,14 @@ const backup_bundle = @import("../backup_bundle.zig");
 const backup_bundle_io = @import("../backup_bundle_io.zig");
 const backups_api = @import("../../api/backups.zig");
 const connection = @import("connection.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const db_types = @import("../db/types.zig");
 const group_ids = @import("../../common/group_ids.zig");
 const internal_keys = @import("../internal_keys.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../api/tables.zig");
-const table_writes = @import("../../api/table_writes.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class AgentStepStatus(str, Enum):
+class AgentStepStatus(StrEnum):
     ERROR = "error"
     SKIPPED = "skipped"
     SUCCESS = "success"

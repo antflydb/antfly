@@ -262,6 +262,11 @@ const ReadyRecoveryAttempt = struct {
 };
 
 const PendingApplyTask = struct {
+    // Scratch links rebuilt before each drain; retained task ownership does not
+    // depend on these indexes surviving compaction or group retirement.
+    next_in_group: ?usize = null,
+    completed: bool = false,
+    async_storage_apply: bool = false,
     group_id: core.types.GroupId,
     snapshot: ?core.types.Snapshot,
     entries: []core.Entry,
@@ -332,7 +337,7 @@ const SnapshotBuildWorker = struct {
     io_impl: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
-    thread: ?std.Thread = null,
+    future: ?std.Io.Future(void) = null,
     stopping: bool = false,
     running: bool = false,
     pending: ?SnapshotBuildRequest = null,
@@ -342,7 +347,7 @@ const SnapshotBuildWorker = struct {
     result: ?SnapshotBuildResult = null,
 
     fn start(self: *@This()) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.future = try self.io_impl.io().concurrent(run, .{self});
     }
 
     fn deinit(self: *@This()) void {
@@ -352,7 +357,7 @@ const SnapshotBuildWorker = struct {
         if (self.running_source) |source| source.cancel();
         self.ready.broadcast(io);
         self.mutex.unlock(io);
-        if (self.thread) |thread| thread.join();
+        if (self.future) |*future| future.await(io);
         if (self.pending) |*request| request.deinit();
         if (self.result) |*result| result.deinit();
         self.io_impl.deinit();
@@ -519,6 +524,8 @@ pub const MultiRaft = struct {
         snapshot_transport_iface.SnapshotAttemptKey,
     ) = .empty,
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    apply_group_heads: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
+    apply_cursor: usize = 0,
     pending_snapshot_bytes: std.atomic.Value(usize) = .init(0),
     snapshot_admission_denials: std.atomic.Value(usize) = .init(0),
     // Reused by every bounded Ready drain. Capacity is reserved when groups
@@ -565,6 +572,7 @@ pub const MultiRaft = struct {
         self.expired_snapshot_submissions.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        self.apply_group_heads.deinit(self.alloc);
         self.oversized_ready_scratch.deinit(self.alloc);
         self.recovery_permits.deinit(self.alloc);
         var snapshot_candidates = self.snapshot_candidates.valueIterator();
@@ -1701,7 +1709,8 @@ pub const MultiRaft = struct {
         for (ready_messages) |msg| {
             switch (msg.msg_type) {
                 .storage_append => try self.handleLocalStorageAppend(group_id, grp, msg, outbox),
-                .storage_apply => try self.handleLocalStorageApply(group_id, grp, msg, outbox),
+                // Acknowledge application only when the retained task completes.
+                .storage_apply => {},
                 else => try outbox.appendMessage(
                     self.alloc,
                     group_id,
@@ -1749,6 +1758,7 @@ pub const MultiRaft = struct {
         var conf_state_owned = cloned_conf_state != null;
         errdefer if (cloned_conf_state) |*owned| if (conf_state_owned) owned.deinit(self.alloc);
         var task: PendingApplyTask = .{
+            .async_storage_apply = committed_entries.len > 0 and self.group(group_id).?.raw_node.async_storage_writes,
             .group_id = group_id,
             .snapshot = cloned_snapshot,
             .entries = cloned_entries,
@@ -1780,6 +1790,14 @@ pub const MultiRaft = struct {
 
         const drain_count = @min(self.cfg.max_apply_tasks_per_round, self.pending_apply.items.len);
         if (drain_count == 0) return;
+
+        // Legacy queues report only a completed prefix. Explicitly retryable
+        // queues and direct state machines use a fair, per-group drain.
+        if (self.hooks.apply_queue) |queue| {
+            if (queue.vtable.is_apply_retryable != null) return self.flushPendingApplyByGroup();
+        } else if (self.hooks.state_machine != null) {
+            return self.flushPendingApplyByGroup();
+        }
 
         var completed: usize = 0;
         var apply_failure: ?anyerror = null;
@@ -1816,6 +1834,7 @@ pub const MultiRaft = struct {
             completed = drain_count;
         }
 
+        for (self.pending_apply.items[0..completed]) |task| self.acknowledgeAppliedTask(task);
         const applied_snapshot = self.scheduleAppliedLogCompaction(self.pending_apply.items[0..completed]);
         self.consumePendingApplyPrefix(completed);
         if (apply_failure) |err| return err;
@@ -1823,6 +1842,93 @@ pub const MultiRaft = struct {
         // Async Ready advances its RawNode after apply drains. Defer maintenance
         // for a round so an incoming snapshot is visible before stale local
         // compaction results are considered for publication.
+        if (!applied_snapshot) self.runSnapshotMaintenance();
+    }
+
+    fn applyPendingTask(self: *MultiRaft, task: PendingApplyTask) !void {
+        if (self.hooks.apply_queue) |queue| {
+            defer queue.abort();
+            try queue.enqueueApply(task.group_id, task.snapshot, task.entries, task.read_states);
+            const result = queue.drain();
+            self.metrics.apply_queue_drains += 1;
+            if (result.completed > 1 or (result.completed == 1 and result.failure != null))
+                return error.InvalidApplyProgress;
+            if (result.failure) |err| return err;
+            if (result.completed != 1) return error.IncompleteApplyDrain;
+        } else {
+            try self.hooks.state_machine.?.applyReady(task.group_id, task.snapshot, task.entries, task.read_states);
+        }
+    }
+
+    fn applyFailureIsRetryable(self: *MultiRaft, group_id: core.types.GroupId, err: anyerror) bool {
+        if (self.hooks.apply_queue) |queue| return queue.isApplyRetryable(group_id, err);
+        return self.hooks.state_machine.?.isApplyRetryable(group_id, err);
+    }
+
+    fn flushPendingApplyByGroup(self: *MultiRaft) !void {
+        const tasks = self.pending_apply.items;
+        self.apply_group_heads.clearRetainingCapacity();
+        // Allocate before the first mutation; an allocation failure cannot lose
+        // a completed task or its retry checkpoint.
+        try self.apply_group_heads.ensureTotalCapacity(self.alloc, @intCast(tasks.len));
+        var reverse = tasks.len;
+        while (reverse > 0) {
+            reverse -= 1;
+            const task = &tasks[reverse];
+            task.completed = false;
+            task.next_in_group = self.apply_group_heads.get(task.group_id);
+            self.apply_group_heads.putAssumeCapacity(task.group_id, reverse);
+        }
+
+        const start = self.apply_cursor % tasks.len;
+        var next_cursor = start;
+        var attempts: usize = 0;
+        var applied_snapshot = false;
+        var failure: ?anyerror = null;
+        for (0..tasks.len) |offset| {
+            if (attempts == self.cfg.max_apply_tasks_per_round) break;
+            const index = (start + offset) % tasks.len;
+            const task = &tasks[index];
+            // A retained earlier task fences every later entry, snapshot, and
+            // ReadState from the same group, even across a cursor wrap.
+            if (self.apply_group_heads.get(task.group_id) != index) continue;
+            attempts += 1;
+            next_cursor = (index + 1) % tasks.len;
+            self.applyPendingTask(task.*) catch |err| {
+                if (self.applyFailureIsRetryable(task.group_id, err)) {
+                    _ = self.apply_group_heads.remove(task.group_id);
+                    continue;
+                }
+                next_cursor = index;
+                failure = err;
+                break;
+            };
+            self.acknowledgeAppliedTask(task.*);
+            applied_snapshot = self.scheduleAppliedLogCompaction(tasks[index..][0..1]) or applied_snapshot;
+            task.completed = true;
+            if (task.next_in_group) |next| {
+                self.apply_group_heads.putAssumeCapacity(task.group_id, next);
+            } else {
+                _ = self.apply_group_heads.remove(task.group_id);
+            }
+        }
+
+        var retained: usize = 0;
+        var retained_before_cursor: usize = 0;
+        for (tasks, 0..) |*task, index| {
+            if (task.completed) {
+                task.deinit(self.alloc);
+                continue;
+            }
+            if (index < next_cursor) retained_before_cursor += 1;
+            if (retained != index) tasks[retained] = task.*;
+            retained += 1;
+        }
+        self.pending_apply.items.len = retained;
+        self.apply_cursor = if (retained == 0) 0 else retained_before_cursor % retained;
+        if (failure) |err| return err;
+        // Expected backpressure is a successful host turn: persisted outbound
+        // traffic must be sent and healthy groups must keep their elections.
         if (!applied_snapshot) self.runSnapshotMaintenance();
     }
 
@@ -2045,7 +2151,10 @@ pub const MultiRaft = struct {
         if (self.snapshot_worker) |worker| return worker;
         const worker = try self.alloc.create(SnapshotBuildWorker);
         errdefer self.alloc.destroy(worker);
-        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{}) };
+        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        }) };
         errdefer worker.io_impl.deinit();
         try worker.start();
         self.snapshot_worker = worker;
@@ -2548,25 +2657,18 @@ pub const MultiRaft = struct {
         }
     }
 
-    fn handleLocalStorageApply(
-        self: *MultiRaft,
-        group_id: core.types.GroupId,
-        grp: *group_mod.Group,
-        msg: core.Message,
-        outbox: *TransportOutbox,
-    ) !void {
-        for (msg.responses) |response| {
-            if (core.message.isLocalStorageThread(response.to) or response.to == grp.localNodeId()) {
-                try grp.step(response);
-            } else {
-                try outbox.appendMessage(
-                    self.alloc,
-                    group_id,
-                    self.group_incarnations.get(group_id) orelse return error.UnknownGroup,
-                    response,
-                );
-            }
-        }
+    fn acknowledgeAppliedTask(self: *MultiRaft, task: PendingApplyTask) void {
+        if (!task.async_storage_apply) return;
+        const grp = self.group(task.group_id) orelse unreachable;
+        // RawNode creates this local response from the same committed entries.
+        // Borrow their retained bytes rather than duplicating another payload.
+        // Its handler only advances appliedTo and releases proposal accounting.
+        grp.step(.{
+            .msg_type = .storage_apply_response,
+            .from = core.message.LocalApplyThread,
+            .to = grp.localNodeId(),
+            .entries = task.entries,
+        }) catch unreachable;
     }
 };
 
@@ -3415,4 +3517,15 @@ test "multi raft progress round drains ready work without advancing raft time" {
     try std.testing.expectEqual(before.virtual_round, after.virtual_round);
     try std.testing.expectEqual(before.virtual_time_ms, after.virtual_time_ms);
     try std.testing.expectEqual(before_advance_time_calls, transport.advance_time_calls);
+}
+
+test "snapshot worker startup failure leaves no task and can be drained" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var worker: SnapshotBuildWorker = .{ .io_impl = std.Io.Threaded.init(std.testing.failing_allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    }) };
+    defer worker.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, worker.start());
+    try std.testing.expect(worker.future == null);
 }

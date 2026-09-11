@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const bloom = @import("bloom");
 const byte_copy = @import("../../common/byte_copy.zig");
 const snappy = @import("../../encoding/snappy.zig");
@@ -29,6 +30,8 @@ pub const default_filter_config: bloom.Config = .{ .bits_per_key = 14 };
 const block_filter_config: bloom.Config = default_filter_config;
 const min_compress_block_bytes: usize = 1024;
 const compression_savings_denominator: usize = 8;
+const snappy_rejection_streak_limit: usize = 4;
+const snappy_reprobe_interval: usize = 32;
 const prefix_block_magic = "ALSMPFX1";
 const prefix_restart_interval: usize = 16;
 /// Footer metadata starts with an explicit marker because footer-only index
@@ -800,7 +803,7 @@ const memory_table_sink_vtable = TableSink.VTable{
 
 const ChecksummedTableSink = struct {
     parent: *TableSink,
-    crc: std.hash.Crc32 = .init(),
+    crc: Crc32 = .init(),
 
     fn sink(self: *ChecksummedTableSink) TableSink {
         return .{
@@ -1122,6 +1125,15 @@ pub const StreamingEncoder = struct {
     blocks: std.ArrayListUnmanaged(OwnedEncodedBlockMeta) = .empty,
     block_bytes: std.ArrayListUnmanaged(u8) = .empty,
     compression_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    /// Dense embeddings and encrypted/compressed documents often contain long
+    /// runs of blocks for which Snappy cannot meet the adaptive savings floor.
+    /// Probe periodically after a rejection streak instead of recompressing
+    /// every block only to discard the result. Prefix compression remains
+    /// active for every block and a successful probe immediately re-enables
+    /// Snappy.
+    snappy_rejection_streak: usize = 0,
+    snappy_reprobe_countdown: usize = 0,
+    snappy_attempted_blocks: usize = 0,
     encoded_filter_bytes: std.ArrayListUnmanaged(u8) = .empty,
     block_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
     block_prefix_hashes: std.ArrayListUnmanaged([2]u64) = .empty,
@@ -1454,8 +1466,29 @@ pub const StreamingEncoder = struct {
     fn flushBlock(self: *StreamingEncoder) !void {
         if (self.block_entry_count == 0) return;
 
-        var encoded_payload = try encodeBlockPayloadAlloc(self.allocator, self.block_bytes.items, self.compression_policy, &self.compression_bytes);
+        const attempt_snappy = self.compression_policy == .snappy_adaptive and self.snappy_reprobe_countdown == 0;
+        if (self.snappy_reprobe_countdown > 0) self.snappy_reprobe_countdown -= 1;
+        var encoded_payload = try encodeBlockPayloadAlloc(
+            self.allocator,
+            self.block_bytes.items,
+            self.compression_policy,
+            attempt_snappy,
+            &self.compression_bytes,
+        );
         defer encoded_payload.deinit(self.allocator);
+        if (encoded_payload.snappy_attempted) {
+            self.snappy_attempted_blocks += 1;
+            const accepted = encoded_payload.compression == .snappy or encoded_payload.compression == .prefix_snappy;
+            if (accepted) {
+                self.snappy_rejection_streak = 0;
+                self.snappy_reprobe_countdown = 0;
+            } else {
+                self.snappy_rejection_streak +|= 1;
+                if (self.snappy_rejection_streak >= snappy_rejection_streak_limit) {
+                    self.snappy_reprobe_countdown = snappy_reprobe_interval - 1;
+                }
+            }
+        }
 
         const physical_relative_offset = try checkedU32(self.sink.len() - self.entry_data_start);
         try self.sink.appendSlice(encoded_payload.payload);
@@ -1505,7 +1538,7 @@ pub const StreamingEncoder = struct {
             .physical_relative_offset = physical_relative_offset,
             .physical_len = try checkedU32(encoded_payload.payload.len),
             .compression = encoded_payload.compression,
-            .checksum = std.hash.Crc32.hash(encoded_payload.payload),
+            .checksum = Crc32.hash(encoded_payload.payload),
             .first_entry_index = try checkedU32(self.block_first_entry_index),
             .entry_count = try checkedU32(self.block_entry_count),
             .smallest_namespace_name = smallest_namespace_name,
@@ -1644,7 +1677,7 @@ fn flushEncodedBlock(
 ) !void {
     if (block_entry_count == 0) return;
 
-    var encoded_payload = try encodeBlockPayloadAlloc(allocator, block_bytes.items, compression_policy, compression_bytes);
+    var encoded_payload = try encodeBlockPayloadAlloc(allocator, block_bytes.items, compression_policy, true, compression_bytes);
     defer encoded_payload.deinit(allocator);
 
     const physical_relative_offset = try checkedU32(sink.len() - entry_data_start);
@@ -1662,7 +1695,7 @@ fn flushEncodedBlock(
         .physical_relative_offset = physical_relative_offset,
         .physical_len = try checkedU32(encoded_payload.payload.len),
         .compression = encoded_payload.compression,
-        .checksum = std.hash.Crc32.hash(encoded_payload.payload),
+        .checksum = Crc32.hash(encoded_payload.payload),
         .first_entry_index = try checkedU32(block_first_entry_index),
         .entry_count = try checkedU32(block_entry_count),
         .smallest_namespace_name = block_smallest_namespace_name,
@@ -1864,6 +1897,7 @@ const EncodedBlockPayload = struct {
     payload: []const u8,
     compression: BlockCompression,
     owned_prefix: ?[]u8 = null,
+    snappy_attempted: bool = false,
 
     fn deinit(self: *EncodedBlockPayload, allocator: std.mem.Allocator) void {
         if (self.owned_prefix) |bytes| allocator.free(bytes);
@@ -1875,6 +1909,7 @@ fn encodeBlockPayloadAlloc(
     allocator: std.mem.Allocator,
     block_bytes: []const u8,
     compression_policy: CompressionPolicy,
+    attempt_snappy: bool,
     compression_bytes: *std.ArrayListUnmanaged(u8),
 ) !EncodedBlockPayload {
     var payload: EncodedBlockPayload = .{
@@ -1895,7 +1930,8 @@ fn encodeBlockPayloadAlloc(
         }
     }
 
-    if (compression_policy == .snappy_adaptive and payload.payload.len >= min_compress_block_bytes) {
+    if (compression_policy == .snappy_adaptive and attempt_snappy and payload.payload.len >= min_compress_block_bytes) {
+        payload.snappy_attempted = true;
         const compressed = try snappy.encodeInto(allocator, compression_bytes, payload.payload);
         if (compressed.len < payload.payload.len - (payload.payload.len / compression_savings_denominator)) {
             payload.payload = compressed;
@@ -2216,7 +2252,7 @@ pub fn decodeWindowFromRawAlloc(
 }
 
 pub fn validateBlockPayload(payload: []const u8, expected_checksum: u32) !void {
-    if (std.hash.Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
+    if (Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
 }
 
 fn validateRawBlockChecksums(raw: []const u8, index: *const TableIndex) !void {
@@ -2295,7 +2331,7 @@ pub fn decodeFooterBytes(raw: []const u8) !Footer {
     if (raw.len != footer_len) return error.InvalidTableFile;
     if (!hasFooterMagic(raw)) return error.InvalidTableFile;
     const stored_footer_checksum = std.mem.readInt(u32, raw[44..48], .little);
-    if (std.hash.Crc32.hash(raw[0..44]) != stored_footer_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(raw[0..44]) != stored_footer_checksum) return error.InvalidTableFile;
 
     var cursor: usize = footer_magic.len;
     if (try readU32(raw, &cursor) != version) return error.UnsupportedVersion;
@@ -2324,7 +2360,7 @@ pub fn decodeIndexFromFooterAlloc(
     metadata: []const u8,
 ) !TableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     return try decodeFooterMetadataAlloc(
         allocator,
         metadata,
@@ -2342,7 +2378,7 @@ pub fn decodeSequentialIndexFromFooterAlloc(
     metadata: []const u8,
 ) !SequentialTableIndex {
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     var cursor: usize = 0;
 
     // Entry offsets and all lookup accelerators are deliberately skipped.
@@ -2615,7 +2651,7 @@ fn appendFooter(
     std.mem.writeInt(u32, raw[32..36], try checkedU32(entry_count), .little);
     std.mem.writeInt(u32, raw[36..40], try checkedU32(entry_data_len), .little);
     std.mem.writeInt(u32, raw[40..44], metadata_checksum, .little);
-    std.mem.writeInt(u32, raw[44..48], std.hash.Crc32.hash(raw[0..44]), .little);
+    std.mem.writeInt(u32, raw[44..48], Crc32.hash(raw[0..44]), .little);
     try sink.appendSlice(&raw);
 }
 
@@ -2667,7 +2703,7 @@ fn decodeVersionedIndexAlloc(
     if (footer.metadata_offset > footer_offset or footer.metadata_len != footer_offset - footer.metadata_offset)
         return error.InvalidTableFile;
     const metadata = raw[footer.metadata_offset..footer_offset];
-    if (std.hash.Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
     var index = try decodeFooterMetadataAlloc(
         allocator,
         metadata,
@@ -3157,7 +3193,7 @@ test "table file rejects forged footer entry count before allocating offsets" {
 
     const footer_bytes = encoded[encoded.len - footer_len ..];
     std.mem.writeInt(u32, footer_bytes[32..36], std.math.maxInt(u32), .little);
-    std.mem.writeInt(u32, footer_bytes[44..48], std.hash.Crc32.hash(footer_bytes[0..44]), .little);
+    std.mem.writeInt(u32, footer_bytes[44..48], Crc32.hash(footer_bytes[0..44]), .little);
     const footer = try decodeFooterBytes(footer_bytes);
     const metadata = encoded[footer.metadata_offset .. footer.metadata_offset + footer.metadata_len];
 
@@ -3369,6 +3405,60 @@ test "streaming table prefix blooms ignore expected entry overestimates" {
     try std.testing.expectEqual(@as(usize, 8), index.prefix_filter.?.bytes.len);
     try std.testing.expectEqual(@as(usize, 8), index.blocks[0].prefix_filter.?.bytes.len);
     try std.testing.expect(index.maybeContainsPrefix("docs", "doc:"));
+}
+
+test "streaming table backs off rejected snappy probes without disabling prefix encoding" {
+    const allocator = std.testing.allocator;
+    const count = 160;
+    const value_len = 2048;
+    const entries = try allocator.alloc(Entry, count);
+    defer allocator.free(entries);
+    const keys = try allocator.alloc([24]u8, count);
+    defer allocator.free(keys);
+    const values = try allocator.alloc(u8, count * value_len);
+    defer allocator.free(values);
+
+    // High-entropy values model dense float payloads without depending on the
+    // host PRNG or architecture. Each entry gets a distinct slice so Snappy
+    // cannot win by referring to a repeated value from a neighboring entry.
+    var random_state: u64 = 0x9e3779b97f4a7c15;
+    for (values) |*byte| {
+        random_state ^= random_state << 13;
+        random_state ^= random_state >> 7;
+        random_state ^= random_state << 17;
+        byte.* = @truncate(random_state >> 24);
+    }
+    for (entries, 0..) |*entry, i| {
+        const key = try std.fmt.bufPrint(keys[i][0..], "doc:{d:0>6}", .{i});
+        entry.* = .{
+            .namespace_name = "docs",
+            .key = key,
+            .value = values[i * value_len ..][0..value_len],
+        };
+    }
+
+    var sink_impl = MemoryTableSink.init(allocator);
+    defer sink_impl.deinit();
+    var sink = sink_impl.sink();
+    var encoder = try StreamingEncoder.init(allocator, &sink, entries.len, .{});
+    defer encoder.deinit();
+    for (entries) |entry| try encoder.appendEntry(entry);
+    var result = try encoder.finish();
+    defer result.filter.deinit(allocator);
+
+    try std.testing.expect(encoder.blocks.items.len > snappy_rejection_streak_limit);
+    try std.testing.expect(encoder.snappy_attempted_blocks >= snappy_rejection_streak_limit);
+    try std.testing.expect(encoder.snappy_attempted_blocks < encoder.blocks.items.len);
+
+    const encoded = try sink_impl.finishOwned();
+    defer allocator.free(encoded);
+    var decoded = try decodeAlloc(allocator, encoded);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(entries.len, decoded.entries.len);
+    for (decoded.entries, entries) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.key, actual.key);
+        try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+    }
 }
 
 test "table file adaptive snappy compression round trips repetitive blocks" {

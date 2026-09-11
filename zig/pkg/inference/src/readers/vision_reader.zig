@@ -22,20 +22,12 @@ const reading_pipeline_mod = @import("../pipelines/reading.zig");
 const image = @import("../pipelines/image.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
 const reader_types = @import("types.zig");
-const c_file = @import("../util/c_file.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const antfly_image = @import("antfly_image");
+const vision_config = @import("vision_config.zig");
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
-pub const PreprocessorConfig = struct {
-    image_size: usize = 384,
-    image_seq_length: usize = 0,
-    resample: image.Resample = .bilinear,
-    image_mean: [3]f32 = .{ 0.5, 0.5, 0.5 },
-    image_std: [3]f32 = .{ 0.5, 0.5, 0.5 },
-    pix2struct_max_patches: usize = 0,
-    pix2struct_patch_height: usize = 0,
-    pix2struct_patch_width: usize = 0,
-    pix2struct_do_normalize: bool = false,
-};
+pub const PreprocessorConfig = vision_config.PreprocessorConfig;
 
 pub const LoadedVisionReader = struct {
     allocator: std.mem.Allocator,
@@ -57,26 +49,54 @@ pub const LoadedVisionReader = struct {
         session_manager: *backends.SessionManager,
         model_manager: *model_manager_mod.ModelManager,
     ) !LoadedVisionReader {
-        const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        return loadFromDirWithControl(allocator, model_path, session_manager, model_manager, null);
+    }
 
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedVisionReader {
+        if (control) |active| try active.check();
         if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
+            const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
             var loader = try model_manager.componentLoaderForPaths(
                 model_path,
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null);
+            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null, control);
         } else |_| {}
 
-        var model_handle = model_manager.acquireFromDir(model_path) catch |err| {
+        var model_handle = (if (control) |active|
+            model_manager.acquireFromDirWithControl(model_path, active)
+        else
+            model_manager.acquireFromDir(model_path)) catch |err| {
             std.log.err("reader native model load failed model={s} err={t}", .{ model_path, err });
             return err;
         };
         errdefer model_handle.release();
         const model = model_handle.get();
+        var reader = try loadFromBorrowedModel(allocator, model_path, model);
+        reader.loaded_model_handle = model_handle;
+        return reader;
+    }
+
+    /// Construct the lightweight reader wrapper around an already fenced
+    /// immutable model generation. The caller must retain its ModelHandle until
+    /// this reader is deinitialized.
+    pub fn loadFromBorrowedModel(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model: *model_manager_mod.LoadedModel,
+    ) !LoadedVisionReader {
+        const runtime_config = model.florence_reader_config orelse return error.IncompleteFlorence2Bundle;
+        const dec_config = runtime_config.decoder;
         const florence_config = session_factory.getFlorenceConfig(model.session) orelse {
             std.log.err(
                 "reader model resolved without a Florence session requested_path={s} loaded_path={s} backend={s}",
@@ -84,8 +104,7 @@ pub const LoadedVisionReader = struct {
             );
             return error.InvalidModelForReading;
         };
-        const preproc_path = model.manifest.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
-        const preproc = try loadPreprocessorConfigFile(allocator, preproc_path);
+        const preproc = runtime_config.preprocessor;
         if (preproc.image_size != @as(usize, florence_config.image_size)) {
             std.log.err("Florence preprocessor image size {d} does not match model image size {d}", .{ preproc.image_size, florence_config.image_size });
             return error.InvalidPreprocessorConfig;
@@ -98,8 +117,8 @@ pub const LoadedVisionReader = struct {
             .dec_config = dec_config,
             .preproc = preproc,
             .loaded_model = model,
-            .loaded_model_handle = model_handle,
             .owns_sessions = false,
+            .florence_final_logits_bias_zero = runtime_config.final_logits_bias_zero,
         };
     }
 
@@ -110,10 +129,28 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !LoadedVisionReader {
+        return loadFromStagePathsWithControl(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            component_loader,
+            null,
+        );
+    }
+
+    pub fn loadFromStagePathsWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        control: ?InferenceExecutionControl,
+    ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
 
-        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null);
+        return loadEncoderDecoderPaths(allocator, model_path, encoder_path, decoder_path, dec_config, preproc, component_loader, null, control);
     }
 
     pub fn loadFromStagePathsWithTokenizer(
@@ -123,6 +160,26 @@ pub const LoadedVisionReader = struct {
         decoder_path: []const u8,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+    ) !LoadedVisionReader {
+        return loadFromStagePathsWithTokenizerAndControl(
+            allocator,
+            model_path,
+            encoder_path,
+            decoder_path,
+            component_loader,
+            managed_tokenizer,
+            null,
+        );
+    }
+
+    pub fn loadFromStagePathsWithTokenizerAndControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        encoder_path: []const u8,
+        decoder_path: []const u8,
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        managed_tokenizer: *model_manager_mod.ManagedHfTokenizer,
+        control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
         const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
         const preproc = loadPreprocessorConfig(allocator, model_path);
@@ -135,6 +192,7 @@ pub const LoadedVisionReader = struct {
             preproc,
             component_loader,
             managed_tokenizer,
+            control,
         );
     }
 
@@ -147,13 +205,14 @@ pub const LoadedVisionReader = struct {
         preproc: PreprocessorConfig,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         preloaded_tokenizer: ?*model_manager_mod.ManagedHfTokenizer,
+        control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
-        var encoder_managed = try component_loader.load(encoder_path);
+        var encoder_managed = try loadComponent(component_loader, encoder_path, control);
         errdefer encoder_managed.deinit();
         const encoder_session = encoder_managed.session;
 
         var strict_loader = try component_loader.restrictToBackend(encoder_session.backend());
-        var decoder_managed = try strict_loader.load(decoder_path);
+        var decoder_managed = try loadComponent(&strict_loader, decoder_path, control);
         errdefer decoder_managed.deinit();
         const decoder_session = decoder_managed.session;
 
@@ -164,6 +223,7 @@ pub const LoadedVisionReader = struct {
         else
             try component_loader.loadHfTokenizerFile(tok_path);
         errdefer loaded_tokenizer.deinit();
+        if (control) |active| try active.check();
 
         return .{
             .allocator = allocator,
@@ -176,6 +236,15 @@ pub const LoadedVisionReader = struct {
             .encoder_managed = encoder_managed,
             .decoder_managed = decoder_managed,
         };
+    }
+
+    fn loadComponent(
+        component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+    ) !model_manager_mod.ManagedSession {
+        if (control) |active| return component_loader.loadWithControl(model_path, active);
+        return component_loader.load(model_path);
     }
 
     pub fn deinit(self: *LoadedVisionReader) void {
@@ -197,9 +266,28 @@ pub const LoadedVisionReader = struct {
         return reader_pipeline.readBatch(image_datas);
     }
 
+    pub fn readRawBatchReported(self: *LoadedVisionReader, image_datas: []const []const u8, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBatchReported(image_datas);
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *LoadedVisionReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: reader_types.ReadOptions,
+    ) !reading_pipeline_mod.ReadBatchResult {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.readBorrowedRasterBatchReported(rasters);
+    }
+
     pub fn readDecodedRaw(self: *LoadedVisionReader, img: image.Image, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadResult {
         var reader_pipeline = try self.pipeline(options);
         return reader_pipeline.readDecoded(img);
+    }
+
+    pub fn inputTokenCount(self: *LoadedVisionReader, options: reader_types.ReadOptions) !usize {
+        var reader_pipeline = try self.pipeline(options);
+        return reader_pipeline.inputTokenCount();
     }
 
     pub fn snapshotMetalGeneratedQuantStats(self: *LoadedVisionReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
@@ -211,9 +299,10 @@ pub const LoadedVisionReader = struct {
     }
 
     fn pipeline(self: *LoadedVisionReader, options: reader_types.ReadOptions) !reading_pipeline_mod.ReadingPipeline {
+        if (options.execution_control) |control| try control.check();
         const prefix_len: usize = if (self.dec_config.forced_bos_token_id == null) 1 else 2;
         const max_length = try resolveMaxLength(self.dec_config.max_length, options.max_tokens, prefix_len);
-        return reading_pipeline_mod.ReadingPipeline.init(
+        var reader_pipeline = reading_pipeline_mod.ReadingPipeline.init(
             self.allocator,
             self.encoder_session,
             self.decoder_session,
@@ -236,9 +325,12 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
                 .source_fingerprint = options.source_fingerprint,
+                .preprocess_io = if (self.loaded_model) |model| model.executor_io else null,
             },
-            &self.florence_final_logits_bias_zero,
+            self.florence_final_logits_bias_zero,
         );
+        reader_pipeline.execution_control = options.execution_control;
+        return reader_pipeline;
     }
 
     fn tokenizer(self: *LoadedVisionReader) tokenizer_mod.Tokenizer {
@@ -258,17 +350,10 @@ pub fn resolveMaxLength(model_max: usize, requested: ?usize, prefix_len: usize) 
     return max_length;
 }
 
-pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
-    if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
-        allocator.free(paths.encoder);
-        allocator.free(paths.decoder);
-        return true;
-    } else |_| {}
-
-    var man = manifest_mod.loadFromDir(allocator, model_path) catch return false;
+pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) !bool {
+    var man = try manifest_mod.loadListingFromDir(allocator, model_path);
     defer man.deinit();
-
-    return isSupportedManifest(man);
+    return try enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man) or isSupportedManifest(man);
 }
 
 /// Same check against a manifest the caller already has.
@@ -282,105 +367,7 @@ pub fn isSupportedManifest(man: manifest_mod.ModelManifest) bool {
         (man.gguf_path != null or man.safetensors_path != null or man.safetensors_index_path != null);
 }
 
-pub fn loadPreprocessorConfig(allocator: std.mem.Allocator, model_dir: []const u8) PreprocessorConfig {
-    const path = std.fmt.allocPrint(allocator, "{s}/preprocessor_config.json", .{model_dir}) catch return .{};
-    defer allocator.free(path);
-
-    return loadPreprocessorConfigFile(allocator, path) catch .{};
-}
-
-fn loadPreprocessorConfigFile(allocator: std.mem.Allocator, path: []const u8) !PreprocessorConfig {
-    const data = try c_file.readFile(allocator, path);
-    defer allocator.free(data);
-
-    var config = PreprocessorConfig{};
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
-
-    const obj = parsed.value.object;
-    if (obj.get("size")) |size_val| {
-        if (jsonValueGetSize(size_val)) |v| config.image_size = v;
-    } else if (obj.get("crop_size")) |crop_val| {
-        if (jsonValueGetSize(crop_val)) |v| config.image_size = v;
-    }
-    if (obj.get("image_seq_length")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| config.image_seq_length = parsed_int;
-    }
-    if (obj.get("resample")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| {
-            config.resample = switch (parsed_int) {
-                3 => .bicubic,
-                2 => .bilinear,
-                0 => .nearest,
-                else => .bilinear,
-            };
-        }
-    }
-    if (obj.get("image_mean")) |v| {
-        if (jsonValueGetFloatArray3(v)) |mean| config.image_mean = mean;
-    }
-    if (obj.get("image_std")) |v| {
-        if (jsonValueGetFloatArray3(v)) |stddev| config.image_std = stddev;
-    }
-    if (obj.get("max_patches")) |v| {
-        if (jsonValueGetUsize(v)) |parsed_int| config.pix2struct_max_patches = parsed_int;
-    }
-    if (obj.get("do_normalize")) |v| {
-        switch (v) {
-            .bool => |parsed_bool| config.pix2struct_do_normalize = parsed_bool,
-            else => {},
-        }
-    }
-    if (obj.get("patch_size")) |v| {
-        if (v == .object) {
-            if (v.object.get("height")) |height_val| {
-                if (jsonValueGetUsize(height_val)) |parsed_int| config.pix2struct_patch_height = parsed_int;
-            }
-            if (v.object.get("width")) |width_val| {
-                if (jsonValueGetUsize(width_val)) |parsed_int| config.pix2struct_patch_width = parsed_int;
-            }
-        }
-    }
-
-    return config;
-}
-
-fn jsonValueGetSize(val: std.json.Value) ?usize {
-    return switch (val) {
-        .integer => |i| @intCast(i),
-        .object => |obj| blk: {
-            if (obj.get("height")) |h| {
-                if (jsonValueGetUsize(h)) |parsed| break :blk parsed;
-            }
-            if (obj.get("width")) |w| {
-                if (jsonValueGetUsize(w)) |parsed| break :blk parsed;
-            }
-            break :blk null;
-        },
-        else => null,
-    };
-}
-
-fn jsonValueGetUsize(val: std.json.Value) ?usize {
-    return switch (val) {
-        .integer => |i| @intCast(i),
-        else => null,
-    };
-}
-
-fn jsonValueGetFloatArray3(val: std.json.Value) ?[3]f32 {
-    if (val != .array or val.array.items.len < 3) return null;
-    var result: [3]f32 = undefined;
-    for (0..3) |i| {
-        result[i] = switch (val.array.items[i]) {
-            .float => |f| @floatCast(f),
-            .integer => |n| @floatFromInt(n),
-            else => return null,
-        };
-    }
-    return result;
-}
+pub const loadPreprocessorConfig = vision_config.loadPreprocessorConfig;
 
 test "vision reader supports gguf-backed native Florence directories" {
     const allocator = std.testing.allocator;
@@ -397,5 +384,5 @@ test "vision reader supports gguf-backed native Florence directories" {
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
 
-    try std.testing.expect(isSupportedModelDir(allocator, model_dir));
+    try std.testing.expect(try isSupportedModelDir(allocator, model_dir));
 }

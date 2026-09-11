@@ -285,6 +285,112 @@ def _check_response(response: requests.Response) -> dict:
     return payload
 
 
+def _create_cluster_table_when_admitted(
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    definition: dict,
+    *,
+    timeout_s=30.0,
+) -> dict:
+    # Leader observations do not reserve mutation authority. Replay only an
+    # explicit pre-admission rejection; an unknown outcome may have committed.
+    deadline = time.monotonic() + timeout_s
+    attempts = 0
+    last_response: requests.Response | None = None
+    try:
+        while True:
+            cluster.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "table create admission deadline exceeded"
+            attempts += 1
+            last_response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table_name}",
+                json=definition,
+                timeout=remaining,
+            )
+            cluster.assert_processes_alive()
+            retryable = False
+            if (
+                last_response.status_code == 503
+                and last_response.headers.get(
+                    "X-Antfly-Metadata-Mutation-Not-Admitted", ""
+                ).lower()
+                == "true"
+                and last_response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                in (None, "not-proposed-v1")
+            ):
+                try:
+                    payload = last_response.json()
+                except ValueError:
+                    payload = None
+                retryable = (
+                    isinstance(payload, dict)
+                    and payload.get("code") == "metadata_leader_unavailable"
+                    and payload.get("retryable") is True
+                )
+            if not retryable:
+                result = _check_response(last_response)
+                if attempts > 1:
+                    print(f"backup table create admitted after {attempts} attempts")
+                return result
+            # This response advertises Retry-After: 1. Keep backoff and every
+            # subsequent request within the original create request budget.
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    except (AssertionError, requests.RequestException) as exc:
+        raise AssertionError(
+            f"backup table create failed after {attempts} attempts: {exc}; "
+            f"last_status={last_response.status_code if last_response is not None else None}; "
+            f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
+            f"last_response={last_response.text if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
+
+
+def _seed_cluster_docs_when_writable(
+    cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
+) -> dict:
+    # Replication status is an observation, not a lease on the data leader or
+    # its routing catalog. Seed through the write API's admission contract.
+    # Only this explicit pre-commit response permits a fresh batch attempt;
+    # transport failures and ambiguous/post-commit outcomes must remain errors.
+    deadline = time.monotonic() + timeout_s
+    last_response: requests.Response | None = None
+
+    def attempt() -> dict | None:
+        nonlocal last_response
+        cluster.assert_processes_alive()
+        last_response = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+            json={"inserts": docs, "sync_level": "write"},
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+        if (
+            last_response.status_code == 503
+            and last_response.text.strip() == "write unavailable"
+        ):
+            return None
+        return _check_response(last_response)
+
+    try:
+        batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+    except (AssertionError, requests.RequestException) as exc:
+        # Ambiguous outcomes must stay failures, but preserve the routing and
+        # proposal diagnostics before teardown removes this six-process cluster.
+        raise AssertionError(
+            f"backup seed failed for table {table_name}: {exc}; "
+            f"last_status={last_response.status_code if last_response is not None else None}; "
+            f"last_headers={dict(last_response.headers) if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
+    assert batch is not None, (
+        f"table {table_name} did not become writable; "
+        f"last_response={last_response.text if last_response is not None else None}\n"
+        f"{cluster.debug_logs()}"
+    )
+    return batch
+
+
 def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
@@ -453,9 +559,7 @@ class ThreeByThreeBackupCluster:
             ]
             self.data_ports = list(self.port_reservations.reserve_many(3))
             self.data_raft_ports = list(self.port_reservations.reserve_many(3))
-            self.data_urls = [
-                f"http://{self.host}:{port}" for port in self.data_ports
-            ]
+            self.data_urls = [f"http://{self.host}:{port}" for port in self.data_ports]
             self.data_api_urls = [
                 antfly_public_api_url(url, binary=binary) for url in self.data_urls
             ]
@@ -635,11 +739,13 @@ class ThreeByThreeBackupCluster:
             data_command = self._data_command(i)
             proc = self.port_reservations.handoff_to(
                 (self.data_ports[i], self.data_raft_ports[i]),
-                lambda command=data_command, log_file=self.data_log_files[i]: subprocess.Popen(
-                    command,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    cwd=REPO_ROOT,
+                lambda command=data_command, log_file=self.data_log_files[i]: (
+                    subprocess.Popen(
+                        command,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=REPO_ROOT,
+                    )
                 ),
             )
             self.data_procs.append(proc)
@@ -658,9 +764,7 @@ class ThreeByThreeBackupCluster:
                 f"{self.debug_logs()}"
             )
 
-    def metadata_snapshot(
-        self, index: int, *, request_timeout_s: float = 1.0
-    ) -> dict:
+    def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
         response = requests.get(
             f"{self.metadata_admin_urls[index]}/metadata/v1/admin/snapshot",
             timeout=request_timeout_s,
@@ -800,8 +904,7 @@ class ThreeByThreeBackupCluster:
         group_ids = {
             int(record.get("group_id", 0))
             for record in snapshot.get("ranges", [])
-            if isinstance(record, dict)
-            and int(record.get("table_id", 0)) == table_id
+            if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
         }
         return table_id, group_ids
 
@@ -823,8 +926,7 @@ class ThreeByThreeBackupCluster:
             if table_id is None:
                 return False
             if any(
-                isinstance(record, dict)
-                and int(record.get("table_id", 0)) == table_id
+                isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
                 for record in snapshot.get("restore_progresses", [])
             ):
                 return False
@@ -1402,12 +1504,11 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     session.headers["Connection"] = "close"
 
     data_api_url = cluster.data_api_urls[0]
-    _check_response(
-        session.post(
-            f"{data_api_url}/tables/{table_name}",
-            json={"num_shards": 3, "description": "3x3 backup and restore docs"},
-            timeout=30,
-        )
+    _create_cluster_table_when_admitted(
+        cluster,
+        session,
+        table_name,
+        {"num_shards": 3, "description": "3x3 backup and restore docs"},
     )
 
     assert wait_until(
@@ -1430,23 +1531,13 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             "content": "high range backup and restore coverage",
         },
     }
-    batch = _check_response(
-        session.post(
-            f"{data_api_url}/tables/{table_name}/batch",
-            json={"inserts": source_docs, "sync_level": "write"},
-            timeout=30,
-        )
-    )
+    batch = _seed_cluster_docs_when_writable(cluster, session, table_name, source_docs)
     assert batch["inserted"] == len(source_docs)
     assert wait_until(
         lambda: (
             True
             if all(
-                (
-                    doc := _lookup_doc_from_url(
-                        session, data_api_url, table_name, key
-                    )
-                )
+                (doc := _lookup_doc_from_url(session, data_api_url, table_name, key))
                 is not None
                 and doc.get("title") == expected["title"]
                 for key, expected in source_docs.items()
@@ -1497,9 +1588,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         assert len(table_manifests) == 1
         table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
         assert len(table_manifest["shards"]) == 3
-        assert len(
-            {int(shard["group_id"]) for shard in table_manifest["shards"]}
-        ) == 3
+        assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
         routed_source_groups = set()
         for key in source_docs:
             matching_shards = [
@@ -1530,10 +1619,12 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         deleted.raise_for_status()
         assert deleted.status_code == 204
         assert wait_until(
-            lambda: cluster.table_absent_on_all_metadata_nodes(
-                table_name, original_table_id, original_group_ids
-            )
-            or None,
+            lambda: (
+                cluster.table_absent_on_all_metadata_nodes(
+                    table_name, original_table_id, original_group_ids
+                )
+                or None
+            ),
             timeout_s=30.0,
             interval_s=0.5,
         ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
@@ -1598,9 +1689,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
                 )
             return None
 
-        restore_job = wait_until(
-            terminal_restore, timeout_s=120.0, interval_s=0.1
-        )
+        restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
         assert restore_job is not None, (
             f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
         )
@@ -1639,7 +1728,9 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             restored_docs_visible_from_every_data_node,
             timeout_s=60.0,
             interval_s=0.5,
-        ), f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        ), (
+            f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+        )
 
         assert wait_until(
             lambda: cluster.restore_progress_cleared(table_name) or None,

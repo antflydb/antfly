@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UnsupportedHierarchyGroupingErrorAction(str, Enum):
+class UnsupportedHierarchyGroupingErrorAction(StrEnum):
     USE_SOURCE_GROUPING_OR_DIRECT_MEMBERS = "use_source_grouping_or_direct_members"
 
     def __str__(self) -> str:

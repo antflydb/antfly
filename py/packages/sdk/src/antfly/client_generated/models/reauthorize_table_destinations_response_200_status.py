@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ReauthorizeTableDestinationsResponse200Status(str, Enum):
+class ReauthorizeTableDestinationsResponse200Status(StrEnum):
     AUTHORIZED = "authorized"
 
     def __str__(self) -> str:

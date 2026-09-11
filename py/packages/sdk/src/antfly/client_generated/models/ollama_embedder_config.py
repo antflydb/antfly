@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.ollama_embedder_config_provider import OllamaEmbedderConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OllamaEmbedderConfig")
@@ -25,17 +26,21 @@ class OllamaEmbedderConfig:
             {'provider': 'ollama', 'model': 'nomic-embed-text', 'url': 'http://localhost:11434'}
 
         Attributes:
+            provider (OllamaEmbedderConfigProvider):
             model (str): The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large'). Example:
                 nomic-embed-text.
             url (str | Unset): The URL of the Ollama API endpoint. Can also be set via OLLAMA_HOST environment variable.
                 Default: 'http://localhost:11434'. Example: http://localhost:11434.
     """
 
+    provider: OllamaEmbedderConfigProvider
     model: str
     url: str | Unset = "http://localhost:11434"
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -44,6 +49,7 @@ class OllamaEmbedderConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -55,11 +61,14 @@ class OllamaEmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = OllamaEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         url = d.pop("url", UNSET)
 
         ollama_embedder_config = cls(
+            provider=provider,
             model=model,
             url=url,
         )

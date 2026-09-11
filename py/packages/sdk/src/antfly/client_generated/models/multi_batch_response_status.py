@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class MultiBatchResponseStatus(str, Enum):
+class MultiBatchResponseStatus(StrEnum):
     COMMITTED = "committed"
     COMMITTED_RECOVERY_PENDING = "committed_recovery_pending"
     COMMITTED_REPAIR_REQUIRED = "committed_repair_required"

@@ -75,6 +75,8 @@ pub const RecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.PostingWalTooLarge,
+            error.PostingRowBackpressure,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
@@ -106,6 +108,8 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
         error.ResourceBudgetExceeded,
+        error.PostingWalTooLarge,
+        error.PostingRowBackpressure,
         error.PersistentDescriptorAdmissionExhausted,
         error.TextMergeBackpressureTimeout,
         error.TextMergeBackpressureUnavailable,
@@ -138,6 +142,8 @@ pub const Policy = struct {
     session_idle_ns: u64 = 0,
     cursor_refresh_records: u64 = replay_cursor_refresh_records,
     max_windows_per_publish: usize = catch_up_max_windows_per_publish,
+    max_call_ns: u64 = 0,
+    max_call_bytes: u64 = 0,
     max_items_per_window: usize = 0,
     max_chunk_bytes: u64 = replay_default_window_bytes,
     estimated_dense_vector_bytes: u64 = 0,
@@ -159,7 +165,10 @@ pub fn replayWindowMaxWaitNs(policy: Policy, pending_records: u64) u64 {
     if (pending_records == 0) return 0;
     if (policy.coalesce_min_records == 0 or policy.coalesce_delay_ns == 0 or policy.coalesce_max_wait_ns == 0) return 0;
     if (pending_records >= policy.coalesce_min_records) return 0;
-    return scaleCeilNs(policy.coalesce_max_wait_ns, pending_records, policy.coalesce_min_records);
+    // This is the total bound for a busy ingest burst, not the delay imposed
+    // on an isolated write. The worker returns after one quiet coalesce period;
+    // it only spends this whole budget while the replay target keeps moving.
+    return policy.coalesce_max_wait_ns;
 }
 
 pub fn sessionIdleMaxWaitNs(policy: Policy, recent_tail_records: u64) u64 {
@@ -172,18 +181,23 @@ pub fn sessionIdleMaxWaitNs(policy: Policy, recent_tail_records: u64) u64 {
 
 pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: ?*resource_manager_mod.ResourceManager) Policy {
     return switch (index_ref.kind) {
-        .dense_vector => .{
-            .coalesce_min_records = denseReplayCoalesceMinRecords(),
-            .coalesce_delay_ns = denseReplayCoalesceDelayNs(),
-            .coalesce_max_wait_ns = denseReplayCoalesceMaxWaitNs(),
-            .session_idle_ns = denseCatchUpSessionIdleNs(),
-            .cursor_refresh_records = replayCursorRefreshRecords(),
-            .max_windows_per_publish = replayMaxWindowsPerPublish(),
-            .max_items_per_window = denseReplayMaxItemsPerWindow(),
-            .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager),
-            .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(index_ref),
-            .force_persist_applied_sequence = true,
-            .not_found_is_recoverable = true,
+        .dense_vector => blk: {
+            var policy: Policy = .{
+                .coalesce_min_records = denseReplayCoalesceMinRecords(),
+                .coalesce_delay_ns = denseReplayCoalesceDelayNs(),
+                .coalesce_max_wait_ns = denseReplayCoalesceMaxWaitNs(),
+                .session_idle_ns = denseCatchUpSessionIdleNs(),
+                .cursor_refresh_records = replayCursorRefreshRecords(),
+                .max_windows_per_publish = replayMaxWindowsPerPublish(),
+                .max_items_per_window = denseReplayMaxItemsPerWindow(),
+                .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager),
+                .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(index_ref),
+                .force_persist_applied_sequence = true,
+                .not_found_is_recoverable = true,
+            };
+            if (@import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_REPLAY_FINALIZE"))
+                policy = coalescedDensePolicy(policy, resource_manager);
+            break :blk policy;
         },
         .full_text, .sparse_vector, .graph, .algebraic => .{
             .cursor_refresh_records = replayCursorRefreshRecords(),
@@ -192,6 +206,45 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
             .max_chunk_bytes = replayMaxWindowBytes(resource_manager),
         },
     };
+}
+
+/// Journal cursor/collection work is read-only. The capture and its snapshot
+/// mutation lease need to cover apply through durable finish, not preparation.
+/// Keep this independent of forIndex(), which adapts the replay byte budget.
+pub fn deferSourceCapture(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: ?*resource_manager_mod.ResourceManager) bool {
+    if (index_ref.kind != .dense_vector) return false;
+    return if (resource_manager) |manager| manager.dense_deferred_source_capture else false;
+}
+
+/// Reuse one source capture across bounded apply chunks at an idle backlog.
+/// Split the existing byte envelope, never multiply it. Foreground traffic
+/// keeps one publication window; the executor also rechecks between chunks.
+pub fn coalescedDensePolicy(original: Policy, resource_manager: ?*resource_manager_mod.ResourceManager) Policy {
+    const manager = resource_manager orelse return original;
+    if (manager.shouldDeferOptionalMaintenanceForForegroundTraffic()) return original;
+    if (original.max_windows_per_publish != 1) return original;
+    const windows = @min(@as(u64, 4), original.max_chunk_bytes / (16 * 1024 * 1024));
+    if (windows < 2) return original;
+    var result = original;
+    result.max_windows_per_publish = @intCast(windows);
+    result.max_call_bytes = original.max_chunk_bytes;
+    result.max_chunk_bytes /= windows;
+    result.max_call_ns = std.time.ns_per_s;
+    return result;
+}
+
+test "coalesced dense replay divides the existing envelope and yields to foreground" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    const original = Policy{ .max_chunk_bytes = 64 * 1024 * 1024, .max_items_per_window = 25000 };
+    const combined = coalescedDensePolicy(original, &manager);
+    try std.testing.expectEqual(@as(usize, 4), combined.max_windows_per_publish);
+    try std.testing.expectEqual(original.max_chunk_bytes, combined.max_chunk_bytes * combined.max_windows_per_publish);
+    try std.testing.expectEqual(original.max_chunk_bytes, combined.max_call_bytes);
+    try std.testing.expectEqual(original.max_items_per_window, combined.max_items_per_window);
+    manager.beginForegroundQuery();
+    defer manager.finishForegroundQuery();
+    try std.testing.expectEqual(original, coalescedDensePolicy(original, &manager));
 }
 
 fn envU64(name: [:0]const u8, default: u64) u64 {
@@ -326,6 +379,12 @@ test "text merge admission failures remain recoverable for derived replay" {
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeBackpressureUnavailable));
     try std.testing.expect(isRecoverableAdmissionError(error.TextMergeRuntimeShutdown));
     try std.testing.expect(!isRecoverableAdmissionError(error.TextPublicationExceedsSegmentLimit));
+}
+
+test "posting WAL capacity remains recoverable for derived replay" {
+    try std.testing.expect(isRecoverableAdmissionError(error.PostingWalTooLarge));
+    try std.testing.expect(isRecoverableAdmissionError(error.PostingRowBackpressure));
+    try std.testing.expect(!isRecoverableAdmissionError(error.MissingPostingChunk));
 }
 
 test "full text replay policy bounds work by item count as well as bytes" {

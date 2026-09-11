@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
-
 SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
 DEFAULT_SOURCE_ROOT = REPO_ROOT / "zig/pkg/antfly/src"
@@ -57,7 +56,7 @@ CODEGEN_BOUNDARIES = (
     ("metadata/domain.zig", "metadata/runtime.zig"),
     ("data/runtime.zig", "metadata/runtime.zig"),
     ("metadata/runtime.zig", "data/runtime.zig"),
-    ("raft/mod.zig", "metadata/sim_harness.zig"),
+    ("raft/mod.zig", "metadata/vopr_harness.zig"),
     ("standalone/inference_host.zig", "standalone/runtime.zig"),
     ("standalone/inference_host.zig", "data/runtime.zig"),
     ("standalone/inference_host.zig", "metadata/runtime.zig"),
@@ -68,7 +67,7 @@ CODEGEN_BOUNDARIES = (
 INFERENCE_ABI_FORBIDDEN_TOKENS = (
     ("standalone/inference_bridge.zig", "ProviderContext"),
     ("standalone/inference_bridge.zig", "antfly_standalone_inference_provider"),
-    ("runtime_artifact_lib.zig", "antfly_standalone_inference_provider"),
+    ("runtime_inference_root.zig", "antfly_standalone_inference_provider"),
     ("standalone/runtime.zig", "antfly_standalone_inference_provider"),
 )
 
@@ -197,7 +196,9 @@ class ImportGraph:
         try:
             path.relative_to(self.source_root)
         except ValueError as error:
-            raise ValueError(f"source path escapes {self.source_root}: {value}") from error
+            raise ValueError(
+                f"source path escapes {self.source_root}: {value}"
+            ) from error
         if not path.is_file():
             raise ValueError(f"source file does not exist: {path}")
         return path
@@ -259,13 +260,17 @@ class ImportGraph:
     def line_count(self, path: Path) -> int:
         cached = self._line_cache.get(path)
         if cached is None:
-            cached = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            cached = len(
+                path.read_text(encoding="utf-8", errors="replace").splitlines()
+            )
             self._line_cache[path] = cached
         return cached
 
     def stats(self, paths: Iterable[Path]) -> GraphStats:
         materialized = tuple(paths)
-        return GraphStats(len(materialized), sum(self.line_count(path) for path in materialized))
+        return GraphStats(
+            len(materialized), sum(self.line_count(path) for path in materialized)
+        )
 
 
 def parse_named_root(value: str) -> tuple[str, str]:
@@ -348,9 +353,14 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--check-api-kernel-boundary",
         action="store_true",
-        help=(
-            "fail on direct storage/table implementation imports from API ABI files"
-        ),
+        help=("fail on direct storage/table implementation imports from API ABI files"),
+    )
+    parser.add_argument(
+        "--largest",
+        type=int,
+        default=0,
+        metavar="N",
+        help="show the N largest files per graph",
     )
     parser.add_argument(
         "--check-compiled-storage-boundary",
@@ -368,13 +378,15 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "status and inverse mapping"
         ),
     )
-    parser.add_argument("--largest", type=int, default=0, metavar="N", help="show the N largest files per graph")
     parser.add_argument("--json", action="store_true", help="emit the summary as JSON")
     return parser.parse_args(argv)
 
 
 def analyze(graph: ImportGraph, roots: dict[str, str]) -> dict[str, set[Path]]:
-    return {name: graph.closure([graph.resolve_source(path)]) for name, path in roots.items()}
+    return {
+        name: graph.closure([graph.resolve_source(path)])
+        for name, path in roots.items()
+    }
 
 
 def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> TimeReport:
@@ -419,14 +431,20 @@ def elf_sections(path: Path) -> list[tuple[str, int, int]]:
     section_entry_size = header[11]
     section_count = header[12]
     string_table_index = header[13]
-    if section_entry_size < 64 or section_count == 0 or string_table_index >= section_count:
+    if (
+        section_entry_size < 64
+        or section_count == 0
+        or string_table_index >= section_count
+    ):
         raise ValueError(f"unsupported ELF section table: {path}")
     section_table_end = section_offset + section_entry_size * section_count
     if section_table_end > len(data):
         raise ValueError(f"truncated ELF section table: {path}")
 
     headers = [
-        struct.unpack_from("<IIQQQQIIQQ", data, section_offset + index * section_entry_size)
+        struct.unpack_from(
+            "<IIQQQQIIQQ", data, section_offset + index * section_entry_size
+        )
         for index in range(section_count)
     ]
     strings_header = headers[string_table_index]
@@ -451,7 +469,9 @@ def elf_sections(path: Path) -> list[tuple[str, int, int]]:
 def source_module_tokens(source_root: Path) -> tuple[str, ...]:
     tokens = []
     for path in source_root.rglob("*.zig"):
-        token = path.relative_to(source_root).with_suffix("").as_posix().replace("/", ".")
+        token = (
+            path.relative_to(source_root).with_suffix("").as_posix().replace("/", ".")
+        )
         # One-segment module names are indistinguishable from dependencies with
         # the same package name in stripped section symbols. Leave them
         # unassigned instead of claiming false Antfly ownership.
@@ -460,7 +480,9 @@ def source_module_tokens(source_root: Path) -> tuple[str, ...]:
     return tuple(sorted(tokens, key=lambda value: (-len(value), value)))
 
 
-def section_source_module(section_name: str, module_tokens: Iterable[str]) -> str | None:
+def section_source_module(
+    section_name: str, module_tokens: Iterable[str]
+) -> str | None:
     for token in module_tokens:
         if token in section_name:
             return token
@@ -473,7 +495,9 @@ def normalized_codegen_section_name(section_name: str) -> str:
     return GENERATED_SECTION_ID_RE.sub("", section_name)
 
 
-def load_object_report(name: str, path: Path, source_root: Path = DEFAULT_SOURCE_ROOT) -> ObjectReport:
+def load_object_report(
+    name: str, path: Path, source_root: Path = DEFAULT_SOURCE_ROOT
+) -> ObjectReport:
     module_tokens = source_module_tokens(source_root.resolve())
     mutable: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
     mutable_sections: dict[str, list[object]] = {}
@@ -570,17 +594,24 @@ def report_stats(report: TimeReport) -> dict[str, object]:
         "llvm_emit_seconds": llvm,
         "llvm_emit_fraction": llvm / total if total else 0,
         "sema_cpu_seconds": seconds(stats.get("cpu_ns_sema")),
-        "imported_files": integer(stats.get("imported_files")) or integer(report.raw.get("file_count")),
+        "imported_files": integer(stats.get("imported_files"))
+        or integer(report.raw.get("file_count")),
         "declarations": integer(report.raw.get("declaration_count")),
         "generic_instances": integer(stats.get("generic_instances")),
         "inline_calls": integer(stats.get("inline_calls")),
         "repo_file_list_available": report.has_file_list,
         "repo_zig_files": len(report.repo_files) if report.has_file_list else None,
-        "repo_zig_lines": sum(source_lines(path) for path in report.repo_files) if report.has_file_list else None,
+        "repo_zig_lines": (
+            sum(source_lines(path) for path in report.repo_files)
+            if report.has_file_list
+            else None
+        ),
     }
 
 
-def grouped_files(paths: Iterable[Path], repo_root: Path = REPO_ROOT) -> list[tuple[str, int, int]]:
+def grouped_files(
+    paths: Iterable[Path], repo_root: Path = REPO_ROOT
+) -> list[tuple[str, int, int]]:
     groups: dict[str, list[Path]] = collections.defaultdict(list)
     for path in paths:
         groups[source_group(path, repo_root)].append(path)
@@ -599,15 +630,15 @@ def aggregate_overlap_stats(
 ) -> dict[str, object]:
     repo_root = repo_root.resolve()
     materialized = tuple(reports)
-    available = bool(materialized) and all(report.has_file_list for report in materialized)
+    available = bool(materialized) and all(
+        report.has_file_list for report in materialized
+    )
     result: dict[str, object] = {"available": available}
     if not available:
         return result
 
     occurrences = collections.Counter(
-        path
-        for report in materialized
-        for path in report.repo_files
+        path for report in materialized for path in report.repo_files
     )
     duplicated = {path: count for path, count in occurrences.items() if count > 1}
     groups: dict[str, list[tuple[Path, int]]] = collections.defaultdict(list)
@@ -629,8 +660,7 @@ def aggregate_overlap_stats(
                         "lines": sum(source_lines(path) for path, _ in entries),
                         "duplicate_instances": sum(count - 1 for _, count in entries),
                         "duplicate_lines": sum(
-                            (count - 1) * source_lines(path)
-                            for path, count in entries
+                            (count - 1) * source_lines(path) for path, count in entries
                         ),
                     }
                     for name, entries in groups.items()
@@ -650,7 +680,9 @@ def print_aggregate_overlap(reports: Iterable[TimeReport], top_groups: int) -> N
     print(f"repository file instances\t{stats['file_instances']}")
     print(f"unique repository files\t{stats['unique_files']}")
     print(f"duplicate instances\t{stats['duplicate_instances']}")
-    print("top duplicated repository groups\tfiles\tduplicate instances\tlines\tduplicate lines")
+    print(
+        "top duplicated repository groups\tfiles\tduplicate instances\tlines\tduplicate lines"
+    )
     groups = stats["groups"]
     assert isinstance(groups, list)
     for row in groups[:top_groups]:
@@ -683,7 +715,9 @@ def object_report_stats(report: ObjectReport) -> dict[str, object]:
     }
 
 
-def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str, object]:
+def aggregate_object_overlap_stats(
+    reports: Iterable[ObjectReport],
+) -> dict[str, object]:
     materialized = tuple(reports)
     module_occurrences: dict[str, list[ModuleEmission]] = collections.defaultdict(list)
     for report in materialized:
@@ -704,12 +738,17 @@ def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str,
                 "instances": len(emissions),
                 "total_bytes": total_bytes,
                 "coemitted_bytes": total_bytes - max(item.bytes for item in emissions),
-                "coemitted_text_bytes": total_text_bytes - max(item.text_bytes for item in emissions),
+                "coemitted_text_bytes": total_text_bytes
+                - max(item.text_bytes for item in emissions),
             }
         )
-    coemitted_rows.sort(key=lambda row: (-int(row["coemitted_bytes"]), str(row["name"])))
+    coemitted_rows.sort(
+        key=lambda row: (-int(row["coemitted_bytes"]), str(row["name"]))
+    )
 
-    section_occurrences: dict[str, list[SectionEmission]] = collections.defaultdict(list)
+    section_occurrences: dict[str, list[SectionEmission]] = collections.defaultdict(
+        list
+    )
     for report in materialized:
         for section_name, emission in report.named_sections.items():
             section_occurrences[section_name].append(emission)
@@ -724,7 +763,9 @@ def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str,
         total_bytes = sum(item.bytes for item in emissions)
         total_text_bytes = sum(item.text_bytes for item in emissions)
         duplicate_bytes = total_bytes - max(item.bytes for item in emissions)
-        duplicate_text_bytes = total_text_bytes - max(item.text_bytes for item in emissions)
+        duplicate_text_bytes = total_text_bytes - max(
+            item.text_bytes for item in emissions
+        )
         modules = {item.module for item in emissions}
         module = next(iter(modules)) if len(modules) == 1 else "<ambiguous>"
         section_rows.append(
@@ -760,8 +801,12 @@ def aggregate_object_overlap_stats(reports: Iterable[ObjectReport]) -> dict[str,
         "module_instances": sum(len(items) for items in module_occurrences.values()),
         "unique_modules": len(module_occurrences),
         "coemitted_modules": len(coemitted_modules),
-        "coemitted_module_bytes": sum(int(row["coemitted_bytes"]) for row in coemitted_rows),
-        "coemitted_module_text_bytes": sum(int(row["coemitted_text_bytes"]) for row in coemitted_rows),
+        "coemitted_module_bytes": sum(
+            int(row["coemitted_bytes"]) for row in coemitted_rows
+        ),
+        "coemitted_module_text_bytes": sum(
+            int(row["coemitted_text_bytes"]) for row in coemitted_rows
+        ),
         "coemitted_module_groups": coemitted_rows,
         "section_instances": sum(len(items) for items in section_occurrences.values()),
         "unique_sections": len(section_occurrences),
@@ -789,7 +834,9 @@ def print_object_report(report: ObjectReport, top_groups: int) -> None:
         print(f"{row['name']}\t{row['bytes']}\t{row['text_bytes']}\t{row['sections']}")
 
 
-def print_aggregate_object_overlap(reports: Iterable[ObjectReport], top_groups: int) -> None:
+def print_aggregate_object_overlap(
+    reports: Iterable[ObjectReport], top_groups: int
+) -> None:
     stats = aggregate_object_overlap_stats(reports)
     if not stats["available"] or int(stats["report_count"]) < 2:
         return
@@ -797,13 +844,17 @@ def print_aggregate_object_overlap(reports: Iterable[ObjectReport], top_groups: 
     print(f"module instances\t{stats['module_instances']}")
     print(f"unique modules\t{stats['unique_modules']}")
     print(f"co-emitted modules\t{stats['coemitted_modules']}")
-    print(f"co-emitted module alloc-byte lower bound\t{stats['coemitted_module_bytes']}")
+    print(
+        f"co-emitted module alloc-byte lower bound\t{stats['coemitted_module_bytes']}"
+    )
     print(f"named section instances\t{stats['section_instances']}")
     print(f"unique named sections\t{stats['unique_sections']}")
     print(f"repeated named sections\t{stats['duplicated_sections']}")
     print(f"repeated named-section alloc bytes\t{stats['duplicate_bytes']}")
     print(f"repeated named-section text bytes\t{stats['duplicate_text_bytes']}")
-    print("top repeated-section modules\tsections\tduplicate bytes\tduplicate text bytes")
+    print(
+        "top repeated-section modules\tsections\tduplicate bytes\tduplicate text bytes"
+    )
     modules = stats["modules"]
     assert isinstance(modules, list)
     for row in modules[:top_groups]:
@@ -830,7 +881,9 @@ def print_time_report(report: TimeReport, top_groups: int) -> None:
     if not report.has_file_list:
         print("repository Zig files\tunavailable (report has no all_files field)")
         return
-    print(f"repository Zig files\t{stats['repo_zig_files']}\t{stats['repo_zig_lines']} lines")
+    print(
+        f"repository Zig files\t{stats['repo_zig_files']}\t{stats['repo_zig_lines']} lines"
+    )
     print("top repository groups\tfiles\tlines")
     for name, files, lines in grouped_files(report.repo_files)[:top_groups]:
         print(f"{name}\t{files}\t{lines}")
@@ -854,10 +907,13 @@ def comparison_stats(base: TimeReport, candidate: TimeReport) -> dict[str, objec
         smaller_graph_files = min(len(base.repo_files), len(candidate.repo_files))
         result.update(
             {
-                "repo_zig_files_delta": len(candidate.repo_files) - len(base.repo_files),
+                "repo_zig_files_delta": len(candidate.repo_files)
+                - len(base.repo_files),
                 "shared_files": len(shared),
                 "shared_lines": sum(source_lines(path) for path in shared),
-                "shared_fraction_of_smaller_graph": len(shared) / smaller_graph_files if smaller_graph_files else 0,
+                "shared_fraction_of_smaller_graph": (
+                    len(shared) / smaller_graph_files if smaller_graph_files else 0
+                ),
                 "added_files": len(added),
                 "added_lines": sum(source_lines(path) for path in added),
                 "removed_files": len(removed),
@@ -897,10 +953,16 @@ def print_comparison(base: TimeReport, candidate: TimeReport, top_groups: int) -
         row = changes[source_group(path)]
         row[2] += 1
         row[3] += source_lines(path)
-    ranked = sorted(changes.items(), key=lambda item: (-(item[1][1] + item[1][3]), item[0]))
+    ranked = sorted(
+        changes.items(), key=lambda item: (-(item[1][1] + item[1][3]), item[0])
+    )
     print("changed repository groups\tadded files/lines\tremoved files/lines")
-    for name, (added_files, added_lines, removed_files, removed_lines) in ranked[:top_groups]:
-        print(f"{name}\t+{added_files}/+{added_lines}\t-{removed_files}/-{removed_lines}")
+    for name, (added_files, added_lines, removed_files, removed_lines) in ranked[
+        :top_groups
+    ]:
+        print(
+            f"{name}\t+{added_files}/+{added_lines}\t-{removed_files}/-{removed_lines}"
+        )
 
 
 def json_report(
@@ -920,20 +982,35 @@ def json_report(
         stats = graph.stats(paths)
         root_report[name] = {"files": stats.files, "lines": stats.lines}
     available_roles = [name for name in SERVER_ROLES if name in graphs]
-    role_union = set().union(*(graphs[name] for name in available_roles)) if available_roles else set()
+    role_union = (
+        set().union(*(graphs[name] for name in available_roles))
+        if available_roles
+        else set()
+    )
     union_stats = graph.stats(role_union)
-    report["server_role_union"] = {"files": union_stats.files, "lines": union_stats.lines}
+    report["server_role_union"] = {
+        "files": union_stats.files,
+        "lines": union_stats.lines,
+    }
     report["time_reports"] = {item.name: report_stats(item) for item in time_reports}
     report["aggregate_compiler_overlap"] = aggregate_overlap_stats(time_reports)
-    report["object_reports"] = {item.name: object_report_stats(item) for item in object_reports}
+    report["object_reports"] = {
+        item.name: object_report_stats(item) for item in object_reports
+    }
     report["aggregate_emitted_overlap"] = aggregate_object_overlap_stats(object_reports)
-    report["comparisons"] = [comparison_stats(base, candidate) for base, candidate in comparisons]
+    report["comparisons"] = [
+        comparison_stats(base, candidate) for base, candidate in comparisons
+    ]
     return report
 
 
-def print_report(graph: ImportGraph, graphs: dict[str, set[Path]], largest: int) -> None:
+def print_report(
+    graph: ImportGraph, graphs: dict[str, set[Path]], largest: int
+) -> None:
     print("root\tfiles\tlines")
-    for name, paths in sorted(graphs.items(), key=lambda item: (-len(item[1]), item[0])):
+    for name, paths in sorted(
+        graphs.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
         stats = graph.stats(paths)
         print(f"{name}\t{stats.files}\t{stats.lines}")
 
@@ -948,14 +1025,20 @@ def print_report(graph: ImportGraph, graphs: dict[str, set[Path]], largest: int)
                 print(f"{left}\t{right}\t{len(shared)}\t{ratio:.1%}")
 
     available_roles = [name for name in SERVER_ROLES if name in graphs]
-    role_union = set().union(*(graphs[name] for name in available_roles)) if available_roles else set()
+    role_union = (
+        set().union(*(graphs[name] for name in available_roles))
+        if available_roles
+        else set()
+    )
     stats = graph.stats(role_union)
     print(f"\nserver-role union\t{stats.files} files\t{stats.lines} lines")
     for name in available_roles:
         other = set().union(*(graphs[role] for role in available_roles if role != name))
         unique = graphs[name] - other
         unique_stats = graph.stats(unique)
-        print(f"unique to {name}\t{unique_stats.files} files\t{unique_stats.lines} lines")
+        print(
+            f"unique to {name}\t{unique_stats.files} files\t{unique_stats.lines} lines"
+        )
 
     if largest > 0:
         for name, paths in graphs.items():
@@ -967,7 +1050,9 @@ def print_report(graph: ImportGraph, graphs: dict[str, set[Path]], largest: int)
 def show_paths(graph: ImportGraph, requests: Iterable[tuple[str, str]]) -> bool:
     all_found = True
     for source, target in requests:
-        path = graph.shortest_path(graph.resolve_source(source), graph.resolve_source(target))
+        path = graph.shortest_path(
+            graph.resolve_source(source), graph.resolve_source(target)
+        )
         print(f"\n{source} -> {target}")
         if not path:
             print("  no path")
@@ -1098,9 +1183,7 @@ def check_compiled_storage_boundary(
 
 def check_ha_seed_failure_registry(source_root: Path = DEFAULT_SOURCE_ROOT) -> bool:
     error_pattern = re.compile(r"\berror\.([A-Za-z][A-Za-z0-9_]*)")
-    mapping_pattern = re.compile(
-        r"\.err\s*=\s*error\.([A-Za-z][A-Za-z0-9_]*)"
-    )
+    mapping_pattern = re.compile(r"\.err\s*=\s*error\.([A-Za-z][A-Za-z0-9_]*)")
     registry_path = source_root / "runtime_failure_identity.zig"
     registered = set(mapping_pattern.findall(registry_path.read_text()))
     required: set[str] = set()
@@ -1122,8 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
         roots = dict(args.root) if args.root else DEFAULT_ROOTS
         graphs = analyze(graph, roots)
         reports = {
-            name: load_time_report(name, Path(path))
-            for name, path in args.time_report
+            name: load_time_report(name, Path(path)) for name, path in args.time_report
         }
         objects = {
             name: load_object_report(name, Path(path), graph.source_root)
@@ -1140,7 +1222,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    json_report(graph, graphs, reports.values(), objects.values(), comparisons),
+                    json_report(
+                        graph, graphs, reports.values(), objects.values(), comparisons
+                    ),
                     indent=2,
                     sort_keys=True,
                 )
@@ -1163,8 +1247,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if args.check_api_kernel_boundary and not check_api_kernel_boundary(graph):
             return 1
-        if args.check_compiled_storage_boundary and not check_compiled_storage_boundary(
-            reports, graph.source_root
+        if (
+            args.check_compiled_storage_boundary
+            and not check_compiled_storage_boundary(reports, graph.source_root)
         ):
             return 1
         if args.check_ha_seed_failure_registry and not check_ha_seed_failure_registry(

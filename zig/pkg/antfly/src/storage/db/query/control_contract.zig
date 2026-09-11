@@ -57,9 +57,22 @@ pub const DenseSearchProfile = struct {
     constraint_ns: u64 = 0,
     hbc_search_ns: u64 = 0,
     hbc_runtime_txn_ns: u64 = 0,
+    hbc_admission_wait_ns: u64 = 0,
+    hbc_scan_admission_wait_ns: u64 = 0,
+    hbc_rerank_admission_wait_ns: u64 = 0,
+    hbc_admission_estimated_scan_bytes: u64 = 0,
+    hbc_admission_selected_scan_bytes: u64 = 0,
+    hbc_admission_peak_reserved_bytes: u64 = 0,
+    hbc_admission_reservations: u64 = 0,
+    hbc_admission_fallback_leaves: u64 = 0,
+    hbc_leaf_scan_bytes: u64 = 0,
+    hbc_native_leaf_lookup_ns: u64 = 0,
+    hbc_projection_completion_ns: u64 = 0,
     hbc_scratch_acquire_ns: u64 = 0,
     hbc_node_cache_lookup_ns: u64 = 0,
     hbc_quantized_cache_lookup_ns: u64 = 0,
+    hbc_child_expand_ns: u64 = 0,
+    hbc_leaf_score_ns: u64 = 0,
     hbc_filter_candidates: u64 = 0,
     hbc_filter_rejected: u64 = 0,
     hbc_filter_metadata_batches: u64 = 0,
@@ -70,6 +83,11 @@ pub const DenseSearchProfile = struct {
     hbc_traversal_bound_resolutions: u64 = 0,
     hbc_traversal_bound_fallbacks: u64 = 0,
     hbc_traversal_bound_stops: u64 = 0,
+    hbc_traversal_bound_unresolved_frontier: u64 = 0,
+    hbc_traversal_bound_incomplete_topk: u64 = 0,
+    hbc_traversal_bound_overlap: u64 = 0,
+    hbc_traversal_unresolved_posting_bounds: u64 = 0,
+    hbc_traversal_incomplete_routing_directory: u64 = 0,
     hbc_traversal_frontier_remaining: u64 = 0,
     hbc_traversal_eligible_vectors: u64 = 0,
     hbc_traversal_stop_lower_bound: f32 = 0,
@@ -107,6 +125,12 @@ pub const DenseSearchProfile = struct {
     hbc_exact_vectors_scored: u64 = 0,
     hbc_leaf_payload_stale: u64 = 0,
     hbc_leaf_payload_missing: u64 = 0,
+    hbc_native_leaf_scan_hits: u64 = 0,
+    hbc_native_leaf_scan_fallbacks: u64 = 0,
+    hbc_subgroup_leaves_scored: u64 = 0,
+    hbc_subgroup_vectors_skipped: u64 = 0,
+    hbc_subgroup_compact_groups_scored: u64 = 0,
+    hbc_subgroup_routing_ns: u64 = 0,
     hbc_reranked_vectors: u64 = 0,
     hbc_approx_candidate_count: u64 = 0,
     hbc_rerank_candidate_count: u64 = 0,
@@ -143,6 +167,17 @@ pub const DenseSearchProfile = struct {
     hbc_rerank_artifact_distance_ns: u64 = 0,
     hbc_rerank_lsm_cache_hits: u64 = 0,
     hbc_rerank_lsm_cache_misses: u64 = 0,
+    hbc_rerank_vector_block_hits: u64 = 0,
+    hbc_rerank_vector_projection_reads: u64 = 0,
+    hbc_rerank_vector_projection_borrows: u64 = 0,
+    hbc_rerank_vector_projection_bytes: u64 = 0,
+    hbc_rerank_vector_residual_reads: u64 = 0,
+    hbc_rerank_vector_residual_bytes: u64 = 0,
+    hbc_rerank_vector_physical_reads: u64 = 0,
+    hbc_rerank_vector_physical_bytes: u64 = 0,
+    hbc_rerank_vector_location_reuses: u64 = 0,
+    hbc_rerank_vector_block_misses: u64 = 0,
+    hbc_rerank_vector_block_fallbacks: u64 = 0,
     hbc_rerank_artifact_cache_hits: u64 = 0,
     hbc_rerank_artifact_vectors_loaded: u64 = 0,
     hbc_rerank_distance_ns: u64 = 0,
@@ -169,4 +204,15 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
         .match_all => true,
         else => false,
     };
+}
+
+pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
+    return req.full_text != null or
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        (!isDefaultMatchAll(req.query) and isTextQuery(req.query));
+}
+
+pub fn requestBindsFilterTextIndex(req: types.SearchRequest) bool {
+    return req.filter_text != null or req.exclusion_text != null;
 }

@@ -1,0 +1,1142 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+
+//! End-to-end serverless workflow campaign over production stores and
+//! orchestration. VOPR selects one immediate fault history; the real WAL,
+//! builder, manifests, progress CAS, compactor, catalog, and query session
+//! establish the recovery behavior.
+
+const std = @import("std");
+const vopr = @import("vopr");
+const objectstore = @import("objectstore");
+const artifacts_object_store = @import("../serverless/artifacts/object_store.zig");
+const manifest_object_store = @import("../serverless/manifest/object_store.zig");
+const wal_object_store = @import("../serverless/wal/object_store.zig");
+const progress_object_store = @import("../serverless/catalog/object_progress_store.zig");
+const catalog_object_store = @import("../serverless/catalog/object_store.zig");
+const artifacts_mod = @import("../serverless/artifacts/mod.zig");
+const manifest_mod = @import("../serverless/manifest/mod.zig");
+const wal_mod = @import("../serverless/wal/mod.zig");
+const catalog_mod = @import("../serverless/catalog/mod.zig");
+const build_mod = @import("../serverless/build/mod.zig");
+const api_mod = @import("../serverless/api/mod.zig");
+const api_codec = @import("../serverless/api/codec.zig");
+const query_mod = @import("../serverless/query/mod.zig");
+const document_segment = @import("../serverless/document_segment/mod.zig");
+const runtime_manager = @import("../serverless/runtime/manager.zig");
+const head_coordination = @import("../serverless/head_coordination.zig");
+const maintenance_cancellation = @import("../serverless/maintenance_cancellation.zig");
+const search_sources = @import("../serverless/search_sources.zig");
+const serverless_http_server = @import("../serverless_http_server.zig");
+const serverless_http_client = @import("../serverless_http_client.zig");
+const io_http_executor = @import("../common/http/io_http_executor.zig");
+const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
+pub const Scenario = struct {
+    pub const name: []const u8 = "serverless-workflow-production-recovery";
+    pub const version: u32 = 5;
+
+    const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
+    const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
+    const stale_fenced_id = vopr.id.stable(name, "stale-owner-fenced-at-publication");
+    const legacy_epoch_id = vopr.id.stable(name, "legacy-head-rewrite-preserves-fencing-epoch");
+    const duplicate_serialized_id = vopr.id.stable(name, "duplicate-workers-serialized");
+    const recovery_id = vopr.id.stable(name, "interrupted-workflow-recovers");
+    const compacted_id = vopr.id.stable(name, "compaction-publishes-complete-head");
+    const generation_fenced_id = vopr.id.stable(name, "stale-enrichment-generation-preserves-documents");
+    const progress_conflict_id = vopr.id.stable(name, "publication-progress-conflict-fences-stale-candidate");
+
+    pub const properties = &[_]vopr.property.Declaration{
+        .{ .id = no_lost_documents_id, .name = name ++ ".no-lost-documents", .kind = .always },
+        .{ .id = catalog_visible_id, .name = name ++ ".catalog-visible-after-cutover", .kind = .always },
+        .{ .id = stale_fenced_id, .name = name ++ ".stale-owner-fenced-at-publication", .kind = .always },
+        .{ .id = legacy_epoch_id, .name = name ++ ".legacy-head-rewrite-preserves-fencing-epoch", .kind = .always },
+        .{ .id = duplicate_serialized_id, .name = name ++ ".duplicate-workers-serialized", .kind = .always },
+        .{ .id = recovery_id, .name = name ++ ".interrupted-workflow-recovers", .kind = .reachable },
+        .{ .id = compacted_id, .name = name ++ ".compaction-publishes-complete-head", .kind = .reachable },
+        .{ .id = generation_fenced_id, .name = name ++ ".stale-enrichment-generation-preserves-documents", .kind = .always },
+        .{ .id = progress_conflict_id, .name = name ++ ".publication-progress-conflict-fences-stale-candidate", .kind = .always },
+    };
+
+    pub const Mode = enum {
+        clean,
+        duplicate_workers,
+        lease_takeover,
+        legacy_head_rewrite,
+        ambiguous_publish,
+        cancellation,
+        retry,
+        crash_recovery,
+        compaction_crash,
+        stale_enrichment_progress_conflict,
+    };
+
+    const mode_ids = [_]vopr.id.StableId{
+        vopr.id.stable(name, "clean"),
+        vopr.id.stable(name, "duplicate-workers"),
+        vopr.id.stable(name, "lease-takeover"),
+        vopr.id.stable(name, "legacy-head-rewrite"),
+        vopr.id.stable(name, "ambiguous-publish"),
+        vopr.id.stable(name, "cancellation"),
+        vopr.id.stable(name, "retry"),
+        vopr.id.stable(name, "crash-recovery"),
+        vopr.id.stable(name, "compaction-crash"),
+        vopr.id.stable(name, "stale-enrichment-progress-conflict"),
+    };
+    const mode_names = [_][]const u8{
+        name ++ ".clean",
+        name ++ ".duplicate_workers",
+        name ++ ".lease_takeover",
+        name ++ ".legacy_head_rewrite",
+        name ++ ".ambiguous_publish",
+        name ++ ".cancellation",
+        name ++ ".retry",
+        name ++ ".crash_recovery",
+        name ++ ".compaction_crash",
+        name ++ ".stale_enrichment_progress_conflict",
+    };
+
+    /// Reusable production serverless owner graph. Full-cluster campaigns may
+    /// borrow their shared VoprIo so worker clocks and any spawned maintenance
+    /// tasks participate in the same history as clients and data nodes.
+    pub const Fixture = struct {
+        alloc: std.mem.Allocator,
+        owned_sim: ?vopr.vopr_io.VoprIo,
+        sim: *vopr.vopr_io.VoprIo,
+        memory: objectstore.MemoryClient,
+        artifact_faults: objectstore.ScriptedFaultClient,
+        manifest_faults: objectstore.ScriptedFaultClient,
+        wal_faults: objectstore.ScriptedFaultClient,
+        progress_faults: objectstore.ScriptedFaultClient,
+        catalog_faults: objectstore.ScriptedFaultClient,
+        lease_faults: objectstore.ScriptedFaultClient,
+        artifact_impl: artifacts_object_store.ObjectStore,
+        artifacts: artifacts_mod.ArtifactStore,
+        manifest_impl: manifest_object_store.ObjectStore,
+        manifests: manifest_mod.ManifestStore,
+        wal_impl: wal_object_store.ObjectStore,
+        wal: wal_mod.WalStore,
+        progress_impl: progress_object_store.ObjectProgressStore,
+        progress: catalog_mod.ProgressStore,
+        catalog_impl: catalog_object_store.ObjectStore,
+        catalog_store: catalog_mod.CatalogStore,
+        lease_impl: build_mod.ObjectWorkLeaseStore,
+        builder: build_mod.Builder,
+        catalog: catalog_mod.CatalogService,
+        api: api_mod.Service,
+        query: query_mod.QueryRuntime,
+        runtime: runtime_manager.ManagedRuntime,
+        runtime_live: bool = false,
+        public_status: api_mod.RuntimeStatusResult = undefined,
+        public_handler: api_mod.HttpHandler = undefined,
+        public_server: serverless_http_server.ServerlessHttpServer = undefined,
+        public_runtime: serverless_http_server.HttpxRuntime = undefined,
+        public_executor: io_http_executor.IoHttpExecutor = undefined,
+        public_client: serverless_http_client.ServerlessHttpClient = undefined,
+        public_live: bool = false,
+        public_catalog_visible: bool = false,
+        mode: Mode = .clean,
+        complete: bool = false,
+        first_attempt_interrupted: bool = false,
+        duplicate_blocked: bool = false,
+        stale_fenced: bool = false,
+        legacy_epoch_preserved: bool = false,
+        recovered: bool = false,
+        final_head: u64 = 0,
+        visible_document_mask: u8 = 0,
+        compacted: bool = false,
+        generation_fenced: bool = true,
+        progress_conflict_fenced: bool = false,
+        publication_hook_calls: u64 = 0,
+        conflicting_candidate_version: u64 = 0,
+        generation_cutover_version: u64 = 0,
+
+        fn init(alloc: std.mem.Allocator) !*Fixture {
+            const self = try alloc.create(Fixture);
+            errdefer alloc.destroy(self);
+            self.alloc = alloc;
+            self.owned_sim = try vopr.vopr_io.VoprIo.init(.{
+                .seed = 0x5352564c,
+                .realtime_ns = 1_000,
+                .instrumentation = .{ .enabled = false, .map_digest = 0x5352564c },
+            });
+            errdefer self.owned_sim.?.deinit();
+            self.sim = &self.owned_sim.?;
+            return try self.initStores();
+        }
+
+        pub fn initWithVoprIo(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
+            const self = try alloc.create(Fixture);
+            errdefer alloc.destroy(self);
+            self.alloc = alloc;
+            self.owned_sim = null;
+            self.sim = sim;
+            return try self.initStores();
+        }
+
+        fn initStores(self: *Fixture) !*Fixture {
+            const alloc = self.alloc;
+            self.memory = objectstore.MemoryClient.init(alloc);
+            errdefer self.memory.deinit();
+            self.artifact_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.artifact_faults.deinit();
+            self.manifest_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.manifest_faults.deinit();
+            self.wal_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.wal_faults.deinit();
+            self.progress_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.progress_faults.deinit();
+            self.catalog_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.catalog_faults.deinit();
+            self.lease_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
+            errdefer self.lease_faults.deinit();
+
+            self.artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(
+                alloc,
+                self.artifact_faults.client(),
+                "workflow-artifacts",
+                "tenant",
+            );
+            self.artifacts = self.artifact_impl.artifactStore();
+            errdefer self.artifacts.deinit();
+            self.manifest_impl = try manifest_object_store.ObjectStore.initWithClient(
+                alloc,
+                self.manifest_faults.client(),
+                "workflow-manifests",
+                "tenant",
+            );
+            self.manifests = self.manifest_impl.manifestStore();
+            errdefer self.manifests.deinit();
+            self.wal_impl = try wal_object_store.ObjectStore.initWithClient(
+                alloc,
+                self.wal_faults.client(),
+                "workflow-wal",
+                "tenant",
+            );
+            self.wal = self.wal_impl.walStore();
+            errdefer self.wal.deinit();
+            self.progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(
+                alloc,
+                self.progress_faults.client(),
+                "workflow-progress",
+                "tenant",
+            );
+            self.progress = self.progress_impl.progressStore();
+            errdefer self.progress.deinit();
+            self.catalog_impl = try catalog_object_store.ObjectStore.initWithClient(
+                alloc,
+                self.catalog_faults.client(),
+                "workflow-catalog",
+                "tenant",
+            );
+            self.catalog_store = self.catalog_impl.catalogStore();
+            errdefer self.catalog_store.deinit();
+            self.lease_impl = try build_mod.ObjectWorkLeaseStore.initWithClient(
+                alloc,
+                self.lease_faults.client(),
+                self.progress_impl.bucket,
+                self.progress_impl.prefix,
+            );
+            errdefer self.lease_impl.deinit();
+
+            self.builder = build_mod.Builder.init(
+                alloc,
+                &self.artifacts,
+                &self.manifests,
+                &self.progress,
+                &self.wal,
+            );
+            self.catalog = catalog_mod.CatalogService.init(
+                alloc,
+                &self.artifacts,
+                &self.manifests,
+                &self.progress,
+                &self.wal,
+                &self.builder,
+                &self.catalog_store,
+            );
+            errdefer self.catalog.deinit();
+            self.api = api_mod.Service.init(alloc, &self.wal, &self.builder);
+            self.query = query_mod.QueryRuntime.init(
+                alloc,
+                &self.artifacts,
+                &self.manifests,
+                &self.progress,
+            );
+            errdefer self.query.deinit();
+            self.runtime_live = false;
+            self.public_live = false;
+            self.public_catalog_visible = false;
+            self.mode = .clean;
+            self.complete = false;
+            self.first_attempt_interrupted = false;
+            self.duplicate_blocked = false;
+            self.stale_fenced = false;
+            self.legacy_epoch_preserved = false;
+            self.recovered = false;
+            self.final_head = 0;
+            self.visible_document_mask = 0;
+            self.compacted = false;
+            self.generation_fenced = true;
+            self.progress_conflict_fenced = false;
+            self.publication_hook_calls = 0;
+            self.conflicting_candidate_version = 0;
+            self.generation_cutover_version = 0;
+
+            try self.initRuntime("worker-primary");
+            errdefer self.runtime.deinit();
+            try std.testing.expect(try self.catalog.ensureTableWithPolicy("docs", 100, .{
+                .keep_latest_versions = 8,
+                .max_pending_records = 1,
+                .compaction_enabled = true,
+                .compaction_trigger_version_count = 2,
+            }));
+            return self;
+        }
+
+        pub fn deinit(self: *Fixture) void {
+            self.stopPublicCatalog();
+            if (self.runtime_live) self.runtime.deinit();
+            self.query.deinit();
+            self.catalog.deinit();
+            self.lease_impl.deinit();
+            self.catalog_store.deinit();
+            self.progress.deinit();
+            self.wal.deinit();
+            self.manifests.deinit();
+            self.artifacts.deinit();
+            self.lease_faults.deinit();
+            self.catalog_faults.deinit();
+            self.progress_faults.deinit();
+            self.wal_faults.deinit();
+            self.manifest_faults.deinit();
+            self.artifact_faults.deinit();
+            self.memory.deinit();
+            if (self.owned_sim) |*owned| owned.deinit();
+            self.alloc.destroy(self);
+        }
+
+        pub fn startPublicCatalog(self: *Fixture) !void {
+            if (self.public_live) return error.ServerlessPublicCatalogAlreadyStarted;
+            const targets = try self.alloc.alloc(api_mod.RuntimeStorageTarget, 0);
+            var status_transferred = false;
+            errdefer if (!status_transferred) self.alloc.free(targets);
+            var published_sources = try search_sources.defaultPublishedSearchSourcesAlloc(self.alloc);
+            errdefer if (!status_transferred)
+                search_sources.deinitPublishedSearchSources(self.alloc, &published_sources);
+            self.public_status = .{
+                .role = .combined,
+                .combined_mode = true,
+                .tick_interval_ms = 1,
+                .validated = true,
+                .published_search_sources = published_sources,
+                .targets = targets,
+            };
+            status_transferred = true;
+            errdefer self.public_status.deinit(self.alloc);
+            self.public_handler = api_mod.HttpHandler.init(
+                self.alloc,
+                &self.api,
+                &self.catalog,
+                &self.manifests,
+                &self.progress,
+                &self.query,
+                &self.public_status,
+            );
+            self.public_handler.setIo(self.sim.io());
+            self.public_handler.setRuntimeMetrics(&self.runtime);
+            self.public_server = serverless_http_server.ServerlessHttpServer.init(
+                self.alloc,
+                .{},
+                &self.public_handler,
+            );
+            self.public_runtime = try serverless_http_server.HttpxRuntime.start(
+                self.alloc,
+                self.sim.io(),
+                &self.public_server,
+            );
+            errdefer self.public_runtime.deinit();
+            self.public_executor = io_http_executor.IoHttpExecutor.init(self.alloc, self.sim.io(), .{
+                .keep_alive = true,
+                .connect_timeout_ms = 0,
+                .read_timeout_ms = 0,
+                .write_timeout_ms = 0,
+                .pool_max_connections = 8,
+                .pool_max_per_host = 8,
+            });
+            self.public_client = serverless_http_client.ServerlessHttpClient.init(
+                self.alloc,
+                self.public_executor.executor(),
+            );
+            self.public_live = true;
+        }
+
+        pub fn stopPublicCatalog(self: *Fixture) void {
+            if (!self.public_live) return;
+            // Publish ownership release before teardown. A parent VOPR future
+            // can be canceled while unwinding through this function, and the
+            // fixture owner may then call deinit as a second shutdown path.
+            // The second path must not touch a client already poisoned by its
+            // first deinit.
+            self.public_live = false;
+            self.public_executor.deinit();
+            self.public_runtime.deinit();
+            self.public_status.deinit(self.alloc);
+        }
+
+        pub fn observePublicCatalogForMode(self: *Fixture, mode: Mode) !bool {
+            if (!self.public_live) return error.ServerlessPublicCatalogNotStarted;
+            var tables = try self.public_client.tables().list(self.public_runtime.base_uri);
+            defer tables.deinit();
+            var found = false;
+            for (tables.value) |table| found = found or std.mem.eql(u8, table.table_name, "docs");
+            if (!found) return false;
+
+            var query_result = try self.public_client.tables().queryPublished(
+                self.public_runtime.base_uri,
+                "docs",
+            );
+            defer query_result.deinit();
+            const expected_version: u64 = if (mode == .stale_enrichment_progress_conflict) 4 else 3;
+            if (query_result.value.version != expected_version or query_result.value.view != .published) return false;
+            var mask: u8 = 0;
+            for (query_result.value.documents) |document| {
+                if (std.mem.eql(u8, document.doc_id, "doc-a")) mask |= 1;
+                if (std.mem.eql(u8, document.doc_id, "doc-b")) mask |= 2;
+            }
+            const expected_mask: u8 = if (mode == .stale_enrichment_progress_conflict) 1 else 3;
+            self.public_catalog_visible = mask == expected_mask;
+            return self.public_catalog_visible;
+        }
+
+        fn initRuntime(self: *Fixture, owner_id: []const u8) !void {
+            self.runtime = runtime_manager.ManagedRuntime.initWithIo(
+                self.alloc,
+                self.sim.io(),
+                .{
+                    .tick_interval_ms = 1,
+                    .publish_enabled = true,
+                    .compaction_enabled = true,
+                    .prune_enabled = false,
+                    .enrichment_enabled = false,
+                },
+                &self.catalog,
+                build_mod.Pruner.init(
+                    self.alloc,
+                    &self.artifacts,
+                    &self.manifests,
+                    &self.progress,
+                    &self.wal,
+                ),
+            );
+            errdefer self.runtime.deinit();
+            try self.runtime.configureWorkLease(
+                self.lease_impl.provider(),
+                owner_id,
+                100,
+            );
+            self.runtime.setCompactor(build_mod.Compactor.init(
+                self.alloc,
+                &self.artifacts,
+                &self.manifests,
+                &self.progress,
+            ));
+            self.runtime_live = true;
+        }
+
+        fn restartRuntime(self: *Fixture) !void {
+            if (self.runtime_live) {
+                self.runtime.deinit();
+                self.runtime_live = false;
+            }
+            self.artifact_faults.resetClientAfterCrash();
+            self.manifest_faults.resetClientAfterCrash();
+            self.wal_faults.resetClientAfterCrash();
+            self.progress_faults.resetClientAfterCrash();
+            self.catalog_faults.resetClientAfterCrash();
+            self.lease_faults.resetClientAfterCrash();
+            try self.initRuntime("worker-recovery");
+        }
+
+        fn ingest(self: *Fixture, doc_id: []const u8, body: []const u8, timestamp_ns: u64) !void {
+            const mutations = [_]api_mod.DocumentMutation{.{
+                .kind = .upsert,
+                .doc_id = doc_id,
+                .body = body,
+            }};
+            var result = try self.api.ingestBatch(.{
+                .namespace = "docs",
+                .timestamp_ns = timestamp_ns,
+                .mutations = &mutations,
+            });
+            result.deinit(self.alloc);
+        }
+
+        fn runFirstPublication(self: *Fixture) !void {
+            switch (self.mode) {
+                .clean, .compaction_crash, .stale_enrichment_progress_conflict => {
+                    _ = try self.runtime.runOnce();
+                },
+                .duplicate_workers => {
+                    var incumbent = (try build_mod.work_lease.acquireBootstrapHeld(
+                        self.lease_impl.provider(),
+                        self.sim.io(),
+                        "docs",
+                        "worker-incumbent",
+                        100,
+                    )).?;
+                    // Cross the original expiry while the incumbent is in a
+                    // CPU checkpoint. The attached heartbeat must extend the
+                    // bootstrap claim before a duplicate worker can start.
+                    try self.sim.jumpRealtime(60);
+                    try incumbent.cancellation(maintenance_cancellation.Token{
+                        .io = self.sim.io(),
+                    }).check();
+                    try self.sim.jumpRealtime(60);
+                    const contender = try self.runtime.runOnce();
+                    self.duplicate_blocked = contender.work_lease_conflicts == 1 and
+                        (self.progress.getHead("docs") catch 0) == 0;
+                    var published = try self.catalog.buildNamespace("docs");
+                    published.deinit(self.alloc);
+                    _ = try incumbent.release();
+                },
+                .lease_takeover, .legacy_head_rewrite => {
+                    // First publication is protected by the absent-to-present
+                    // HEAD CAS; bootstrap coordination never materializes HEAD.
+                    _ = try self.runtime.runOnce();
+                },
+                .ambiguous_publish => {
+                    self.progress_faults.commitNextPutThenFail(error.Timeout);
+                    try self.expectInterrupted(error.Timeout);
+                    try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
+                    try self.restartRuntime();
+                    _ = try self.runtime.runOnce();
+                },
+                .cancellation => {
+                    self.progress_faults.failNextPutBefore(error.Canceled);
+                    try self.expectInterrupted(error.Canceled);
+                    try std.testing.expectError(error.FileNotFound, self.progress.getHead("docs"));
+                    try self.restartRuntime();
+                    _ = try self.runtime.runOnce();
+                },
+                .retry => {
+                    self.artifact_faults.failNextPutBefore(error.Timeout);
+                    try self.expectInterrupted(error.Timeout);
+                    try self.restartRuntime();
+                    _ = try self.runtime.runOnce();
+                },
+                .crash_recovery => {
+                    self.manifest_faults.commitNextPutThenFail(error.ConnectionResetByPeer);
+                    try self.expectInterrupted(error.ConnectionResetByPeer);
+                    try std.testing.expectError(error.FileNotFound, self.progress.getHead("docs"));
+                    try self.restartRuntime();
+                    _ = try self.runtime.runOnce();
+                },
+            }
+            try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
+        }
+
+        fn expectInterrupted(self: *Fixture, expected: anyerror) !void {
+            if (self.runtime.runOnce()) |_| return error.ExpectedWorkflowInterruption else |err| {
+                if (err != expected) return err;
+                self.first_attempt_interrupted = true;
+            }
+        }
+
+        fn runSecondPublicationAndCompaction(self: *Fixture) !void {
+            try self.ingest("doc-b", "beta gamma", 200);
+            if (self.mode == .lease_takeover) {
+                var stale = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-stale",
+                    10,
+                )).?;
+                if (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-stale",
+                    100,
+                )) |unexpected| {
+                    var owned = unexpected;
+                    _ = try owned.release();
+                    return error.ActiveSameOwnerReacquired;
+                }
+                var raw = self.memory.client();
+                var before_takeover = try raw.getObject("workflow-progress", "tenant/docs/HEAD", .{});
+                const stale_etag = try self.alloc.dupe(u8, before_takeover.metadata.etag.?);
+                before_takeover.deinit(self.alloc);
+                defer self.alloc.free(stale_etag);
+                const stale_renewal = head_coordination.Record{
+                    .head_version = 1,
+                    .owner_id = "worker-stale",
+                    .fencing_token = stale.acquisition.fencing_token,
+                    .expires_at_unix_ns = 200,
+                    .released = false,
+                };
+                const stale_payload = try head_coordination.payloadAlloc(self.alloc, stale_renewal);
+                defer self.alloc.free(stale_payload);
+                const stale_content_type = try head_coordination.contentTypeAlloc(self.alloc, stale_renewal);
+                defer self.alloc.free(stale_content_type);
+                try self.sim.jumpRealtime(10);
+                var replacement = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-replacement",
+                    100,
+                )).?;
+                if (raw.putObject("workflow-progress", "tenant/docs/HEAD", stale_payload, .{
+                    .content_type = stale_content_type,
+                    .if_match_etag = stale_etag,
+                })) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleLeaseResurrected;
+                } else |err| {
+                    if (err != error.PreconditionFailed) return err;
+                }
+                if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleWorkerPublished;
+                } else |err| {
+                    if (err != error.WorkLeaseLost) return err;
+                    self.stale_fenced = true;
+                    self.first_attempt_interrupted = true;
+                }
+                _ = try replacement.release();
+                _ = try self.runtime.runOnce();
+            } else if (self.mode == .legacy_head_rewrite) {
+                var stale = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "stable-owner",
+                    100,
+                )).?;
+                var legacy_client = self.memory.client();
+                var current = try legacy_client.getObject("workflow-progress", "tenant/docs/HEAD", .{});
+                const current_etag = try self.alloc.dupe(u8, current.metadata.etag.?);
+                current.deinit(self.alloc);
+                defer self.alloc.free(current_etag);
+                var legacy_write = try legacy_client.putObject("workflow-progress", "tenant/docs/HEAD", "1", .{
+                    .content_type = "text/plain",
+                    .if_match_etag = current_etag,
+                });
+                legacy_write.deinit(self.alloc);
+                var replacement = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "stable-owner",
+                    100,
+                )).?;
+                self.legacy_epoch_preserved = replacement.acquisition.fencing_token > stale.acquisition.fencing_token;
+                if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
+                    var owned = result.*;
+                    owned.deinit(self.alloc);
+                    return error.StaleWorkerPublishedAfterLegacyRewrite;
+                } else |err| {
+                    if (err != error.WorkLeaseLost) return err;
+                }
+                _ = try replacement.release();
+                _ = try self.runtime.runOnce();
+            } else if (self.mode == .compaction_crash) {
+                var builder_lease = (try build_mod.work_lease.acquireHeld(
+                    self.lease_impl.provider(),
+                    self.sim.io(),
+                    "docs",
+                    "worker-builder",
+                    100,
+                )).?;
+                var build = try self.catalog.buildNamespaceGuarded("docs", builder_lease.guard());
+                build.deinit(self.alloc);
+                _ = try builder_lease.release();
+                self.progress_faults.commitNextPutThenFail(error.Timeout);
+                try self.expectInterrupted(error.Timeout);
+                try std.testing.expectEqual(@as(u64, 3), try self.progress.getHead("docs"));
+                try self.restartRuntime();
+                _ = try self.runtime.runOnce();
+            } else {
+                const stats = try self.runtime.runOnce();
+                self.compacted = stats.compacted_namespaces == 1;
+            }
+            self.final_head = try self.progress.getHead("docs");
+            if (self.final_head == 3) self.compacted = true;
+        }
+
+        fn observeVisibility(self: *Fixture) !void {
+            var status = try self.catalog.buildStatus("docs");
+            defer status.deinit(self.alloc);
+            if (status.head_version != self.final_head or
+                status.pending_records != 0 or
+                status.publish_recommended)
+            {
+                return error.CatalogHeadNotVisible;
+            }
+
+            var session = try self.query.openHeadSession("docs");
+            defer session.deinit();
+            const artifact_index = session.findArtifactIndex(.document_segment) orelse
+                return error.DocumentSegmentNotFound;
+            const payload = try session.fetchArtifactAlloc(artifact_index);
+            defer self.alloc.free(payload);
+            const entries = try document_segment.decodeAlloc(self.alloc, payload);
+            defer document_segment.freeEntries(self.alloc, entries);
+            var mask: u8 = 0;
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.doc_id, "doc-a")) mask |= 1;
+                if (std.mem.eql(u8, entry.doc_id, "doc-b")) mask |= 2;
+            }
+            self.visible_document_mask = mask;
+        }
+
+        fn publicationLifecycleHook(self: *Fixture) build_mod.PublicationLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reachPublicationLifecycle };
+        }
+
+        fn reachPublicationLifecycle(
+            ptr: *anyopaque,
+            event: build_mod.PublicationLifecycleEvent,
+        ) !void {
+            const self: *Fixture = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, event.namespace, "docs") or
+                event.expected_head != @as(?u64, 1) or event.candidate_version != 2)
+            {
+                return error.UnexpectedPublicationLifecycleBoundary;
+            }
+            self.publication_hook_calls += 1;
+            self.conflicting_candidate_version = event.candidate_version;
+            try self.advanceGenerationDuringPublication();
+        }
+
+        fn advanceGenerationDuringPublication(self: *Fixture) !void {
+            var generation = try self.manifests.getAlloc("docs", 1);
+            defer generation.deinit(self.alloc);
+            generation.version = self.conflicting_candidate_version;
+            self.generation_cutover_version = try build_mod.builder.putManifestForPublication(
+                &self.manifests,
+                &generation,
+                1,
+            );
+            if (self.generation_cutover_version != 3)
+                return error.GenerationCutoverVersionMismatch;
+            if (!try self.progress.compareAndSwapHead(
+                "docs",
+                1,
+                self.generation_cutover_version,
+            )) return error.GenerationCutoverConflict;
+        }
+
+        fn runStaleEnrichmentProgressConflict(self: *Fixture) !void {
+            try self.ingest("doc-a", "{\"text\":\"authoritative\"}", 100);
+            _ = try self.runtime.runOnce();
+            try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
+
+            // The enricher captured generation 1 before producing this
+            // full-body derived mutation. A concurrent metadata publisher will
+            // advance the authoritative generation while the ordinary builder
+            // is parked after persisting its candidate but before HEAD CAS.
+            const stale_mutation = try api_codec.encodeMutationAlloc(self.alloc, .{
+                .kind = .upsert,
+                .doc_id = "doc-a",
+                .body = "{\"text\":\"stale-derived-overwrite\"}",
+            });
+            defer self.alloc.free(stale_mutation);
+            if (try self.wal.appendIdempotentIfLatest(
+                "docs",
+                101,
+                stale_mutation,
+                "enrich-v1/1/1/0/1",
+                1,
+            ) != 2) return error.StaleEnrichmentAppendNotRecorded;
+
+            self.builder.setPublicationLifecycleHook(self.publicationLifecycleHook());
+            const first_publish_error: ?anyerror = blk: {
+                var candidate = self.builder.publishNamespace("docs") catch |err| break :blk err;
+                candidate.deinit(self.alloc);
+                break :blk null;
+            };
+            self.builder.setPublicationLifecycleHook(null);
+
+            const head_after_conflict = try self.progress.getHead("docs");
+            var orphan = try self.manifests.getAlloc("docs", self.conflicting_candidate_version);
+            defer orphan.deinit(self.alloc);
+            if (first_publish_error) |err| {
+                if (err != error.HeadChanged) return err;
+            } else return error.ConflictingPublicationUnexpectedlyWon;
+            if (self.publication_hook_calls != 1)
+                return error.PublicationLifecycleHookCountMismatch;
+            if (self.conflicting_candidate_version != 2)
+                return error.ConflictingCandidateVersionMismatch;
+            if (self.generation_cutover_version != 3)
+                return error.GenerationCutoverVersionMismatch;
+            if (head_after_conflict != self.generation_cutover_version)
+                return error.ConflictingPublicationChangedVisibleHead;
+            if (!orphan.publication_lineage_tracked or
+                orphan.publication_parent_version != @as(?u64, 1))
+            {
+                return error.ConflictingCandidateLineageMismatch;
+            }
+            self.progress_conflict_fenced = true;
+            self.first_attempt_interrupted = true;
+
+            // Retry from the winning generation. The stale mutation is now
+            // inapplicable to HEAD 3, so the builder consumes its WAL position
+            // while cloning only the authoritative document artifacts.
+            var consumed = try self.builder.publishNamespace("docs");
+            defer consumed.deinit(self.alloc);
+            self.final_head = consumed.version;
+            if (!consumed.published or consumed.version != 4 or consumed.wal_end_lsn != 2)
+                return error.StaleEnrichmentNotConsumed;
+
+            var visible = try self.manifests.getAlloc("docs", 4);
+            defer visible.deinit(self.alloc);
+            const document_ref = for (visible.artifacts) |artifact| {
+                if (artifact.kind == .document_segment) break artifact;
+            } else return error.DocumentSegmentNotFound;
+            const payload = try self.artifacts.getAlloc(document_ref.artifact_id);
+            defer self.alloc.free(payload);
+            const entries = try document_segment.decodeAlloc(self.alloc, payload);
+            defer document_segment.freeEntries(self.alloc, entries);
+            self.generation_fenced = entries.len == 1 and
+                std.mem.eql(u8, entries[0].doc_id, "doc-a") and
+                std.mem.eql(u8, entries[0].body, "{\"text\":\"authoritative\"}");
+            self.visible_document_mask = @intFromBool(self.generation_fenced);
+            self.recovered = true;
+            self.complete = true;
+        }
+
+        fn run(self: *Fixture) !void {
+            if (self.mode == .stale_enrichment_progress_conflict) {
+                try self.runStaleEnrichmentProgressConflict();
+                try self.sim.ensureNoCapabilityViolation();
+                return;
+            }
+            try self.ingest("doc-a", "alpha beta", 100);
+            try self.runFirstPublication();
+            try self.runSecondPublicationAndCompaction();
+            try self.observeVisibility();
+            try self.sim.ensureNoCapabilityViolation();
+            self.recovered = true;
+            self.complete = true;
+        }
+
+        pub fn runClean(self: *Fixture) !void {
+            try self.runMode(.clean);
+        }
+
+        pub fn runMode(self: *Fixture, mode: Mode) !void {
+            self.mode = mode;
+            try self.run();
+        }
+
+        pub fn setWorkCostPort(self: *Fixture, port: ?runtime_manager.RuntimeWorkCostPort) void {
+            self.runtime.setWorkCostPort(port);
+        }
+
+        pub fn cleanWorkflowVisible(self: *const Fixture) bool {
+            return self.workflowVisibleForMode(.clean);
+        }
+
+        pub fn workflowVisibleForMode(self: *const Fixture, mode: Mode) bool {
+            const fencing_mode = mode == .stale_enrichment_progress_conflict;
+            const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+            const expected_head: u64 = if (fencing_mode) 4 else 3;
+            return self.complete and self.recovered and self.final_head == expected_head and
+                self.visible_document_mask == expected_document_mask and
+                (fencing_mode or self.compacted) and
+                self.generation_fenced and (!fencing_mode or self.progress_conflict_fenced);
+        }
+    };
+
+    pub const World = struct { state: *Fixture };
+
+    pub fn init(allocator: std.mem.Allocator) !World {
+        return .{ .state = try Fixture.init(allocator) };
+    }
+
+    pub fn deinit(world: *World, _: std.mem.Allocator) void {
+        world.state.deinit();
+        world.* = undefined;
+    }
+
+    pub fn enumerate(
+        world: *World,
+        list: *vopr.transition.List,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (world.state.complete) return;
+        inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| {
+            try list.append(allocator, .{
+                .id = id,
+                .name = mode_name,
+                .kind = if (mode == .clean) .workload else .fault,
+            });
+        }
+    }
+
+    pub fn execute(
+        world: *World,
+        selected: vopr.transition.Transition,
+        events: *vopr.event.Sink,
+        allocator: std.mem.Allocator,
+    ) !vopr.outcome.TransitionOutcome {
+        var found = false;
+        inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
+            if (selected.id == id) {
+                world.state.mode = mode;
+                found = true;
+            }
+        }
+        if (!found) return error.InvalidServerlessWorkflowTransition;
+        try world.state.run();
+        try events.emitNamed(allocator, .domain, selected.name, world.state.final_head);
+        return .applied();
+    }
+
+    pub fn observe(
+        world: *World,
+        builder: *vopr.observation.Builder,
+        allocator: std.mem.Allocator,
+    ) !void {
+        try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
+        try builder.addNamed(allocator, name ++ ".head", @intCast(world.state.final_head));
+        try builder.addNamed(allocator, name ++ ".documents", @intCast(world.state.visible_document_mask));
+        try builder.addNamed(allocator, name ++ ".interrupted", @intFromBool(world.state.first_attempt_interrupted));
+        try builder.addNamed(allocator, name ++ ".compacted", @intFromBool(world.state.compacted));
+        try builder.addNamed(allocator, name ++ ".legacy-epoch-preserved", @intFromBool(world.state.legacy_epoch_preserved));
+        try builder.addNamed(allocator, name ++ ".publication-hook-calls", @intCast(world.state.publication_hook_calls));
+        try builder.addNamed(allocator, name ++ ".conflicting-candidate-version", @intCast(world.state.conflicting_candidate_version));
+        try builder.addNamed(allocator, name ++ ".generation-cutover-version", @intCast(world.state.generation_cutover_version));
+        try builder.addNamed(allocator, name ++ ".progress-conflict-fenced", @intFromBool(world.state.progress_conflict_fenced));
+    }
+
+    pub fn evaluate(
+        world: *World,
+        sink: *vopr.property.Sink,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const state = world.state;
+        const fencing_mode = state.mode == .stale_enrichment_progress_conflict;
+        const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+        const expected_head: u64 = if (fencing_mode) 4 else 3;
+        try sink.check(
+            allocator,
+            no_lost_documents_id,
+            !state.complete or state.visible_document_mask == expected_document_mask,
+        );
+        try sink.check(
+            allocator,
+            catalog_visible_id,
+            !state.complete or state.final_head == expected_head,
+        );
+        try sink.check(
+            allocator,
+            stale_fenced_id,
+            state.mode != .lease_takeover or state.stale_fenced,
+        );
+        try sink.check(
+            allocator,
+            legacy_epoch_id,
+            state.mode != .legacy_head_rewrite or state.legacy_epoch_preserved,
+        );
+        try sink.check(
+            allocator,
+            duplicate_serialized_id,
+            state.mode != .duplicate_workers or state.duplicate_blocked,
+        );
+        try sink.check(allocator, recovery_id, state.complete and state.recovered);
+        try sink.check(allocator, compacted_id, state.complete and
+            (fencing_mode or state.compacted));
+        try sink.check(
+            allocator,
+            generation_fenced_id,
+            !fencing_mode or state.generation_fenced,
+        );
+        try sink.check(
+            allocator,
+            progress_conflict_id,
+            !fencing_mode or state.progress_conflict_fenced,
+        );
+    }
+
+    pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
+        const state = world.state;
+        const fencing_mode = state.mode == .stale_enrichment_progress_conflict;
+        const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
+        const expected_head: u64 = if (fencing_mode) 4 else 3;
+        return state.sim.healthSnapshot(.{
+            .progress_expected = true,
+            .progress_units = state.final_head + @popCount(state.visible_document_mask),
+            .recovery_expected = state.mode != .clean,
+            .recovery_complete = state.complete and state.recovered,
+            .consistency_valid = !state.complete or
+                (state.visible_document_mask == expected_document_mask and state.final_head == expected_head and
+                    (fencing_mode or state.compacted) and state.generation_fenced and
+                    (!fencing_mode or state.progress_conflict_fenced)),
+            .cleanup_complete = state.complete and !state.runtime_live,
+        });
+    }
+
+    pub fn done(world: *World) bool {
+        return world.state.complete;
+    }
+};
+
+test "serverless workflow service rates compose and heal across publish and compaction" {
+    var alloc_state: VoprTestAllocator = .init;
+    defer _ = alloc_state.deinit();
+    const alloc = alloc_state.allocator();
+    const fixture = try Scenario.Fixture.init(alloc);
+    defer fixture.deinit();
+
+    const node = vopr.service_rate.Node{
+        .id = vopr.id.stable(Scenario.name, "service-node.worker-primary"),
+        .name = Scenario.name ++ ".service-node.worker-primary",
+    };
+    const operations = [_]vopr.service_rate.Operation{
+        vopr.service_rate.Operation.named(Scenario.name ++ ".publish-round", 10),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".enrichment-round", 30),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".compaction-round", 20),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".prune-round", 40),
+    };
+    const node_fault_id = vopr.id.stable(Scenario.name, "service-rate.node-slowdown");
+    const publish_fault_id = vopr.id.stable(Scenario.name, "service-rate.publish-slowdown");
+    var model = try vopr.service_rate.Model.init(alloc, &.{node}, &operations);
+    defer model.deinit();
+    try model.activate(.{
+        .fault_id = node_fault_id,
+        .node_id = node.id,
+        .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+    });
+    try model.activate(.{
+        .fault_id = publish_fault_id,
+        .node_id = node.id,
+        .operation_id = operations[0].id,
+        .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+    });
+
+    const Adapter = struct {
+        model: *vopr.service_rate.Model,
+        port: vopr.service_rate.Port,
+        operation_ids: [4]vopr.id.StableId,
+        node_fault_id: vopr.id.StableId,
+        publish_fault_id: vopr.id.StableId,
+        heal_stage: u8 = 0,
+        charges: [4]u64 = .{ 0, 0, 0, 0 },
+
+        fn iface(self: *@This()) runtime_manager.RuntimeWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: runtime_manager.RuntimeWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index: usize = switch (kind) {
+                .publish_round => 0,
+                .enrichment_round => 1,
+                .compaction_round => 2,
+                .prune_round => 3,
+            };
+            _ = try self.port.charge(self.operation_ids[index], units);
+            self.charges[index] += units;
+            if (kind != .publish_round) return;
+            switch (self.heal_stage) {
+                0 => {
+                    try self.model.heal(self.publish_fault_id);
+                    self.heal_stage = 1;
+                },
+                1 => {
+                    try self.model.heal(self.node_fault_id);
+                    self.heal_stage = 2;
+                },
+                else => {},
+            }
+        }
+    };
+    var adapter = Adapter{
+        .model = &model,
+        .port = try model.port(fixture.sim.io(), node.id),
+        .operation_ids = .{ operations[0].id, operations[1].id, operations[2].id, operations[3].id },
+        .node_fault_id = node_fault_id,
+        .publish_fault_id = publish_fault_id,
+    };
+    fixture.runtime.setWorkCostPort(adapter.iface());
+    defer fixture.runtime.setWorkCostPort(null);
+
+    var done = false;
+    var failure: ?anyerror = null;
+    const Task = struct {
+        fn run(target: *Scenario.Fixture, completed: *bool, task_failure: *?anyerror) void {
+            target.runMode(.clean) catch |err| {
+                task_failure.* = err;
+            };
+            completed.* = true;
+        }
+    };
+    const io = fixture.sim.io();
+    _ = io.async(Task.run, .{ fixture, &done, &failure });
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var transitions: usize = 0;
+    while (!fixture.sim.scheduler().quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try fixture.sim.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprServerlessServiceRateDeadlock;
+        try fixture.sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        transitions += 1;
+        if (transitions > 10_000) return error.VoprServerlessServiceRateTransitionBudgetExceeded;
+    }
+
+    try std.testing.expect(done);
+    if (failure) |err| return err;
+    try std.testing.expect(fixture.cleanWorkflowVisible());
+    try std.testing.expectEqual(@as(u8, 2), adapter.heal_stage);
+    try std.testing.expectEqual(@as(u64, 2), adapter.charges[0]);
+    try std.testing.expectEqual(@as(u64, 0), adapter.charges[1]);
+    try std.testing.expectEqual(@as(u64, 1), adapter.charges[2]);
+    try std.testing.expectEqual(@as(u64, 0), adapter.charges[3]);
+    const usage = try model.nodeUsage(node.id);
+    try std.testing.expectEqual(@as(u64, 3), usage.charges);
+    try std.testing.expectEqual(@as(u64, 3), usage.units);
+    try std.testing.expectEqual(@as(u64, 80), usage.charged_ns);
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{ .charges = 2, .units = 2, .charged_ns = 60 }, try model.operationUsage(node.id, operations[0].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{ .charges = 1, .units = 1, .charged_ns = 20 }, try model.operationUsage(node.id, operations[2].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{}, try model.operationUsage(node.id, operations[1].id));
+    try std.testing.expectEqualDeep(vopr.service_rate.Usage{}, try model.operationUsage(node.id, operations[3].id));
+    try std.testing.expectEqual(@as(usize, 0), model.active.items.len);
+    try fixture.sim.ensureNoCapabilityViolation();
+}
+
+test "complete serverless workflow VOPR exact replays claim build compact publish and recovery" {
+    const backend_ids = vopr.vopr_io.artifactBackendIds();
+    for (Scenario.mode_ids) |mode_id| {
+        var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };
+        var recorded = try vopr.runner.run(
+            Scenario,
+            std.testing.allocator,
+            scripted.source(),
+            .{
+                .system = "antfly",
+                .transition_budget = 1,
+                .backend_ids = &backend_ids,
+                .source_revision = "serverless-workflow-vopr-v5-generation-progress-conflict",
+                .target = "native",
+                .optimize = @tagName(@import("builtin").mode),
+            },
+        );
+        defer recorded.deinit();
+        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
+        for (0..10) |_| {
+            var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
+            replayed.deinit();
+        }
+    }
+}

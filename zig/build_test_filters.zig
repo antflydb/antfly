@@ -19,7 +19,9 @@ fn validateSkipTestFilter(value: []const u8) error{EmptySkipTestFilter}!void {
 }
 
 fn isTestControl(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--test-filter") or
+    return std.mem.eql(u8, arg, "--list-tests") or
+        std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+        std.mem.eql(u8, arg, "--test-filter") or
         std.mem.startsWith(u8, arg, "--test-filter=") or
         std.mem.eql(u8, arg, "--skip-test-filter") or
         std.mem.startsWith(u8, arg, "--skip-test-filter=") or
@@ -72,7 +74,9 @@ pub fn select(
         } else if (std.mem.startsWith(u8, arg, "--skip-test-filter=")) {
             validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
                 @panic("missing value after --skip-test-filter=");
-        } else if (std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.eql(u8, arg, "--list-tests") or
+            std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+            std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -123,7 +127,9 @@ pub fn addRuntimeControls(
             validateSkipTestFilter(arg["--skip-test-filter=".len..]) catch
                 @panic("missing value after --skip-test-filter=");
             run.addArg(arg);
-        } else if (std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.eql(u8, arg, "--list-tests") or
+            std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+            std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -139,7 +145,7 @@ test "select accepts repeated and equals-form test filters" {
         "metadata service",
         "--test-filter=table manager",
         "--skip-test-filter",
-        "metadata sim",
+        "metadata VOPR",
         "--seed=0x1234",
     };
     const filters = select(std.testing.allocator, &args, &.{"default"});
@@ -214,4 +220,11 @@ test "foreign option detection is generic and preserves test-only arguments" {
 test "empty skip filters are rejected before compiling a zero-test selection" {
     try std.testing.expectError(error.EmptySkipTestFilter, validateSkipTestFilter(""));
     try validateSkipTestFilter("known flaky test");
+}
+
+test "list mode preserves an independently requested runtime selection" {
+    const filters = select(std.testing.allocator, &.{ "--list-tests", "--test-filter", "cutover" }, &.{"suite"});
+    defer std.testing.allocator.free(filters);
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("cutover", filters[0]);
 }

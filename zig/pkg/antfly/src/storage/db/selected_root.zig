@@ -21,4 +21,4 @@ const storage_source_options = @import("storage_source_options");
 pub const db = if (storage_source_options.control_only)
     @import("control_root.zig")
 else
-    @import("mod.zig");
+    @import("antfly_source_root").antfly_sources.selected_db;

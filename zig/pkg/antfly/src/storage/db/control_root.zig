@@ -113,3 +113,7 @@ pub const searchRequestHasScoreBearingTextSource = runtime_preflight.searchReque
 pub const searchRequestHasScoreBearingVectorSource = runtime_preflight.searchRequestHasScoreBearingVectorSource;
 pub const searchRequestHasScoreBearingSource = runtime_preflight.searchRequestHasScoreBearingSource;
 pub const validateStructuredFilterValueAlloc = structured_filter_validation.validateStructuredFilterValueAlloc;
+
+pub const DenseNativeMigrationPolicySource = runtime_callbacks.DenseNativeMigrationPolicySource;
+
+pub const merge_state = @import("merge_contract.zig");

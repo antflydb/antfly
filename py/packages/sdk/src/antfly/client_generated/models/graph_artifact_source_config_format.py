@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphArtifactSourceConfigFormat(str, Enum):
+class GraphArtifactSourceConfigFormat(StrEnum):
     EXTRACTION_GRAPH = "extraction_graph"
     EXTRACTION_RELATION = "extraction_relation"
 

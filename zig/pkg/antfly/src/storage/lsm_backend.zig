@@ -361,6 +361,10 @@ pub const Options = struct {
     recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
+    // Optional lower logical-byte floor for already-coalesced direct bulk
+    // transactions. Zero preserves the ordinary base flush threshold. This is
+    // intentionally independent of the larger mutable bulk flush multiplier.
+    direct_bulk_ingest_min_bytes: u64 = 0,
     compact_threshold_runs: usize = 4,
     l0_overlap_compact_threshold_runs: usize = 4,
     l0_soft_limit_runs: usize = 0,
@@ -378,7 +382,25 @@ pub const Options = struct {
     // generations to accumulate when background flush falls behind.
     max_deferred_immutable_bytes: u64 = 0,
     background_maintenance_max_steps: usize = 64,
+    // Coalesce adjacent sorted immutable epochs into one streaming flush
+    // publication up to this logical-byte window. Already-sorted bulk commits
+    // may enter the same WAL-backed queue without first writing a short-lived
+    // L0 file. Zero preserves one epoch per publication and direct bulk ingest.
+    // The merge borrows the epoch arenas and does not build a second combined
+    // memtable.
+    immutable_flush_window_bytes: u64 = 0,
+    immutable_flush_window_max_memtables: usize = 16,
     direct_bulk_ingest: bool = true,
+    // Optional size-tiered L0 merge fan-in for sustained sorted publication.
+    // Zero disables it. The tier lane streams equal-sized publication
+    // generations without repeatedly rewriting the overlapping lower level.
+    bulk_ingest_tiered_l0_fan_in: usize = 0,
+    // Seal fragmented L0 generations once their bytes reach 1/N of all
+    // lower-level bytes. Zero disables ratio sealing. The seal remains in L0,
+    // excludes the largest established anchor, and must be at least twice its
+    // largest input generation, so small deltas cannot rewrite prior tiers or
+    // the lower base.
+    bulk_ingest_l0_delta_seal_ratio_denominator: usize = 0,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 1024 * 1024,
@@ -406,7 +428,12 @@ pub const Options = struct {
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,
-    max_concurrent_point_block_reads: usize = 4,
+    max_concurrent_point_block_reads: usize = 16,
+    // Share sparse point-read fan-out across concurrent batches. This keeps
+    // single-query cold latency low without allowing N public queries to each
+    // issue the full per-batch width. Zero leaves the per-batch limit as the
+    // only bound.
+    target_aggregate_concurrent_point_block_reads: usize = 64,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
     maintenance_waker: ?MaintenanceWaker = null,
@@ -462,6 +489,8 @@ pub const IoRuntime = storage_io.RuntimeKind;
 pub const Storage = storage_io.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const NativeStorageStats = storage_io.NativeStorageStats;
+pub const NativeStorage = storage_io.NativeStorage;
+pub const NativeStorageLease = storage_io.NativeStorage.Lease;
 pub const Cache = cache_mod.Cache;
 pub const CacheStats = cache_mod.Stats;
 pub const CacheKindStats = cache_mod.KindStats;
@@ -471,6 +500,9 @@ pub const BackgroundExecutor = lsm_background_mod.Executor;
 pub const BackendHandleConfig = struct {
     background_runtime: ?background_runtime_mod.Config = null,
     internal_flush_worker: bool = false,
+    /// Borrowed scheduling capacity for internal maintenance. Must outlive
+    /// this handle; otherwise use its owned backend runtime or a one-task Io.
+    maintenance_io: ?std.Io = null,
 };
 const max_local_cached_run_blocks: usize = 64;
 const root_writer_lock_file_name = "writer.lock";
@@ -708,7 +740,13 @@ pub const Backend = struct {
         sorted_ingest_runs: u64 = 0,
         sorted_ingest_bytes: u64 = 0,
         sorted_ingest_ns: u64 = 0,
+        compactions: u64 = 0,
+        compaction_input_bytes: u64 = 0,
+        compaction_output_bytes: u64 = 0,
         compaction_ns: u64 = 0,
+        compaction_max_input_bytes: u64 = 0,
+        compaction_max_output_bytes: u64 = 0,
+        compaction_max_ns: u64 = 0,
         manifest_writes: u64 = 0,
         manifest_bytes: u64 = 0,
         manifest_ns: u64 = 0,
@@ -750,6 +788,7 @@ pub const Backend = struct {
         wal_reset_ns: u64 = 0,
         immutable_rotations: u64 = 0,
         immutable_flushes: u64 = 0,
+        immutable_flush_input_memtables: u64 = 0,
         immutable_flush_entries: u64 = 0,
         immutable_flush_ns: u64 = 0,
         bulk_append_attempts: u64 = 0,
@@ -1011,6 +1050,11 @@ pub const Backend = struct {
         inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
             if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
                 @field(dst, field.name) |= @field(src, field.name);
+            } else if (comptime std.mem.eql(u8, field.name, "compaction_max_input_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_output_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_ns"))
+            {
+                @field(dst, field.name) = @max(@field(dst, field.name), @field(src, field.name));
             } else {
                 @field(dst, field.name) +|= @field(src, field.name);
             }
@@ -1496,6 +1540,7 @@ pub const Backend = struct {
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
+    point_async_batches_active: CounterU64 = .init(0),
     tracked_in_memory_state_bytes: u64 = 0,
     tracked_wal_retention_bytes: u64 = 0,
     tracked_recovery_working_set_bytes: u64 = 0,
@@ -1514,9 +1559,15 @@ pub const Backend = struct {
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
+    // Physical run ids allocated at or after this value belong to the current
+    // explicit bulk window. L0 logical sequences make the boundary stable even
+    // if an older generation is physically rewritten while the window is open.
+    bulk_ingest_window_first_sequence: u64 = 0,
     mutable: ActiveMemTable = .{},
     mutable_idle_flush_deadline_ns: u64 = 0,
     mutable_idle_flush_max_deadline_ns: u64 = 0,
+    immutable_idle_flush_deadline_ns: u64 = 0,
+    immutable_idle_flush_max_deadline_ns: u64 = 0,
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
@@ -2195,6 +2246,14 @@ pub const Backend = struct {
         return owner.snapshotStats();
     }
 
+    /// Retains the internally-created native storage after this LSM backend is
+    /// closed. Backends using a caller-owned Storage return null; that caller
+    /// already owns the required lifetime.
+    pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
+        const owner = self.storage_owner orelse return null;
+        return try owner.acquireLease();
+    }
+
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
         return self.cached_maintenance_hint.load(.monotonic);
     }
@@ -2248,6 +2307,46 @@ pub const Backend = struct {
             self.mutable_idle_flush_max_deadline_ns = 0;
         }
         self.notePotentialMaintenanceDebtLocked();
+    }
+
+    /// Apply the mutable-table idle policy to the complete, WAL-backed epochs
+    /// retained for a windowed flush. Full windows publish immediately; a
+    /// partial final window remains query-visible in memory until write
+    /// quiescence, while the maximum-age deadline prevents a quiet table from
+    /// retaining that memory and WAL indefinitely.
+    fn noteImmutableWriteMutationLocked(self: *Backend) void {
+        if (self.options.mutable_idle_flush_after_ns > 0 and
+            self.activeImmutableMemtableCount() > 0 and
+            !self.options.backend.read_only)
+        {
+            const now_ns = self.nowNs();
+            if (self.immutable_idle_flush_max_deadline_ns == 0 and
+                self.options.mutable_idle_flush_max_age_ns > 0)
+            {
+                self.immutable_idle_flush_max_deadline_ns = now_ns +| self.options.mutable_idle_flush_max_age_ns;
+            }
+
+            const idle_eligible = self.options.mutable_idle_flush_min_bytes == 0 or
+                self.activeImmutableMemtableBytes() >= self.options.mutable_idle_flush_min_bytes;
+            const idle_deadline = if (idle_eligible)
+                now_ns +| self.options.mutable_idle_flush_after_ns
+            else
+                std.math.maxInt(u64);
+            self.immutable_idle_flush_deadline_ns = if (self.immutable_idle_flush_max_deadline_ns > 0)
+                @min(idle_deadline, self.immutable_idle_flush_max_deadline_ns)
+            else if (idle_eligible)
+                idle_deadline
+            else
+                0;
+        } else {
+            self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
+        }
+    }
+
+    fn clearImmutableIdleFlushDeadlineIfEmptyLocked(self: *Backend) void {
+        if (self.activeImmutableMemtableCount() != 0) return;
+        self.immutable_idle_flush_deadline_ns = 0;
+        self.immutable_idle_flush_max_deadline_ns = 0;
     }
 
     /// WAL replay proves this mutable state was already dirty before this
@@ -2318,17 +2417,23 @@ pub const Backend = struct {
 
         const soft_limit_l0_runs = self.effectiveL0SoftLimitRuns();
         const hard_limit_l0_runs = self.effectiveL0HardLimitRuns();
+        const tiered_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2;
+        const has_l0_tier = tiered_l0 and
+            compaction_mod.hasBulkL0Tier(self.runs.items, self.options.bulk_ingest_tiered_l0_fan_in);
         if (hard_limit_l0_runs > 0) {
             const l0_runs = countLevelRuns(self.runs.items, 0);
             if (l0_runs > hard_limit_l0_runs) {
                 score +|= (l0_runs - hard_limit_l0_runs) * 1_000_000;
-            } else if (l0_runs > soft_limit_l0_runs) {
+            } else if (l0_runs > soft_limit_l0_runs and (!tiered_l0 or has_l0_tier)) {
                 score +|= (l0_runs - soft_limit_l0_runs) * 10_000;
             }
-            if (l0_runs > self.options.compact_threshold_runs) {
+            if (!tiered_l0 and l0_runs > self.options.compact_threshold_runs) {
                 score +|= (l0_runs - self.options.compact_threshold_runs) * 1_000;
             }
-            score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+            if (!tiered_l0) score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+        }
+        if (self.l0SoftPressureLocked() and has_l0_tier) {
+            score +|= 2_500;
         }
 
         var l0_bytes: u64 = 0;
@@ -2361,7 +2466,10 @@ pub const Backend = struct {
 
         if (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes) {
             score +|= (l0_bytes - self.options.l0_hard_limit_bytes) / 1024;
-        } else if (self.options.l0_soft_limit_bytes > 0 and l0_bytes > self.options.l0_soft_limit_bytes) {
+        } else if (self.options.l0_soft_limit_bytes > 0 and
+            l0_bytes > self.options.l0_soft_limit_bytes and
+            (!tiered_l0 or has_l0_tier))
+        {
             score +|= (l0_bytes - self.options.l0_soft_limit_bytes) / (16 * 1024);
         }
 
@@ -2524,10 +2632,32 @@ pub const Backend = struct {
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
             if (try self.runWalPressureMaintenanceStepLocked()) return true;
         }
-        // Bulk ingest suppresses compaction, not durability/resource bounds.
-        // This lane can only flush unpublished memtables and publish a
-        // checkpoint manifest; it deliberately cannot compact runs.
-        if (self.bulkIngestActive()) return false;
+        // Ordinary leveled compaction remains deferred during bulk ingest, but
+        // a pressured sorted-publication lane may stream one size-tier merge.
+        // This prevents the import from reaching hard L0 pressure and then
+        // repeatedly rewriting its entire overlapping lower-level base.
+        if (self.bulkIngestActive()) {
+            if (!self.bulkTieredL0MaintenanceDueLocked()) return false;
+            self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
+                self.options.background_io_budget_bytes
+            else
+                null;
+            defer self.maintenance_io_budget_remaining = null;
+            const compacted = try compaction_mod.compactBulkL0TierScheduledBeforeSequence(
+                Backend,
+                self,
+                self.options.bulk_ingest_tiered_l0_fan_in,
+                self.maintenanceScoreLocked(),
+                self.bulk_ingest_window_first_sequence,
+            );
+            if (compacted and self.root_dir != null and
+                (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+            {
+                try self.persistManifest();
+            }
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return compacted;
+        }
         self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
             self.options.background_io_budget_bytes
         else
@@ -2544,14 +2674,28 @@ pub const Backend = struct {
                 self.obsolete_paths.items.len != before_obsolete_paths;
         }
 
-        if (self.shouldFlushMutableForIdleLocked() or
-            self.shouldFlushMutable() or
-            try self.shouldFlushMutableForWalPressureLocked())
-        {
+        const mutable_idle_flush_required = self.shouldFlushMutableForIdleLocked();
+        const mutable_size_flush_required = self.shouldFlushMutable();
+        const mutable_wal_flush_required = try self.shouldFlushMutableForWalPressureLocked();
+        const mutable_flush_required = mutable_idle_flush_required or
+            mutable_size_flush_required or
+            mutable_wal_flush_required;
+        const immutable_flush_required = self.shouldFlushImmutableForIdleLocked();
+        if (mutable_flush_required) {
             try self.rotateMutableToImmutable();
         }
         if (self.activeImmutableMemtableCount() > 0) {
-            _ = try self.flushOldestImmutableMemtable();
+            // A size boundary ends one mutable generation, not the configured
+            // durable publication window. Keep that WAL-backed epoch visible
+            // in the immutable queue so adjacent generations can share one
+            // sorted run build. Idle and WAL pressure remain explicit durable
+            // boundaries, and disabling windowing preserves the legacy
+            // one-generation-per-flush behavior.
+            const force_partial_window = self.options.immutable_flush_window_bytes == 0 or
+                mutable_idle_flush_required or
+                mutable_wal_flush_required or
+                immutable_flush_required;
+            _ = try self.flushImmutableMemtableWindow(force_partial_window);
         } else {
             const soft_l0_runs = self.effectiveL0SoftLimitRuns();
             const score = self.maintenanceScoreLocked();
@@ -2561,16 +2705,34 @@ pub const Backend = struct {
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
             const defer_soft_compaction = if (self.options.resource_manager) |manager|
-                manager.shouldDeferSoftCompactionForDerivedReplay()
+                manager.shouldDeferSoftCompactionForDerivedReplay() or
+                    manager.shouldDeferOptionalMaintenanceForForegroundTraffic()
             else
                 false;
             if (!defer_soft_compaction) {
-                _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
-                    Backend,
-                    self,
-                    if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
-                    score,
-                );
+                const tiered = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                    try compaction_mod.compactBulkL0TierScheduled(
+                        Backend,
+                        self,
+                        self.options.bulk_ingest_tiered_l0_fan_in,
+                        score,
+                    )
+                else
+                    false;
+                if (!tiered) {
+                    const tier_owns_soft_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2 and
+                        !self.l0HardPressureLocked();
+                    if (tier_owns_soft_l0) {
+                        _ = try compaction_mod.maybeCompactLowerLevelsScheduled(Backend, self, score);
+                    } else {
+                        _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                            Backend,
+                            self,
+                            if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
+                            score,
+                        );
+                    }
+                }
             }
         }
         // Hard L0/WAL bounds remain authoritative even while latency-sensitive
@@ -2586,6 +2748,52 @@ pub const Backend = struct {
         return self.compaction_stats.compactions != before_compactions or
             self.write_stats.manifest_writes != before_manifest_writes or
             self.obsolete_paths.items.len != before_obsolete_paths;
+    }
+
+    fn bulkTieredL0MaintenanceDueLocked(self: *Backend) bool {
+        const fan_in = self.options.bulk_ingest_tiered_l0_fan_in;
+        if (fan_in < 2) return false;
+        if (!self.l0SoftPressureLocked()) return false;
+        const before_sequence = self.bulk_ingest_window_first_sequence;
+        // Explicit bulk sessions own a durable window and fence its runs for
+        // one final linear merge. Per-request bulk transactions have no such
+        // owner (sequence zero): every run in `runs` is already committed and
+        // may be size-tiered while overlapping requests keep bulk mode active.
+        // Refusing sequence zero disabled all proactive merging under a
+        // continuous public upload and left hard-pressure compaction as the
+        // only progress path.
+        return compaction_mod.hasBulkL0TierBeforeSequence(self.runs.items, fan_in, before_sequence);
+    }
+
+    fn l0SoftPressureLocked(self: *const Backend) bool {
+        return self.l0RunSoftPressureLocked() or self.l0ByteSoftPressureLocked();
+    }
+
+    fn l0RunSoftPressureLocked(self: *const Backend) bool {
+        var l0_runs: usize = 0;
+        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {}
+        return self.effectiveL0SoftLimitRuns() > 0 and
+            l0_runs > self.effectiveL0SoftLimitRuns();
+    }
+
+    fn l0ByteSoftPressureLocked(self: *const Backend) bool {
+        if (self.options.l0_soft_limit_bytes == 0) return false;
+        var l0_bytes: u64 = 0;
+        for (self.runs.items) |run| {
+            if (run.level != 0) break;
+            l0_bytes +|= run.size_bytes;
+        }
+        return l0_bytes > self.options.l0_soft_limit_bytes;
+    }
+
+    fn l0HardPressureLocked(self: *const Backend) bool {
+        var l0_runs: usize = 0;
+        var l0_bytes: u64 = 0;
+        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {
+            l0_bytes +|= self.runs.items[l0_runs].size_bytes;
+        }
+        return (self.effectiveL0HardLimitRuns() > 0 and l0_runs > self.effectiveL0HardLimitRuns()) or
+            (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes);
     }
 
     fn runWalPressureMaintenanceStepLocked(self: *Backend) !bool {
@@ -2759,7 +2967,12 @@ pub const Backend = struct {
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
         var snapshot = try self.mutable.cloneArena(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(&snapshot);
+        self.recordMutableSnapshotClone(&snapshot, reason);
+        return snapshot;
+    }
+
+    fn recordMutableSnapshotClone(self: *Backend, snapshot: *const State, reason: MutableSnapshotReason) void {
+        const snapshot_bytes = estimateStateBytes(snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -2767,6 +2980,21 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
         self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
+    }
+
+    /// Snapshot only the mutable replay-lane range needed by an async-index
+    /// pass. Replay keys are append-only, so a range snapshot plus generation-
+    /// pinned immutable/run state provides the same consistency as cloning the
+    /// complete mutable memtable without duplicating unrelated user records.
+    pub fn cloneReplayLaneMutableRange(
+        self: *Backend,
+        namespace: backend_types.Namespace,
+        lower: []const u8,
+        upper: []const u8,
+    ) !State {
+        var snapshot = try self.mutable.cloneRangeArena(self.allocator, namespace, lower, upper);
+        errdefer snapshot.deinit(self.allocator);
+        self.recordMutableSnapshotClone(&snapshot, .current_scan);
         return snapshot;
     }
 
@@ -3147,7 +3375,7 @@ pub const Backend = struct {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
                 self.scheduleImmutableFlushJob();
-                try self.enforceDeferredImmutableBackpressure();
+                try self.enforceDeferredImmutableBackpressure(true);
             } else {
                 try self.flushMutable();
             }
@@ -3166,21 +3394,51 @@ pub const Backend = struct {
     /// This boundary can be reached while the caller holds a higher-level DB
     /// apply lock. It must therefore never sleep waiting for aggregate
     /// ResourceManager usage owned by another backend: that backend may need
-    /// the same apply lock to flush or publish its work. Soft throttling is a
-    /// local reclamation request here. If local state has been drained and the
-    /// aggregate slice is still only soft-pressured, admit the write and let
-    /// the post-commit/background paths make progress. Hard pressure remains
-    /// a non-blocking pre-WAL rejection.
+    /// the same apply lock to flush or publish its work. Pressure first asks
+    /// elastic caches and this backend's already-durable state for bounded
+    /// reclamation. If local state has been drained and aggregate hard
+    /// pressure remains, reject before WAL append. Soft aggregate pressure
+    /// owned by another backend remains advisory here.
     pub fn enforceMutableWriteAdmission(self: *Backend, incoming: *const ActiveMemTable) !void {
+        return try self.enforceInMemoryWriteAdmission(estimateStateBytes(incoming));
+    }
+
+    pub fn enforceSortedWriteAdmission(self: *Backend, incoming: *const State) !void {
+        return try self.enforceInMemoryWriteAdmission(estimateStateBytes(incoming));
+    }
+
+    fn enforceInMemoryWriteAdmission(self: *Backend, incoming_bytes: u64) !void {
         const manager = self.options.resource_manager orelse return;
-        const incoming_bytes = estimateStateBytes(incoming);
 
         while (true) {
             const decision = manager.admissionDecision(.lsm_in_memory_state, incoming_bytes);
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
-                .reject_work => return error.ResourceBudgetExceeded,
+                .reject_work => {
+                    // Aggregate hard pressure uses reject_work regardless of
+                    // this slice's normal hard policy. Give cheap derivative
+                    // caches and locally owned durable state a chance to make
+                    // this request fit before surfacing a retry to the public
+                    // API. Never wait on another owner from this boundary.
+                    _ = manager.reclaimForAllocation(.lsm_in_memory_state, incoming_bytes);
+                },
                 .throttle_writes => {},
+            }
+
+            // Soft pressure paces writes and asks this owner for bounded
+            // reclamation; it must not destroy an incomplete publication
+            // window merely because another LSM owns the remaining aggregate
+            // usage. Publish at most one complete window, or one ordinary
+            // mutable generation when windowing is disabled, then admit.
+            if (decision.pressure == .soft) {
+                if (self.activeImmutableMemtableCount() > 0) {
+                    _ = try self.flushImmutableMemtableWindow(false);
+                } else if (self.mutable.entries.items.len > 0 and
+                    self.options.immutable_flush_window_bytes == 0)
+                {
+                    try self.flushMutable();
+                }
+                return;
             }
 
             if (self.activeImmutableMemtableCount() > 0) {
@@ -3210,7 +3468,7 @@ pub const Backend = struct {
         return self.options.defer_flush_on_commit;
     }
 
-    fn enforceDeferredImmutableBackpressure(self: *Backend) !void {
+    fn enforceDeferredImmutableBackpressure(self: *Backend, include_global_pressure: bool) !void {
         const count_limit = self.options.max_deferred_immutable_memtables;
         const byte_limit = self.options.max_deferred_immutable_bytes;
         while (true) {
@@ -3224,10 +3482,21 @@ pub const Backend = struct {
             // This boundary is after the write was admitted and may already be
             // durable. A newly observed reject action therefore drains like a
             // throttle; rejection itself is handled before WAL append above.
-            const global_throttle = (resource_decision.action == .throttle_writes or
-                resource_decision.action == .reject_work) and
+            const global_throttle = include_global_pressure and
+                (resource_decision.action == .throttle_writes or
+                    resource_decision.action == .reject_work) and
                 self.activeImmutableMemtableCount() > 0;
             if (!local_pressure and !global_throttle) return;
+
+            // Soft aggregate pressure may be owned by another backend. Offer
+            // one complete local window without force-publishing a partial
+            // one, then return; the pre-WAL hard guard and local caps retain
+            // their strict behavior. This avoids turning every status-scan
+            // rotation into a tiny file during sustained ingestion.
+            if (!local_pressure and resource_decision.pressure == .soft) {
+                _ = try self.flushImmutableMemtableWindow(false);
+                return;
+            }
 
             if (!try self.flushOldestImmutableMemtable()) {
                 self.scheduleImmutableFlushJob();
@@ -3274,14 +3543,25 @@ pub const Backend = struct {
 
         try clearRunsAndFiles(&dest);
 
+        // Imported runs retain their logical L0 publication sequence. Reserve
+        // the source's sequence space before allocating child runs so later
+        // child flushes (including metadata tombstones) sort ahead of them.
+        dest.next_run_id = @max(dest.next_run_id, self.next_run_id);
+
         var wrote_any = false;
-        for (self.runs.items) |*run| {
+        // L0 precedence is encoded by run ID. Assign replacement IDs oldest
+        // first so the child keeps the source's newest-write-wins ordering.
+        var source_index = self.runs.items.len;
+        while (source_index > 0) {
+            source_index -= 1;
+            const run = &self.runs.items[source_index];
             switch (classifyRun(run.*, split_key)) {
                 .left => {},
                 .right => {
                     const source_runs = [_]*Run{run};
                     var child_runs = try compaction_mod.makePersistedRunsFromSelectedRuns(Backend, &dest, &source_runs, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
                     try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
@@ -3292,6 +3572,7 @@ pub const Backend = struct {
                     if (split.right.entries.items.len == 0) continue;
                     var child_runs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &dest, &split.right, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
                     try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
@@ -3328,9 +3609,9 @@ pub const Backend = struct {
 
         var actions = try allocator.alloc(RunAction, old_runs.items.len);
         defer allocator.free(actions);
-        var actions_initialized: usize = 0;
+        for (actions) |*action| action.* = .keep;
         errdefer {
-            for (actions[0..actions_initialized]) |*action| {
+            for (actions) |*action| {
                 switch (action.*) {
                     .replace => |*runs| compaction_mod.discardOutputRuns(Backend, self, runs),
                     .keep, .drop => {},
@@ -3338,10 +3619,26 @@ pub const Backend = struct {
             }
         }
 
+        // Any newly numbered L0 replacement would outrank every retained L0
+        // run, including newer left-only writes. Renumber all surviving L0
+        // runs together when a straddling L0 run needs replacement.
+        const rewrite_l0 = for (old_runs.items) |run| {
+            if (run.level == 0 and classifyRun(run, split_key) == .overlap) break true;
+        } else false;
         var changed = false;
-        for (old_runs.items, 0..) |*run, i| {
+        var source_index = old_runs.items.len;
+        while (source_index > 0) {
+            source_index -= 1;
+            const i = source_index;
+            const run = &old_runs.items[i];
             switch (classifyRun(run.*, split_key)) {
-                .left => actions[i] = .keep,
+                .left => if (run.level == 0 and rewrite_l0) {
+                    const run_state = try self.resolveRunStateWithAllocator(run, allocator);
+                    actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, run_state, run.level) };
+                    changed = true;
+                } else {
+                    actions[i] = .keep;
+                },
                 .right => {
                     actions[i] = .drop;
                     changed = true;
@@ -3353,12 +3650,13 @@ pub const Backend = struct {
                     if (split.left.entries.items.len == 0) {
                         actions[i] = .drop;
                     } else {
-                        actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level) };
+                        const replacements = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level);
+                        compaction_mod.setL0Sequence(replacements.items, compaction_mod.l0Sequence(run.*));
+                        actions[i] = .{ .replace = replacements };
                     }
                     changed = true;
                 },
             }
-            actions_initialized = i + 1;
         }
 
         if (!changed) {
@@ -3372,13 +3670,13 @@ pub const Backend = struct {
         var prospective_runs = std.ArrayListUnmanaged(Run).empty;
         defer prospective_runs.deinit(allocator);
         var prospective_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => prospective_run_count += 1,
             .drop => {},
             .replace => |replacements| prospective_run_count += replacements.items.len,
         };
         try prospective_runs.ensureTotalCapacity(allocator, prospective_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => prospective_runs.appendAssumeCapacity(run),
             .drop => {},
             .replace => |replacements| for (replacements.items) |replacement| {
@@ -3394,7 +3692,7 @@ pub const Backend = struct {
         }
         var rewritten_run_count: usize = 0;
         var obsolete_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => rewritten_run_count += 1,
             .drop => obsolete_run_count += 1,
             .replace => |replacements| {
@@ -3417,7 +3715,7 @@ pub const Backend = struct {
             obsolete_paths.deinit(allocator);
         }
         try obsolete_paths.ensureTotalCapacity(allocator, obsolete_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => {},
             .drop, .replace => if (run.path) |path| {
                 obsolete_paths.appendAssumeCapacity(try allocator.dupe(u8, path));
@@ -3504,8 +3802,25 @@ pub const Backend = struct {
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return true;
+        if (self.canQueueDirectBulkStateWithPendingImmutable()) {
+            // The queued epochs remain older than the incoming sorted state.
+            // Rotate only the mutable tail; flushing the complete queue here
+            // would recreate one table publication per request boundary.
+            if (self.mutable.entries.items.len > 0) try self.rotateMutableToImmutable();
+            return true;
+        }
+        // Direct-ingested runs are newer than every pending memtable, while
+        // readers intentionally consult mutable/immutable state before runs.
+        // Publish all older immutable epochs first so tier priority cannot let
+        // an older value shadow the new direct run. This is foreground work
+        // replacing an even more expensive mutable fallback, so it is not
+        // charged to the background maintenance-step budget.
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
         if (self.activeImmutableMemtableCount() != 0) return false;
+        if (self.mutable.entries.items.len == 0) return true;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
         errdefer sorted.deinit(self.allocator);
@@ -3514,6 +3829,36 @@ pub const Backend = struct {
         sorted.deinit(self.allocator);
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return true;
+    }
+
+    /// Publish every older immutable epoch, then fold the current transaction
+    /// into the older mutable epoch and publish the combined state as one run.
+    /// Commit serialization supplies the epoch order; merging before sorting
+    /// preserves last-write-wins without manufacturing a small run for the old
+    /// mutable state followed immediately by another run for the new batch.
+    pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
+        if (!self.options.direct_bulk_ingest) return false;
+
+        if (self.canQueueDirectBulkStateWithPendingImmutable()) {
+            // Commit serialization orders the old mutable entries before the
+            // incoming transaction. Fold them once, sort by moving to State,
+            // then append that complete epoch after every existing immutable.
+            self.invalidateMutableReadSnapshot();
+            try state_mod.applyMutableMoveToMutable(&self.mutable, self.allocator, incoming);
+            var sorted = try self.mutable.toStateMove(self.allocator);
+            errdefer sorted.deinit(self.allocator);
+            return try self.enqueueOwnedSortedStateForFlush(&sorted);
+        }
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
+        if (self.activeImmutableMemtableCount() != 0) return false;
+
+        self.invalidateMutableReadSnapshot();
+        try state_mod.applyMutableMoveToMutable(&self.mutable, self.allocator, incoming);
+        return try self.directIngestMutableAtBulkFinishIfPossible();
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
@@ -3532,6 +3877,7 @@ pub const Backend = struct {
         self.mutable_idle_flush_deadline_ns = 0;
         self.mutable_idle_flush_max_deadline_ns = 0;
         self.write_stats.immutable_rotations += 1;
+        self.noteImmutableWriteMutationLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -3542,6 +3888,12 @@ pub const Backend = struct {
     fn scheduleImmutableFlushJob(self: *Backend) void {
         if (self.activeImmutableMemtableCount() == 0) return;
         if (self.closing.load(.acquire)) return;
+        // A partial window is already durable in the WAL and query-visible in
+        // the immutable queue. Do not launch a force-draining job for it: the
+        // next append, local pressure, idle deadline, explicit finish, or close
+        // will publish it. This is the batching boundary that lets adjacent
+        // sorted commits share one run build and manifest generation.
+        if (self.immutableFlushWindowCount(false) == 0) return;
         if (self.options.maintenance_waker != null) {
             self.wakeMaintenanceWorker();
             return;
@@ -3563,7 +3915,7 @@ pub const Backend = struct {
         defer runtime_mod.unlockBackend(Backend, self, locked);
         defer self.immutable_flush_job_in_flight = false;
         if (self.options.backend.read_only) return;
-        try self.flushAllImmutableMemtables();
+        while (try self.flushImmutableMemtableWindow(false)) {}
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
@@ -3572,7 +3924,9 @@ pub const Backend = struct {
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
         if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and !self.wal_checkpoint_pending) return;
+        if (self.bulkIngestActive() and
+            !self.wal_checkpoint_pending and
+            !self.bulkTieredL0MaintenanceDueLocked()) return;
         if (self.options.maintenance_waker != null) {
             if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
             return;
@@ -3623,12 +3977,37 @@ pub const Backend = struct {
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
 
+    fn immutableFlushWindowCount(self: *const Backend, force: bool) usize {
+        const active_count = self.activeImmutableMemtableCount();
+        if (active_count == 0) return 0;
+        const target_bytes = self.options.immutable_flush_window_bytes;
+        if (target_bytes == 0 or self.root_dir == null or self.storage == null) return 1;
+        const max_count = @max(@as(usize, 1), self.options.immutable_flush_window_max_memtables);
+        var logical_bytes: u64 = 0;
+        var count: usize = 0;
+        for (self.activeImmutableMemtables()[0..@min(active_count, max_count)]) |state| {
+            logical_bytes +|= estimateStateLogicalBytes(state);
+            count += 1;
+            if (logical_bytes >= target_bytes) return count;
+        }
+        return if (force or count == max_count) count else 0;
+    }
+
     fn flushOldestImmutableMemtable(self: *Backend) !bool {
-        if (self.activeImmutableMemtableCount() == 0) return false;
+        return try self.flushImmutableMemtableWindow(true);
+    }
+
+    fn flushImmutableMemtableWindow(self: *Backend, force: bool) !bool {
+        const window_count = self.immutableFlushWindowCount(force);
+        if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
-        if (!self.tryReserveMaintenanceIoBudget(estimatedFlushIoBytes(state))) return false;
+        var estimated_io_bytes: u64 = 0;
+        for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
+            estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
+        }
+        if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
-            return try self.flushOldestImmutableMemtableUnlockedBuild();
+            return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
         }
         const start_ns = self.writeStatsNowNs();
         const input_entries = state.entries.items.len;
@@ -3641,6 +4020,7 @@ pub const Backend = struct {
         const elapsed_ns = self.writeStatsElapsedNs(start_ns);
         self.recordFlushWriteStats(input_entries, new_runs.items, elapsed_ns);
         self.write_stats.immutable_flushes += 1;
+        self.write_stats.immutable_flush_input_memtables += 1;
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try self.reserveImmutableMemtableRetirement(state);
@@ -3649,6 +4029,7 @@ pub const Backend = struct {
         self.immutable_head += 1;
         self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
+        self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
         compaction_mod.sortRuns(self.runs.items);
@@ -3669,14 +4050,21 @@ pub const Backend = struct {
         return true;
     }
 
-    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend) !bool {
+    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend, window_count: usize) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
         if (self.immutable_flush_build_in_flight) return false;
+        std.debug.assert(window_count > 0 and window_count <= self.activeImmutableMemtableCount());
 
         const start_ns = self.writeStatsNowNs();
         const publish_head = self.immutable_head;
-        const state = self.immutable_memtables.items[publish_head];
-        const input_entries = state.entries.items.len;
+        const window_oldest_first = self.immutable_memtables.items[publish_head .. publish_head + window_count];
+        var input_entries: usize = 0;
+        for (window_oldest_first) |window_state| input_entries += window_state.entries.items.len;
+        const states_newest_first = try self.allocator.alloc(*const State, window_count);
+        defer self.allocator.free(states_newest_first);
+        for (window_oldest_first, 0..) |window_state, i| {
+            states_newest_first[window_count - 1 - i] = window_state;
+        }
         const reserved_run_ids = @max(@as(u64, 1), @as(u64, @intCast(input_entries)));
         const reserved_run_id_start = self.next_run_id;
         self.next_run_id +|= reserved_run_ids;
@@ -3688,10 +4076,10 @@ pub const Backend = struct {
         var build_result: std.ArrayListUnmanaged(Run) = .empty;
         var build_result_valid = false;
         var build_err: ?anyerror = null;
-        build_result = compaction_mod.buildRunsFromStateBorrowedWithReservedIds(
+        build_result = compaction_mod.buildRunsFromStatesBorrowedWithReservedIds(
             Backend,
             self,
-            state,
+            states_newest_first,
             reserved_run_id_start,
             reserved_run_id_end,
         ) catch |err| blk: {
@@ -3706,10 +4094,18 @@ pub const Backend = struct {
         errdefer if (build_result_valid) compaction_mod.discardOutputRuns(Backend, self, &build_result);
         if (build_err) |err| return err;
 
-        if (publish_head != self.immutable_head or
-            self.activeImmutableMemtableCount() == 0 or
-            self.immutable_memtables.items[publish_head] != state)
-        {
+        var window_matches = publish_head == self.immutable_head and
+            self.activeImmutableMemtableCount() >= window_count;
+        if (window_matches) {
+            for (0..window_count) |i| {
+                const window_state = states_newest_first[window_count - 1 - i];
+                if (self.immutable_memtables.items[publish_head + i] != window_state) {
+                    window_matches = false;
+                    break;
+                }
+            }
+        }
+        if (!window_matches) {
             compaction_mod.discardOutputRuns(Backend, self, &build_result);
             return false;
         }
@@ -3717,18 +4113,24 @@ pub const Backend = struct {
         const elapsed_ns = self.writeStatsElapsedNs(start_ns);
         self.recordFlushWriteStats(input_entries, build_result.items, elapsed_ns);
         self.write_stats.immutable_flushes += 1;
+        self.write_stats.immutable_flush_input_memtables += @intCast(window_count);
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         // The build ran without the backend lock, so reserve only after the
         // generation identity has been revalidated. From this point through
         // retirement, publication is allocation-free except for installing
         // the new run pointers themselves.
-        try self.reserveImmutableMemtableRetirement(state);
+        var pinned_retirements: usize = 0;
+        for (states_newest_first) |window_state| {
+            if (self.immutableMemtableIsPinned(window_state)) pinned_retirements += 1;
+        }
+        try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, pinned_retirements);
         try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
-        self.noteImmutablePublishedForWal(state);
-        self.immutable_head += 1;
-        self.retireImmutableMemtable(state);
+        for (states_newest_first) |window_state| self.noteImmutablePublishedForWal(window_state);
+        self.immutable_head += window_count;
+        for (states_newest_first) |window_state| self.retireImmutableMemtable(@constCast(window_state));
         self.compactImmutableMemtableQueue();
+        self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
         compaction_mod.sortRuns(self.runs.items);
@@ -3981,18 +4383,69 @@ pub const Backend = struct {
         }
     }
 
+    /// Retain an already-sorted, WAL-backed bulk transaction as a query-visible
+    /// immutable epoch. A bounded bulk window can then stream several adjacent
+    /// transactions into one table generation and one manifest publication.
+    ///
+    /// This is intentionally opt-in through immutable_flush_window_bytes. The
+    /// caller appended the transaction WAL before entering this function, so
+    /// the mutable WAL range belongs to the moved state and is transferred at
+    /// the same lock-held visibility boundary.
+    pub fn enqueueOwnedSortedStateForFlush(self: *Backend, state: *State) !bool {
+        if (self.options.immutable_flush_window_bytes == 0 or
+            self.root_dir == null or
+            self.storage == null or
+            state.entries.items.len == 0)
+        {
+            return false;
+        }
+        std.debug.assert(self.mutable.entries.items.len == 0);
+
+        const logical_bytes = estimateStateLogicalBytes(state);
+        const queued = try self.allocator.create(State);
+        errdefer self.allocator.destroy(queued);
+        try self.immutable_memtables.ensureUnusedCapacity(self.allocator, 1);
+        try self.immutable_wal_ranges.ensureUnusedCapacity(self.allocator, 1);
+
+        queued.* = state.*;
+        state.* = .{};
+        self.immutable_memtables.appendAssumeCapacity(queued);
+        self.immutable_wal_ranges.appendAssumeCapacity(self.mutable_wal_range);
+        self.mutable_wal_range = .{};
+        self.active_immutable_logical_bytes +|= logical_bytes;
+        self.noteImmutableWriteMutationLocked();
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebtLocked();
+        // This transaction passed aggregate admission before its WAL append.
+        // Re-reading the global decision after installing it can observe the
+        // usage it just added and immediately flush every individually sorted
+        // bulk commit, defeating the bounded merge window. Enforce the local
+        // count/byte caps here; the next pre-WAL admission and the maintenance
+        // worker still react to aggregate pressure without a false-negative
+        // post-commit failure.
+        try self.enforceDeferredImmutableBackpressure(false);
+        return true;
+    }
+
+    pub fn canQueueDirectBulkStateWithPendingImmutable(self: *const Backend) bool {
+        return self.options.immutable_flush_window_bytes > 0 and
+            self.root_dir != null and
+            self.storage != null;
+    }
+
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        return self.stateMeetsBulkFlushThreshold(state);
+        if (self.activeImmutableMemtableCount() != 0 and
+            !self.canQueueDirectBulkStateWithPendingImmutable()) return false;
+        return self.stateMeetsDirectBulkIngestThreshold(state);
     }
 
     pub fn shouldDirectIngestBulkMutable(self: *const Backend, mutable: *const ActiveMemTable) bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
-        if (byte_threshold > 0) return stateMeetsByteFlushThreshold(mutable, byte_threshold);
-        return mutable.entries.items.len >= self.effectiveFlushThreshold();
+        if (self.activeImmutableMemtableCount() != 0 and
+            !self.canQueueDirectBulkStateWithPendingImmutable()) return false;
+        return self.stateMeetsDirectBulkIngestThreshold(mutable);
     }
 
     pub fn persistManifest(self: *Backend) !void {
@@ -4310,15 +4763,23 @@ pub const Backend = struct {
         }
     }
 
-    pub fn recordCompactionWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
-        self.write_stats.compaction_ns += elapsed_ns;
+    pub fn recordCompactionWriteStats(self: *Backend, input_bytes: u64, output_runs: []const Run, elapsed_ns: u64) void {
+        var output_bytes: u64 = 0;
+        self.write_stats.compactions +|= 1;
+        self.write_stats.compaction_input_bytes +|= input_bytes;
+        self.write_stats.compaction_ns +|= elapsed_ns;
+        self.write_stats.compaction_max_input_bytes = @max(self.write_stats.compaction_max_input_bytes, input_bytes);
+        self.write_stats.compaction_max_ns = @max(self.write_stats.compaction_max_ns, elapsed_ns);
         for (output_runs) |run| {
+            output_bytes +|= run.size_bytes;
             if (run.path != null) {
                 self.write_stats.table_file_writes += 1;
                 self.write_stats.table_file_bytes += run.size_bytes;
                 self.recordTableCompressionWriteStats(run.compression_stats);
             }
         }
+        self.write_stats.compaction_output_bytes +|= output_bytes;
+        self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
     }
 
     fn recordSortedIngestWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
@@ -4601,6 +5062,27 @@ pub const Backend = struct {
         _ = self.read_stats.point_run_async_reads_issued.fetchAdd(@intCast(reads_issued), .monotonic);
     }
 
+    /// Reserve a fair, non-blocking share of the backend-wide sparse-read
+    /// pipeline. Existing batches retain their width; later arrivals see the
+    /// increased active count and narrow themselves. The harmonic admission
+    /// curve avoids a convoy while bounding fan-out far below
+    /// `queries * max_concurrent_point_block_reads` under load.
+    pub fn acquirePointAsyncBatchLimit(self: *Backend, stack_limit: usize) usize {
+        const per_batch = @min(self.options.max_concurrent_point_block_reads, stack_limit);
+        if (per_batch < 2) return per_batch;
+        const previous = self.point_async_batches_active.fetchAdd(1, .acq_rel);
+        const active = previous + 1;
+        const aggregate = self.options.target_aggregate_concurrent_point_block_reads;
+        if (aggregate == 0) return per_batch;
+        const fair = std.math.divCeil(u64, aggregate, active) catch 1;
+        return @min(per_batch, @as(usize, @intCast(@min(fair, std.math.maxInt(usize)))));
+    }
+
+    pub fn releasePointAsyncBatchLimit(self: *Backend) void {
+        const previous = self.point_async_batches_active.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+
     pub fn recordPointRunAsyncCancel(self: *Backend) void {
         _ = self.read_stats.point_run_async_reads_canceled.fetchAdd(1, .monotonic);
     }
@@ -4756,6 +5238,14 @@ pub const Backend = struct {
     }
 
     pub fn queueObsoleteFilePathAssumeCapacity(self: *Backend, path: []u8) void {
+        // The active run set no longer references this path. Shed its shared
+        // cache residency immediately instead of letting indexes and blocks
+        // from every compacted generation accumulate until cache pressure.
+        // Existing handles remain valid: Cache.invalidatePath marks pinned
+        // entries and destroys them only after the last handle is released.
+        // A snapshot reader may reload the still-retained file, so physical
+        // reclamation invalidates the path a second time below.
+        if (self.options.cache) |cache| cache.invalidatePath(path);
         const delete_after_ns = self.nowNs() +| self.options.obsolete_retention_ns;
         for (self.obsolete_paths.items) |*obsolete| {
             if (!std.mem.eql(u8, obsolete.path, path)) continue;
@@ -5095,10 +5585,27 @@ pub const Backend = struct {
         return std.math.mul(u64, self.options.flush_threshold_bytes, multiplier) catch std.math.maxInt(u64);
     }
 
-    fn stateMeetsBulkFlushThreshold(self: *const Backend, state: *const State) bool {
-        const byte_threshold = self.effectiveFlushThresholdBytes();
-        if (byte_threshold > 0) return stateMeetsByteFlushThreshold(state, byte_threshold);
-        return state.entries.items.len >= self.effectiveFlushThreshold();
+    fn stateMeetsDirectBulkIngestThreshold(self: *const Backend, state: anytype) bool {
+        // A committed bulk transaction is already the coalesced unit of work.
+        // The bulk flush multiplier exists to amortize mutable flushes; applying
+        // it again here made normal concurrent batches miss direct ingest and
+        // recreate the mutable-copy hot path.
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
+        if (byte_threshold > 0 and stateMeetsByteFlushThreshold(state, byte_threshold)) return true;
+        // Snapshot publication is also a hard reason to bypass mutable state.
+        // Vector-heavy values can reach their allocator-backed snapshot bound
+        // before their encoded logical bytes reach the flush threshold.
+        if (self.options.read_snapshot_rotate_mutable_bytes > 0 and
+            estimateStateBytes(state) >= self.options.read_snapshot_rotate_mutable_bytes) return true;
+        if (byte_threshold > 0) return false;
+        return state.entries.items.len >= @max(@as(usize, 1), self.options.flush_threshold);
+    }
+
+    fn directBulkIngestLogicalThresholdBytes(self: *const Backend) u64 {
+        return if (self.options.direct_bulk_ingest_min_bytes > 0)
+            self.options.direct_bulk_ingest_min_bytes
+        else
+            self.options.flush_threshold_bytes;
     }
 
     fn shouldFlushMutable(self: *const Backend) bool {
@@ -5110,6 +5617,10 @@ pub const Backend = struct {
 
     fn shouldFlushMutableForIdleLocked(self: *Backend) bool {
         return if (self.nextMutableIdleFlushDelayNsLocked()) |delay_ns| delay_ns == 0 else false;
+    }
+
+    fn shouldFlushImmutableForIdleLocked(self: *Backend) bool {
+        return if (self.nextImmutableIdleFlushDelayNsLocked()) |delay_ns| delay_ns == 0 else false;
     }
 
     fn shouldFlushMutableDuringRecoveryReplay(self: *const Backend) bool {
@@ -5297,7 +5808,18 @@ pub const Backend = struct {
             self.active_immutable_logical_bytes +|
             self.unpublished_wal_max_batch_logical_bytes;
         const scaled = std.math.mul(u64, dirty_bytes, multiplier) catch std.math.maxInt(u64);
-        return @max(self.options.wal_checkpoint_dirty_bytes_floor, scaled);
+        // Retention advances only at segment boundaries. After a window is
+        // published, its newest records can share one segment with a newer
+        // immutable epoch, and that epoch can continue into the current
+        // segment. A dirty target below those two physical segments sees the
+        // unavoidable retained tail as fresh pressure and force-publishes each
+        // following partial epoch. Windowed publication therefore needs this
+        // geometry floor; hard WAL byte/segment limits remain authoritative.
+        const window_segment_floor = if (self.options.immutable_flush_window_bytes > 0)
+            std.math.mul(u64, self.options.wal_segment_bytes, 2) catch std.math.maxInt(u64)
+        else
+            0;
+        return @max(self.options.wal_checkpoint_dirty_bytes_floor, window_segment_floor, scaled);
     }
 
     fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -5519,6 +6041,20 @@ pub const Backend = struct {
         return pressure;
     }
 
+    fn bulkL0DeltaSealDueLocked(self: *const Backend, l0_bytes: u64) bool {
+        const denominator = self.options.bulk_ingest_l0_delta_seal_ratio_denominator;
+        if (denominator == 0 or l0_bytes == 0) return false;
+
+        var lower_bytes: u64 = 0;
+        var i = self.snapshotL0PressureLocked().runs;
+        while (i < self.runs.items.len) : (i += 1) {
+            lower_bytes +|= self.runs.items[i].size_bytes;
+        }
+        if (lower_bytes == 0) return false;
+        const threshold = lower_bytes / denominator + @intFromBool(lower_bytes % denominator != 0);
+        return l0_bytes >= threshold;
+    }
+
     fn enforceWritePressure(self: *Backend) anyerror!void {
         if (self.bulkIngestActive() and !self.writePressureDuringBulkIngestEnabled()) return;
         if (self.write_pressure_enforcing) return;
@@ -5544,7 +6080,25 @@ pub const Backend = struct {
         var steps: usize = 0;
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
-            try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            const byte_hard = hard_bytes > 0 and pressure.bytes > hard_bytes;
+            const delta_seal_due = self.bulkL0DeltaSealDueLocked(pressure.bytes);
+            const sealed = if (!byte_hard and delta_seal_due)
+                try compaction_mod.compactBulkL0DeltaSeal(Backend, self, 2)
+            else
+                false;
+            const tiered = if (!byte_hard and !sealed and
+                hard_runs > 0 and pressure.runs > hard_runs and
+                self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                try compaction_mod.compactBulkL0Tier(
+                    Backend,
+                    self,
+                    self.options.bulk_ingest_tiered_l0_fan_in,
+                )
+            else
+                false;
+            if (!sealed and !tiered) {
+                _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            }
             if (self.compaction_stats.compactions == before_step_compactions) break;
             steps += self.compaction_stats.compactions - before_step_compactions;
             pressure = self.snapshotL0PressureLocked();
@@ -5667,21 +6221,20 @@ pub const Backend = struct {
     }
 
     pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
-        if (self.mutable.entries.items.len == 0) return false;
-        if (self.active_bulk_ingest_batches <= 1) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
+        const has_mutable = self.mutable.entries.items.len != 0;
+        const has_immutable = self.activeImmutableMemtableCount() != 0;
+        if (!has_mutable and !has_immutable) return false;
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
         if (byte_threshold > 0) {
             const logical_bytes = estimateStateLogicalBytes(&self.mutable) +| estimateStateLogicalBytes(incoming);
             if (logical_bytes >= byte_threshold) return true;
-            const memory_threshold = std.math.mul(
-                u64,
-                byte_threshold,
-                mutable_memory_guard_multiplier,
-            ) catch std.math.maxInt(u64);
+            const guard_threshold = std.math.mul(u64, byte_threshold, mutable_memory_guard_multiplier) catch std.math.maxInt(u64);
+            const snapshot_threshold = self.options.read_snapshot_rotate_mutable_bytes;
+            const memory_threshold = if (snapshot_threshold > 0) @min(guard_threshold, snapshot_threshold) else guard_threshold;
             return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= memory_threshold;
         }
-        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+        if (self.active_bulk_ingest_batches <= 1 and !has_immutable) return false;
+        return self.mutable.entries.items.len + incoming.entries.items.len >= @max(@as(usize, 1), self.options.flush_threshold);
     }
 
     fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
@@ -5696,6 +6249,9 @@ pub const Backend = struct {
 
     fn beginBulkIngestSessionLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.active_bulk_ingest_batches == 0) {
+            self.bulk_ingest_window_first_sequence = self.next_run_id;
+        }
         self.active_bulk_ingest_batches += 1;
     }
 
@@ -5739,6 +6295,7 @@ pub const Backend = struct {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.runForegroundCompactionBudget(options);
             if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
@@ -5750,6 +6307,7 @@ pub const Backend = struct {
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
@@ -5761,9 +6319,28 @@ pub const Backend = struct {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
         }
+    }
+
+    fn mergeBulkIngestWindowLocked(self: *Backend) !bool {
+        const first_sequence = self.bulk_ingest_window_first_sequence;
+        if (first_sequence == 0 or self.options.bulk_ingest_tiered_l0_fan_in < 2) return false;
+        const merged = try compaction_mod.compactBulkL0WindowScheduled(
+            Backend,
+            self,
+            first_sequence,
+            self.maintenanceScoreLocked(),
+        );
+        if (merged and self.root_dir != null and
+            (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+        {
+            try self.persistManifest();
+        }
+        return merged;
     }
 
     fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
@@ -5787,6 +6364,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        if (self.active_bulk_ingest_batches == 0) self.bulk_ingest_window_first_sequence = 0;
         self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
@@ -5834,7 +6412,7 @@ pub const Backend = struct {
             return;
         }
         while (countLevelRuns(self.runs.items, 0) > limit) {
-            try compaction_mod.compactL0ToLimit(Backend, self, limit);
+            if (!try compaction_mod.compactL0ToLimit(Backend, self, limit)) break;
         }
     }
 
@@ -6008,6 +6586,10 @@ pub const Backend = struct {
                     continue;
                 },
             };
+            // Readers of the retired generation were allowed to repopulate
+            // the cache while the file was retained. No version pins remain
+            // at this boundary, so remove any such late entries as well.
+            if (self.options.cache) |cache| cache.invalidatePath(obsolete.path);
             run_snapshot_refs.forget(obsolete.path);
             var removed = self.obsolete_paths.orderedRemove(i);
             removed.deinit(self.allocator);
@@ -6046,6 +6628,9 @@ pub const Backend = struct {
         if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
+        if (self.nextImmutableIdleFlushDelayNsLocked()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
         if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
@@ -6066,6 +6651,24 @@ pub const Backend = struct {
             0
         else
             self.mutable_idle_flush_deadline_ns - now_ns;
+        if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
+    }
+
+    fn nextImmutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
+        if (self.options.mutable_idle_flush_after_ns == 0 or
+            self.immutable_idle_flush_deadline_ns == 0 or
+            self.activeImmutableMemtableCount() == 0 or
+            self.root_dir == null or
+            self.storage == null or
+            self.options.backend.read_only or
+            self.bulkIngestActive()) return null;
+
+        const now_ns = self.nowNs();
+        const delay_ns = if (self.immutable_idle_flush_deadline_ns <= now_ns)
+            0
+        else
+            self.immutable_idle_flush_deadline_ns - now_ns;
         if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
         return delay_ns;
     }
@@ -6171,6 +6774,7 @@ pub const Backend = struct {
 
 const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.single_threaded) struct {
     backend: *Backend,
+    borrowed_io: ?std.Io,
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6179,8 +6783,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
     }
 
     fn start(_: *InternalFlushWorker) !void {
@@ -6188,6 +6792,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 
     fn stopAndJoin(_: *InternalFlushWorker, _: bool) void {}
+
+    fn deinit(_: *InternalFlushWorker) void {}
 
     fn waker(self: *InternalFlushWorker) MaintenanceWaker {
         return .{ .ptr = self, .wake_fn = wake };
@@ -6200,8 +6806,11 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 } else struct {
     backend: *Backend,
-    mutex: std.atomic.Mutex = .unlocked,
-    thread: ?std.Thread = null,
+    borrowed_io: ?std.Io,
+    mutex: std.Io.Mutex = .init,
+    wake_event: std.Io.Event = .unset,
+    owned_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
     wake_requested: bool = false,
@@ -6210,8 +6819,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     errors: u64 = 0,
     joined: bool = false,
 
-    const idle_obsolete_reclaim_poll_ns = 250 * std.time.ns_per_ms;
-    const idle_wake_poll_ns = 2 * std.time.ns_per_ms;
+    const Work = enum { run, drain, stop };
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6220,24 +6828,39 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
+    }
+
+    fn io(self: *InternalFlushWorker) std.Io {
+        return self.borrowed_io orelse self.owned_io.?.io();
     }
 
     fn start(self: *InternalFlushWorker) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (self.borrowed_io == null) {
+            self.owned_io = std.Io.Threaded.init(self.backend.allocator, .{
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            });
+        }
+        self.future = try self.io().concurrent(run, .{self});
+    }
+
+    fn deinit(self: *InternalFlushWorker) void {
+        if (self.owned_io) |*io_impl| io_impl.deinit();
     }
 
     fn stopAndJoin(self: *InternalFlushWorker, drain: bool) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.stop_requested = true;
         self.drain_on_stop = self.drain_on_stop or drain;
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
 
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.wake_event.set(self.io());
+        if (self.future) |*future| {
+            future.await(self.io());
+            self.future = null;
             self.joined = true;
         }
     }
@@ -6248,15 +6871,16 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn wake(ptr: *anyopaque) void {
         const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
         self.wakeups +|= 1;
-        self.mutex.unlock();
+        self.wake_event.set(self.io());
+        self.mutex.unlock(self.io());
     }
 
     fn snapshotStats(self: *InternalFlushWorker) Stats {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
         return .{
             .wakeups = self.wakeups,
             .maintenance_steps = self.maintenance_steps,
@@ -6268,36 +6892,50 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     fn run(self: *InternalFlushWorker) void {
         var next_reclaim_delay_ns: ?u64 = null;
         while (true) {
-            const drain_then_stop = self.waitForWork(next_reclaim_delay_ns);
-            if (drain_then_stop) {
-                _ = self.drainMaintenance();
-                return;
+            switch (self.waitForWork(next_reclaim_delay_ns)) {
+                .stop => return,
+                .drain => {
+                    _ = self.drainMaintenance();
+                    return;
+                },
+                .run => next_reclaim_delay_ns = self.drainMaintenance(),
             }
-            next_reclaim_delay_ns = self.drainMaintenance();
         }
     }
 
-    fn waitForWork(self: *InternalFlushWorker, initial_reclaim_delay_ns: ?u64) bool {
-        var reclaim_delay_ns = initial_reclaim_delay_ns;
+    fn waitForWork(self: *InternalFlushWorker, reclaim_delay_ns: ?u64) Work {
+        const io_ctx = self.io();
+        const deadline_ns = if (reclaim_delay_ns) |delay| platform.time.monotonicNs() +| delay else null;
         while (true) {
-            lockWorkerMutex(&self.mutex);
-            if (self.stop_requested or self.wake_requested) break;
-            self.mutex.unlock();
-
-            if (reclaim_delay_ns) |delay_ns| {
-                if (delay_ns == 0) return false;
-                const sleep_ns = @min(delay_ns, idle_obsolete_reclaim_poll_ns);
-                sleepForTest(sleep_ns);
-                reclaim_delay_ns = if (delay_ns <= sleep_ns) 0 else delay_ns - sleep_ns;
+            self.mutex.lockUncancelable(io_ctx);
+            if (self.stop_requested) {
+                const work: Work = if (self.drain_on_stop) .drain else .stop;
+                self.mutex.unlock(io_ctx);
+                return work;
+            }
+            if (self.wake_requested) {
+                self.wake_requested = false;
+                self.mutex.unlock(io_ctx);
+                return .run;
+            }
+            // Reset under the same mutex used to publish wakes. A wake
+            // arriving before wait remains latched and cannot be lost.
+            self.wake_event.reset();
+            self.mutex.unlock(io_ctx);
+            if (deadline_ns) |deadline| {
+                const now = platform.time.monotonicNs();
+                if (now >= deadline) return .run;
+                self.wake_event.waitTimeout(io_ctx, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline - now),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return .stop,
+                };
             } else {
-                sleepForTest(idle_wake_poll_ns);
+                self.wake_event.waitUncancelable(io_ctx);
             }
         }
-        defer self.mutex.unlock();
-        const drain_then_stop = self.stop_requested and self.drain_on_stop;
-        if (self.stop_requested and !drain_then_stop) return true;
-        self.wake_requested = false;
-        return drain_then_stop;
     }
 
     fn drainMaintenance(self: *InternalFlushWorker) ?u64 {
@@ -6310,22 +6948,22 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         return null;
     }
 
     fn recordStep(self: *InternalFlushWorker) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.maintenance_steps +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
     }
 
     fn recordError(self: *InternalFlushWorker, err: anyerror) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.errors +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         std.log.warn("lsm internal flush worker failed root={?s} err={}", .{ self.backend.root_dir, err });
     }
 };
@@ -6355,6 +6993,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6371,8 +7010,9 @@ pub const BackendHandle = struct {
         }
 
         backend.* = Backend.init(allocator, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6395,6 +7035,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6411,8 +7052,9 @@ pub const BackendHandle = struct {
         }
 
         try backend.openInto(allocator, root_dir, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6426,6 +7068,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6439,6 +7082,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(false);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6472,11 +7116,12 @@ pub const BackendHandle = struct {
         return worker.snapshotStats();
     }
 
-    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend) !*InternalFlushWorker {
+    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend, io: ?std.Io) !*InternalFlushWorker {
         if (backend.options.maintenance_waker != null) return error.MaintenanceWakerAlreadyConfigured;
         const worker = try allocator.create(InternalFlushWorker);
         errdefer allocator.destroy(worker);
-        worker.* = InternalFlushWorker.init(backend);
+        worker.* = InternalFlushWorker.init(backend, io);
+        errdefer worker.deinit();
         backend.options.maintenance_waker = worker.waker();
         errdefer backend.options.maintenance_waker = null;
         try worker.start();
@@ -6566,8 +7211,12 @@ fn validateRunLayoutForManifest(runs: []const Run) !void {
             }
             if (prev.level == run.level) {
                 if (prev.level == 0) {
-                    if (prev.id <= run.id) {
-                        logInvalidRunLayout("l0_id_order", prior, run);
+                    const prev_sequence = compaction_mod.l0Sequence(prev);
+                    const run_sequence = compaction_mod.l0Sequence(run);
+                    if (prev_sequence < run_sequence or
+                        (prev_sequence == run_sequence and prev.id <= run.id))
+                    {
+                        logInvalidRunLayout("l0_sequence_order", prior, run);
                         return error.InvalidTableFile;
                     }
                 } else {
@@ -6801,6 +7450,35 @@ fn waitSignalForTest(fd: std.posix.fd_t) !void {
             else => return error.Unexpected,
         }
     }
+}
+
+test "lsm backend aggregates compaction totals and preserves per-job maxima" {
+    var aggregate: Backend.WriteStats = .{
+        .compactions = 2,
+        .compaction_input_bytes = 300,
+        .compaction_output_bytes = 200,
+        .compaction_ns = 30,
+        .compaction_max_input_bytes = 200,
+        .compaction_max_output_bytes = 125,
+        .compaction_max_ns = 20,
+    };
+    Backend.accumulateWriteStats(&aggregate, .{
+        .compactions = 1,
+        .compaction_input_bytes = 250,
+        .compaction_output_bytes = 150,
+        .compaction_ns = 40,
+        .compaction_max_input_bytes = 250,
+        .compaction_max_output_bytes = 150,
+        .compaction_max_ns = 40,
+    });
+
+    try std.testing.expectEqual(@as(u64, 3), aggregate.compactions);
+    try std.testing.expectEqual(@as(u64, 550), aggregate.compaction_input_bytes);
+    try std.testing.expectEqual(@as(u64, 350), aggregate.compaction_output_bytes);
+    try std.testing.expectEqual(@as(u64, 70), aggregate.compaction_ns);
+    try std.testing.expectEqual(@as(u64, 250), aggregate.compaction_max_input_bytes);
+    try std.testing.expectEqual(@as(u64, 150), aggregate.compaction_max_output_bytes);
+    try std.testing.expectEqual(@as(u64, 40), aggregate.compaction_max_ns);
 }
 
 test "lsm backend default base level target absorbs L0 pressure output" {
@@ -7288,6 +7966,153 @@ test "lsm backend schedules deferred immutable flush on configured background ex
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
 }
 
+test "lsm backend background flush waits for and merges a complete immutable window" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 780);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 2,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "old");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expect(!backend.immutable_flush_job_in_flight);
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "new");
+        try txn.put(.{}, "key:b", "visible");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.immutable_flush_job_in_flight);
+
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.immutable_idle_flush_deadline_ns);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend idle maintenance publishes a partial immutable window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-idle-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .mutable_idle_flush_after_ns = 1,
+        .mutable_idle_flush_min_bytes = 0,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    backend.immutable_idle_flush_deadline_ns = 1;
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.immutable_idle_flush_deadline_ns);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
+test "lsm backend size maintenance preserves a partial immutable window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-size-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1024,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    // Model a runtime threshold reduction after the write. Maintenance must
+    // rotate the oversized mutable generation without treating that rotation
+    // as permission to publish an intentionally incomplete merge window.
+    backend.options.flush_threshold = 1;
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_rotations);
+    try std.testing.expectEqual(@as(u64, 0), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
 test "lsm backend close drains scheduled immutable flush before destroying backend" {
     const FakeLane = struct {
         submitted_job: ?background_runtime_mod.Job = null,
@@ -7517,6 +8342,129 @@ test "lsm backend resource manager throttles projected immutable state" {
     try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
 }
 
+test "lsm backend aggregate soft pressure preserves a partial immutable window" {
+    var sample: ActiveMemTable = .{};
+    defer sample.deinit(std.testing.allocator);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    try std.testing.expect(one_memtable_bytes > 0);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = one_memtable_bytes * 10,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-resource-window-throttle-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 8,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend aggregate soft pressure preserves a mutable bulk window" {
+    var sample: ActiveMemTable = .{};
+    defer sample.deinit(std.testing.allocator);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    try std.testing.expect(one_memtable_bytes > 0);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = one_memtable_bytes * 10,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-resource-mutable-window-throttle-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold = 1024,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 8,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend direct bulk admission rejects before wal append" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-resource-admission-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold_bytes = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .immutable_flush_window_bytes = 1024,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{});
+    defer runtime.deinit();
+    var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put("key", "value");
+    try std.testing.expectError(error.ResourceBudgetExceeded, txn.commit());
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_attempts);
+    try std.testing.expectEqual(@as(u64, 0), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 0), stats.wal_append_records);
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
 test "lsm backend does not wait on aggregate soft pressure owned elsewhere" {
     var sample: ActiveMemTable = .{};
     defer sample.deinit(std.testing.allocator);
@@ -7588,7 +8536,7 @@ test "lsm backend rejects aggregate hard throttle without waiting" {
     manager.observeUsage(.lsm_in_memory_state, &external_usage, 0);
 }
 
-test "lsm backend resource manager rejects before wal apply" {
+test "lsm backend resource manager reclaims local durable state before rejecting" {
     var sample: ActiveMemTable = .{};
     defer sample.deinit(std.testing.allocator);
     try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
@@ -7622,10 +8570,12 @@ test "lsm backend resource manager rejects before wal apply" {
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
-        try std.testing.expectError(error.ResourceBudgetExceeded, txn.commit());
+        try txn.commit();
     }
-    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().immutable_flushes);
 }
 
 test "lsm backend deferred immutable backpressure waits for in-flight build" {
@@ -7694,13 +8644,14 @@ test "lsm backend deferred immutable backpressure waits for in-flight build" {
             target.finishImmutableFlushBuildLocked();
         }
     };
-    const clear_thread = try std.Thread.spawn(.{}, ClearBuild.run, .{&backend});
+    var clear_thread = try std.testing.io.concurrent(ClearBuild.run, .{&backend});
+    defer clear_thread.await(std.testing.io);
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
         try txn.commit();
     }
-    clear_thread.join();
+    clear_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
 
@@ -8737,6 +9688,26 @@ test "lsm backend wal pressure maintenance flushes and checkpoints retained segm
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
 }
 
+test "lsm backend windowed wal checkpoint floor covers a straddling segment tail" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .wal_segment_bytes = 64 * 1024 * 1024,
+        .wal_checkpoint_dirty_bytes_multiplier = 2,
+        .wal_checkpoint_dirty_bytes_floor = 32 * 1024 * 1024,
+        .immutable_flush_window_bytes = 256 * 1024 * 1024,
+    });
+    defer backend.close();
+
+    try std.testing.expectEqual(
+        @as(?u64, 128 * 1024 * 1024),
+        backend.walCheckpointDirtyBytesLimit(),
+    );
+    backend.options.immutable_flush_window_bytes = 0;
+    try std.testing.expectEqual(
+        @as(?u64, 32 * 1024 * 1024),
+        backend.walCheckpointDirtyBytesLimit(),
+    );
+}
+
 test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -9471,6 +10442,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
         .bulk_ingest_flush_threshold_multiplier = 4,
+        .direct_bulk_ingest = false,
     });
     defer backend.close();
 
@@ -9591,8 +10563,8 @@ test "lsm runtime bulk append after put preserves write order" {
 
 test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
     var backend = Backend.init(std.testing.allocator, .{
-        .flush_threshold = 1,
-        .bulk_ingest_flush_threshold_multiplier = 4,
+        .flush_threshold = 4,
+        .bulk_ingest_flush_threshold_multiplier = 2,
     });
     defer backend.close();
 
@@ -9624,14 +10596,52 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_attempts);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_fallback_below_threshold);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("F", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:f"));
+}
+
+test "lsm backend direct bulk ingest publishes older immutable epoch first" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 2,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.commit();
+    }
+    try backend.rotateMutableToImmutable();
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
 }
 
 test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
@@ -9797,6 +10807,108 @@ test "lsm backend reopens overlapping direct ingest l0 runs with newest values v
         try std.testing.expectEqualStrings("new-range", try visible.get(.{ .name = "hbc_nodes" }, node_range_key[0..]));
         try std.testing.expectEqualStrings("meta-4b", try visible.get(.{ .name = "hbc_vecs" }, vec_meta_keys[3][0..]));
     }
+}
+
+test "lsm backend linear bulk window merge preserves l0 chronology tombstones and reopen" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const options = Options{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .compact_threshold_runs = 4,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 128,
+        .foreground_soft_compaction = false,
+        .storage = storage.storage(),
+    };
+
+    {
+        var backend = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        var bulk_active = true;
+        errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+        var generation: usize = 1;
+        while (generation <= 5) : (generation += 1) {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            var pad_key_buf: [32]u8 = undefined;
+            const pad_key = try std.fmt.bufPrint(&pad_key_buf, "pad:{d}", .{generation});
+            const padding = [_]u8{'p'} ** 256;
+            try txn.put(.{ .name = "docs" }, pad_key, &padding);
+            switch (generation) {
+                1 => {
+                    try txn.put(.{ .name = "docs" }, "doc:overwrite", "old");
+                    try txn.put(.{ .name = "docs" }, "doc:deleted", "present");
+                },
+                2 => try txn.put(.{ .name = "docs" }, "doc:overwrite", "new"),
+                4 => try txn.delete(.{ .name = "docs" }, "doc:deleted"),
+                5 => try txn.put(.{ .name = "docs" }, "doc:newest", "visible"),
+                else => {},
+            }
+            try txn.commit();
+        }
+        try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        bulk_active = false;
+        try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+        try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+        try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:overwrite"));
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:deleted"));
+        try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:newest"));
+    }
+
+    var reopened = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(reopened.runs.items, 0));
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:overwrite"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:deleted"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:newest"));
+}
+
+test "lsm backend tiers committed runs while overlapping request bulk mode remains active" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/request-bulk-tiering", .{
+        .flush_threshold = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .compact_threshold_runs = 4,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 128,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const request_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
+    // Model another overlapping public request. It keeps generic leveled
+    // compaction deferred, but unlike an explicit ingest session it owns no
+    // final window and therefore leaves the sequence fence at zero.
+    backend.beginBatchMode(request_options);
+    var request_active = true;
+    defer if (request_active) {
+        backend.finishBatchMode(request_options);
+        backend.finalizeExitedBatchMode(request_options) catch {};
+    };
+
+    for (0..5) |generation| {
+        var txn = try backend.beginBatchWithOptions(request_options);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{generation});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(u64, 0), backend.bulk_ingest_window_first_sequence);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+
+    backend.finishBatchMode(request_options);
+    request_active = false;
+    try backend.finalizeExitedBatchMode(request_options);
 }
 
 test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
@@ -10072,6 +11184,53 @@ test "lsm backend probe owns active mutable point values across later writes" {
     try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
 }
 
+test "lsm backend stable probe batch borrows pinned run values without recopying" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var cache = Cache.init(std.testing.allocator, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-stable-probe-batch-borrow", .{
+        .flush_threshold = 1,
+        .storage = storage.storage(),
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    const value_a = [_]u8{'a'} ** 4096;
+    const value_b = [_]u8{'b'} ** 4096;
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", &value_a);
+        try write.put("doc:b", &value_b);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    const keys = [_][]const u8{ "doc:a", "doc:b" };
+    var values = [_]?[]const u8{ null, null };
+    const before = backend.snapshotReadStats();
+    try probe.getManySorted(&keys, &values);
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
+    try std.testing.expectEqualSlices(u8, &value_b, values[1].?);
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+
+    // The probe pins the run-backed block generation, so a later replacement
+    // cannot change the views returned by the earlier batch.
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "new-a");
+        try write.commit();
+    }
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
+}
+
 test "lsm backend probe owns active mutable point values during bulk ingest" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1000,
@@ -10148,6 +11307,160 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expect(backend.runs.items.len > 0);
+}
+
+test "lsm backend streams adjacent immutable epochs into one durable publication" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root_dir = "/lsm-windowed-immutable-flush";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .storage = storage.storage(),
+    });
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.put(.{ .name = "docs" }, "doc:b", "present");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "middle");
+        try txn.delete(.{ .name = "docs" }, "doc:b");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.put(.{ .name = "docs" }, "doc:c", "visible");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    try std.testing.expectEqual(@as(usize, 3), backend.activeImmutableMemtableCount());
+    var window_bytes: u64 = 0;
+    for (backend.activeImmutableMemtables()) |state| window_bytes +|= Backend.estimateStateLogicalBytes(state);
+    backend.options.immutable_flush_window_bytes = window_bytes;
+
+    var pinned = try backend.beginRead();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    const manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 3), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(u64, 1), stats.flushes);
+    try std.testing.expectEqual(manifests_before + 1, stats.manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 3), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
+    try std.testing.expectEqualStrings("new", try pinned.get(.{ .name = "docs" }, "doc:a"));
+
+    pinned.abort();
+    pinned_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+    backend.close();
+    backend_open = false;
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, .{ .storage = storage.storage() });
+    defer reopened.close();
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm backend bulk session rolls preserve one wal backed flush window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root_dir = "/lsm-windowed-direct-bulk";
+    const options = Options{
+        .flush_threshold_bytes = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .max_deferred_immutable_memtables = 8,
+        .storage = storage.storage(),
+    };
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_open = true;
+    errdefer if (bulk_open) backend.abortBulkIngestSession();
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.put(.{ .name = "docs" }, "doc:b", "present");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("old", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+
+    const roll_manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    bulk_open = false;
+    try std.testing.expectEqual(roll_manifests_before, backend.snapshotWriteStats().manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("old", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+
+    try backend.beginBulkIngestSession();
+    bulk_open = true;
+
+    var pinned = try backend.beginRead();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.delete(.{ .name = "docs" }, "doc:b");
+        try txn.put(.{ .name = "docs" }, "doc:c", "visible");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("old", try pinned.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("present", try pinned.get(.{ .name = "docs" }, "doc:b"));
+
+    const manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
+    bulk_open = false;
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(u64, 1), stats.flushes);
+    try std.testing.expectEqual(@as(u64, 0), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(manifests_before + 1, stats.manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+
+    pinned.abort();
+    pinned_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+    backend.close();
+    backend_open = false;
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+    defer reopened.close();
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:c"));
 }
 
 test "lsm backend write stats separate wal sync latency from append latency" {
@@ -10250,6 +11563,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
         .flush_threshold = 1000,
         .flush_threshold_bytes = 256,
         .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .direct_bulk_ingest = false,
         .storage = storage.storage(),
     });
     defer backend.close();
@@ -10274,6 +11588,67 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
     try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
     try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
+}
+
+test "lsm backend direct bulk ingest uses base byte threshold" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-bulk-byte-threshold", .{
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+        .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 300;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest honors configured coalesced minimum" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold_bytes = 1024,
+        .read_snapshot_rotate_mutable_bytes = 0,
+        .direct_bulk_ingest_min_bytes = 64,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 100;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest precedes mutable snapshot rotation" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-before-snapshot-rotation", .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .read_snapshot_rotate_mutable_bytes = 1,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", "A");
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.read_snapshot_mutable_rotations);
 }
 
 test "lsm backend write pressure compacts hard L0 debt" {
@@ -10322,7 +11697,9 @@ test "lsm backend write pressure records bounded overload when input budget deni
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try backend.finalizeDeferredStorageWork();
 
     const stats = backend.snapshotWriteStats();
@@ -10358,7 +11735,9 @@ test "lsm backend write pressure can reject when overload remains after budget" 
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try std.testing.expectError(error.WritePressureExceeded, backend.finalizeDeferredStorageWork());
 
     const stats = backend.snapshotWriteStats();
@@ -10367,6 +11746,74 @@ test "lsm backend write pressure can reject when overload remains after budget" 
     try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
     try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
+}
+
+test "lsm backend write pressure honors the configured compaction input budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    const l0_count = countLevelRuns(backend.runs.items, 0);
+    try std.testing.expectEqual(@as(usize, 10), l0_count);
+    const oldest_pair_budget = backend.runs.items[l0_count - 2].size_bytes +|
+        backend.runs.items[l0_count - 1].size_bytes;
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_bytes = oldest_pair_budget;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes <= oldest_pair_budget);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < l0_count);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > backend.options.l0_hard_limit_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+}
+
+test "lsm backend write pressure preserves oversized minimum job progress" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_bytes = 1,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes > backend.options.max_compaction_input_bytes);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 10);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
 }
 
 test "lsm backend maintenance step compacts soft L0 debt" {
@@ -10394,6 +11841,155 @@ test "lsm backend maintenance step compacts soft L0 debt" {
     try std.testing.expect(backend.maintenanceScore() > 0);
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
+test "lsm backend tier-owned L0 avoids low-growth rewrite below hard pressure" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .l0_soft_limit_bytes = 1,
+        .l0_hard_limit_bytes = 2 * 1024 * 1024,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Three publications exceed both soft limits but cannot form a four-way
+    // carry. That is bounded read amplification, not a reason to promote and
+    // rewrite an overlapping lower-level base with less than 4x growth.
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    const before_compactions = backend.compaction_stats.compactions;
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+
+    // Hard pressure remains authoritative and may use ordinary promotion to
+    // guarantee bounded write admission even when a complete tier is absent.
+    backend.options.l0_hard_limit_runs = 2;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(backend.compaction_stats.compactions > before_compactions);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
+}
+
+test "lsm backend hard run pressure prefers a complete geometric L0 carry" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Build four equally sized chronological publication generations while
+    // hard pressure is disabled. They form one complete geometric carry.
+    for (0..4) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 4), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(backend.runs.items, 1));
+
+    backend.options.l0_hard_limit_runs = 3;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try backend.enforceWritePressure();
+
+    try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(backend.runs.items, 1));
+    try std.testing.expectEqual(@as(u64, 1), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.write_pressure_overloads);
+}
+
+test "lsm backend hard run pressure seals meaningful L0 delta without rewriting base" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .bulk_ingest_l0_delta_seal_ratio_denominator = 2,
+    });
+    defer backend.close();
+
+    // Establish an overlapping lower-level base through byte-hard pressure.
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "base");
+        try txn.commit();
+    }
+    backend.options.l0_hard_limit_bytes = 1;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+    backend.options.l0_hard_limit_bytes = 0;
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
+    const setup_overloads = backend.write_stats.write_pressure_overloads;
+    var lower_bytes_before: u64 = 0;
+    for (backend.runs.items) |run| {
+        if (run.level > 0) lower_bytes_before +|= run.size_bytes;
+    }
+
+    // Establish one dominant L0 anchor, then add four smaller newer
+    // generations. At run-hard pressure only the fragmented newer prefix must
+    // seal; neither the anchor nor L1 may be rewritten.
+    var anchor_value: [4096]u8 = undefined;
+    @memset(&anchor_value, 'a');
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", &anchor_value);
+        try txn.commit();
+    }
+    const anchor_run_id = backend.runs.items[0].id;
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "newer");
+        try txn.commit();
+    }
+    const l0_runs_before = countLevelRuns(backend.runs.items, 0);
+    backend.options.l0_hard_limit_runs = 3;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+
+    // The four newer runs become one. The dominant anchor and the small L0
+    // precedence run retained by setup remain separate generations.
+    try std.testing.expectEqual(l0_runs_before - 3, countLevelRuns(backend.runs.items, 0));
+    var retained_anchor = false;
+    for (backend.runs.items) |run| {
+        if (run.id == anchor_run_id) retained_anchor = true;
+    }
+    try std.testing.expect(retained_anchor);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
+    var lower_bytes_after: u64 = 0;
+    for (backend.runs.items) |run| {
+        if (run.level > 0) lower_bytes_after +|= run.size_bytes;
+    }
+    try std.testing.expectEqual(lower_bytes_before, lower_bytes_after);
+    try std.testing.expectEqualStrings("newer", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
+    try std.testing.expectEqual(@as(u64, 2), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(setup_overloads, backend.write_stats.write_pressure_overloads);
 }
 
 test "lsm backend defers soft compaction behind latency-sensitive derived replay" {
@@ -10428,6 +12024,45 @@ test "lsm backend defers soft compaction behind latency-sensitive derived replay
     sleepForTest(550 * std.time.ns_per_ms);
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
+test "lsm backend foreground query defers soft but not hard pressure compaction" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    manager.beginForegroundQuery();
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+
+    // Crossing the hard bound must retain the existing minimum-progress
+    // escape even while a query is active.
+    backend.options.l0_hard_limit_runs = 1;
+    platform.sync.lockYielding(&backend.mu);
+    {
+        defer backend.mu.unlock();
+        try backend.enforceWritePressure();
+    }
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    manager.finishForegroundQuery();
 }
 
 test "lsm backend public maintenance mutators serialize on backend mutex" {
@@ -10465,7 +12100,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             };
 
             const locked = runtime_mod.lockBackend(Backend, backend);
-            const thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+            var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
 
             while (stage.load(.acquire) == 0) {
                 platform.time.yieldBriefly();
@@ -10477,7 +12112,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             const blocked_stage = stage.load(.acquire);
 
             if (locked) runtime_mod.unlockBackend(Backend, backend, locked);
-            thread.join();
+            thread.await(std.testing.io);
             try std.testing.expectEqual(@as(u8, 1), blocked_stage);
             try std.testing.expectEqual(@as(u8, 2), stage.load(.acquire));
         }
@@ -11428,7 +13063,13 @@ test "lsm backend opt-in hard L0 pressure applies during active bulk flush" {
     try std.testing.expect(backend.bulkIngestActive());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 5);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
+    const write_stats = backend.snapshotWriteStats();
+    try std.testing.expect(write_stats.write_pressure_compactions > 0);
+    try std.testing.expectEqual(@as(u64, @intCast(backend.compaction_stats.compactions)), write_stats.compactions);
+    try std.testing.expect(write_stats.compaction_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_output_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_output_bytes > 0);
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
@@ -11855,7 +13496,7 @@ test "lsm backend refreshes stale cached run state indexes after eviction" {
     try std.testing.expectEqual(@as(?usize, 0), backend.runs.items[1].cached_state_index);
 }
 
-test "lsm backend obsolete run cleanup does not invalidate shared cache by path" {
+test "lsm backend obsolete run cleanup invalidates shared cache by path" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
     defer backing.deinit();
@@ -11891,7 +13532,8 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
     const invalidations_before = before.run_state.invalidations +
         before.run_table_raw.invalidations +
         before.run_table_index.invalidations +
-        before.run_table_block.invalidations;
+        before.run_table_block.invalidations +
+        before.run_table_physical_block.invalidations;
     try std.testing.expect(before.entry_count > 0);
 
     {
@@ -11901,21 +13543,23 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         try txn.commit();
     }
 
+    const after = cache.snapshotStats();
+    const invalidations_after = after.run_state.invalidations +
+        after.run_table_raw.invalidations +
+        after.run_table_index.invalidations +
+        after.run_table_block.invalidations +
+        after.run_table_physical_block.invalidations;
+    try std.testing.expect(invalidations_after > invalidations_before);
+    try std.testing.expect(after.entry_count < before.entry_count);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+
     {
         var txn = try runtime.beginRead();
         defer txn.abort();
         try std.testing.expectError(error.NotFound, txn.get("doc:a"));
         try std.testing.expectEqualStrings("B", try txn.get("doc:b"));
     }
-
-    const after = cache.snapshotStats();
-    const invalidations_after = after.run_state.invalidations +
-        after.run_table_raw.invalidations +
-        after.run_table_index.invalidations +
-        after.run_table_block.invalidations;
-    try std.testing.expectEqual(invalidations_before, invalidations_after);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend cache namespaces entries by root generation" {
@@ -13199,6 +14843,104 @@ test "lsm backend async point reads issue overlapping survivors in source order"
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
+test "lsm backend sparse point batches pipeline independent blocks without weakening precedence" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-async-sparse-point-batch";
+    const count = 32;
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            var key_buf: [64]u8 = undefined;
+            for (0..count) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i});
+                try txn.put(key, large_value);
+            }
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("artifact:00000010:dense");
+            try txn.put("artifact:00000011:dense", "newest");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_storage: [count][64]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
+    }
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[10]);
+    try std.testing.expectEqualStrings("newest", values[11].?);
+    try std.testing.expectEqualSlices(u8, large_value, values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, count - 1), stats.get_many_sorted_hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_misses);
+    try std.testing.expect(stats.point_run_async_batches > 0);
+    try std.testing.expect(stats.point_run_async_reads_issued >= 2);
+}
+
+test "lsm backend shares sparse point read fanout across active batches" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-async-shared-fanout", .{
+        .storage = backing.storage(),
+        .max_concurrent_point_block_reads = 16,
+        .target_aggregate_concurrent_point_block_reads = 8,
+    });
+    defer backend.close();
+
+    const expected = [_]usize{ 8, 4, 3, 2, 2 };
+    for (expected) |limit| {
+        try std.testing.expectEqual(limit, backend.acquirePointAsyncBatchLimit(16));
+    }
+    for (expected) |_| backend.releasePointAsyncBatchLimit();
+
+    backend.options.target_aggregate_concurrent_point_block_reads = 0;
+    try std.testing.expectEqual(@as(usize, 16), backend.acquirePointAsyncBatchLimit(16));
+    backend.releasePointAsyncBatchLimit();
+}
+
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -14112,6 +15854,40 @@ test "lsm backend namespace write batch getManySorted merges overlay and committ
     try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
 }
 
+test "lsm backend closed write transactions reject access after terminal commit failure" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    const namespace = backend_types.Namespace{ .name = "docs" };
+    const keys = [_][]const u8{"doc:a"};
+    var values = [_]?[]const u8{null};
+
+    var bound = try runtime_mod.BoundWriteTxn(Backend).open(&backend, namespace);
+    defer {
+        bound.closed = false;
+        bound.abort();
+    }
+    bound.closed = true;
+    try std.testing.expectError(error.TransactionClosed, bound.get("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.getManySorted(&keys, &values));
+    try std.testing.expectError(error.TransactionClosed, bound.put("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.appendPut("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.delete("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.openCursor());
+
+    var namespaced = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+    defer {
+        namespaced.closed = false;
+        namespaced.abort();
+    }
+    namespaced.closed = true;
+    try std.testing.expectError(error.TransactionClosed, namespaced.get(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.getManySorted(namespace, &keys, &values));
+    try std.testing.expectError(error.TransactionClosed, namespaced.put(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.appendPut(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.delete(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.openCursor(namespace));
+}
+
 test "lsm backend bound read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();
@@ -14334,16 +16110,16 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
 
     var ctx = Worker.Context{ .txn = &read };
     const locked = runtime_mod.lockBackend(Backend, &backend);
-    var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
     var joined = false;
-    defer if (!joined) thread.join();
+    defer if (!joined) thread.await(std.testing.io);
 
     while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
     sleepForTest(100 * std.time.ns_per_ms);
     const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
 
     runtime_mod.unlockBackend(Backend, &backend, locked);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(completed_without_backend_lock);
@@ -14351,7 +16127,7 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
     try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
-test "lsm backend getManySorted decodes prefix-compressed blocks once for batch reuse" {
+test "lsm backend getManySorted promotes repeated prefix-block reads for batch reuse" {
     const alloc = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(alloc);
     defer storage.deinit();
@@ -14409,7 +16185,128 @@ test "lsm backend getManySorted decodes prefix-compressed blocks once for batch 
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 
     const cache_stats = cache.snapshotStats();
+    // Adaptive compression may deliberately serve a decoded block without a
+    // distinct physical-cache insertion. This test's semantic contract is
+    // batch prefix reuse; dedicated cache tests cover physical admission.
     try std.testing.expect(cache_stats.run_table_block.inserts > 0);
+}
+
+test "lsm backend getManySorted materializes sparse large prefix values without decoded blocks" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-batch-prefix-sparse-large-values";
+    const count = 96;
+    const stride = 4;
+    const selected_count = count / stride;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:artifact:very-long-shared-prefix:{d:0>6}:dense",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(.{ .name = "docs" }, key, large_value);
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var selected_keys: [selected_count][]const u8 = undefined;
+    for (&selected_keys, 0..) |*key, i| key.* = keys[i * stride];
+    var values: [selected_count]?[]const u8 = [_]?[]const u8{null} ** selected_count;
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, &selected_keys, &values);
+    for (values) |maybe_value| try std.testing.expectEqualSlices(u8, large_value, maybe_value.?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point + stats.get_many_sorted_plan_sorted_by_run);
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
+}
+
+test "lsm backend erased probe honors transient block cache admission" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-probe-transient-block-admission";
+    const count = 24;
+    var keys: [count][64]u8 = undefined;
+    var key_views: [count][]const u8 = undefined;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (&keys, &key_views, 0..) |*key_buf, *key_view, i| {
+            key_view.* = try std.fmt.bufPrint(
+                key_buf,
+                "artifact:shared-prefix:{d:0>8}:dense",
+                .{i},
+            );
+            try txn.put(.{ .name = "docs" }, key_view.*, "vector-payload");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySortedWithBlockCacheAdmission(&key_views, &values, .transient);
+    for (values) |value| try std.testing.expectEqualStrings("vector-payload", value.?);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_physical_block.inserts);
 }
 
@@ -14651,9 +16548,9 @@ test "lsm backend close drains generation readers before teardown" {
     var read = try backend.beginRead();
     var read_released = false;
     var state = CloseState{ .backend = &backend };
-    var thread = try std.Thread.spawn(.{}, CloseState.run, .{&state});
+    var thread = try std.testing.io.concurrent(CloseState.run, .{&state});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
     defer if (!read_released) read.abort();
 
     while (!state.started.load(.acquire)) platform.time.yieldBriefly();
@@ -14663,7 +16560,7 @@ test "lsm backend close drains generation readers before teardown" {
 
     read.abort();
     read_released = true;
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(state.finished.load(.acquire));
 }
@@ -16111,6 +18008,178 @@ test "lsm backend reopen reclaim stress preserves manifest referenced runs" {
     try std.testing.expectEqualStrings("value-7-updated", try txn.get("doc:stable"));
 }
 
+test "lsm backend replay lane snapshots exclude unrelated mutable values" {
+    const alloc = std.testing.allocator;
+    var backend = Backend.init(alloc, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const unrelated = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(unrelated);
+    @memset(unrelated, 'x');
+    const full_text_lane: u8 = 1;
+    const other_lane: u8 = 2;
+    const first_key = internal_keys.replayEntryKey(full_text_lane, 1);
+    const second_key = internal_keys.replayEntryKey(full_text_lane, 3);
+    const other_key = internal_keys.replayEntryKey(other_lane, 2);
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:large", unrelated);
+        try txn.put(first_key[0..], "first");
+        try txn.put(other_key[0..], "other");
+        try txn.put(second_key[0..], "second");
+        try txn.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+    try std.testing.expect(before.mutable_bytes > unrelated.len);
+
+    const Capture = struct {
+        calls: usize = 0,
+        sequence: u64 = 0,
+        value_matches: bool = false,
+
+        fn consume(self: *@This(), sequence: u64, value: []const u8) !void {
+            self.calls += 1;
+            self.sequence = sequence;
+            self.value_matches = std.mem.eql(u8, value, "first");
+        }
+    };
+    var capture = Capture{};
+    const stats = try runtime.forEachReplayLaneFrom(
+        full_text_lane,
+        1,
+        1,
+        &capture,
+        Capture.consume,
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 1), capture.sequence);
+    try std.testing.expect(capture.value_matches);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+
+    const after = backend.snapshotMaintenanceStats();
+    const reason = after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)];
+    // Replay scans freeze the mutable generation into the immutable queue.
+    // They do not clone even the filtered lane, keeping memory proportional
+    // to one authoritative generation rather than scan concurrency.
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+        reason.calls,
+    );
+    try std.testing.expectEqual(
+        before_writes.immutable_rotations + 1,
+        backend.snapshotWriteStats().immutable_rotations,
+    );
+    try std.testing.expectEqual(@as(u64, 0), after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
+}
+
+test "lsm backend persistent replay lane scan snapshots mutable tail once" {
+    const alloc = std.testing.allocator;
+    var backend = Backend.init(alloc, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 2;
+    const first_key = internal_keys.replayEntryKey(lane, 1);
+    const second_key = internal_keys.replayEntryKey(lane, 2);
+    const third_key = internal_keys.replayEntryKey(lane, 3);
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:unrelated", "large-enough-to-detect-a-broad-snapshot");
+        try txn.put(first_key[0..], "first");
+        try txn.put(second_key[0..], "second");
+        try txn.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+    var scan = try runtime.beginReplayLaneScan(lane, 1);
+    defer scan.abort();
+    var cursor = try scan.openCursor();
+    defer cursor.close();
+
+    const lower = internal_keys.replayRangeLower(lane, 1);
+    const upper = internal_keys.replayRangeUpper(lane);
+    cursor.setUpperBound(upper[0..]);
+    const first = (try cursor.seekAtOrAfter(lower[0..])).?;
+    try std.testing.expectEqualStrings("first", first.value);
+    const after_first_window = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1,
+        after_first_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+    );
+
+    // A new commit is outside this cursor's pinned generation. Advancing the
+    // existing cursor across another logical replay window neither clones the
+    // mutable table again nor observes the later generation.
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put(third_key[0..], "third");
+        try txn.commit();
+    }
+    const second = (try cursor.next()).?;
+    try std.testing.expectEqualStrings("second", second.value);
+    try std.testing.expect((try cursor.next()) == null);
+    const after_second_window = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        after_first_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+        after_second_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+    );
+}
+
+test "lsm backend replay lane scans do not retain one-pass data blocks" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-replay-lane-transient-blocks", .{
+        .storage = backing.storage(),
+        .cache = &cache,
+        .flush_threshold = 1,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 1;
+    const key = internal_keys.replayEntryKey(lane, 1);
+    const value = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(value);
+    for (value, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% 17);
+    {
+        var write = try runtime.beginWrite();
+        try write.put(key[0..], value);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expect(backend.runs.items.len > 0);
+
+    const Capture = struct {
+        calls: usize = 0,
+
+        fn consume(self: *@This(), _: u64, replay_value: []const u8) !void {
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 64 * 1024), replay_value.len);
+        }
+    };
+    const before = cache.snapshotStats();
+    var capture = Capture{};
+    const stats = try runtime.forEachReplayLaneFrom(lane, 1, 1, &capture, Capture.consume);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+
+    const after = cache.snapshotStats();
+    try std.testing.expectEqual(before.run_table_block.inserts, after.run_table_block.inserts);
+    try std.testing.expectEqual(before.run_table_physical_block.inserts, after.run_table_physical_block.inserts);
+}
+
 test "lsm backend reader release reclaims expired clean obsolete paths" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -17486,6 +19555,110 @@ test "lsm backend fast split prepares child and rewrites left in place" {
     }
 }
 
+test "lsm backend physical split preserves L0 overwrite and tombstone order" {
+    const alloc = std.testing.allocator;
+    var parent_buf: [256]u8 = undefined;
+    const parent_path = repository_mod.tmpPath(&parent_buf, "split-order-parent");
+    defer repository_mod.cleanupTmp(parent_path);
+    var child_buf: [256]u8 = undefined;
+    const child_path = repository_mod.tmpPath(&child_buf, "split-order-child");
+    defer repository_mod.cleanupTmp(child_path);
+    const options: Options = .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .foreground_soft_compaction = false,
+    };
+    const Check = struct {
+        fn run(backend: *Backend, left: bool) !void {
+            var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+            defer runtime.deinit();
+            var txn = try runtime.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("latest", try txn.get(if (left) "doc:a" else "doc:z"));
+            try std.testing.expectEqualStrings("revived", try txn.get(if (left) "doc:b" else "doc:y"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:c" else "doc:x"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:z" else "doc:a"));
+        }
+    };
+    {
+        var backend = try Backend.open(alloc, std.mem.span(parent_path), options);
+        defer backend.close();
+        // Model an established source whose publication sequence is much
+        // higher than the number of physical files surviving the split.
+        backend.next_run_id = 1000;
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            for ([_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:x", "doc:y", "doc:z" }) |key| try txn.put(key, "old");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "middle");
+            try txn.put("doc:z", "middle");
+            for ([_][]const u8{ "doc:b", "doc:c", "doc:x", "doc:y" }) |key| try txn.delete(key);
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        // Newer left-only and right-only runs must retain precedence over
+        // replacements of older straddling runs, including old tombstones.
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "latest");
+            try txn.put("doc:b", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:z", "latest");
+            try txn.put("doc:y", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        try std.testing.expectEqual(@as(usize, 4), backend.runs.items.len);
+        for (backend.runs.items) |run| try std.testing.expectEqual(@as(u32, 0), run.level);
+        try std.testing.expect(try backend.prepareSplitRightToDir("doc:m", std.mem.span(child_path), options));
+        try std.testing.expect(try backend.rewriteLeftInPlace("doc:m"));
+        try Check.run(&backend, true);
+    }
+    for ([_]bool{ true, false }) |left| {
+        var reopened = try Backend.open(alloc, std.mem.span(if (left) parent_path else child_path), options);
+        defer reopened.close();
+        try Check.run(&reopened, left);
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        try txn.put("doc:z", "child overwrite");
+        try txn.delete("doc:y");
+        try txn.put("doc:x", "child revival");
+        try txn.commit();
+        try child.flushMutable();
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("child overwrite", try txn.get("doc:z"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:y"));
+        try std.testing.expectEqualStrings("child revival", try txn.get("doc:x"));
+    }
+}
+
 test "lsm backend shard rewrites preserve the configured physical run cap" {
     var parent_buf: [256]u8 = undefined;
     const parent_path = repository_mod.tmpPath(&parent_buf, "split-bounded-parent");
@@ -17832,4 +20005,53 @@ test "lsm backend obsolete publication is allocation free after reservation" {
         failing.resize_fail_index = std.math.maxInt(usize);
     }
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "lsm internal flush worker scheduling failure releases an opened backend" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = unavailable.io() },
+    ));
+    // Failed startup must also release writer ownership so the root reopens.
+    var reopened = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = std.testing.io },
+    );
+    defer reopened.close();
+    try std.testing.expect(reopened.internal_flush_worker.?.owned_io == null);
+}
+
+test "lsm internal flush worker distinguishes stop from drain" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend: Backend = undefined;
+    try backend.openInto(std.testing.allocator, "/lsm-flush-stop-drain", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    var txn = try backend.beginWrite();
+    try txn.put(.{}, "key", "value");
+    try txn.commit();
+
+    var worker = InternalFlushWorker.init(&backend, std.testing.io);
+    defer worker.deinit();
+    worker.stopAndJoin(false);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotMaintenanceStats().immutable_memtables);
+    worker.stopAndJoin(true);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().immutable_memtables);
+    try std.testing.expect(backend.snapshotMaintenanceStats().total_runs > 0);
 }

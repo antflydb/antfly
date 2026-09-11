@@ -283,8 +283,8 @@ const ApplyRecorder = struct {
     snapshot_prepare_failures_remaining: usize = 0,
     materialized_groups: [8]std.atomic.Value(core.types.GroupId) = [_]std.atomic.Value(core.types.GroupId){.init(0)} ** 8,
     block_snapshot_materialization: bool = false,
-    snapshot_materialization_started: std.atomic.Value(bool) = .init(false),
-    release_snapshot_materialization: std.atomic.Value(bool) = .init(false),
+    snapshot_materialization_started: std.Io.Event = .unset,
+    release_snapshot_materialization: std.Io.Event = .unset,
     materialize_artifact: bool = false,
 
     const PreparedSnapshot = struct {
@@ -314,10 +314,8 @@ const ApplyRecorder = struct {
                 return error.InjectedSnapshotBuildFailure;
             }
             if (self.recorder.block_snapshot_materialization) {
-                self.recorder.snapshot_materialization_started.store(true, .release);
-                while (!self.recorder.release_snapshot_materialization.load(.acquire)) {
-                    std.Thread.yield() catch {};
-                }
+                self.recorder.snapshot_materialization_started.set(std.testing.io);
+                self.recorder.release_snapshot_materialization.waitUncancelable(std.testing.io);
             }
             const bytes = try std.fmt.allocPrint(alloc, "applied-state-{d}", .{self.applied_index});
             if (!self.recorder.materialize_artifact) return .{ .bytes = bytes };
@@ -334,7 +332,7 @@ const ApplyRecorder = struct {
 
         fn cancel(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.recorder.release_snapshot_materialization.store(true, .release);
+            self.recorder.release_snapshot_materialization.set(std.testing.io);
         }
     };
 
@@ -1155,7 +1153,7 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
         .alloc = std.testing.allocator,
         .block_snapshot_materialization = true,
     };
-    defer apply_recorder.release_snapshot_materialization.store(true, .release);
+    defer apply_recorder.release_snapshot_materialization.set(std.testing.io);
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .applied_log_retained_entries = 1,
@@ -1173,12 +1171,12 @@ test "multi raft cancels and drops a snapshot from a retired group incarnation" 
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 64));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
     try std.testing.expect(host.removeGroup(64));
-    try std.testing.expect(apply_recorder.release_snapshot_materialization.load(.acquire));
+    try std.testing.expect(apply_recorder.release_snapshot_materialization.isSet());
     try storage_recorder.registerStore(64, &replacement_store);
     try addSingleNodeGroup(&host, 64, &replacement_store, false);
 
@@ -1335,14 +1333,14 @@ test "multi raft shutdown cancels a blocked snapshot materialization" {
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 70));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
 
     host.deinit();
     host_live = false;
-    try std.testing.expect(apply_recorder.release_snapshot_materialization.load(.acquire));
+    try std.testing.expect(apply_recorder.release_snapshot_materialization.isSet());
 }
 
 test "multi raft snapshot scheduling is fair when a hot group requeues" {
@@ -1358,7 +1356,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
         .alloc = std.testing.allocator,
         .block_snapshot_materialization = true,
     };
-    defer apply_recorder.release_snapshot_materialization.store(true, .release);
+    defer apply_recorder.release_snapshot_materialization.set(std.testing.io);
 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .applied_log_retained_entries = 1,
@@ -1379,10 +1377,10 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 66));
 
     const start_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
-    while (!apply_recorder.snapshot_materialization_started.load(.acquire) and clock.monotonicNs() < start_deadline) {
+    while (!apply_recorder.snapshot_materialization_started.isSet() and clock.monotonicNs() < start_deadline) {
         sleepOneMillisecond();
     }
-    try std.testing.expect(apply_recorder.snapshot_materialization_started.load(.acquire));
+    try std.testing.expect(apply_recorder.snapshot_materialization_started.isSet());
     try host.propose(67, "cold");
     try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 67));
     for (1..5) |i| {
@@ -1391,7 +1389,7 @@ test "multi raft snapshot scheduling is fair when a hot group requeues" {
         try std.testing.expectEqual(@as(usize, 1), try drainGroup(&host, 66));
     }
 
-    apply_recorder.release_snapshot_materialization.store(true, .release);
+    apply_recorder.release_snapshot_materialization.set(std.testing.io);
     const completion_deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (apply_recorder.snapshot_materializations.load(.acquire) < 3 and clock.monotonicNs() < completion_deadline) {
         _ = try host.drainReady(0);
@@ -1802,7 +1800,10 @@ test "multi raft fetches snapshot through snapshot transport and steps it into t
 
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
 
-    const root_dir = "/tmp/antflydb-raft-runtime-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -1929,7 +1930,10 @@ test "multi raft ensureReplica can fetch snapshot bootstrap" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-ensure-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -2001,7 +2005,10 @@ test "multi raft rejects snapshot bootstrap above aggregate ownership budget" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-reject-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
     var voters = [_]core.types.NodeId{ 1, 2 };
@@ -2113,7 +2120,10 @@ test "multi raft limit backpressure denies oversized snapshot ready" {
     defer storage_recorder.deinit();
     try storage_recorder.registerStore(134, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-limit-backpressure";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -3015,7 +3025,10 @@ test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" 
     defer factory.deinit();
     try factory.registerStore(142, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-catalog-rejoin";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -3120,4 +3133,204 @@ test "multi raft restoreReplicasFromCatalog works with file replica catalog" {
 
     try std.testing.expectEqual(@as(usize, 1), try host.restoreReplicasFromCatalog(std.testing.allocator));
     try std.testing.expectEqual(@as(core.types.Index, 3), host.group(143).?.status().hard.commit_index);
+}
+
+fn exerciseApplyDeferral(queued: bool, budget: usize, fatal: bool) !void {
+    var store_a = core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(51, &store_a);
+    try storage_recorder.registerStore(52, &store_b);
+
+    var apply_recorder = RetryableApplyRecorder{ .failure = if (fatal) error.InjectedApplyFailure else error.WriterBusy };
+    var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{ .max_apply_tasks_per_round = budget, .applied_log_retained_entries = 0 }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = if (queued) null else apply_recorder.iface(),
+        .apply_queue = if (queued) apply_recorder.queue() else null,
+        .transport = transport_recorder.iface(),
+    });
+    defer host.deinit();
+
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 51,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 51,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store_a.storage(),
+    });
+    try host.addGroup(.{
+        .group_id = 52,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 52,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store_b.storage(),
+    });
+
+    try host.group(51).?.campaign();
+    try host.group(52).?.campaign();
+
+    // A deferred snapshot fences its later entry and read barrier. The healthy
+    // group's read must complete while that snapshot is still unavailable.
+    const alloc = std.testing.allocator;
+    try host.pending_apply.append(alloc, .{
+        .group_id = 51,
+        .snapshot = .{ .data = &.{}, .metadata = .{ .index = 1, .term = 1 } },
+        .entries = &.{},
+        .read_states = &.{},
+        .conf_state = null,
+        .approx_bytes = 0,
+    });
+    try host.pending_apply.append(alloc, .{
+        .group_id = 51,
+        .snapshot = null,
+        .entries = try alloc.dupe(core.Entry, &.{.{ .term = 1, .index = 2 }}),
+        .read_states = try alloc.dupe(core.ReadState, &.{.{ .index = 2, .request_ctx = try alloc.dupe(u8, "blocked-read") }}),
+        .conf_state = null,
+        .approx_bytes = 0,
+    });
+    try host.pending_apply.append(alloc, .{
+        .group_id = 52,
+        .snapshot = null,
+        .entries = &.{},
+        .read_states = try alloc.dupe(core.ReadState, &.{.{ .index = 0, .request_ctx = try alloc.dupe(u8, "healthy-read") }}),
+        .conf_state = null,
+        .approx_bytes = 0,
+    });
+    if (fatal) {
+        try std.testing.expectError(error.InjectedApplyFailure, host.runRound(2, 8));
+        try std.testing.expectEqual(@as(usize, 0), transport_recorder.sent_messages);
+        try std.testing.expectEqual(@as(usize, 0), apply_recorder.healthy_reads);
+    } else {
+        for (0..3) |_| _ = try host.runRound(2, 8);
+        try std.testing.expect(transport_recorder.sent_messages > 0);
+        try std.testing.expectEqual(@as(usize, 1), apply_recorder.healthy_reads);
+        try std.testing.expectEqual(@as(usize, 0), apply_recorder.blocked_reads);
+        try std.testing.expectEqual(@as(usize, 0), apply_recorder.applied_count);
+        try std.testing.expectEqual(@as(usize, 2), host.pending_apply.items.len);
+    }
+    apply_recorder.failure = null;
+    for (0..4) |_| _ = try host.runRound(2, 8);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, apply_recorder.applied[0..apply_recorder.applied_count]);
+    try std.testing.expectEqual(@as(usize, 1), apply_recorder.blocked_reads);
+    try std.testing.expectEqual(@as(usize, 1), apply_recorder.healthy_reads);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_apply.items.len);
+}
+
+const RetryableApplyRecorder = struct {
+    failure: ?anyerror,
+    applied: [4]u64 = @splat(0),
+    applied_count: usize = 0,
+    healthy_reads: usize = 0,
+    blocked_reads: usize = 0,
+    queued_result: ?runtime.storage_iface.ApplyDrainResult = null,
+
+    fn iface(self: *@This()) runtime.storage_iface.StateMachine {
+        return .{ .ptr = self, .vtable = &.{ .apply_ready = apply, .is_apply_retryable = retryable } };
+    }
+
+    fn retryable(_: *anyopaque, _: u64, err: anyerror) bool {
+        return err == error.WriterBusy;
+    }
+
+    fn apply(ptr: *anyopaque, group_id: u64, snapshot: ?core.types.Snapshot, entries: []const core.Entry, reads: []const core.ReadState) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (group_id == 51) {
+            if (self.failure) |err| return err;
+            const index = if (snapshot) |value| value.metadata.index else if (entries.len > 0) entries[entries.len - 1].index else 0;
+            if (index != 0) {
+                self.applied[self.applied_count] = index;
+                self.applied_count += 1;
+            }
+            self.blocked_reads += reads.len;
+        } else {
+            self.healthy_reads += reads.len;
+        }
+    }
+
+    fn queue(self: *@This()) runtime.storage_iface.ApplyQueue {
+        return .{ .ptr = self, .vtable = &.{ .enqueue_apply = enqueue, .drain = drain, .abort = abortQueue, .is_apply_retryable = retryable } };
+    }
+
+    fn enqueue(ptr: *anyopaque, group_id: u64, snapshot: ?core.types.Snapshot, entries: []const core.Entry, reads: []const core.ReadState) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (apply(ptr, group_id, snapshot, entries, reads)) |_| {
+            self.queued_result = .{ .completed = 1 };
+        } else |err| {
+            self.queued_result = .{ .completed = 0, .failure = err };
+        }
+    }
+
+    fn drain(ptr: *anyopaque) runtime.storage_iface.ApplyDrainResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.queued_result.?;
+    }
+
+    fn abortQueue(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.queued_result = null;
+    }
+};
+
+test "multi raft retryable apply preserves healthy transport and read completion" {
+    for ([_]bool{ false, true }) |queued| try exerciseApplyDeferral(queued, 8, false);
+}
+
+test "multi raft retryable apply remains fair with a one-task budget" {
+    for ([_]bool{ false, true }) |queued| try exerciseApplyDeferral(queued, 1, false);
+}
+
+test "multi raft fatal apply still stops the host turn" {
+    for ([_]bool{ false, true }) |queued| try exerciseApplyDeferral(queued, 8, true);
+}
+
+test "multi raft retryable async apply acknowledges only completed groups" {
+    for ([_]bool{ false, true }) |queued| {
+        var blocked_store = core.MemoryStorage.init(std.testing.allocator);
+        defer blocked_store.deinit();
+        var healthy_store = core.MemoryStorage.init(std.testing.allocator);
+        defer healthy_store.deinit();
+        var storage = StorageRecorder{ .alloc = std.testing.allocator };
+        defer storage.deinit();
+        try storage.registerStore(51, &blocked_store);
+        try storage.registerStore(52, &healthy_store);
+        var apply = RetryableApplyRecorder{ .failure = error.WriterBusy };
+        var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+            .group_storage = storage.iface(),
+            .state_machine = if (queued) null else apply.iface(),
+            .apply_queue = if (queued) apply.queue() else null,
+        });
+        defer host.deinit();
+        try addSingleNodeGroup(&host, 51, &blocked_store, true);
+        try addSingleNodeGroup(&host, 52, &healthy_store, true);
+        try host.group(51).?.campaign();
+        try host.group(52).?.campaign();
+        for (0..3) |_| _ = try host.drainReady(8);
+        try std.testing.expectEqual(@as(u64, 0), host.group(51).?.status().applied_index);
+        try std.testing.expectEqual(@as(u64, 1), host.group(52).?.status().applied_index);
+        try std.testing.expectEqual(@as(usize, 0), apply.applied_count);
+        apply.failure = null;
+        for (0..3) |_| _ = try host.drainReady(8);
+        try std.testing.expectEqual(@as(u64, 1), host.group(51).?.status().applied_index);
+        try std.testing.expectEqual(@as(usize, 1), apply.applied_count);
+        try std.testing.expectEqual(@as(usize, 0), host.pending_apply.items.len);
+    }
 }

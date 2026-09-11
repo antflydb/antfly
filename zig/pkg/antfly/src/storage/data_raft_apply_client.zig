@@ -138,6 +138,18 @@ pub const RaftApplyStore = struct {
         return try projection_wire.decodeSplitControlAlloc(alloc, response.slice());
     }
 
+    pub fn currentMergeSourceState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?projection_wire.AppliedMergeSourceState {
+        var response = try self.projection(.{ .kind = .current_merge_source, .group_id = group_id });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try std.json.parseFromSliceLeaky(?projection_wire.AppliedMergeSourceState, alloc, response.slice(), .{ .allocate = .alloc_always });
+    }
+
+    pub fn currentMergeReceiverState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?@import("db/merge_contract.zig").State {
+        var response = try self.projection(.{ .kind = .current_merge_receiver, .group_id = group_id });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try std.json.parseFromSliceLeaky(?@import("db/merge_contract.zig").State, alloc, response.slice(), .{ .allocate = .alloc_always });
+    }
+
     pub fn currentSplitState(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,

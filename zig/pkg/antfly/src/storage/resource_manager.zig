@@ -17,6 +17,10 @@ const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
+pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+const admission = @import("admission_waiter.zig");
+const dense_perf = @import("dense_perf_experiments.zig");
+pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
 const MiB: u64 = 1024 * 1024;
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
@@ -28,6 +32,14 @@ const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
 const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
+const foreground_query_maintenance_quiet_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_write_maintenance_quiet_ns: u64 = 2 * std.time.ns_per_ms;
+// A two-millisecond cap is shorter than one cold vector query and lets a
+// multi-GiB compactor repeatedly reclaim the storage device before the query
+// can fault its native posting/vector pages. Fifty milliseconds still gives a
+// sustained query stream bounded compaction progress at every merge quantum,
+// while allowing ordinary foreground reads to finish in one yield window.
+const foreground_query_compaction_yield_max_ns: u64 = 50 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -74,6 +86,11 @@ else
     };
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
+// Percentage-only reserves strand tens or hundreds of GiB on large volumes
+// and can prevent the small repair that restores query service. Planned
+// candidate bytes are reserved independently, so this cap is additional
+// emergency durability headroom rather than the maintenance work budget.
+const default_disk_safety_floor_max_bytes: u64 = 16 * 1024 * MiB;
 
 pub const Slice = enum(u8) {
     lsm_block_table_cache,
@@ -106,6 +123,17 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    /// Transient heap used to project primary embedding artifacts into an
+    /// immutable mmap exact-vector generation. This is separate from dense
+    /// apply so readiness publication cannot consume foreground mutation
+    /// admission, and every builder allocation remains inside the aggregate
+    /// host-memory envelope.
+    dense_vector_block_build_working_set,
+    dense_source_payload_state,
+    /// Pending persistent object-range cache writes. The durable bytes use
+    /// the capacity-domain ledger; this slice owns only queued key/payload
+    /// memory until the cache worker completes or drops the write.
+    lake_range_cache_queue,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -139,6 +167,9 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
+            .dense_source_payload_state => "dense.source_payload_state",
+            .lake_range_cache_queue => "lake.range_cache_queue",
         };
     }
 };
@@ -307,22 +338,32 @@ pub const Options = struct {
     /// These are runtime policy values, not index or API configuration.
     derived_backlog_high_sequences: usize = 200,
     derived_backlog_resume_sequences: usize = 100,
-    /// Bound how much sequence-only replay debt one foreground admission must
-    /// inherit. Byte and aggregate LSM pressure can still request a larger
-    /// drain; this window only prevents a healthy async index backlog from
-    /// concentrating minutes of work into one public write acknowledgement.
+    /// Bound the asynchronous urgency target emitted when sequence-only replay
+    /// debt crosses its high watermark. Foreground requests never drain this
+    /// window themselves; payload plus tracker metadata remain independently
+    /// bounded by the derived-backlog byte budget.
     derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
-    /// index configuration. The larger of the fixed floor and this fraction
-    /// of observed capacity is kept available for WAL, checkpoints, and
-    /// foreground durability.
+    /// index configuration. The larger of the fixed floor and the bounded
+    /// capacity fraction is kept available for WAL, checkpoints, and
+    /// foreground durability. A zero max preserves an uncapped fraction.
     disk_safety_floor_bytes: u64 = default_disk_safety_floor_bytes,
     disk_safety_floor_divisor: u64 = default_disk_safety_floor_divisor,
+    disk_safety_floor_max_bytes: u64 = default_disk_safety_floor_max_bytes,
     /// Internal query-embedding cache policy. Serving layers consume this
     /// policy but cannot override it independently of the node manager.
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
     query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
     query_embedding_max_inflight: usize = 16,
+    /// Node-wide bandwidth budget for concurrently scanning dense candidate
+    /// planes. Null derives the budget from the dense-search soft byte limit;
+    /// zero disables bandwidth admission. This is intentionally separate from
+    /// retained-memory accounting: permits model bytes simultaneously streamed
+    /// through shared caches and memory channels.
+    dense_search_bandwidth_capacity_bytes: ?u64 = null,
+    /// Additional std.Io read workers, beyond already-admitted query callers.
+    /// Null derives from logical CPUs; zero keeps caller-only execution.
+    dense_read_extra_task_limit: ?u32 = null,
     /// Allocates identity tables and the reclaimer registry only as concurrent
     /// owners exceed their previous high-water mark. Production owners should
     /// pass their lifetime allocator; the page allocator keeps lightweight
@@ -330,76 +371,81 @@ pub const Options = struct {
     identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
-        return .{
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
-            // ModelManager owns hardware-aware host/backend limits. These
-            // owner-bridge slices are unlimited by default, while deployments
-            // may set coordinated node budgets through ResourceManager options.
-            .{},
-            .{},
-            .{},
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Budget).init(.{
+            .lsm_block_table_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_compaction_work = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_table_builder_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_in_memory_state = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_wal_write_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .lsm_wal_retention = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
+            .lsm_recovery_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .hbc_node_metadata_cache = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .dense_search_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .dense_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_routing_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_replay_window = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .full_text_pending_segments = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .full_text_build_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .full_text_segment_residency = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .document_extraction_working_set = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_backlog = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .text_merge_buffers = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .algebraic_tensor_accumulators = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .sparse_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lite_native_page_cache = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
+            .lite_native_link_cache = .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
+            .lite_docstore_snapshot_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .inference_prompt_cache = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .inference_tokenizer_cache = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .inference_model_residency = .{},
+            .inference_kv_working_set = .{},
+            .inference_scratch_working_set = .{},
+            .dense_repair_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .shard_transition_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_vector_block_build_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .dense_source_payload_state = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
+            .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+        }).values;
     }
 
     pub fn defaultPolicies() [slice_count]Policy {
-        return .{
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .report },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Policy).init(.{
+            .lsm_block_table_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lsm_compaction_work = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_table_builder_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_in_memory_state = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .lsm_wal_write_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_wal_retention = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_recovery_working_set = .{ .soft_action = .report, .hard_action = .report },
+            .hbc_node_metadata_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .dense_search_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_routing_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .derived_replay_window = .{ .soft_action = .report, .hard_action = .reject_work },
+            .full_text_pending_segments = .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
+            .full_text_build_working_set = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .full_text_segment_residency = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .document_extraction_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .derived_backlog = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .text_merge_buffers = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .algebraic_tensor_accumulators = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .sparse_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lite_native_page_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_native_link_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_docstore_snapshot_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_prompt_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_tokenizer_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_model_residency = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_kv_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_scratch_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_repair_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .shard_transition_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .dense_vector_block_build_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_source_payload_state = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
+        }).values;
     }
 };
 
@@ -422,7 +468,49 @@ pub const Stats = struct {
     slices: [slice_count]SliceStats,
     reclaim_requests: u64 = 0,
     reclaimed_bytes: u64 = 0,
+    dense_search_admission: DenseSearchAdmissionStats = .{},
+    dense_read_tasks: DenseReadTaskStats = .{},
 };
+
+pub const DenseReadTaskStats = struct {
+    limit: u32 = 0,
+    active: u32 = 0,
+    peak_active: u32 = 0,
+    denied: u64 = 0,
+};
+
+pub const DenseSearchAdmissionStats = struct {
+    capacity_bytes: u64 = 0,
+    active_bytes: u64 = 0,
+    peak_active_bytes: u64 = 0,
+    active_queries: u64 = 0,
+    peak_active_queries: u64 = 0,
+    queued_queries: u64 = 0,
+    peak_queued_queries: u64 = 0,
+    admissions: u64 = 0,
+    waits: u64 = 0,
+    cancellations: u64 = 0,
+    wait_ns: u64 = 0,
+};
+
+pub const DenseSearchCancellation = admission.Cancellation;
+
+pub const DenseSearchAdmissionLease = struct {
+    manager: ?*ResourceManager = null,
+    bytes: u64 = 0,
+
+    pub fn release(self: *@This()) void {
+        const manager = self.manager orelse return;
+        manager.releaseDenseSearchBandwidth(self.bytes);
+        self.* = .{};
+    }
+};
+
+const DenseSearchWaiters = admission.Fifo(struct {
+    bytes: u64,
+    enqueued_ns: u64,
+});
+const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
     used_bytes: u64 = 0,
@@ -561,6 +649,7 @@ const DerivedRecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
@@ -651,7 +740,25 @@ pub const ReclaimerOptions = struct {
     weight: u32 = 1,
 };
 
+test "dense aggregate resource manager bounds callers and helpers together" {
+    var manager = ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
+    defer manager.deinit(std.testing.allocator);
+    manager.dense_aggregate_admission = true;
+    manager.dense_driver_admission.capacity = 2;
+    var caller = try manager.dense_driver_admission.acquire(null, null);
+    defer caller.release();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    try std.testing.expect(!manager.tryAcquireDenseReadTask());
+    try std.testing.expectEqual(@as(u32, 1), manager.denseReadTaskStats().active);
+    manager.releaseDenseReadTask();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    manager.releaseDenseReadTask();
+    caller.release();
+    manager.dense_driver_admission.assertIdle();
+}
+
 pub const ResourceManager = struct {
+    dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
     // Slots are never compacted while the manager is live: an invocation can
@@ -669,6 +776,52 @@ pub const ResourceManager = struct {
     memory: MutableMemory,
     latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
     latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_query_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_write_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
+    dense_search_bandwidth_capacity_bytes: u64 = 0,
+    dense_search_active_bytes: u64 = 0,
+    dense_search_peak_active_bytes: u64 = 0,
+    dense_search_active_queries: u64 = 0,
+    dense_search_peak_active_queries: u64 = 0,
+    dense_search_waiters: DenseSearchWaiters = .{},
+    dense_search_queued_queries: u64 = 0,
+    dense_search_peak_queued_queries: u64 = 0,
+    dense_search_admissions: u64 = 0,
+    dense_search_waits: u64 = 0,
+    dense_search_cancellations: u64 = 0,
+    dense_search_wait_ns: u64 = 0,
+    dense_read_extra_task_limit: u32 = 0,
+    dense_rerank_admission: DenseWorkAdmission.Queue = .{},
+    dense_driver_admission: DenseWorkAdmission.Queue = .{},
+    dense_aggregate_admission: bool = false,
+    dense_phase_admission: bool = false,
+    dense_scan_prediction: bool = false,
+    dense_fused_no_copy: bool = false,
+    dense_angular_bounds: bool = false,
+    dense_quantized_routing: bool = false,
+    dense_centered_routing: bool = false,
+    dense_subgroup_count: u8 = 0,
+    dense_subgroup_routing: bool = false,
+    dense_global_subgroup_routing: bool = false,
+    dense_compact_subgroup_routing: bool = false,
+    dense_certified_subgroups: bool = false,
+    dense_deferred_source_capture: bool = false,
+    dense_coalesced_replay_deletes: bool = false,
+    dense_reused_delete_vectors: bool = false,
+    dense_stable_posting_origins: bool = false,
+    dense_posting_row_deltas: bool = false,
+    dense_projection_pages_enabled: bool = false,
+    dense_projection_borrow_enabled: bool = false,
+    dense_projection_trace_enabled: bool = false,
+    dense_grouped_fallbacks: bool = false,
+    dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
+    dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
+    dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -679,6 +832,7 @@ pub const ResourceManager = struct {
     derived_backlog_throttle_window_sequences: usize,
     disk_safety_floor_bytes: u64,
     disk_safety_floor_divisor: u64,
+    disk_safety_floor_max_bytes: u64,
     capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
     query_embedding_cache_budget: cache_budget.CacheBudget,
     query_embedding_cache_ttl_ns: u64,
@@ -712,15 +866,98 @@ pub const ResourceManager = struct {
             .derived_backlog_throttle_window_sequences = options.derived_backlog_throttle_window_sequences,
             .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
             .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
+            .disk_safety_floor_max_bytes = options.disk_safety_floor_max_bytes,
             .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
+            .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
+                options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
+            .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
+                @intCast(@min(std.math.maxInt(u32), (std.Thread.getCpuCount() catch 1) *| 2)),
+            .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
+            .dense_phase_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_PHASE_ADMISSION"),
+            .dense_scan_prediction = dense_perf.enabled("ANTFLY_EXPERIMENT_SCAN_PREDICTION"),
+            .dense_fused_no_copy = dense_perf.enabled("ANTFLY_EXPERIMENT_FUSED_NO_COPY"),
+            .dense_angular_bounds = dense_perf.enabled("ANTFLY_EXPERIMENT_ANGULAR_BOUNDS"),
+            .dense_quantized_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_QUANTIZED_ROUTING"),
+            .dense_centered_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_CENTERED_ROUTING"),
+            .dense_subgroup_count = if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_16")) 16 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_8")) 8 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_4")) 4 else 0,
+            .dense_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"),
+            .dense_global_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"),
+            .dense_compact_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING"),
+            .dense_certified_subgroups = dense_perf.enabled("ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"),
+            .dense_deferred_source_capture = dense_perf.enabled("ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"),
+            .dense_coalesced_replay_deletes = dense_perf.enabled("ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES"),
+            .dense_reused_delete_vectors = dense_perf.enabled("ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"),
+            .dense_stable_posting_origins = dense_perf.enabled("ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS"),
+            .dense_posting_row_deltas = dense_perf.enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS"),
+            .dense_projection_pages_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_PAGES"),
+            .dense_projection_borrow_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_BORROW"),
+            .dense_projection_trace_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_TRACE"),
+            .dense_grouped_fallbacks = dense_perf.enabled("ANTFLY_EXPERIMENT_GROUPED_FALLBACKS"),
             .identity_allocator = options.identity_allocator,
         };
     }
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    pub fn projectionPageCache(self: *ResourceManager) ?*ProjectionPageCache.Cache {
+        if (!self.dense_projection_pages_enabled) return null;
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        if (!self.dense_projection_pages_mutex.tryLock()) return null;
+        defer self.dense_projection_pages_mutex.unlock();
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        const cache = ProjectionPageCache.Cache.create(self) catch return null;
+        self.dense_projection_pages.store(cache, .release);
+        return cache;
+    }
+
+    /// Optional parallelism is nonblocking. The admitted query caller always
+    /// drains its queue, so no generation/scratch lease waits for more workers.
+    pub fn tryAcquireDenseReadTask(self: *ResourceManager) bool {
+        var driver: DenseWorkAdmission.Queue.Lease = .{};
+        if (self.dense_aggregate_admission) {
+            driver = self.dense_driver_admission.tryAcquire() orelse {
+                _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+                return false;
+            };
+        }
+        var granted = false;
+        defer if (!granted) driver.release();
+        var active = self.dense_read_extra_tasks.load(.monotonic);
+        while (active < self.dense_read_extra_task_limit) {
+            if (self.dense_read_extra_tasks.cmpxchgWeak(active, active + 1, .acquire, .monotonic)) |updated| {
+                active = updated;
+            } else {
+                _ = self.dense_read_peak_extra_tasks.fetchMax(active + 1, .monotonic);
+                granted = true;
+                return true;
+            }
+        }
+        _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    pub fn releaseDenseReadTask(self: *ResourceManager) void {
+        const previous = self.dense_read_extra_tasks.fetchSub(1, .release);
+        std.debug.assert(previous != 0);
+        if (self.dense_aggregate_admission) {
+            var driver: DenseWorkAdmission.Queue.Lease = .{ .queue = &self.dense_driver_admission };
+            driver.release();
+        }
+    }
+
+    pub fn denseReadTaskStats(self: *const ResourceManager) DenseReadTaskStats {
+        return .{
+            .limit = self.dense_read_extra_task_limit,
+            .active = self.dense_read_extra_tasks.load(.monotonic),
+            .peak_active = self.dense_read_peak_extra_tasks.load(.monotonic),
+            .denied = self.dense_read_denied_tasks.load(.monotonic),
+        };
     }
 
     pub fn registerReclaimer(
@@ -785,7 +1022,7 @@ pub const ResourceManager = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
     }
@@ -806,7 +1043,7 @@ pub const ResourceManager = struct {
     /// therefore publish their byte decreases through normal accounting APIs.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
         if (additional_bytes == 0) return 0;
-        const target_bytes = blk: {
+        const targets = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
             const memory_hard = self.memory.budget.hard_limit_bytes;
@@ -816,19 +1053,21 @@ pub const ResourceManager = struct {
                 (self.memory.used_bytes +| additional_bytes) -| memory_hard;
             const requester_state = &self.slices[sliceIndex(requester)];
             const slice_hard = requester_state.budget.hard_limit_bytes;
-            // Dense scratch and HBC metadata both have reclaimers in their own
-            // slices. Do not evict unrelated caches for a hard-limit violation
-            // they cannot resolve.
+            // These slices mix active allocations with reclaimable retained
+            // state. Satisfy their slice pressure before aggregate pressure:
+            // evicting an unrelated cache cannot raise this slice's ceiling.
             const requester_slice_reclaimable = requester == .dense_search_working_set or
-                requester == .hbc_node_metadata_cache;
+                requester == .hbc_node_metadata_cache or
+                requester == .document_extraction_working_set;
             const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
             else
                 (requester_state.used_bytes +| additional_bytes) -| slice_hard;
             const target = @max(memory_target, slice_target);
             if (target == 0) return 0;
-            break :blk target;
+            break :blk .{ .total = target, .slice = slice_target };
         };
+        const target_bytes = targets.total;
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
@@ -849,10 +1088,21 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        for ([_]Slice{ .dense_search_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
+        for (candidates, 0..) |candidate_slice, candidate_index| {
+            if (candidate_index == 0) {
+                if (targets.slice == 0) continue;
+            } else if (targets.slice != 0) {
+                // The first pass is the only one that can resolve local
+                // pressure. Do not discard useful unrelated cache contents
+                // when live owners prevented that pass from making progress.
+                if (reclaimed < targets.slice) break;
+                if (candidate_slice == requester) continue;
+            }
             if (candidate_slice == requester and
                 candidate_slice != .dense_search_working_set and
-                candidate_slice != .hbc_node_metadata_cache) continue;
+                candidate_slice != .hbc_node_metadata_cache and
+                candidate_slice != .document_extraction_working_set) continue;
             var remaining_weight: u64 = 0;
             lockAtomic(&self.reclaimer_mutex);
             for (0..scan_len) |offset| {
@@ -924,6 +1174,188 @@ pub const ResourceManager = struct {
     pub fn shouldDeferSoftCompactionForDerivedReplay(self: *const ResourceManager) bool {
         if (self.latency_sensitive_derived_replay_sessions.load(.acquire) != 0) return true;
         return platform_time.monotonicNs() < self.latency_sensitive_derived_replay_quiet_until_ns.load(.acquire);
+    }
+
+    /// Foreground searches share storage bandwidth with LSM compaction and
+    /// whole-HBC checkpoint construction. Optional maintenance yields while a
+    /// query is active and for a short coalescing interval afterward. Hard WAL
+    /// and write-pressure work deliberately does not consult this signal.
+    pub fn beginForegroundQuery(self: *ResourceManager) void {
+        _ = self.foreground_query_sessions.fetchAdd(1, .release);
+    }
+
+    pub fn finishForegroundQuery(self: *ResourceManager) void {
+        const previous = self.foreground_query_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            self.foreground_query_quiet_until_ns.store(
+                platform_time.monotonicNs() +| foreground_query_maintenance_quiet_ns,
+                .release,
+            );
+        }
+    }
+
+    pub const ForegroundWriteLease = struct {
+        manager: ?*ResourceManager = null,
+
+        pub fn release(self: *ForegroundWriteLease) void {
+            const manager = self.manager orelse return;
+            const previous = manager.foreground_write_sessions.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                manager.foreground_write_quiet_until_ns.store(
+                    platform_time.monotonicNs() +| foreground_write_maintenance_quiet_ns,
+                    .release,
+                );
+            }
+            self.manager = null;
+        }
+    };
+
+    /// Marks only the latency-sensitive mutation portion of a request. Callers
+    /// release this lease immediately after primary WAL publication, before
+    /// any explicit full-index visibility wait.
+    pub fn beginForegroundWrite(self: *ResourceManager) ForegroundWriteLease {
+        _ = self.foreground_write_sessions.fetchAdd(1, .release);
+        return .{ .manager = self };
+    }
+
+    fn denseSearchGrantBytes(self: *const ResourceManager, requested_bytes: u64) u64 {
+        const capacity = self.dense_search_bandwidth_capacity_bytes;
+        if (capacity == 0) return 0;
+        return @min(@max(requested_bytes, 1), capacity);
+    }
+
+    fn canGrantDenseSearchLocked(self: *const ResourceManager, bytes: u64) bool {
+        return bytes <= self.dense_search_bandwidth_capacity_bytes -| self.dense_search_active_bytes;
+    }
+
+    fn noteDenseSearchGrantLocked(self: *ResourceManager, bytes: u64) void {
+        self.dense_search_active_bytes += bytes;
+        self.dense_search_active_queries += 1;
+        self.dense_search_peak_active_bytes = @max(self.dense_search_peak_active_bytes, self.dense_search_active_bytes);
+        self.dense_search_peak_active_queries = @max(self.dense_search_peak_active_queries, self.dense_search_active_queries);
+        self.dense_search_admissions +|= 1;
+    }
+
+    fn admitDenseSearchWaitersLocked(self: *ResourceManager) void {
+        while (self.dense_search_waiters.head) |head| {
+            if (!self.canGrantDenseSearchLocked(head.payload.bytes)) return;
+            const waiter = self.dense_search_waiters.pop().?;
+            self.dense_search_queued_queries -|= 1;
+            self.noteDenseSearchGrantLocked(waiter.payload.bytes);
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
+            waiter.handoff.publish();
+        }
+    }
+
+    fn cancelDenseSearchWaiter(self: *ResourceManager, waiter: *DenseSearchWaiter) void {
+        lockAtomic(&self.dense_search_admission_mutex);
+        defer self.dense_search_admission_mutex.unlock();
+        if (waiter.handoff.isAdmitted()) {
+            // Cancellation was observed before grant but lost the queue-lock
+            // race. No lease escapes: return its charge here exactly once.
+            std.debug.assert(self.dense_search_active_queries > 0);
+            std.debug.assert(self.dense_search_active_bytes >= waiter.payload.bytes);
+            self.dense_search_active_queries -= 1;
+            self.dense_search_active_bytes -= waiter.payload.bytes;
+        } else {
+            const removed = self.dense_search_waiters.remove(waiter);
+            std.debug.assert(removed);
+            self.dense_search_queued_queries -|= 1;
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
+        }
+        self.dense_search_cancellations +|= 1;
+        self.admitDenseSearchWaitersLocked();
+    }
+
+    /// Acquire a fair node-wide permit for the estimated candidate bytes one
+    /// dense search will scan. Waiters must not hold mutable index/cache locks
+    /// or a publication fence. Native two-phase searches may retain immutable
+    /// generation leases and separately budgeted request scratch. Oversized searches consume the
+    /// whole budget and therefore retain correctness progress without letting
+    /// smaller requests starve them indefinitely.
+    pub fn acquireDenseSearchBandwidth(
+        self: *ResourceManager,
+        requested_bytes: u64,
+        cancellation: ?DenseSearchCancellation,
+        wait_io: ?std.Io,
+    ) !DenseSearchAdmissionLease {
+        const bytes = self.denseSearchGrantBytes(requested_bytes);
+        if (bytes == 0) return .{};
+        if (cancellation) |token| {
+            if (token.is_cancelled(token.ptr)) return error.Cancelled;
+        }
+
+        lockAtomic(&self.dense_search_admission_mutex);
+        if (self.dense_search_waiters.head == null and self.canGrantDenseSearchLocked(bytes)) {
+            self.noteDenseSearchGrantLocked(bytes);
+            self.dense_search_admission_mutex.unlock();
+            return .{ .manager = self, .bytes = bytes };
+        }
+        var waiter = DenseSearchWaiter{
+            .payload = .{ .bytes = bytes, .enqueued_ns = platform_time.monotonicNs() },
+            .handoff = .{ .io = wait_io },
+        };
+        self.dense_search_waiters.enqueue(&waiter);
+        self.dense_search_queued_queries += 1;
+        self.dense_search_peak_queued_queries = @max(self.dense_search_peak_queued_queries, self.dense_search_queued_queries);
+        self.dense_search_waits +|= 1;
+        self.dense_search_admission_mutex.unlock();
+
+        waiter.handoff.wait(cancellation) catch |err| {
+            self.cancelDenseSearchWaiter(&waiter);
+            return err;
+        };
+        return .{ .manager = self, .bytes = bytes };
+    }
+
+    fn releaseDenseSearchBandwidth(self: *ResourceManager, bytes: u64) void {
+        if (bytes == 0) return;
+        lockAtomic(&self.dense_search_admission_mutex);
+        std.debug.assert(self.dense_search_active_queries > 0);
+        std.debug.assert(self.dense_search_active_bytes >= bytes);
+        self.dense_search_active_queries -= 1;
+        self.dense_search_active_bytes -= bytes;
+        self.admitDenseSearchWaitersLocked();
+        self.dense_search_admission_mutex.unlock();
+    }
+
+    pub fn denseSearchAdmissionStats(self: *ResourceManager) DenseSearchAdmissionStats {
+        lockAtomic(&self.dense_search_admission_mutex);
+        defer self.dense_search_admission_mutex.unlock();
+        return .{
+            .capacity_bytes = self.dense_search_bandwidth_capacity_bytes,
+            .active_bytes = self.dense_search_active_bytes,
+            .peak_active_bytes = self.dense_search_peak_active_bytes,
+            .active_queries = self.dense_search_active_queries,
+            .peak_active_queries = self.dense_search_peak_active_queries,
+            .queued_queries = self.dense_search_queued_queries,
+            .peak_queued_queries = self.dense_search_peak_queued_queries,
+            .admissions = self.dense_search_admissions,
+            .waits = self.dense_search_waits,
+            .cancellations = self.dense_search_cancellations,
+            .wait_ns = self.dense_search_wait_ns,
+        };
+    }
+
+    pub fn shouldDeferOptionalMaintenanceForForegroundTraffic(self: *const ResourceManager) bool {
+        if (self.foreground_query_sessions.load(.acquire) != 0) return true;
+        if (self.foreground_write_sessions.load(.acquire) != 0) return true;
+        const now_ns = platform_time.monotonicNs();
+        return now_ns < self.foreground_query_quiet_until_ns.load(.acquire) or
+            now_ns < self.foreground_write_quiet_until_ns.load(.acquire);
+    }
+
+    /// Soft compaction builders call this at bounded work intervals. Each
+    /// pause is capped: a compaction selected before hard pressure developed
+    /// must continue making progress even under a sustained query stream.
+    pub fn yieldOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) void {
+        const deadline_ns = platform_time.monotonicNs() +| foreground_query_compaction_yield_max_ns;
+        while (self.shouldDeferOptionalMaintenanceForForegroundTraffic()) {
+            if (platform_time.monotonicNs() >= deadline_ns) return;
+            platform_time.yieldBriefly();
+        }
     }
 
     pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
@@ -1002,6 +1434,18 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        self.dense_checkpoint_ready.assertUnbound();
+        self.dense_rerank_admission.assertIdle();
+        self.dense_driver_admission.assertIdle();
+        if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
+        if (self.dense_read_extra_tasks.load(.acquire) != 0)
+            @panic("resource manager deinitialized with active dense read workers");
+        lockAtomic(&self.dense_search_admission_mutex);
+        if (self.dense_search_active_queries != 0 or self.dense_search_waiters.head != null)
+            @panic("resource manager deinitialized with active dense search admission");
+        self.dense_search_admission_mutex.unlock();
+
+        _ = alloc;
         lockAtomic(&self.reclaimer_mutex);
         for (self.reclaimers.items) |slot| {
             if (slot.identity != 0 or slot.in_flight != 0)
@@ -1022,7 +1466,7 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with live reservations");
         if (self.batch_reservation_identities.count() != 0)
             @panic("resource manager deinitialized with live batch reservations");
-        self.capacity_domains.deinit(alloc);
+        self.capacity_domains.deinit(self.identity_allocator);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
         self.reservation_identities = .empty;
@@ -1040,10 +1484,11 @@ pub const ResourceManager = struct {
         observation: CapacityObservation,
         now_ns: u64,
     ) !CapacityReservation {
+        _ = alloc;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const entry = try self.capacity_domains.getOrPut(alloc, domain_id);
+        const entry = try self.capacity_domains.getOrPut(self.identity_allocator, domain_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         const domain = entry.value_ptr;
         self.observeCapacityLocked(domain, observation);
@@ -1170,7 +1615,11 @@ pub const ResourceManager = struct {
         var floor = self.disk_safety_floor_bytes;
         if (self.disk_safety_floor_divisor != 0) {
             if (observation.capacity_bytes) |capacity| {
-                floor = @max(floor, capacity / self.disk_safety_floor_divisor);
+                var proportional = capacity / self.disk_safety_floor_divisor;
+                if (self.disk_safety_floor_max_bytes != 0) {
+                    proportional = @min(proportional, self.disk_safety_floor_max_bytes);
+                }
+                floor = @max(floor, proportional);
             }
         }
         return floor;
@@ -1556,6 +2005,116 @@ pub const ResourceManager = struct {
         };
     }
 
+    /// Performs the final non-blocking admission check at a commit boundary.
+    /// Unlike `reserve`, this never invokes reclaimers: callers may use it
+    /// while holding a short mutation fence when failure still precedes WAL
+    /// publication. Any slower pacing or reclamation belongs above that fence.
+    pub fn reserveImmediate(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return try self.reserveOnce(slice, bytes);
+    }
+
+    /// Attempt admission exactly once and never invoke a reclaimer callback.
+    /// Use this while holding a storage transaction or another subsystem lock
+    /// whose lock order cannot safely include arbitrary cache owners.
+    pub fn reserveWithoutReclaim(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return self.reserveOnce(slice, bytes);
+    }
+
+    /// Atomically owns a required secondary credit and as much of the requested
+    /// primary credit as currently fits. The full request gets the normal cache
+    /// reclamation opportunity before the partial fallback is considered.
+    ///
+    /// Unlike a "leave N bytes free" calculation, both returned credits belong
+    /// to this reservation until release, so concurrent work cannot consume the
+    /// secondary credit between admission and allocation.
+    pub fn reserveOwnedSplitAtMost(
+        self: *ResourceManager,
+        slice: Slice,
+        requested_primary_bytes: u64,
+        required_secondary_bytes: u64,
+    ) !OwnedSplitReservation {
+        return self.reserveOwnedSplitAtMostWithPolicy(slice, requested_primary_bytes, required_secondary_bytes, true);
+    }
+
+    /// Atomically grant available headroom up to the requested ceiling. Like
+    /// reserveWithoutReclaim, this never calls cache owners while the caller
+    /// holds another subsystem's resources. A nonzero request requires a
+    /// nonzero grant; partial grants remain ordinary owned reservations.
+    pub fn reserveAtMostWithoutReclaim(self: *ResourceManager, slice: Slice, requested_bytes: u64) !Reservation {
+        const split = try self.reserveOwnedSplitAtMostWithPolicy(slice, requested_bytes, 0, false);
+        return split.reservation;
+    }
+
+    fn reserveOwnedSplitAtMostWithPolicy(
+        self: *ResourceManager,
+        slice: Slice,
+        requested_primary_bytes: u64,
+        required_secondary_bytes: u64,
+        allow_reclaim: bool,
+    ) !OwnedSplitReservation {
+        const requested_total = std.math.add(u64, requested_primary_bytes, required_secondary_bytes) catch
+            return error.ResourceBudgetExceeded;
+        if (requested_total == 0) return .{
+            .reservation = .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 },
+            .primary_bytes = 0,
+            .secondary_bytes = 0,
+        };
+
+        if (if (allow_reclaim) self.reserve(slice, requested_total) else self.reserveWithoutReclaim(slice, requested_total)) |reservation| {
+            return .{
+                .reservation = reservation,
+                .primary_bytes = requested_primary_bytes,
+                .secondary_bytes = required_secondary_bytes,
+            };
+        } else |err| {
+            if (err != error.ResourceBudgetExceeded) return err;
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            requested_total
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            requested_total
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        const available = @min(slice_available, memory_available);
+        if (available < required_secondary_bytes) return error.ResourceBudgetExceeded;
+        const primary_bytes = @min(requested_primary_bytes, available - required_secondary_bytes);
+        if (requested_primary_bytes > 0 and primary_bytes == 0) return error.ResourceBudgetExceeded;
+        const granted = std.math.add(u64, primary_bytes, required_secondary_bytes) catch
+            return error.ResourceBudgetExceeded;
+
+        const next_slice = std.math.add(u64, state.used_bytes, granted) catch {
+            state.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+
+        const identity = try self.registerReservationIdentityLocked(slice, granted);
+        state.used_bytes = next_slice;
+        state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+        if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        self.memory.used_bytes = next_memory;
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
+        if (self.memory.budget.soft_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        self.pressure_change.advance();
+        return .{
+            .reservation = .{ .manager = self, .identity = identity, .slice = slice, .bytes = granted },
+            .primary_bytes = primary_bytes,
+            .secondary_bytes = required_secondary_bytes,
+        };
+    }
+
     fn reserveOnce(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
         if (bytes == 0) return .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 };
 
@@ -1827,6 +2386,57 @@ pub const ResourceManager = struct {
         reservation.bytes -= released;
         self.pressure_change.advance();
         return true;
+    }
+
+    /// Move already-accounted credit between two live reservations without
+    /// changing slice or host usage. This is the ownership handoff used when
+    /// operation admission pre-reserves allocator headroom before the
+    /// destination BudgetedAllocator exists or begins allocating.
+    fn transferReservationCredit(
+        self: *ResourceManager,
+        source: *Reservation,
+        destination: *Reservation,
+        bytes: u64,
+    ) !void {
+        if (bytes == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        if (source.manager != self or destination.manager != self or
+            source.slice != destination.slice or source == destination or
+            (source.identity != 0 and source.identity == destination.identity) or
+            source.released or destination.released)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+
+        // Register an empty destination first. The insertion may rehash the
+        // identity map, so acquire both entry pointers only afterwards.
+        _ = try self.reservationIdentityLocked(destination);
+        const source_owned = self.reservation_identities.getPtr(source.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        const destination_owned = self.reservation_identities.getPtr(destination.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        if (source_owned.slice != source.slice or source_owned.bytes != source.bytes or
+            destination_owned.slice != destination.slice or destination_owned.bytes != destination.bytes or
+            bytes > source.bytes)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const next_destination = std.math.add(u64, destination.bytes, bytes) catch {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        source.bytes -= bytes;
+        source_owned.bytes = source.bytes;
+        destination.bytes = next_destination;
+        destination_owned.bytes = next_destination;
     }
 
     fn reconcileUsageLocked(
@@ -2160,6 +2770,8 @@ pub const ResourceManager = struct {
             .slices = stats,
             .reclaim_requests = self.reclaim_requests.load(.monotonic),
             .reclaimed_bytes = self.reclaimed_bytes.load(.monotonic),
+            .dense_search_admission = self.denseSearchAdmissionStats(),
+            .dense_read_tasks = self.denseReadTaskStats(),
         };
     }
 
@@ -2521,6 +3133,10 @@ pub const Reservation = struct {
     bytes: u64,
     released: bool = false,
 
+    pub fn reservedBytes(self: *const Reservation) u64 {
+        return self.bytes;
+    }
+
     pub fn release(self: *Reservation) void {
         if (self.released) return;
         _ = self.manager.releaseReservation(self);
@@ -2544,18 +3160,129 @@ pub const Reservation = struct {
         if (self.released or bytes == 0) return;
         _ = self.manager.shrinkReservation(self, bytes);
     }
+
+    pub fn transferCreditTo(self: *Reservation, destination: *Reservation, bytes: u64) !void {
+        if (self.released or destination.released) return error.ReservationReleased;
+        try self.manager.transferReservationCredit(self, destination, bytes);
+    }
+};
+
+/// One ResourceManager reservation split into independently enforced owner
+/// credits. The manager accounts the sum; callers cap the native and allocator
+/// owners at `primary_bytes` and `secondary_bytes` respectively.
+pub const OwnedSplitReservation = struct {
+    reservation: Reservation,
+    primary_bytes: u64,
+    secondary_bytes: u64,
+
+    pub fn release(self: *OwnedSplitReservation) void {
+        self.reservation.release();
+    }
+
+    /// Hand secondary credit to an allocator using its normal idle-credit
+    /// reclamation policy. The ResourceManager total is unchanged; only
+    /// reservation ownership moves.
+    pub fn transferSecondaryTo(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
+        if (self.secondary_bytes == 0) return;
+        try destination.adoptReservationCredit(&self.reservation, self.secondary_bytes);
+        self.secondary_bytes = 0;
+    }
+
+    /// Transfer a credit that must remain available across several bounded
+    /// allocation windows. The destination releases it only at deinit.
+    pub fn transferSecondaryToPinned(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
+        if (self.secondary_bytes == 0) return;
+        try destination.adoptPinnedReservationCredit(&self.reservation, self.secondary_bytes);
+        self.secondary_bytes = 0;
+    }
 };
 
 /// Accounts allocator-backed working sets before each allocation reaches the
 /// backing allocator. One operation may make bounded progress above the normal
 /// hard limit only while it is the slice's sole user.
 pub const BudgetedAllocator = struct {
+    pub const AllocationFailure = struct {
+        cause: enum { admission, backing },
+        requested_bytes: usize,
+        live_bytes: u64,
+        slice_used_bytes: u64,
+        slice_limit_bytes: u64,
+        aggregate_used_bytes: u64,
+        aggregate_limit_bytes: u64,
+        return_address: usize,
+    };
+
+    allocator_mutex: std.atomic.Mutex = .unlocked,
     backing: std.mem.Allocator,
     reservation: Reservation,
     max_hard_limit_multiple: u64,
     live_bytes: u64 = 0,
+    pinned_bytes: u64 = 0,
     credit_quantum: u64,
     budget_denied: bool = false,
+    denial_generation: u64 = 0,
+    reclaim_on_denial: bool = false,
+    last_allocation_failure: ?AllocationFailure = null,
+    reservation_floor: u64 = 0,
+
+    pub const ScratchReservation = struct {
+        owner: *BudgetedAllocator,
+        previous_floor: u64,
+
+        pub fn release(self: ScratchReservation) void {
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            self.owner.reservation_floor = self.previous_floor;
+            self.owner.releaseBytes(0);
+        }
+    };
+
+    /// Admit an operation's temporary working set before durable mutation.
+    /// Allocations consume these same credits instead of being charged twice.
+    /// Scopes nest and release in reverse order under owner serialization.
+    pub fn reserveScratch(self: *BudgetedAllocator, bytes: usize) !ScratchReservation {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        const previous_floor = self.reservation_floor;
+        if (!self.reserveGrowth(bytes)) {
+            self.recordAllocationFailure(.admission, bytes, @returnAddress());
+            return error.ResourceBudgetExceeded;
+        }
+        self.reservation_floor = @max(previous_floor, self.live_bytes);
+        self.live_bytes -= bytes;
+        return .{ .owner = self, .previous_floor = previous_floor };
+    }
+
+    pub fn allocationFailureThreadSafe(self: *BudgetedAllocator) ?AllocationFailure {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.last_allocation_failure;
+    }
+
+    fn recordAllocationFailure(self: *BudgetedAllocator, cause: @FieldType(AllocationFailure, "cause"), bytes: usize, ret_addr: usize) void {
+        const snapshot = self.reservation.manager.snapshot();
+        const slice = snapshot.slices[@intFromEnum(self.reservation.slice)];
+        self.last_allocation_failure = .{
+            .cause = cause,
+            .requested_bytes = bytes,
+            .live_bytes = self.live_bytes,
+            .slice_used_bytes = slice.used_bytes,
+            .slice_limit_bytes = slice.hard_limit_bytes,
+            .aggregate_used_bytes = snapshot.memory.used_bytes,
+            .aggregate_limit_bytes = snapshot.memory.hard_limit_bytes,
+            .return_address = ret_addr,
+        };
+        // Opt-in stack diagnostics allocate through the debug runtime, never
+        // this allocator. Normal admission records only a bounded receipt.
+        if (@import("builtin").link_libc and self.reservation.slice == .dense_source_payload_state) {
+            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_ALLOCATION_DIAGNOSTICS")) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "1")) {
+                    std.log.warn("source allocation denied cause={s} requested={d} live={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d} caller=0x{x}", .{ @tagName(cause), bytes, self.live_bytes, slice.used_bytes, slice.hard_limit_bytes, snapshot.memory.used_bytes, snapshot.memory.hard_limit_bytes, ret_addr });
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+            }
+        }
+    }
 
     pub fn init(
         manager: *ResourceManager,
@@ -2581,6 +3308,20 @@ pub const BudgetedAllocator = struct {
         };
     }
 
+    /// Opt in only at allocation sites whose lock order permits invoking cache
+    /// owners. Ordinary init remains callback-free for storage transactions and
+    /// cache-internal allocators. Admission retries once, without raising limits.
+    pub fn initReclaiming(
+        manager: *ResourceManager,
+        slice: Slice,
+        backing: std.mem.Allocator,
+        max_hard_limit_multiple: u64,
+    ) BudgetedAllocator {
+        var self = init(manager, slice, backing, max_hard_limit_multiple);
+        self.reclaim_on_denial = true;
+        return self;
+    }
+
     pub fn deinit(self: *BudgetedAllocator) void {
         self.reservation.release();
         self.* = undefined;
@@ -2598,17 +3339,88 @@ pub const BudgetedAllocator = struct {
         };
     }
 
+    /// Shared immutable generations may release their final allocation on a
+    /// query thread while the source writer allocates a successor. Owners that
+    /// publish such leases must use this interface for every allocation.
+    /// Reclaimers for this allocator must not recursively free through it.
+    pub fn threadSafeAllocator(self: *BudgetedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = lockedAlloc, .resize = lockedResize, .remap = lockedRemap, .free = lockedFree } };
+    }
+
+    pub fn liveBytesThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.live_bytes;
+    }
+
+    fn lockedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return alloc(ctx, len, alignment, ret_addr);
+    }
+    fn lockedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return resize(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return remap(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        free(ctx, memory, alignment, ret_addr);
+    }
+
     pub fn denied(self: *const BudgetedAllocator) bool {
         return self.budget_denied;
     }
 
+    /// Distinguish a new admission failure from backing-allocator resize or
+    /// remap refusal without clearing the operation's sticky denied flag.
+    pub fn denialGeneration(self: *const BudgetedAllocator) u64 {
+        return self.denial_generation;
+    }
+
+    /// Pressure reclamation must return amortized spare credit as well as
+    /// freed buffers, without disturbing live bytes or an invocation's pin.
+    pub fn releaseUnusedCredit(self: *BudgetedAllocator) u64 {
+        const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
+        self.reservation.shrink(bytes);
+        return bytes;
+    }
+
+    fn recordDenial(self: *BudgetedAllocator) void {
+        self.budget_denied = true;
+        self.denial_generation +%= 1;
+    }
+
+    pub fn adoptReservationCredit(self: *BudgetedAllocator, source: *Reservation, bytes: u64) !void {
+        try source.transferCreditTo(&self.reservation, bytes);
+    }
+
+    /// Adopt operation-lifetime credit. Ordinary frees may return any growth
+    /// above this floor, but cannot discard the next window's admission.
+    pub fn adoptPinnedReservationCredit(self: *BudgetedAllocator, source: *Reservation, bytes: u64) !void {
+        const pinned = std.math.add(u64, self.pinned_bytes, bytes) catch
+            return error.ResourceBudgetExceeded;
+        try source.transferCreditTo(&self.reservation, bytes);
+        self.pinned_bytes = pinned;
+    }
+
     fn reserveGrowth(self: *BudgetedAllocator, bytes: usize) bool {
         const amount = std.math.cast(u64, bytes) orelse {
-            self.budget_denied = true;
+            self.recordDenial();
             return false;
         };
         const next_live = std.math.add(u64, self.live_bytes, amount) catch {
-            self.budget_denied = true;
+            self.recordDenial();
             return false;
         };
         if (next_live > self.reservation.bytes) {
@@ -2618,9 +3430,24 @@ pub const BudgetedAllocator = struct {
                 minimum,
                 @max(minimum, self.credit_quantum),
                 self.max_hard_limit_multiple,
-            ) catch {
-                self.budget_denied = true;
-                return false;
+            ) catch |err| {
+                // growReservationAmortized has released the accounting lock.
+                // Ask only for the actual deficit, not amortized spare credit.
+                if (!self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
+                    self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0)
+                {
+                    self.recordDenial();
+                    return false;
+                }
+                _ = self.reservation.manager.growReservationAmortized(
+                    &self.reservation,
+                    minimum,
+                    @max(minimum, self.credit_quantum),
+                    self.max_hard_limit_multiple,
+                ) catch {
+                    self.recordDenial();
+                    return false;
+                };
             };
         }
         self.live_bytes = next_live;
@@ -2631,22 +3458,26 @@ pub const BudgetedAllocator = struct {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
         if (self.live_bytes == 0) {
-            self.reservation.shrink(self.reservation.bytes);
+            self.reservation.shrink(self.reservation.bytes -| @max(self.pinned_bytes, self.reservation_floor));
             return;
         }
         const spare = self.reservation.bytes -| self.live_bytes;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = self.live_bytes +| retained_spare;
+        const target = @max(@max(self.pinned_bytes, self.reservation_floor), self.live_bytes +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
+        if (!self.reserveGrowth(len)) {
+            self.recordAllocationFailure(.admission, len, ret_addr);
+            return null;
+        }
         return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.releaseBytes(len);
+            self.recordAllocationFailure(.backing, len, ret_addr);
             return null;
         };
     }
@@ -2699,6 +3530,33 @@ pub const BudgetedAllocator = struct {
     }
 };
 
+test "source vector payloads scratch admission accounts credits and records denial cause" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    {
+        const scratch = try budget.reserveScratch(1024);
+        defer scratch.release();
+        const buffer = try budget.threadSafeAllocator().alloc(u8, 512);
+        budget.threadSafeAllocator().free(buffer);
+        try std.testing.expect(budget.reservation.bytes >= 1024);
+        try std.testing.expectError(error.ResourceBudgetExceeded, budget.reserveScratch(4097));
+        try std.testing.expectEqual(@as(usize, 4097), budget.allocationFailureThreadSafe().?.requested_bytes);
+        try std.testing.expect(budget.allocationFailureThreadSafe().?.cause == .admission);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var denied_backing = BudgetedAllocator.init(&manager, .dense_source_payload_state, failing.allocator(), 1);
+    defer denied_backing.deinit();
+    try std.testing.expectError(error.OutOfMemory, denied_backing.threadSafeAllocator().alloc(u8, 1));
+    try std.testing.expect(denied_backing.allocationFailureThreadSafe().?.cause == .backing);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+}
+
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
@@ -2719,6 +3577,17 @@ test "default tokenizer cache budget is aligned with its resource slice" {
         PressureAction.shrink_cache,
         policies[tokenizer_idx].hard_action,
     );
+}
+
+test "default lake range cache queue budget is aligned with its terminal resource slice" {
+    const budgets = Options.defaultBudgets();
+    const policies = Options.defaultPolicies();
+    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    try std.testing.expectEqual(slice_count - 1, index);
+    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
+    try std.testing.expectEqual(PressureAction.report, policies[index].soft_action);
+    try std.testing.expectEqual(PressureAction.reject_work, policies[index].hard_action);
 }
 
 test "identity allocation failure rolls back every memory ledger" {
@@ -2815,13 +3684,7 @@ fn cacheBenefitPerByte(sample: HbcCacheBenefitSample, miss_service_ns_per_miss: 
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (comptime builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 test "resource manager tracks reservations and releases" {
@@ -3051,6 +3914,123 @@ test "bounded oversized progress cannot bypass aggregate host memory" {
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
+test "dense search bandwidth admission is FIFO and work weighted" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 10 });
+    defer manager.deinit(std.testing.allocator);
+    var first = try manager.acquireDenseSearchBandwidth(7, null, null);
+
+    const State = struct {
+        manager: *ResourceManager,
+        bytes: u64,
+        order_counter: *std.atomic.Value(u32),
+        order: std.atomic.Value(u32) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var lease = self.manager.acquireDenseSearchBandwidth(self.bytes, null, null) catch unreachable;
+            const order = self.order_counter.fetchAdd(1, .acq_rel) + 1;
+            self.order.store(order, .release);
+            while (!self.release.load(.acquire)) platform_time.yieldBriefly();
+            lease.release();
+        }
+    };
+    var order_counter = std.atomic.Value(u32).init(0);
+    var heavy = State{ .manager = &manager, .bytes = 8, .order_counter = &order_counter };
+    const heavy_thread = try std.Thread.spawn(.{}, State.run, .{&heavy});
+    while (manager.denseSearchAdmissionStats().queued_queries != 1) platform_time.yieldBriefly();
+    var light = State{ .manager = &manager, .bytes = 3, .order_counter = &order_counter };
+    const light_thread = try std.Thread.spawn(.{}, State.run, .{&light});
+    while (manager.denseSearchAdmissionStats().queued_queries != 2) platform_time.yieldBriefly();
+
+    // The light request would fit beside the active request, but cannot barge
+    // ahead of the older heavy request.
+    try std.testing.expectEqual(@as(u32, 0), light.order.load(.acquire));
+    first.release();
+    while (heavy.order.load(.acquire) == 0) platform_time.yieldBriefly();
+    try std.testing.expectEqual(@as(u32, 1), heavy.order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), light.order.load(.acquire));
+    heavy.release.store(true, .release);
+    while (light.order.load(.acquire) == 0) platform_time.yieldBriefly();
+    try std.testing.expectEqual(@as(u32, 2), light.order.load(.acquire));
+    light.release.store(true, .release);
+    heavy_thread.join();
+    light_thread.join();
+
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 8), stats.peak_active_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.peak_active_queries);
+    try std.testing.expectEqual(@as(u64, 2), stats.waits);
+}
+
+test "dense search bandwidth admission removes cancelled waiters" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 1 });
+    defer manager.deinit(std.testing.allocator);
+    var first = try manager.acquireDenseSearchBandwidth(1, null, null);
+
+    const State = struct {
+        manager: *ResourceManager,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        saw_cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return signal.load(.acquire);
+        }
+
+        fn run(self: *@This()) void {
+            var lease = self.manager.acquireDenseSearchBandwidth(1, .{
+                .ptr = &self.cancelled,
+                .is_cancelled = isCancelled,
+            }, std.Io.Threaded.global_single_threaded.io()) catch |err| {
+                std.debug.assert(err == error.Cancelled);
+                self.saw_cancelled.store(true, .release);
+                return;
+            };
+            lease.release();
+        }
+    };
+    var state = State{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, State.run, .{&state});
+    while (manager.denseSearchAdmissionStats().queued_queries != 1) platform_time.yieldBriefly();
+    state.cancelled.store(true, .release);
+    thread.join();
+    try std.testing.expect(state.saw_cancelled.load(.acquire));
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
+    try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
+    first.release();
+}
+
+test "dense search bandwidth cancellation racing a grant returns its full charge" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 10 });
+    defer manager.deinit(std.testing.allocator);
+    var blocker = try manager.acquireDenseSearchBandwidth(10, null, null);
+    defer blocker.release();
+    const Cancel = struct {
+        blocker: *DenseSearchAdmissionLease,
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 1) return false;
+            self.blocker.release(); // synchronous grant between observing cancellation and removing
+            return true;
+        }
+    };
+    var cancel = Cancel{ .blocker = &blocker };
+    try std.testing.expectError(error.Cancelled, manager.acquireDenseSearchBandwidth(7, .{ .ptr = &cancel, .is_cancelled = Cancel.check }, null));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
+    try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
+    try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
+    var next = try manager.acquireDenseSearchBandwidth(10, null, null);
+    next.release();
+    next.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.denseSearchAdmissionStats().active_bytes);
+}
+
 test "resource manager coordinates growable capacity by physical domain" {
     var manager = ResourceManager.init(.{
         .disk_safety_floor_bytes = 10,
@@ -3078,6 +4058,45 @@ test "resource manager coordinates growable capacity by physical domain" {
     try std.testing.expectEqual(@as(u64, 2), stats.denials);
     try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
     try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "capacity percentage safety floor is capped on large volumes" {
+    var manager = ResourceManager.init(.{
+        .disk_safety_floor_bytes = 10,
+        .disk_safety_floor_divisor = 20,
+        .disk_safety_floor_max_bytes = 30,
+    });
+    defer manager.deinit(std.testing.allocator);
+    const observation = CapacityObservation{
+        .available_bytes = 100,
+        .capacity_bytes = 1000,
+    };
+
+    // Five percent would reserve 50 bytes. The independent 30-byte emergency
+    // cap leaves room for 70 bytes of explicitly accounted maintenance.
+    var admitted = try manager.reserveCapacity(std.testing.allocator, 7, 70, observation, 0);
+    defer admitted.release();
+    try std.testing.expectError(
+        error.CapacityUnavailable,
+        manager.reserveCapacity(std.testing.allocator, 7, 1, observation, 0),
+    );
+    const domains = try manager.capacityDomainStats(std.testing.allocator);
+    defer std.testing.allocator.free(domains);
+    try std.testing.expectEqual(@as(usize, 1), domains.len);
+    try std.testing.expectEqual(@as(u64, 30), domains[0].last_safety_floor_bytes);
+}
+
+test "resource manager owns capacity domains independently of consumer allocator" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .disk_safety_floor_bytes = 0,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation = try manager.reserveCapacity(std.heap.page_allocator, 7, 1, .{}, 0);
+    reservation.release();
+    try std.testing.expectEqual(@as(usize, 1), manager.capacityStats().domain_count);
 }
 
 test "capacity reservation revalidation fails closed when available space falls" {
@@ -3206,6 +4225,209 @@ test "bounded observer growth grants aggregate slice and host capacity atomicall
     );
 }
 
+test "owned split reservations prevent concurrent headroom theft" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .budgets = budgets,
+        .memory_budget = .{ .hard_limit_bytes = 90 },
+    });
+
+    var reservation = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 100, 30);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 60), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 90), reservation.reservation.reservedBytes());
+    try std.testing.expectEqual(@as(u64, 90), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 90), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.document_extraction_working_set, 1));
+    if (!builtin.single_threaded and builtin.os.tag != .freestanding) {
+        const Concurrent = struct {
+            manager: *ResourceManager,
+            acquired: std.atomic.Value(bool) = .init(false),
+
+            fn run(self: *@This()) void {
+                var competing = self.manager.reserve(.document_extraction_working_set, 1) catch return;
+                self.acquired.store(true, .release);
+                competing.release();
+            }
+        };
+        var concurrent = Concurrent{ .manager = &manager };
+        const thread = try std.Thread.spawn(.{}, Concurrent.run, .{&concurrent});
+        thread.join();
+        try std.testing.expect(!concurrent.acquired.load(.acquire));
+    }
+}
+
+test "nonreclaiming partial reservations atomically respect slice and host headroom" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    for ([_]u64{ 90, 200 }) |host_limit| {
+        var budgets = Options.defaultBudgets();
+        budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = host_limit } });
+        defer manager.deinit(std.testing.allocator);
+        var probe = Probe{};
+        const id = try manager.registerReclaimer(.document_extraction_working_set, &probe, Probe.reclaim);
+        defer manager.unregisterReclaimer(id);
+        var held = try manager.reserveWithoutReclaim(.document_extraction_working_set, 40);
+        defer held.release();
+        var other = try manager.reserveWithoutReclaim(.hbc_node_metadata_cache, 10);
+        defer other.release();
+        var growth = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 100);
+        try std.testing.expectEqual(@as(u64, if (host_limit == 90) 40 else 60), growth.bytes);
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 1));
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        growth.release();
+        try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
+        var zero = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 0);
+        zero.release();
+    }
+}
+
+test "owned split reservations reclaim before partial fallback for slice pressure" {
+    const Context = struct {
+        manager: *ResourceManager,
+        slice: Slice,
+        accounted: u64 = 0,
+        pinned: bool = false,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.pinned) return 0;
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(self.slice, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 200 } });
+    defer manager.deinit(std.testing.allocator);
+    var unrelated = Context{ .manager = &manager, .slice = .hbc_node_metadata_cache };
+    manager.observeUsage(unrelated.slice, &unrelated.accounted, 40);
+    const unrelated_id = try manager.registerReclaimer(unrelated.slice, &unrelated, Context.reclaim);
+    defer manager.unregisterReclaimer(unrelated_id);
+    var document = Context{ .manager = &manager, .slice = .document_extraction_working_set, .pinned = true };
+    manager.observeUsage(document.slice, &document.accounted, 60);
+    const document_id = try manager.registerReclaimer(document.slice, &document, Context.reclaim);
+    defer manager.unregisterReclaimer(document_id);
+
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveOwnedSplitAtMost(document.slice, 1, 70));
+    try std.testing.expectEqual(@as(usize, 0), unrelated.calls);
+    document.pinned = false;
+    var reservation = try manager.reserveOwnedSplitAtMost(document.slice, 1, 70);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 29), document.accounted);
+    try std.testing.expectEqual(@as(u64, 40), unrelated.accounted);
+    try std.testing.expectEqual(@as(usize, 0), unrelated.calls);
+    try std.testing.expectEqual(@as(u64, 1), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 70), reservation.secondary_bytes);
+}
+
+test "owned split reservations reclaim before partial fallback" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64 = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
+    var manager = ResourceManager.init(.{
+        .budgets = budgets,
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+    });
+    defer manager.deinit(std.testing.allocator);
+    var reclaimable = ReclaimContext{ .manager = &manager };
+    manager.observeUsage(.hbc_node_metadata_cache, &reclaimable.accounted, 40);
+    const reclaimer_id = try manager.registerReclaimer(.hbc_node_metadata_cache, &reclaimable, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(reclaimer_id);
+
+    var reservation = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 70), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 0), reclaimable.accounted);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+}
+
+test "owned split secondary credit transfers into a budgeted allocator" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var split = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer split.release();
+    var retained = BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer retained.deinit();
+
+    var aliased_source = split.reservation;
+    try std.testing.expectError(
+        error.ResourceAccountingMismatch,
+        split.reservation.transferCreditTo(&aliased_source, 1),
+    );
+    try split.transferSecondaryTo(&retained);
+    try std.testing.expectEqual(@as(u64, 0), split.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 70), split.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 30), retained.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+
+    const retained_alloc = retained.allocator();
+    const value = try retained_alloc.alloc(u8, 30);
+    split.release();
+    try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    retained_alloc.free(value);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "pinned split credit survives idle allocation windows" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var split = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer split.release();
+    var invocation = BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    try split.transferSecondaryToPinned(&invocation);
+    const invocation_alloc = invocation.allocator();
+    const first_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(first_window);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    const second_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(second_window);
+    split.release();
+    try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    invocation.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
 test "resource manager tracks inference prompt cache usage" {
     var manager = ResourceManager.init(.{});
     var current: u64 = 0;
@@ -3249,6 +4471,29 @@ test "latency-sensitive derived replay defers only optional background work" {
     try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
     manager.latency_sensitive_derived_replay_quiet_until_ns.store(0, .release);
     try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+}
+
+test "foreground traffic defers optional maintenance through bounded quiet windows" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.beginForegroundQuery();
+    manager.beginForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.foreground_query_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+
+    var write = manager.beginForegroundWrite();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    write.release();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.foreground_write_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
 }
 
 test "resource manager background deferral follows slice policy" {
@@ -3459,6 +4704,43 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "non-reclaiming reservation never invokes callbacks" {
+    const ReclaimContext = struct {
+        invoked: bool = false,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invoked = true;
+            return 0;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.shard_transition_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{};
+    var cache_bytes: u64 = 0;
+    manager.observeUsage(.hbc_node_metadata_cache, &cache_bytes, 80);
+    const identity = try manager.registerReclaimer(
+        .hbc_node_metadata_cache,
+        &context,
+        ReclaimContext.reclaim,
+    );
+    defer manager.unregisterReclaimer(identity);
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveWithoutReclaim(.shard_transition_working_set, 30),
+    );
+    try std.testing.expect(!context.invoked);
 }
 
 test "dense search admission reclaims retained scratch from its own slice" {
@@ -3876,13 +5158,161 @@ test "budgeted allocator admits before allocation and releases exact live bytes"
     try std.testing.expectEqual(@as(u64, 12), manager.sliceStats(.shard_transition_working_set).used_bytes);
     const oversized = try alloc.alloc(u8, 12);
     try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), budgeted.denialGeneration());
     try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 9));
     try std.testing.expect(budgeted.denied());
+    try std.testing.expectEqual(@as(u64, 1), budgeted.denialGeneration());
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 9));
+    try std.testing.expectEqual(@as(u64, 2), budgeted.denialGeneration());
     try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
 
     alloc.free(oversized);
     alloc.free(first);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    const recovered = try alloc.alloc(u8, 8);
+    defer alloc.free(recovered);
+    try std.testing.expect(budgeted.denied());
+    try std.testing.expectEqual(@as(u64, 2), budgeted.denialGeneration());
+}
+
+test "budgeted allocator reclamation is opt in and retries without raising limits" {
+    const Cache = struct {
+        retained: Reservation,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const bytes = @min(target, self.retained.bytes);
+            self.retained.shrink(bytes);
+            return bytes;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var cache = Cache{ .retained = try manager.reserve(.document_extraction_working_set, 48) };
+    defer cache.retained.release();
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var ordinary = BudgetedAllocator.init(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer ordinary.deinit();
+    try std.testing.expectError(error.OutOfMemory, ordinary.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 0), cache.calls);
+    try std.testing.expectEqual(@as(u64, 48), cache.retained.bytes);
+
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    const bytes = try required.allocator().alloc(u8, 32);
+    defer required.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 32), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 64), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), required.denialGeneration());
+
+    // Even evicting all remaining optional bytes cannot admit this request.
+    // The allocator retries once, retains its original live allocation, and
+    // never increases the configured hard limit or loops over reclaimers.
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 33));
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    try std.testing.expectEqual(@as(u64, 0), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 32), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+}
+
+test "budgeted allocator reclaim denial does not retry a busy cache" {
+    const Cache = struct {
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = try manager.reserve(.document_extraction_working_set, 48);
+    defer retained.release();
+    var cache: Cache = .{};
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+    try std.testing.expectEqual(@as(u64, 0), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 48), retained.bytes);
+}
+
+test "budgeted allocator reclaims aggregate cache before denying growth" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.dense_vector_block_build_working_set)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &context.accounted, 80);
+    const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &context, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var budgeted = BudgetedAllocator.initReclaiming(
+        &manager,
+        .dense_vector_block_build_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const bytes = try budgeted.allocator().alloc(u8, 30);
+    defer budgeted.allocator().free(bytes);
+
+    try std.testing.expectEqual(@as(u64, 70), context.accounted);
+    try std.testing.expectEqual(@as(u64, 30), budgeted.live_bytes);
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
+    try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "budgeted allocator retains both scratch and pinned credit floors" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var pinned = try manager.reserve(.dense_source_payload_state, 32);
+    defer pinned.release();
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    try budget.adoptPinnedReservationCredit(&pinned, 32);
+    const bytes = try budget.allocator().alloc(u8, 8);
+    const scratch = try budget.reserveScratch(64);
+    _ = budget.releaseUnusedCredit();
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    scratch.release();
+    try std.testing.expectEqual(@as(u64, 32), budget.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.releaseUnusedCredit());
 }
 
 test "budgeted allocator allows concurrent operations within the shared hard limit" {
@@ -3929,6 +5359,9 @@ test "budgeted allocator amortizes manager reservations and releases idle credit
 
     alloc.free(first);
     try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(reserved - second.len, budgeted.releaseUnusedCredit());
+    try std.testing.expectEqual(@as(u64, second.len), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), budgeted.releaseUnusedCredit());
     alloc.free(second);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
 }

@@ -14,7 +14,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const data_format = @import("../../common/data_format.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const raft_catalog = @import("../../raft/storage/catalog.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const generation_lifecycle = @import("../db/generation_lifecycle.zig");
 const backend_types = @import("../backend_types.zig");
 const lsm_backend = @import("../lsm_backend.zig");
@@ -40,6 +40,7 @@ pub const AuthArtifact = seed_topology.AuthArtifact;
 pub const Topology = seed_topology.Topology;
 
 pub const MaterializeRequest = struct {
+    io: std.Io = std.Options.debug_io,
     raw_generation_root: []const u8,
     live_installing_root: []const u8,
     generation: []const u8,
@@ -97,9 +98,7 @@ pub const PublishedEvidence = struct {
 
 pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeResult {
     try validateMaterializeRequest(request);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
+    const io = request.io;
 
     if (try pathExists(io, request.live_installing_root)) return error.LiveInstallingRootExists;
     try fs_paths.createDirPathPortable(io, request.live_installing_root);
@@ -116,7 +115,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     defer parsed.deinit();
     try validateTopology(alloc, io, request.raw_generation_root, request.generation, parsed.value);
 
-    try data_format.ensureCompatible(alloc, request.live_installing_root);
+    try data_format.ensureCompatible(alloc, io, request.live_installing_root);
     const data_root = try std.fs.path.join(alloc, &.{ request.live_installing_root, "data" });
     defer alloc.free(data_root);
     const replicas_root = try std.fs.path.join(alloc, &.{ data_root, "replicas" });
@@ -157,7 +156,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         const db_path = try std.fs.path.join(alloc, &.{ replicas_root, relative_db_path });
         defer alloc.free(db_path);
 
-        var transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(db_path, null);
+        var transition = try generation_lifecycle.beginProcessExclusiveWithIo(db_path, io);
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();

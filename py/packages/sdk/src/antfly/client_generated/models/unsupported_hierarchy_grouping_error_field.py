@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class UnsupportedHierarchyGroupingErrorField(str, Enum):
+class UnsupportedHierarchyGroupingErrorField(StrEnum):
     HIERARCHY_GROUP_BY_LEVEL = "hierarchy.group_by.level"
 
     def __str__(self) -> str:

@@ -42,16 +42,7 @@ pub const SplitTerminalOutcome = enum(u8) {
     rolled_back = 2,
 };
 
-pub const ByteRange = struct {
-    start: []u8,
-    end: []u8,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        freeBytes(alloc, self.start);
-        freeBytes(alloc, self.end);
-        self.* = undefined;
-    }
-};
+pub const ByteRange = @import("byte_range.zig").ByteRange;
 
 pub const SplitState = struct {
     phase: SplitPhase,
@@ -581,3 +572,19 @@ test "projection wire rejects truncation and trailing bytes" {
     defer alloc.free(with_trailing);
     try std.testing.expectError(error.InvalidProjectionWire, decodeRangeAlloc(alloc, with_trailing));
 }
+
+pub const MergeSourcePhase = enum(u8) {
+    accepting = 1,
+    finalized = 2,
+    rolled_back = 3,
+};
+
+/// Durable donor-side range-merge fence. `applied_index` is the exact Raft
+/// index of the lifecycle command, and therefore the receiver watermark that
+/// must be covered before metadata can retire a finalized donor.
+pub const AppliedMergeSourceState = struct {
+    transition_id: u64,
+    receiver_group_id: u64,
+    phase: MergeSourcePhase,
+    applied_index: u64,
+};

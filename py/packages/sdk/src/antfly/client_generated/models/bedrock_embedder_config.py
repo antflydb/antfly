@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from ..models.bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
 
 T = TypeVar("T", bound="BedrockEmbedderConfig")
 
@@ -19,16 +24,17 @@ class BedrockEmbedderConfig:
     Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2
     instance roles.
 
-    **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0
+    **Example Models:** cohere.embed-v4:0, amazon.titan-embed-text-v2:0
 
     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 
         Example:
-            {'provider': 'bedrock', 'model': 'cohere.embed-v4', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
+            {'provider': 'bedrock', 'model': 'cohere.embed-v4:0', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
 
         Attributes:
-            model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
-                'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4.
+            provider (BedrockEmbedderConfigProvider):
+            model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4:0',
+                'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4:0.
             request_format (BedrockEmbedderConfigRequestFormat | Unset): Bedrock provider request schema. `auto` recognizes
                 direct foundation-model IDs,
                 foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
@@ -43,8 +49,14 @@ class BedrockEmbedderConfig:
             truncate (str | Unset): Cohere Bedrock truncate behavior.
             strip_new_lines (bool | Unset): Whether to strip new lines from the input text before embedding. Default: False.
             batch_size (int | Unset): The batch size for embedding requests to optimize throughput. Default: 1.
+            retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
+                intent
+                automatically: semantic-search inputs are `RETRIEVAL_QUERY`, while index
+                and artifact writes are `RETRIEVAL_DOCUMENT`. These fields only override
+                how a provider or instruction-aware model represents that intent.
     """
 
+    provider: BedrockEmbedderConfigProvider
     model: str
     request_format: BedrockEmbedderConfigRequestFormat | Unset = BedrockEmbedderConfigRequestFormat.AUTO
     region: str | Unset = UNSET
@@ -54,9 +66,12 @@ class BedrockEmbedderConfig:
     truncate: str | Unset = UNSET
     strip_new_lines: bool | Unset = False
     batch_size: int | Unset = 1
+    retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         request_format: str | Unset = UNSET
@@ -77,10 +92,15 @@ class BedrockEmbedderConfig:
 
         batch_size = self.batch_size
 
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -100,12 +120,18 @@ class BedrockEmbedderConfig:
             field_dict["strip_new_lines"] = strip_new_lines
         if batch_size is not UNSET:
             field_dict["batch_size"] = batch_size
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+
         d = dict(src_dict)
+        provider = BedrockEmbedderConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         _request_format = d.pop("request_format", UNSET)
@@ -129,7 +155,15 @@ class BedrockEmbedderConfig:
 
         batch_size = d.pop("batch_size", UNSET)
 
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: EmbeddingRetrievalConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = EmbeddingRetrievalConfig.from_dict(_retrieval)
+
         bedrock_embedder_config = cls(
+            provider=provider,
             model=model,
             request_format=request_format,
             region=region,
@@ -139,6 +173,7 @@ class BedrockEmbedderConfig:
             truncate=truncate,
             strip_new_lines=strip_new_lines,
             batch_size=batch_size,
+            retrieval=retrieval,
         )
 
         bedrock_embedder_config.additional_properties = d

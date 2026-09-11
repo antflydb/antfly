@@ -35,6 +35,7 @@ pub const WalScanAction = enum {
 pub const WalStats = abi.WalStats;
 
 pub const WAL = struct {
+    clock: @import("sim_runtime.zig").Clock,
     handle: ?*anyopaque = null,
 
     pub const ScanAction = WalScanAction;
@@ -54,6 +55,7 @@ pub const WAL = struct {
         }, &result));
         return .{
             .handle = result.handle orelse return error.StorageKernelFailure,
+            .clock = opts.clock,
         };
     }
 

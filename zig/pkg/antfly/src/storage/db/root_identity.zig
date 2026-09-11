@@ -10,6 +10,7 @@
 //! atomically published; ordinary opens only load the path-owned identity.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_time = @import("antfly_platform").time;
@@ -134,7 +135,7 @@ fn encode(state: State) [encoded_len]u8 {
     pos += @sizeOf(u32);
     std.mem.writeInt(u128, raw[pos..][0..@sizeOf(u128)], state.incarnation, .little);
     pos += @sizeOf(u128);
-    std.mem.writeInt(u32, raw[pos..][0..@sizeOf(u32)], std.hash.Crc32.hash(raw[0..pos]), .little);
+    std.mem.writeInt(u32, raw[pos..][0..@sizeOf(u32)], Crc32.hash(raw[0..pos]), .little);
     return raw;
 }
 
@@ -142,7 +143,7 @@ fn decode(raw: []const u8) !State {
     if (raw.len != encoded_len or !std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidRootIdentityState;
     const payload_end = raw.len - @sizeOf(u32);
     const expected_crc = std.mem.readInt(u32, raw[payload_end..][0..@sizeOf(u32)], .little);
-    if (std.hash.Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidRootIdentityState;
+    if (Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidRootIdentityState;
     var pos: usize = magic.len;
     const version = std.mem.readInt(u32, raw[pos..][0..@sizeOf(u32)], .little);
     pos += @sizeOf(u32);
@@ -188,12 +189,16 @@ test "root identity concurrent first opens publish one incarnation" {
     var start = std.atomic.Value(bool).init(false);
     var first = Worker{ .io = std.testing.io, .path = path, .ready = &ready, .start = &start };
     var second = Worker{ .io = std.testing.io, .path = path, .ready = &ready, .start = &start };
-    const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
-    const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    defer {
+        start.store(true, .release);
+        first_thread.await(std.testing.io);
+    }
+    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
     while (ready.load(.acquire) != 2) platform_time.yieldBriefly();
     start.store(true, .release);
-    first_thread.join();
-    second_thread.join();
+    first_thread.await(std.testing.io);
+    second_thread.await(std.testing.io);
 
     if (first.err) |err| return err;
     if (second.err) |err| return err;

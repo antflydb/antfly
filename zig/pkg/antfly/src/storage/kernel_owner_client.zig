@@ -483,11 +483,23 @@ pub const Owner = struct {
     }
 
     pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
+        return try self.waitForSyncWithCancellation(table_name, sync_level, .none);
+    }
+
+    pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !void {
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("../common/cancellation.zig").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,
             &.{
                 .sync_level = @intFromEnum(sync_level),
                 .table_name = .fromSlice(table_name),
+                .cancellation_ctx = @ptrCast(@constCast(&cancellation)),
+                .cancellation_fn = Callback.cancelled,
             },
         ));
     }

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CohereEmbedderConfigInputType(str, Enum):
+class CohereEmbedderConfigInputType(StrEnum):
     CLASSIFICATION = "classification"
     CLUSTERING = "clustering"
     SEARCH_DOCUMENT = "search_document"

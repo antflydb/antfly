@@ -30,11 +30,15 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SUITE = SCRIPT_DIR / "fixtures/gemma4_lm_head_repack_quality_v2.json"
-REVIEWED_SUITE_SHA256 = "f9f9240bbb6ec8ce0f0284053ac210f156711ff1fd050e7f019484ffbae52393"
+REVIEWED_SUITE_SHA256 = (
+    "f9f9240bbb6ec8ce0f0284053ac210f156711ff1fd050e7f019484ffbae52393"
+)
 SUITE_SCHEMA = "antfly.gemma4_lm_head_repack_quality_suite.v2"
 EVIDENCE_SCHEMA = "antfly.gemma4_lm_head_repack_quality_evidence.v3"
 REVIEWED_VOCAB_SIZE = 262144
-PROMPT_IDS_RE = re.compile(r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
+PROMPT_IDS_RE = re.compile(
+    r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE
+)
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
 SUPPRESS_IDS_RE = re.compile(
     r"^generate_logits_suppress_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$",
@@ -102,7 +106,9 @@ def same_file_provenance(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 def git_provenance(repo: Path) -> dict[str, Any]:
     def run(*args: str) -> bytes:
-        return subprocess.check_output(("git", "-C", str(repo), *args), env={**os.environ, "LC_ALL": "C"})
+        return subprocess.check_output(
+            ("git", "-C", str(repo), *args), env={**os.environ, "LC_ALL": "C"}
+        )
 
     revision = run("rev-parse", "HEAD").decode().strip()
     status = run("status", "--porcelain=v1", "--untracked-files=all")
@@ -118,7 +124,9 @@ def git_provenance(repo: Path) -> dict[str, Any]:
 def machine_metadata() -> dict[str, Any]:
     def sysctl(name: str) -> str | None:
         try:
-            return subprocess.check_output(("sysctl", "-n", name), text=True, stderr=subprocess.DEVNULL).strip()
+            return subprocess.check_output(
+                ("sysctl", "-n", name), text=True, stderr=subprocess.DEVNULL
+            ).strip()
         except (OSError, subprocess.CalledProcessError):
             return None
 
@@ -152,7 +160,9 @@ def validate_output_directory(path: Path, repo: Path) -> Path:
 
 def validate_thresholds(thresholds: dict[str, float]) -> dict[str, float]:
     if set(thresholds) != set(DEFAULT_THRESHOLDS):
-        raise ContractError("quality threshold set does not match the reviewed contract")
+        raise ContractError(
+            "quality threshold set does not match the reviewed contract"
+        )
     validated: dict[str, float] = {}
     for name, reviewed in DEFAULT_THRESHOLDS.items():
         raw = thresholds[name]
@@ -165,21 +175,31 @@ def validate_thresholds(thresholds: dict[str, float]) -> dict[str, float]:
             if not 0.0 <= value <= 1.0:
                 raise ContractError(f"{name} must be in [0, 1]")
             if value < reviewed:
-                raise ContractError(f"{name} cannot be looser than reviewed value {reviewed}")
+                raise ContractError(
+                    f"{name} cannot be looser than reviewed value {reviewed}"
+                )
         else:
             if value < 0.0:
                 raise ContractError(f"{name} must be non-negative")
             if value > reviewed:
-                raise ContractError(f"{name} cannot be looser than reviewed value {reviewed}")
+                raise ContractError(
+                    f"{name} cannot be looser than reviewed value {reviewed}"
+                )
         validated[name] = value
     return validated
 
 
-def validate_campaign_dimensions(repetitions: int, vocab_size: int, timeout_seconds: float) -> None:
+def validate_campaign_dimensions(
+    repetitions: int, vocab_size: int, timeout_seconds: float
+) -> None:
     if not 2 <= repetitions <= 4:
-        raise ContractError("repetitions must be in [2, 4] so determinism is observable")
+        raise ContractError(
+            "repetitions must be in [2, 4] so determinism is observable"
+        )
     if vocab_size != REVIEWED_VOCAB_SIZE:
-        raise ContractError(f"vocab-size must match the reviewed Gemma 4 value {REVIEWED_VOCAB_SIZE}")
+        raise ContractError(
+            f"vocab-size must match the reviewed Gemma 4 value {REVIEWED_VOCAB_SIZE}"
+        )
     if not math.isfinite(timeout_seconds) or not 1.0 <= timeout_seconds <= 3600.0:
         raise ContractError("timeout-seconds must be finite and in [1, 3600]")
 
@@ -196,7 +216,11 @@ def load_suite(path: Path, expected_sha256: str) -> dict[str, Any]:
     if raw.get("schema") != SUITE_SCHEMA:
         raise ContractError(f"unsupported suite schema: {raw.get('schema')!r}")
     max_tokens = raw.get("max_continuation_tokens_per_case")
-    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 32:
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or not 1 <= max_tokens <= 32
+    ):
         raise ContractError("max_continuation_tokens_per_case must be in [1, 32]")
     cases = raw.get("cases")
     if not isinstance(cases, list) or len(cases) < 8:
@@ -212,7 +236,11 @@ def load_suite(path: Path, expected_sha256: str) -> dict[str, Any]:
         prompt_mode = case.get("prompt_mode", "raw")
         continuation = case.get("continuation")
         continuation_token_ids = case.get("continuation_token_ids")
-        if not isinstance(case_id, str) or CASE_ID_RE.fullmatch(case_id) is None or case_id in seen:
+        if (
+            not isinstance(case_id, str)
+            or CASE_ID_RE.fullmatch(case_id) is None
+            or case_id in seen
+        ):
             raise ContractError(f"invalid or duplicate case id: {case_id!r}")
         if not isinstance(category, str) or not category:
             raise ContractError(f"missing category for {case_id}")
@@ -222,19 +250,36 @@ def load_suite(path: Path, expected_sha256: str) -> dict[str, Any]:
             raise ContractError(f"{case_id} prefix must be nonempty")
         if prompt_mode == "raw":
             if not prefix.endswith("\n"):
-                raise ContractError(f"{case_id} raw prefix must end at a newline token boundary")
-            if not isinstance(continuation, str) or not continuation or continuation[0].isspace():
-                raise ContractError(f"{case_id} continuation must be nonempty and left-aligned")
+                raise ContractError(
+                    f"{case_id} raw prefix must end at a newline token boundary"
+                )
+            if (
+                not isinstance(continuation, str)
+                or not continuation
+                or continuation[0].isspace()
+            ):
+                raise ContractError(
+                    f"{case_id} continuation must be nonempty and left-aligned"
+                )
             if continuation_token_ids is not None:
-                raise ContractError(f"{case_id} raw case cannot freeze continuation token IDs")
+                raise ContractError(
+                    f"{case_id} raw case cannot freeze continuation token IDs"
+                )
         else:
-            if not isinstance(continuation_token_ids, list) or not continuation_token_ids:
-                raise ContractError(f"{case_id} chat case must freeze continuation token IDs")
+            if (
+                not isinstance(continuation_token_ids, list)
+                or not continuation_token_ids
+            ):
+                raise ContractError(
+                    f"{case_id} chat case must freeze continuation token IDs"
+                )
             if len(continuation_token_ids) > max_tokens or any(
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
                 for value in continuation_token_ids
             ):
-                raise ContractError(f"{case_id} has invalid chat continuation token IDs")
+                raise ContractError(
+                    f"{case_id} has invalid chat continuation token IDs"
+                )
         seen.add(case_id)
         categories.add(category)
     if len(categories) < 8:
@@ -274,12 +319,16 @@ def run_logged(
             output = output.decode("utf-8", errors="replace")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(output, encoding="utf-8")
-        raise ContractError(f"command timed out after {timeout_seconds}s; output={log_path}") from exc
+        raise ContractError(
+            f"command timed out after {timeout_seconds}s; output={log_path}"
+        ) from exc
     elapsed = time.monotonic() - started
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(completed.stdout, encoding="utf-8")
     if completed.returncode != 0:
-        raise ContractError(f"command failed with exit {completed.returncode}; output={log_path}")
+        raise ContractError(
+            f"command failed with exit {completed.returncode}; output={log_path}"
+        )
     return completed.stdout, elapsed
 
 
@@ -329,9 +378,9 @@ def tokenize_text(
     log_path: Path,
     timeout_seconds: float,
 ) -> list[int]:
-    command = generate_command(
-        binary, model, text, 1, prompt_mode=prompt_mode
-    ) + ["--print-prompt-token-ids"]
+    command = generate_command(binary, model, text, 1, prompt_mode=prompt_mode) + [
+        "--print-prompt-token-ids"
+    ]
     output, _ = run_logged(
         command,
         env=clean_environment(),
@@ -347,17 +396,24 @@ def tokenize_text(
 def read_logits(path: Path, expected_count: int) -> array.array[float]:
     expected_bytes = expected_count * 4
     if path.stat().st_size != expected_bytes:
-        raise ContractError(f"invalid logit dump size for {path}: {path.stat().st_size} != {expected_bytes}")
+        raise ContractError(
+            f"invalid logit dump size for {path}: {path.stat().st_size} != {expected_bytes}"
+        )
     values = array.array("f")
     with path.open("rb") as source:
         values.fromfile(source, expected_count)
-    if len(values) != expected_count or any(not math.isfinite(value) for value in values):
+    if len(values) != expected_count or any(
+        not math.isfinite(value) for value in values
+    ):
         raise ContractError(f"non-finite or incomplete logit dump: {path}")
     return values
 
 
 def top_ids(
-    values: array.array[float], count: int, *, suppress_token_ids: set[int] | None = None
+    values: array.array[float],
+    count: int,
+    *,
+    suppress_token_ids: set[int] | None = None,
 ) -> list[int]:
     suppressed = suppress_token_ids or set()
     return heapq.nlargest(
@@ -383,7 +439,9 @@ def compare_logits(
     baseline = read_logits(baseline_path, expected_count)
     candidate = read_logits(candidate_path, expected_count)
     if not 0 <= expected_token_id < expected_count:
-        raise ContractError(f"teacher token {expected_token_id} outside vocabulary {expected_count}")
+        raise ContractError(
+            f"teacher token {expected_token_id} outside vocabulary {expected_count}"
+        )
 
     baseline_lse = logsumexp(baseline)
     candidate_lse = logsumexp(candidate)
@@ -417,9 +475,13 @@ def compare_logits(
     if len(suppressed) != len(suppress_token_ids) or any(
         token_id < 0 or token_id >= expected_count for token_id in suppressed
     ):
-        raise ContractError("suppress-token policy contains duplicate or out-of-range IDs")
+        raise ContractError(
+            "suppress-token policy contains duplicate or out-of-range IDs"
+        )
     if expected_count - len(suppressed) < 10:
-        raise ContractError("suppress-token policy leaves fewer than ten candidate tokens")
+        raise ContractError(
+            "suppress-token policy leaves fewer than ten candidate tokens"
+        )
     base_top10 = top_ids(baseline, 10, suppress_token_ids=suppressed)
     candidate_top10 = top_ids(candidate, 10, suppress_token_ids=suppressed)
     production_baseline_top1 = base_top10[0]
@@ -435,8 +497,10 @@ def compare_logits(
         "candidate_sha256": stable_file_provenance(candidate_path)["sha256"],
         "candidate_logits_distinct": baseline != candidate,
         "expected_token_id": expected_token_id,
-        "baseline_expected_rank": 1 + sum(value > baseline[expected_token_id] for value in baseline),
-        "candidate_expected_rank": 1 + sum(value > candidate[expected_token_id] for value in candidate),
+        "baseline_expected_rank": 1
+        + sum(value > baseline[expected_token_id] for value in baseline),
+        "candidate_expected_rank": 1
+        + sum(value > candidate[expected_token_id] for value in candidate),
         "baseline_expected_nll": baseline_nll,
         "candidate_expected_nll": candidate_nll,
         "expected_nll_delta": candidate_nll - baseline_nll,
@@ -485,7 +549,9 @@ def run_teacher_case(
     dump_base.parent.mkdir(parents=True, exist_ok=True)
     extra = {
         "TERMITE_METAL_DISABLE_SPLIT_SWA_KV_RING": "1",
-        "TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS": ",".join(str(value) for value in continuation_ids),
+        "TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS": ",".join(
+            str(value) for value in continuation_ids
+        ),
         "TERMITE_METAL_DUMP_GENERATE_LOGITS_F32": str(dump_base),
     }
     if mode == "candidate":
@@ -515,7 +581,9 @@ def run_teacher_case(
     if observed_prompt_ids != prompt_ids:
         raise ContractError(f"prompt IDs changed during {mode} run; output={log_path}")
     if observed_token_ids != continuation_ids:
-        raise ContractError(f"teacher-forced IDs changed during {mode} run; output={log_path}")
+        raise ContractError(
+            f"teacher-forced IDs changed during {mode} run; output={log_path}"
+        )
     repack_count = output.count(f"lm_head {candidate_format.upper()} repack:")
     if mode == "candidate" and repack_count != 1:
         raise ContractError(
@@ -523,7 +591,9 @@ def run_teacher_case(
             f"output={log_path}"
         )
     if mode == "baseline" and repack_count != 0:
-        raise ContractError(f"baseline unexpectedly repacked lm_head; output={log_path}")
+        raise ContractError(
+            f"baseline unexpectedly repacked lm_head; output={log_path}"
+        )
     dumps = expected_dump_paths(dump_base, len(continuation_ids))
     for path in dumps:
         if not path.is_file():
@@ -549,12 +619,14 @@ def verify_ring_prefill_identity(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     dump_base.parent.mkdir(parents=True, exist_ok=True)
-    command = generate_command(
-        binary, model, prefix, 1, prompt_mode=prompt_mode
-    ) + ["--print-token-count"]
+    command = generate_command(binary, model, prefix, 1, prompt_mode=prompt_mode) + [
+        "--print-token-count"
+    ]
     output, elapsed = run_logged(
         command,
-        env=clean_environment({"TERMITE_METAL_DUMP_GENERATE_LOGITS_F32": str(dump_base)}),
+        env=clean_environment(
+            {"TERMITE_METAL_DUMP_GENERATE_LOGITS_F32": str(dump_base)}
+        ),
         log_path=log_path,
         timeout_seconds=timeout_seconds,
     )
@@ -572,7 +644,9 @@ def verify_ring_prefill_identity(
     }
 
 
-def aggregate_metrics(steps: list[dict[str, Any]], thresholds: dict[str, float]) -> tuple[dict[str, Any], list[str]]:
+def aggregate_metrics(
+    steps: list[dict[str, Any]], thresholds: dict[str, float]
+) -> tuple[dict[str, Any], list[str]]:
     if not steps:
         raise ContractError("quality campaign produced no compared logit steps")
     token_count = len(steps)
@@ -591,8 +665,12 @@ def aggregate_metrics(steps: list[dict[str, Any]], thresholds: dict[str, float])
         "perplexity_ratio": candidate_perplexity / baseline_perplexity,
         "top1_matches": sum(step["top1_match"] for step in steps),
         "top1_agreement": sum(step["top1_match"] for step in steps) / token_count,
-        "mean_top10_overlap": math.fsum(step["top10_overlap"] for step in steps) / token_count,
-        "mean_top10_overlap_fraction": math.fsum(step["top10_overlap"] for step in steps) / (10 * token_count),
+        "mean_top10_overlap": math.fsum(step["top10_overlap"] for step in steps)
+        / token_count,
+        "mean_top10_overlap_fraction": math.fsum(
+            step["top10_overlap"] for step in steps
+        )
+        / (10 * token_count),
         "min_top10_overlap": min(step["top10_overlap"] for step in steps),
         "min_top10_overlap_fraction": min(step["top10_overlap"] for step in steps) / 10,
         "distinct_candidate_logit_steps": sum(
@@ -601,31 +679,47 @@ def aggregate_metrics(steps: list[dict[str, Any]], thresholds: dict[str, float])
         "refined_argmax_matches": sum(step["refined_top1_match"] for step in steps),
         "refined_argmax_agreement": sum(step["refined_top1_match"] for step in steps)
         / token_count,
-        "mean_kl_base_to_candidate": math.fsum(step["kl_base_to_candidate"] for step in steps) / token_count,
+        "mean_kl_base_to_candidate": math.fsum(
+            step["kl_base_to_candidate"] for step in steps
+        )
+        / token_count,
         "max_kl_base_to_candidate": max(step["kl_base_to_candidate"] for step in steps),
-        "mean_js_divergence": math.fsum(step["js_divergence"] for step in steps) / token_count,
+        "mean_js_divergence": math.fsum(step["js_divergence"] for step in steps)
+        / token_count,
         "max_abs": max(step["max_abs"] for step in steps),
         "mean_abs": math.fsum(step["_sum_abs"] for step in steps) / total_elements,
-        "rmse": math.sqrt(math.fsum(step["_sum_sq"] for step in steps) / total_elements),
+        "rmse": math.sqrt(
+            math.fsum(step["_sum_sq"] for step in steps) / total_elements
+        ),
     }
     failures: list[str] = []
     checks = (
-        (aggregate["perplexity_ratio"] <= thresholds["max_perplexity_ratio"], "perplexity ratio"),
-        (aggregate["top1_agreement"] >= thresholds["min_top1_agreement"], "top-1 agreement"),
         (
-            aggregate["mean_kl_base_to_candidate"] <= thresholds["max_mean_kl_base_to_candidate"],
+            aggregate["perplexity_ratio"] <= thresholds["max_perplexity_ratio"],
+            "perplexity ratio",
+        ),
+        (
+            aggregate["top1_agreement"] >= thresholds["min_top1_agreement"],
+            "top-1 agreement",
+        ),
+        (
+            aggregate["mean_kl_base_to_candidate"]
+            <= thresholds["max_mean_kl_base_to_candidate"],
             "mean KL",
         ),
         (
-            aggregate["max_kl_base_to_candidate"] <= thresholds["max_step_kl_base_to_candidate"],
+            aggregate["max_kl_base_to_candidate"]
+            <= thresholds["max_step_kl_base_to_candidate"],
             "max step KL",
         ),
         (
-            aggregate["mean_top10_overlap_fraction"] >= thresholds["min_mean_top10_overlap_fraction"],
+            aggregate["mean_top10_overlap_fraction"]
+            >= thresholds["min_mean_top10_overlap_fraction"],
             "mean top-10 overlap",
         ),
         (
-            aggregate["min_top10_overlap_fraction"] >= thresholds["min_step_top10_overlap_fraction"],
+            aggregate["min_top10_overlap_fraction"]
+            >= thresholds["min_step_top10_overlap_fraction"],
             "minimum top-10 overlap",
         ),
         (
@@ -664,14 +758,18 @@ def main() -> int:
     args = parse_args()
     if not CASE_ID_RE.fullmatch(args.model_label):
         raise ContractError("model-label must be a lowercase identifier")
-    validate_campaign_dimensions(args.repetitions, args.vocab_size, args.timeout_seconds)
+    validate_campaign_dimensions(
+        args.repetitions, args.vocab_size, args.timeout_seconds
+    )
 
     repo = SCRIPT_DIR.parents[4]
     args.out_dir = validate_output_directory(args.out_dir, repo)
     suite = load_suite(args.suite, args.suite_sha256)
     binary = args.binary.resolve(strict=True)
     model = args.model.resolve(strict=True)
-    thresholds = validate_thresholds({name: getattr(args, name) for name in DEFAULT_THRESHOLDS})
+    thresholds = validate_thresholds(
+        {name: getattr(args, name) for name in DEFAULT_THRESHOLDS}
+    )
     provenance_start = {
         "binary": stable_file_provenance(binary),
         "model": stable_file_provenance(model),
@@ -707,8 +805,12 @@ def main() -> int:
                 log_path=token_dir / "combined.txt",
                 timeout_seconds=args.timeout_seconds,
             )
-            if combined_ids[: len(prefix_ids)] != prefix_ids or len(combined_ids) <= len(prefix_ids):
-                raise ContractError(f"{case_id} continuation is not token-prefix aligned")
+            if combined_ids[: len(prefix_ids)] != prefix_ids or len(
+                combined_ids
+            ) <= len(prefix_ids):
+                raise ContractError(
+                    f"{case_id} continuation is not token-prefix aligned"
+                )
             continuation_ids = combined_ids[len(prefix_ids) :][:max_continuation_tokens]
         else:
             continuation_ids = case["continuation_token_ids"][:max_continuation_tokens]
@@ -724,11 +826,19 @@ def main() -> int:
             "repetitions": [],
         }
         for repetition in range(args.repetitions):
-            order = ["baseline", "candidate"] if repetition % 2 == 0 else ["candidate", "baseline"]
+            order = (
+                ["baseline", "candidate"]
+                if repetition % 2 == 0
+                else ["candidate", "baseline"]
+            )
             runs: dict[str, dict[str, Any]] = {}
             for mode in order:
-                base = args.out_dir / "logits" / case_id / f"rep-{repetition + 1}" / mode
-                log = args.out_dir / "logs" / case_id / f"rep-{repetition + 1}-{mode}.txt"
+                base = (
+                    args.out_dir / "logits" / case_id / f"rep-{repetition + 1}" / mode
+                )
+                log = (
+                    args.out_dir / "logs" / case_id / f"rep-{repetition + 1}-{mode}.txt"
+                )
                 runs[mode] = run_teacher_case(
                     binary=binary,
                     model=model,
@@ -746,7 +856,10 @@ def main() -> int:
             for step_index, token_id in enumerate(continuation_ids):
                 baseline_path = Path(runs["baseline"]["dump_paths"][step_index])
                 candidate_path = Path(runs["candidate"]["dump_paths"][step_index])
-                if runs["baseline"]["suppress_token_ids"] != runs["candidate"]["suppress_token_ids"]:
+                if (
+                    runs["baseline"]["suppress_token_ids"]
+                    != runs["candidate"]["suppress_token_ids"]
+                ):
                     raise ContractError(
                         f"baseline/candidate suppress-token policy differs for {case_id}"
                     )
@@ -767,7 +880,9 @@ def main() -> int:
                 )
                 for mode in ("baseline", "candidate"):
                     digest = metrics[f"{mode}_sha256"]
-                    deterministic_inputs.setdefault((case_id, step_index, mode), set()).add(digest)
+                    deterministic_inputs.setdefault(
+                        (case_id, step_index, mode), set()
+                    ).add(digest)
                 repetition_steps.append(metrics)
                 all_steps.append(metrics)
             case_record["repetitions"].append(
@@ -794,9 +909,13 @@ def main() -> int:
     aggregate, failures = aggregate_metrics(all_steps, thresholds)
     deterministic = all(len(digests) == 1 for digests in deterministic_inputs.values())
     if not deterministic:
-        failures.append("baseline or candidate logit dumps were not deterministic across repetitions")
+        failures.append(
+            "baseline or candidate logit dumps were not deterministic across repetitions"
+        )
     if ring_identity is None or not ring_identity["identical"]:
-        failures.append("normal-ring and full-history prefill logits were not byte-identical")
+        failures.append(
+            "normal-ring and full-history prefill logits were not byte-identical"
+        )
     if suite["provenance"]["sha256"] != REVIEWED_SUITE_SHA256:
         failures.append("suite digest is not reviewed for promotion")
 
@@ -858,7 +977,10 @@ def main() -> int:
         "cases": cases_output,
     }
     summary_path = args.out_dir / "summary.json"
-    summary_path.write_text(json.dumps(evidence, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(evidence, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"summary={summary_path}")
     print(
         "quality: pass={passed} candidate={candidate_format} tokens={tokens} ppl_base={base:.6f} ppl_candidate={candidate:.6f} "

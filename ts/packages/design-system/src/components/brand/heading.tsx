@@ -36,7 +36,10 @@ const headingVariants = cva("font-display font-bold tracking-tight text-foregrou
 
 type HeadingLevel = 1 | 2 | 3 | 4 | 5 | 6;
 
-const LEVEL_SIZE: Record<HeadingLevel, NonNullable<VariantProps<typeof headingVariants>["size"]>> = {
+const LEVEL_SIZE: Record<
+  HeadingLevel,
+  NonNullable<VariantProps<typeof headingVariants>["size"]>
+> = {
   1: "xl",
   2: "lg",
   3: "md",

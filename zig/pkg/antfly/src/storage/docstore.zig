@@ -30,6 +30,7 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -50,10 +51,7 @@ fn backoffWriterLockRetry(io: ?std.Io) void {
         return;
     }
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_locked_retry_sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 const replay_hints = [_]change_journal_mod.TargetHint{
@@ -344,23 +342,7 @@ pub const ReplayIterationStats = struct {
 // ByteRange — shard ownership range
 // ============================================================================
 
-pub const ByteRange = struct {
-    start: []const u8, // inclusive, empty = -inf
-    end: []const u8, // exclusive, empty = +inf
-
-    /// Check if key is within [start, end).
-    pub fn contains(self: ByteRange, key: []const u8) bool {
-        // start <= key
-        if (self.start.len > 0) {
-            if (std.mem.order(u8, key, self.start) == .lt) return false;
-        }
-        // key < end
-        if (self.end.len > 0) {
-            if (std.mem.order(u8, key, self.end) != .lt) return false;
-        }
-        return true;
-    }
-};
+pub const ByteRange = @import("byte_range.zig").ByteRange;
 
 // ============================================================================
 // DocStore
@@ -374,6 +356,7 @@ pub const DocStoreOptions = struct {
 };
 
 pub const DocStore = struct {
+    payload_store: ?artifact_payload.Store = null,
     alloc: Allocator,
     kind: Kind,
     runtime_store: backend_erased.Store,
@@ -404,6 +387,7 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
         raw: ?LmdbTransaction = null,
         dbi: LmdbDbi = undefined,
@@ -428,6 +412,8 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            const payload_session = self.payload_session;
+            defer if (payload_session) |session| session.release();
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
@@ -448,6 +434,10 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Txn) !void {
+            const payload_session = self.payload_session;
+            if (payload_session) |session| try session.stageReferenceEpoch(self);
+            if (payload_session) |session| try session.prepareCommit();
+            if (payload_session) |session| session.primary_commit_attempted = true;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
@@ -460,10 +450,33 @@ pub const DocStore = struct {
             } else {
                 return error.ReadOnly;
             }
+            if (payload_session) |session| {
+                session.committed = true;
+                session.release();
+            }
             self.* = undefined;
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
+            const value = try self.getPhysical(key);
+            return if (self.payload_session) |session| try session.get(key, value) else value;
+        }
+
+        pub fn getArtifactMetadata(self: *Txn, key: []const u8) !artifact_payload.Metadata {
+            const value = try self.getPhysical(key);
+            const metadata = try artifact_payload.Metadata.decode(value);
+            // Same-binary qualification control for the cost of reconstructing
+            // source payloads in metadata consumers. Keep the API result equal.
+            const control = if (@import("builtin").link_libc) std.c.getenv("ANTFLY_SOURCE_VECTOR_METADATA_ONLY") else null;
+            if (control) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "0")) {
+                    if (self.payload_session) |session| _ = try session.get(key, value);
+                }
+            }
+            return metadata;
+        }
+
+        fn getPhysical(self: *Txn, key: []const u8) ![]const u8 {
             if (supports_lmdb) {
                 if (self.raw) |*raw| return try raw.get(self.dbi, key);
             }
@@ -474,6 +487,15 @@ pub const DocStore = struct {
         }
 
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            try self.getManySortedPhysical(keys, values);
+            if (self.payload_session) |session| {
+                for (keys, values) |key, *value| if (value.*) |raw| {
+                    value.* = try session.get(key, raw);
+                };
+            }
+        }
+
+        pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
             if (supports_lmdb) {
@@ -503,6 +525,22 @@ pub const DocStore = struct {
             return try self.read.?.getManySorted(keys, values);
         }
 
+        /// Fetch values without admitting their source data blocks to the LSM
+        /// cache. Callers should use this only when they retain a decoded or
+        /// otherwise more useful representation of every returned value.
+        pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            if (self.probe) |*probe| {
+                try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+                if (self.payload_session) |session| {
+                    for (keys, values) |key, *value| if (value.*) |raw| {
+                        value.* = try session.get(key, raw);
+                    };
+                }
+                return;
+            }
+            return try self.getManySorted(keys, values);
+        }
+
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
@@ -510,7 +548,9 @@ pub const DocStore = struct {
                     return;
                 }
             }
-            try self.write.?.put(key, value);
+            const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+            try self.write.?.put(key, stored);
+            if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
@@ -521,6 +561,10 @@ pub const DocStore = struct {
                 }
             }
             try self.write.?.delete(key);
+            if (self.payload_session) |session| {
+                if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
+                try session.recordOwnership(&self.write.?, key, null);
+            }
         }
 
         pub fn cursor(self: *Txn) !LmdbCursor {
@@ -540,6 +584,12 @@ pub const DocStore = struct {
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor_adapter = try self.openPhysicalCursorAdapter();
+            errdefer cursor_adapter.close();
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session);
+        }
+
+        pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
             if (supports_lmdb and self.raw != null) {
                 return try backend_erased.cursorFrom(self.alloc, backend_lmdb_adapter.Cursor.init(try self.cursor()));
             }
@@ -559,12 +609,14 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
+            payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
@@ -574,7 +626,8 @@ pub const DocStore = struct {
                 if (supports_lmdb) {
                     if (self.raw) |raw| return try raw.get(self.dbi, key);
                 }
-                return try self.runtime.?.get(key);
+                const value = try self.runtime.?.get(key);
+                return if (self.payload_session) |session| try session.get(key, value) else value;
             }
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -591,7 +644,12 @@ pub const DocStore = struct {
                         return;
                     }
                 }
-                return try self.runtime.?.getManySorted(keys, values);
+                try self.runtime.?.getManySorted(keys, values);
+                if (self.payload_session) |session| {
+                    for (keys, values) |key, *value| if (value.*) |raw| {
+                        value.* = try session.get(key, raw);
+                    };
+                }
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
@@ -601,14 +659,18 @@ pub const DocStore = struct {
                         return;
                     }
                 }
-                try self.runtime.?.put(key, value);
+                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                try self.runtime.?.put(key, stored);
+                if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
                 if (supports_lmdb) {
                     if (self.raw != null) return error.Unsupported;
                 }
-                try self.runtime.?.appendPut(key, value);
+                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                try self.runtime.?.appendPut(key, stored);
+                if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
@@ -619,6 +681,10 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+                if (self.payload_session) |session| {
+                    if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
+                    try session.recordOwnership(self.runtime.?, key, null);
+                }
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
@@ -627,7 +693,9 @@ pub const DocStore = struct {
                         return try backend_erased.cursorFrom(self.alloc, backend_lmdb_adapter.Cursor.init(try raw.cursor(self.dbi)));
                     }
                 }
-                return try self.runtime.?.openCursor();
+                var physical = try self.runtime.?.openCursor();
+                errdefer physical.close();
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session);
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
@@ -644,6 +712,8 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Batch) void {
+            const payload_session = self.payload_session;
+            defer if (payload_session) |session| session.release();
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
@@ -658,6 +728,10 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            const payload_session = self.payload_session;
+            if (payload_session) |session| try session.stageReferenceEpoch(self);
+            if (payload_session) |session| try session.prepareCommit();
+            if (payload_session) |session| session.primary_commit_attempted = true;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
@@ -668,11 +742,16 @@ pub const DocStore = struct {
             if (self.runtime) |*runtime| {
                 try runtime.commit();
             }
+            if (payload_session) |session| {
+                session.committed = true;
+                session.release();
+            }
             self.* = undefined;
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
+                .payload_session = self.payload_session,
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
                 .dbi = self.dbi,
@@ -897,6 +976,55 @@ pub const DocStore = struct {
         return true;
     }
 
+    const PayloadCursor = struct {
+        physical: backend_erased.Cursor,
+        session: *artifact_payload.Session,
+        arena: std.heap.ArenaAllocator,
+
+        pub fn close(self: *@This()) void {
+            self.physical.close();
+            self.arena.deinit();
+            self.session.release();
+        }
+        fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
+            _ = self.arena.reset(.retain_capacity);
+            const value = entry orelse return null;
+            return .{ .key = value.key, .value = try self.session.getAlloc(self.arena.allocator(), value.key, value.value) };
+        }
+        pub fn first(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.first());
+        }
+        pub fn last(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.last());
+        }
+        pub fn next(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.next());
+        }
+        pub fn prev(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.prev());
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return self.resolve(try self.physical.seekAtOrAfter(key));
+        }
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return self.resolve(try self.physical.seekAtOrBefore(key));
+        }
+        pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+            self.physical.setUpperBound(upper);
+        }
+    };
+
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session) !backend_erased.Cursor {
+        const owner = session orelse return physical;
+        owner.retain();
+        errdefer owner.release();
+        return try backend_erased.cursorFrom(alloc, PayloadCursor{
+            .physical = physical,
+            .session = owner,
+            .arena = std.heap.ArenaAllocator.init(alloc),
+        });
+    }
+
     pub fn beginReadTxn(self: *DocStore) !Txn {
         return try self.beginReadTxnWithBlockCacheAdmission(.retain);
     }
@@ -905,6 +1033,8 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{ .read_only = true });
@@ -917,6 +1047,7 @@ pub const DocStore = struct {
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .read = try self.runtime_store.beginReadWithBlockCacheAdmission(admission),
             },
@@ -937,9 +1068,12 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => try self.beginReadTxnWithBlockCacheAdmission(admission),
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
             },
@@ -952,16 +1086,38 @@ pub const DocStore = struct {
     /// append-only lanes without widening the point-probe API. LMDB keeps the
     /// normal read-only transaction because its snapshot semantics are cheap.
     pub fn beginCurrentScanTxn(self: *DocStore) !Txn {
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => try self.beginReadTxn(),
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .current_scan = try self.runtime_store.beginCurrentScan(),
             },
         };
     }
 
+    /// Open one stable replay-lane generation. Runtime LSM implementations
+    /// narrow the mutable snapshot to this lane; callers may retain the
+    /// transaction and cursor while consuming several bounded replay chunks.
+    pub fn beginReplayLaneScanTxn(self: *DocStore, kind_ordinal: u8, from_sequence: u64) !Txn {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
+        return switch (self.kind) {
+            .lmdb => try self.beginReadTxn(),
+            .runtime => .{
+                .payload_session = payload_session,
+                .alloc = self.alloc,
+                .current_scan = try self.runtime_store.beginReplayLaneScan(kind_ordinal, from_sequence),
+            },
+        };
+    }
+
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{});
@@ -974,6 +1130,7 @@ pub const DocStore = struct {
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .write = try self.runtime_store.beginWrite(),
             },
@@ -985,6 +1142,8 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        const payload_session = if (self.payload_store) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var batch = try self.env.beginBatch();
@@ -997,6 +1156,7 @@ pub const DocStore = struct {
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .runtime = try self.runtime_store.beginBatchWithOptions(options),
             },
@@ -1066,6 +1226,13 @@ pub const DocStore = struct {
         try txn.commit();
     }
 
+    /// Inspect committed artifact metadata without fetching external vectors.
+    pub fn getArtifactMetadata(self: *DocStore, key: []const u8) !artifact_payload.Metadata {
+        var txn = try self.beginProbeTxn();
+        defer txn.abort();
+        return try txn.getArtifactMetadata(key);
+    }
+
     /// Atomic batch: apply all writes and deletes in a single transaction.
     pub fn putBatch(self: *DocStore, writes: []const KVPair, deletes: []const []const u8) !void {
         try self.putBatchWithReplay(null, writes, deletes, null);
@@ -1074,6 +1241,27 @@ pub const DocStore = struct {
     pub const ReplayAppend = struct {
         sequence: u64,
         payload: []const u8,
+    };
+
+    pub const KeyPromotion = struct {
+        source_key: []const u8,
+        destination_key: []const u8,
+    };
+
+    /// Builds one value from the same write transaction used for key
+    /// promotions. This lets callers serialize promotion source values while
+    /// they are still borrowed and commit the derived write atomically.
+    pub const TransactionalWriteBuilder = struct {
+        ptr: *anyopaque,
+        key: []const u8,
+        build: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror![]u8,
+    };
+
+    /// Read-only predicate evaluated inside the exact write transaction that
+    /// performs promotions and replay publication.
+    pub const TransactionalGuard = struct {
+        ptr: *anyopaque,
+        validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
     };
 
     fn putBatchWithReplayOnceWithOptions(
@@ -1148,6 +1336,102 @@ pub const DocStore = struct {
 
     pub fn putBatchWithReplay(self: *DocStore, io: ?std.Io, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         try self.putBatchWithReplayWithOptions(io, writes, deletes, replay, .{});
+    }
+
+    fn putBatchWithPromotionsAndReplayOnce(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var batch = try self.beginWriteBatchWithOptions(.{});
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        const built_value = if (transactional_write) |builder|
+            try builder.build(builder.ptr, self.alloc, &txn)
+        else
+            null;
+        defer if (built_value) |value| self.alloc.free(value);
+        if (transactional_write) |builder| try txn.put(builder.key, built_value.?);
+        var promoted_bytes: usize = 0;
+        for (promotions) |promotion| {
+            const value = txn.get(promotion.source_key) catch |err| switch (err) {
+                error.NotFound => return error.InvalidKeyPromotion,
+                else => return err,
+            };
+            promoted_bytes = std.math.add(usize, promoted_bytes, value.len) catch
+                return error.KeyPromotionBytesOverflow;
+            try txn.put(promotion.destination_key, value);
+            try txn.delete(promotion.source_key);
+        }
+        for (deletes) |key| {
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        for (writes) |kv| try txn.put(kv.key, kv.value);
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        // Recheck immediately before commit. A guard may contain a wall-clock
+        // lease expiry, and building a large replay value can outlive the tenure
+        // even though no competing writer can modify the record mid-transaction.
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        try batch.commit();
+        return promoted_bytes;
+    }
+
+    /// Atomically moves existing values to canonical keys while committing the
+    /// accompanying mutations and replay record. Promotion values remain
+    /// borrowed from the write transaction, so document-sized generations do
+    /// not require a second heap copy.
+    pub fn putBatchWithPromotionsAndReplay(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+    ) !usize {
+        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null, null);
+    }
+
+    pub fn putBatchWithPromotionsReplayAndBuiltWrite(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const promoted_bytes = self.putBatchWithPromotionsAndReplayOnce(
+                writes,
+                deletes,
+                promotions,
+                replay,
+                transactional_write,
+                transactional_guard,
+            ) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+            if (replay) |entry| {
+                self.markReplayIndexAvailable();
+                self.observeCommittedReplaySequence(entry.sequence);
+            }
+            return promoted_bytes;
+        }
     }
 
     /// Update the in-memory replay watermark after a replay entry was committed
@@ -1494,33 +1778,23 @@ pub const DocStore = struct {
             deletes.deinit(alloc);
         }
 
-        {
-            var txn = try self.beginCurrentScanTxn();
+        // Replay lanes are append-only. Capturing each lane independently is
+        // sufficient below an acknowledged retirement watermark, and avoids
+        // cloning/sorting unrelated document and artifact keys after every
+        // enrichment completion. The existing atomic deletion batch remains.
+        for (0..replay_hints.len + 1) |lane| {
+            const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
+            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
             defer txn.abort();
-
             var cur = try txn.openCursor();
             defer cur.close();
-
-            for (replay_hints) |hint| {
-                const hint_ordinal = replayHintOrdinal(hint);
-                const lower = internal_keys.replayRangeLower(hint_ordinal, 0);
-                const upper = internal_keys.replayRangeUpper(hint_ordinal);
-
-                var entry = try cur.seekAtOrAfter(lower[0..]);
-                while (entry) |kv| : (entry = try cur.next()) {
-                    if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
-                    const sequence = internal_keys.parseReplayEntrySequence(kv.key, hint_ordinal) orelse break;
-                    if (sequence > up_to_sequence) break;
-                    try deletes.append(alloc, try alloc.dupe(u8, kv.key));
-                }
-            }
-
-            const all_lower = internal_keys.replayRangeLower(internal_keys.replay_all_kind, 0);
-            const all_upper = internal_keys.replayRangeUpper(internal_keys.replay_all_kind);
-            var entry = try cur.seekAtOrAfter(all_lower[0..]);
+            const lower = internal_keys.replayRangeLower(ordinal, 0);
+            const upper = internal_keys.replayRangeUpper(ordinal);
+            cur.setUpperBound(&upper);
+            var entry = try cur.seekAtOrAfter(&lower);
             while (entry) |kv| : (entry = try cur.next()) {
-                if (std.mem.order(u8, kv.key, all_upper[0..]) != .lt) break;
-                const sequence = internal_keys.parseReplayEntrySequence(kv.key, internal_keys.replay_all_kind) orelse break;
+                if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                 if (sequence > up_to_sequence) break;
                 try deletes.append(alloc, try alloc.dupe(u8, kv.key));
             }
@@ -1640,7 +1914,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openCursor();
+        var cur = try txn.openPhysicalCursorAdapter();
         defer cur.close();
 
         var results = std.ArrayListUnmanaged([]u8).empty;
@@ -1715,7 +1989,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openCursor();
+        var cur = try txn.openPhysicalCursorAdapter();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);
 
@@ -1749,6 +2023,7 @@ pub const DocStore = struct {
     // ====================================================================
 
     pub const ScanOptions = struct {
+        physical_payloads: bool = false,
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
         reverse: bool = false,
@@ -1809,7 +2084,7 @@ pub const DocStore = struct {
         callback: ScanWithContextCallback,
     ) !void {
         _ = self;
-        var cur = try txn.openCursor();
+        var cur = if (options.physical_payloads) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
         defer cur.close();
         if (!options.reverse) {
             cur.setUpperBound(if (upper.len > 0) upper else null);

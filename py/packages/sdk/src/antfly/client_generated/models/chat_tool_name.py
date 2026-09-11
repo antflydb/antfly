@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class ChatToolName(str, Enum):
+class ChatToolName(StrEnum):
     ADD_FILTER = "add_filter"
     AGGREGATE = "aggregate"
     ASK_CLARIFICATION = "ask_clarification"

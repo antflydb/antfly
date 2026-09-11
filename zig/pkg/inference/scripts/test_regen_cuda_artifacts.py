@@ -38,7 +38,9 @@ class RegenCudaArtifactsTest(unittest.TestCase):
             )
 
         self.assertEqual(37, completed.returncode)
-        self.assertIn("zig-args:build quant-kernel-codegen -- --check", completed.stdout)
+        self.assertIn(
+            "zig-args:build quant-kernel-codegen -- --check", completed.stdout
+        )
         self.assertNotIn("nvcc not found", completed.stderr)
 
     def test_default_zig_resolution_prefers_the_repo_pinned_toolchain(self) -> None:
@@ -60,7 +62,9 @@ class RegenCudaArtifactsTest(unittest.TestCase):
 
         for artifact in ("tmp_ptx", "tmp_fatbin", "tmp_sm89"):
             with self.subTest(artifact=artifact):
-                self.assertEqual(1, source.count(f'check_required_symbols "${artifact}"'))
+                self.assertEqual(
+                    1, source.count(f'check_required_symbols "${artifact}"')
+                )
 
 
 if __name__ == "__main__":

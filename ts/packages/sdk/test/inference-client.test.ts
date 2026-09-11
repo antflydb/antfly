@@ -285,6 +285,18 @@ describe("InferenceClient with mock fetch", () => {
       expect(cancel).toHaveBeenCalledOnce();
     });
 
+    it.each([
+      "data: [DONE]",
+      "data: [DONE]\n",
+      "data: [DONE]\r\n",
+    ])("rejects an unterminated terminal frame: %j", async (body) => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(body, { headers: { "Content-Type": "text/event-stream" } })
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream(request).next()).rejects.toThrow("incomplete SSE event");
+    });
+
     it("cancels the response body when a stream event contains invalid JSON", async () => {
       const cancel = vi.fn();
       const body = new ReadableStream<Uint8Array>({
@@ -1185,7 +1197,9 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.transcribe("bad-data")).rejects.toMatchObject({
+      await expect(
+        client.transcribe("bad-data", { model: "openai/whisper-tiny" })
+      ).rejects.toMatchObject({
         status: 400,
         code: "Invalid audio",
       });

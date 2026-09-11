@@ -10,7 +10,6 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).with_name("analyze_zig_import_graph.py")
 SPEC = importlib.util.spec_from_file_location("analyze_zig_import_graph", SCRIPT)
 assert SPEC and SPEC.loader
@@ -92,25 +91,34 @@ class ImportGraphTest(unittest.TestCase):
                     0,
                 )
             )
-        payload = header + names + bytes(section_offset - string_offset - len(names)) + b"".join(section_headers)
+        payload = (
+            header
+            + names
+            + bytes(section_offset - string_offset - len(names))
+            + b"".join(section_headers)
+        )
         path = self.root / name
         path.write_bytes(payload)
         return path
 
     def write_codegen_boundaries(self):
-        for name in {
-            source for source, _ in analyzer.CODEGEN_BOUNDARIES
-        } | {
-            target for _, target in analyzer.CODEGEN_BOUNDARIES
-        } | set(analyzer.CONTROL_WAL_CONSUMERS) | {
-            analyzer.NATIVE_WAL_IMPLEMENTATION,
-        } | {source for source, _ in analyzer.INFERENCE_ABI_FORBIDDEN_TOKENS}:
+        for name in (
+            {source for source, _ in analyzer.CODEGEN_BOUNDARIES}
+            | {target for _, target in analyzer.CODEGEN_BOUNDARIES}
+            | set(analyzer.CONTROL_WAL_CONSUMERS)
+            | {
+                analyzer.NATIVE_WAL_IMPLEMENTATION,
+            }
+            | {source for source, _ in analyzer.INFERENCE_ABI_FORBIDDEN_TOKENS}
+        ):
             path = self.root / name
             if not path.exists():
                 self.write(name, "pub const value = 1;\n")
 
     def write_api_kernel_boundaries(self):
-        for name in set(analyzer.API_KERNEL_CONTRACTS) | set(analyzer.API_KERNEL_IMPLEMENTATIONS):
+        for name in set(analyzer.API_KERNEL_CONTRACTS) | set(
+            analyzer.API_KERNEL_IMPLEMENTATIONS
+        ):
             path = self.root / name
             if not path.exists():
                 self.write(name, "pub const value = 1;\n")
@@ -131,7 +139,10 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual({entry, child, leaf}, graph.closure([entry]))
 
     def test_shortest_path_reports_import_chain(self):
-        entry = self.write('entry.zig', 'const left = @import("left.zig");\nconst right = @import("right.zig");\n')
+        entry = self.write(
+            "entry.zig",
+            'const left = @import("left.zig");\nconst right = @import("right.zig");\n',
+        )
         left = self.write("left.zig", 'const target = @import("target.zig");\n')
         self.write("right.zig", 'const detour = @import("detour.zig");\n')
         self.write("detour.zig", 'const target = @import("target.zig");\n')
@@ -167,7 +178,8 @@ class ImportGraphTest(unittest.TestCase):
 
         self.assertTrue(
             analyzer.check_compiled_storage_boundary(
-                {"distributed": distributed, "api": api, "serverless": serverless}, self.root
+                {"distributed": distributed, "api": api, "serverless": serverless},
+                self.root,
             )
         )
 
@@ -220,7 +232,11 @@ class ImportGraphTest(unittest.TestCase):
         physical = self.write("storage/db/db.zig", "pub const value = 1;\n")
         reports = {
             "distributed": analyzer.TimeReport(
-                "distributed", self.root / "distributed.json", {}, frozenset({control}), True
+                "distributed",
+                self.root / "distributed.json",
+                {},
+                frozenset({control}),
+                True,
             ),
             "api": analyzer.TimeReport(
                 "api", self.root / "api.json", {}, frozenset({physical}), True
@@ -236,7 +252,9 @@ class ImportGraphTest(unittest.TestCase):
     def write_ha_seed_failure_fixture(self, registry: str, activation: str) -> None:
         self.write("runtime_failure_identity.zig", registry)
         for relative in analyzer.HA_SEED_FAILURE_SOURCE_FILES:
-            self.write(relative, activation if relative.endswith("seed_activation.zig") else "")
+            self.write(
+                relative, activation if relative.endswith("seed_activation.zig") else ""
+            )
 
     def test_ha_seed_failure_registry_accepts_exact_mapping(self):
         self.write_ha_seed_failure_fixture(
@@ -256,7 +274,9 @@ class ImportGraphTest(unittest.TestCase):
             clean = analyzer.check_ha_seed_failure_registry(self.root)
 
         self.assertFalse(clean)
-        self.assertIn("error.NewLifecycleFailure has no stable status", diagnostics.getvalue())
+        self.assertIn(
+            "error.NewLifecycleFailure has no stable status", diagnostics.getvalue()
+        )
 
     def test_resolve_source_rejects_escape(self):
         self.write("entry.zig", "pub const value = 1;\n")
@@ -275,7 +295,9 @@ class ImportGraphTest(unittest.TestCase):
 
     def test_codegen_boundary_rejects_transitive_runtime_import(self):
         self.write("cli_runtime.zig", 'const command = @import("cmd/lite.zig");\n')
-        self.write("cmd/lite.zig", 'const runtime = @import("../standalone/runtime.zig");\n')
+        self.write(
+            "cmd/lite.zig", 'const runtime = @import("../standalone/runtime.zig");\n'
+        )
         self.write_codegen_boundaries()
         graph = analyzer.ImportGraph(self.root)
 
@@ -314,7 +336,9 @@ class ImportGraphTest(unittest.TestCase):
         diagnostics = io.StringIO()
         with redirect_stderr(diagnostics):
             self.assertFalse(analyzer.check_codegen_boundary(graph))
-        self.assertIn("removed raw inference ABI token ProviderContext", diagnostics.getvalue())
+        self.assertIn(
+            "removed raw inference ABI token ProviderContext", diagnostics.getvalue()
+        )
 
     def test_codegen_boundary_accepts_control_wal_runtime_selector(self):
         self.write_codegen_boundaries()
@@ -348,7 +372,10 @@ class ImportGraphTest(unittest.TestCase):
 
     def test_api_kernel_boundary_accepts_data_only_contract_imports(self):
         self.write_api_kernel_boundaries()
-        self.write("api/table_write_source.zig", 'const wire = @import("backup_contract.zig");\n')
+        self.write(
+            "api/table_write_source.zig",
+            'const wire = @import("backup_contract.zig");\n',
+        )
         self.write("api/backup_contract.zig", "pub const value = 1;\n")
         graph = analyzer.ImportGraph(self.root)
 
@@ -356,7 +383,9 @@ class ImportGraphTest(unittest.TestCase):
 
     def test_api_kernel_boundary_rejects_direct_implementation_import(self):
         self.write_api_kernel_boundaries()
-        self.write("api/table_write_source.zig", 'const impl = @import("table_writes.zig");\n')
+        self.write(
+            "api/table_write_source.zig", 'const impl = @import("table_writes.zig");\n'
+        )
         graph = analyzer.ImportGraph(self.root)
 
         diagnostics = io.StringIO()
@@ -400,10 +429,18 @@ class ImportGraphTest(unittest.TestCase):
         self.assertIsNone(analyzer.report_stats(report)["repo_zig_files"])
 
     def test_time_report_comparison_reports_shared_fraction_of_smaller_graph(self):
-        shared = self.write("zig/pkg/antfly/src/shared.zig", "pub const shared = true;\n")
-        base_only = self.write("zig/pkg/antfly/src/base.zig", "pub const base = true;\n")
-        candidate_only = self.write("zig/pkg/antfly/src/candidate.zig", "pub const candidate = true;\n")
-        base = analyzer.TimeReport("base", self.root / "base.json", {}, frozenset({shared, base_only}), True)
+        shared = self.write(
+            "zig/pkg/antfly/src/shared.zig", "pub const shared = true;\n"
+        )
+        base_only = self.write(
+            "zig/pkg/antfly/src/base.zig", "pub const base = true;\n"
+        )
+        candidate_only = self.write(
+            "zig/pkg/antfly/src/candidate.zig", "pub const candidate = true;\n"
+        )
+        base = analyzer.TimeReport(
+            "base", self.root / "base.json", {}, frozenset({shared, base_only}), True
+        )
         candidate = analyzer.TimeReport(
             "candidate",
             self.root / "candidate.json",
@@ -423,9 +460,19 @@ class ImportGraphTest(unittest.TestCase):
         httpx = self.write("zig/lib/httpx/src/httpx.zig", "one\n")
         unique = self.write("zig/pkg/antfly/src/unique.zig", "one\n")
         reports = [
-            analyzer.TimeReport("one", self.root / "one.json", {}, frozenset({storage, httpx}), True),
-            analyzer.TimeReport("two", self.root / "two.json", {}, frozenset({storage, httpx, unique}), True),
-            analyzer.TimeReport("three", self.root / "three.json", {}, frozenset({storage}), True),
+            analyzer.TimeReport(
+                "one", self.root / "one.json", {}, frozenset({storage, httpx}), True
+            ),
+            analyzer.TimeReport(
+                "two",
+                self.root / "two.json",
+                {},
+                frozenset({storage, httpx, unique}),
+                True,
+            ),
+            analyzer.TimeReport(
+                "three", self.root / "three.json", {}, frozenset({storage}), True
+            ),
         ]
 
         stats = analyzer.aggregate_overlap_stats(reports, self.root)
@@ -440,7 +487,9 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(1, groups["zig/lib/httpx"]["duplicate_instances"])
 
     def test_aggregate_overlap_requires_file_lists_from_every_report(self):
-        report = analyzer.TimeReport("old", self.root / "old.json", {}, frozenset(), False)
+        report = analyzer.TimeReport(
+            "old", self.root / "old.json", {}, frozenset(), False
+        )
 
         self.assertFalse(analyzer.aggregate_overlap_stats([report])["available"])
 
@@ -448,7 +497,9 @@ class ImportGraphTest(unittest.TestCase):
         source_root = self.root / "src"
         (source_root / "storage/db").mkdir(parents=True)
         (source_root / "storage/db.zig").write_text("pub const root = true;\n")
-        (source_root / "storage/db/db.zig").write_text("pub const implementation = true;\n")
+        (source_root / "storage/db/db.zig").write_text(
+            "pub const implementation = true;\n"
+        )
         object_path = self.write_elf_object(
             "candidate.o",
             [
@@ -481,8 +532,12 @@ class ImportGraphTest(unittest.TestCase):
             80,
             0,
             {
-                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 80, 80),
-                ".rodata..Lstorage.db.db.onlyOne": analyzer.SectionEmission("storage.db.db", 20, 0),
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission(
+                    "storage.db.db", 80, 80
+                ),
+                ".rodata..Lstorage.db.db.onlyOne": analyzer.SectionEmission(
+                    "storage.db.db", 20, 0
+                ),
             },
         )
         two = analyzer.ObjectReport(
@@ -496,9 +551,15 @@ class ImportGraphTest(unittest.TestCase):
             85,
             0,
             {
-                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission("storage.db.db", 70, 70),
-                ".text..Lstorage.db.db.onlyTwo": analyzer.SectionEmission("storage.db.db", 20, 0),
-                ".text..Lapi.query.parse": analyzer.SectionEmission("api.query", 20, 15),
+                ".text..Lstorage.db.db.DB.open": analyzer.SectionEmission(
+                    "storage.db.db", 70, 70
+                ),
+                ".text..Lstorage.db.db.onlyTwo": analyzer.SectionEmission(
+                    "storage.db.db", 20, 0
+                ),
+                ".text..Lapi.query.parse": analyzer.SectionEmission(
+                    "api.query", 20, 15
+                ),
             },
         )
 

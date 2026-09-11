@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SSEEvent(str, Enum):
+class SSEEvent(StrEnum):
     CLASSIFICATION = "classification"
     DONE = "done"
     ERROR = "error"

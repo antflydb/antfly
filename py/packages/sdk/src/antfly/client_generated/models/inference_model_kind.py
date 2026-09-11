@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceModelKind(str, Enum):
+class InferenceModelKind(StrEnum):
     CHUNKER = "chunker"
     CLASSIFIER = "classifier"
     EMBEDDER = "embedder"

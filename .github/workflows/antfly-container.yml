@@ -96,9 +96,13 @@ jobs:
           name: antfly-release-runtime-archives
           path: dist/release-archives
 
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ steps.toolchain.outputs.python_build }}
 
       - name: Install hash-locked object storage client
         run: |

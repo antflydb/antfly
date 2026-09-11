@@ -83,6 +83,9 @@ fn isRequestCancellation(err: anyerror) bool {
 }
 
 pub const StdHttpListenerConfig = struct {
+    /// Dedicated capabilities borrowed until stop; neither may share request capacity.
+    accept_io: ?std.Io = null,
+    observer_io: ?std.Io = null,
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
     kernel_backlog: u31 = 512,
@@ -147,7 +150,12 @@ pub const StdHttpListener = struct {
     io_impl: *std.Io.Threaded,
     io_owner: IoOwner,
     server: ?std.Io.net.Server = null,
-    thread: ?std.Thread = null,
+    // Control capacity is independent of the borrowed request executor, which
+    // may have no concurrent slots and serve accepted requests inline.
+    accept_io: ?std.Io.Threaded = null,
+    accept_future: ?std.Io.Future(void) = null,
+    stop_event: std.Io.Event = .unset,
+    lifecycle_mutex: std.Io.Mutex = .init,
     connection_group: std.Io.Group = .init,
     stopping: std.atomic.Value(bool) = .init(false),
     active_connection_threads: std.atomic.Value(u32) = .init(0),
@@ -204,9 +212,31 @@ pub const StdHttpListener = struct {
         self.* = undefined;
     }
 
+    fn acceptIo(self: *StdHttpListener) std.Io {
+        return self.cfg.accept_io orelse self.accept_io.?.io();
+    }
+
     pub fn start(self: *StdHttpListener) !void {
+        return self.startWithControlLimit(.limited(1));
+    }
+
+    // The explicit limit also exercises partial-start rollback in tests.
+    fn startWithControlLimit(self: *StdHttpListener, limit: std.Io.Limit) !void {
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
         if (self.server != null) return error.AlreadyListening;
         self.stopping.store(false, .release);
+        self.stop_event = .unset;
+        if (self.cfg.accept_io == null) self.accept_io = std.Io.Threaded.init(self.alloc, .{
+            .stack_size = self.cfg.thread_stack_size,
+            .async_limit = .nothing,
+            .concurrent_limit = limit,
+        });
+        errdefer {
+            if (self.accept_io) |*owned| owned.deinit();
+            self.accept_io = null;
+        }
 
         const observer_capacity = if (self.cfg.max_connection_threads > 0)
             self.cfg.max_connection_threads
@@ -215,6 +245,7 @@ pub const StdHttpListener = struct {
         else
             64;
         self.peer_observer = PeerObserver.init(self.alloc, observer_capacity);
+        self.peer_observer.?.scheduling_io = self.cfg.observer_io;
         self.peer_observer.?.start() catch |err| {
             self.peer_observer.?.deinit();
             self.peer_observer = null;
@@ -263,15 +294,19 @@ pub const StdHttpListener = struct {
             self.server = null;
         }
 
-        self.thread = try std.Thread.spawn(.{ .stack_size = self.cfg.thread_stack_size }, serve, .{self});
+        self.accept_future = try self.acceptIo().concurrent(serve, .{self});
     }
 
     pub fn stop(self: *StdHttpListener) void {
+        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        self.lifecycle_mutex.lockUncancelable(lifecycle_io);
+        defer self.lifecycle_mutex.unlock(lifecycle_io);
         const io = self.io_impl.io();
         const bound_addr = self.boundAddress();
         self.stopping.store(true, .release);
         self.shutdownActiveStreams(io);
-        if (self.thread) |thread| {
+        if (self.accept_future) |*future| {
+            self.stop_event.set(self.acceptIo());
             if (bound_addr) |addr| {
                 const wake_io = std.Io.Threaded.global_single_threaded.io();
                 const wake_addr = listenerWakeAddress(addr);
@@ -280,8 +315,8 @@ pub const StdHttpListener = struct {
                     wake_stream.close(wake_io);
                 } else |_| {}
             }
-            thread.join();
-            self.thread = null;
+            future.await(self.acceptIo());
+            self.accept_future = null;
         }
         self.shutdownActiveStreams(io);
         // The accept task is joined above, so no new group members can be
@@ -295,6 +330,14 @@ pub const StdHttpListener = struct {
             server.deinit(io);
             self.server = null;
         }
+        if (self.accept_io) |*control| control.deinit();
+        self.accept_io = null;
+    }
+
+    fn waitForAcceptRetry(self: *StdHttpListener, ms: u32) void {
+        self.stop_event.waitTimeout(self.acceptIo(), .{
+            .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake },
+        }) catch {};
     }
 
     fn listenerWakeAddress(bound: std.Io.net.IpAddress) std.Io.net.IpAddress {
@@ -355,7 +398,7 @@ pub const StdHttpListener = struct {
                 // connection inline blocks the accept thread on a client
                 // read, stalling accepts (and stop()) on an idle peer.
                 if (!self.tryAcquireConnectionThreadSlot()) {
-                    sleepMs(1);
+                    self.waitForAcceptRetry(1);
                     continue;
                 }
                 slot_held = true;
@@ -368,7 +411,7 @@ pub const StdHttpListener = struct {
                         if (self.stopping.load(.acquire)) return;
                         _ = self.accept_errors_total.fetchAdd(1, .monotonic);
                         std.log.warn("std http listener accept failed; backing off delay_ms={d} err={s}", .{ accept_error_backoff_ms, @errorName(err) });
-                        sleepMs(accept_error_backoff_ms);
+                        self.waitForAcceptRetry(accept_error_backoff_ms);
                         accept_error_backoff_ms = @min(self.acceptErrorBackoffMaxMs(), accept_error_backoff_ms *| 2);
                         continue;
                     },
@@ -1372,10 +1415,10 @@ test "std http executor cancels an in-flight production request and retires its 
         .uri = uri,
         .cancellation = &cancellation,
     };
-    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request_state});
+    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request_state});
     defer {
         app.release.store(true, .release);
-        request_thread.join();
+        request_thread.await(std.testing.io);
     }
 
     for (0..10_000) |_| {
@@ -1465,8 +1508,8 @@ test "std http executor deinit drains the complete timed operation" {
 
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     var request = RequestThread{ .executor = executor.executor(), .uri = base_uri };
-    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request});
-    defer request_thread.join();
+    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request});
+    defer request_thread.await(std.testing.io);
 
     var entered = false;
     for (0..1_000) |_| {
@@ -1479,8 +1522,8 @@ test "std http executor deinit drains the complete timed operation" {
     try std.testing.expect(entered);
 
     var shutdown = DeinitThread{ .executor = &executor };
-    const shutdown_thread = try std.Thread.spawn(.{}, DeinitThread.run, .{&shutdown});
-    defer shutdown_thread.join();
+    var shutdown_thread = try std.testing.io.concurrent(DeinitThread.run, .{&shutdown});
+    defer shutdown_thread.await(std.testing.io);
 
     for (0..1_000) |_| {
         if (shutdown.done.load(.acquire)) break;
@@ -2227,8 +2270,8 @@ test "std http listener saturated connection slots queue instead of resetting" {
     defer std.testing.allocator.free(fast_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    defer slow_thread.join();
+    var slow_thread = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    defer slow_thread.await(std.testing.io);
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
@@ -2242,8 +2285,8 @@ test "std http listener saturated connection slots queue instead of resetting" {
     try std.testing.expect(saw_slow);
 
     var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
-    const fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
-    defer fast_thread.join();
+    var fast_thread = try std.testing.io.concurrent(RequestThread.run, .{&fast_req});
+    defer fast_thread.await(std.testing.io);
 
     // While the slot is saturated the second request must not be reset.
     sleepMs(50);
@@ -2707,8 +2750,8 @@ test "std http listener stop interrupts accepted header read" {
     try std.testing.expect(saw_slot);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     var stopped = false;
     for (0..10_000) |_| {
@@ -2787,8 +2830,8 @@ test "std http listener stop interrupts accepted body read" {
     try std.testing.expect(saw_slot);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     var stopped = false;
     for (0..10_000) |_| {
@@ -2876,8 +2919,8 @@ test "std http listener stop returns while saturated with a headerless connectio
     defer std.testing.allocator.free(slow_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    const slow_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    defer slow_thread.join();
+    var slow_thread = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    defer slow_thread.await(std.testing.io);
     defer app.release_slow.store(true, .release);
 
     var saw_slow = false;
@@ -2899,8 +2942,8 @@ test "std http listener stop returns while saturated with a headerless connectio
     sleepMs(20);
 
     var stop_thread_state = StopThread{ .listener = &listener };
-    const stop_thread = try std.Thread.spawn(.{}, StopThread.run, .{&stop_thread_state});
-    defer stop_thread.join();
+    var stop_thread = try std.testing.io.concurrent(StopThread.run, .{&stop_thread_state});
+    defer stop_thread.await(std.testing.io);
 
     // stop() waits for in-flight requests; release the slow one and the
     // whole shutdown must then complete promptly even though the headerless
@@ -3029,23 +3072,23 @@ test "std http executor runs timed requests concurrently" {
     defer std.testing.allocator.free(fast_uri);
 
     var slow_req = RequestThread{ .uri = slow_uri, .executor = request_executor };
-    var slow_thread: ?std.Thread = try std.Thread.spawn(.{}, RequestThread.run, .{&slow_req});
-    var fast_thread: ?std.Thread = null;
+    var slow_thread: ?std.Io.Future(void) = try std.testing.io.concurrent(RequestThread.run, .{&slow_req});
+    var fast_thread: ?std.Io.Future(void) = null;
     defer {
         app.release_slow.set(event_io);
-        if (fast_thread) |thread| thread.join();
-        if (slow_thread) |thread| thread.join();
+        if (fast_thread) |*thread| thread.await(std.testing.io);
+        if (slow_thread) |*thread| thread.await(std.testing.io);
     }
     try std.testing.expect(Wait.event(&app.entered_slow, event_io));
 
     var fast_req = RequestThread{ .uri = fast_uri, .executor = request_executor };
-    fast_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&fast_req});
+    fast_thread = try std.testing.io.concurrent(RequestThread.run, .{&fast_req});
     const fast_admitted = Wait.event(&app.entered_fast, event_io);
 
     app.release_slow.set(event_io);
-    fast_thread.?.join();
+    fast_thread.?.await(std.testing.io);
     fast_thread = null;
-    slow_thread.?.join();
+    slow_thread.?.await(std.testing.io);
     slow_thread = null;
 
     try std.testing.expect(fast_admitted);
@@ -3053,4 +3096,41 @@ test "std http executor runs timed requests concurrently" {
     try std.testing.expectEqual(@as(u16, 200), fast_req.status.load(.acquire));
     try std.testing.expect(!slow_req.failed.load(.acquire));
     try std.testing.expectEqual(@as(u16, 200), slow_req.status.load(.acquire));
+}
+
+test "std http listener rolls back refused control capacity and serializes stop before restart" {
+    const App = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+        fn noop() void {}
+    };
+    var context: u8 = 0;
+    var request_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer request_io.deinit();
+    var listener = StdHttpListener.initShared(std.testing.allocator, .{}, .{
+        .ptr = &context,
+        .vtable = &.{ .execute = App.execute },
+    }, &request_io);
+    defer listener.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, listener.startWithControlLimit(.nothing));
+    try std.testing.expect(listener.accept_io == null);
+    try std.testing.expect(listener.accept_future == null);
+    try std.testing.expect(listener.server == null);
+    try std.testing.expect(listener.peer_observer == null);
+    for (0..3) |_| {
+        try listener.start();
+        try std.testing.expectError(error.AlreadyListening, listener.start());
+        try std.testing.expectError(error.ConcurrencyUnavailable, listener.accept_io.?.io().concurrent(App.noop, .{}));
+        var stop = try std.testing.io.concurrent(StdHttpListener.stop, .{&listener});
+        listener.stop();
+        stop.await(std.testing.io);
+        try std.testing.expect(listener.accept_io == null);
+        try std.testing.expect(listener.accept_future == null);
+        try std.testing.expect(listener.server == null);
+        try std.testing.expect(listener.peer_observer == null);
+    }
 }

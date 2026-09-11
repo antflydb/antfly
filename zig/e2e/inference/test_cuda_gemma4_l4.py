@@ -52,7 +52,9 @@ def test_cuda_gemma4_l4_evidence(tmp_path: Path) -> None:
         pytest.skip(f"set {ENABLE_ENV}=1 to run the dedicated L4 qualification lane")
 
     env = os.environ.copy()
-    evidence_dir = Path(env.setdefault("CUDA_EVIDENCE_DIR", str(tmp_path / "cuda-gemma4-l4")))
+    evidence_dir = Path(
+        env.setdefault("CUDA_EVIDENCE_DIR", str(tmp_path / "cuda-gemma4-l4"))
+    )
     subprocess.run(["bash", str(RUNNER)], check=True, env=env)
 
     summary_path = evidence_dir / "release_summary.json"

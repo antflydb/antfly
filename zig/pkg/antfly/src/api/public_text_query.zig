@@ -429,9 +429,7 @@ fn directStringOperatorValue(
     if (query != .object) return null;
     const operator_value = query.object.get(operator) orelse return null;
     if (operator_value == .string) {
-        const field = directFieldValue(query.object) orelse return error.UnsupportedQueryRequest;
-        if (field != .string) return error.UnsupportedQueryRequest;
-        return .{ .field = field.string, .value = try directNonBlankString(operator_value) };
+        return .{ .field = try directTextFieldName(query.object), .value = try directNonBlankString(operator_value) };
     }
     if (operator_value != .object) return error.UnsupportedQueryRequest;
     if (directFieldValue(operator_value.object)) |field| {
@@ -455,16 +453,13 @@ fn directFuzzyOperatorValue(query: std.json.Value) !?DirectFuzzyOperatorValue {
     if (query != .object) return null;
     const fuzzy = query.object.get("fuzzy") orelse return null;
     if (fuzzy == .string) {
-        const field = directFieldValue(query.object) orelse return error.UnsupportedQueryRequest;
-        if (field != .string) return error.UnsupportedQueryRequest;
-        return .{ .field = field.string, .value = try directNonBlankString(fuzzy) };
+        return .{ .field = try directTextFieldName(query.object), .value = try directNonBlankString(fuzzy) };
     }
     if (fuzzy != .object) return error.UnsupportedQueryRequest;
-    const field = directFieldValue(fuzzy.object) orelse return error.UnsupportedQueryRequest;
+    const field = try directTextFieldName(fuzzy.object);
     const term = fuzzy.object.get("term") orelse fuzzy.object.get("query") orelse fuzzy.object.get("value") orelse return error.UnsupportedQueryRequest;
-    if (field != .string) return error.UnsupportedQueryRequest;
     return .{
-        .field = field.string,
+        .field = field,
         .value = try directNonBlankString(term),
         .max_edits = try directOptionalBoundedU8(fuzzy.object, "max_edits", 1, 2),
         .prefix_len = try directOptionalBoundedU8(
@@ -529,6 +524,13 @@ fn directRangeQueryAlloc(alloc: std.mem.Allocator, query: std.json.Value, boost:
         } };
     }
     return error.UnsupportedQueryRequest;
+}
+
+// The public text-query schemas make field optional. Omission selects the
+// cross-field index; an explicitly malformed selector must still be rejected.
+fn directTextFieldName(object: std.json.ObjectMap) ![]const u8 {
+    const field = directFieldValue(object) orelse return "_all";
+    return directNonBlankString(field);
 }
 
 fn directFieldValue(object: std.json.ObjectMap) ?std.json.Value {

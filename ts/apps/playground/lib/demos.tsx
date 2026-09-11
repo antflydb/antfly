@@ -219,7 +219,8 @@ demoCategories.primitives.demos = [
   {
     slug: "button",
     name: "Button",
-    description: "Clickable trigger. Ink is the everyday primary; brand (amber) is for special, infrequent actions.",
+    description:
+      "Clickable trigger. Ink is the everyday primary; brand (amber) is for special, infrequent actions.",
     render: () => (
       <div className="flex flex-wrap gap-3">
         <Button>Primary</Button>
@@ -1065,8 +1066,7 @@ demoCategories.compound.demos = [
   {
     slug: "dashboard-page",
     name: "DashboardPage",
-    description:
-      "Dashboard page scaffolding: title, description, actions, and a compact toolbar.",
+    description: "Dashboard page scaffolding: title, description, actions, and a compact toolbar.",
     render: () => (
       <div className="af-dashboard w-full max-w-3xl">
         <DashboardPage>
@@ -1326,12 +1326,7 @@ demoCategories.brand.demos = [
         </Lockup>
 
         <Lockup>
-          <Logo
-            src="/af-logo.svg"
-            srcDark="/af-logo-dark.svg"
-            alt="Antfly Inference"
-            size="xl"
-          />
+          <Logo src="/af-logo.svg" srcDark="/af-logo-dark.svg" alt="Antfly Inference" size="xl" />
           <Wordmark className="text-4xl">Antfly Inference</Wordmark>
         </Lockup>
       </div>

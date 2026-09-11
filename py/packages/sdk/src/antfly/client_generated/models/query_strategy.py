@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class QueryStrategy(str, Enum):
+class QueryStrategy(StrEnum):
     DECOMPOSE = "decompose"
     HYDE = "hyde"
     SIMPLE = "simple"

@@ -123,7 +123,6 @@ const (
 	antflySecretStoreVolumeName                   = "secret-store"
 	antflySecretStoreDefaultKey                   = "secrets.json"
 	antflySecretStoreDefaultPath                  = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	antflySecretStoreEnvVar                       = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 	antflyExtensionPackageStoreEnvVar             = "ANTFLY_EXTENSION_PACKAGE_STORE"
 	antflyStandaloneExtensionPackageStore         = "/antflydb/extensions"
 	antflyInternalServiceSecretEnvVar             = "ANTFLY_INTERNAL_SERVICE_SECRET"              // #nosec G101 -- environment variable name, not a credential
@@ -231,16 +230,6 @@ func secretStorePath(store *antflyv1.SecretStoreSpec) string {
 		return antflySecretStoreDefaultPath
 	}
 	return store.Path
-}
-
-func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
-	if store == nil {
-		return nil
-	}
-	return []corev1.EnvVar{{
-		Name:  antflySecretStoreEnvVar,
-		Value: secretStorePath(store),
-	}}
 }
 
 type internalServiceAuthRolloutMode string
@@ -4689,7 +4678,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
 						Env: append(
-							append(append(append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
+							append(append(haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability), haPodUIDEnv()...), haRuntimeLeaseEnv(cluster)...),
 							corev1.EnvVar{
 								Name:  antflyExtensionPackageStoreEnvVar,
 								Value: antflyStandaloneExtensionPackageStore,
@@ -5019,7 +5008,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         cluster.Spec.MetadataNodes.EnvFrom,
-						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), internalServiceAuthEnv(cluster, authMode, keyMode)...),
+						Env:             internalServiceAuthEnv(cluster, authMode, keyMode),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -5311,7 +5300,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 								MountPath: "/config",
 							},
 						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
-						Env: append(append(append([]corev1.EnvVar{
+						Env: append(append([]corev1.EnvVar{
 							{
 								Name: "POD_IP",
 								ValueFrom: &corev1.EnvVarSource{
@@ -5320,7 +5309,7 @@ func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, 
 									},
 								},
 							},
-						}, secretStoreEnv(cluster.Spec.SecretStore)...), haPodUIDEnv()...), internalServiceAuthEnv(cluster, authMode, keyMode)...),
+						}, haPodUIDEnv()...), internalServiceAuthEnv(cluster, authMode, keyMode)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`

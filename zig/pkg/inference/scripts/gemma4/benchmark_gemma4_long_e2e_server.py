@@ -319,8 +319,20 @@ ANTFLY_ENV_OVERRIDE_PREFIXES = (
     "ANTFLY_",
     "TERMITE_",
 )
-SENSITIVE_ENV_NAME_PARTS = ("SECRET", "PASSWORD", "CREDENTIAL", "API_KEY", "PRIVATE_KEY")
-SENSITIVE_ENV_TOKEN_MARKERS = ("AUTH_TOKEN", "ACCESS_TOKEN", "API_TOKEN", "BEARER_TOKEN", "SESSION_TOKEN")
+SENSITIVE_ENV_NAME_PARTS = (
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "API_KEY",
+    "PRIVATE_KEY",
+)
+SENSITIVE_ENV_TOKEN_MARKERS = (
+    "AUTH_TOKEN",
+    "ACCESS_TOKEN",
+    "API_TOKEN",
+    "BEARER_TOKEN",
+    "SESSION_TOKEN",
+)
 SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE = 512
 MIN_FROZEN_BASELINE_SAMPLES = 10
 MAX_FROZEN_BASELINE_CV = 0.03
@@ -408,11 +420,16 @@ def sha256_file(path: pathlib.Path) -> str:
 
 
 def write_json(path: pathlib.Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def canonical_sha256(value: object) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
     return sha256_bytes(encoded)
 
 
@@ -426,7 +443,10 @@ def is_antfly_env_override(name: str) -> bool:
 
 def is_sensitive_environment_name(name: str) -> bool:
     normalized = name.upper()
-    return any(part in normalized for part in SENSITIVE_ENV_NAME_PARTS + SENSITIVE_ENV_TOKEN_MARKERS)
+    return any(
+        part in normalized
+        for part in SENSITIVE_ENV_NAME_PARTS + SENSITIVE_ENV_TOKEN_MARKERS
+    )
 
 
 def parse_antfly_env_override(raw: str) -> tuple[str, str]:
@@ -441,12 +461,23 @@ def parse_antfly_env_override(raw: str) -> tuple[str, str]:
 
 
 def validate_cuda_profile_value(name: str, value: str) -> None:
-    if name == "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY" and value not in {"off", "auto", "required"}:
+    if name == "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY" and value not in {
+        "off",
+        "auto",
+        "required",
+    }:
         raise ValueError(f"{name} must be off, auto, or required")
-    if name == "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE" and value not in CUDA_GQA_PREFILL_PROFILES:
-        raise ValueError(f"{name} must be one of: {', '.join(CUDA_GQA_PREFILL_PROFILES)}")
+    if (
+        name == "ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE"
+        and value not in CUDA_GQA_PREFILL_PROFILES
+    ):
+        raise ValueError(
+            f"{name} must be one of: {', '.join(CUDA_GQA_PREFILL_PROFILES)}"
+        )
     if name == "ANTFLY_INFERENCE_CUDA_GQA_DECODE_PROFILE" and value not in {
-        "off", "splitk-online-sm89", "required-splitk-online-sm89",
+        "off",
+        "splitk-online-sm89",
+        "required-splitk-online-sm89",
     }:
         raise ValueError(
             f"{name} must be off, splitk-online-sm89, or required-splitk-online-sm89"
@@ -480,7 +511,9 @@ def resolve_antfly_execution_profile(
     environment: dict[str, str],
 ) -> dict[str, Any]:
     inherited_material_env = {
-        name: value for name, value in sorted(environment.items()) if is_material_tuning_env(name)
+        name: value
+        for name, value in sorted(environment.items())
+        if is_material_tuning_env(name)
     }
     prefix_sha256 = {
         "antfly": sha256_bytes(args.antfly_server_prefix.encode("utf-8")),
@@ -508,19 +541,25 @@ def resolve_antfly_execution_profile(
             "sha256": canonical_sha256(hashed_value),
         }
 
-    profile_key = getattr(args, "cuda_execution_profile", CUDA_EXECUTION_PROFILE_DEFAULT)
+    profile_key = getattr(
+        args, "cuda_execution_profile", CUDA_EXECUTION_PROFILE_DEFAULT
+    )
     try:
         profile_spec = CUDA_EXECUTION_PROFILES[profile_key]
     except KeyError as exc:
         raise ValueError(f"unknown CUDA execution profile: {profile_key!r}") from exc
-    capacity = ((fixture.expected_prompt_tokens + args.output_tokens + 32 + 31) // 32) * 32
+    capacity = (
+        (fixture.expected_prompt_tokens + args.output_tokens + 32 + 31) // 32
+    ) * 32
     defaults = {
         **profile_spec["environment"],
         "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": str(capacity),
     }
     effective = dict(defaults)
     locked_environment = bool(profile_spec.get("lock_environment"))
-    default_source = "reviewed_versioned_profile" if locked_environment else "model_neutral_default"
+    default_source = (
+        "reviewed_versioned_profile" if locked_environment else "model_neutral_default"
+    )
     sources = {name: default_source for name in defaults}
     for name, value in inherited_material_env.items():
         if locked_environment and is_antfly_env_override(name):
@@ -591,12 +630,16 @@ def validate_headline_execution_profile(
 ) -> None:
     if args.profile != "headline" or not args.enforce_performance:
         return
-    capacity = ((fixture.expected_prompt_tokens + args.output_tokens + 32 + 31) // 32) * 32
+    capacity = (
+        (fixture.expected_prompt_tokens + args.output_tokens + 32 + 31) // 32
+    ) * 32
     profile_key = profile.get("profile_key", CUDA_EXECUTION_PROFILE_DEFAULT)
     try:
         profile_spec = CUDA_EXECUTION_PROFILES[profile_key]
     except KeyError as exc:
-        raise ValueError(f"unknown CUDA execution profile in resolved profile: {profile_key!r}") from exc
+        raise ValueError(
+            f"unknown CUDA execution profile in resolved profile: {profile_key!r}"
+        ) from exc
     required = {
         **profile_spec["environment"],
         "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY": str(capacity),
@@ -609,7 +652,9 @@ def validate_headline_execution_profile(
             )
     legacy_period = effective.get("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD")
     if legacy_period not in {None, "0"}:
-        raise ValueError("headline execution profile forbids a legacy fixed CUDA temp-slot period")
+        raise ValueError(
+            "headline execution profile forbids a legacy fixed CUDA temp-slot period"
+        )
     for name in CUDA_TIMING_INSTRUMENTATION_ENV:
         if effective.get(name) not in {None, "0"}:
             raise ValueError(
@@ -627,7 +672,9 @@ def antfly_server_budget_mb(args: argparse.Namespace) -> dict[str, int]:
     result: dict[str, int] = {}
     for name, default in CUDA_SERVER_BUDGET_MB.items():
         configured = getattr(args, f"antfly_{name}_budget_mb", None)
-        result[name] = int(default if configured is None and backend == "cuda" else configured or 0)
+        result[name] = int(
+            default if configured is None and backend == "cuda" else configured or 0
+        )
     return result
 
 
@@ -638,7 +685,10 @@ def execution_profile_provenance(profile: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for name, value in environment.items():
             if is_sensitive_environment_name(name):
-                result[name] = {"redacted": True, "sha256": sha256_bytes(value.encode("utf-8"))}
+                result[name] = {
+                    "redacted": True,
+                    "sha256": sha256_bytes(value.encode("utf-8")),
+                }
             else:
                 result[name] = value
         return result
@@ -666,43 +716,71 @@ def load_fixture(path: pathlib.Path) -> PromptFixture:
     user_content = segment * repeat + suffix
     user_encoded = user_content.encode("utf-8")
     user_sha = sha256_bytes(user_encoded)
-    if len(user_encoded) != raw.get("expected_user_utf8_bytes") or user_sha != raw.get("expected_user_sha256"):
-        raise ValueError("prompt fixture rendered user content does not match its byte/hash contract")
+    if len(user_encoded) != raw.get("expected_user_utf8_bytes") or user_sha != raw.get(
+        "expected_user_sha256"
+    ):
+        raise ValueError(
+            "prompt fixture rendered user content does not match its byte/hash contract"
+        )
     prefix = raw.get("reference_chat_prefix")
     reference_suffix = raw.get("reference_chat_suffix")
     if not isinstance(prefix, str) or not isinstance(reference_suffix, str):
         raise ValueError("prompt fixture reference chat prefix/suffix must be strings")
-    if prefix != REFERENCE_CHAT_PREFIX or reference_suffix != REFERENCE_PUBLIC_FINAL_SUFFIX:
-        raise ValueError("prompt fixture must use the versioned public-final Gemma 4 chat contract")
+    if (
+        prefix != REFERENCE_CHAT_PREFIX
+        or reference_suffix != REFERENCE_PUBLIC_FINAL_SUFFIX
+    ):
+        raise ValueError(
+            "prompt fixture must use the versioned public-final Gemma 4 chat contract"
+        )
     chat_template_kwargs = raw.get("chat_template_kwargs")
     response_channel = raw.get("response_channel")
-    if chat_template_kwargs != CHAT_TEMPLATE_KWARGS or response_channel != "public_final":
-        raise ValueError("prompt fixture chat-template policy must explicitly select the public final channel")
+    if (
+        chat_template_kwargs != CHAT_TEMPLATE_KWARGS
+        or response_channel != "public_final"
+    ):
+        raise ValueError(
+            "prompt fixture chat-template policy must explicitly select the public final channel"
+        )
     expected_output_substrings = raw.get("expected_output_substrings")
     if (
         not isinstance(expected_output_substrings, list)
         or not expected_output_substrings
-        or any(not isinstance(value, str) or not value for value in expected_output_substrings)
+        or any(
+            not isinstance(value, str) or not value
+            for value in expected_output_substrings
+        )
     ):
-        raise ValueError("prompt fixture expected_output_substrings must be a non-empty string list")
+        raise ValueError(
+            "prompt fixture expected_output_substrings must be a non-empty string list"
+        )
     minimum_visible_utf8_bytes = raw.get("minimum_visible_utf8_bytes")
     if (
         isinstance(minimum_visible_utf8_bytes, bool)
         or not isinstance(minimum_visible_utf8_bytes, int)
         or minimum_visible_utf8_bytes < 1
     ):
-        raise ValueError("prompt fixture minimum_visible_utf8_bytes must be a positive integer")
+        raise ValueError(
+            "prompt fixture minimum_visible_utf8_bytes must be a positive integer"
+        )
     reference_prompt = prefix + user_content + reference_suffix
     reference = reference_prompt.encode("utf-8")
     reference_sha = sha256_bytes(reference)
-    if (
-        len(reference) != raw.get("expected_reference_prompt_utf8_bytes")
-        or reference_sha != raw.get("expected_reference_prompt_sha256")
-    ):
-        raise ValueError("prompt fixture reference prompt does not match its byte/hash contract")
+    if len(reference) != raw.get(
+        "expected_reference_prompt_utf8_bytes"
+    ) or reference_sha != raw.get("expected_reference_prompt_sha256"):
+        raise ValueError(
+            "prompt fixture reference prompt does not match its byte/hash contract"
+        )
     expected_tokens = raw.get("expected_reference_prompt_tokens")
-    if isinstance(expected_tokens, bool) or not isinstance(expected_tokens, int) or expected_tokens < 1:
-        raise ValueError("prompt fixture expected token count must be a positive integer")
+    if (
+        isinstance(expected_tokens, bool)
+        or not isinstance(expected_tokens, int)
+        or expected_tokens < 1
+    ):
+        raise ValueError(
+            "prompt fixture expected token count must be a positive integer"
+        )
     return PromptFixture(
         path=path.resolve(),
         fixture_id=str(raw.get("id") or path.stem),
@@ -789,7 +867,10 @@ def parse_sse_lines(lines: Iterable[bytes]) -> list[dict[str, Any]]:
 
 
 def is_event_stream_content_type(value: str | None) -> bool:
-    return isinstance(value, str) and value.partition(";")[0].strip().lower() == "text/event-stream"
+    return (
+        isinstance(value, str)
+        and value.partition(";")[0].strip().lower() == "text/event-stream"
+    )
 
 
 def event_delta(event: dict[str, Any]) -> tuple[bool, str, str | None]:
@@ -798,7 +879,11 @@ def event_delta(event: dict[str, Any]) -> tuple[bool, str, str | None]:
         return False, "", None
     choice = choices[0]
     delta = choice.get("delta")
-    has_content = isinstance(delta, dict) and "content" in delta and delta.get("content") is not None
+    has_content = (
+        isinstance(delta, dict)
+        and "content" in delta
+        and delta.get("content") is not None
+    )
     content = str(delta.get("content") or "") if isinstance(delta, dict) else ""
     # OpenAI-compatible servers may emit an initial role chunk with empty
     # content. It is not a generated token and must not become TTFT.
@@ -807,14 +892,18 @@ def event_delta(event: dict[str, Any]) -> tuple[bool, str, str | None]:
     return has_token, content, str(finish_reason) if finish_reason is not None else None
 
 
-def stream_completion_accounting(events: list[dict[str, Any]], content_event_count: int) -> tuple[int, str]:
+def stream_completion_accounting(
+    events: list[dict[str, Any]], content_event_count: int
+) -> tuple[int, str]:
     for event in reversed(events):
         usage = event.get("usage")
         if not isinstance(usage, dict) or usage.get("completion_tokens") is None:
             continue
         value = usage["completion_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("stream usage completion_tokens must be a non-negative integer")
+            raise ValueError(
+                "stream usage completion_tokens must be a non-negative integer"
+            )
         return value, "final_sse_usage"
     if content_event_count < 0:
         raise ValueError("content event count must be non-negative")
@@ -828,7 +917,9 @@ def stream_prompt_accounting(events: list[dict[str, Any]]) -> tuple[int | None, 
             continue
         value = usage["prompt_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError("stream usage prompt_tokens must be a non-negative integer")
+            raise ValueError(
+                "stream usage prompt_tokens must be a non-negative integer"
+            )
         return value, "final_sse_usage"
     return None, "warmup_usage_fallback"
 
@@ -874,12 +965,14 @@ def request_body(
         "stream": stream,
     }
     if engine == "antfly":
-        body.update({
-            "backend": backend,
-            "cache_dtype": cache_dtype,
-            "ignore_eos": True,
-            "prompt_cache": False,
-        })
+        body.update(
+            {
+                "backend": backend,
+                "cache_dtype": cache_dtype,
+                "ignore_eos": True,
+                "prompt_cache": False,
+            }
+        )
         if stream:
             body["stream_options"] = {"include_usage": True}
     elif engine == "llama_cpp":
@@ -903,7 +996,9 @@ def antfly_model_identifier(model: pathlib.Path, models_dir: pathlib.Path) -> st
         ) from exc
     relative_dir = relative_file.parent
     if relative_dir == pathlib.Path("."):
-        raise ValueError("benchmark GGUF must be inside a dedicated model directory below models-dir")
+        raise ValueError(
+            "benchmark GGUF must be inside a dedicated model directory below models-dir"
+        )
 
     def is_decoder_gguf(path: pathlib.Path) -> bool:
         name = path.name
@@ -917,9 +1012,8 @@ def antfly_model_identifier(model: pathlib.Path, models_dir: pathlib.Path) -> st
             or stem.endswith("-mmproj")
             or stem.endswith("_mmproj")
         )
-        is_gliner_head = (
-            name in {"gliner_head.gguf", "gliner2-head.gguf"}
-            or (name.startswith("gliner2-head.") and name.endswith(".gguf"))
+        is_gliner_head = name in {"gliner_head.gguf", "gliner2-head.gguf"} or (
+            name.startswith("gliner2-head.") and name.endswith(".gguf")
         )
         return not is_projector and not is_gliner_head
 
@@ -975,16 +1069,22 @@ class ManagedServer:
             if self.process.poll() is not None:
                 returncode = self.process.returncode
                 self.__exit__()
-                raise RuntimeError(f"{self.spec.engine} server exited with {returncode}; see {self.log_path}")
+                raise RuntimeError(
+                    f"{self.spec.engine} server exited with {returncode}; see {self.log_path}"
+                )
             try:
                 with urllib.request.urlopen(health_url, timeout=1.0) as response:
                     if 200 <= response.status < 300:
-                        self.connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.request_timeout)
+                        self.connection = http.client.HTTPConnection(
+                            "127.0.0.1", self.port, timeout=self.request_timeout
+                        )
                         return self
             except (OSError, urllib.error.URLError):
                 time.sleep(0.25)
         self.__exit__()
-        raise RuntimeError(f"{self.spec.engine} server did not become ready; see {self.log_path}")
+        raise RuntimeError(
+            f"{self.spec.engine} server did not become ready; see {self.log_path}"
+        )
 
     @property
     def port(self) -> int:
@@ -992,7 +1092,9 @@ class ManagedServer:
         try:
             return int(command[command.index("--port") + 1])
         except (ValueError, IndexError) as exc:
-            raise RuntimeError(f"server command has no --port: {shlex.join(command)}") from exc
+            raise RuntimeError(
+                f"server command has no --port: {shlex.join(command)}"
+            ) from exc
 
     def __exit__(self, *_: object) -> None:
         if self.connection is not None:
@@ -1021,7 +1123,9 @@ class ManagedServer:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if self.connection is None:
             raise RuntimeError("server connection is not initialized")
-        payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
         reused = self.connection.sock is not None
         started = time.monotonic_ns()
         self.connection.request(
@@ -1034,19 +1138,29 @@ class ManagedServer:
         raw = response.read()
         elapsed_ms = (time.monotonic_ns() - started) / 1_000_000.0
         if response.status != 200:
-            raise RuntimeError(f"{self.spec.engine} HTTP {response.status}: {raw.decode(errors='replace')[:1000]}")
+            raise RuntimeError(
+                f"{self.spec.engine} HTTP {response.status}: {raw.decode(errors='replace')[:1000]}"
+            )
         value = json.loads(raw)
         if not isinstance(value, dict):
-            raise RuntimeError(f"{self.spec.engine} returned a non-object JSON response")
+            raise RuntimeError(
+                f"{self.spec.engine} returned a non-object JSON response"
+            )
         return value, {"total_latency_ms": elapsed_ms, "connection_reused": reused}
 
-    def post_nonstream(self, body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def post_nonstream(
+        self, body: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         return self.post_json(body)
 
-    def post_stream(self, body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def post_stream(
+        self, body: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if self.connection is None:
             raise RuntimeError("server connection is not initialized")
-        payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
         reused = self.connection.sock is not None
         started = time.monotonic_ns()
         self.connection.request(
@@ -1058,7 +1172,9 @@ class ManagedServer:
         response = self.connection.getresponse()
         if response.status != 200:
             raw = response.read()
-            raise RuntimeError(f"{self.spec.engine} HTTP {response.status}: {raw.decode(errors='replace')[:1000]}")
+            raise RuntimeError(
+                f"{self.spec.engine} HTTP {response.status}: {raw.decode(errors='replace')[:1000]}"
+            )
         response_content_type = response.getheader("content-type")
         if not is_event_stream_content_type(response_content_type):
             raw = response.read()
@@ -1076,10 +1192,15 @@ class ManagedServer:
             parsed = parse_sse_lines([raw_line])
             for event in parsed:
                 event_received_ns = time.monotonic_ns()
-                event["_benchmark_arrival_ms"] = (event_received_ns - started) / 1_000_000.0
+                event["_benchmark_arrival_ms"] = (
+                    event_received_ns - started
+                ) / 1_000_000.0
                 events.append(event)
                 usage = event.get("usage")
-                if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
+                if (
+                    isinstance(usage, dict)
+                    and usage.get("completion_tokens") is not None
+                ):
                     terminal_usage_ns = event_received_ns
                 has_token, content, event_finish = event_delta(event)
                 if has_token:
@@ -1091,7 +1212,9 @@ class ManagedServer:
                 if event_finish is not None:
                     finish_reason = event_finish
         if first_token_ns is None or last_token_ns is None:
-            raise RuntimeError(f"{self.spec.engine} stream emitted no non-empty visible content")
+            raise RuntimeError(
+                f"{self.spec.engine} stream emitted no non-empty visible content"
+            )
         response_finished_ns = time.monotonic_ns()
         total_ms = (response_finished_ns - started) / 1_000_000.0
         ttft_ms = (first_token_ns - started) / 1_000_000.0
@@ -1099,10 +1222,18 @@ class ManagedServer:
         visible_content = "".join(token_fragments)
         visible_content_bytes = visible_content.encode("utf-8")
         if not visible_content_bytes:
-            raise RuntimeError(f"{self.spec.engine} stream emitted empty visible content")
-        token_count, accounting_source = stream_completion_accounting(events, content_event_count)
+            raise RuntimeError(
+                f"{self.spec.engine} stream emitted empty visible content"
+            )
+        token_count, accounting_source = stream_completion_accounting(
+            events, content_event_count
+        )
         prompt_token_count, prompt_accounting_source = stream_prompt_accounting(events)
-        decode_end_ns = terminal_usage_ns if accounting_source == "final_sse_usage" else last_token_ns
+        decode_end_ns = (
+            terminal_usage_ns
+            if accounting_source == "final_sse_usage"
+            else last_token_ns
+        )
         decode_ms = (decode_end_ns - first_token_ns) / 1_000_000.0
         visible_content_ms = (last_token_ns - first_token_ns) / 1_000_000.0
         stream_tail_ms = (response_finished_ns - decode_end_ns) / 1_000_000.0
@@ -1113,7 +1244,9 @@ class ManagedServer:
             "stream_tail_ms": stream_tail_ms,
             "visible_content_ms": visible_content_ms,
             "inter_token_ms": decode_ms / (token_count - 1) if token_count > 1 else 0.0,
-            "decode_tok_s": (token_count - 1) * 1000.0 / decode_ms if token_count > 1 and decode_ms > 0 else 0.0,
+            "decode_tok_s": (token_count - 1) * 1000.0 / decode_ms
+            if token_count > 1 and decode_ms > 0
+            else 0.0,
             "completion_tokens": token_count,
             "completion_token_accounting_source": accounting_source,
             "prompt_tokens": prompt_token_count,
@@ -1129,22 +1262,35 @@ class ManagedServer:
         }, events
 
 
-def make_server_spec(args: argparse.Namespace, engine: str, port: int, run_dir: pathlib.Path) -> ServerSpec:
+def make_server_spec(
+    args: argparse.Namespace, engine: str, port: int, run_dir: pathlib.Path
+) -> ServerSpec:
     if engine == "antfly":
         config_path = run_dir / "antfly-server.json"
-        write_json(config_path, {
-            "models_dir": str(args.models_dir.resolve()),
-            "admission": {"inference": {"max_concurrent_requests": 1}},
-            "generation_batching": {
-                "mode": "off",
-                "max_step_items": 1,
-                "max_step_query_tokens": 512,
-                "max_idle_prefill_chunk_size": SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE,
+        write_json(
+            config_path,
+            {
+                "models_dir": str(args.models_dir.resolve()),
+                "admission": {"inference": {"max_concurrent_requests": 1}},
+                "generation_batching": {
+                    "mode": "off",
+                    "max_step_items": 1,
+                    "max_step_query_tokens": 512,
+                    "max_idle_prefill_chunk_size": SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE,
+                },
             },
-        })
+        )
         command = [
-            str(args.antfly_bin.resolve()), "run", "--host", "127.0.0.1", "--port", str(port),
-            "--models-dir", str(args.models_dir.resolve()), "--config", str(config_path),
+            str(args.antfly_bin.resolve()),
+            "run",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--models-dir",
+            str(args.models_dir.resolve()),
+            "--config",
+            str(config_path),
         ]
         for name, value in antfly_server_budget_mb(args).items():
             if value > 0:
@@ -1156,11 +1302,28 @@ def make_server_spec(args: argparse.Namespace, engine: str, port: int, run_dir: 
         template_path = run_dir / "gemma4-public-final-chat-template.jinja"
         template_path.write_text(LLAMA_CHAT_TEMPLATE, encoding="utf-8")
         command = [
-            str(args.llama_server_bin.resolve()), "-m", str(args.model.resolve()),
-            "--host", "127.0.0.1", "--port", str(port), "-c", str(args.context_size),
-            "-b", "512", "-ub", "512", "-ngl", "999",
-            "-ctk", args.cache_dtype, "-ctv", args.cache_dtype,
-            "--jinja", "--chat-template-file", str(template_path.resolve()),
+            str(args.llama_server_bin.resolve()),
+            "-m",
+            str(args.model.resolve()),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "-c",
+            str(args.context_size),
+            "-b",
+            "512",
+            "-ub",
+            "512",
+            "-ngl",
+            "999",
+            "-ctk",
+            args.cache_dtype,
+            "-ctv",
+            args.cache_dtype,
+            "--jinja",
+            "--chat-template-file",
+            str(template_path.resolve()),
         ]
         if args.llama_server_prefix:
             command = shlex.split(args.llama_server_prefix) + command
@@ -1171,7 +1334,9 @@ def make_server_spec(args: argparse.Namespace, engine: str, port: int, run_dir: 
 def token_id_summary(token_ids: list[int]) -> dict[str, Any]:
     if not token_ids:
         raise ValueError("token ID sequence must not be empty")
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in token_ids):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) for value in token_ids
+    ):
         raise ValueError("token ID sequence contains a non-integer value")
     return {
         "count": len(token_ids),
@@ -1181,9 +1346,13 @@ def token_id_summary(token_ids: list[int]) -> dict[str, Any]:
     }
 
 
-def validate_llama_rendered_prompt(rendered_prompt: object, fixture: PromptFixture) -> dict[str, Any]:
+def validate_llama_rendered_prompt(
+    rendered_prompt: object, fixture: PromptFixture
+) -> dict[str, Any]:
     if not isinstance(rendered_prompt, str):
-        raise RuntimeError("llama.cpp /apply-template response is missing a string prompt")
+        raise RuntimeError(
+            "llama.cpp /apply-template response is missing a string prompt"
+        )
     encoded = rendered_prompt.encode("utf-8")
     summary = {
         "source": "llama_cpp_apply_template",
@@ -1207,11 +1376,24 @@ def collect_antfly_prompt_token_contract(
     fixture: PromptFixture,
 ) -> dict[str, Any]:
     command = [
-        str(args.antfly_bin.resolve()), "generate", str(args.model.resolve().parent), fixture.user_content,
-        "--backend", args.backend, "--max-tokens", "0", "--temperature", "0",
-        "--cache-dtype", getattr(args, "cache_dtype", "f16"),
-        "--prefill-chunk-size", str(SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE),
-        "--disable-thinking", "--print-chat-template-status", "--print-prompt", "--print-prompt-token-ids",
+        str(args.antfly_bin.resolve()),
+        "generate",
+        str(args.model.resolve().parent),
+        fixture.user_content,
+        "--backend",
+        args.backend,
+        "--max-tokens",
+        "0",
+        "--temperature",
+        "0",
+        "--cache-dtype",
+        getattr(args, "cache_dtype", "f16"),
+        "--prefill-chunk-size",
+        str(SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE),
+        "--disable-thinking",
+        "--print-chat-template-status",
+        "--print-prompt",
+        "--print-prompt-token-ids",
     ]
     # The token-contract preflight initializes the same model/runtime as the
     # measured server even though it emits no completion tokens. Keep its KV
@@ -1235,20 +1417,28 @@ def collect_antfly_prompt_token_contract(
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"Antfly prompt-token preflight failed to run: {exc}") from exc
+        raise RuntimeError(
+            f"Antfly prompt-token preflight failed to run: {exc}"
+        ) from exc
     log_path = args.output_dir / "antfly_prompt_tokens.log"
     log_path.write_text(completed.stdout or "", encoding="utf-8")
     if completed.returncode != 0:
-        raise RuntimeError(f"Antfly prompt-token preflight exited {completed.returncode}; see {log_path}")
+        raise RuntimeError(
+            f"Antfly prompt-token preflight exited {completed.returncode}; see {log_path}"
+        )
     output = completed.stdout or ""
     if "chat_template=true" not in output.splitlines():
-        raise RuntimeError(f"Antfly prompt-token preflight did not apply a chat template; see {log_path}")
+        raise RuntimeError(
+            f"Antfly prompt-token preflight did not apply a chat template; see {log_path}"
+        )
     prompt_marker = "prompt:\n"
     token_marker = "\nprompt_token_ids:"
     prompt_start = output.find(prompt_marker)
     prompt_end = output.find(token_marker, prompt_start + len(prompt_marker))
     if prompt_start < 0 or prompt_end < 0:
-        raise RuntimeError(f"Antfly prompt-token preflight emitted no rendered prompt; see {log_path}")
+        raise RuntimeError(
+            f"Antfly prompt-token preflight emitted no rendered prompt; see {log_path}"
+        )
     serialized_prompt = output[prompt_start + len(prompt_marker) : prompt_end]
     serialized_bytes = serialized_prompt.encode("utf-8")
     if not serialized_prompt.startswith(TOKENIZER_BOS_TEXT):
@@ -1277,11 +1467,15 @@ def collect_antfly_prompt_token_contract(
         if line.startswith("prompt_token_ids:"):
             token_line = line.partition(":")[2].strip()
     if token_line is None:
-        raise RuntimeError(f"Antfly prompt-token preflight emitted no prompt_token_ids; see {log_path}")
+        raise RuntimeError(
+            f"Antfly prompt-token preflight emitted no prompt_token_ids; see {log_path}"
+        )
     try:
         token_ids = [int(value) for value in token_line.split()]
     except ValueError as exc:
-        raise RuntimeError(f"Antfly prompt-token preflight emitted invalid token IDs; see {log_path}") from exc
+        raise RuntimeError(
+            f"Antfly prompt-token preflight emitted invalid token IDs; see {log_path}"
+        ) from exc
     return {
         **token_id_summary(token_ids),
         "source": "antfly_cli_rendered_public_channel_prompt",
@@ -1298,7 +1492,9 @@ def collect_antfly_prompt_token_contract(
     }
 
 
-def parse_key_value_log_events(log_path: pathlib.Path, marker: str) -> list[dict[str, str]]:
+def parse_key_value_log_events(
+    log_path: pathlib.Path, marker: str
+) -> list[dict[str, str]]:
     """Extract one stable key/value event family from a structured server log."""
 
     events: list[dict[str, str]] = []
@@ -1313,7 +1509,7 @@ def parse_key_value_log_events(log_path: pathlib.Path, marker: str) -> list[dict
             if separator and name and value:
                 # Structured Zig logs wrap the message in JSON, so the last
                 # key/value token can carry the closing quote and brace.
-                fields[name] = value.rstrip('\",}')
+                fields[name] = value.rstrip('",}')
         if fields:
             events.append(fields)
     return events
@@ -1328,61 +1524,80 @@ def parse_cuda_gqa_prefill_telemetry(log_path: pathlib.Path) -> dict[str, Any]:
     fallback_events = [event for event in events if event.get("status") == "fallback"]
     rejected_events = [event for event in events if event.get("status") == "rejected"]
     required_fast_events = [
-        event for event in active_events
-        if event.get("profile") == "required-fast" and event.get("route") == "prefill-fast"
-    ]
-    required_fast_gemma4_geometries = sorted({
-        int(event["head_dim"])
-        for event in required_fast_events
-        if event.get("num_heads") == "8"
-        and event.get("num_kv_heads") == "1"
-        and event.get("head_dim", "").isdigit()
-        and int(event["head_dim"]) in {256, 512}
-    })
-    route_keys = sorted({
-        (event.get("profile", ""), event.get("route", ""))
+        event
         for event in active_events
-        if event.get("profile") and event.get("route")
-    })
+        if event.get("profile") == "required-fast"
+        and event.get("route") == "prefill-fast"
+    ]
+    required_fast_gemma4_geometries = sorted(
+        {
+            int(event["head_dim"])
+            for event in required_fast_events
+            if event.get("num_heads") == "8"
+            and event.get("num_kv_heads") == "1"
+            and event.get("head_dim", "").isdigit()
+            and int(event["head_dim"]) in {256, 512}
+        }
+    )
+    route_keys = sorted(
+        {
+            (event.get("profile", ""), event.get("route", ""))
+            for event in active_events
+            if event.get("profile") and event.get("route")
+        }
+    )
     route_observations = []
     for profile, route in route_keys:
         matching = [
-            event for event in active_events
+            event
+            for event in active_events
             if event.get("profile") == profile and event.get("route") == route
         ]
-        route_observations.append({
-            "profile": profile,
-            "route": route,
-            "active_count": len(matching),
-            "gemma4_head_dims": sorted({
-                int(event["head_dim"])
-                for event in matching
-                if event.get("num_heads") == "8"
-                and event.get("num_kv_heads") == "1"
-                and event.get("head_dim", "").isdigit()
-                and int(event["head_dim"]) in {256, 512}
-            }),
-            "gemma4_query_lengths": sorted({
-                int(event["q_seq_len"])
-                for event in matching
-                if event.get("q_seq_len", "").isdigit()
-                and int(event["q_seq_len"]) in {3, 512}
-            }),
-        })
+        route_observations.append(
+            {
+                "profile": profile,
+                "route": route,
+                "active_count": len(matching),
+                "gemma4_head_dims": sorted(
+                    {
+                        int(event["head_dim"])
+                        for event in matching
+                        if event.get("num_heads") == "8"
+                        and event.get("num_kv_heads") == "1"
+                        and event.get("head_dim", "").isdigit()
+                        and int(event["head_dim"]) in {256, 512}
+                    }
+                ),
+                "gemma4_query_lengths": sorted(
+                    {
+                        int(event["q_seq_len"])
+                        for event in matching
+                        if event.get("q_seq_len", "").isdigit()
+                        and int(event["q_seq_len"]) in {3, 512}
+                    }
+                ),
+            }
+        )
     return {
         "events": events,
-        "configured_profiles": sorted({
-            event["profile"] for event in events
-            if event.get("status") == "configured" and "profile" in event
-        }),
-        "active_routes": sorted({event["route"] for event in active_events if "route" in event}),
+        "configured_profiles": sorted(
+            {
+                event["profile"]
+                for event in events
+                if event.get("status") == "configured" and "profile" in event
+            }
+        ),
+        "active_routes": sorted(
+            {event["route"] for event in active_events if "route" in event}
+        ),
         "active_count": len(active_events),
         "route_observations": route_observations,
         "required_fast_active_count": len(required_fast_events),
         "required_fast_gemma4_head_dims": required_fast_gemma4_geometries,
         "fallback_count": len(fallback_events),
         "rejected_count": len(rejected_events),
-        "required_fast_route_active": required_fast_gemma4_geometries == [256, 512] and not rejected_events,
+        "required_fast_route_active": required_fast_gemma4_geometries == [256, 512]
+        and not rejected_events,
     }
 
 
@@ -1423,7 +1638,9 @@ def cuda_route_contract(args: argparse.Namespace) -> dict[str, Any]:
     resolved = getattr(args, "antfly_execution_profile", None)
     if isinstance(resolved, dict) and isinstance(resolved.get("route_contract"), dict):
         return resolved["route_contract"]
-    profile_key = getattr(args, "cuda_execution_profile", CUDA_EXECUTION_PROFILE_DEFAULT)
+    profile_key = getattr(
+        args, "cuda_execution_profile", CUDA_EXECUTION_PROFILE_DEFAULT
+    )
     return CUDA_EXECUTION_PROFILES[profile_key]["route_contract"]
 
 
@@ -1434,38 +1651,50 @@ def parse_cuda_gqa_score_prework_telemetry(log_path: pathlib.Path) -> dict[str, 
     active_events = [event for event in events if event.get("event") == "active"]
     fallback_events = [event for event in events if event.get("event") == "fallback"]
     rejected_events = [event for event in events if event.get("event") == "rejected"]
-    consumers = sorted({event["consumer"] for event in active_events if event.get("consumer")})
+    consumers = sorted(
+        {event["consumer"] for event in active_events if event.get("consumer")}
+    )
     observations = []
     for consumer in consumers:
-        matching = [event for event in active_events if event.get("consumer") == consumer]
+        matching = [
+            event for event in active_events if event.get("consumer") == consumer
+        ]
         routes_by_head_dim = {
             str(int(event["head_dim"])): event.get("route")
             for event in matching
-            if event.get("head_dim", "").isdigit() and int(event["head_dim"]) in {256, 512}
+            if event.get("head_dim", "").isdigit()
+            and int(event["head_dim"]) in {256, 512}
         }
-        observations.append({
-            "consumer": consumer,
-            "active_count": len(matching),
-            "gemma4_head_dims": sorted(int(value) for value in routes_by_head_dim),
-            "routes_by_head_dim": routes_by_head_dim,
-        })
+        observations.append(
+            {
+                "consumer": consumer,
+                "active_count": len(matching),
+                "gemma4_head_dims": sorted(int(value) for value in routes_by_head_dim),
+                "routes_by_head_dim": routes_by_head_dim,
+            }
+        )
     return {
         "events": events,
-        "configured_modes": sorted({
-            event["configured"]
-            for event in events
-            if event.get("event") == "configured" and event.get("configured")
-        }),
+        "configured_modes": sorted(
+            {
+                event["configured"]
+                for event in events
+                if event.get("event") == "configured" and event.get("configured")
+            }
+        ),
         "active_consumers": consumers,
         "active_count": len(active_events),
         "active_observations": observations,
         "fallback_count": len(fallback_events),
         "rejected_count": len(rejected_events),
-        "fallback_reasons": sorted({
-            event["fallback_reason"]
-            for event in fallback_events + rejected_events
-            if event.get("fallback_reason") and event.get("fallback_reason") != "none"
-        }),
+        "fallback_reasons": sorted(
+            {
+                event["fallback_reason"]
+                for event in fallback_events + rejected_events
+                if event.get("fallback_reason")
+                and event.get("fallback_reason") != "none"
+            }
+        ),
     }
 
 
@@ -1493,40 +1722,56 @@ def parse_cuda_gqa_decode_telemetry(log_path: pathlib.Path) -> dict[str, Any]:
     fallback_events = [event for event in events if event.get("status") == "fallback"]
     rejected_events = [event for event in events if event.get("status") == "rejected"]
     observations = []
-    for profile, route in sorted({
-        (event.get("profile"), event.get("route"))
-        for event in active_events
-        if event.get("profile") and event.get("route")
-    }):
+    for profile, route in sorted(
+        {
+            (event.get("profile"), event.get("route"))
+            for event in active_events
+            if event.get("profile") and event.get("route")
+        }
+    ):
         matching = [
-            event for event in active_events
+            event
+            for event in active_events
             if event.get("profile") == profile and event.get("route") == route
         ]
-        observations.append({
-            "profile": profile,
-            "route": route,
-            "active_count": len(matching),
-            "gemma4_head_dims": sorted({
-                int(event["head_dim"])
-                for event in matching
-                if event.get("head_dim", "").isdigit()
-                and int(event["head_dim"]) in {256, 512}
-            }),
-        })
+        observations.append(
+            {
+                "profile": profile,
+                "route": route,
+                "active_count": len(matching),
+                "gemma4_head_dims": sorted(
+                    {
+                        int(event["head_dim"])
+                        for event in matching
+                        if event.get("head_dim", "").isdigit()
+                        and int(event["head_dim"]) in {256, 512}
+                    }
+                ),
+            }
+        )
     return {
         "events": events,
-        "configured_profiles": sorted({
-            event["profile"] for event in events
-            if event.get("status") == "configured" and event.get("profile")
-        }),
-        "active_routes": sorted({event["route"] for event in active_events if event.get("route")}),
+        "configured_profiles": sorted(
+            {
+                event["profile"]
+                for event in events
+                if event.get("status") == "configured" and event.get("profile")
+            }
+        ),
+        "active_routes": sorted(
+            {event["route"] for event in active_events if event.get("route")}
+        ),
         "active_count": len(active_events),
         "route_observations": observations,
         "fallback_count": len(fallback_events),
         "rejected_count": len(rejected_events),
-        "fallback_reasons": sorted({
-            event["reason"] for event in fallback_events + rejected_events if event.get("reason")
-        }),
+        "fallback_reasons": sorted(
+            {
+                event["reason"]
+                for event in fallback_events + rejected_events
+                if event.get("reason")
+            }
+        ),
     }
 
 
@@ -1535,10 +1780,9 @@ def cuda_gqa_decode_route_observation(
     contract: dict[str, Any],
 ) -> dict[str, Any]:
     for observation in telemetry.get("route_observations") or []:
-        if (
-            observation.get("profile") == contract.get("profile")
-            and observation.get("route") == contract.get("route")
-        ):
+        if observation.get("profile") == contract.get("profile") and observation.get(
+            "route"
+        ) == contract.get("route"):
             return observation
     return {
         "profile": contract.get("profile"),
@@ -1563,13 +1807,23 @@ def run_engine_sample(
         environment.update(args.antfly_execution_profile["effective_env"])
     log_path = run_dir / "server.log"
     warmups: list[dict[str, Any]] = []
-    with ManagedServer(spec, log_path, environment, args.startup_timeout, args.request_timeout) as server:
-        request_model = args.antfly_model_id if engine == "antfly" else args.model.resolve()
+    with ManagedServer(
+        spec, log_path, environment, args.startup_timeout, args.request_timeout
+    ) as server:
+        request_model = (
+            args.antfly_model_id if engine == "antfly" else args.model.resolve()
+        )
         llama_token_summary = None
         llama_template_summary = None
         if engine == "llama_cpp":
             measured_messages = request_body(
-                engine, request_model, args.backend, fixture, args.output_tokens, args.cache_dtype, stream=True,
+                engine,
+                request_model,
+                args.backend,
+                fixture,
+                args.output_tokens,
+                args.cache_dtype,
+                stream=True,
             )["messages"]
             templated, _ = server.post_json(
                 {
@@ -1582,11 +1836,19 @@ def run_engine_sample(
             rendered_prompt = templated.get("prompt")
             write_json(run_dir / "llama_apply_template_response.json", templated)
             if isinstance(rendered_prompt, str):
-                (run_dir / "llama_applied_prompt.txt").write_text(rendered_prompt, encoding="utf-8")
-            llama_template_summary = validate_llama_rendered_prompt(rendered_prompt, fixture)
+                (run_dir / "llama_applied_prompt.txt").write_text(
+                    rendered_prompt, encoding="utf-8"
+                )
+            llama_template_summary = validate_llama_rendered_prompt(
+                rendered_prompt, fixture
+            )
             write_json(run_dir / "llama_prompt_template.json", llama_template_summary)
             tokenized, _ = server.post_json(
-                {"content": rendered_prompt, "add_special": True, "parse_special": True},
+                {
+                    "content": rendered_prompt,
+                    "add_special": True,
+                    "parse_special": True,
+                },
                 path="/tokenize",
             )
             token_ids = tokenized.get("tokens")
@@ -1598,7 +1860,9 @@ def run_engine_sample(
                     "source": "llama_cpp_tokenize_applied_template",
                 }
             except ValueError as exc:
-                raise RuntimeError(f"invalid llama.cpp /tokenize response: {exc}") from exc
+                raise RuntimeError(
+                    f"invalid llama.cpp /tokenize response: {exc}"
+                ) from exc
             write_json(
                 run_dir / "llama_prompt_tokens.json",
                 {**llama_token_summary, "token_ids": token_ids},
@@ -1610,18 +1874,32 @@ def run_engine_sample(
                 )
         for warmup_index in range(1, args.warmups + 1):
             body = request_body(
-                engine, request_model, args.backend, fixture, args.output_tokens, args.cache_dtype, stream=False,
+                engine,
+                request_model,
+                args.backend,
+                fixture,
+                args.output_tokens,
+                args.cache_dtype,
+                stream=False,
             )
             response, transport = server.post_nonstream(body)
             warmup = {"index": warmup_index, **nonstream_summary(response), **transport}
             warmups.append(warmup)
         body = request_body(
-            engine, request_model, args.backend, fixture, args.output_tokens, args.cache_dtype, stream=True,
+            engine,
+            request_model,
+            args.backend,
+            fixture,
+            args.output_tokens,
+            args.cache_dtype,
+            stream=True,
         )
         measured, events = server.post_stream(body)
 
     cuda_gqa_prefill_telemetry = (
-        parse_cuda_gqa_prefill_telemetry(log_path) if engine == "antfly" and args.backend == "cuda" else None
+        parse_cuda_gqa_prefill_telemetry(log_path)
+        if engine == "antfly" and args.backend == "cuda"
+        else None
     )
     cuda_gqa_score_prework_telemetry = (
         parse_cuda_gqa_score_prework_telemetry(log_path)
@@ -1635,11 +1913,17 @@ def run_engine_sample(
     )
 
     if not warmups:
-        raise RuntimeError("at least one warmup is required to establish token accounting and HTTP reuse")
+        raise RuntimeError(
+            "at least one warmup is required to establish token accounting and HTTP reuse"
+        )
     prompt_counts = {int(row["prompt_tokens"]) for row in warmups}
     completion_counts = {int(row["completion_tokens"]) for row in warmups}
     finish_reasons = {str(row["finish_reason"]) for row in warmups}
-    if len(prompt_counts) != 1 or len(completion_counts) != 1 or len(finish_reasons) != 1:
+    if (
+        len(prompt_counts) != 1
+        or len(completion_counts) != 1
+        or len(finish_reasons) != 1
+    ):
         raise RuntimeError(f"{engine} warmup accounting was not stable")
     warmup_prompt_tokens = prompt_counts.pop()
     if measured["prompt_tokens"] is None:
@@ -1649,18 +1933,23 @@ def run_engine_sample(
             f"{engine} measured prompt accounting differs from warmup: "
             f"measured={measured['prompt_tokens']} warmup={warmup_prompt_tokens}"
         )
-    measured.update({
-        "engine": engine,
-        "warmups": warmups,
-        "prompt_token_ids": llama_token_summary or {
-            key: prompt_token_contract[key] for key in ("count", "sha256", "first_16", "last_16", "source")
-        },
-        "prompt_template": llama_template_summary or {
-            **prompt_token_contract["template"],
-        },
-        "server_command": list(spec.command),
-        "server_log": str(log_path),
-    })
+    measured.update(
+        {
+            "engine": engine,
+            "warmups": warmups,
+            "prompt_token_ids": llama_token_summary
+            or {
+                key: prompt_token_contract[key]
+                for key in ("count", "sha256", "first_16", "last_16", "source")
+            },
+            "prompt_template": llama_template_summary
+            or {
+                **prompt_token_contract["template"],
+            },
+            "server_command": list(spec.command),
+            "server_log": str(log_path),
+        }
+    )
     if cuda_gqa_prefill_telemetry is not None:
         measured["cuda_gqa_prefill_telemetry"] = cuda_gqa_prefill_telemetry
     if cuda_gqa_score_prework_telemetry is not None:
@@ -1672,9 +1961,13 @@ def run_engine_sample(
     return measured
 
 
-def command_output(command: list[str], *, cwd: pathlib.Path | None = None) -> str | None:
+def command_output(
+    command: list[str], *, cwd: pathlib.Path | None = None
+) -> str | None:
     try:
-        return subprocess.check_output(command, cwd=cwd, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
+        return subprocess.check_output(
+            command, cwd=cwd, text=True, stderr=subprocess.STDOUT, timeout=30
+        ).strip()
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -1721,12 +2014,16 @@ def parse_gpu_execution_state(
             try:
                 numeric = parser(value)
             except ValueError as exc:
-                raise ValueError(f"GPU-state field {name} is not numeric: {value!r}") from exc
+                raise ValueError(
+                    f"GPU-state field {name} is not numeric: {value!r}"
+                ) from exc
             if numeric < 0 or (name != "index" and numeric <= 0):
                 raise ValueError(f"GPU-state field {name} must be positive")
             record[name] = numeric
         if record["persistence_mode"] not in {"Enabled", "Disabled"}:
-            raise ValueError(f"invalid persistence mode: {record['persistence_mode']!r}")
+            raise ValueError(
+                f"invalid persistence mode: {record['persistence_mode']!r}"
+            )
         if record["mig.mode.current"] not in {"Enabled", "Disabled", "N/A", "[N/A]"}:
             raise ValueError(f"invalid MIG mode: {record['mig.mode.current']!r}")
         parsed.append(record)
@@ -1743,24 +2040,37 @@ def parse_gpu_execution_state(
         matches = [
             record
             for record in parsed
-            if str(record["index"]) == selector or str(record["uuid"]).startswith(selector)
+            if str(record["index"]) == selector
+            or str(record["uuid"]).startswith(selector)
         ]
         if len(matches) != 1:
-            raise ValueError(f"CUDA_VISIBLE_DEVICES selector {selector!r} does not resolve uniquely")
+            raise ValueError(
+                f"CUDA_VISIBLE_DEVICES selector {selector!r} does not resolve uniquely"
+            )
         if matches[0] in selected:
-            raise ValueError(f"CUDA_VISIBLE_DEVICES selects GPU {selector!r} more than once")
+            raise ValueError(
+                f"CUDA_VISIBLE_DEVICES selects GPU {selector!r} more than once"
+            )
         selected.append(matches[0])
     return {"cuda_visible_devices": cuda_visible_devices, "selected_gpus": selected}
 
 
-def capture_gpu_execution_state(environment: dict[str, str] | None = None) -> dict[str, Any]:
+def capture_gpu_execution_state(
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     environment = os.environ if environment is None else environment
-    raw = command_output([
-        "nvidia-smi", f"--query-gpu={','.join(STABLE_GPU_QUERY_FIELDS)}",
-        "--format=csv,noheader,nounits",
-    ])
+    raw = command_output(
+        [
+            "nvidia-smi",
+            f"--query-gpu={','.join(STABLE_GPU_QUERY_FIELDS)}",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     try:
-        return {**parse_gpu_execution_state(raw, environment.get("CUDA_VISIBLE_DEVICES")), "error": None}
+        return {
+            **parse_gpu_execution_state(raw, environment.get("CUDA_VISIBLE_DEVICES")),
+            "error": None,
+        }
     except ValueError as exc:
         return {
             "cuda_visible_devices": environment.get("CUDA_VISIBLE_DEVICES"),
@@ -1770,26 +2080,38 @@ def capture_gpu_execution_state(environment: dict[str, str] | None = None) -> di
 
 
 def capture_selected_gpu_compute_processes(gpu_state: dict[str, Any]) -> dict[str, Any]:
-    raw = command_output([
-        "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name",
-        "--format=csv,noheader,nounits",
-    ])
+    raw = command_output(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,process_name",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     if raw is None:
-        return {"selected_gpu_processes": [], "error": "nvidia-smi compute-process query failed"}
-    selected_uuids = {str(record.get("uuid")) for record in gpu_state.get("selected_gpus") or []}
+        return {
+            "selected_gpu_processes": [],
+            "error": "nvidia-smi compute-process query failed",
+        }
+    selected_uuids = {
+        str(record.get("uuid")) for record in gpu_state.get("selected_gpus") or []
+    }
     processes: list[dict[str, Any]] = []
     try:
         for row_number, row in enumerate(csv.reader(io.StringIO(raw)), start=1):
             values = [value.strip() for value in row]
             if len(values) != 3:
-                raise ValueError(f"compute-process row {row_number} does not have three fields")
+                raise ValueError(
+                    f"compute-process row {row_number} does not have three fields"
+                )
             gpu_uuid, pid_text, process_name = values
             if gpu_uuid not in selected_uuids:
                 continue
             pid = int(pid_text)
             if pid <= 0 or not process_name:
                 raise ValueError(f"compute-process row {row_number} is invalid")
-            processes.append({"gpu_uuid": gpu_uuid, "pid": pid, "process_name": process_name})
+            processes.append(
+                {"gpu_uuid": gpu_uuid, "pid": pid, "process_name": process_name}
+            )
     except ValueError as exc:
         return {"selected_gpu_processes": [], "error": str(exc)}
     return {"selected_gpu_processes": processes, "error": None}
@@ -1800,7 +2122,9 @@ def visible_model_bundle_files(model_dir: pathlib.Path) -> list[pathlib.Path]:
         (
             path
             for path in model_dir.rglob("*")
-            if not any(part.startswith(".") for part in path.relative_to(model_dir).parts)
+            if not any(
+                part.startswith(".") for part in path.relative_to(model_dir).parts
+            )
             and path.is_file()
         ),
         key=lambda item: item.relative_to(model_dir).as_posix(),
@@ -1809,14 +2133,22 @@ def visible_model_bundle_files(model_dir: pathlib.Path) -> list[pathlib.Path]:
 
 def model_bundle_layout_errors(model_dir: pathlib.Path) -> list[str]:
     errors: list[str] = []
-    for path in sorted(model_dir.rglob("*"), key=lambda item: item.relative_to(model_dir).as_posix()):
+    for path in sorted(
+        model_dir.rglob("*"), key=lambda item: item.relative_to(model_dir).as_posix()
+    ):
         relative = path.relative_to(model_dir).as_posix()
         if any(part.startswith(".") for part in path.relative_to(model_dir).parts):
-            errors.append(f"hidden model-bundle path is unsupported for enforced evidence: {relative}")
+            errors.append(
+                f"hidden model-bundle path is unsupported for enforced evidence: {relative}"
+            )
         if path.is_symlink():
-            errors.append(f"symlinked model-bundle path is unsupported for enforced evidence: {relative}")
+            errors.append(
+                f"symlinked model-bundle path is unsupported for enforced evidence: {relative}"
+            )
         elif not path.is_file() and not path.is_dir():
-            errors.append(f"special model-bundle path is unsupported for enforced evidence: {relative}")
+            errors.append(
+                f"special model-bundle path is unsupported for enforced evidence: {relative}"
+            )
         if path.is_file() and path.name in UNSAFE_MODEL_CONTROL_FILES:
             errors.append(
                 "runtime-path manifest is unsupported for enforced evidence until ModelManager "
@@ -1832,20 +2164,29 @@ def path_provenance(path: pathlib.Path) -> dict[str, Any]:
         before = resolved.stat()
         digest = sha256_file(resolved)
         after = resolved.stat()
-        before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
         after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         if before_identity != after_identity:
-            raise RuntimeError(f"file changed while hashing benchmark provenance: {resolved}")
-        value.update({
-            "bytes": after.st_size,
-            "sha256": digest,
-            "file_identity": {
-                "device": after.st_dev,
-                "inode": after.st_ino,
-                "size": after.st_size,
-                "mtime_ns": after.st_mtime_ns,
-            },
-        })
+            raise RuntimeError(
+                f"file changed while hashing benchmark provenance: {resolved}"
+            )
+        value.update(
+            {
+                "bytes": after.st_size,
+                "sha256": digest,
+                "file_identity": {
+                    "device": after.st_dev,
+                    "inode": after.st_ino,
+                    "size": after.st_size,
+                    "mtime_ns": after.st_mtime_ns,
+                },
+            }
+        )
     return value
 
 
@@ -1891,32 +2232,53 @@ def antfly_model_bundle_provenance(
             item = decoder_provenance
             expected_identity = item.get("file_identity")
             observed_identity = before_identities[relative.as_posix()]
-            if not isinstance(expected_identity, dict) or (
-                expected_identity.get("device"),
-                expected_identity.get("inode"),
-                expected_identity.get("size"),
-                expected_identity.get("mtime_ns"),
-            ) != observed_identity:
-                raise RuntimeError("benchmark decoder changed after its provenance hash was collected")
+            if (
+                not isinstance(expected_identity, dict)
+                or (
+                    expected_identity.get("device"),
+                    expected_identity.get("inode"),
+                    expected_identity.get("size"),
+                    expected_identity.get("mtime_ns"),
+                )
+                != observed_identity
+            ):
+                raise RuntimeError(
+                    "benchmark decoder changed after its provenance hash was collected"
+                )
         else:
             item = path_provenance(path)
-        files.append({
-            "path": relative.as_posix(),
-            "bytes": item.get("bytes"),
-            "sha256": item.get("sha256"),
-            "file_identity": item.get("file_identity"),
-        })
+        files.append(
+            {
+                "path": relative.as_posix(),
+                "bytes": item.get("bytes"),
+                "sha256": item.get("sha256"),
+                "file_identity": item.get("file_identity"),
+            }
+        )
     after_paths = visible_model_bundle_files(model_dir)
-    if [path.relative_to(model_dir).as_posix() for path in after_paths] != list(before_identities):
-        raise RuntimeError("Antfly model bundle inventory changed while provenance was collected")
+    if [path.relative_to(model_dir).as_posix() for path in after_paths] != list(
+        before_identities
+    ):
+        raise RuntimeError(
+            "Antfly model bundle inventory changed while provenance was collected"
+        )
     for path in after_paths:
         relative = path.relative_to(model_dir).as_posix()
         stat = path.stat()
-        if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != before_identities[relative]:
-            raise RuntimeError(f"Antfly model bundle file changed while hashing provenance: {relative}")
+        if (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        ) != before_identities[relative]:
+            raise RuntimeError(
+                f"Antfly model bundle file changed while hashing provenance: {relative}"
+            )
     decoder_relative = resolved_model.relative_to(model_dir).as_posix()
     if not any(item["path"] == decoder_relative for item in files):
-        raise RuntimeError("Antfly model bundle inventory does not contain the benchmark decoder")
+        raise RuntimeError(
+            "Antfly model bundle inventory does not contain the benchmark decoder"
+        )
     identity = {
         "files": [
             {"path": item["path"], "bytes": item["bytes"], "sha256": item["sha256"]}
@@ -1931,14 +2293,18 @@ def antfly_model_bundle_provenance(
     }
 
 
-def model_bundle_stat_errors(model: pathlib.Path, expected_bundle: dict[str, Any]) -> list[str]:
+def model_bundle_stat_errors(
+    model: pathlib.Path, expected_bundle: dict[str, Any]
+) -> list[str]:
     model_dir = model.resolve().parent
     expected_files = expected_bundle.get("files")
     if not isinstance(expected_files, list):
         return ["model-bundle provenance has no file inventory"]
     current_paths = visible_model_bundle_files(model_dir)
     current_names = [path.relative_to(model_dir).as_posix() for path in current_paths]
-    expected_names = [item.get("path") for item in expected_files if isinstance(item, dict)]
+    expected_names = [
+        item.get("path") for item in expected_files if isinstance(item, dict)
+    ]
     errors: list[str] = []
     if current_names != expected_names:
         errors.append(
@@ -1946,8 +2312,12 @@ def model_bundle_stat_errors(model: pathlib.Path, expected_bundle: dict[str, Any
         )
         return errors
     for path, expected in zip(current_paths, expected_files, strict=True):
-        if not isinstance(expected, dict) or not isinstance(expected.get("file_identity"), dict):
-            errors.append(f"model-bundle file lacks stable identity: {path.relative_to(model_dir)}")
+        if not isinstance(expected, dict) or not isinstance(
+            expected.get("file_identity"), dict
+        ):
+            errors.append(
+                f"model-bundle file lacks stable identity: {path.relative_to(model_dir)}"
+            )
             continue
         stat = path.stat()
         observed_identity = {
@@ -1961,7 +2331,9 @@ def model_bundle_stat_errors(model: pathlib.Path, expected_bundle: dict[str, Any
     return errors
 
 
-def parse_ldd_dependencies(output: str) -> tuple[list[tuple[str, pathlib.Path]], list[str]]:
+def parse_ldd_dependencies(
+    output: str,
+) -> tuple[list[tuple[str, pathlib.Path]], list[str]]:
     resolved: list[tuple[str, pathlib.Path]] = []
     unresolved: list[str] = []
     for raw_line in output.splitlines():
@@ -1980,12 +2352,16 @@ def parse_ldd_dependencies(output: str) -> tuple[list[tuple[str, pathlib.Path]],
         if target.startswith("/"):
             path = pathlib.Path(target).resolve()
             resolved.append((path.name, path))
-    return sorted(set(resolved), key=lambda item: (item[0], str(item[1]))), sorted(set(unresolved))
+    return sorted(set(resolved), key=lambda item: (item[0], str(item[1]))), sorted(
+        set(unresolved)
+    )
 
 
 def is_system_shared_object(path: pathlib.Path) -> bool:
     resolved = path.resolve()
-    return any(resolved == root or root in resolved.parents for root in SYSTEM_LIBRARY_ROOTS)
+    return any(
+        resolved == root or root in resolved.parents for root in SYSTEM_LIBRARY_ROOTS
+    )
 
 
 def dynamic_dependency_provenance(path: pathlib.Path) -> dict[str, Any]:
@@ -2012,9 +2388,8 @@ def dynamic_dependency_provenance(path: pathlib.Path) -> dict[str, Any]:
     material: list[dict[str, Any]] = []
     system: list[dict[str, str]] = []
     for name, dependency_path in dependencies:
-        if (
-            not is_system_shared_object(dependency_path)
-            or name.startswith(MATERIAL_SHARED_OBJECT_PREFIXES)
+        if not is_system_shared_object(dependency_path) or name.startswith(
+            MATERIAL_SHARED_OBJECT_PREFIXES
         ):
             material.append({"name": name, **path_provenance(dependency_path)})
         else:
@@ -2045,7 +2420,9 @@ def git_provenance(path: pathlib.Path) -> dict[str, Any]:
     root = command_output(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
     if not root:
         return {"available": False}
-    status = command_output(["git", "-C", root, "status", "--porcelain=v1", "--untracked-files=all"])
+    status = command_output(
+        ["git", "-C", root, "status", "--porcelain=v1", "--untracked-files=all"]
+    )
     return {
         "available": True,
         "root": root,
@@ -2059,11 +2436,15 @@ def stable_executable_build_metadata(version_output: str | None) -> str | None:
     if not version_output:
         return None
     lines = [line.strip() for line in version_output.splitlines() if line.strip()]
-    stable_lines = [line for line in lines if line.startswith(("version:", "built with "))]
+    stable_lines = [
+        line for line in lines if line.startswith(("version:", "built with "))
+    ]
     return "\n".join(stable_lines or lines)
 
 
-def executable_provenance(path: pathlib.Path, *, inspect_dependencies: bool = False) -> dict[str, Any]:
+def executable_provenance(
+    path: pathlib.Path, *, inspect_dependencies: bool = False
+) -> dict[str, Any]:
     value = path_provenance(path)
     value["version"] = command_output([str(path.resolve()), "--version"])
     value["build_metadata"] = stable_executable_build_metadata(value["version"])
@@ -2092,12 +2473,17 @@ def stable_runtime_identity() -> dict[str, Any]:
     return {**identity, "sha256": canonical_sha256(identity)}
 
 
-def collect_provenance(args: argparse.Namespace, fixture: PromptFixture) -> dict[str, Any]:
+def collect_provenance(
+    args: argparse.Namespace, fixture: PromptFixture
+) -> dict[str, Any]:
     script_path = pathlib.Path(__file__).resolve()
-    gpu = command_output([
-        "nvidia-smi", "--query-gpu=index,uuid,name,driver_version,compute_cap,pci.bus_id,persistence_mode,pstate,temperature.gpu,power.draw,memory.total",
-        "--format=csv,noheader,nounits",
-    ])
+    gpu = command_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,name,driver_version,compute_cap,pci.bus_id,persistence_mode,pstate,temperature.gpu,power.draw,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     runtime_identity = stable_runtime_identity()
     gpu_compute_processes = capture_selected_gpu_compute_processes(
         runtime_identity["gpu_execution_state"]
@@ -2113,22 +2499,30 @@ def collect_provenance(args: argparse.Namespace, fixture: PromptFixture) -> dict
         "runtime_identity": runtime_identity,
         "antfly_git": git_provenance(script_path.parent),
         "antfly_binary": executable_provenance(args.antfly_bin),
-        "llama_cpp_binary": executable_provenance(args.llama_server_bin, inspect_dependencies=True),
+        "llama_cpp_binary": executable_provenance(
+            args.llama_server_bin, inspect_dependencies=True
+        ),
         "model": model,
         "antfly_model_bundle": antfly_model_bundle_provenance(args.model, model),
         "harness": harness_provenance(script_path),
         "fixture_file": path_provenance(fixture.path),
-        "antfly_execution_profile": execution_profile_provenance(args.antfly_execution_profile),
+        "antfly_execution_profile": execution_profile_provenance(
+            args.antfly_execution_profile
+        ),
     }
 
 
-def provenance_validation_errors(args: argparse.Namespace, provenance: dict[str, Any]) -> list[str]:
+def provenance_validation_errors(
+    args: argparse.Namespace, provenance: dict[str, Any]
+) -> list[str]:
     if not args.enforce_performance or args.backend != "cuda":
         return []
     errors: list[str] = []
     model_bundle = provenance.get("antfly_model_bundle") or {}
     if not model_bundle.get("sha256") or not model_bundle.get("files"):
-        errors.append("enforced evidence requires a hashed Antfly model-bundle inventory")
+        errors.append(
+            "enforced evidence requires a hashed Antfly model-bundle inventory"
+        )
     errors.extend(model_bundle.get("layout_errors") or [])
     runtime_identity = provenance.get("runtime_identity") or {}
     gpu_execution_state = runtime_identity.get("gpu_execution_state") or {}
@@ -2140,7 +2534,9 @@ def provenance_validation_errors(args: argparse.Namespace, provenance: dict[str,
         errors.append("enforced CUDA evidence requires CUDA toolchain provenance")
     compute_processes = provenance.get("gpu_compute_processes_before_benchmark") or {}
     if compute_processes.get("error"):
-        errors.append("enforced CUDA evidence could not inspect pre-existing GPU compute processes")
+        errors.append(
+            "enforced CUDA evidence could not inspect pre-existing GPU compute processes"
+        )
     elif compute_processes.get("selected_gpu_processes"):
         errors.append(
             "enforced CUDA evidence requires an idle GPU; pre-existing compute processes were observed: "
@@ -2152,13 +2548,19 @@ def provenance_validation_errors(args: argparse.Namespace, provenance: dict[str,
     if not dependencies.get("is_elf"):
         errors.append("enforced evidence requires llama-server to be an ELF executable")
     if status not in {"resolved", "static"}:
-        errors.append(f"could not resolve llama-server dynamic dependency closure: status={status!r}")
+        errors.append(
+            f"could not resolve llama-server dynamic dependency closure: status={status!r}"
+        )
     unresolved = dependencies.get("unresolved_dependencies") or []
     if unresolved:
-        errors.append(f"llama-server has unresolved dynamic dependencies: {unresolved!r}")
+        errors.append(
+            f"llama-server has unresolved dynamic dependencies: {unresolved!r}"
+        )
     for item in dependencies.get("material_dependency_files") or []:
         if not item.get("sha256"):
-            errors.append(f"could not hash llama-server material dependency: {item.get('path')!r}")
+            errors.append(
+                f"could not hash llama-server material dependency: {item.get('path')!r}"
+            )
     if not llama.get("runtime_bundle_sha256"):
         errors.append("llama-server runtime bundle hash is unavailable")
     if not llama.get("build_metadata"):
@@ -2175,15 +2577,23 @@ def capture_runtime_guard(
     expected_gpu_state = expected_runtime.get("gpu_execution_state")
     gpu_state = capture_gpu_execution_state()
     compute_processes = capture_selected_gpu_compute_processes(gpu_state)
-    integrity_errors = model_bundle_stat_errors(args.model, provenance.get("antfly_model_bundle") or {})
+    integrity_errors = model_bundle_stat_errors(
+        args.model, provenance.get("antfly_model_bundle") or {}
+    )
     performance_errors: list[str] = []
     if args.backend == "cuda":
         if gpu_state.get("error") or not gpu_state.get("selected_gpus"):
-            performance_errors.append(f"{stage}: could not capture stable selected-GPU execution state")
+            performance_errors.append(
+                f"{stage}: could not capture stable selected-GPU execution state"
+            )
         elif gpu_state != expected_gpu_state:
-            performance_errors.append(f"{stage}: selected-GPU power/clock/MIG state changed")
+            performance_errors.append(
+                f"{stage}: selected-GPU power/clock/MIG state changed"
+            )
         if compute_processes.get("error"):
-            performance_errors.append(f"{stage}: could not inspect selected-GPU compute processes")
+            performance_errors.append(
+                f"{stage}: could not inspect selected-GPU compute processes"
+            )
         elif compute_processes.get("selected_gpu_processes"):
             performance_errors.append(
                 f"{stage}: selected GPU is not idle: {compute_processes['selected_gpu_processes']!r}"
@@ -2205,20 +2615,30 @@ def runtime_guard_errors(args: argparse.Namespace, guard: dict[str, Any]) -> lis
     return errors
 
 
-def build_lock(args: argparse.Namespace, fixture: PromptFixture, provenance: dict[str, Any]) -> dict[str, Any]:
+def build_lock(
+    args: argparse.Namespace, fixture: PromptFixture, provenance: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "schema": LOCK_SCHEMA,
         "model_sha256": provenance["model"].get("sha256"),
         "antfly_model_bundle_sha256": provenance["antfly_model_bundle"].get("sha256"),
         "llama_cpp_commit": provenance["llama_cpp_binary"].get("git", {}).get("commit"),
         "llama_cpp_binary_sha256": provenance["llama_cpp_binary"].get("sha256"),
-        "llama_cpp_runtime_bundle_sha256": provenance["llama_cpp_binary"].get("runtime_bundle_sha256"),
+        "llama_cpp_runtime_bundle_sha256": provenance["llama_cpp_binary"].get(
+            "runtime_bundle_sha256"
+        ),
         "runtime_identity_sha256": provenance.get("runtime_identity", {}).get("sha256"),
         "harness_sha256": provenance.get("harness", {}).get("sha256"),
         "antfly_execution_profile_sha256": args.antfly_execution_profile["sha256"],
-        "material_environment_sha256": args.antfly_execution_profile["material_environment_sha256"],
-        "antfly_server_prefix_sha256": args.antfly_execution_profile["server_prefix_sha256"]["antfly"],
-        "llama_cpp_server_prefix_sha256": args.antfly_execution_profile["server_prefix_sha256"]["llama_cpp"],
+        "material_environment_sha256": args.antfly_execution_profile[
+            "material_environment_sha256"
+        ],
+        "antfly_server_prefix_sha256": args.antfly_execution_profile[
+            "server_prefix_sha256"
+        ]["antfly"],
+        "llama_cpp_server_prefix_sha256": args.antfly_execution_profile[
+            "server_prefix_sha256"
+        ]["llama_cpp"],
         "fixture_id": fixture.fixture_id,
         "fixture_file_sha256": fixture.file_sha256,
         "rendered_prompt_sha256": fixture.reference_prompt_sha256,
@@ -2226,7 +2646,9 @@ def build_lock(args: argparse.Namespace, fixture: PromptFixture, provenance: dic
         "cache_dtype": args.cache_dtype,
         "context_size": args.context_size,
         "output_tokens": args.output_tokens,
-        "antfly_server_budget_mb": dict(args.antfly_execution_profile["server_budget_mb"]),
+        "antfly_server_budget_mb": dict(
+            args.antfly_execution_profile["server_budget_mb"]
+        ),
     }
 
 
@@ -2240,11 +2662,15 @@ def lock_errors(expected: object, observed: dict[str, Any]) -> list[str]:
         if key == "schema":
             continue
         if expected.get(key) != value:
-            errors.append(f"benchmark lock mismatch for {key}: expected {expected.get(key)!r}, observed {value!r}")
+            errors.append(
+                f"benchmark lock mismatch for {key}: expected {expected.get(key)!r}, observed {value!r}"
+            )
     return errors
 
 
-def baseline_compatibility_errors(baseline: object, observed_lock: dict[str, Any]) -> list[str]:
+def baseline_compatibility_errors(
+    baseline: object, observed_lock: dict[str, Any]
+) -> list[str]:
     if not isinstance(baseline, dict):
         return ["baseline evidence must be a JSON object"]
     if baseline.get("schema") != EVIDENCE_SCHEMA:
@@ -2253,10 +2679,22 @@ def baseline_compatibility_errors(baseline: object, observed_lock: dict[str, Any
     if not isinstance(baseline_lock, dict):
         return ["baseline evidence is missing its benchmark lock"]
     compared_fields = (
-        "model_sha256", "antfly_model_bundle_sha256", "fixture_id", "fixture_file_sha256", "rendered_prompt_sha256",
-        "backend", "cache_dtype", "context_size", "output_tokens", "antfly_execution_profile_sha256",
-        "material_environment_sha256", "antfly_server_prefix_sha256", "llama_cpp_server_prefix_sha256",
-        "harness_sha256", "llama_cpp_runtime_bundle_sha256", "runtime_identity_sha256",
+        "model_sha256",
+        "antfly_model_bundle_sha256",
+        "fixture_id",
+        "fixture_file_sha256",
+        "rendered_prompt_sha256",
+        "backend",
+        "cache_dtype",
+        "context_size",
+        "output_tokens",
+        "antfly_execution_profile_sha256",
+        "material_environment_sha256",
+        "antfly_server_prefix_sha256",
+        "llama_cpp_server_prefix_sha256",
+        "harness_sha256",
+        "llama_cpp_runtime_bundle_sha256",
+        "runtime_identity_sha256",
         "antfly_server_budget_mb",
     )
     errors = []
@@ -2271,8 +2709,14 @@ def baseline_compatibility_errors(baseline: object, observed_lock: dict[str, Any
 
 def evidence_lock_projection(evidence: dict[str, Any]) -> dict[str, Any]:
     """Reconstruct lock fields from the evidence sections they attest."""
-    provenance = evidence.get("provenance") if isinstance(evidence.get("provenance"), dict) else {}
-    contract = evidence.get("contract") if isinstance(evidence.get("contract"), dict) else {}
+    provenance = (
+        evidence.get("provenance")
+        if isinstance(evidence.get("provenance"), dict)
+        else {}
+    )
+    contract = (
+        evidence.get("contract") if isinstance(evidence.get("contract"), dict) else {}
+    )
     model = provenance.get("model") if isinstance(provenance.get("model"), dict) else {}
     model_bundle = (
         provenance.get("antfly_model_bundle")
@@ -2290,7 +2734,9 @@ def evidence_lock_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         if isinstance(provenance.get("runtime_identity"), dict)
         else {}
     )
-    harness = provenance.get("harness") if isinstance(provenance.get("harness"), dict) else {}
+    harness = (
+        provenance.get("harness") if isinstance(provenance.get("harness"), dict) else {}
+    )
     fixture_file = (
         provenance.get("fixture_file")
         if isinstance(provenance.get("fixture_file"), dict)
@@ -2316,7 +2762,9 @@ def evidence_lock_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         "runtime_identity_sha256": runtime_identity.get("sha256"),
         "harness_sha256": harness.get("sha256"),
         "antfly_execution_profile_sha256": execution_profile.get("sha256"),
-        "material_environment_sha256": execution_profile.get("material_environment_sha256"),
+        "material_environment_sha256": execution_profile.get(
+            "material_environment_sha256"
+        ),
         "antfly_server_prefix_sha256": prefix_sha256.get("antfly"),
         "llama_cpp_server_prefix_sha256": prefix_sha256.get("llama_cpp"),
         "fixture_id": contract.get("prompt_fixture_id"),
@@ -2339,7 +2787,9 @@ def baseline_quality_errors(baseline: object, expected_profile: str) -> list[str
         return ["baseline evidence must be a JSON object"]
     errors: list[str] = []
     if baseline.get("passed") is not True:
-        errors.append("baseline evidence must have passed all enforced correctness checks")
+        errors.append(
+            "baseline evidence must have passed all enforced correctness checks"
+        )
     contract = baseline.get("contract")
     if not isinstance(contract, dict):
         errors.append("baseline evidence is missing its benchmark contract")
@@ -2358,9 +2808,16 @@ def baseline_quality_errors(baseline: object, expected_profile: str) -> list[str
                 f"baseline contract requires at least {MIN_FROZEN_BASELINE_SAMPLES} paired samples"
             )
     rows_value = baseline.get("rows")
-    if not isinstance(rows_value, list) or len(rows_value) < MIN_FROZEN_BASELINE_SAMPLES:
-        errors.append(f"baseline evidence requires at least {MIN_FROZEN_BASELINE_SAMPLES} sample rows")
-    elif isinstance(contract, dict) and contract.get("paired_samples") != len(rows_value):
+    if (
+        not isinstance(rows_value, list)
+        or len(rows_value) < MIN_FROZEN_BASELINE_SAMPLES
+    ):
+        errors.append(
+            f"baseline evidence requires at least {MIN_FROZEN_BASELINE_SAMPLES} sample rows"
+        )
+    elif isinstance(contract, dict) and contract.get("paired_samples") != len(
+        rows_value
+    ):
         errors.append("baseline row count differs from contract.paired_samples")
 
     provenance = baseline.get("provenance")
@@ -2387,20 +2844,32 @@ def baseline_quality_errors(baseline: object, expected_profile: str) -> list[str
             try:
                 stored = metrics[engine][metric]
                 stored_median = float(stored["median"])
-                recomputed = distribution(float(row[engine][metric]) for row in rows_value)
+                recomputed = distribution(
+                    float(row[engine][metric]) for row in rows_value
+                )
             except (KeyError, TypeError, ValueError):
                 errors.append(f"baseline evidence cannot verify {engine} {metric}")
                 continue
-            if not math.isclose(stored_median, recomputed["median"], rel_tol=1e-12, abs_tol=1e-9):
-                errors.append(f"baseline stored {engine} {metric} median does not match sample rows")
+            if not math.isclose(
+                stored_median, recomputed["median"], rel_tol=1e-12, abs_tol=1e-9
+            ):
+                errors.append(
+                    f"baseline stored {engine} {metric} median does not match sample rows"
+                )
             if metric == "total_latency_ms":
                 try:
                     stored_cv = float(stored["cv"])
                 except (KeyError, TypeError, ValueError):
-                    errors.append(f"baseline evidence is missing {engine} total-latency CV")
+                    errors.append(
+                        f"baseline evidence is missing {engine} total-latency CV"
+                    )
                     continue
-                if not math.isclose(stored_cv, recomputed["cv"], rel_tol=1e-12, abs_tol=1e-12):
-                    errors.append(f"baseline stored {engine} total-latency CV does not match sample rows")
+                if not math.isclose(
+                    stored_cv, recomputed["cv"], rel_tol=1e-12, abs_tol=1e-12
+                ):
+                    errors.append(
+                        f"baseline stored {engine} total-latency CV does not match sample rows"
+                    )
                 if recomputed["cv"] > MAX_FROZEN_BASELINE_CV:
                     errors.append(
                         f"baseline {engine} total-latency CV {recomputed['cv']!r} "
@@ -2414,10 +2883,24 @@ def baseline_evidence_identity(
     baseline: dict[str, Any],
     source_bytes: bytes,
 ) -> dict[str, Any]:
-    contract = baseline.get("contract") if isinstance(baseline.get("contract"), dict) else {}
-    provenance = baseline.get("provenance") if isinstance(baseline.get("provenance"), dict) else {}
-    antfly_binary = provenance.get("antfly_binary") if isinstance(provenance.get("antfly_binary"), dict) else {}
-    antfly_git = provenance.get("antfly_git") if isinstance(provenance.get("antfly_git"), dict) else {}
+    contract = (
+        baseline.get("contract") if isinstance(baseline.get("contract"), dict) else {}
+    )
+    provenance = (
+        baseline.get("provenance")
+        if isinstance(baseline.get("provenance"), dict)
+        else {}
+    )
+    antfly_binary = (
+        provenance.get("antfly_binary")
+        if isinstance(provenance.get("antfly_binary"), dict)
+        else {}
+    )
+    antfly_git = (
+        provenance.get("antfly_git")
+        if isinstance(provenance.get("antfly_git"), dict)
+        else {}
+    )
     return {
         "file": {
             "path": str(path.resolve()),
@@ -2441,7 +2924,9 @@ def baseline_median(baseline: dict[str, Any], metric: str) -> float:
     try:
         value = float(baseline["metrics"]["antfly"][metric]["median"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"baseline evidence is missing Antfly {metric} median") from exc
+        raise ValueError(
+            f"baseline evidence is missing Antfly {metric} median"
+        ) from exc
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"baseline Antfly {metric} median must be positive")
     return value
@@ -2479,15 +2964,37 @@ def evaluate(
         metrics[engine] = {
             metric: distribution(row[engine][metric] for row in rows)
             for metric in (
-                "total_latency_ms", "ttft_ms", "decode_ms", "stream_tail_ms", "inter_token_ms", "decode_tok_s",
+                "total_latency_ms",
+                "ttft_ms",
+                "decode_ms",
+                "stream_tail_ms",
+                "inter_token_ms",
+                "decode_tok_s",
             )
         }
-    pair_ratios = [row["antfly"]["total_latency_ms"] / row["llama_cpp"]["total_latency_ms"] for row in rows]
-    total_ratio = metrics["antfly"]["total_latency_ms"]["median"] / metrics["llama_cpp"]["total_latency_ms"]["median"]
-    ttft_ratio = metrics["antfly"]["ttft_ms"]["median"] / metrics["llama_cpp"]["ttft_ms"]["median"]
-    decode_ratio = metrics["antfly"]["decode_ms"]["median"] / metrics["llama_cpp"]["decode_ms"]["median"]
-    p95_ratio = metrics["antfly"]["total_latency_ms"]["p95"] / metrics["llama_cpp"]["total_latency_ms"]["p95"]
-    bootstrap = paired_bootstrap_ratio_ci(rows, samples=args.bootstrap_samples, seed=args.bootstrap_seed)
+    pair_ratios = [
+        row["antfly"]["total_latency_ms"] / row["llama_cpp"]["total_latency_ms"]
+        for row in rows
+    ]
+    total_ratio = (
+        metrics["antfly"]["total_latency_ms"]["median"]
+        / metrics["llama_cpp"]["total_latency_ms"]["median"]
+    )
+    ttft_ratio = (
+        metrics["antfly"]["ttft_ms"]["median"]
+        / metrics["llama_cpp"]["ttft_ms"]["median"]
+    )
+    decode_ratio = (
+        metrics["antfly"]["decode_ms"]["median"]
+        / metrics["llama_cpp"]["decode_ms"]["median"]
+    )
+    p95_ratio = (
+        metrics["antfly"]["total_latency_ms"]["p95"]
+        / metrics["llama_cpp"]["total_latency_ms"]["p95"]
+    )
+    bootstrap = paired_bootstrap_ratio_ci(
+        rows, samples=args.bootstrap_samples, seed=args.bootstrap_seed
+    )
     paired_log_ratio_cis = {
         metric: paired_metric_log_ratio_ci(
             rows,
@@ -2502,9 +3009,18 @@ def evaluate(
 
     checks: list[dict[str, Any]] = []
 
-    def check(name: str, passed: bool, detail: str, *, performance: bool = False) -> None:
+    def check(
+        name: str, passed: bool, detail: str, *, performance: bool = False
+    ) -> None:
         enforced = not performance or args.enforce_performance
-        checks.append({"name": name, "passed": bool(passed), "enforced": enforced, "detail": detail})
+        checks.append(
+            {
+                "name": name,
+                "passed": bool(passed),
+                "enforced": enforced,
+                "detail": detail,
+            }
+        )
 
     for row in rows:
         for engine in ENGINES:
@@ -2527,11 +3043,14 @@ def evaluate(
             visible_content = str(sample.get("content") or "")
             check(
                 f"pair_{row['pair']}_{engine}_visible_content",
-                int(sample.get("content_utf8_bytes") or 0) >= fixture.minimum_visible_utf8_bytes,
+                int(sample.get("content_utf8_bytes") or 0)
+                >= fixture.minimum_visible_utf8_bytes,
                 f"utf8_bytes={sample.get('content_utf8_bytes')!r} minimum={fixture.minimum_visible_utf8_bytes}",
             )
             missing_terms = [
-                value for value in fixture.expected_output_substrings if value not in visible_content
+                value
+                for value in fixture.expected_output_substrings
+                if value not in visible_content
             ]
             check(
                 f"pair_{row['pair']}_{engine}_semantic_output",
@@ -2547,7 +3066,9 @@ def evaluate(
                 telemetry = sample.get("cuda_gqa_prefill_telemetry") or {}
                 prefill_contract = cuda_route_contract(args)["prefill"]
                 configured_profiles = telemetry.get("configured_profiles") or []
-                observation = cuda_gqa_prefill_route_observation(telemetry, prefill_contract)
+                observation = cuda_gqa_prefill_route_observation(
+                    telemetry, prefill_contract
+                )
                 active_count = int(observation.get("active_count") or 0)
                 active_head_dims = observation.get("gemma4_head_dims") or []
                 active_query_lengths = observation.get("gemma4_query_lengths") or []
@@ -2556,18 +3077,27 @@ def evaluate(
                 expected_profile = str(prefill_contract["profile"])
                 expected_route = str(prefill_contract["route"])
                 expected_head_dims = list(prefill_contract["gemma4_head_dims"])
-                expected_query_lengths = list(prefill_contract.get("gemma4_query_lengths") or [])
+                expected_query_lengths = list(
+                    prefill_contract.get("gemma4_query_lengths") or []
+                )
                 check_suffix = (
                     "required_fast_gqa_prefill"
-                    if expected_profile == "required-fast" and expected_route == "prefill-fast"
+                    if expected_profile == "required-fast"
+                    and expected_route == "prefill-fast"
                     else "gqa_prefill_route_contract"
                 )
                 check(
                     f"pair_{row['pair']}_antfly_{check_suffix}",
                     expected_profile in configured_profiles
                     and active_head_dims == expected_head_dims
-                    and (not expected_query_lengths or active_query_lengths == expected_query_lengths)
-                    and (not prefill_contract.get("forbid_fallback") or fallback_count == 0)
+                    and (
+                        not expected_query_lengths
+                        or active_query_lengths == expected_query_lengths
+                    )
+                    and (
+                        not prefill_contract.get("forbid_fallback")
+                        or fallback_count == 0
+                    )
                     and rejected_count == 0,
                     f"{expected_profile} must be configured and {expected_route} must launch for "
                     "both locked Gemma 4 attention head dimensions without rejection; "
@@ -2580,12 +3110,20 @@ def evaluate(
                 decode_contract = cuda_route_contract(args)["decode"]
                 if "profile" in decode_contract:
                     decode_telemetry = sample.get("cuda_gqa_decode_telemetry") or {}
-                    decode_observation = cuda_gqa_decode_route_observation(decode_telemetry, decode_contract)
-                    configured_profiles = decode_telemetry.get("configured_profiles") or []
+                    decode_observation = cuda_gqa_decode_route_observation(
+                        decode_telemetry, decode_contract
+                    )
+                    configured_profiles = (
+                        decode_telemetry.get("configured_profiles") or []
+                    )
                     expected_decode_profile = str(decode_contract["profile"])
                     expected_decode_route = str(decode_contract["route"])
-                    expected_decode_head_dims = list(decode_contract["gemma4_head_dims"])
-                    observed_decode_head_dims = decode_observation.get("gemma4_head_dims") or []
+                    expected_decode_head_dims = list(
+                        decode_contract["gemma4_head_dims"]
+                    )
+                    observed_decode_head_dims = (
+                        decode_observation.get("gemma4_head_dims") or []
+                    )
                     decode_fallbacks = int(decode_telemetry.get("fallback_count") or 0)
                     decode_rejections = int(decode_telemetry.get("rejected_count") or 0)
                     check(
@@ -2593,7 +3131,10 @@ def evaluate(
                         expected_decode_profile in configured_profiles
                         and decode_observation.get("route") == expected_decode_route
                         and observed_decode_head_dims == expected_decode_head_dims
-                        and (not decode_contract.get("forbid_fallback") or decode_fallbacks == 0)
+                        and (
+                            not decode_contract.get("forbid_fallback")
+                            or decode_fallbacks == 0
+                        )
                         and decode_rejections == 0,
                         "the required split-K online profile must launch both Gemma 4 head dimensions "
                         "without fallback or rejection; "
@@ -2604,15 +3145,25 @@ def evaluate(
                         performance=True,
                     )
                 else:
-                    decode_telemetry = sample.get("cuda_gqa_score_prework_telemetry") or {}
-                    decode_observation = cuda_gqa_score_prework_observation(decode_telemetry, decode_contract)
+                    decode_telemetry = (
+                        sample.get("cuda_gqa_score_prework_telemetry") or {}
+                    )
+                    decode_observation = cuda_gqa_score_prework_observation(
+                        decode_telemetry, decode_contract
+                    )
                     configured_modes = decode_telemetry.get("configured_modes") or []
                     expected_configured = str(decode_contract["configured"])
                     expected_consumer = str(decode_contract["consumer"])
-                    expected_decode_head_dims = list(decode_contract["gemma4_head_dims"])
+                    expected_decode_head_dims = list(
+                        decode_contract["gemma4_head_dims"]
+                    )
                     expected_decode_routes = dict(decode_contract["routes_by_head_dim"])
-                    observed_decode_head_dims = decode_observation.get("gemma4_head_dims") or []
-                    observed_decode_routes = decode_observation.get("routes_by_head_dim") or {}
+                    observed_decode_head_dims = (
+                        decode_observation.get("gemma4_head_dims") or []
+                    )
+                    observed_decode_routes = (
+                        decode_observation.get("routes_by_head_dim") or {}
+                    )
                     decode_fallbacks = int(decode_telemetry.get("fallback_count") or 0)
                     decode_rejections = int(decode_telemetry.get("rejected_count") or 0)
                     check(
@@ -2621,7 +3172,10 @@ def evaluate(
                         and decode_observation.get("consumer") == expected_consumer
                         and observed_decode_head_dims == expected_decode_head_dims
                         and observed_decode_routes == expected_decode_routes
-                        and (not decode_contract.get("forbid_fallback") or decode_fallbacks == 0)
+                        and (
+                            not decode_contract.get("forbid_fallback")
+                            or decode_fallbacks == 0
+                        )
                         and decode_rejections == 0,
                         "the configured score-prework consumer must launch the exact local/global Gemma 4 "
                         "routes for both head dimensions without fallback or rejection; "
@@ -2636,7 +3190,8 @@ def evaluate(
             if args.profile == "headline":
                 check(
                     f"pair_{row['pair']}_{engine}_authoritative_completion_usage",
-                    sample.get("completion_token_accounting_source") == "final_sse_usage",
+                    sample.get("completion_token_accounting_source")
+                    == "final_sse_usage",
                     "completion token count must come from the terminal SSE usage event",
                     performance=True,
                 )
@@ -2671,11 +3226,14 @@ def evaluate(
                 )
                 warmup_content = str(warmup.get("content") or "")
                 missing_warmup_terms = [
-                    value for value in fixture.expected_output_substrings if value not in warmup_content
+                    value
+                    for value in fixture.expected_output_substrings
+                    if value not in warmup_content
                 ]
                 check(
                     f"{prefix}_visible_content",
-                    int(warmup.get("content_utf8_bytes") or 0) >= fixture.minimum_visible_utf8_bytes,
+                    int(warmup.get("content_utf8_bytes") or 0)
+                    >= fixture.minimum_visible_utf8_bytes,
                     f"utf8_bytes={warmup.get('content_utf8_bytes')!r} minimum={fixture.minimum_visible_utf8_bytes}",
                 )
                 check(
@@ -2683,8 +3241,12 @@ def evaluate(
                     not missing_warmup_terms,
                     f"missing_required_substrings={missing_warmup_terms!r}",
                 )
-        antfly_prompt_digest = (row["antfly"].get("prompt_token_ids") or {}).get("sha256")
-        llama_prompt_digest = (row["llama_cpp"].get("prompt_token_ids") or {}).get("sha256")
+        antfly_prompt_digest = (row["antfly"].get("prompt_token_ids") or {}).get(
+            "sha256"
+        )
+        llama_prompt_digest = (row["llama_cpp"].get("prompt_token_ids") or {}).get(
+            "sha256"
+        )
         check(
             f"pair_{row['pair']}_prompt_token_ids_equal",
             bool(antfly_prompt_digest) and antfly_prompt_digest == llama_prompt_digest,
@@ -2692,7 +3254,11 @@ def evaluate(
         )
     for engine in ENGINES:
         digests = {row[engine]["content_sha256"] for row in rows}
-        check(f"{engine}_deterministic_output", len(digests) == 1, f"unique_content_digests={len(digests)}")
+        check(
+            f"{engine}_deterministic_output",
+            len(digests) == 1,
+            f"unique_content_digests={len(digests)}",
+        )
     check(
         "prompt_fixture_token_contract",
         args.expected_prompt_tokens == fixture.expected_prompt_tokens,
@@ -2700,14 +3266,44 @@ def evaluate(
     )
 
     if args.profile == "headline":
-        check("headline_median_total_ratio", total_ratio <= args.max_median_ratio, f"ratio={total_ratio:.6f} max={args.max_median_ratio:.6f}", performance=True)
-        check("headline_bootstrap_ci", bootstrap["upper_95"] < args.max_ci_upper, f"upper_95={bootstrap['upper_95']:.6f} max_exclusive={args.max_ci_upper:.6f}", performance=True)
+        check(
+            "headline_median_total_ratio",
+            total_ratio <= args.max_median_ratio,
+            f"ratio={total_ratio:.6f} max={args.max_median_ratio:.6f}",
+            performance=True,
+        )
+        check(
+            "headline_bootstrap_ci",
+            bootstrap["upper_95"] < args.max_ci_upper,
+            f"upper_95={bootstrap['upper_95']:.6f} max_exclusive={args.max_ci_upper:.6f}",
+            performance=True,
+        )
         for engine in ENGINES:
             cv = metrics[engine]["total_latency_ms"]["cv"]
-            check(f"{engine}_latency_cv", cv <= args.max_cv, f"cv={cv:.6f} max={args.max_cv:.6f}", performance=True)
-        check("headline_p95", p95_ratio <= args.max_p95_ratio, f"ratio={p95_ratio:.6f} max={args.max_p95_ratio:.6f}", performance=True)
-        check("headline_ttft", ttft_ratio <= args.max_component_ratio, f"ratio={ttft_ratio:.6f} max={args.max_component_ratio:.6f}", performance=True)
-        check("headline_decode", decode_ratio <= args.max_component_ratio, f"ratio={decode_ratio:.6f} max={args.max_component_ratio:.6f}", performance=True)
+            check(
+                f"{engine}_latency_cv",
+                cv <= args.max_cv,
+                f"cv={cv:.6f} max={args.max_cv:.6f}",
+                performance=True,
+            )
+        check(
+            "headline_p95",
+            p95_ratio <= args.max_p95_ratio,
+            f"ratio={p95_ratio:.6f} max={args.max_p95_ratio:.6f}",
+            performance=True,
+        )
+        check(
+            "headline_ttft",
+            ttft_ratio <= args.max_component_ratio,
+            f"ratio={ttft_ratio:.6f} max={args.max_component_ratio:.6f}",
+            performance=True,
+        )
+        check(
+            "headline_decode",
+            decode_ratio <= args.max_component_ratio,
+            f"ratio={decode_ratio:.6f} max={args.max_component_ratio:.6f}",
+            performance=True,
+        )
         ttft_ci_upper = float(paired_log_ratio_cis["ttft_ms"]["upper_95"])
         decode_ci_upper = float(paired_log_ratio_cis["decode_ms"]["upper_95"])
         check(
@@ -2734,15 +3330,24 @@ def evaluate(
                 performance=True,
             )
         if baseline is None:
-            check("frozen_antfly_baseline", False, "--baseline-evidence is required", performance=True)
+            check(
+                "frozen_antfly_baseline",
+                False,
+                "--baseline-evidence is required",
+                performance=True,
+            )
         else:
             baseline_ratios = {}
             for metric in ("total_latency_ms", "ttft_ms", "decode_ms"):
-                ratio = metrics["antfly"][metric]["median"] / baseline_median(baseline, metric)
+                ratio = metrics["antfly"][metric]["median"] / baseline_median(
+                    baseline, metric
+                )
                 baseline_ratios[metric] = ratio
                 check(
-                    f"antfly_baseline_{metric}", ratio <= args.max_baseline_regression,
-                    f"ratio={ratio:.6f} max={args.max_baseline_regression:.6f}", performance=True,
+                    f"antfly_baseline_{metric}",
+                    ratio <= args.max_baseline_regression,
+                    f"ratio={ratio:.6f} max={args.max_baseline_regression:.6f}",
+                    performance=True,
                 )
 
     return {
@@ -2766,9 +3371,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     repo = pathlib.Path(__file__).resolve().parents[5]
     gemma4_scripts = repo / "zig/pkg/inference/scripts/gemma4"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--antfly-bin", type=pathlib.Path, default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference")
-    parser.add_argument("--llama-server-bin", type=pathlib.Path, default=pathlib.Path("/tmp/llama.cpp/build/bin/llama-server"))
-    parser.add_argument("--model", type=pathlib.Path, required=True, help="Byte-identical GGUF used by both engines")
+    parser.add_argument(
+        "--antfly-bin",
+        type=pathlib.Path,
+        default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference",
+    )
+    parser.add_argument(
+        "--llama-server-bin",
+        type=pathlib.Path,
+        default=pathlib.Path("/tmp/llama.cpp/build/bin/llama-server"),
+    )
+    parser.add_argument(
+        "--model",
+        type=pathlib.Path,
+        required=True,
+        help="Byte-identical GGUF used by both engines",
+    )
     parser.add_argument("--models-dir", type=pathlib.Path, default=repo / ".models")
     parser.add_argument(
         "--fixture",
@@ -2776,11 +3394,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=gemma4_scripts / "fixtures/gemma4_long_context_v1.json",
     )
     default_output = pathlib.Path(
-        "/tmp/antfly-gemma4-long-e2e-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        "/tmp/antfly-gemma4-long-e2e-"
+        + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     )
     parser.add_argument("--output-dir", type=pathlib.Path, default=default_output)
-    parser.add_argument("--profile", choices=sorted(PROFILE_DEFAULTS), default="headline")
-    parser.add_argument("--backend", choices=("cuda", "metal", "native"), default="cuda")
+    parser.add_argument(
+        "--profile", choices=sorted(PROFILE_DEFAULTS), default="headline"
+    )
+    parser.add_argument(
+        "--backend", choices=("cuda", "metal", "native"), default="cuda"
+    )
     parser.add_argument(
         "--cuda-execution-profile",
         choices=sorted(CUDA_EXECUTION_PROFILES),
@@ -2812,11 +3435,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-decode-ci-upper", type=float, default=1.02)
     parser.add_argument("--max-baseline-regression", type=float)
     parser.add_argument("--baseline-evidence", type=pathlib.Path)
-    parser.add_argument("--baseline-sha256", help="Expected SHA-256 of frozen baseline evidence")
-    parser.add_argument("--lockfile", type=pathlib.Path, help="Validate model/engine/config provenance against this lock")
-    parser.add_argument("--lockfile-sha256", help="Expected SHA-256 of the reviewed benchmark lock")
+    parser.add_argument(
+        "--baseline-sha256", help="Expected SHA-256 of frozen baseline evidence"
+    )
+    parser.add_argument(
+        "--lockfile",
+        type=pathlib.Path,
+        help="Validate model/engine/config provenance against this lock",
+    )
+    parser.add_argument(
+        "--lockfile-sha256", help="Expected SHA-256 of the reviewed benchmark lock"
+    )
     parser.add_argument("--require-lock", action="store_true")
-    parser.add_argument("--antfly-server-prefix", default=os.environ.get("ANTFLY_LONG_E2E_SERVER_PREFIX", ""))
+    parser.add_argument(
+        "--antfly-server-prefix",
+        default=os.environ.get("ANTFLY_LONG_E2E_SERVER_PREFIX", ""),
+    )
     parser.add_argument(
         "--antfly-env",
         action="append",
@@ -2824,10 +3458,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="NAME=VALUE",
         help="Explicit Antfly CUDA execution-profile override; repeat for multiple values",
     )
-    parser.add_argument("--llama-server-prefix", default=os.environ.get("LLAMA_LONG_E2E_SERVER_PREFIX", ""))
+    parser.add_argument(
+        "--llama-server-prefix",
+        default=os.environ.get("LLAMA_LONG_E2E_SERVER_PREFIX", ""),
+    )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--enforce-performance", dest="enforce_performance", action="store_true")
-    mode.add_argument("--collect-only", dest="enforce_performance", action="store_false")
+    mode.add_argument(
+        "--enforce-performance", dest="enforce_performance", action="store_true"
+    )
+    mode.add_argument(
+        "--collect-only", dest="enforce_performance", action="store_false"
+    )
     parser.set_defaults(enforce_performance=True)
     args = parser.parse_args(argv)
     defaults = PROFILE_DEFAULTS[args.profile]
@@ -2838,9 +3479,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
-    missing = [path for path in (args.antfly_bin, args.llama_server_bin, args.model) if not path.is_file()]
+    missing = [
+        path
+        for path in (args.antfly_bin, args.llama_server_bin, args.model)
+        if not path.is_file()
+    ]
     if missing:
-        raise ValueError("missing required file(s): " + ", ".join(str(path) for path in missing))
+        raise ValueError(
+            "missing required file(s): " + ", ".join(str(path) for path in missing)
+        )
     if not args.models_dir.is_dir():
         raise ValueError(f"models directory does not exist: {args.models_dir}")
     args.antfly_model_id = antfly_model_identifier(args.model, args.models_dir)
@@ -2858,7 +3505,9 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
     if args.expected_prompt_tokens < 1:
         raise ValueError("expected prompt tokens must be positive")
     if args.expected_prompt_tokens + args.output_tokens > args.context_size:
-        raise ValueError("prompt plus requested output exceeds the configured context size")
+        raise ValueError(
+            "prompt plus requested output exceeds the configured context size"
+        )
     thresholds = (
         args.max_median_ratio,
         args.max_ci_upper,
@@ -2871,12 +3520,16 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
     if any(not math.isfinite(value) or value <= 0 for value in thresholds):
         raise ValueError("performance thresholds must be finite positive values")
     if args.max_baseline_regression is not None and (
-        not math.isfinite(args.max_baseline_regression) or args.max_baseline_regression <= 0
+        not math.isfinite(args.max_baseline_regression)
+        or args.max_baseline_regression <= 0
     ):
         raise ValueError("max baseline regression must be finite and positive")
     profile_baseline_max = PROFILE_DEFAULTS[args.profile]["max_baseline_regression"]
     if args.enforce_performance and profile_baseline_max is not None:
-        if args.max_baseline_regression is None or args.max_baseline_regression > profile_baseline_max:
+        if (
+            args.max_baseline_regression is None
+            or args.max_baseline_regression > profile_baseline_max
+        ):
             raise ValueError(
                 f"{args.profile} max-baseline-regression cannot be looser than {profile_baseline_max}"
             )
@@ -2891,38 +3544,65 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
         if (
             len(args.baseline_sha256) != 64
             or args.baseline_sha256.lower() != args.baseline_sha256
-            or any(character not in "0123456789abcdef" for character in args.baseline_sha256)
+            or any(
+                character not in "0123456789abcdef"
+                for character in args.baseline_sha256
+            )
         ):
-            raise ValueError("--baseline-sha256 must be 64 lowercase hexadecimal characters")
+            raise ValueError(
+                "--baseline-sha256 must be 64 lowercase hexadecimal characters"
+            )
         if not args.require_lock:
-            raise ValueError(f"{args.profile} enforcement requires a reviewed --lockfile and --require-lock")
+            raise ValueError(
+                f"{args.profile} enforcement requires a reviewed --lockfile and --require-lock"
+            )
     if args.require_lock and args.lockfile is None:
         raise ValueError("--require-lock requires --lockfile")
     if args.lockfile_sha256 is not None and args.lockfile is None:
         raise ValueError("--lockfile-sha256 requires --lockfile")
     if args.enforce_performance and args.lockfile_sha256 is None:
-        raise ValueError("performance enforcement requires --lockfile-sha256 for the reviewed lock")
+        raise ValueError(
+            "performance enforcement requires --lockfile-sha256 for the reviewed lock"
+        )
     if args.lockfile_sha256 is not None and (
         len(args.lockfile_sha256) != 64
         or args.lockfile_sha256.lower() != args.lockfile_sha256
-        or any(character not in "0123456789abcdef" for character in args.lockfile_sha256)
+        or any(
+            character not in "0123456789abcdef" for character in args.lockfile_sha256
+        )
     ):
-        raise ValueError("--lockfile-sha256 must be 64 lowercase hexadecimal characters")
+        raise ValueError(
+            "--lockfile-sha256 must be 64 lowercase hexadecimal characters"
+        )
     if args.profile == "headline" and args.enforce_performance:
         if not args.require_lock:
-            raise ValueError("headline enforcement requires a reviewed --lockfile and --require-lock")
+            raise ValueError(
+                "headline enforcement requires a reviewed --lockfile and --require-lock"
+            )
         if args.antfly_server_prefix:
-            raise ValueError("headline enforcement forbids an opaque Antfly server prefix; use --antfly-env")
+            raise ValueError(
+                "headline enforcement forbids an opaque Antfly server prefix; use --antfly-env"
+            )
         if args.llama_server_prefix:
-            raise ValueError("headline enforcement forbids an opaque llama.cpp server prefix; use explicit arguments")
+            raise ValueError(
+                "headline enforcement forbids an opaque llama.cpp server prefix; use explicit arguments"
+            )
         if args.backend != "cuda" or args.cache_dtype != "f16":
-            raise ValueError("headline enforcement requires CUDA with matched F16 K/V caches")
+            raise ValueError(
+                "headline enforcement requires CUDA with matched F16 K/V caches"
+            )
         if args.context_size != 4096 or args.output_tokens != 300 or args.warmups != 2:
-            raise ValueError("headline enforcement requires context-size=4096, output-tokens=300, and warmups=2")
+            raise ValueError(
+                "headline enforcement requires context-size=4096, output-tokens=300, and warmups=2"
+            )
         if args.expected_prompt_tokens != fixture.expected_prompt_tokens:
-            raise ValueError("headline enforcement requires the fixture's exact prompt token count")
+            raise ValueError(
+                "headline enforcement requires the fixture's exact prompt token count"
+            )
         if args.bootstrap_samples < 10_000:
-            raise ValueError("headline enforcement requires at least 10000 paired bootstrap resamples")
+            raise ValueError(
+                "headline enforcement requires at least 10000 paired bootstrap resamples"
+            )
         accepted_maxima = {
             "max_median_ratio": 0.95,
             "max_ci_upper": 1.0,
@@ -2934,10 +3614,20 @@ def validate_args(args: argparse.Namespace, fixture: PromptFixture) -> None:
         }
         for field, accepted in accepted_maxima.items():
             if getattr(args, field) > accepted:
-                raise ValueError(f"headline {field.replace('_', '-')} cannot be looser than {accepted}")
-    if args.profile in {"e2b-regression", "e4b-regression"} and args.enforce_performance and args.cache_dtype != "f16":
+                raise ValueError(
+                    f"headline {field.replace('_', '-')} cannot be looser than {accepted}"
+                )
+    if (
+        args.profile in {"e2b-regression", "e4b-regression"}
+        and args.enforce_performance
+        and args.cache_dtype != "f16"
+    ):
         raise ValueError("Gemma 4 regression enforcement requires F16 K/V caches")
-    if args.profile == "f32-control" and args.enforce_performance and args.cache_dtype != "f32":
+    if (
+        args.profile == "f32-control"
+        and args.enforce_performance
+        and args.cache_dtype != "f32"
+    ):
         raise ValueError("F32 control enforcement requires F32 K/V caches")
 
 
@@ -2946,8 +3636,12 @@ def main(argv: list[str] | None = None) -> None:
     try:
         fixture = load_fixture(args.fixture)
         validate_args(args, fixture)
-        args.antfly_execution_profile = resolve_antfly_execution_profile(args, fixture, dict(os.environ))
-        validate_headline_execution_profile(args, fixture, args.antfly_execution_profile)
+        args.antfly_execution_profile = resolve_antfly_execution_profile(
+            args, fixture, dict(os.environ)
+        )
+        validate_headline_execution_profile(
+            args, fixture, args.antfly_execution_profile
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -2955,7 +3649,9 @@ def main(argv: list[str] | None = None) -> None:
     try:
         provenance = collect_provenance(args, fixture)
     except (OSError, RuntimeError) as exc:
-        raise SystemExit(f"could not collect stable benchmark provenance: {exc}") from exc
+        raise SystemExit(
+            f"could not collect stable benchmark provenance: {exc}"
+        ) from exc
     observed_lock = build_lock(args, fixture, provenance)
     write_json(args.output_dir / "benchmark.lock.json", observed_lock)
     preflight_errors = provenance_validation_errors(args, provenance)
@@ -3010,7 +3706,9 @@ def main(argv: list[str] | None = None) -> None:
         ]
         if compatibility_errors:
             raise SystemExit("\n".join(compatibility_errors))
-        baseline_identity = baseline_evidence_identity(args.baseline_evidence, baseline, baseline_source)
+        baseline_identity = baseline_evidence_identity(
+            args.baseline_evidence, baseline, baseline_source
+        )
         baseline_identity["expected_sha256"] = args.baseline_sha256
 
     try:
@@ -3041,7 +3739,9 @@ def main(argv: list[str] | None = None) -> None:
         for engine in order:
             guard_runtime(f"before-pair-{pair_index:02d}-{engine}")
             print(f"RUN pair={pair_index}/{args.repeats} engine={engine}", flush=True)
-            samples[engine] = run_engine_sample(args, fixture, prompt_token_contract, pair_index, engine)
+            samples[engine] = run_engine_sample(
+                args, fixture, prompt_token_contract, pair_index, engine
+            )
             guard_runtime(f"after-pair-{pair_index:02d}-{engine}")
         rows.append({"pair": pair_index, "order": list(order), **samples})
         with (args.output_dir / "samples.jsonl").open("a", encoding="utf-8") as output:
@@ -3050,7 +3750,9 @@ def main(argv: list[str] | None = None) -> None:
     try:
         final_model_bundle = antfly_model_bundle_provenance(args.model)
     except (OSError, RuntimeError) as exc:
-        raise SystemExit(f"could not verify final model-bundle provenance: {exc}") from exc
+        raise SystemExit(
+            f"could not verify final model-bundle provenance: {exc}"
+        ) from exc
     provenance["antfly_model_bundle_post_benchmark"] = final_model_bundle
     if final_model_bundle["sha256"] != provenance["antfly_model_bundle"]["sha256"]:
         raise SystemExit(
@@ -3073,7 +3775,9 @@ def main(argv: list[str] | None = None) -> None:
         "output_tokens": args.output_tokens,
         "warmups_per_server": args.warmups,
         "paired_samples": args.repeats,
-        "paired_order": [list(paired_order(index)) for index in range(1, args.repeats + 1)],
+        "paired_order": [
+            list(paired_order(index)) for index in range(1, args.repeats + 1)
+        ],
         "gpu_process_isolation": (
             "benchmark servers run sequentially; selected-GPU state and process isolation are "
             "verified before and after every server sample"
@@ -3097,7 +3801,9 @@ def main(argv: list[str] | None = None) -> None:
         "antfly_execution_profile_sha256": args.antfly_execution_profile["sha256"],
         "antfly_server_max_idle_prefill_chunk_size": SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE,
         "frozen_baseline_sha256": (
-            baseline_identity["file"].get("sha256") if baseline_identity is not None else None
+            baseline_identity["file"].get("sha256")
+            if baseline_identity is not None
+            else None
         ),
         "performance_enforced": args.enforce_performance,
         "performance_thresholds": performance_threshold_contract(args),
@@ -3117,18 +3823,30 @@ def main(argv: list[str] | None = None) -> None:
     evidence_path = args.output_dir / "evidence.json"
     write_json(evidence_path, evidence)
     fields = (
-        "pair", "order", "antfly_total_ms", "llama_total_ms", "total_ratio",
-        "antfly_ttft_ms", "llama_ttft_ms", "antfly_decode_ms", "llama_decode_ms",
+        "pair",
+        "order",
+        "antfly_total_ms",
+        "llama_total_ms",
+        "total_ratio",
+        "antfly_ttft_ms",
+        "llama_ttft_ms",
+        "antfly_decode_ms",
+        "llama_decode_ms",
     )
     with (args.output_dir / "paired_samples.tsv").open("w", encoding="utf-8") as output:
         output.write("\t".join(fields) + "\n")
         for row in rows:
             values = (
-                row["pair"], "/".join(row["order"]), row["antfly"]["total_latency_ms"],
+                row["pair"],
+                "/".join(row["order"]),
+                row["antfly"]["total_latency_ms"],
                 row["llama_cpp"]["total_latency_ms"],
-                row["antfly"]["total_latency_ms"] / row["llama_cpp"]["total_latency_ms"],
-                row["antfly"]["ttft_ms"], row["llama_cpp"]["ttft_ms"],
-                row["antfly"]["decode_ms"], row["llama_cpp"]["decode_ms"],
+                row["antfly"]["total_latency_ms"]
+                / row["llama_cpp"]["total_latency_ms"],
+                row["antfly"]["ttft_ms"],
+                row["llama_cpp"]["ttft_ms"],
+                row["antfly"]["decode_ms"],
+                row["llama_cpp"]["decode_ms"],
             )
             output.write("\t".join(str(value) for value in values) + "\n")
 

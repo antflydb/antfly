@@ -52,11 +52,15 @@ def encode_entry(raw_line: bytes, ordinal: int) -> bytes:
         raise ValueError(f"missing string text at corpus ordinal {ordinal}")
     key = f"doc:{ordinal}"
     document = {"corpus_ordinal": ordinal, "body": value["text"]}
-    return json.dumps(key, separators=(",", ":")).encode() + b":" + json.dumps(
-        document,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return (
+        json.dumps(key, separators=(",", ":")).encode()
+        + b":"
+        + json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
 
 
 def batches(
@@ -91,7 +95,13 @@ def batches(
 
 
 def batch_payload(entries: bytes, sync_level: str) -> bytes:
-    return b'{"inserts":{' + entries + b'},"sync_level":' + json.dumps(sync_level).encode() + b"}"
+    return (
+        b'{"inserts":{'
+        + entries
+        + b'},"sync_level":'
+        + json.dumps(sync_level).encode()
+        + b"}"
+    )
 
 
 class AntflyClient:
@@ -99,7 +109,9 @@ class AntflyClient:
         parsed = urlsplit(base_url)
         if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("loader currently requires an http base URL")
-        self.connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=timeout)
+        self.connection = http.client.HTTPConnection(
+            parsed.hostname, parsed.port or 80, timeout=timeout
+        )
         self.base_path = parsed.path.rstrip("/")
         self.table = table
         self.path = f"{parsed.path.rstrip('/')}/tables/{quote(table, safe='')}/batch"
@@ -110,28 +122,41 @@ class AntflyClient:
     def ensure_table(self) -> None:
         path = f"{self.base_path}/tables/{quote(self.table, safe='')}"
         payload = b'{"num_shards":1}'
-        self.connection.request("POST", path, body=payload, headers={"Content-Type": "application/json"})
+        self.connection.request(
+            "POST", path, body=payload, headers={"Content-Type": "application/json"}
+        )
         response = self.connection.getresponse()
         body = response.read()
         if not 200 <= response.status < 300 and response.status != 409:
-            raise RuntimeError(f"Antfly table creation failed with HTTP {response.status}: {body[:1000]!r}")
+            raise RuntimeError(
+                f"Antfly table creation failed with HTTP {response.status}: {body[:1000]!r}"
+            )
 
     def ingest(self, entries: bytes, sync_level: str) -> int:
         payload = batch_payload(entries, sync_level)
         deadline = time.monotonic() + self.timeout
         delay = 0.01
         while True:
-            self.connection.request("POST", self.path, body=payload, headers={"Content-Type": "application/json"})
+            self.connection.request(
+                "POST",
+                self.path,
+                body=payload,
+                headers={"Content-Type": "application/json"},
+            )
             response = self.connection.getresponse()
             body = response.read()
             if 200 <= response.status < 300:
                 result = json.loads(body)
                 return int(result.get("inserted", 0))
             if response.status != 429:
-                raise RuntimeError(f"Antfly batch failed with HTTP {response.status}: {body[:1000]!r}")
+                raise RuntimeError(
+                    f"Antfly batch failed with HTTP {response.status}: {body[:1000]!r}"
+                )
             now = time.monotonic()
             if now >= deadline:
-                raise TimeoutError(f"Antfly batch remained backpressured for {self.timeout:.3f}s")
+                raise TimeoutError(
+                    f"Antfly batch remained backpressured for {self.timeout:.3f}s"
+                )
             sleep_seconds = min(delay, deadline - now)
             time.sleep(sleep_seconds)
             self.backpressure_retries += 1
@@ -146,7 +171,9 @@ def main() -> int:
     args = arguments()
     started = time.perf_counter()
     with args.corpus.open("rb") as corpus:
-        prepared = batches(corpus, args.batch_bytes, args.max_documents, args.start_document)
+        prepared = batches(
+            corpus, args.batch_bytes, args.max_documents, args.start_document
+        )
         pending = next(prepared, None)
         if pending is None:
             raise ValueError("corpus contains no documents")
@@ -161,10 +188,15 @@ def main() -> int:
                 expected = cumulative_documents - submitted
                 inserted = client.ingest(entries, "write")
                 if inserted != expected:
-                    raise RuntimeError(f"Antfly inserted {inserted} of {expected} documents")
+                    raise RuntimeError(
+                        f"Antfly inserted {inserted} of {expected} documents"
+                    )
                 submitted = cumulative_documents
                 batch_count += 1
-                if args.progress_every_batches and batch_count % args.progress_every_batches == 0:
+                if (
+                    args.progress_every_batches
+                    and batch_count % args.progress_every_batches == 0
+                ):
                     elapsed = time.perf_counter() - started
                     print(
                         json.dumps(
@@ -184,21 +216,28 @@ def main() -> int:
             expected = cumulative_documents - submitted
             inserted = client.ingest(entries, "full_index")
             if inserted != expected:
-                raise RuntimeError(f"Antfly inserted {inserted} of {expected} documents")
+                raise RuntimeError(
+                    f"Antfly inserted {inserted} of {expected} documents"
+                )
             submitted = cumulative_documents
             batch_count += 1
         finally:
             client.close()
     elapsed = time.perf_counter() - started
-    print(json.dumps({
-        "batches": batch_count,
-        "documents": submitted,
-        "documents_per_second": submitted / elapsed,
-        "elapsed_seconds": elapsed,
-        "final_sync_level": "full_index",
-        "backpressure_retries": client.backpressure_retries,
-        "backpressure_wait_seconds": client.backpressure_wait_seconds,
-    }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "batches": batch_count,
+                "documents": submitted,
+                "documents_per_second": submitted / elapsed,
+                "elapsed_seconds": elapsed,
+                "final_sync_level": "full_index",
+                "backpressure_retries": client.backpressure_retries,
+                "backpressure_wait_seconds": client.backpressure_wait_seconds,
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 

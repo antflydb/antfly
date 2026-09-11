@@ -18,6 +18,7 @@
 //! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -341,7 +342,7 @@ const PageAllocator = struct {
 
     fn deinit(self: *PageAllocator) void {
         if (self.data_lock_file) |lock_file| {
-            lock_file.close(self.file.io_impl.io());
+            lock_file.close(self.file.runtimeIo());
         }
         self.file.allocator.free(self.free_pages);
     }
@@ -421,11 +422,13 @@ pub const OpenOptions = struct {
 
 pub const PathWriterLock = struct {
     io_impl: std.Io.Threaded,
+    borrowed_io: ?std.Io = null,
     file: std.Io.File,
 
     pub fn close(self: *PathWriterLock) void {
-        self.file.close(self.io_impl.io());
-        self.io_impl.deinit();
+        const io = self.borrowed_io orelse self.io_impl.io();
+        self.file.close(io);
+        if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
     }
 };
@@ -764,7 +767,12 @@ const PageCache = struct {
 
 pub const NativeFile = struct {
     allocator: Allocator,
+    /// The default constructors own this Threaded runtime. Borrowed-I/O
+    /// constructors leave it undefined and retain `borrowed_io` instead. This
+    /// keeps the production convenience API while making the complete Lite
+    /// file lifecycle executable by deterministic std.Io implementations.
     io_impl: std.Io.Threaded,
+    borrowed_io: ?std.Io = null,
     path: []u8,
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
@@ -789,7 +797,25 @@ pub const NativeFile = struct {
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
-        const io = io_impl.io();
+        return try openWithRuntime(allocator, path, opts, io_impl, null);
+    }
+
+    /// Opens a Lite file using a caller-owned std.Io runtime. The runtime must
+    /// outlive the returned file. No native thread or host-I/O escape is
+    /// created by this path.
+    pub fn openWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: OpenOptions) !NativeFile {
+        return try openWithRuntime(allocator, path, opts, undefined, io);
+    }
+
+    fn openWithRuntime(
+        allocator: Allocator,
+        path: []const u8,
+        opts: OpenOptions,
+        io_impl: std.Io.Threaded,
+        borrowed_io: ?std.Io,
+    ) !NativeFile {
+        var owned_io_impl = io_impl;
+        const io = borrowed_io orelse owned_io_impl.io();
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -813,7 +839,8 @@ pub const NativeFile = struct {
 
         var result = NativeFile{
             .allocator = allocator,
-            .io_impl = io_impl,
+            .io_impl = owned_io_impl,
+            .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
@@ -838,6 +865,12 @@ pub const NativeFile = struct {
         return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager);
     }
 
+    /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
+    /// must outlive the returned file.
+    pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
+        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, undefined, io);
+    }
+
     fn createWithMode(
         allocator: Allocator,
         path: []const u8,
@@ -847,7 +880,20 @@ pub const NativeFile = struct {
     ) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
-        const io = io_impl.io();
+        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, io_impl, null);
+    }
+
+    fn createWithRuntime(
+        allocator: Allocator,
+        path: []const u8,
+        exclusive: bool,
+        no_sync: bool,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
+        io_impl: std.Io.Threaded,
+        borrowed_io: ?std.Io,
+    ) !NativeFile {
+        var owned_io_impl = io_impl;
+        const io = borrowed_io orelse owned_io_impl.io();
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -905,7 +951,8 @@ pub const NativeFile = struct {
 
         var result = NativeFile{
             .allocator = allocator,
-            .io_impl = io_impl,
+            .io_impl = owned_io_impl,
+            .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
@@ -919,15 +966,31 @@ pub const NativeFile = struct {
     }
 
     pub fn close(self: *NativeFile) void {
+        const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
         if (self.writer_lock_file) |lock_file| {
-            lock_file.close(self.io_impl.io());
+            lock_file.close(io);
         }
-        self.file.close(self.io_impl.io());
+        self.file.close(io);
         self.allocator.free(self.path);
-        self.io_impl.deinit();
+        if (self.borrowed_io == null) self.io_impl.deinit();
         self.* = undefined;
+    }
+
+    pub fn usesBorrowedIo(self: *const NativeFile) bool {
+        return self.borrowed_io != null;
+    }
+
+    /// Returns the runtime used for file operations and synchronization. The
+    /// returned interface is borrowed from this file and is invalid after
+    /// `close`.
+    pub fn runtime(self: *NativeFile) std.Io {
+        return self.borrowed_io orelse self.io_impl.io();
+    }
+
+    fn runtimeIo(self: *NativeFile) std.Io {
+        return self.runtime();
     }
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
@@ -946,7 +1009,7 @@ pub const NativeFile = struct {
 
         const checkpoint = self.activeCheckpoint();
         const expected_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
-        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        const file_size = (try self.file.stat(self.runtimeIo())).size;
 
         const report = CheckReport{
             .valid = true,
@@ -1050,7 +1113,7 @@ pub const NativeFile = struct {
         const page = try allocator.alloc(u8, page_size);
         errdefer allocator.free(page);
 
-        try readExactAt(self.file, self.io_impl.io(), page, page_id * @as(u64, self.header.page_size));
+        try readExactAt(self.file, self.runtimeIo(), page, page_id * @as(u64, self.header.page_size));
         // Free-map pages are rewritten every commit and read once, so caching
         // them buys nothing; skipping them also keeps free-map validation
         // reading disk truth before any pages are handed out for reuse.
@@ -1660,7 +1723,7 @@ pub const NativeFile = struct {
     fn buildVacuumLiveIndex(self: *NativeFile, source: VacuumRecordSource, suffix: []const u8, cancel: ?*const maintenance.CancelToken) !VacuumLiveIndex {
         const path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum-{s}-index", .{ self.path, suffix });
         errdefer self.allocator.free(path);
-        const io = self.io_impl.io();
+        const io = self.runtimeIo();
         std.Io.Dir.cwd().deleteTree(io, path) catch {};
         errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
 
@@ -2441,7 +2504,7 @@ pub const NativeFile = struct {
         var cursor = try read.openCursor();
         defer cursor.close();
 
-        const io = self.io_impl.io();
+        const io = self.runtimeIo();
         const page_size: usize = @intCast(self.header.page_size);
         var count: usize = 0;
         var maybe_entry = try cursor.first();
@@ -2492,7 +2555,7 @@ pub const NativeFile = struct {
         var cursor = try read.openCursor();
         defer cursor.close();
 
-        const io = self.io_impl.io();
+        const io = self.runtimeIo();
         const page_size: usize = @intCast(self.header.page_size);
         var document_index = DocumentIndexBulkBuilder{
             .owner = self,
@@ -2554,14 +2617,14 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (cancel) |token| try token.check();
 
-        var data_lock = try acquireDataRewriteLock(self.io_impl.io(), self.path);
-        defer data_lock.file.close(self.io_impl.io());
+        const io = self.runtimeIo();
+        var data_lock = try acquireDataRewriteLock(io, self.path);
+        defer data_lock.file.close(io);
 
-        const before_size = (try self.file.stat(self.io_impl.io())).size;
+        const before_size = (try self.file.stat(io)).size;
         const previous = self.activeCheckpoint();
 
         const page_size: usize = @intCast(self.header.page_size);
-        const io = self.io_impl.io();
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum", .{self.path});
         defer self.allocator.free(tmp_path);
         errdefer deleteFilePath(io, tmp_path) catch {};
@@ -2642,29 +2705,30 @@ pub const NativeFile = struct {
     }
 
     pub fn copyStableSnapshotToPath(self: *NativeFile, dest_path: []const u8, replace: bool) !StableSnapshotReport {
-        if (std.mem.eql(u8, self.path, dest_path) or try pathsReferToSameExistingFile(self.allocator, self.io_impl.io(), self.path, dest_path)) {
+        const io = self.runtimeIo();
+        if (std.mem.eql(u8, self.path, dest_path) or try pathsReferToSameExistingFile(self.allocator, io, self.path, dest_path)) {
             return error.InvalidNativeSnapshotPath;
         }
-        const dest_exists = pathExists(self.io_impl.io(), dest_path);
+        const dest_exists = pathExists(io, dest_path);
         if (!replace and dest_exists) return error.PathAlreadyExists;
 
-        var dest_lock = try lockWriterPath(self.allocator, dest_path);
+        var dest_lock = try lockWriterPathWithIo(self.allocator, io, dest_path);
         defer dest_lock.close();
 
-        if (!replace and !dest_exists and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
+        if (!replace and !dest_exists and pathExists(io, dest_path)) return error.PathAlreadyExists;
 
         const checkpoint = self.activeCheckpoint();
         const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
-        const source_size = (try self.file.stat(self.io_impl.io())).size;
+        const source_size = (try self.file.stat(io)).size;
         if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
         defer self.allocator.free(tmp_path);
-        errdefer deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+        errdefer deleteFilePath(io, tmp_path) catch {};
 
         {
-            var out_file = try createSnapshotFile(self.io_impl.io(), tmp_path);
-            defer out_file.close(self.io_impl.io());
+            var out_file = try createSnapshotFile(io, tmp_path);
+            defer out_file.close(io);
 
             const chunk_size: usize = 1024 * 1024;
             const buffer_len: usize = @intCast(@min(@as(u64, chunk_size), snapshot_size));
@@ -2674,23 +2738,23 @@ pub const NativeFile = struct {
             var offset: u64 = 0;
             while (offset < snapshot_size) {
                 const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
-                try readExactAt(self.file, self.io_impl.io(), buffer[0..len], offset);
-                try out_file.writePositionalAll(self.io_impl.io(), buffer[0..len], offset);
+                try readExactAt(self.file, io, buffer[0..len], offset);
+                try out_file.writePositionalAll(io, buffer[0..len], offset);
                 offset += len;
             }
             var snapshot_header: [header_size]u8 = undefined;
             encodeHeader(&snapshot_header, self.header);
-            try out_file.writePositionalAll(self.io_impl.io(), &snapshot_header, 0);
-            try out_file.setLength(self.io_impl.io(), snapshot_size);
-            try out_file.sync(self.io_impl.io());
+            try out_file.writePositionalAll(io, &snapshot_header, 0);
+            try out_file.setLength(io, snapshot_size);
+            try out_file.sync(io);
         }
 
-        renameFilePath(self.io_impl.io(), tmp_path, dest_path) catch |err| {
-            deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+        renameFilePath(io, tmp_path, dest_path) catch |err| {
+            deleteFilePath(io, tmp_path) catch {};
             return err;
         };
         try fs_paths.syncDirPortable(
-            self.io_impl.io(),
+            io,
             std.fs.path.dirname(dest_path) orelse ".",
         );
 
@@ -3044,7 +3108,7 @@ pub const NativeFile = struct {
         try self.validateFreePagesSafeForCheckpointSlots(free_pages);
         var data_lock_file: ?std.Io.File = null;
         if (free_pages.len > 0) {
-            const data_lock = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
+            const data_lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
                 error.WouldBlock => blk: {
                     self.allocator.free(free_pages);
                     free_pages = try self.allocator.alloc(u64, 0);
@@ -3236,7 +3300,7 @@ pub const NativeFile = struct {
     }
 
     fn collectAllValidCheckpointReachablePages(self: *NativeFile, out: *ReachablePageSet) !void {
-        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        const file_size = (try self.file.stat(self.runtimeIo())).size;
         for (self.header.checkpoints) |slot| {
             if (!validCheckpointSlot(slot)) continue;
             const expected_size = checkpointPrefixSize(slot, self.header.page_size) catch continue;
@@ -3486,11 +3550,12 @@ pub const NativeFile = struct {
         encodePage(page, kind, contents);
 
         const page_end = page_offset + self.header.page_size;
-        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        const io = self.runtimeIo();
+        const file_size = (try self.file.stat(io)).size;
         if (file_size < page_end) {
-            try self.file.setLength(self.io_impl.io(), page_end);
+            try self.file.setLength(io, page_end);
         }
-        try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
+        try self.file.writePositionalAll(io, page, page_offset);
         if (kind == .free_map) {
             // A reused page id may still be cached under its previous life;
             // free-map pages themselves are not cached (see read path).
@@ -3557,10 +3622,11 @@ pub const NativeFile = struct {
         var encoded_slot: [checkpoint_slot_size]u8 = undefined;
         encodeCheckpointSlot(&encoded_slot, checkpoint);
 
-        try self.file.writePositionalAll(self.io_impl.io(), &encoded_slot, checkpointOffset(next_slot));
+        const io = self.runtimeIo();
+        try self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot));
         try self.syncIfRequired();
         const active_checkpoint: [1]u8 = .{next_slot};
-        try self.file.writePositionalAll(self.io_impl.io(), &active_checkpoint, active_checkpoint_offset);
+        try self.file.writePositionalAll(io, &active_checkpoint, active_checkpoint_offset);
         try self.syncIfRequired();
 
         self.header.checkpoints[next_slot] = checkpoint;
@@ -3568,7 +3634,7 @@ pub const NativeFile = struct {
     }
 
     fn syncIfRequired(self: *NativeFile) !void {
-        if (!self.no_sync) try self.file.sync(self.io_impl.io());
+        if (!self.no_sync) try self.file.sync(self.runtimeIo());
     }
 
     pub fn sync(self: *NativeFile) !void {
@@ -3586,7 +3652,7 @@ pub const NativeFile = struct {
         replacement_header: Header,
         caller_owns_replacement: *bool,
     ) !void {
-        const io = self.io_impl.io();
+        const io = self.runtimeIo();
         try renameFilePath(io, tmp_path, self.path);
 
         const previous_file = self.file;
@@ -3660,7 +3726,7 @@ const DocumentIndexBulkBuilder = struct {
         return try appendPageToFile(
             self.owner.allocator,
             self.file,
-            self.owner.io_impl.io(),
+            self.owner.runtimeIo(),
             @intCast(self.owner.header.page_size),
             self.next_page_id,
             .document_index,
@@ -3876,6 +3942,17 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
 
     return .{
         .io_impl = io_impl,
+        .file = file,
+    };
+}
+
+/// Acquires the same cross-process writer lock through a caller-owned std.Io.
+pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
+    const file = (try acquireWriterLock(allocator, io, path)).file;
+    errdefer file.close(io);
+    return .{
+        .io_impl = undefined,
+        .borrowed_io = io,
         .file = file,
     };
 }
@@ -4279,7 +4356,7 @@ fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
     std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
     @memcpy(out[page_header_size..][0..payload.len], payload);
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(out[0..page_crc_offset]);
     crc.update(out[page_header_size..][0..payload.len]);
     std.mem.writeInt(u32, out[page_crc_offset..][0..4], crc.final(), .little);
@@ -4303,7 +4380,7 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
     const payload_len = std.mem.readInt(u32, raw[8..12], .little);
     if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;
 
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..page_crc_offset]);
     crc.update(raw[page_header_size..][0..payload_len]);
     const expected_crc = std.mem.readInt(u32, raw[page_crc_offset..][0..4], .little);
@@ -4631,7 +4708,7 @@ fn readHeaderExactAt(file: std.Io.File, io: std.Io, out: *[header_size]u8) !void
 }
 
 fn headerChecksum(raw: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
     crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
@@ -4639,7 +4716,7 @@ fn headerChecksum(raw: []const u8) u32 {
 }
 
 fn checkpointSlotChecksum(raw: []const u8) u32 {
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     crc.update(raw[0..checkpoint_slot_payload_size]);
     return crc.final();
 }

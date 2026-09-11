@@ -326,6 +326,34 @@ pub const Detail = enum(c_int) {
     native_backup_projection_not_quiescent,
     native_backup_projection_repair_failed,
     native_backup_projection_repair_paused,
+    reranker_candidate_limit_exceeded,
+    // Reranker execution happens behind the independently generated data
+    // runtime boundary. Preserve the public retry/dependency classification
+    // instead of collapsing provider failures into RuntimeBoundaryFailure.
+    rerank_rate_limited,
+    rerank_transient_failure,
+    rerank_upstream_failure,
+    invalid_rate_limit_policy,
+    conflicting_rate_limit_policy,
+    provider_token_budget_exceeded,
+    provider_quota_registry_full,
+    unsupported_media_token_budget,
+    unsupported_local_rate_limit,
+    // Append after published main values to preserve their wire identities.
+    // Model compatibility is decided inside the independently generated
+    // inference runtime; do not reinterpret compilation-local error integers.
+    incompatible_model,
+    unsupported_generator_provider,
+    generate_request_failed,
+    generation_rate_limit,
+    unsupported_tensor_type,
+    generation_capacity_unavailable,
+    invalid_table_storage_settings,
+    vector_store_requires_local_single_shard_table,
+    vector_store_requires_empty_table,
+    immutable_table_storage_settings,
+    vector_store_lifecycle_unsupported,
+    vector_store_reference_format_required,
 };
 
 pub const Status = extern struct {
@@ -422,6 +450,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.MethodNotAllowed => status(.unsupported, .method_not_allowed),
         error.Unsupported => status(.unsupported, .unsupported),
         error.UnsupportedOperation => status(.unsupported, .unsupported_operation),
+        error.UnsupportedTensorType => status(.unsupported, .unsupported_tensor_type),
         error.UnsupportedTransformOperation => status(.invalid_argument, .unsupported_transform_operation),
         error.InvalidGraphEdges => status(.invalid_argument, .invalid_graph_edges),
         error.InvalidTableIndexMetadata => status(.invalid_argument, .invalid_table_index_metadata),
@@ -504,6 +533,21 @@ pub fn statusFromError(err: anyerror) Status {
         error.NativeBackupProjectionNotQuiescent => status(.retryable, .native_backup_projection_not_quiescent),
         error.NativeBackupProjectionRepairFailed => status(.corrupt, .native_backup_projection_repair_failed),
         error.NativeBackupProjectionRepairPaused => status(.conflict, .native_backup_projection_repair_paused),
+        error.RerankerCandidateLimitExceeded => status(.invalid_argument, .reranker_candidate_limit_exceeded),
+        error.RerankRateLimited => status(.retryable, .rerank_rate_limited),
+        error.RerankTransientFailure => status(.retryable, .rerank_transient_failure),
+        error.RerankUpstreamFailure => status(.unavailable, .rerank_upstream_failure),
+        error.IncompatibleModel => status(.invalid_argument, .incompatible_model),
+        error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
+        error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
+        error.GenerationCapacityUnavailable => status(.retryable, .generation_capacity_unavailable),
+        error.RateLimit => status(.retryable, .generation_rate_limit),
+        error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
+        error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
+        error.ProviderTokenBudgetExceeded => status(.invalid_argument, .provider_token_budget_exceeded),
+        error.ProviderQuotaRegistryFull => status(.retryable, .provider_quota_registry_full),
+        error.UnsupportedMediaTokenBudget => status(.unsupported, .unsupported_media_token_budget),
+        error.UnsupportedLocalRateLimit => status(.unsupported, .unsupported_local_rate_limit),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -634,6 +678,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedSourceKind => status(.unsupported, .unsupported_source_kind),
         error.UpdatePathNotFound => status(.not_found, .update_path_not_found),
         error.UserExists => status(.already_exists, .user_exists),
+        error.InvalidTableStorageSettings => status(.invalid_argument, .invalid_table_storage_settings),
+        error.VectorStoreRequiresLocalSingleShardTable => status(.invalid_argument, .vector_store_requires_local_single_shard_table),
+        error.VectorStoreRequiresEmptyTable => status(.conflict, .vector_store_requires_empty_table),
+        error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
+        error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
+        error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
         else => status(.internal, .none),
     };
 }
@@ -678,6 +728,13 @@ pub fn errorFromStatus(value: Status) anyerror {
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
         .none => "RuntimeBoundaryFailure",
+        .invalid_table_storage_settings => "InvalidTableStorageSettings",
+        .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
+        .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
+        .immutable_table_storage_settings => "ImmutableTableStorageSettings",
+        .vector_store_lifecycle_unsupported => "VectorStoreLifecycleUnsupported",
+        .vector_store_reference_format_required => "VectorStoreReferenceFormatRequired",
+
         .out_of_memory => "OutOfMemory",
         .invalid_argument => "InvalidArgument",
         .invalid_arguments => "InvalidArguments",
@@ -743,6 +800,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .method_not_allowed => "MethodNotAllowed",
         .unsupported => "Unsupported",
         .unsupported_operation => "UnsupportedOperation",
+        .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
@@ -960,6 +1018,21 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .native_backup_projection_not_quiescent => "NativeBackupProjectionNotQuiescent",
         .native_backup_projection_repair_failed => "NativeBackupProjectionRepairFailed",
         .native_backup_projection_repair_paused => "NativeBackupProjectionRepairPaused",
+        .reranker_candidate_limit_exceeded => "RerankerCandidateLimitExceeded",
+        .rerank_rate_limited => "RerankRateLimited",
+        .rerank_transient_failure => "RerankTransientFailure",
+        .rerank_upstream_failure => "RerankUpstreamFailure",
+        .incompatible_model => "IncompatibleModel",
+        .unsupported_generator_provider => "UnsupportedGeneratorProvider",
+        .generate_request_failed => "GenerateRequestFailed",
+        .generation_capacity_unavailable => "GenerationCapacityUnavailable",
+        .generation_rate_limit => "RateLimit",
+        .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
+        .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
+        .provider_token_budget_exceeded => "ProviderTokenBudgetExceeded",
+        .provider_quota_registry_full => "ProviderQuotaRegistryFull",
+        .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
+        .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
     };
 }
 
@@ -985,6 +1058,14 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
+    try std.testing.expectEqual(error.RerankerCandidateLimitExceeded, errorFromStatus(statusFromError(error.RerankerCandidateLimitExceeded)));
+    try std.testing.expectEqual(error.RerankRateLimited, errorFromStatus(statusFromError(error.RerankRateLimited)));
+    try std.testing.expectEqual(error.RerankTransientFailure, errorFromStatus(statusFromError(error.RerankTransientFailure)));
+    try std.testing.expectEqual(error.RerankUpstreamFailure, errorFromStatus(statusFromError(error.RerankUpstreamFailure)));
+    try std.testing.expectEqual(error.IncompatibleModel, errorFromStatus(statusFromError(error.IncompatibleModel)));
+    try std.testing.expectEqual(error.UnsupportedGeneratorProvider, errorFromStatus(statusFromError(error.UnsupportedGeneratorProvider)));
+    try std.testing.expectEqual(error.GenerateRequestFailed, errorFromStatus(statusFromError(error.GenerateRequestFailed)));
+    try std.testing.expectEqual(error.RateLimit, errorFromStatus(statusFromError(error.RateLimit)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
@@ -1042,4 +1123,28 @@ test "unknown wire values fail closed" {
         .code = @intFromEnum(Code.invalid_argument),
         .detail = @intFromEnum(Detail.table_not_found),
     }));
+}
+
+test "table vector storage errors retain their runtime boundary classification" {
+    try std.testing.expectEqual(error.InvalidTableStorageSettings, errorFromStatus(statusFromError(error.InvalidTableStorageSettings)));
+    try std.testing.expectEqual(error.VectorStoreRequiresLocalSingleShardTable, errorFromStatus(statusFromError(error.VectorStoreRequiresLocalSingleShardTable)));
+    try std.testing.expectEqual(error.VectorStoreRequiresEmptyTable, errorFromStatus(statusFromError(error.VectorStoreRequiresEmptyTable)));
+    try std.testing.expectEqual(error.ImmutableTableStorageSettings, errorFromStatus(statusFromError(error.ImmutableTableStorageSettings)));
+    try std.testing.expectEqual(error.VectorStoreLifecycleUnsupported, errorFromStatus(statusFromError(error.VectorStoreLifecycleUnsupported)));
+    try std.testing.expectEqual(error.VectorStoreReferenceFormatRequired, errorFromStatus(statusFromError(error.VectorStoreReferenceFormatRequired)));
+}
+
+test "provider quota errors retain stable boundary details" {
+    try std.testing.expectEqual(error.InvalidRateLimitPolicy, errorFromStatus(statusFromError(error.InvalidRateLimitPolicy)));
+    try std.testing.expectEqual(error.ConflictingRateLimitPolicy, errorFromStatus(statusFromError(error.ConflictingRateLimitPolicy)));
+    try std.testing.expectEqual(error.ProviderTokenBudgetExceeded, errorFromStatus(statusFromError(error.ProviderTokenBudgetExceeded)));
+    try std.testing.expectEqual(error.ProviderQuotaRegistryFull, errorFromStatus(statusFromError(error.ProviderQuotaRegistryFull)));
+    try std.testing.expectEqual(error.UnsupportedMediaTokenBudget, errorFromStatus(statusFromError(error.UnsupportedMediaTokenBudget)));
+    try std.testing.expectEqual(error.UnsupportedLocalRateLimit, errorFromStatus(statusFromError(error.UnsupportedLocalRateLimit)));
+}
+
+test "generation capacity retains retryability across the runtime boundary" {
+    const result = statusFromError(error.GenerationCapacityUnavailable);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
+    try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }

@@ -34,6 +34,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const TensorInfo = @import("tensor.zig").TensorInfo;
 const DType = @import("tensor.zig").DType;
 const BackendType = @import("backends.zig").BackendType;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const ops_mod = @import("../ops/ops.zig");
 const graph_runtime_mod = if (build_options.enable_wasm) WasmGraphRuntime else @import("../graph/runtime.zig");
 
@@ -204,9 +205,7 @@ const BackendContext = union(enum) {
             .native => |*ctx| {
                 if (comptime build_options.enable_native) {
                     ctx.compute.computeBackend().deinit();
-                    ctx.weight_store.resident_weights.deinit(allocator);
-                    ctx.weight_store.lazy_weights.deinit(allocator);
-                    native_mod.deinitPrefetchQueue(ctx.weight_store);
+                    ctx.weight_store.deinitOwned();
                     allocator.destroy(ctx.weight_store);
                 } else {
                     unreachable;
@@ -761,6 +760,31 @@ pub const OnnxArtifactSet = struct {
     }
 };
 
+/// Inspect only declared graph I/O. No tensor data or backend session is loaded.
+/// The caller provides an arena so all descriptors have one short-lived owner.
+pub fn inspectSignature(arena: std.mem.Allocator, onnx_path: []const u8) !struct { inputs: []TensorInfo, outputs: []TensorInfo } {
+    var mapped = try c_file.MmapRegion.init(arena, onnx_path);
+    defer mapped.deinit();
+    if (mapped.data.len > max_onnx_model_bytes) return error.FileTooLarge;
+    var model = try onnx_graph.parseLazyAsModelWithBaseDir(arena, mapped.data, std.fs.path.dirname(onnx_path) orelse ".");
+    defer model.deinit();
+    const graph = model.graph() orelse return error.InvalidOnnxGraph;
+    var inputs = std.ArrayList(TensorInfo).empty;
+    for (graph.inputs) |input| {
+        if (input.name.len == 0 or !model.input_set.contains(input.name)) continue;
+        if (input.type_proto == null or input.type_proto.?.tensor_type == null) return error.IncompatibleModel;
+        if (input.type_proto.?.tensor_type.?.shape == null) return error.IncompatibleModel;
+        try inputs.append(arena, try tensorInfoFromValueOrShape(arena, input.name, input.type_proto, Shape.init(.f32, &.{})));
+    }
+    const outputs = try arena.alloc(TensorInfo, graph.outputs.len);
+    for (graph.outputs, outputs) |output, *info| {
+        if (output.type_proto == null or output.type_proto.?.tensor_type == null) return error.IncompatibleModel;
+        if (output.type_proto.?.tensor_type.?.shape == null) return error.IncompatibleModel;
+        info.* = try tensorInfoFromValueOrShape(arena, output.name, output.type_proto, Shape.init(.f32, &.{}));
+    }
+    return .{ .inputs = inputs.items, .outputs = outputs };
+}
+
 /// Parse only initializer metadata and return the complete, validated artifact
 /// set. External files are deduplicated and conservatively charged at their
 /// full file size: runtimes may mmap or cache the complete backing file even
@@ -1061,13 +1085,26 @@ pub fn createSessionWithOptions(
 
 const imported_session_vtable = Session.VTable{
     .run = run,
+    .runWithControl = runWithControl,
     .inputInfo = inputInfo,
     .outputInfo = outputInfo,
     .backend = backend,
     .close = close,
     .runResident = runResident,
     .runResidentInputs = runResidentInputs,
+    .runResidentWithControl = runResidentWithControl,
+    .runResidentInputsWithControl = runResidentInputsWithControl,
 };
+
+fn runWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) ![]Tensor {
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
+    return runImpl(self, inputs, allocator, control);
+}
 
 pub fn sharedBackendContext(session: Session) ?*SharedBackendContext {
     if (session.vtable != &imported_session_vtable) return null;
@@ -1118,7 +1155,16 @@ fn logImportedGraphBindings(graph: *const Graph, input_node_ids: []const NodeId,
 
 fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    var resident_outputs = try runResidentImpl(self, inputs, null, allocator);
+    return runImpl(self, inputs, allocator, null);
+}
+
+fn runImpl(
+    self: *ImportedOnnxSession,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) ![]Tensor {
+    var resident_outputs = try runResidentImpl(self, inputs, null, allocator, control);
     defer resident_outputs.deinit();
 
     const outputs = try allocator.alloc(Tensor, resident_outputs.outputs.len);
@@ -1129,6 +1175,7 @@ fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) an
     }
 
     for (resident_outputs.outputs, 0..) |output_ct, i| {
+        if (control) |active| try active.check();
         const info = self.output_info[i];
         const shape = self.cb.tensorShape(output_ct, allocator) catch try allocator.dupe(i64, info.shape);
         defer allocator.free(shape);
@@ -1147,12 +1194,32 @@ fn run(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) an
 
 fn runResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror!?ResidentOutputs {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    return try runResidentImpl(self, inputs, null, allocator);
+    return try runResidentImpl(self, inputs, null, allocator, null);
 }
 
 fn runResidentInputs(ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator) anyerror!?ResidentOutputs {
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
-    return try runResidentImpl(self, null, inputs, allocator);
+    return try runResidentImpl(self, null, inputs, allocator, null);
+}
+
+fn runResidentWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) anyerror!?ResidentOutputs {
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
+    return try runResidentImpl(self, inputs, null, allocator, control);
+}
+
+fn runResidentInputsWithControl(
+    ptr: *anyopaque,
+    inputs: []const ResidentInput,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) anyerror!?ResidentOutputs {
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(ptr));
+    return try runResidentImpl(self, null, inputs, allocator, control);
 }
 
 fn runResidentImpl(
@@ -1160,7 +1227,9 @@ fn runResidentImpl(
     host_inputs: ?[]const Tensor,
     resident_inputs: ?[]const ResidentInput,
     allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
 ) !ResidentOutputs {
+    if (control) |active| try active.check();
     const input_len = if (host_inputs) |inputs| inputs.len else if (resident_inputs) |inputs| inputs.len else 0;
     if (input_len != self.input_info.len) return error.InputArityMismatch;
 
@@ -1180,6 +1249,7 @@ fn runResidentImpl(
     }
 
     for (self.input_node_ids, 0..) |node_id, i| {
+        if (control) |active| try active.check();
         if (node_id == ml.graph.null_node) continue;
         const value = if (host_inputs) |inputs|
             try self.shared_backend_ctx.importHostTensor(allocator, &inputs[i])
@@ -1204,8 +1274,10 @@ fn runResidentImpl(
         .runtime_inputs = runtime_inputs,
         .sdpa_mask = sdpa_mask,
         .cached_analysis = self.cached_analysis,
+        .execution_control = control,
     });
     errdefer exec_result.deinit(&self.runtime);
+    if (control) |active| try active.check();
 
     const outputs = exec_result.outputs;
     exec_result.outputs = &.{};

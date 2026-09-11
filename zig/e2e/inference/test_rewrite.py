@@ -27,7 +27,9 @@ pytestmark = pytest.mark.model_integration
 def test_rewrite_text(api):
     """Seq2seq rewriting should return a result with text field."""
     resp = api.rewrite(
-        text=["generate question: Machine learning is a subset of artificial intelligence."],
+        text=[
+            "generate question: Machine learning is a subset of artificial intelligence."
+        ],
     )
     assert_openai_list_response(resp, expected_len=1)
     results = resp["data"]

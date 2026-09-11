@@ -18,6 +18,9 @@
 // and backend session, and returns a pipeline ready for inference.
 
 const std = @import("std");
+const execution_control_mod = @import("../execution_control.zig");
+const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
@@ -35,11 +38,14 @@ const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
+const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
+const florence_arch = @import("../architectures/florence.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const tokenizer_mod = @import("inference_tokenizer");
 const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
+const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
@@ -169,6 +175,7 @@ const NativeCompanion = struct {
 const ProjectorDecoderFamily = enum {
     gemma3,
     gemma4,
+    qwen3vl,
     unsupported,
 };
 
@@ -182,6 +189,8 @@ const ProjectorDecoderContract = struct {
 
 fn projectorDecoderFamilyForArchitecture(architecture: []const u8) ProjectorDecoderFamily {
     if (std.mem.eql(u8, architecture, "gemma3")) return .gemma3;
+    if (std.mem.eql(u8, architecture, "qwen3_vl") or
+        std.mem.eql(u8, architecture, "qwen3vl")) return .qwen3vl;
     if (std.mem.eql(u8, architecture, "gemma4") or
         std.mem.eql(u8, architecture, "gemma4_unified"))
     {
@@ -196,12 +205,21 @@ fn projectorMatchesDecoder(
 ) bool {
     return switch (projector) {
         .antfly_gemma3 => decoder.family == .gemma3,
+        .clip_qwen3vl_image => decoder.family == .qwen3vl,
         .clip_gemma4_image,
         .clip_gemma4_audio,
         .clip_gemma4_image_audio,
         => decoder.family == .gemma4,
         .unknown => false,
     };
+}
+
+test "Qwen3-VL projectors are paired only with Qwen3-VL decoders" {
+    const qwen = ProjectorDecoderContract{ .family = .qwen3vl };
+    const gemma = ProjectorDecoderContract{ .family = .gemma4 };
+    try std.testing.expect(projectorMatchesDecoder(.clip_qwen3vl_image, qwen));
+    try std.testing.expect(!projectorMatchesDecoder(.clip_qwen3vl_image, gemma));
+    try std.testing.expect(!projectorMatchesDecoder(.clip_gemma4_image, qwen));
 }
 
 fn validateGgufCompanionForBackend(
@@ -252,7 +270,7 @@ fn validateGgufCompanionForBackend(
             return .{
                 .level = .incompatible,
                 .code = .unsupported_backend,
-                .message = "a projector GGUF does not declare a supported Antfly Gemma 3 or Gemma 4 CLIP projector format",
+                .message = "a projector GGUF does not declare a supported Antfly Gemma 3, Gemma 4, or Qwen3-VL CLIP projector format",
             };
         }
         const contract = projector_format_mod.inspectFileContract(&file) catch {
@@ -520,6 +538,29 @@ pub fn compatibilitySummaryForBackend(
 ) !?CompatibilitySummary {
     const candidate = artifactCandidateForBackend(man.*, backend) orelse return null;
 
+    // Split GGUF Qwen3-VL promotions are Metal-only. The official integrated
+    // BF16 generation bundle has a separate CUDA-qualified resident route.
+    // Reject other routes before inspectAlloc re-hashes multi-gigabyte files.
+    const cuda_qwen3vl_generation = backend == .cuda and
+        man.isQwen3VlGenerationSafetensorsBundle();
+    if (man.isQwen3VlBundle() and backend != .metal and !cuda_qwen3vl_generation) {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "the split Qwen3-VL decoder/projector route requires Metal; the integrated safetensors generation route also supports CUDA",
+        };
+    }
+    if (man.embedding_style == .qwen3_embedding and
+        man.usesGgufWeights() and
+        !qwen3EmbeddingSupportsBackend(backend))
+    {
+        return .{
+            .level = .incompatible,
+            .code = .unsupported_backend,
+            .message = "Qwen3 GGUF embedding requires Metal, native CPU, or CUDA",
+        };
+    }
+
     // GGUF metadata is authoritative only when this route will consume GGUF.
     // ONNX/safetensors routes use the manifest architecture rather than
     // accidentally inheriting an unrelated optional GGUF's classification.
@@ -529,7 +570,6 @@ pub fn compatibilitySummaryForBackend(
     defer inspection.deinit(allocator);
     const assessment = model_compatibility.assessInspection(&candidate_manifest, inspection);
     if (assessment.level == .incompatible) return summaryFromAssessment(assessment);
-
     var projector_decoder = ProjectorDecoderContract{
         .family = projectorDecoderFamilyForArchitecture(man.config_model_arch),
         .hidden_size = man.hidden_size,
@@ -654,6 +694,16 @@ pub fn compatibilitySummaryForBackend(
         }
     }
     return summaryFromAssessment(assessment);
+}
+
+fn qwen3EmbeddingSupportsBackend(backend: backends.BackendType) bool {
+    return backend == .metal or backend == .native or backend == .cuda;
+}
+
+test "Qwen3 embedding production backends include native CPU and CUDA" {
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.metal));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.native));
+    try std.testing.expect(qwen3EmbeddingSupportsBackend(.cuda));
 }
 
 /// Aggregate candidate compatibility as an OR: a model bundle is usable when
@@ -838,7 +888,7 @@ fn selectWorseCompatibility(
 
 const ComponentPlanKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const component_plan_cache_capacity = 256;
-const whisper_assets_cache_capacity = 256;
+const composite_assets_cache_capacity = 256;
 
 fn updateComponentPlanKeySlice(
     hash: *std.crypto.hash.sha2.Sha256,
@@ -1764,12 +1814,38 @@ fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []c
         const id = std.math.cast(i32, index) orelse return error.InvalidTokenizerMetadata;
         try tok.addTokenIdAliasForDecode(token, id);
     }
+    const bos_id = metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id");
+    const eos_id = metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id");
     tok.applySpecialTokenIds(
-        metadataTokenId(&parsed, "tokenizer.ggml.bos_token_id"),
-        metadataTokenId(&parsed, "tokenizer.ggml.eos_token_id"),
+        bos_id,
+        eos_id,
         metadataTokenId(&parsed, "tokenizer.ggml.padding_token_id"),
         metadataTokenId(&parsed, "tokenizer.ggml.unknown_token_id"),
     );
+    // Honor the checkpoint's declared wrap semantics when present. Without
+    // this, encodeForModel wraps with bos AND eos unconditionally — for
+    // Qwen3-Embedding GGUFs (add_bos_token=false, add_eos_token=true) that
+    // injects a leading <|endoftext|> the HF reference does not produce,
+    // shifting every position and breaking embedding parity. GGUFs that
+    // declare neither flag keep the legacy wrap unchanged.
+    const gguf_view = gguf_metadata.View.init(&parsed);
+    const add_bos = gguf_view.getBool("tokenizer.ggml.add_bos_token");
+    const add_eos = gguf_view.getBool("tokenizer.ggml.add_eos_token");
+    if (add_bos != null or add_eos != null) {
+        var prepend_buf: [1]i32 = undefined;
+        var append_buf: [1]i32 = undefined;
+        var prepend: []const i32 = &.{};
+        var append: []const i32 = &.{};
+        if ((add_bos orelse false) and bos_id != null) {
+            prepend_buf[0] = bos_id.?;
+            prepend = prepend_buf[0..1];
+        }
+        if ((add_eos orelse false) and eos_id != null) {
+            append_buf[0] = eos_id.?;
+            append = append_buf[0..1];
+        }
+        try tok.applyModelWrapTemplate(prepend, append);
+    }
     return tok;
 }
 
@@ -2234,6 +2310,12 @@ pub const LoadedModel = struct {
     model_manager: *ModelManager,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
+    /// Borrowed from the serving BackendRuntime and valid for the model's
+    /// loaded lifetime. Offline model owners leave this null.
+    executor_io: ?std.Io = null,
+    /// Immutable Florence reader sidecars, parsed before this generation is
+    /// published so request microbatches perform no filesystem discovery.
+    florence_reader_config: ?vision_config.RuntimeConfig = null,
     chat_tmpl: ?*ChatTemplate = null,
     whisper_prompt_cache: ?whisper_prompt.PromptCache = null,
     /// The model shipped a chat template that we could not parse, so chat requests fall
@@ -2298,6 +2380,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        self.executor_io = io;
         session_factory.attachIo(self.session, io);
         if (self.vision_session) |session| session_factory.attachIo(session, io);
         if (self.audio_session) |session| session_factory.attachIo(session, io);
@@ -2375,13 +2458,15 @@ pub const LoadedModel = struct {
         );
     }
 
-    fn ensureOptionalSession(
+    fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
         slot: *?backends.Session,
         lease_slot: *?runtime.tier.memory.AdmissionLease,
         path: ?[]const u8,
+        control: ?InferenceExecutionControl,
     ) !bool {
+        if (control) |active| try active.check();
         if (slot.* != null) return false;
         const session_path = path orelse return false;
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
@@ -2404,12 +2489,24 @@ pub const LoadedModel = struct {
             strict_backend[0..],
             shared_ctx,
             &session_manager,
+            control,
         );
-        slot.* = loaded.session;
-        lease_slot.* = loaded.resource_lease;
-        loaded.owns_session = false;
-        loaded.resource_lease = null;
+        defer loaded.deinit();
+        if (control) |active| try active.check();
+        const owned = loaded.take();
+        slot.* = owned.session;
+        lease_slot.* = owned.resource_lease;
         return true;
+    }
+
+    fn ensureOptionalSession(
+        self: *LoadedModel,
+        kind: DeclaredOptionalSessionKind,
+        slot: *?backends.Session,
+        lease_slot: *?runtime.tier.memory.AdmissionLease,
+        path: ?[]const u8,
+    ) !bool {
+        return self.ensureOptionalSessionWithControl(kind, slot, lease_slot, path, null);
     }
 
     fn releaseOptionalSession(
@@ -2427,6 +2524,10 @@ pub const LoadedModel = struct {
     /// retain shared concurrency.
     pub fn lockEmbeddingAssets(self: *LoadedModel) void {
         spinLock(&self.embedding_session_lock);
+    }
+
+    pub fn lockEmbeddingAssetsWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try control.lock(&self.embedding_session_lock);
     }
 
     pub fn unlockEmbeddingAssets(self: *LoadedModel) void {
@@ -2489,6 +2590,18 @@ pub const LoadedModel = struct {
         );
     }
 
+    pub fn ensureVisionSessionWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        try self.lockEmbeddingAssetsWithControl(control);
+        defer self.unlockEmbeddingAssets();
+        _ = try self.ensureOptionalSessionWithControl(
+            .vision,
+            &self.vision_session,
+            &self.vision_resource_lease,
+            self.manifest.visual_model_path,
+            control,
+        );
+    }
+
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         self.lockEmbeddingAssets();
         defer self.unlockEmbeddingAssets();
@@ -2498,6 +2611,17 @@ pub const LoadedModel = struct {
     pub fn ensureEmbeddingAssetsLocked(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
         try self.ensurePrimaryEmbeddingAssetsLocked(include_text, include_image);
         if (include_audio) try self.ensureAudioEmbeddingAssetsLocked();
+    }
+
+    pub fn ensureEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        include_audio: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        try self.ensurePrimaryEmbeddingAssetsLockedWithControl(include_text, include_image, control);
+        if (include_audio) try self.ensureAudioEmbeddingAssetsLockedWithControl(control);
     }
 
     const PrimaryEmbeddingAssetAcquisitions = struct {
@@ -2553,6 +2677,42 @@ pub const LoadedModel = struct {
         }
     }
 
+    pub fn ensurePrimaryEmbeddingAssetsLockedWithControl(
+        self: *LoadedModel,
+        include_text: bool,
+        include_image: bool,
+        control: InferenceExecutionControl,
+    ) !void {
+        var acquired = PrimaryEmbeddingAssetAcquisitions{};
+        errdefer self.rollbackPrimaryEmbeddingAssetsLocked(acquired);
+
+        if (include_text) {
+            acquired.text_projection = try self.ensureOptionalSessionWithControl(
+                .text_projection,
+                &self.text_projection,
+                &self.text_projection_resource_lease,
+                self.manifest.text_projection_path,
+                control,
+            );
+        }
+        if (include_image) {
+            acquired.vision = try self.ensureOptionalSessionWithControl(
+                .vision,
+                &self.vision_session,
+                &self.vision_resource_lease,
+                self.manifest.visual_model_path,
+                control,
+            );
+            acquired.visual_projection = try self.ensureOptionalSessionWithControl(
+                .visual_projection,
+                &self.visual_projection,
+                &self.visual_projection_resource_lease,
+                self.manifest.visual_projection_path,
+                control,
+            );
+        }
+    }
+
     /// Admit the ephemeral audio sidecars as one phase. Any partial admission
     /// is rolled back immediately so a failed request cannot strand a lease
     /// and prevent subsequent text/image work from making progress.
@@ -2569,6 +2729,24 @@ pub const LoadedModel = struct {
             &self.audio_projection,
             &self.audio_projection_resource_lease,
             self.manifest.audio_projection_path,
+        );
+    }
+
+    pub fn ensureAudioEmbeddingAssetsLockedWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
+        errdefer self.releaseAudioEmbeddingAssetsLocked();
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio,
+            &self.audio_session,
+            &self.audio_resource_lease,
+            self.manifest.audio_model_path,
+            control,
+        );
+        _ = try self.ensureOptionalSessionWithControl(
+            .audio_projection,
+            &self.audio_projection,
+            &self.audio_projection_resource_lease,
+            self.manifest.audio_projection_path,
+            control,
         );
     }
 
@@ -2601,10 +2779,7 @@ pub const LoadedModel = struct {
         const tok = self.getTokenizer();
         const generic_encoder: ?session_factory.GenericEncoderArchConfig = session_factory.getGenericEncoderArchConfig(self.session) catch null;
         const resident_text_encoder = (self.session.backend() == .metal or self.session.backend() == .cuda) and
-            if (generic_encoder) |arch| switch (arch) {
-                .bert => true,
-                .deberta => false,
-            } else false;
+            session_factory.supportsResidentTextEncoder(self.session);
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.maxTextSequenceLength(),
             .normalize = self.manifest.normalize,
@@ -2614,10 +2789,19 @@ pub const LoadedModel = struct {
                 .max => .max,
                 .last => .last,
             },
-            .text_prefix = self.manifest.embedding_text_prefix,
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or generic_encoder != null,
+            .text_prefix = self.manifest.embedding_profile.document.prefix,
+            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                generic_encoder != null or
+                session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            .preprocess_io = self.executor_io,
+            // Last-token pooling reads the EOS position; guarantee exactly
+            // one trailing EOS regardless of tokenizer.json snapshot age.
+            .ensure_trailing_eos_id = if (isJinaStyleEmbeddingManifest(&self.manifest) and tok.specialTokens().sep_id >= 0)
+                tok.specialTokens().sep_id
+            else
+                null,
         });
         if (usesClipImagePreprocessProfile(&self.manifest)) {
             pipeline.config.image_preprocess_profile = .clip;
@@ -2661,16 +2845,25 @@ pub const LoadedModel = struct {
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
+        const is_qwen3vl_reranker = self.manifest.isQwen3VlReranker();
+        const is_qwen3_text_reranker = self.manifest.isQwen3TextReranker();
+        const is_generative_reranker = is_qwen3vl_reranker or is_qwen3_text_reranker;
         var pipeline = RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = self.manifest.maxTextSequenceLength(),
-            .mode = if (self.manifest.hasCapability("late_interaction") or
+            .max_length = if (is_generative_reranker)
+                @min(self.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length)
+            else
+                self.manifest.maxTextSequenceLength(),
+            .mode = if (is_generative_reranker)
+                ScoringMode.generative_yes_no
+            else if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
                 self.manifest.hasCapability("colqwen") or
                 self.manifest.hasCapability("multimodal_late_interaction"))
                 ScoringMode.late_interaction
             else
                 ScoringMode.cross_encoder,
-            .single_text_encoding = if (self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
+            .single_text_encoding = if (is_generative_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
+            .generative_prompt = if (is_qwen3_text_reranker) .qwen3_text else .qwen3_vl,
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });
@@ -2819,8 +3012,7 @@ pub const LoadedModel = struct {
 };
 
 fn isJinaStyleEmbeddingManifest(manifest: *const manifest_mod.ModelManifest) bool {
-    return std.mem.eql(u8, manifest.config_model_arch, "jina_embeddings_v5") or
-        (manifest.pooling == .last and std.mem.eql(u8, manifest.embedding_text_prefix, "Document: "));
+    return manifest.isLastTokenDecoderEmbedder();
 }
 
 fn targetInferenceExecutionMutexForBackend(
@@ -2886,7 +3078,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
         fn run(self: *@This()) void {
             self.gate.lockExclusive();
             self.acquired.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             self.gate.unlockExclusive();
         }
     };
@@ -2897,7 +3089,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
     defer if (shared_held) gate.unlockShared();
 
     var writer = Writer{ .gate = &gate };
-    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         if (shared_held) {
@@ -2905,7 +3097,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             shared_held = false;
         }
         writer.release.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     };
 
     var writer_queued = false;
@@ -2915,7 +3107,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             break;
         }
         gate.unlockShared();
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
 
@@ -2931,13 +3123,13 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             writer_acquired = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_acquired) return error.TestTimeout;
     try std.testing.expect(!gate.tryLockShared());
 
     writer.release.store(true, .release);
-    writer_thread.join();
+    writer_thread.await(std.testing.io);
     writer_joined = true;
 
     try std.testing.expect(gate.tryLockShared());
@@ -2950,6 +3142,10 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
 
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
+        }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
         }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
@@ -2970,6 +3166,7 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3009,6 +3206,10 @@ test "audio asset rollback closes every ephemeral session" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -3028,6 +3229,7 @@ test "audio asset rollback closes every ephemeral session" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -3072,44 +3274,162 @@ fn usesClipImagePreprocessProfile(manifest: *const manifest_mod.ModelManifest) b
 const LoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
+    hard_cancellation: ?execution_control_mod.HardCancellationBoundary = null,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
-    /// Protected by ModelManager.load_lock. The owner starts with one reference;
-    /// every waiter takes one before dropping the manager lock.
-    refs: usize = 1,
-    /// The owner already receives a model handle directly from the uncached
-    /// load. Keep its flight reference distinguishable so retirement reserves
-    /// handles only for waiters that have not adopted theirs yet.
-    owner_ref_pending: bool = true,
+    /// Protected by ModelManager.load_lock. The manager-owned task holds one
+    /// reference and every request waiter holds another.
+    refs: usize = 2,
+    /// Active request waiters. The terminal `abandoned` state prevents a new
+    /// request from joining initialization after the final waiter has left.
+    waiters: std.atomic.Value(usize) = .init(1),
+    /// Distinguishes the manager task reference so retirement reserves handles
+    /// only for request waiters that have not adopted theirs yet.
+    task_ref_pending: bool = true,
     /// A retired model detaches its completed flight so a replacement can use
     /// the same key. Detached flights live until existing waiters consume them.
     registered: bool = true,
     /// Retirement reserves one active model handle for every remaining flight
     /// waiter. Waiters adopt those reservations instead of incrementing the
-    /// handle count a second time; the owner already has its handle.
+    /// handle count a second time.
     handles_reserved: bool = false,
 
+    const abandoned = std.math.maxInt(usize);
+
+    fn tryAddWaiter(self: *LoadFlight) bool {
+        var current = self.waiters.load(.acquire);
+        while (current != abandoned) {
+            std.debug.assert(current < abandoned - 1);
+            if (self.waiters.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn releaseWaiter(self: *LoadFlight, abandon_if_last: bool) void {
+        var current = self.waiters.load(.acquire);
+        while (true) {
+            std.debug.assert(current != abandoned and current > 0);
+            const next = if (abandon_if_last and current == 1) abandoned else current - 1;
+            if (self.waiters.cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+                current = observed;
+            } else return;
+        }
+    }
+
     fn unadoptedWaiterRefs(self: *const LoadFlight) usize {
-        std.debug.assert(self.refs >= @intFromBool(self.owner_ref_pending));
-        return self.refs - @intFromBool(self.owner_ref_pending);
+        std.debug.assert(self.refs >= @intFromBool(self.task_ref_pending));
+        return self.refs - @intFromBool(self.task_ref_pending);
     }
 };
 
-test "load flight retirement reservations exclude the owner handle" {
+const LoadFlightControl = struct {
+    flight: *LoadFlight,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.flight.waiters.load(.acquire) == LoadFlight.abandoned)
+            return error.Cancelled;
+    }
+
+    fn control(self: *@This()) InferenceExecutionControl {
+        return .{
+            .io = self.flight.io,
+            .ptr = self,
+            .check_fn = check,
+            .hard_cancellation = self.flight.hard_cancellation,
+        };
+    }
+};
+
+const LoadTask = struct {
+    manager: *ModelManager,
+    flight: *LoadFlight,
+    flight_key: []u8,
+    model_dir: []u8,
+    preferred_backends: []backends.BackendType,
+    session_manager: backends.SessionManager,
+    cache_default_alias: bool,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+
+    fn deinit(self: *@This()) void {
+        const allocator = self.manager.allocator;
+        allocator.free(self.flight_key);
+        allocator.free(self.model_dir);
+        allocator.free(self.preferred_backends);
+        allocator.destroy(self);
+    }
+};
+
+test "manager load flight remains active until its final waiter leaves" {
+    var flight = LoadFlight{ .io = std.testing.io };
+    var load_control = LoadFlightControl{ .flight = &flight };
+    try load_control.control().check();
+    try std.testing.expect(flight.tryAddWaiter());
+    flight.releaseWaiter(true);
+    try load_control.control().check();
+    flight.releaseWaiter(true);
+    try std.testing.expectError(error.Cancelled, load_control.control().check());
+    try std.testing.expect(!flight.tryAddWaiter());
+}
+
+test "load flight retirement reservations exclude the manager task" {
     var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
     try std.testing.expectEqual(@as(usize, 2), flight.unadoptedWaiterRefs());
-    flight.owner_ref_pending = false;
+    flight.task_ref_pending = false;
     try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
 }
 
-const WhisperAssetsLoadFlight = struct {
+const CompositeAssetsLoadFlight = struct {
     completed: std.Io.Event = .unset,
     io: std.Io,
-    assets: ?*WhisperCompositeAssets = null,
+    assets: ?*CompositeAssets = null,
     err: ?anyerror = null,
     /// Protected by ModelManager.load_lock. The owner starts with one reference;
     /// every waiter takes one before dropping the manager lock.
     refs: usize = 1,
+    registered: bool = true,
+    // Reuse the model-loader waiter/cancellation state machine. The component
+    // task is manager-owned; no individual request controls a shared cold load.
+    load_state: LoadFlight,
+};
+
+const CompositeLoadTask = struct {
+    manager: *ModelManager,
+    flight: *CompositeAssetsLoadFlight,
+    key: ComponentPlanKey,
+    model_dir: []u8,
+    paths: [][]const u8,
+    kind: CompositeKind,
+
+    fn create(manager: *ModelManager, flight: *CompositeAssetsLoadFlight, key: ComponentPlanKey, model_dir: []const u8, paths: []const []const u8, kind: CompositeKind) !*@This() {
+        const allocator = manager.allocator;
+        const task = try allocator.create(@This());
+        errdefer allocator.destroy(task);
+        const owned_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(owned_dir);
+        const owned_paths = try allocator.alloc([]const u8, paths.len);
+        var count: usize = 0;
+        errdefer {
+            for (owned_paths[0..count]) |path| allocator.free(path);
+            allocator.free(owned_paths);
+        }
+        for (paths, owned_paths) |path, *owned| {
+            owned.* = try allocator.dupe(u8, path);
+            count += 1;
+        }
+        task.* = .{ .manager = manager, .flight = flight, .key = key, .model_dir = owned_dir, .paths = owned_paths, .kind = kind };
+        return task;
+    }
+
+    fn deinit(self: *@This()) void {
+        const allocator = self.manager.allocator;
+        for (self.paths) |path| allocator.free(path);
+        allocator.free(self.paths);
+        allocator.free(self.model_dir);
+        allocator.destroy(self);
+    }
 };
 
 fn admissionBackendClassForRuntime(
@@ -3213,6 +3533,16 @@ pub const ModelHandle = struct {
         self.manager.retireLoadedModel(model);
         self.release();
     }
+
+    /// Quarantine the exact model/backend pair before retiring its in-process
+    /// runtime. A later durable retry can select the next healthy backend
+    /// without penalizing unrelated models that use the same backend.
+    pub fn quarantine(self: *ModelHandle) void {
+        const model = self.model orelse return;
+        markModelBackendUnhealthy(self.manager, model.model_dir, model.session.backend());
+        self.manager.retireLoadedModel(model);
+        self.release();
+    }
 };
 
 pub const LoadedModelSnapshot = struct {
@@ -3226,41 +3556,57 @@ pub const LoadedModelSnapshot = struct {
     }
 };
 
-/// Immutable tokenizer and decoder metadata shared by every request using a
-/// split encoder/decoder Whisper bundle. The heavyweight sessions continue to
-/// use ManagedSession so admission and backend lifetime stay unchanged.
-pub const WhisperCompositeAssets = struct {
+pub const CompositeKind = enum { whisper_metadata, whisper, seq2seq };
+
+/// One immutable publication pinned across tokenization, encode and decode.
+/// Component sessions keep their resident admission and backend ownership.
+pub const CompositeAssets = struct {
+    encoder_gate: std.atomic.Mutex = .unlocked,
+    decoder_gate: std.atomic.Mutex = .unlocked,
     managed_tokenizer: ManagedHfTokenizer,
-    prompt_cache: whisper_prompt.PromptCache,
+    prompt_cache: ?whisper_prompt.PromptCache,
+    encoder: ?ManagedSession = null,
+    decoder: ?ManagedSession = null,
+    kind: CompositeKind = .whisper_metadata,
+    decoder_execution: enum { full_prefix, merged_kv } = .full_prefix,
+    considered_merged_decoder: bool = false,
     decoder_config: encoder_decoder.DecoderConfig,
     generation: ComponentPlanKey,
     active_handles: usize = 0,
     last_used_ns: u64 = 0,
 
-    pub fn tokenizer(self: *const WhisperCompositeAssets) tokenizer_mod.Tokenizer {
+    pub fn tokenizer(self: *const CompositeAssets) tokenizer_mod.Tokenizer {
         return self.managed_tokenizer.tokenizer.tokenizer();
     }
 
-    fn reclaimableAdmission(self: *const WhisperCompositeAssets) ?runtime.tier.memory.AdmissionLease {
-        return self.managed_tokenizer.reclaimableAdmission();
+    fn reclaimRelevant(self: *const CompositeAssets, pressure: runtime.tier.memory.AdmissionPressure) bool {
+        if (self.managed_tokenizer.reclaimableAdmission()) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        if (self.encoder) |managed| if (managed.resource_lease) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        if (self.decoder) |managed| if (managed.resource_lease) |lease|
+            if (ModelManager.admissionReclaimRelevant(lease, pressure)) return true;
+        return false;
     }
 
-    fn deinit(self: *WhisperCompositeAssets) void {
-        self.prompt_cache.deinit();
+    fn deinit(self: *CompositeAssets) void {
+        if (self.decoder) |*managed| managed.deinit();
+        if (self.encoder) |*managed| managed.deinit();
+        if (self.prompt_cache) |*cache| cache.deinit();
         self.managed_tokenizer.deinit();
         self.* = undefined;
     }
 };
 
-pub const WhisperAssetsHandle = struct {
+pub const CompositeAssetsHandle = struct {
     manager: *ModelManager,
-    assets: ?*WhisperCompositeAssets,
+    assets: ?*CompositeAssets,
 
-    pub fn get(self: *const WhisperAssetsHandle) *const WhisperCompositeAssets {
+    pub fn get(self: *const CompositeAssetsHandle) *const CompositeAssets {
         return self.assets orelse unreachable;
     }
 
-    pub fn release(self: *WhisperAssetsHandle) void {
+    pub fn release(self: *CompositeAssetsHandle) void {
         const assets = self.assets orelse return;
         self.manager.lockLoadedModels();
         std.debug.assert(assets.active_handles > 0);
@@ -3478,9 +3824,9 @@ pub const ModelManager = struct {
         model: *LoadedModel,
     };
 
-    const EvictedWhisperAssets = struct {
+    const EvictedCompositeAssets = struct {
         key: ComponentPlanKey,
-        assets: *WhisperCompositeAssets,
+        assets: *CompositeAssets,
     };
 
     allocator: std.mem.Allocator,
@@ -3507,14 +3853,25 @@ pub const ModelManager = struct {
     eviction_group: std.Io.Group = .init,
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
+    /// Cold initialization is owned by the manager rather than whichever
+    /// request happened to miss the cache first. Request waiters may therefore
+    /// cancel independently without invalidating shared work.
+    load_group: std.Io.Group = .init,
+    load_io: ?std.Io = null,
+    /// Lazily allocated at a stable address for offline/direct callers. Never
+    /// borrow a request's Io: shared loads and resident sessions outlive it.
+    owned_load_runtime: ?*std.Io.Threaded = null,
+    owned_load_watchdog: ?*HardCancellationWatchdog = null,
     in_flight_loads: std.StringHashMapUnmanaged(*LoadFlight) = .empty,
-    whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperCompositeAssets) = .empty,
-    in_flight_whisper_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *WhisperAssetsLoadFlight) = .empty,
+    composite_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *CompositeAssets) = .empty,
+    in_flight_composite_assets: std.AutoHashMapUnmanaged(ComponentPlanKey, *CompositeAssetsLoadFlight) = .empty,
     component_plan_cache: std.AutoHashMapUnmanaged(
         ComponentPlanKey,
         *ComponentPlanCacheEntry,
     ) = .empty,
     component_plan_cache_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_backend_lock: std.atomic.Mutex = .unlocked,
+    unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
@@ -3531,7 +3888,7 @@ pub const ModelManager = struct {
 
     pub fn configureServingPolicy(self: *ModelManager, policy: model_compatibility.Policy) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.serving_policy = policy;
         self.admission_enabled = true;
         if (self.resource_domain) |domain|
@@ -3543,7 +3900,7 @@ pub const ModelManager = struct {
         ownership: ResourceOwnership,
     ) !void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         spinLock(&self.tokenizer_cache_config_mutex);
         defer self.tokenizer_cache_config_mutex.unlock();
         if (self.tokenizer_cache_budget_source != .none)
@@ -3557,7 +3914,7 @@ pub const ModelManager = struct {
         provenance: runtime.tier.memory.ProcessMemoryLimitProvenance,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.process_memory_limit_bytes = limit_bytes;
         self.process_memory_limit_provenance = provenance;
         if (self.resource_domain) |domain|
@@ -3937,7 +4294,7 @@ pub const ModelManager = struct {
         max_loaded_models: usize,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         std.debug.assert(!self.eviction_loop_started);
         self.keep_alive_ms = keep_alive_ms;
         self.max_loaded_models = max_loaded_models;
@@ -3982,7 +4339,7 @@ pub const ModelManager = struct {
         overrides: runtime.tier.memory.Limits,
     ) void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         self.admission_limit_overrides = overrides;
         if (self.resource_domain) |domain|
             self.configureAdmissionController(domain);
@@ -3997,7 +4354,7 @@ pub const ModelManager = struct {
         tokenizer_budget: hf_tokenizer.HfTokenizer.BpeCacheResourceBudget,
     ) !void {
         std.debug.assert(self.loaded.count() == 0);
-        std.debug.assert(self.whisper_assets.count() == 0);
+        std.debug.assert(self.composite_assets.count() == 0);
         if (self.resource_ownership != .external_required)
             return error.ExternalResourceBudgetInLocalOwnership;
         spinLock(&self.tokenizer_cache_config_mutex);
@@ -4186,23 +4543,23 @@ pub const ModelManager = struct {
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
-    fn takeLruWhisperAssetsLocked(
+    fn takeLruCompositeAssetsLocked(
         self: *ModelManager,
         now_ns: u64,
         expired_only: bool,
-    ) ?EvictedWhisperAssets {
+    ) ?EvictedCompositeAssets {
         const ttl_ns = std.math.mul(
             u64,
             self.keep_alive_ms,
             std.time.ns_per_ms,
         ) catch std.math.maxInt(u64);
         var victim_key: ?ComponentPlanKey = null;
-        var victim: ?*WhisperCompositeAssets = null;
+        var victim: ?*CompositeAssets = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
-        var it = self.whisper_assets.iterator();
+        var it = self.composite_assets.iterator();
         while (it.next()) |entry| {
             const assets = entry.value_ptr.*;
-            if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
+            if (assets.active_handles != 0 or self.compositeAssetsIsInFlightLocked(assets)) continue;
             const age_ns = if (now_ns >= assets.last_used_ns)
                 now_ns - assets.last_used_ns
             else
@@ -4219,25 +4576,25 @@ pub const ModelManager = struct {
             }
         }
         const selected = victim orelse return null;
-        const removed = self.whisper_assets.fetchRemove(victim_key.?) orelse unreachable;
+        const removed = self.composite_assets.fetchRemove(victim_key.?) orelse unreachable;
         std.debug.assert(removed.value == selected);
         return .{ .key = removed.key, .assets = selected };
     }
 
-    fn whisperAssetsIsInFlightLocked(
+    fn compositeAssetsIsInFlightLocked(
         self: *ModelManager,
-        assets: *WhisperCompositeAssets,
+        assets: *CompositeAssets,
     ) bool {
-        var it = self.in_flight_whisper_assets.valueIterator();
+        var it = self.in_flight_composite_assets.valueIterator();
         while (it.next()) |flight_ptr| {
             if (flight_ptr.*.assets == assets) return true;
         }
         return false;
     }
 
-    fn destroyEvictedWhisperAssets(
+    fn destroyEvictedCompositeAssets(
         self: *ModelManager,
-        evicted: EvictedWhisperAssets,
+        evicted: EvictedCompositeAssets,
     ) void {
         evicted.assets.deinit();
         self.allocator.destroy(evicted.assets);
@@ -4290,19 +4647,18 @@ pub const ModelManager = struct {
         return false;
     }
 
-    fn takeLruWhisperAssetsForAdmissionLocked(
+    fn takeLruCompositeAssetsForAdmissionLocked(
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
-    ) ?EvictedWhisperAssets {
+    ) ?EvictedCompositeAssets {
         var victim_key: ?ComponentPlanKey = null;
-        var victim: ?*WhisperCompositeAssets = null;
+        var victim: ?*CompositeAssets = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
-        var it = self.whisper_assets.iterator();
+        var it = self.composite_assets.iterator();
         while (it.next()) |entry| {
             const assets = entry.value_ptr.*;
-            if (assets.active_handles != 0 or self.whisperAssetsIsInFlightLocked(assets)) continue;
-            const reclaimable = assets.reclaimableAdmission() orelse continue;
-            if (!admissionReclaimRelevant(reclaimable, pressure)) continue;
+            if (assets.active_handles != 0 or self.compositeAssetsIsInFlightLocked(assets)) continue;
+            if (!assets.reclaimRelevant(pressure)) continue;
             if (victim == null or assets.last_used_ns < oldest_ns) {
                 victim_key = entry.key_ptr.*;
                 victim = assets;
@@ -4310,7 +4666,7 @@ pub const ModelManager = struct {
             }
         }
         const selected = victim orelse return null;
-        const removed = self.whisper_assets.fetchRemove(victim_key.?) orelse unreachable;
+        const removed = self.composite_assets.fetchRemove(victim_key.?) orelse unreachable;
         std.debug.assert(removed.value == selected);
         return .{ .key = removed.key, .assets = selected };
     }
@@ -4325,14 +4681,14 @@ pub const ModelManager = struct {
     ) bool {
         self.lockLoadedModels();
         const now_ns = platform.time.monotonicNs();
-        const assets = self.takeLruWhisperAssetsForAdmissionLocked(pressure);
+        const assets = self.takeLruCompositeAssetsForAdmissionLocked(pressure);
         const model = if (assets == null)
             self.takeLruModelLocked(now_ns, false, pressure)
         else
             null;
         self.unlockLoadedModels();
         if (assets) |evicted| {
-            self.destroyEvictedWhisperAssets(evicted);
+            self.destroyEvictedCompositeAssets(evicted);
             return true;
         }
         if (model) |evicted| {
@@ -4454,8 +4810,15 @@ pub const ModelManager = struct {
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
-                    ))
+                    )) {
+                        const denied_request = [_]runtime.tier.memory.AdmissionRequest{.{
+                            .backend_class = backend_class,
+                            .limits = limits,
+                            .amounts = amounts,
+                        }};
+                        self.logRunAdmissionDenied(pressure, &denied_request);
                         return error.ResourceTemporarilyUnavailable;
+                    }
                 }
             },
             else => return first_err,
@@ -4489,12 +4852,55 @@ pub const ModelManager = struct {
                     }
                     if (!self.reclaimOneForAdmission(
                         pressure orelse return error.ResourceTemporarilyUnavailable,
-                    ))
+                    )) {
+                        self.logRunAdmissionDenied(pressure, requests);
                         return error.ResourceTemporarilyUnavailable;
+                    }
                 }
             },
             else => return first_err,
         };
+    }
+
+    /// Keep client responses deliberately generic while leaving enough
+    /// operator evidence to distinguish stable-policy saturation from current
+    /// live-memory pressure. Artifact paths and request contents are excluded.
+    fn logRunAdmissionDenied(
+        self: *ModelManager,
+        pressure: ?runtime.tier.memory.AdmissionPressure,
+        requests: []const runtime.tier.memory.AdmissionRequest,
+    ) void {
+        if (builtin.is_test) return;
+        const admitted = self.admissionController().snapshot();
+        std.log.warn(
+            "inference run admission denied pressure={s} request_count={d} admitted_host_bytes={d} admitted_backend_bytes={d} admitted_kv_bytes={d} admitted_scratch_bytes={d}",
+            .{
+                if (pressure) |value| @tagName(std.meta.activeTag(value)) else "unknown",
+                requests.len,
+                admitted.hostTotalBytes(),
+                admitted.backendTotalBytes(),
+                admitted.kvTotalBytes(),
+                admitted.scratchTotalBytes(),
+            },
+        );
+        for (requests, 0..) |request, index| {
+            std.log.warn(
+                "inference run admission request index={d} backend={s} host_bytes={d} backend_bytes={d} kv_bytes={d} scratch_bytes={d} host_limit_bytes={d} backend_limit_bytes={d} combined_limit_bytes={d} kv_limit_bytes={d} scratch_limit_bytes={d}",
+                .{
+                    index,
+                    @tagName(request.backend_class),
+                    request.amounts.hostTotalBytes(),
+                    request.amounts.backendTotalBytes(),
+                    request.amounts.kvTotalBytes(),
+                    request.amounts.scratchTotalBytes(),
+                    request.limits.host_limit_bytes,
+                    request.limits.backend_limit_bytes,
+                    request.limits.combined_limit_bytes,
+                    request.limits.kv_limit_bytes,
+                    request.limits.scratch_limit_bytes,
+                },
+            );
+        }
     }
 
     fn evictExpired(self: *ModelManager) void {
@@ -4511,10 +4917,10 @@ pub const ModelManager = struct {
         }
         while (true) {
             self.lockLoadedModels();
-            const evicted = self.takeLruWhisperAssetsLocked(now_ns, true);
+            const evicted = self.takeLruCompositeAssetsLocked(now_ns, true);
             self.unlockLoadedModels();
             if (evicted == null) break;
-            self.destroyEvictedWhisperAssets(evicted.?);
+            self.destroyEvictedCompositeAssets(evicted.?);
         }
     }
 
@@ -4541,6 +4947,7 @@ pub const ModelManager = struct {
         const PathDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
         manager: *ModelManager,
+        validated_generation: ?ComponentPlanKey = null,
         allowed_backends: [7]backends.BackendType = undefined,
         allowed_backend_count: usize = 0,
         component_path_digests: [max_component_paths]PathDigest = undefined,
@@ -4595,6 +5002,21 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 null,
+                null,
+            );
+        }
+
+        pub fn loadWithControl(
+            self: *const ComponentLoader,
+            model_path: []const u8,
+            control: InferenceExecutionControl,
+        ) !ManagedSession {
+            try self.ensureComponentPath(model_path);
+            return self.manager.loadManagedSessionWithAdmission(
+                model_path,
+                self.preferredBackends(),
+                null,
+                control,
             );
         }
 
@@ -4608,6 +5030,7 @@ pub const ModelManager = struct {
                 model_path,
                 self.preferredBackends(),
                 shared_backend_ctx,
+                null,
             );
         }
 
@@ -4693,26 +5116,33 @@ pub const ModelManager = struct {
         key: ComponentPlanKey,
         loader: *ComponentLoader,
     ) !bool {
+        const entry = try self.cachedComponentPlan(key) orelse return false;
+        defer entry.release();
+        @memcpy(loader.allowed_backends[0..entry.allowed_backend_count], entry.allowed_backends[0..entry.allowed_backend_count]);
+        loader.allowed_backend_count = entry.allowed_backend_count;
+        loader.validated_generation = entry.signature;
+        return true;
+    }
+
+    fn cachedComponentPlan(self: *ModelManager, key: ComponentPlanKey) !?*ComponentPlanCacheEntry {
         spinLock(&self.component_plan_cache_lock);
         const entry = self.component_plan_cache.get(key) orelse {
             self.component_plan_cache_lock.unlock();
-            return false;
+            return null;
         };
         entry.retain();
         self.component_plan_cache_lock.unlock();
-        defer entry.release();
+        errdefer entry.release();
 
         const signature = try componentDependencySignature(
             self.componentPlanIo(),
             entry.dependencies,
         );
-        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) return false;
-        @memcpy(
-            loader.allowed_backends[0..entry.allowed_backend_count],
-            entry.allowed_backends[0..entry.allowed_backend_count],
-        );
-        loader.allowed_backend_count = entry.allowed_backend_count;
-        return true;
+        if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) {
+            entry.release();
+            return null;
+        }
+        return entry;
     }
 
     fn publishComponentPlan(
@@ -4844,6 +5274,7 @@ pub const ModelManager = struct {
                 validated,
                 inspection.dependencies.items,
             ) catch {};
+            loader.validated_generation = signature_after;
             break :blk validated;
         } else effective_backends;
         for (allowed) |backend| {
@@ -4868,6 +5299,45 @@ pub const ModelManager = struct {
         return limits;
     }
 
+    /// Apply architecture/artifact residency floors before attaching the hard
+    /// serving envelope. Explicit per-bucket operator overrides remain the
+    /// final authority; the model floor only widens automatically derived
+    /// defaults such as the generic Metal host-cache allowance.
+    fn admissionLimitsForModelPath(
+        self: *const ModelManager,
+        model_path: []const u8,
+        backend_runtime: backends.BackendRuntime,
+    ) !runtime.tier.memory.Limits {
+        var limits = self.admissionLimitsForBackend(backend_runtime);
+        limits = try session_factory.widenBudgetLimitsForModelPath(
+            self.allocator,
+            model_path,
+            limits,
+            backend_runtime.backend,
+        );
+        return runtime.tier.memory.applyLimitOverrides(
+            limits,
+            self.admission_limit_overrides,
+        );
+    }
+
+    /// Architecture sessions may carry a minimum safe cache/workspace floor
+    /// that cannot be known until their config has been parsed. Apply that
+    /// floor before attaching serving admission, then reapply explicit node
+    /// overrides so an operator hard cap always remains authoritative.
+    fn admissionLimitsForSession(
+        self: *const ModelManager,
+        backend_runtime: backends.BackendRuntime,
+        session: backends.Session,
+    ) runtime.tier.memory.Limits {
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
+        );
+        limits = session_factory.widenBudgetLimitsForSession(session, limits);
+        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
+    }
+
     /// Lazily loaded composite-model components participate in the same
     /// process-wide admission accounting as the primary session. Reserve their
     /// construction peak immediately before import, then retain only completed
@@ -4877,12 +5347,14 @@ pub const ModelManager = struct {
         model_path: []const u8,
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
         return self.loadManagedSessionWithAdmissionUsingManager(
             model_path,
             preferred_backends,
             shared_backend_ctx,
             &self.session_manager,
+            control,
         );
     }
 
@@ -4892,7 +5364,9 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
+        control: ?InferenceExecutionControl,
     ) !ManagedSession {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try source_session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -4906,6 +5380,7 @@ pub const ModelManager = struct {
         defer artifact_estimate.deinit();
 
         for (effective_backends) |backend| {
+            if (control) |active| try active.check();
             if (!backend.supportsDirectSessionLoad()) continue;
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
@@ -4924,6 +5399,7 @@ pub const ModelManager = struct {
             session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (resource_lease) |*lease| lease.release();
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
@@ -4944,7 +5420,13 @@ pub const ModelManager = struct {
                     continue;
                 };
                 resident_amounts = admission_plan.resident;
-                admission_limits = self.admissionLimitsForBackend(backend_runtime);
+                admission_limits = self.admissionLimitsForModelPath(
+                    model_path,
+                    backend_runtime,
+                ) catch |err| {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                };
                 if (try admittedSessionCudaLimit(
                     backend_runtime,
                     resident_amounts,
@@ -4961,39 +5443,43 @@ pub const ModelManager = struct {
                 };
             }
 
+            var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
+                if (err == error.ProcessIsolationRequired) {
+                    // An in-process caller can still use a later cooperative
+                    // backend. A required backend has a single candidate and
+                    // therefore remains fail-closed.
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                }
+                return err;
+            };
+            defer construction.deinit();
             if (session_manager.loadModelWithImportedOnnxContext(
                 model_path,
                 shared_backend_ctx,
             )) |loaded_session| {
-                var session = loaded_session;
-                if (resource_lease) |*lease| {
-                    lease.retain(resident_amounts) catch |err| {
-                        session.close();
-                        lease.release();
-                        return err;
-                    };
-                }
+                var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+                resource_lease = null;
+                defer loaded.deinit();
+                if (control) |active| try active.check();
+                if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
                 if (self.admission_enabled) {
-                    attachSessionRunAdmission(
+                    const session_admission_limits = self.admissionLimitsForSession(
+                        backend_runtime,
+                        loaded.session,
+                    );
+                    try attachSessionRunAdmission(
                         self.allocator,
-                        &session,
+                        &loaded.session,
                         self.admissionController(),
                         backend_runtime,
-                        admission_limits,
+                        session_admission_limits,
                         resident_amounts,
                         null,
-                    ) catch |err| {
-                        session.close();
-                        if (resource_lease) |*lease| lease.release();
-                        return err;
-                    };
+                    );
                 }
-                return .{
-                    .session = session,
-                    .resource_lease = resource_lease,
-                };
+                return loaded.take();
             } else |err| {
-                if (resource_lease) |*lease| lease.release();
                 rememberPreferredLoadError(&first_err, err);
             }
         }
@@ -5111,7 +5597,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         config: hf_tokenizer.HfTokenizer.BpeCacheConfig,
     ) !void {
-        if (self.loaded.count() != 0 or self.whisper_assets.count() != 0)
+        if (self.loaded.count() != 0 or self.composite_assets.count() != 0)
             return error.TokenizerCacheConfigAfterModelLoad;
         spinLock(&self.tokenizer_cache_config_mutex);
         defer self.tokenizer_cache_config_mutex.unlock();
@@ -5137,26 +5623,35 @@ pub const ModelManager = struct {
         self: *ModelManager,
         config: hf_tokenizer.HfTokenizer.ParallelBpeConfig,
     ) !void {
-        if (self.loaded.count() != 0 or self.whisper_assets.count() != 0)
+        if (self.loaded.count() != 0 or self.composite_assets.count() != 0)
             return error.TokenizerParallelConfigAfterModelLoad;
         self.tokenizer_parallel_bpe_config = config;
     }
 
     pub fn deinit(self: *ModelManager) void {
+        // Sessions can retain the load runtime. Join work and destroy all
+        // resident resources before tearing down the manager-owned fallback.
+        defer if (self.owned_load_runtime) |owned| {
+            owned.deinit();
+            self.allocator.destroy(owned);
+        };
+        defer if (self.owned_load_watchdog) |watchdog| watchdog.destroy();
+        if (self.load_io) |io| self.load_group.cancel(io);
         if (self.eviction_io) |io| self.eviction_group.cancel(io);
         std.debug.assert(self.in_flight_loads.count() == 0);
-        std.debug.assert(self.in_flight_whisper_assets.count() == 0);
+        std.debug.assert(self.in_flight_composite_assets.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
-        self.in_flight_whisper_assets.deinit(self.allocator);
+        self.in_flight_composite_assets.deinit(self.allocator);
         var component_plan_it = self.component_plan_cache.iterator();
         while (component_plan_it.next()) |entry| entry.value_ptr.*.release();
         self.component_plan_cache.deinit(self.allocator);
-        var whisper_assets_it = self.whisper_assets.iterator();
-        while (whisper_assets_it.next()) |entry| {
+        self.unhealthy_model_backends.deinit(self.allocator);
+        var composite_assets_it = self.composite_assets.iterator();
+        while (composite_assets_it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
-        self.whisper_assets.deinit(self.allocator);
+        self.composite_assets.deinit(self.allocator);
         var it = self.loaded.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
@@ -5279,10 +5774,10 @@ pub const ModelManager = struct {
         }
     }
 
-    fn finishWhisperAssetsLoadFlight(
+    fn finishCompositeAssetsLoadFlight(
         self: *ModelManager,
-        flight: *WhisperAssetsLoadFlight,
-        assets: ?*WhisperCompositeAssets,
+        flight: *CompositeAssetsLoadFlight,
+        assets: ?*CompositeAssets,
         err: ?anyerror,
     ) void {
         self.lockLoadedModels();
@@ -5292,10 +5787,10 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
-    fn releaseWhisperAssetsLoadFlight(
+    fn releaseCompositeAssetsLoadFlight(
         self: *ModelManager,
         flight_key: ComponentPlanKey,
-        flight: *WhisperAssetsLoadFlight,
+        flight: *CompositeAssetsLoadFlight,
     ) void {
         self.lockLoadedModels();
         std.debug.assert(flight.refs > 0);
@@ -5304,19 +5799,34 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return;
         }
-        const removed = self.in_flight_whisper_assets.fetchRemove(flight_key) orelse unreachable;
-        std.debug.assert(removed.value == flight);
+        if (flight.registered) {
+            const removed = self.in_flight_composite_assets.fetchRemove(flight_key) orelse unreachable;
+            std.debug.assert(removed.value == flight);
+            flight.registered = false;
+        }
         self.unlockLoadedModels();
 
         self.allocator.destroy(flight);
     }
 
-    fn waitForWhisperAssetsLoadFlight(
+    fn waitForCompositeAssetsLoadFlight(
         self: *ModelManager,
         flight_key: ComponentPlanKey,
-        flight: *WhisperAssetsLoadFlight,
-    ) !WhisperAssetsHandle {
-        flight.completed.waitUncancelable(flight.io);
+        flight: *CompositeAssetsLoadFlight,
+        control: ?InferenceExecutionControl,
+    ) !CompositeAssetsHandle {
+        defer self.releaseCompositeAssetsLoadFlight(flight_key, flight);
+        defer flight.load_state.releaseWaiter(!flight.completed.isSet());
+        while (!flight.completed.isSet()) {
+            if (control) |active| try active.update(.loading_model, 0, 1);
+            flight.completed.waitTimeout(flight.io, .{
+                .duration = .{ .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .clock = .awake },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        if (control) |active| try active.check();
         const assets = flight.assets;
         const maybe_err = flight.err;
 
@@ -5325,12 +5835,34 @@ pub const ModelManager = struct {
             loaded.active_handles += 1;
             self.unlockLoadedModels();
         }
-        self.releaseWhisperAssetsLoadFlight(flight_key, flight);
         if (maybe_err) |err| return err;
         return .{
             .manager = self,
             .assets = assets orelse return error.TokenizerLoadFailed,
         };
+    }
+
+    fn runCompositeLoadTask(task: *CompositeLoadTask) std.Io.Cancelable!void {
+        defer task.deinit();
+        const manager = task.manager;
+        defer manager.releaseCompositeAssetsLoadFlight(task.key, task.flight);
+        var active = LoadFlightControl{ .flight = &task.flight.load_state };
+        const assets = manager.loadCompositeAssetsUncached(task.model_dir, task.paths, task.key, task.kind, active.control()) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        active.control().check() catch |err| {
+            assets.deinit();
+            manager.allocator.destroy(assets);
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        var handle = manager.publishCompositeAssets(task.key, assets) catch |err| {
+            manager.finishCompositeAssetsLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.finishCompositeAssetsLoadFlight(task.flight, handle.assets, null);
+        handle.release();
     }
 
     const ResolvedWhisperSidecars = struct {
@@ -5393,7 +5925,7 @@ pub const ModelManager = struct {
         };
     }
 
-    fn whisperAssetGenerationSignature(
+    fn compositeAssetGenerationSignature(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
@@ -5406,6 +5938,13 @@ pub const ModelManager = struct {
             "tokenizer.json",
             "config.json",
             "generation_config.json",
+            "clip_config.json",
+            "model_manifest.json",
+            "antfly_inference_bundle.json",
+            "antfly_inference_variants.json",
+            "gliner_config.json",
+            "added_tokens.json",
+            "1_SpladePooling/config.json",
             managed_receipt.complete_filename,
             managed_receipt.in_progress_filename,
             managed_receipt.plan_filename,
@@ -5421,54 +5960,150 @@ pub const ModelManager = struct {
             owned_paths.appendAssumeCapacity(path);
             try dependencies.append(self.allocator, path);
         }
-        return componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        const direct = try componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        if (component_paths.len == 0) return direct;
+        // Artifact identity is backend-neutral. Optional graphs participate in
+        // invalidation, but must not restrict the backend of the selected pair.
+        // Cache the closure under a distinct namespace in the bounded plan cache.
+        var closure_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        closure_hash.update("composite-artifact-closure-v1");
+        closure_hash.update(&direct);
+        const closure_key = closure_hash.finalResult();
+        const closure = if (try self.cachedComponentPlan(closure_key)) |entry| blk: {
+            defer entry.release();
+            break :blk entry.signature;
+        } else blk: {
+            var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+            defer man.deinit();
+            var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .multistage_ocr);
+            defer inspection.deinit();
+            if (inspection.invalid_summary != null) return error.IncompatibleModel;
+            const signature = try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
+            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
+            try self.publishComponentPlan(closure_key, signature, &.{}, inspection.dependencies.items);
+            break :blk signature;
+        };
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&direct);
+        hash.update(&closure);
+        return hash.finalResult();
     }
 
-    fn loadWhisperCompositeAssetsUncached(
+    fn loadCompositeAssetsUncached(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
         asset_generation: ComponentPlanKey,
-    ) !*WhisperCompositeAssets {
+        kind: CompositeKind,
+        control: ?InferenceExecutionControl,
+    ) !*CompositeAssets {
+        if (control) |active| try active.check();
         var sidecars = try self.resolveWhisperSidecars(model_dir);
         defer sidecars.deinit();
 
         var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
         errdefer managed_tokenizer.deinit();
-        var prompt_cache = try whisper_prompt.PromptCache.initFromPaths(
+        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromPaths(
             self.allocator,
             sidecars.generation_config_path,
             sidecars.config_path,
             managed_tokenizer.tokenizer.tokenizer(),
         );
-        errdefer prompt_cache.deinit();
+        errdefer if (prompt_cache) |*cache| cache.deinit();
         const decoder_config = try encoder_decoder.loadDecoderConfigFile(
             self.allocator,
             sidecars.config_path,
         );
-        const verified_generation = try self.whisperAssetGenerationSignature(
+        var encoder: ?ManagedSession = null;
+        errdefer if (encoder) |*managed| managed.deinit();
+        var decoder: ?ManagedSession = null;
+        errdefer if (decoder) |*managed| managed.deinit();
+        if (kind != .whisper_metadata) {
+            if (component_paths.len != 2 and component_paths.len != 3) return error.InvalidModelLayout;
+            var metadata = std.heap.ArenaAllocator.init(self.allocator);
+            defer metadata.deinit();
+            const merged = if (component_paths.len == 3) blk: {
+                const signature = @import("../backends/imported_onnx_session.zig").inspectSignature(metadata.allocator(), component_paths[2]) catch |err| switch (err) {
+                    error.IncompatibleModel, error.UnsupportedDType => break :blk false,
+                    else => return err,
+                };
+                break :blk @import("../pipelines/seq2seq_decode.zig").qualifiedSignature(signature.inputs, signature.outputs);
+            } else false;
+            if (merged) {
+                const selected = [_][]const u8{ component_paths[0], component_paths[2] };
+                // Optional graph support must not constrain fallback placement.
+                const loaded = blk: {
+                    var loader = self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, &selected) catch |err| break :blk err;
+                    encoder = (if (control) |active| loader.loadWithControl(selected[0], active) else loader.load(selected[0])) catch |err| break :blk err;
+                    var strict = loader.restrictToBackend(encoder.?.session.backend()) catch |err| break :blk err;
+                    decoder = (if (control) |active| strict.loadWithControl(selected[1], active) else strict.load(selected[1])) catch |err| break :blk err;
+                    if (!@import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) break :blk error.IncompatibleModel;
+                    break :blk @as(anyerror!void, {});
+                };
+                if (loaded) |_| {} else |err| {
+                    switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => {},
+                        else => return err,
+                    }
+                    if (decoder) |*candidate| candidate.deinit();
+                    decoder = null;
+                    if (encoder) |*candidate| candidate.deinit();
+                    encoder = null;
+                }
+            }
+            if (decoder == null) {
+                var loader = try self.componentLoaderForPaths(model_dir, self.session_manager.preferred_backends, component_paths[0..2]);
+                encoder = if (control) |active| try loader.loadWithControl(component_paths[0], active) else try loader.load(component_paths[0]);
+                var strict = try loader.restrictToBackend(encoder.?.session.backend());
+                decoder = if (control) |active| try strict.loadWithControl(component_paths[1], active) else try strict.load(component_paths[1]);
+            }
+        }
+        const verified_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
+            kind,
         );
         if (!std.mem.eql(u8, asset_generation[0..], verified_generation[0..]))
             return error.ModelArtifactsChanging;
 
-        const assets = try self.allocator.create(WhisperCompositeAssets);
+        const assets = try self.allocator.create(CompositeAssets);
+        errdefer self.allocator.destroy(assets);
         assets.* = .{
             .managed_tokenizer = managed_tokenizer.take(),
             .prompt_cache = prompt_cache,
+            .encoder = encoder,
+            .decoder = decoder,
+            .kind = kind,
+            .decoder_execution = if (decoder != null and @import("../pipelines/seq2seq_decode.zig").qualified(decoder.?.session)) .merged_kv else .full_prefix,
+            .considered_merged_decoder = component_paths.len == 3,
             .decoder_config = decoder_config,
             .generation = asset_generation,
         };
+        if (assets.encoder) |*managed| {
+            managed.session.execution_gate = &assets.encoder_gate;
+            const info = managed.session.outputInfo();
+            if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32) {
+                // Exported hidden width is authoritative; the validated model
+                // configuration supplies the bound when the export is symbolic.
+                const width = if (info[0].shape[2] > 0) @as(usize, @intCast(info[0].shape[2])) else decoder_config.hidden_size orelse 0;
+                if (width > 0) managed.session.output_geometry = .{ .input_name = if (kind == .whisper) "input_features" else "input_ids", .sequence_axis = if (kind == .whisper) 2 else 1, .sequence_divisor = if (kind == .whisper) 2 else 1, .width = width };
+            }
+        }
+        if (assets.decoder) |*managed| {
+            managed.session.execution_gate = &assets.decoder_gate;
+            const info = managed.session.outputInfo();
+            if (info.len == 1 and info[0].shape.len == 3 and info[0].dtype == .f32)
+                managed.session.output_geometry = .{ .input_name = "input_ids", .width = if (info[0].shape[2] > 0) @intCast(info[0].shape[2]) else decoder_config.vocab_size };
+        }
         prompt_cache = undefined;
         return assets;
     }
 
-    fn publishWhisperCompositeAssets(
+    fn publishCompositeAssets(
         self: *ModelManager,
         asset_generation: ComponentPlanKey,
-        assets: *WhisperCompositeAssets,
-    ) !WhisperAssetsHandle {
+        assets: *CompositeAssets,
+    ) !CompositeAssetsHandle {
         var assets_owned = true;
         errdefer if (assets_owned) {
             assets.deinit();
@@ -5479,7 +6114,7 @@ pub const ModelManager = struct {
         defer self.eviction_lock.unlock();
         while (true) {
             self.lockLoadedModels();
-            if (self.whisper_assets.get(asset_generation)) |existing| {
+            if (self.composite_assets.get(asset_generation)) |existing| {
                 existing.active_handles += 1;
                 self.unlockLoadedModels();
                 assets.deinit();
@@ -5492,29 +6127,29 @@ pub const ModelManager = struct {
             const configured_capacity = if (self.max_loaded_models > 0)
                 self.max_loaded_models
             else
-                whisper_assets_cache_capacity;
+                composite_assets_cache_capacity;
             const capacity = @max(
                 @as(usize, 1),
-                @min(configured_capacity, whisper_assets_cache_capacity),
+                @min(configured_capacity, composite_assets_cache_capacity),
             );
-            if (self.whisper_assets.count() >= capacity) {
-                const evicted = self.takeLruWhisperAssetsLocked(
+            if (self.composite_assets.count() >= capacity) {
+                const evicted = self.takeLruCompositeAssetsLocked(
                     platform.time.monotonicNs(),
                     false,
                 );
                 self.unlockLoadedModels();
                 if (evicted == null) return error.ResourceTemporarilyUnavailable;
-                self.destroyEvictedWhisperAssets(evicted.?);
+                self.destroyEvictedCompositeAssets(evicted.?);
                 continue;
             }
 
-            self.whisper_assets.ensureUnusedCapacity(self.allocator, 1) catch |err| {
+            self.composite_assets.ensureUnusedCapacity(self.allocator, 1) catch |err| {
                 self.unlockLoadedModels();
                 return err;
             };
             assets.active_handles = 1;
             assets.last_used_ns = platform.time.monotonicNs();
-            self.whisper_assets.putAssumeCapacity(asset_generation, assets);
+            self.composite_assets.putAssumeCapacity(asset_generation, assets);
             self.unlockLoadedModels();
             assets_owned = false;
             return .{ .manager = self, .assets = assets };
@@ -5524,76 +6159,132 @@ pub const ModelManager = struct {
     /// Acquire immutable tokenizer and decoder metadata for a split Whisper
     /// bundle. Cold construction is single-flight; warm requests perform one
     /// map lookup and keep the entry pinned through the returned handle.
-    pub fn acquireWhisperCompositeAssets(
+    pub fn acquireCompositeAssets(
         self: *ModelManager,
         model_dir: []const u8,
         component_paths: []const []const u8,
-    ) !WhisperAssetsHandle {
-        const asset_generation = try self.whisperAssetGenerationSignature(
+    ) !CompositeAssetsHandle {
+        return self.acquireCompositeRuntime(model_dir, component_paths, .whisper_metadata, null);
+    }
+
+    fn compositeRuntimeKey(self: *ModelManager, model_dir: []const u8, paths: []const []const u8, kind: CompositeKind) !ComponentPlanKey {
+        const generation_key = try self.compositeAssetGenerationSignature(model_dir, paths);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&generation_key);
+        hash.update(@tagName(kind));
+        for (self.session_manager.preferred_backends) |backend| {
+            hash.update("/");
+            hash.update(@tagName(backend));
+        }
+        return hash.finalResult();
+    }
+
+    /// Lazy, single-flight component runtime. The handle pins both sessions,
+    /// tokenizer and metadata; callers must not close the borrowed sessions.
+    pub fn acquireCompositeRuntime(
+        self: *ModelManager,
+        model_dir: []const u8,
+        component_paths: []const []const u8,
+        kind: CompositeKind,
+        control: ?InferenceExecutionControl,
+    ) !CompositeAssetsHandle {
+        if (control) |active| try active.check();
+        if (kind != .whisper_metadata and component_paths.len == 2 and std.mem.endsWith(u8, component_paths[1], ".onnx")) {
+            if (try encoder_decoder.findMergedDecoder(self.allocator, model_dir)) |candidate| {
+                defer self.allocator.free(candidate);
+                if (!std.mem.eql(u8, candidate, component_paths[1])) {
+                    const planned = [_][]const u8{ component_paths[0], component_paths[1], candidate };
+                    // The runtime single-flight pins metadata-only selection.
+                    // Artifact identity includes the optional graph; backend
+                    // policy is applied only to the selected executable pair.
+                    return self.acquireCompositeRuntimePlanned(model_dir, &planned, kind, control) catch |err| switch (err) {
+                        error.IncompatibleModel, error.UnsupportedArchitecture, error.UnsupportedOperation, error.UnsupportedOperator, error.NoCompatibleBackend, error.NoBackendAvailable, error.UnsupportedBackend => return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control),
+                        else => return err,
+                    };
+                }
+            }
+        }
+        return self.acquireCompositeRuntimePlanned(model_dir, component_paths, kind, control);
+    }
+
+    fn acquireCompositeRuntimePlanned(self: *ModelManager, model_dir: []const u8, component_paths: []const []const u8, kind: CompositeKind, control: ?InferenceExecutionControl) !CompositeAssetsHandle {
+        const asset_generation = try self.compositeRuntimeKey(
             model_dir,
             component_paths,
+            kind,
         );
         self.lockLoadedModels();
-        if (self.whisper_assets.get(asset_generation)) |assets| {
+        if (self.composite_assets.get(asset_generation)) |assets| {
             assets.active_handles += 1;
             self.unlockLoadedModels();
             return .{ .manager = self, .assets = assets };
         }
-        if (self.in_flight_whisper_assets.get(asset_generation)) |flight| {
+        if (self.joinableCompositeLoadFlightLocked(asset_generation)) |flight| {
+            if (!flight.load_state.tryAddWaiter()) {
+                self.unlockLoadedModels();
+                return error.ResourceTemporarilyUnavailable;
+            }
             flight.refs += 1;
             self.unlockLoadedModels();
-            return self.waitForWhisperAssetsLoadFlight(asset_generation, flight);
+            return self.waitForCompositeAssetsLoadFlight(asset_generation, flight, control);
         }
 
-        const flight = self.allocator.create(WhisperAssetsLoadFlight) catch |err| {
+        const coordination_io = self.loadCoordinationIoLocked() catch |err| {
             self.unlockLoadedModels();
             return err;
         };
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
-        flight.* = .{ .io = coordination_io };
-        self.in_flight_whisper_assets.put(
-            self.allocator,
-            asset_generation,
-            flight,
-        ) catch |err| {
+        const flight = self.allocator.create(CompositeAssetsLoadFlight) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        flight.* = .{
+            .io = coordination_io,
+            .refs = 2,
+            .load_state = .{
+                .io = coordination_io,
+                .hard_cancellation = if (control) |active| active.hard_cancellation else null,
+            },
+        };
+        const task = CompositeLoadTask.create(self, flight, asset_generation, model_dir, component_paths, kind) catch |err| {
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        self.in_flight_composite_assets.put(self.allocator, asset_generation, flight) catch |err| {
+            task.deinit();
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
             return err;
         };
         self.unlockLoadedModels();
-
-        const assets = self.loadWhisperCompositeAssetsUncached(
-            model_dir,
-            component_paths,
-            asset_generation,
-        ) catch |err| {
-            self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-            return err;
-        };
-        const handle = self.publishWhisperCompositeAssets(asset_generation, assets) catch |err| {
-            self.finishWhisperAssetsLoadFlight(flight, null, err);
-            self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-            return err;
-        };
-        self.finishWhisperAssetsLoadFlight(flight, handle.assets, null);
-        self.releaseWhisperAssetsLoadFlight(asset_generation, flight);
-        return handle;
+        if (control != null) {
+            self.load_group.concurrent(coordination_io, runCompositeLoadTask, .{task}) catch |err| {
+                self.finishCompositeAssetsLoadFlight(flight, null, err);
+                task.deinit();
+                self.releaseCompositeAssetsLoadFlight(asset_generation, flight);
+            };
+        } else {
+            self.load_group.async(coordination_io, runCompositeLoadTask, .{task});
+        }
+        return self.waitForCompositeAssetsLoadFlight(asset_generation, flight, control);
     }
 
     /// Verify that sessions loaded after asset acquisition still describe the
     /// same immutable publication. A model pull may atomically replace the
     /// directory between those operations; fail the request instead of pairing
     /// sessions and token IDs from different generations.
-    pub fn validateWhisperAssetsCurrent(
+    pub fn validateCompositeAssetsCurrent(
         self: *ModelManager,
-        handle: *const WhisperAssetsHandle,
+        handle: *const CompositeAssetsHandle,
         model_dir: []const u8,
         component_paths: []const []const u8,
     ) !void {
-        const current = try self.whisperAssetGenerationSignature(model_dir, component_paths);
         const assets = handle.get();
+        const current = if (assets.considered_merged_decoder and component_paths.len == 2) blk: {
+            const candidate = try encoder_decoder.findMergedDecoder(self.allocator, model_dir) orelse return error.ModelArtifactsChanging;
+            defer self.allocator.free(candidate);
+            break :blk try self.compositeRuntimeKey(model_dir, &.{ component_paths[0], component_paths[1], candidate }, assets.kind);
+        } else try self.compositeRuntimeKey(model_dir, component_paths, assets.kind);
         if (!std.mem.eql(u8, assets.generation[0..], current[0..]))
             return error.ModelArtifactsChanging;
     }
@@ -5606,6 +6297,21 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+            control,
         );
     }
 
@@ -5620,6 +6326,23 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            control,
         );
     }
 
@@ -5639,6 +6362,22 @@ pub const ModelManager = struct {
             self.session_manager.preferred_backends,
             true,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
         );
     }
 
@@ -5654,6 +6393,24 @@ pub const ModelManager = struct {
             preferred_backends,
             cache_default_alias,
             .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            null,
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndA4bRequestAndControl(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+        control: InferenceExecutionControl,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+            control,
         );
     }
 
@@ -5694,6 +6451,7 @@ pub const ModelManager = struct {
     ) !?*LoadedModel {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
+            if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
             const variant_key = try backendVariantCacheKey(
                 self.allocator,
                 model_dir,
@@ -5706,11 +6464,13 @@ pub const ModelManager = struct {
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (!policy.require_default_alias_backend_match or
-                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!modelBackendIsUnhealthy(self, model_dir, model.session.backend()) and
+                    (!policy.require_default_alias_backend_match or
+                        loadedModelUsesPreferredBackend(model, preferred_backends))) return model;
         }
         return null;
     }
@@ -5770,6 +6530,59 @@ pub const ModelManager = struct {
         flight.completed.set(flight.io);
     }
 
+    /// Completed failures are not negative cache entries. The task and its old
+    /// waiters may still own the flight, but a new request must be able to retry
+    /// after admission or artifacts change. Detachment does not destroy it, and
+    /// old-reference cleanup must never remove a replacement with the same key.
+    fn joinableCompositeLoadFlightLocked(self: *ModelManager, key: ComponentPlanKey) ?*CompositeAssetsLoadFlight {
+        const flight = self.in_flight_composite_assets.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_composite_assets.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        return null;
+    }
+
+    fn joinableLoadFlightLocked(self: *ModelManager, key: []const u8) ?*LoadFlight {
+        const flight = self.in_flight_loads.get(key) orelse return null;
+        if (!flight.completed.isSet() or flight.err == null) return flight;
+        const removed = self.in_flight_loads.fetchRemove(key) orelse unreachable;
+        std.debug.assert(removed.value == flight);
+        flight.registered = false;
+        self.allocator.free(removed.key);
+        return null;
+    }
+
+    fn runLoadTask(task: *LoadTask) std.Io.Cancelable!void {
+        defer task.deinit();
+        const manager = task.manager;
+        defer manager.releaseLoadFlight(task.flight_key, task.flight);
+
+        var load_control = LoadFlightControl{ .flight = task.flight };
+        var handle = manager.loadFromDirUncached(
+            task.model_dir,
+            &task.session_manager,
+            task.cache_default_alias,
+            task.a4b_request,
+            load_control.control(),
+        ) catch |err| {
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        load_control.control().check() catch |err| {
+            // loadFromDirUncached publishes before returning. If every waiter
+            // left during its final non-suspending section, retire that orphan
+            // instead of leaving an unused runtime resident.
+            handle.retire();
+            manager.finishLoadFlight(task.flight, null, err);
+            return;
+        };
+        manager.finishLoadFlight(task.flight, handle.get(), null);
+        // The task owns only the construction handle. Request waiters adopt
+        // their own handles from the completed flight.
+        handle.release();
+    }
+
     fn releaseLoadFlight(
         self: *ModelManager,
         flight_key: []const u8,
@@ -5777,8 +6590,8 @@ pub const ModelManager = struct {
     ) void {
         var removed_key: ?[]const u8 = null;
         self.lockLoadedModels();
-        std.debug.assert(flight.owner_ref_pending);
-        flight.owner_ref_pending = false;
+        std.debug.assert(flight.task_ref_pending);
+        flight.task_ref_pending = false;
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         if (flight.refs != 0) {
@@ -5801,18 +6614,59 @@ pub const ModelManager = struct {
         self: *ModelManager,
         flight_key: []const u8,
         flight: *LoadFlight,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
-        flight.completed.waitUncancelable(flight.io);
+        var waiter_consumed = false;
+        defer if (!waiter_consumed) {
+            var result = self.consumeLoadFlightWaiter(flight_key, flight, .abandon);
+            result.handle.release();
+        };
+        while (!flight.completed.isSet()) {
+            if (control) |active| try active.update(.loading_model, 0, 1);
+            flight.completed.waitTimeout(flight.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+        }
+        var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
+        waiter_consumed = true;
+        errdefer result.handle.release();
+        if (control) |active| try active.check();
+        if (result.err) |err| return err;
+        if (result.handle.model == null) return error.NoBackendAvailable;
+        return result.handle;
+    }
+
+    /// Consume exactly one waiter reference and transfer its model ownership,
+    /// if any, to the caller. Retirement reserves handles for outstanding
+    /// waiters; even an abandoning waiter must release that reservation. Keep
+    /// this accounting under the same lock as retirement, and release returned
+    /// handles outside the lock because the last release can destroy a model.
+    fn consumeLoadFlightWaiter(
+        self: *ModelManager,
+        flight_key: []const u8,
+        flight: *LoadFlight,
+        disposition: enum { adopt, abandon },
+    ) struct { handle: ModelHandle, err: ?anyerror } {
         var removed_key: ?[]const u8 = null;
         var destroy_flight = false;
         self.lockLoadedModels();
-        const model = flight.model;
+        var handle = ModelHandle{ .manager = self, .model = null };
         const maybe_err = flight.err;
-        if (model) |loaded| {
-            if (!flight.handles_reserved) loaded.active_handles += 1;
+        if (flight.model) |loaded| {
+            if (flight.handles_reserved or disposition == .adopt) {
+                if (!flight.handles_reserved) loaded.active_handles += 1;
+                handle.model = loaded;
+            }
         }
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
+        flight.releaseWaiter(disposition == .abandon);
         if (flight.refs == 0) {
             if (flight.registered) {
                 const removed = self.in_flight_loads.fetchRemove(flight_key) orelse unreachable;
@@ -5823,14 +6677,34 @@ pub const ModelManager = struct {
             destroy_flight = true;
         }
         self.unlockLoadedModels();
-
         if (removed_key) |key| self.allocator.free(key);
         if (destroy_flight) self.allocator.destroy(flight);
-        if (maybe_err) |err| return err;
-        return .{
-            .manager = self,
-            .model = model orelse return error.NoBackendAvailable,
+        return .{ .handle = handle, .err = maybe_err };
+    }
+
+    /// Called under load_lock. Once selected, the group's runtime never changes,
+    /// including when attachIo is called after an offline load has started.
+    fn loadCoordinationIoLocked(self: *ModelManager) !std.Io {
+        if (self.load_io) |io| return io;
+        const io = self.session_manager.io orelse blk: {
+            const owned = try self.allocator.create(std.Io.Threaded);
+            owned.* = std.Io.Threaded.init(self.allocator, .{});
+            self.owned_load_runtime = owned;
+            break :blk owned.io();
         };
+        self.load_io = io;
+        return io;
+    }
+
+    fn offlineLoadBoundaryLocked(self: *ModelManager, io: std.Io) !?execution_control_mod.HardCancellationBoundary {
+        if (!self.session_manager.process_isolation_available) return null;
+        if (self.owned_load_watchdog == null) {
+            const watchdog = try HardCancellationWatchdog.create(self.allocator);
+            errdefer watchdog.destroy();
+            try watchdog.start(io);
+            self.owned_load_watchdog = watchdog;
+        }
+        return self.owned_load_watchdog.?.boundary();
     }
 
     fn loadFromDirCoordinated(
@@ -5839,7 +6713,9 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 1);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
             preferred_backends,
@@ -5868,32 +6744,66 @@ pub const ModelManager = struct {
             self.unlockLoadedModels();
             return .{ .manager = self, .model = model };
         }
-        if (self.in_flight_loads.get(flight_key)) |flight| {
+        if (self.joinableLoadFlightLocked(flight_key)) |flight| {
             flight.refs += 1;
+            if (!flight.tryAddWaiter()) {
+                flight.refs -= 1;
+                self.unlockLoadedModels();
+                return error.ResourceTemporarilyUnavailable;
+            }
             self.unlockLoadedModels();
-            return self.waitForLoadFlight(flight_key, flight);
+            return self.waitForLoadFlight(flight_key, flight, control);
         }
 
+        const coordination_io = self.loadCoordinationIoLocked() catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
+        // Offline CLI loads also run in a cancellable manager-owned task.
+        // Their process is disposable, but the task still needs a real monitor
+        // for a driver call that cannot observe its final waiter's cancellation.
+        const hard_cancellation = if (control) |active| active.hard_cancellation else self.offlineLoadBoundaryLocked(coordination_io) catch |err| {
+            self.unlockLoadedModels();
+            return err;
+        };
         const flight = self.allocator.create(LoadFlight) catch |err| {
             self.unlockLoadedModels();
             return err;
         };
-        // Antfly injects BackendRuntime.io through Node.attachIo. Keep the
-        // inference package coupled only to the std.Io capability so standalone
-        // and embedded owners can provide different runtime implementations.
-        // The process-local fallback is only for offline callers that do not
-        // attach a runtime.
-        const coordination_io = self.session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
         flight.* = .{
             .io = coordination_io,
+            .hard_cancellation = hard_cancellation,
         };
         const owned_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
             return err;
         };
-        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+        const task = self.allocator.create(LoadTask) catch |err| {
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_flight_key = self.allocator.dupe(u8, flight_key) catch |err| {
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_model_dir = self.allocator.dupe(u8, model_dir) catch |err| {
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
+            return err;
+        };
+        const task_backends = self.allocator.dupe(backends.BackendType, effective_backends) catch |err| {
+            self.allocator.free(task_model_dir);
+            self.allocator.free(task_flight_key);
+            self.allocator.destroy(task);
             self.allocator.free(owned_flight_key);
             self.allocator.destroy(flight);
             self.unlockLoadedModels();
@@ -5904,25 +6814,48 @@ pub const ModelManager = struct {
         // runtime for its complete construction.
         var session_manager = sessionManagerForPreferredBackends(
             self.allocator,
-            effective_backends,
+            task_backends,
             &self.session_manager,
         );
+        session_manager.io = coordination_io;
         session_manager.a4b_inference_request = policy.a4b_request;
-        self.unlockLoadedModels();
-
-        var handle = self.loadFromDirUncached(
-            model_dir,
-            &session_manager,
-            cache_default_alias,
-            policy.a4b_request,
-        ) catch |err| {
-            self.finishLoadFlight(flight, null, err);
-            self.releaseLoadFlight(flight_key, flight);
+        task.* = .{
+            .manager = self,
+            .flight = flight,
+            .flight_key = task_flight_key,
+            .model_dir = task_model_dir,
+            .preferred_backends = task_backends,
+            .session_manager = session_manager,
+            .cache_default_alias = cache_default_alias,
+            .a4b_request = policy.a4b_request,
+        };
+        self.in_flight_loads.put(self.allocator, owned_flight_key, flight) catch |err| {
+            task.deinit();
+            self.allocator.free(owned_flight_key);
+            self.allocator.destroy(flight);
+            self.unlockLoadedModels();
             return err;
         };
-        self.finishLoadFlight(flight, handle.get(), null);
-        self.releaseLoadFlight(flight_key, flight);
-        return handle;
+        self.unlockLoadedModels();
+        if (control != null) {
+            self.load_group.concurrent(coordination_io, runLoadTask, .{task}) catch |err| {
+                // `Group.async` is allowed to execute eagerly when its async pool is
+                // saturated. A request-scoped cold load must never run on the request
+                // lane: the waiter is what translates request cancellation into an
+                // abandoned flight. Fail closed when guaranteed concurrency is not
+                // available and retire the task reference exactly as runLoadTask
+                // would have done.
+                self.finishLoadFlight(flight, null, err);
+                task.deinit();
+                self.releaseLoadFlight(flight_key, flight);
+            };
+        } else {
+            // Startup preloads and direct/offline callers have no request lifetime
+            // to protect. Retain the permissive path for executors such as
+            // std.testing.io that intentionally do not offer concurrency.
+            self.load_group.async(coordination_io, runLoadTask, .{task});
+        }
+        return self.waitForLoadFlight(flight_key, flight, control);
     }
 
     fn loadFromDirUncached(
@@ -5931,12 +6864,15 @@ pub const ModelManager = struct {
         sm: *backends.SessionManager,
         cache_default_alias: bool,
         a4b_request: ?backend_contracts.A4bInferenceRequest,
+        control: ?InferenceExecutionControl,
     ) !ModelHandle {
+        if (control) |active| try active.update(.loading_model, 0, 4);
 
         // Load manifest
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         var man_owned = true;
         errdefer if (man_owned) man.deinit();
+        if (control) |active| try active.update(.loading_model, 1, 4);
         var policy_backend_scratch: [7]backends.BackendType = undefined;
         if (self.serving_policy) |policy| {
             sm.preferred_backends = try policyAllowedBackends(
@@ -6004,6 +6940,7 @@ pub const ModelManager = struct {
             self.allocator.destroy(sp);
         };
 
+        if (control) |active| try active.check();
         switch (tokenizer_type) {
             .huggingface => {
                 hf_tok = try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
@@ -6025,16 +6962,24 @@ pub const ModelManager = struct {
                 sp_tok = sp;
             },
         }
+        if (control) |active| try active.update(.loading_model, 2, 4);
         if (tokenizer_resource_lease) |*lease| {
             try lease.retain(tokenizer_admission_plan.?.resident);
         }
 
         // Plan and reserve resources before the backend begins allocating weights.
-        var loaded_session = try loadSessionForPreferredBackends(self, sm.preferred_backends, model_dir, man, sm);
-        errdefer if (loaded_session.resource_lease) |*lease| lease.release();
+        if (control) |active| try active.update(.loading_weights, 0, 1);
+        var loaded_session = try loadSessionForPreferredBackends(
+            self,
+            sm.preferred_backends,
+            model_dir,
+            man,
+            sm,
+            control,
+        );
+        defer loaded_session.deinit();
+        if (control) |active| try active.update(.loading_model, 3, 4);
         const session = loaded_session.session;
-        var session_owned = true;
-        errdefer if (session_owned) session.close();
 
         var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
             try whisper_prompt.PromptCache.init(
@@ -6046,9 +6991,13 @@ pub const ModelManager = struct {
             null;
         errdefer if (whisper_prompt_cache) |*cache| cache.deinit();
 
-        // Load chat template if available (for generator models)
+        // Embedding checkpoints can ship their decoder backbone's chat
+        // template, but embedding execution never uses it. Qwen rerankers use
+        // their explicit scoring templates instead of this general chat path.
         var chat_template_failed = false;
-        var chat_tmpl: ?*ChatTemplate = if (man.chat_template) |ct_source| blk2: {
+        const needs_chat_template = man.model_type != .embedder and
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+        var chat_tmpl: ?*ChatTemplate = if (if (needs_chat_template) man.chat_template else null) |ct_source| blk2: {
             const ct = self.allocator.create(ChatTemplate) catch {
                 chat_template_failed = true;
                 break :blk2 null;
@@ -6108,6 +7057,24 @@ pub const ModelManager = struct {
             break :blk coordinator;
         } else null;
         errdefer if (native_generate_coordinator) |coordinator| self.allocator.destroy(coordinator);
+        const florence_reader_config: ?vision_config.RuntimeConfig = if (session_factory.getFlorenceConfig(session)) |florence| blk: {
+            const config_path = man.config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor_path = man.preprocessor_config_path orelse return error.IncompleteFlorence2Bundle;
+            const preprocessor = try vision_config.loadPreprocessorConfigFile(self.allocator, preprocessor_path);
+            if (preprocessor.image_size != @as(usize, florence.image_size))
+                return error.InvalidPreprocessorConfig;
+            var cb = try session_factory.getComputeBackend(session, self.allocator);
+            defer cb.deinit();
+            break :blk .{
+                .decoder = try encoder_decoder.loadDecoderConfigFile(self.allocator, config_path),
+                .preprocessor = preprocessor,
+                .final_logits_bias_zero = try florence_arch.decoderFinalLogitsBiasIsZero(
+                    &cb,
+                    self.allocator,
+                    florence.vocab_size,
+                ),
+            };
+        } else null;
         const owned_model_dir = try self.allocator.dupe(u8, model_dir);
         var owned_model_dir_owned = true;
         errdefer if (owned_model_dir_owned) self.allocator.free(owned_model_dir);
@@ -6123,6 +7090,8 @@ pub const ModelManager = struct {
             .model_manager = self,
             .model_dir = owned_model_dir,
             .allocator = self.allocator,
+            .executor_io = self.session_manager.io,
+            .florence_reader_config = florence_reader_config,
             .chat_tmpl = chat_tmpl,
             .whisper_prompt_cache = whisper_prompt_cache,
             .chat_template_failed = chat_template_failed,
@@ -6140,6 +7109,12 @@ pub const ModelManager = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
+        model.session.execution_gate = &model.target_inference_run_lock;
+
+        // Keep publication behind the same cooperative boundary as expensive
+        // construction. An abandoned manager task should release its fully
+        // built model through the armed errdefers, not briefly expose it.
+        if (control) |active| try active.update(.loading_model, 4, 4);
 
         // The fully initialized model is now the sole owner. Disarm every
         // construction errdefer before publishLoadedModel takes responsibility
@@ -6148,7 +7123,6 @@ pub const ModelManager = struct {
         hf_tok = null;
         sp_tok = null;
         tokenizer_resource_lease = null;
-        session_owned = false;
         chat_tmpl = null;
         whisper_prompt_cache = null;
         shared_moe_cache = null;
@@ -6156,7 +7130,16 @@ pub const ModelManager = struct {
         native_generate_coordinator = null;
         owned_model_dir_owned = false;
         model_storage_owned = false;
-        loaded_session.resource_lease = null;
+        _ = loaded_session.take();
+        model.kernel_jit_profile_bundle = qualified_profile_bundle;
+        qualified_profile_bundle = null;
+        // Preparation is still fallible after construction ownership moves to
+        // the model. Keep a single rollback owner until publication takes it.
+        var unpublished_model_owned = true;
+        errdefer if (unpublished_model_owned) {
+            model.deinit();
+            self.allocator.destroy(model);
+        };
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the
@@ -6169,16 +7152,26 @@ pub const ModelManager = struct {
         {
             if (session_factory.getGptConfig(session)) |gpt_config| {
                 if (graph_mod.metal_executor.supportsSession(session)) {
-                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(self.allocator, session, gpt_config) catch |err| {
+                    _ = graph_mod.metal_executor.prewarmSharedDecoderRuntimeWithControl(self.allocator, session, gpt_config, control) catch |err| {
+                        if (control) |active| try active.check();
+                        switch (err) {
+                            error.Canceled,
+                            error.Cancelled,
+                            error.Timeout,
+                            error.ProcessIsolationRequired,
+                            error.HardCancellationWatchdogNotStarted,
+                            error.InferenceWorkerShuttingDown,
+                            => return err,
+                            else => {},
+                        }
                         std.log.warn("metal decoder-runtime prewarm failed for {s}: {s}", .{ model_dir, @errorName(err) });
                     };
                 }
             }
         }
 
-        model.kernel_jit_profile_bundle = qualified_profile_bundle;
-        qualified_profile_bundle = null;
-
+        if (control) |active| try active.check();
+        unpublished_model_owned = false;
         return self.publishLoadedModel(model, cache_default_alias, a4b_request);
     }
 
@@ -6329,6 +7322,56 @@ fn loadedModelUsesPreferredBackend(
     return false;
 }
 
+const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
+const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(model_dir);
+    hasher.update(&[_]u8{@intFromEnum(backend)});
+    var digest: ModelBackendHealthKey = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn markModelBackendUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) void {
+    const retry_after_ns = platform.time.monotonicNs() +| model_backend_quarantine_ns;
+    spinLock(&self.unhealthy_backend_lock);
+    self.unhealthy_model_backends.put(
+        self.allocator,
+        modelBackendHealthKey(model_dir, backend),
+        retry_after_ns,
+    ) catch {
+        self.unhealthy_backend_lock.unlock();
+        return;
+    };
+    self.unhealthy_backend_lock.unlock();
+    std.log.warn("quarantined inference model path={s} backend={s} for {d}ms", .{
+        model_dir,
+        @tagName(backend),
+        model_backend_quarantine_ns / std.time.ns_per_ms,
+    });
+}
+
+fn modelBackendIsUnhealthy(
+    self: *ModelManager,
+    model_dir: []const u8,
+    backend: backends.BackendType,
+) bool {
+    const key = modelBackendHealthKey(model_dir, backend);
+    const now_ns = platform.time.monotonicNs();
+    spinLock(&self.unhealthy_backend_lock);
+    defer self.unhealthy_backend_lock.unlock();
+    const retry_after_ns = self.unhealthy_model_backends.get(key) orelse return false;
+    if (now_ns < retry_after_ns) return true;
+    _ = self.unhealthy_model_backends.remove(key);
+    return false;
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -6399,6 +7442,10 @@ test "explicit backend lookup reuses only a matching default alias" {
         fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
             return allocator.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, allocator);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6416,6 +7463,7 @@ test "explicit backend lookup reuses only a matching default alias" {
 
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -6624,6 +7672,10 @@ test "failed loaded model retires from lookup while active handles unwind" {
         fn run(_: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
             return alloc.alloc(backends.Tensor, 0);
         }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]backends.Tensor {
+            try control.check();
+            return run(ptr, inputs, alloc);
+        }
         fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{};
         }
@@ -6638,6 +7690,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         var state: u8 = 0;
         const vtable = backends.Session.VTable{
             .run = run,
+            .runWithControl = runWithControl,
             .inputInfo = inputInfo,
             .outputInfo = outputInfo,
             .backend = backend,
@@ -6661,7 +7714,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
         .io = std.testing.io,
         .model = &model,
         .refs = 2,
-        .owner_ref_pending = false,
+        .task_ref_pending = false,
     };
     try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
 
@@ -6821,7 +7874,19 @@ fn sessionManagerForPreferredBackends(
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
+        .process_isolation_available = source.process_isolation_available,
     };
+}
+
+test "session manager load clones preserve process isolation policy" {
+    var source = backends.SessionManager.init(std.testing.allocator);
+    source.process_isolation_available = false;
+    const clone = sessionManagerForPreferredBackends(
+        std.testing.allocator,
+        &.{.native},
+        &source,
+    );
+    try std.testing.expect(!clone.process_isolation_available);
 }
 
 pub const ManagedSession = struct {
@@ -6834,6 +7899,15 @@ pub const ManagedSession = struct {
         if (self.resource_lease) |*lease| lease.release();
         self.resource_lease = null;
         self.owns_session = false;
+    }
+
+    /// Move the session and its admission together. A deferred deinit remains
+    /// safe on the emptied source, including across fallible publication work.
+    pub fn take(self: *ManagedSession) ManagedSession {
+        const owned = self.*;
+        self.resource_lease = null;
+        self.owns_session = false;
+        return owned;
     }
 
     /// Transfer session ownership while leaving admission accounting with the
@@ -7191,13 +8265,32 @@ fn estimateModelArtifactBytes(
 /// residency. Charge its mapped artifact to the request that owns that mapping.
 pub fn projectorRunAdmissionAmounts(
     man: manifest_mod.ModelManifest,
+    backend: runtime.kv.pool.BackendKind,
+    media: generation.NativeGenerationMediaAdmission,
 ) !runtime.tier.memory.AdmissionAmounts {
     const path = man.gguf_projector_path orelse return .{};
     const bytes = std.math.cast(
         usize,
         try c_file.fileSize(man.allocator, path),
     ) orelse return error.ResourceLimitExceeded;
-    return .{ .host_weight_bytes = bytes };
+    return switch (backend) {
+        .native => .{
+            .host_weight_bytes = bytes,
+            .host_scratch_bytes = std.math.add(
+                usize,
+                media.host_scratch_bytes,
+                media.backend_scratch_bytes,
+            ) catch return error.ResourceLimitExceeded,
+        },
+        .metal, .cuda => .{
+            // The GGUF mapping remains resident on the host while the request
+            // weight cache exposes the same tensors to the accelerator.
+            .host_weight_bytes = bytes,
+            .backend_weight_bytes = bytes,
+            .host_scratch_bytes = media.host_scratch_bytes,
+            .backend_scratch_bytes = media.backend_scratch_bytes,
+        },
+    };
 }
 
 fn estimateModelLoadAdmission(
@@ -7372,13 +8465,26 @@ fn nativeModelLoadAdmission(
     };
 }
 
+/// All managed constructors share this boundary. Keep the returned guard in
+/// the attempt's scope until post-construction checks and rollback finish.
+fn enterSessionConstruction(
+    control: ?InferenceExecutionControl,
+    backend_runtime: backends.BackendRuntime,
+) !execution_control_mod.UninterruptibleGuard {
+    const active = control orelse return .{};
+    try active.check();
+    return active.enterUninterruptible(backend_runtime.loadInterruption());
+}
+
 fn loadSessionForPreferredBackends(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
     model_dir: []const u8,
     man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
+    if (control) |active| try active.check();
     var required_backend_scratch: [1]backends.BackendType = undefined;
     const policy_backends = try source_session_manager.requiredBackendCandidates(
         preferred_backends,
@@ -7399,6 +8505,11 @@ fn loadSessionForPreferredBackends(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
+        if (control) |active| try active.check();
+        if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
+            rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
+            continue;
+        }
         if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
             std.log.err(
                 "loadModel({s}) qualified CUDA A4B artifact rejected CPU fallback after GPU admission failure",
@@ -7416,6 +8527,13 @@ fn loadSessionForPreferredBackends(
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
+        if (control) |active| try active.updateDetail(
+            .preparing_weights,
+            0,
+            1,
+            model_dir,
+            @tagName(backend),
+        );
         if (source_session_manager.kernel_jit.mode.failClosed() and
             std.mem.endsWith(u8, candidate_path, ".onnx")) continue;
         var single_backend = [_]backends.BackendType{backend};
@@ -7426,6 +8544,9 @@ fn loadSessionForPreferredBackends(
         };
         backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
+        // This attempt owns admission until the successful result explicitly
+        // takes it. Includes cancellation, guard-arm failure, and fallback.
+        defer if (resource_lease) |*lease| lease.release();
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
@@ -7439,7 +8560,13 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
             resident_amounts = admission_plan.resident;
-            admission_limits = manager.admissionLimitsForBackend(backend_runtime);
+            admission_limits = manager.admissionLimitsForModelPath(
+                model_dir,
+                backend_runtime,
+            ) catch |err| {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            };
             if (admittedSessionCudaLimit(
                 backend_runtime,
                 resident_amounts,
@@ -7449,6 +8576,7 @@ fn loadSessionForPreferredBackends(
             }) |cuda_limit| {
                 backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
             }
+            if (control) |active| try active.check();
             resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
                 admission_limits,
@@ -7471,38 +8599,45 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
-        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
-            var session = loaded_session;
-            if (resource_lease) |*lease| {
-                lease.retain(resident_amounts) catch |err| {
-                    session.close();
-                    lease.release();
-                    return err;
-                };
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
             }
+            return err;
+        };
+        defer hard_cancellation.deinit();
+        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+            var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
+            resource_lease = null;
+            defer loaded.deinit();
+            if (control) |active| try active.check();
+            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
-                attachSessionRunAdmission(
+                const session_admission_limits = manager.admissionLimitsForSession(
+                    backend_runtime,
+                    loaded.session,
+                );
+                try attachSessionRunAdmission(
                     manager.allocator,
-                    &session,
+                    &loaded.session,
                     manager.admissionController(),
                     backend_runtime,
-                    admission_limits,
+                    session_admission_limits,
                     resident_amounts,
                     &man,
-                ) catch |err| {
-                    session.close();
-                    if (resource_lease) |*lease| lease.release();
-                    return err;
-                };
+                );
             }
-            return .{ .session = session, .resource_lease = resource_lease };
+            return loaded.take();
         } else |err| {
-            if (resource_lease) |*lease| lease.release();
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
             rememberPreferredLoadError(&first_err, err);
         }
     }
 
+    // A missing process boundary is an expected fail-closed policy decision,
+    // not an artifact/import failure.
+    if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;
     std.log.err("loadModel({s}) failed: no backend accepted model", .{model_dir});
     std.log.err("manifest paths onnx={?s} visual={?s} audio={?s} text_projection={?s} visual_projection={?s} audio_projection={?s}", .{
         man.onnx_path,
@@ -7515,6 +8650,407 @@ fn loadSessionForPreferredBackends(
     // NoModelFileFound only when nothing was even attempted.
     if (first_err) |err| return err;
     return error.NoModelFileFound;
+}
+
+fn writeCancellationTestModel(dir: std.Io.Dir, allocator: std.mem.Allocator) !void {
+    try writeTinyDebertaEncoderGgufForModelManagerTest(dir, allocator, "model.gguf");
+    try dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data =
+        \\{"model_type":"deberta","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        ,
+    });
+    try dir.writeFile(std.testing.io, .{
+        .sub_path = "tokenizer.json",
+        .data =
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}
+        ,
+    });
+}
+
+/// Record checkpoints on a successful cold load, then inject cancellation at
+/// those exact checkpoints without depending on hard-coded check counts.
+const LoadCancellationTrace = struct {
+    checks: usize = 0,
+    fail_at: ?usize = null,
+    after_manifest: usize = 0,
+    after_session: usize = 0,
+
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.checks += 1;
+        if (self.fail_at == self.checks) return error.Cancelled;
+    }
+
+    fn progress(raw: ?*anyopaque, update: execution_control_mod.Progress) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (update.phase != .loading_model or update.total != 4) return;
+        if (update.completed == 1) self.after_manifest = self.checks;
+        if (update.completed == 3) self.after_session = self.checks;
+    }
+
+    fn control(self: *@This()) InferenceExecutionControl {
+        return .{ .ptr = self, .check_fn = check, .progress = .{ .ptr = self, .update_fn = progress } };
+    }
+};
+
+test "cold direct loads own a concurrent runtime beyond the request lifetime" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    {
+        var request_io = std.Io.Threaded.init(allocator, .{});
+        defer request_io.deinit();
+        var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{ .io = request_io.io() });
+        defer handle.release();
+        try std.testing.expect(manager.owned_load_runtime != null);
+        try std.testing.expect(manager.load_io.?.userdata != request_io.io().userdata);
+    }
+    // The request runtime has been destroyed. Both cached access and another
+    // cold load must still work; retiring the first handle forces the latter.
+    {
+        var cached = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+        cached.retire();
+    }
+    var reloaded = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer reloaded.release();
+    // A late attachment must not move an existing Group to a different Io.
+    const owned_io = manager.load_io.?;
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+}
+
+test "cold load coordination reuses an attached runtime without a fallback" {
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.attachIo(std.testing.io);
+    manager.lockLoadedModels();
+    defer manager.unlockLoadedModels();
+    try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+    try std.testing.expect(manager.owned_load_runtime == null);
+}
+
+test "ColQwen query forward observes managed backend cancellation after tokenization" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{});
+    defer handle.release();
+    var trace = LoadCancellationTrace{};
+    var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+    defer compute.deinit();
+    trace.fail_at = trace.checks + 1;
+    // No pipeline-level control: only the managed backend can stop this
+    // forward after tokenization, at its first weight operation.
+    try std.testing.expectError(error.Cancelled, @import("../pipelines/multimodal_reranker_colqwen_impl.zig").encodeQuery(
+        &compute.backend,
+        allocator,
+        handle.get().getTokenizer(),
+        .{},
+        .{ .hidden_size = 4, .vocab_size = 16, .num_hidden_layers = 1, .num_attention_heads = 2 },
+        "a",
+        16,
+        false,
+        null,
+    ));
+    try std.testing.expectEqual(trace.fail_at.?, trace.checks);
+}
+
+test "cold load rollback owns manifest and constructed session before cancellation checkpoints" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var checkpoints: [3]usize = undefined;
+    for (0..4) |iteration| {
+        var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+        defer manager.deinit();
+        manager.configureServingPolicy(.{ .allow_unknown = true });
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+        try manager.ensureResourceOwnerReady();
+        var trace = LoadCancellationTrace{ .fail_at = if (iteration == 0) null else checkpoints[iteration - 1] };
+        const result = manager.loadFromDirUncached(root, &manager.session_manager, true, null, trace.control());
+        if (iteration == 0) {
+            var handle = try result;
+            defer handle.release();
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+            // The final checkpoint is after ownership has moved into the
+            // unpublished model, including any speculative preparation.
+            checkpoints = .{ trace.after_manifest, trace.after_session, trace.checks };
+            try std.testing.expect(checkpoints[0] > 0 and checkpoints[1] > checkpoints[0]);
+            try std.testing.expect(checkpoints[2] > checkpoints[1]);
+            var compute = try session_factory.getComputeBackendWithControl(handle.get().session, allocator, trace.control());
+            defer compute.deinit();
+            trace.fail_at = trace.checks + 1;
+            try std.testing.expectError(error.Cancelled, compute.backend.checkExecutionControl());
+        } else {
+            try std.testing.expectError(error.Cancelled, result);
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "load flight waiter exits release retirement reservations and admission" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+
+    const Exit = enum { cancel_during_wait, cancel_after_completion, adopt };
+    const Cancellation = struct {
+        manager: *ModelManager,
+        flight: *LoadFlight,
+        model: *LoadedModel,
+        publish_before_cancel: bool,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.publish_before_cancel) {
+                // Deterministically interleave completion and retirement after
+                // the waiter observed an incomplete flight, before it exits.
+                self.manager.finishLoadFlight(self.flight, self.model, null);
+                self.manager.retireLoadedModel(self.model);
+            }
+            return error.Cancelled;
+        }
+    };
+
+    for ([_]bool{ false, true }) |task_ref_pending| {
+        for ([_]Exit{ .cancel_during_wait, .cancel_after_completion, .adopt }) |exit| {
+            var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+            defer manager.deinit();
+            manager.configureServingPolicy(.{ .allow_unknown = true });
+            manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+            try manager.ensureResourceOwnerReady();
+            var keeper = try manager.loadFromDirUncached(root, &manager.session_manager, true, null, null);
+            defer keeper.release();
+            const model = keeper.get();
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > 0);
+
+            const flight = try allocator.create(LoadFlight);
+            flight.* = .{
+                .io = std.testing.io,
+                .refs = 1 + @as(usize, @intFromBool(task_ref_pending)),
+                .task_ref_pending = task_ref_pending,
+            };
+            try manager.in_flight_loads.put(allocator, try allocator.dupe(u8, "flight"), flight);
+            // The task can drop its reference either before or after the
+            // waiter. Only waiter references own retirement reservations.
+            defer if (task_ref_pending) manager.releaseLoadFlight("flight", flight);
+            var cancellation = Cancellation{
+                .manager = &manager,
+                .flight = flight,
+                .model = model,
+                .publish_before_cancel = exit == .cancel_during_wait,
+            };
+            if (exit != .cancel_during_wait) {
+                manager.finishLoadFlight(flight, model, null);
+                manager.retireLoadedModel(model);
+            }
+            const result = manager.waitForLoadFlight("flight", flight, if (exit == .adopt) null else .{
+                .ptr = &cancellation,
+                .check_fn = Cancellation.check,
+            });
+            if (exit == .adopt) {
+                var adopted = try result;
+                try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+                adopted.release();
+            } else {
+                try std.testing.expectError(error.Cancelled, result);
+            }
+            try std.testing.expectEqual(@as(usize, 0), manager.in_flight_loads.count());
+            try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+            try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+            keeper.release();
+            // This proves that cancellation releases the native model and its
+            // lease, not merely that it removes the flight from the registry.
+            try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "optional session adoption owns rollback and transfers admission exactly once" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var final_check: usize = 0;
+    for (0..2) |iteration| {
+        var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+        defer manager.deinit();
+        manager.configureServingPolicy(.{ .allow_unknown = true });
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024 });
+        try manager.ensureResourceOwnerReady();
+        var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+        defer primary.deinit();
+        const baseline = manager.admissionController().snapshot();
+        var model: LoadedModel = undefined;
+        model.allocator = allocator;
+        model.session = primary.session;
+        model.session_manager = &manager.session_manager;
+        model.model_manager = &manager;
+        model.kernel_jit_profile_bundle = null;
+        var slot: ?backends.Session = null;
+        var lease_slot: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (lease_slot) |*lease| lease.release();
+        defer if (slot) |session| session.close();
+        var trace = LoadCancellationTrace{ .fail_at = if (iteration == 0) null else final_check };
+        const result = model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease_slot, root, trace.control());
+        if (iteration == 0) {
+            try std.testing.expect(try result);
+            final_check = trace.checks;
+            try std.testing.expect(slot != null and lease_slot != null);
+            try std.testing.expect(manager.admissionController().snapshot().host_weight_bytes > baseline.host_weight_bytes);
+            // Already-adopted components must not load or reserve again.
+            try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease_slot, root, .{}));
+        } else {
+            try std.testing.expectError(error.Cancelled, result);
+            try std.testing.expect(slot == null and lease_slot == null);
+            try std.testing.expectEqual(baseline, manager.admissionController().snapshot());
+        }
+    }
+}
+
+test "component construction arms cancellation before backend entry and releases admission on failure" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    const Boundary = struct {
+        manager: *ModelManager,
+        arms: usize = 0,
+        fn arm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.manager.admissionController().snapshot().host_weight_bytes > 0);
+            self.arms += 1;
+            return error.OutOfMemory;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed constructor guard cannot be disarmed");
+        }
+    };
+    var boundary = Boundary{ .manager = &manager };
+    for (0..3) |_| {
+        try std.testing.expectError(error.ProcessIsolationRequired, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{}));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        try std.testing.expectError(error.OutOfMemory, manager.loadManagedSessionWithAdmission(root, &.{.metal}, null, .{
+            .hard_cancellation = .{ .ptr = &boundary, .arm_fn = Boundary.arm, .disarm_fn = Boundary.disarm },
+        }));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    }
+    try std.testing.expectEqual(@as(usize, 3), boundary.arms);
+}
+
+test "managed constructors retain cooperative fallback without a process boundary" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{ .metal, .native },
+        .process_isolation_available = false,
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    var man = try manifest_mod.loadFromDir(allocator, root);
+    defer man.deinit();
+    for ([_]bool{ false, true }) |component| {
+        var loaded = if (component)
+            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{})
+        else
+            try loadSessionForPreferredBackends(&manager, &.{ .metal, .native }, root, man, &manager.session_manager, .{});
+        try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
+        loaded.deinit();
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    }
+}
+
+test "preferred load attempt releases admission on cancellation and guard failure" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // Admission only needs artifact bytes. These cases must fail before any
+    // backend constructor sees the deliberately invalid artifact.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "weights.bin", .data = "weights" });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "weights.bin" });
+    defer allocator.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = allocator, .onnx_path = path };
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.required_backend = null;
+    sessions.required_backend_invalid = false;
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{});
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1024, .backend_limit_bytes = 1024 });
+    try manager.ensureResourceOwnerReady();
+
+    const Hooks = struct {
+        fn cancelAfterAdmission(raw: ?*anyopaque) !void {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw.?));
+            if (owner.admissionController().snapshot().host_weight_bytes > 0) return error.Timeout;
+        }
+        fn failArm(raw: *anyopaque, _: execution_control_mod.MonitorControl) !u64 {
+            const owner: *ModelManager = @ptrCast(@alignCast(raw));
+            try std.testing.expect(owner.admissionController().snapshot().host_weight_bytes > 0);
+            return error.OutOfMemory;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed arm must not be disarmed");
+        }
+    };
+    const controls = [_]InferenceExecutionControl{
+        .{},
+        .{ .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
+        .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
+    };
+    const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
+    // Metal and CPU ONNX have the same process-required construction contract;
+    // use Metal's runtime descriptor so this test needs no optional ORT install.
+    for (0..3) |_| for (controls, errors) |control, expected| {
+        try std.testing.expectError(expected, loadSessionForPreferredBackends(
+            &manager,
+            &.{.metal},
+            root,
+            man,
+            &sessions,
+            control,
+        ));
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    };
 }
 
 fn loadErrorPriority(err: anyerror) u2 {
@@ -8830,6 +10366,61 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
 }
 
+test "composite decoder selection qualifies optional merged artifacts and pins fallback" {
+    const allocator = std.testing.allocator;
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name|
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"t5","vocab_size":4,"d_model":4,"decoder_start_token_id":0}
+    });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"}],"model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
+    defer allocator.free(paths.encoder);
+    defer allocator.free(paths.decoder);
+    var sessions = backends.SessionManager.init(allocator);
+    sessions.preferred_backends = &.{.native};
+    var manager = ModelManager.init(allocator, sessions);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    var first = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer first.release();
+    try std.testing.expect(first.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, first.get().decoder_execution);
+    // The unqualified graph is fingerprinted, but never enters executable
+    // backend policy (or its heavyweight session construction).
+    var plans = manager.component_plan_cache.valueIterator();
+    while (plans.next()) |entry| {
+        if (entry.*.allowed_backend_count == 0) continue;
+        for (entry.*.dependencies) |dependency|
+            try std.testing.expect(!std.mem.endsWith(u8, dependency, "decoder_model_merged.onnx"));
+    }
+    var second = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer second.release();
+    try std.testing.expect(first.get() == second.get());
+    try manager.validateCompositeAssetsCurrent(&first, root, &.{ paths.encoder, paths.decoder });
+    // Invalid optional publication cannot displace the working ordinary graph.
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });
+    var fallback = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
+    defer fallback.release();
+    try std.testing.expect(!fallback.get().considered_merged_decoder);
+    try std.testing.expectEqual(.full_prefix, fallback.get().decoder_execution);
+    try std.testing.expect(first.get() != fallback.get());
+}
+
 test "split Whisper assets remain model-lifetime cached across request handles" {
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
@@ -8871,12 +10462,12 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
     defer manager.deinit();
     manager.configureModelCache(0, 2);
 
-    var first = try manager.acquireWhisperCompositeAssets(root, &.{});
+    var first = try manager.acquireCompositeAssets(root, &.{});
     defer first.release();
     const cached = first.get();
     try std.testing.expectEqual(@as(usize, 99), cached.decoder_config.max_length);
     try std.testing.expectEqual(@as(i32, 7), cached.decoder_config.decoder_start_token_id);
-    try std.testing.expectEqual(@as(usize, 2), cached.prompt_cache.language_tokens.len);
+    try std.testing.expectEqual(@as(usize, 2), cached.prompt_cache.?.language_tokens.len);
 
     // A republished directory gets a distinct immutable generation even while
     // requests still hold the previous tokenizer and prompt metadata.
@@ -8892,32 +10483,140 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
         \\{"decoder_start_token_id":17,"eos_token_id":8,"max_length":77}
         ,
     });
-    var second = try manager.acquireWhisperCompositeAssets(root, &.{});
+    var second = try manager.acquireCompositeAssets(root, &.{});
     defer second.release();
     try std.testing.expect(cached != second.get());
     try std.testing.expectEqual(@as(i32, 17), second.get().decoder_config.decoder_start_token_id);
     try std.testing.expectEqual(@as(usize, 77), second.get().decoder_config.max_length);
-    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
+    try std.testing.expectEqual(@as(usize, 2), manager.composite_assets.count());
     try std.testing.expectError(
         error.ModelArtifactsChanging,
-        manager.validateWhisperAssetsCurrent(&first, root, &.{}),
+        manager.validateCompositeAssetsCurrent(&first, root, &.{}),
     );
-    try manager.validateWhisperAssetsCurrent(&second, root, &.{});
+    try manager.validateCompositeAssetsCurrent(&second, root, &.{});
 
     // Capacity pressure cannot invalidate an entry while either request holds it.
     try std.testing.expectError(
         error.ResourceTemporarilyUnavailable,
-        manager.acquireWhisperCompositeAssets(other_root, &.{}),
+        manager.acquireCompositeAssets(other_root, &.{}),
     );
     second.release();
     first.release();
 
     // Once idle, the oldest generation is reclaimable and all admission-owned
     // tokenizer memory moves to the replacement entry.
-    var replacement = try manager.acquireWhisperCompositeAssets(other_root, &.{});
+    var replacement = try manager.acquireCompositeAssets(other_root, &.{});
     defer replacement.release();
-    try std.testing.expectEqual(@as(usize, 2), manager.whisper_assets.count());
+    try std.testing.expectEqual(@as(usize, 2), manager.composite_assets.count());
     try std.testing.expectEqual(@as(usize, 88), replacement.get().decoder_config.max_length);
+
+    // Publish a fake component pair through the real runtime cache. Warm
+    // acquisition must lend the exact sessions, and device pressure must see
+    // component leases even though the tokenizer resides in the CPU domain.
+    const Probe = struct {
+        closes: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &.{ .run = undefined, .runWithControl = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = close } };
+        }
+    };
+    var probe = Probe{};
+    var controller = runtime.tier.memory.AdmissionController{};
+    const metadata_key = try manager.compositeRuntimeKey(root, &.{}, .whisper_metadata);
+    const runtime_key = try manager.compositeRuntimeKey(root, &.{}, .seq2seq);
+    try std.testing.expect(!std.mem.eql(u8, &metadata_key, &runtime_key));
+    const candidate = try manager.loadCompositeAssetsUncached(root, &.{}, metadata_key, .whisper_metadata, null);
+    candidate.prompt_cache.?.deinit();
+    candidate.prompt_cache = null;
+    candidate.generation = runtime_key;
+    candidate.kind = .seq2seq;
+    candidate.encoder = .{ .session = probe.session(), .resource_lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = 256 }, false) };
+    candidate.decoder = .{ .session = probe.session(), .resource_lease = null };
+    var published = try manager.publishCompositeAssets(runtime_key, candidate);
+    defer published.release();
+    var warm = try manager.acquireCompositeRuntime(root, &.{}, .seq2seq, null);
+    defer warm.release();
+    try std.testing.expectEqual(published.get(), warm.get());
+    try std.testing.expectEqual(candidate.encoder.?.session.ptr, warm.get().encoder.?.session.ptr);
+    manager.lockLoadedModels();
+    const pinned = manager.takeLruCompositeAssetsForAdmissionLocked(.{ .domain_backend = .gpu });
+    manager.unlockLoadedModels();
+    try std.testing.expect(pinned == null);
+    warm.release();
+    published.release();
+    manager.lockLoadedModels();
+    const evicted = manager.takeLruCompositeAssetsForAdmissionLocked(.{ .domain_backend = .gpu });
+    manager.unlockLoadedModels();
+    try std.testing.expect(evicted != null);
+    manager.destroyEvictedCompositeAssets(evicted.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.closes);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "composite cold load cancellation abandons only the departing waiter" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const flight = try std.testing.allocator.create(CompositeAssetsLoadFlight);
+    const key = [_]u8{0} ** 32;
+    flight.* = .{ .io = std.testing.io, .refs = 3, .load_state = .{ .io = std.testing.io } };
+    try std.testing.expect(flight.load_state.tryAddWaiter());
+    try manager.in_flight_composite_assets.put(std.testing.allocator, key, flight);
+    const Canceled = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, manager.waitForCompositeAssetsLoadFlight(key, flight, .{ .check_fn = Canceled.check }));
+    var load_control = LoadFlightControl{ .flight = &flight.load_state };
+    try load_control.control().check();
+    try std.testing.expectEqual(@as(usize, 2), flight.refs);
+    manager.finishCompositeAssetsLoadFlight(flight, null, error.TestLoadFailure);
+    try std.testing.expectError(error.TestLoadFailure, manager.waitForCompositeAssetsLoadFlight(key, flight, null));
+    manager.releaseCompositeAssetsLoadFlight(key, flight);
+    try std.testing.expectEqual(@as(usize, 0), manager.in_flight_composite_assets.count());
+}
+
+test "failed load flights allow immediate retry before the old task releases" {
+    const alloc = std.testing.allocator;
+    var manager = ModelManager.init(alloc, backends.SessionManager.init(alloc));
+    defer manager.deinit();
+    const key = [_]u8{1} ** 32;
+    const old = try alloc.create(CompositeAssetsLoadFlight);
+    old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, old);
+    manager.finishCompositeAssetsLoadFlight(old, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForCompositeAssetsLoadFlight(key, old, null));
+    manager.lockLoadedModels();
+    const joinable = manager.joinableCompositeLoadFlightLocked(key);
+    manager.unlockLoadedModels();
+    try std.testing.expect(joinable == null);
+    try std.testing.expect(!old.registered);
+    const replacement = try alloc.create(CompositeAssetsLoadFlight);
+    replacement.* = .{ .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    try manager.in_flight_composite_assets.put(alloc, key, replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, old);
+    try std.testing.expect(manager.in_flight_composite_assets.get(key).? == replacement);
+    manager.releaseCompositeAssetsLoadFlight(key, replacement);
+
+    const old_model = try alloc.create(LoadFlight);
+    old_model.* = .{ .io = std.testing.io };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), old_model);
+    manager.finishLoadFlight(old_model, null, error.ResourceTemporarilyUnavailable);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForLoadFlight("retry", old_model, null));
+    manager.lockLoadedModels();
+    const model_joinable = manager.joinableLoadFlightLocked("retry");
+    manager.unlockLoadedModels();
+    try std.testing.expect(model_joinable == null);
+    try std.testing.expect(!old_model.registered);
+    const new_model = try alloc.create(LoadFlight);
+    new_model.* = .{ .io = std.testing.io, .refs = 1 };
+    try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), new_model);
+    manager.releaseLoadFlight("retry", old_model);
+    try std.testing.expect(manager.in_flight_loads.get("retry").? == new_model);
+    manager.releaseLoadFlight("retry", new_model);
 }
 
 test "component compatibility rejects malformed directory-backed native artifacts" {
@@ -9076,10 +10775,13 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
 
     // Updating a child in place does not change the component directory's
     // identity. The external-data file itself must invalidate the cached plan.
+    const composite_generation = try manager.compositeAssetGenerationSignature(root, &.{root});
+    try std.testing.expectEqualSlices(u8, &composite_generation, &(try manager.compositeAssetGenerationSignature(root, &.{root})));
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "visual_model.data",
         .data = "truncated",
     });
+    try std.testing.expectError(error.IncompatibleModel, manager.compositeAssetGenerationSignature(root, &.{root}));
     try std.testing.expectError(
         error.IncompatibleModel,
         manager.componentLoaderForPathsWithContract(
@@ -9194,9 +10896,18 @@ test "projector residency follows its request-scoped lifecycle" {
         decoder_bytes,
         try estimateModelArtifactBytes(man, .native),
     );
-    const request = try projectorRunAdmissionAmounts(man);
+    const request = try projectorRunAdmissionAmounts(man, .native, .{});
     try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
     try std.testing.expectEqual(projector_bytes, request.hostTotalBytes());
+
+    const metal_request = try projectorRunAdmissionAmounts(man, .metal, .{
+        .host_scratch_bytes = 32,
+        .backend_scratch_bytes = 64,
+    });
+    try std.testing.expectEqual(projector_bytes, metal_request.host_weight_bytes);
+    try std.testing.expectEqual(projector_bytes, metal_request.backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 32), metal_request.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 64), metal_request.backend_scratch_bytes);
 }
 
 test "onnx admission separates encoded staging from completed residency" {
@@ -9369,11 +11080,16 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
         .{ .manager = &manager, .path = dir_path },
         .{ .manager = &manager, .path = dir_path },
     };
-    var threads: [workers.len]std.Thread = undefined;
-    for (&workers, 0..) |*worker, i| {
-        threads[i] = try std.Thread.spawn(.{}, ColdLoadWorker.run, .{worker});
+    var threads: [workers.len]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (&threads) |*thread| thread.join();
+    for (&workers, 0..) |*worker, i| {
+        threads[i] = try std.testing.io.concurrent(ColdLoadWorker.run, .{worker});
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (workers) |worker| {
         try std.testing.expect(worker.err == null);
         try std.testing.expect(worker.model == workers[0].model);
@@ -9389,7 +11105,34 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try std.testing.expectError(error.MissingSpecialTokenIds, pipeline.recognizeBatch(&.{"hello"}, &.{"person"}));
 }
 
-test "ModelManager serving policy fails closed before loading generator weights" {
+test "ModelManager strict serving policy rejects unknown generator architectures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"generator\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"brand_new_decoder\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(dir_path);
+
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{.native},
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = false });
+
+    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
+}
+
+test "ModelManager default serving policy still rejects a generator without a loadable artifact" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9413,37 +11156,10 @@ test "ModelManager serving policy fails closed before loading generator weights"
     defer manager.deinit();
     manager.configureServingPolicy(.{});
 
-    try std.testing.expectError(error.UnknownModelCompatibility, manager.loadFromDir(dir_path));
-}
-
-test "unknown opt in still rejects a generator without a loadable artifact" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"generator\"}",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "config.json",
-        .data = "{\"model_type\":\"brand_new_decoder\"}",
-    });
-
-    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(dir_path);
-
-    var manager = ModelManager.init(allocator, .{
-        .allocator = allocator,
-        .preferred_backends = &.{.native},
-    });
-    defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
-
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
 
-test "unknown opt in does not enable a known incompatible generator" {
+test "ModelManager default serving policy does not enable a known incompatible generator" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9465,7 +11181,7 @@ test "unknown opt in does not enable a known incompatible generator" {
         .preferred_backends = &.{.native},
     });
     defer manager.deinit();
-    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureServingPolicy(.{});
 
     try std.testing.expectError(error.IncompatibleModel, manager.loadFromDir(dir_path));
 }
@@ -10045,6 +11761,62 @@ fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
+/// Qwen3-Embedding-shaped tokenizer metadata: bos and eos share one id
+/// (<|endoftext|>), add_bos_token=false, add_eos_token=true. The historical
+/// bos->cls mapping would wrap encodeForModel sequences with a leading eos
+/// the HF reference never emits.
+fn buildTestGgufWithQwen3EmbeddingTokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 9);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "hello",
+        "world",
+        "<|endoftext|>",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 2);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", false);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+test "load huggingface tokenizer from gguf qwen3 embedding metadata wraps eos only" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3EmbeddingTokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gguf_path = try std.fs.path.join(allocator, &.{ model_dir, "qwen3-embedding-q8_0.gguf" });
+    defer allocator.free(gguf_path);
+
+    var tok = try loadHuggingFaceTokenizerFromDirOrGguf(allocator, model_dir, gguf_path);
+    defer tok.deinitSelf();
+
+    var encoded = try tok.tokenizer().encodeForModel(allocator, "hello", 4);
+    defer encoded.deinit();
+
+    // No leading token; one trailing <|endoftext|>; padding masked out.
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 2, 2 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 0, 0 }, encoded.attention_mask);
+}
+
 fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -10153,4 +11925,20 @@ fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
+}
+
+test "offline load runtime supplies a real hard cancellation boundary only for disposable processes" {
+    const alloc = std.testing.allocator;
+    var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
+    defer manager.deinit();
+    try std.testing.expect(try manager.offlineLoadBoundaryLocked(std.testing.io) == null);
+    try std.testing.expect(manager.owned_load_watchdog == null);
+    manager.session_manager.process_isolation_available = true;
+    const boundary = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
+    const again = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
+    try std.testing.expectEqual(boundary.ptr, again.ptr);
+    const control = InferenceExecutionControl{ .hard_cancellation = boundary };
+    var guard = try control.enterUninterruptible(.process_required);
+    guard.deinit();
+    try std.testing.expectEqual(@as(usize, 0), manager.owned_load_watchdog.?.entries.items.len);
 }

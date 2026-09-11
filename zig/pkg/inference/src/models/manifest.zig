@@ -29,30 +29,44 @@ const managed_receipt = @import("../registry/managed_receipt.zig");
 const build_options = @import("build_options");
 const jinja = @import("jinja");
 
+pub const qwen3_vl_gguf_bundle_family = "qwen3_vl_gguf_bundle/v1";
+pub const qwen3_vl_safetensors_bundle_family = "qwen3_vl_safetensors_bundle/v1";
+pub const qwen3_vl_reranker_gguf_bundle_family = "qwen3_vl_reranker_gguf_bundle/v1";
+pub const qwen3_vl_reranker_safetensors_bundle_family = "qwen3_vl_reranker_safetensors_bundle/v1";
+
 /// Built-in chat template for Gemma 4 models (uses <|turn>/<turn|> tokens).
-/// Applied when tokenizer_config.json has sot_token=<|turn> but no
-/// chat_template, and when GGUF metadata carries the upstream tool template
-/// that requires Jinja features outside our rendering subset.
+/// Applied only when tokenizer_config.json has sot_token=<|turn> but no
+/// chat_template. Artifact-provided templates retain their tool protocol.
 const gemma4_chat_template =
     "{{ bos_token }}" ++
+    "{%- if enable_thinking is defined and enable_thinking -%}" ++
+    "{{ '<|turn>system\\n<|think|>\\n' }}" ++
+    "{%- elif messages[0]['role'] == 'system' -%}" ++
+    "{{ '<|turn>system\\n' }}" ++
+    "{%- endif -%}" ++
     "{%- if messages[0]['role'] == 'system' -%}" ++
     "{%- if messages[0]['content'] is string -%}" ++
-    "{%- set first_user_prefix = messages[0]['content'] + '\\n\\n' -%}" ++
+    "{{ messages[0]['content'] }}" ++
     "{%- else -%}" ++
-    "{%- set first_user_prefix = messages[0]['content'][0]['text'] + '\\n\\n' -%}" ++
+    "{{ messages[0]['content'][0]['text'] }}" ++
     "{%- endif -%}" ++
     "{%- set loop_messages = messages[1:] -%}" ++
     "{%- else -%}" ++
-    "{%- set first_user_prefix = \"\" -%}" ++
     "{%- set loop_messages = messages -%}" ++
     "{%- endif -%}" ++
+    "{%- if (enable_thinking is defined and enable_thinking) or messages[0]['role'] == 'system' -%}" ++
+    "{{ '<turn|>\\n' }}" ++
+    "{%- endif -%}" ++
     "{%- for message in loop_messages -%}" ++
+    "{%- if message['tool_calls'] or message['role'] == 'tool' -%}" ++
+    "{{ raise_exception('Tool history requires an artifact-provided Gemma 4 chat template') }}" ++
+    "{%- endif -%}" ++
     "{%- if (message['role'] == 'assistant') -%}" ++
     "{%- set role = \"model\" -%}" ++
     "{%- else -%}" ++
     "{%- set role = message['role'] -%}" ++
     "{%- endif -%}" ++
-    "{{ '<|turn>' + role + '\\n' + (first_user_prefix if loop.first else \"\") }}" ++
+    "{{ '<|turn>' + role + '\\n' }}" ++
     "{%- if message['content'] is string -%}" ++
     "{{ message['content'] | trim }}" ++
     "{%- elif message['content'] is iterable -%}" ++
@@ -69,11 +83,7 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
-    "{%- if enable_thinking is defined and not enable_thinking -%}" ++
-    "{{ '<|turn>model\\n<|channel>final\\n<channel|>' }}" ++
-    "{%- else -%}" ++
-    "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
-    "{%- endif -%}" ++
+    "{{ '<|turn>model\\n' }}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -114,6 +124,78 @@ pub const PoolingStrategy = enum {
     last,
 };
 
+/// Qwen3-Embedding model-card default retrieval instruction, used for
+/// query-side inputs when the checkpoint ships no sentence-transformers
+/// prompts (matches sentence-transformers' `prompts.query` for the official
+/// repo, so GGUF and safetensors deployments embed queries identically).
+pub const qwen3_embedding_default_query_prefix =
+    "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:";
+pub const qwen3_embedding_instruction_template = "Instruct: {instruction}\nQuery:";
+
+/// Whether retrieval roles are interchangeable, backed by a resolved profile,
+/// or known to require a profile that could not be resolved. `required` is a
+/// fail-closed intermediate state: model admission must reject it.
+pub const EmbeddingTaskContract = enum {
+    symmetric,
+    profiled,
+    required,
+};
+
+pub const EmbeddingTransform = struct {
+    prefix: []const u8 = "",
+    declared: bool = false,
+};
+
+/// Data-driven rendering contract for the text presented to an embedding
+/// model. Execution details such as decoder pooling remain in EmbeddingStyle;
+/// this profile owns only query/document semantics.
+pub const EmbeddingProfile = struct {
+    task_contract: EmbeddingTaskContract = .symmetric,
+    query: EmbeddingTransform = .{},
+    document: EmbeddingTransform = .{},
+    /// Query prefix template containing exactly one `{instruction}` marker.
+    /// It is used only when a request overrides the model's default task text.
+    instruction_template: []const u8 = "",
+
+    fn deinit(self: *EmbeddingProfile, allocator: std.mem.Allocator) void {
+        if (self.query.prefix.len > 0) allocator.free(self.query.prefix);
+        if (self.document.prefix.len > 0) allocator.free(self.document.prefix);
+        if (self.instruction_template.len > 0) allocator.free(self.instruction_template);
+        self.* = .{};
+    }
+
+    pub fn isResolved(self: EmbeddingProfile) bool {
+        return self.task_contract == .profiled and self.query.declared and self.document.declared;
+    }
+};
+
+/// Which decoder-embedder execution convention the manifest resolved to.
+/// Styles select pooling/EOS/runtime behavior and suppress the generative-arch
+/// model-type flip. Query/document text rendering belongs to EmbeddingProfile.
+pub const EmbeddingStyle = enum {
+    none,
+    /// Jina embeddings v5 decoder execution and last-token pooling.
+    jina_v5,
+    /// Qwen3-Embedding trailing-EOS last-token pooling.
+    qwen3_embedding,
+};
+
+/// Tracks which executable fields were declared by Antfly-owned
+/// model_manifest.json metadata. Upstream config, artifact metadata, and
+/// SentenceTransformers sidecars may fill undeclared values, but must never
+/// replace these fields.
+pub const ModelManifestDeclarations = struct {
+    model_type: bool = false,
+    inputs: bool = false,
+    pooling: bool = false,
+    normalize: bool = false,
+    embedding_profile: bool = false,
+    embedding_task_contract: bool = false,
+    embedding_query_prefix: bool = false,
+    embedding_document_prefix: bool = false,
+    embedding_style: bool = false,
+};
+
 pub const Sparse3DOutputLayout = enum {
     batch_seq,
     seq_batch,
@@ -126,6 +208,12 @@ pub const NativeArchHint = enum {
     clap,
     florence,
     layoutlmv3,
+};
+
+pub const VisionResample = enum {
+    nearest,
+    bilinear,
+    bicubic,
 };
 
 /// Primary native weight source selected consistently by compatibility,
@@ -161,6 +249,9 @@ pub const listing_compatibility_sidecars = [_][]const u8{
     "clip_config.json",
     "special_tokens_map.json",
     "1_SpladePooling/config.json",
+    "modules.json",
+    "1_Pooling/config.json",
+    "config_sentence_transformers.json",
 };
 
 /// Resolved model configuration loaded from a model directory.
@@ -212,9 +303,17 @@ pub const ModelManifest = struct {
     // Pipeline config
     pooling: PoolingStrategy = .mean,
     normalize: bool = true,
-    embedding_text_prefix: []const u8 = "",
+    embedding_profile: EmbeddingProfile = .{},
+    embedding_style: EmbeddingStyle = .none,
+    model_manifest_declarations: ModelManifestDeclarations = .{},
     sparse_3d_output_layout: ?Sparse3DOutputLayout = null,
     native_arch_hint: NativeArchHint = .none,
+    /// Fixed spatial input owned by the resolved vision preprocessor. These
+    /// remain null for dynamic or unrecognized processors; callers must never
+    /// infer a default merely from image modality.
+    vision_target_width: ?u32 = null,
+    vision_target_height: ?u32 = null,
+    vision_resample: VisionResample = .bilinear,
 
     // Classification / NER
     num_labels: u32 = 0,
@@ -293,7 +392,7 @@ pub const ModelManifest = struct {
             self.allocator.free(labels);
         }
         if (self.chat_template) |t| self.allocator.free(t);
-        if (self.embedding_text_prefix.len > 0) self.allocator.free(self.embedding_text_prefix);
+        self.embedding_profile.deinit(self.allocator);
         if (self.gliner_model_type.len > 0) self.allocator.free(self.gliner_model_type);
         if (self.config_model_arch.len > 0) self.allocator.free(self.config_model_arch);
         if (self.gliner_default_labels.len > 0) {
@@ -320,6 +419,31 @@ pub const ModelManifest = struct {
         if (self.eos_token.len > 0) self.allocator.free(self.eos_token);
         if (self.unk_token.len > 0) self.allocator.free(self.unk_token);
         if (self.pad_token.len > 0) self.allocator.free(self.pad_token);
+    }
+
+    /// True when this manifest resolves to a decoder-style last-token
+    /// embedder (Qwen3-Embedding, Jina v5) eligible for the resident Qwen3
+    /// embedding path and query/document prefix handling.
+    pub fn isLastTokenDecoderEmbedder(self: *const ModelManifest) bool {
+        if (self.embedding_style != .none) return self.model_type == .embedder;
+        // Legacy heuristic kept for manifests written before embedding_style
+        // existed: Jina v5's last pooling + document prefix pairing.
+        return self.pooling == .last and
+            std.mem.eql(u8, self.embedding_profile.document.prefix, "Document: ");
+    }
+
+    /// Query-side prefix for retrieval-query task types. Qwen3-Embedding
+    /// manifests without sentence-transformers prompts (e.g. bare GGUF
+    /// bundles) fall back to the model card's default retrieval instruction.
+    pub fn queryPrefix(self: *const ModelManifest) []const u8 {
+        return self.embedding_profile.query.prefix;
+    }
+
+    /// True when retrieval task roles alter the text presented to the model.
+    /// Decoder execution style and task prefixing are deliberately separate:
+    /// encoder models such as Nomic can require query/document prefixes too.
+    pub fn hasEmbeddingTaskProfile(self: *const ModelManifest) bool {
+        return self.embedding_profile.isResolved();
     }
 
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
@@ -353,7 +477,8 @@ pub const ModelManifest = struct {
         return self.isSplitGlinerBundle() or
             std.mem.eql(u8, self.inference_bundle_family, "colqwen2_gguf_bundle/v1") or
             self.isClipclapGgufBundle() or
-            self.isFlorence2GgufBundle();
+            self.isFlorence2GgufBundle() or
+            self.isQwen3VlGgufBundle();
     }
 
     pub fn prefersGenerationEncodingForLateInteraction(self: *const ModelManifest) bool {
@@ -413,6 +538,66 @@ pub const ModelManifest = struct {
         return self.gguf_path == null or
             self.config_path == null or
             self.model_manifest_path == null or
+            self.tokenizer_json_path == null or
+            self.tokenizer_config_path == null or
+            self.preprocessor_config_path == null;
+    }
+
+    pub fn isQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_gguf_bundle_family) or
+            self.isQwen3VlRerankerGgufBundle();
+    }
+
+    pub fn isQwen3VlRerankerGgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_gguf_bundle_family);
+    }
+
+    pub fn isQwen3TextReranker(self: *const ModelManifest) bool {
+        return self.model_type == .reranker and self.usesGgufWeights() and
+            std.mem.eql(u8, self.config_model_arch, "qwen3");
+    }
+
+    pub fn isQwen3VlRerankerSafetensorsBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
+    }
+
+    pub fn isQwen3VlGenerationSafetensorsBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_safetensors_bundle_family);
+    }
+
+    pub fn isQwen3VlReranker(self: *const ModelManifest) bool {
+        return self.isQwen3VlRerankerGgufBundle() or
+            self.isQwen3VlRerankerSafetensorsBundle() or
+            (self.model_type == .reranker and
+                (std.mem.eql(u8, self.config_model_arch, "qwen3_vl") or
+                    std.mem.eql(u8, self.config_model_arch, "qwen3vl")));
+    }
+
+    pub fn isQwen3VlBundle(self: *const ModelManifest) bool {
+        return self.isQwen3VlGgufBundle() or
+            self.isQwen3VlGenerationSafetensorsBundle() or
+            self.isQwen3VlRerankerSafetensorsBundle();
+    }
+
+    pub fn hasIncompleteQwen3VlGgufBundle(self: *const ModelManifest) bool {
+        if (self.isQwen3VlGenerationSafetensorsBundle()) {
+            return self.safetensors_path == null or
+                self.config_path == null or
+                self.tokenizer_json_path == null or
+                self.tokenizer_config_path == null or
+                self.preprocessor_config_path == null;
+        }
+        if (self.isQwen3VlRerankerSafetensorsBundle()) {
+            return self.safetensors_path == null or
+                self.config_path == null or
+                self.tokenizer_json_path == null or
+                self.tokenizer_config_path == null or
+                self.preprocessor_config_path == null;
+        }
+        if (!self.isQwen3VlGgufBundle()) return false;
+        return self.gguf_path == null or
+            self.gguf_projector_path == null or
+            self.config_path == null or
             self.tokenizer_json_path == null or
             self.tokenizer_config_path == null or
             self.preprocessor_config_path == null;
@@ -496,6 +681,21 @@ fn ignoreNonResourceMetadataError(result: anytype) !void {
     };
 }
 
+/// Antfly contracts distinguish an unsupported family from a broken known family.
+const BundleParseResult = enum { applied, unsupported_family };
+
+fn parseBundleObject(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(std.json.Value) {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidInferenceBundle,
+    };
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return error.InvalidInferenceBundle;
+    }
+    return parsed;
+}
+
 const ArtifactCatalog = struct {
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
@@ -552,9 +752,9 @@ const ArtifactCatalog = struct {
         };
     }
 
-    fn exists(self: *const ArtifactCatalog, relative_path: []const u8) bool {
+    fn exists(self: *const ArtifactCatalog, relative_path: []const u8) !bool {
         if (self.receipt != null) return self.find(relative_path) != null;
-        return c_file.fileExistsInDir(self.allocator, self.model_dir_path, relative_path);
+        return c_file.fileExistsInDirChecked(self.allocator, self.model_dir_path, relative_path);
     }
 
     fn resolve(self: *const ArtifactCatalog, relative_path: []const u8) !?[]u8 {
@@ -710,6 +910,8 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
             direct.catalog.model_dir_path,
             manifest.gguf_path.?,
         ));
+        try applyImplicitModelTypeHints(&manifest, model_dir_path);
+        try finalizeEmbeddingProfile(&manifest);
         return manifest;
     }
 
@@ -747,18 +949,32 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
             try ignoreNonResourceMetadataError(parseConfigJson(&manifest, allocator, config_bytes));
         }
     }
+    if (try catalog.readOptional("preprocessor_config.json")) |preprocessor_bytes| {
+        defer allocator.free(preprocessor_bytes);
+        try ignoreNonResourceMetadataError(parseVisionPreprocessorJson(&manifest, allocator, preprocessor_bytes));
+    }
 
-    // Try to parse model_manifest.json
+    // SentenceTransformers checkpoints carry their embedding reduction in a
+    // numbered pooling module. Honor a single declared reduction before an
+    // Antfly-specific model_manifest.json, which remains the explicit override.
+    if (try catalog.readOptional("1_Pooling/config.json")) |pooling_bytes| {
+        defer allocator.free(pooling_bytes);
+        try ignoreNonResourceMetadataError(parseSentenceTransformersPoolingConfig(&manifest, allocator, pooling_bytes));
+    }
+
+    // model_manifest.json is Antfly-owned executable metadata, not an
+    // opportunistic upstream hint. A present file must be valid so task-aware
+    // embedders cannot silently fall back to symmetric raw-text behavior.
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreNonResourceMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes));
+        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, catalog, bundle_bytes);
     }
-    if (shouldParseClipclapGgufVariant(catalog)) {
+    if (try shouldParseClipclapGgufVariant(catalog)) {
         try parseOptionalInferenceVariantsFile(&manifest, allocator, catalog);
     }
 
@@ -804,12 +1020,12 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     try fillAutoDetectedGgufPaths(&manifest, allocator, catalog);
 
     // Auto-detect tokenizer
-    if (catalog.exists("tokenizer.json") or
-        catalog.exists("vocab.txt") or
-        catalog.exists("vocab.json"))
+    if (try catalog.exists("tokenizer.json") or
+        try catalog.exists("vocab.txt") or
+        try catalog.exists("vocab.json"))
     {
         manifest.tokenizer_type = .huggingface;
-    } else if (catalog.exists("tokenizer.model")) {
+    } else if (try catalog.exists("tokenizer.model")) {
         manifest.tokenizer_type = .sentencepiece;
     }
 
@@ -836,8 +1052,10 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         try ignoreNonResourceMetadataError(applyGgufTokenizerMetadata(&manifest, allocator, catalog, model_dir_path, gguf_path));
     }
 
-    applyImplicitSparseOutputLayout(&manifest, catalog);
+    try applyImplicitSparseOutputLayout(&manifest, catalog);
+    try applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
 }
@@ -876,15 +1094,22 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
             try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
         }
     }
+    if (try catalog.readOptional("preprocessor_config.json")) |preprocessor_bytes| {
+        defer allocator.free(preprocessor_bytes);
+        try ignoreNonResourceMetadataError(parseVisionPreprocessorJson(&manifest, allocator, preprocessor_bytes));
+    }
 
     if (try catalog.readOptional("model_manifest.json")) |manifest_bytes| {
         defer allocator.free(manifest_bytes);
-        try ignoreNonResourceMetadataError(parseModelManifestJson(&manifest, allocator, manifest_bytes));
+        // Keep discovery and compatibility admission aligned with the full
+        // loader. An invalid Antfly manifest must never be advertised as a
+        // loadable model and then fail only when a session is created.
+        try parseModelManifestJson(&manifest, allocator, manifest_bytes);
     }
 
     if (try catalog.readOptional("antfly_inference_bundle.json")) |bundle_bytes| {
         defer allocator.free(bundle_bytes);
-        try ignoreNonResourceMetadataError(parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes));
+        try parseInferenceBundleJsonWithCatalog(&manifest, allocator, &catalog, bundle_bytes);
     }
     try parseOptionalInferenceVariantsFile(&manifest, allocator, &catalog);
 
@@ -919,10 +1144,51 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
 
-    applyImplicitSparseOutputLayout(&manifest, &catalog);
+    try applyImplicitSparseOutputLayout(&manifest, &catalog);
+    try applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
+}
+
+/// Load one candidate during registry-wide discovery. Candidate-local
+/// publication, artifact, and metadata failures make that candidate
+/// undiscoverable; process and I/O resource failures must still abort the scan
+/// so callers do not publish an incomplete inventory under resource pressure.
+pub fn loadListingCandidateFromDir(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+) !?ModelManifest {
+    return loadListingFromDir(allocator, model_dir_path) catch |err| {
+        if (isListingCandidateRejection(err)) return null;
+        return err;
+    };
+}
+
+/// Only errors that conclusively describe one unusable candidate are safe to
+/// suppress during a registry scan. Keeping this as a rejection allowlist
+/// makes new filesystem, allocator, and runtime errors fail visible by default.
+fn isListingCandidateRejection(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.IsDir,
+        error.SymLinkLoop,
+        error.FileTooLarge,
+        error.InvalidManagedDownload,
+        error.IncompleteManagedDownload,
+        error.InvalidModelArtifactKind,
+        error.InvalidModelArtifactPath,
+        error.ModelArtifactOutsideRoot,
+        error.ModelArtifactNotPublished,
+        error.InvalidModelManifest,
+        error.InvalidInferenceBundle,
+        error.InvalidEmbeddingTaskProfile,
+        error.MissingEmbeddingTaskProfile,
+        => true,
+        else => false,
+    };
 }
 
 fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
@@ -947,10 +1213,123 @@ fn listingSpecialTokensMapHasGlinerMarkers(json_bytes: []const u8) bool {
         std.mem.indexOf(u8, json_bytes, "\"[SEP_TEXT]\"") != null;
 }
 
-fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const ArtifactCatalog) void {
+fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
     if (manifest.sparse_3d_output_layout != null) return;
-    if (catalog.exists("1_SpladePooling/config.json")) {
+    if (try catalog.exists("1_SpladePooling/config.json")) {
         manifest.sparse_3d_output_layout = .batch_seq;
+    }
+}
+
+/// Detect sentence-transformers-format decoder embedders from their sidecar
+/// files. Qwen3-Embedding ships `config.json` saying `Qwen3ForCausalLM` —
+/// indistinguishable from the generative chat checkpoint — but its ST
+/// sidecars are unambiguous: `modules.json` declares a Pooling module whose
+/// `1_Pooling/config.json` has `pooling_mode_lasttoken: true`, and
+/// `config_sentence_transformers.json` carries the query/document prompts.
+/// Scoped to the qwen3 decoder family; BERT-family ST repos keep their
+/// existing detection paths untouched.
+fn applySentenceTransformersPoolingSidecars(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    catalog: *const ArtifactCatalog,
+) !void {
+    if (!std.mem.eql(u8, manifest.config_model_arch, "qwen3")) return;
+
+    const modules_bytes = (try catalog.readOptional("modules.json")) orelse return;
+    defer allocator.free(modules_bytes);
+    const modules_parsed = std.json.parseFromSlice(std.json.Value, allocator, modules_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer modules_parsed.deinit();
+    if (modules_parsed.value != .array) return;
+
+    var pooling_dir: ?[]const u8 = null;
+    var has_normalize_module = false;
+    for (modules_parsed.value.array.items) |module| {
+        if (module != .object) continue;
+        const type_val = module.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (std.mem.eql(u8, type_val.string, "sentence_transformers.models.Pooling")) {
+            if (module.object.get("path")) |path_val| {
+                if (path_val == .string and path_val.string.len > 0) {
+                    pooling_dir = path_val.string;
+                }
+            }
+        } else if (std.mem.eql(u8, type_val.string, "sentence_transformers.models.Normalize")) {
+            has_normalize_module = true;
+        }
+    }
+    const dir = pooling_dir orelse return;
+
+    var pooling_path_buf: [256]u8 = undefined;
+    const pooling_path = std.fmt.bufPrint(&pooling_path_buf, "{s}/config.json", .{dir}) catch return;
+    const pooling_bytes = (try catalog.readOptional(pooling_path)) orelse return;
+    defer allocator.free(pooling_bytes);
+    const pooling_parsed = std.json.parseFromSlice(std.json.Value, allocator, pooling_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer pooling_parsed.deinit();
+    if (pooling_parsed.value != .object) return;
+    const pooling_obj = pooling_parsed.value.object;
+
+    const pooling: PoolingStrategy = if (poolingModeEnabled(pooling_obj, "pooling_mode_lasttoken"))
+        .last
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_mean_tokens"))
+        .mean
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_cls_token"))
+        .cls
+    else if (poolingModeEnabled(pooling_obj, "pooling_mode_max_tokens"))
+        .max
+    else
+        return;
+
+    const declarations = manifest.model_manifest_declarations;
+    if (!declarations.model_type) {
+        manifest.model_type = .embedder;
+        manifest.model_type_origin = .config;
+    }
+    if (!declarations.pooling) manifest.pooling = pooling;
+    if (has_normalize_module and !declarations.normalize) manifest.normalize = true;
+    if (!declarations.embedding_style and manifest.embedding_style == .none)
+        manifest.embedding_style = .qwen3_embedding;
+
+    if (!declarations.embedding_profile) {
+        if (try catalog.readOptional("config_sentence_transformers.json")) |st_bytes| {
+            defer allocator.free(st_bytes);
+            applySentenceTransformersPrompts(manifest, allocator, st_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {},
+            };
+        }
+    }
+}
+
+fn poolingModeEnabled(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value == .bool and value.bool;
+}
+
+fn applySentenceTransformersPrompts(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompts = parsed.value.object.get("prompts") orelse return;
+    if (prompts != .object) return;
+    if (prompts.object.get("query")) |q| {
+        if (q == .string and !manifest.model_manifest_declarations.embedding_query_prefix) {
+            try setEmbeddingProfilePrefix(manifest, .query, q.string);
+        }
+    }
+    if (prompts.object.get("document")) |d| {
+        if (d == .string and !manifest.model_manifest_declarations.embedding_document_prefix) {
+            try setEmbeddingProfilePrefix(manifest, .document, d.string);
+        }
     }
 }
 
@@ -965,7 +1344,16 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         }
     }
 
-    if (hasRerankPathHint(model_dir_path) and (manifest.model_type == .embedder or manifest.model_type == .classifier)) {
+    // `type` is executable Antfly metadata. Path names, upstream architecture
+    // hints, and inferred task families must not reclassify an explicitly
+    // declared model after model_manifest.json has been parsed.
+    if (manifest.model_manifest_declarations.model_type) return;
+
+    if (hasRerankPathHint(model_dir_path) and
+        (manifest.model_type == .embedder or manifest.model_type == .classifier or
+            std.mem.eql(u8, manifest.config_model_arch, "qwen3_vl") or
+            std.mem.eql(u8, manifest.config_model_arch, "qwen3vl")))
+    {
         manifest.model_type = .reranker;
         manifest.model_type_origin = .path;
         return;
@@ -1000,7 +1388,21 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         manifest.model_type_origin = .config;
         return;
     }
-    if (manifest.config_model_arch.len > 0 and gpt.isGenerativeModel(manifest.config_model_arch)) {
+    // A resolved embedding style pins the model as an embedder even when the
+    // backbone arch is generative. Qwen3-Embedding's config.json declares
+    // `Qwen3ForCausalLM`/`qwen3` — without this guard the generative-arch
+    // flip below would reclassify it as a generator.
+    if (manifest.embedding_style != .none) return;
+    // Only reinterpret the neutral default (or a role derived from the
+    // architecture config itself). Explicit directory, manifest, task, and
+    // bundle roles must remain authoritative: decoder backbones are also
+    // used by embedding checkpoints.
+    const architecture_may_select_role = manifest.model_type_origin == .default or
+        manifest.model_type_origin == .config;
+    if (architecture_may_select_role and
+        manifest.config_model_arch.len > 0 and
+        gpt.isGenerativeModel(manifest.config_model_arch))
+    {
         manifest.model_type = .generator;
         manifest.model_type_origin = .config;
     }
@@ -1111,7 +1513,14 @@ fn applyGgufTokenizerMetadata(
     // Do not issue a whole-file DONTNEED that defeats rolling-worker prefetch.
     region.preserveFileCacheOnDeinit();
 
-    var parsed = try gguf_format.parse(allocator, region.data);
+    const has_external_tokenizer = try artifactExists(catalog, allocator, model_dir_path, "tokenizer.json") or
+        try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model") or
+        try artifactExists(catalog, allocator, model_dir_path, "vocab.json") or
+        try artifactExists(catalog, allocator, model_dir_path, "vocab.txt");
+    var parsed = if (has_external_tokenizer)
+        try gguf_format.parseWithExternalTokenizer(allocator, region.data)
+    else
+        try gguf_format.parse(allocator, region.data);
     defer parsed.deinit(allocator);
 
     const view = gguf_metadata.View.init(&parsed);
@@ -1132,21 +1541,71 @@ fn applyGgufTokenizerMetadata(
             manifest.bert_model_type = config.model_type;
             manifest.bert_pad_token_id = config.pad_token_id;
         }
-        if (view.getU64("bert.pooling_type")) |pooling_type| {
-            manifest.pooling = switch (pooling_type) {
-                1 => .mean,
-                2 => .cls,
-                3 => .last,
-                else => manifest.pooling,
-            };
+        if (!manifest.model_manifest_declarations.pooling) {
+            if (view.getU64("bert.pooling_type")) |pooling_type| {
+                manifest.pooling = switch (pooling_type) {
+                    1 => .mean,
+                    2 => .cls,
+                    3 => .last,
+                    else => manifest.pooling,
+                };
+            }
+        }
+        // Decoder-embedder GGUFs advertise their pooling under the model
+        // architecture key (llama.cpp convention: 1=mean, 2=cls, 3=last).
+        // The official Qwen3-Embedding GGUF carries `qwen3.pooling_type = 3`
+        // — the only signal distinguishing it from a generative qwen3
+        // checkpoint, so it also resolves the embedding style here.
+        if (view.getString("general.architecture")) |arch| {
+            // A standalone GGUF commonly has no config.json. Preserve its
+            // architecture in the manifest so the ordinary model-type hints
+            // can distinguish a decoder from the neutral embedder default.
+            // An explicit config remains authoritative for mixed-artifact
+            // directories.
+            if (manifest.config_model_arch.len == 0) {
+                manifest.config_model_arch = try allocator.dupe(u8, arch);
+            }
+            if (std.mem.eql(u8, arch, "qwen3")) {
+                var key_buf: [64]u8 = undefined;
+                // Without this the manifest keeps its BERT-era default of 512
+                // and maxTextSequenceLength() silently truncates long
+                // embedding inputs to 512 tokens.
+                const ctx_key = std.fmt.bufPrint(&key_buf, "{s}.context_length", .{arch}) catch unreachable;
+                if (view.getU64(ctx_key)) |context_length| {
+                    if (context_length > 0 and context_length <= std.math.maxInt(u32)) {
+                        manifest.max_position_embeddings = @intCast(context_length);
+                    }
+                }
+                const key = std.fmt.bufPrint(&key_buf, "{s}.pooling_type", .{arch}) catch unreachable;
+                if (view.getU64(key)) |pooling_type| {
+                    const inferred_pooling: ?PoolingStrategy = switch (pooling_type) {
+                        1 => .mean,
+                        2 => .cls,
+                        3 => .last,
+                        else => null,
+                    };
+                    if (inferred_pooling) |pooling| {
+                        const declarations = manifest.model_manifest_declarations;
+                        if (!declarations.pooling) manifest.pooling = pooling;
+                        if (!declarations.model_type) {
+                            manifest.model_type = .embedder;
+                            manifest.model_type_origin = .config;
+                        }
+                        if (!declarations.normalize) manifest.normalize = true;
+                        if (!declarations.embedding_style and manifest.embedding_style == .none) {
+                            manifest.embedding_style = .qwen3_embedding;
+                        }
+                    }
+                }
+            }
         }
     }
 
     const gguf_model_name = view.getString("tokenizer.ggml.model");
     if (gguf_model_name) |model_name| {
-        if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
+        if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
             manifest.tokenizer_type = .sentencepiece;
-        } else if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.json")) {
+        } else if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.json")) {
             manifest.tokenizer_type = .huggingface;
         } else if (supportsGgufHuggingFaceFallback(model_name) and hasGgufHuggingFaceMetadata(&parsed)) {
             manifest.tokenizer_type = .huggingface;
@@ -1155,7 +1614,7 @@ fn applyGgufTokenizerMetadata(
         } else {
             manifest.tokenizer_type = null;
         }
-    } else if (artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
+    } else if (try artifactExists(catalog, allocator, model_dir_path, "tokenizer.model")) {
         manifest.tokenizer_type = .sentencepiece;
     }
 
@@ -1167,12 +1626,8 @@ fn applyGgufTokenizerMetadata(
     }
     if (view.getString("tokenizer.chat_template")) |value| {
         if (std.mem.trim(u8, value, &.{ ' ', '\t', '\n', '\r' }).len > 0) {
-            const selected = if (gguf_model_name) |model_name|
-                if (shouldUseBuiltInGemma4GgufChatTemplate(model_name, value)) gemma4_chat_template else value
-            else
-                value;
             if (manifest.chat_template) |old| allocator.free(old);
-            manifest.chat_template = try allocator.dupe(u8, selected);
+            manifest.chat_template = try allocator.dupe(u8, value);
         }
     }
 
@@ -1187,20 +1642,9 @@ fn artifactExists(
     allocator: std.mem.Allocator,
     model_dir_path: []const u8,
     relative_path: []const u8,
-) bool {
+) !bool {
     if (catalog) |value| return value.exists(relative_path);
-    return c_file.fileExistsInDir(allocator, model_dir_path, relative_path);
-}
-
-fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
-    return std.mem.indexOf(u8, chat_template, "macro format_parameters") != null or
-        std.mem.indexOf(u8, chat_template, "namespace(") != null or
-        std.mem.indexOf(u8, chat_template, "{% set captured_content") != null or
-        std.mem.indexOf(u8, chat_template, "{%- set captured_content") != null;
-}
-
-fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
+    return c_file.fileExistsInDirChecked(allocator, model_dir_path, relative_path);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -1564,6 +2008,7 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
 
     const obj = parsed.value.object;
     const jina_v5_embedding_config = isJinaV5TextEmbeddingConfig(&obj);
+    applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("hidden_size")) |v| {
         if (jsonU32(v)) |val| manifest.hidden_size = val;
@@ -1690,6 +2135,13 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            } else if (std.mem.eql(u8, s, "nomic_bert")) {
+                // Nomic Embed v1/v1.5 checkpoints require asymmetric literal
+                // task prefixes. Keep these in the manifest so HTTP and
+                // embedded inference use one model-owned profile.
+                markEmbeddingTaskProfileRequired(manifest);
+                try setEmbeddingProfilePrefix(manifest, .query, "search_query: ");
+                try setEmbeddingProfilePrefix(manifest, .document, "search_document: ");
             }
         }
     }
@@ -1699,8 +2151,10 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
         manifest.model_type_origin = .config;
         manifest.pooling = .last;
         manifest.normalize = true;
-        if (manifest.embedding_text_prefix.len > 0) allocator.free(manifest.embedding_text_prefix);
-        manifest.embedding_text_prefix = try allocator.dupe(u8, "Document: ");
+        manifest.embedding_style = .jina_v5;
+        markEmbeddingTaskProfileRequired(manifest);
+        try setEmbeddingProfilePrefix(manifest, .document, "Document: ");
+        try setEmbeddingProfilePrefix(manifest, .query, "Query: ");
     }
 
     // For CLIP/CLAP/multimodal models, text_config contains the text encoder's
@@ -1715,11 +2169,40 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
     }
 }
 
+fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+    var selected: ?PoolingStrategy = null;
+
+    if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
+    if (jsonBool(obj.get("pooling_mode_mean_tokens"))) {
+        if (selected != null) return;
+        selected = .mean;
+    }
+    if (jsonBool(obj.get("pooling_mode_max_tokens"))) {
+        if (selected != null) return;
+        selected = .max;
+    }
+    if (jsonBool(obj.get("pooling_mode_lasttoken"))) {
+        if (selected != null) return;
+        selected = .last;
+    }
+
+    // Multiple enabled modes concatenate vectors in SentenceTransformers. Our
+    // manifest represents one reduction, so leave its configured/default mode
+    // intact rather than silently selecting an incompatible partial output.
+    if (selected) |pooling| manifest.pooling = pooling;
+}
+
 fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
+    applyVisionTargetFromModelConfig(manifest, obj);
 
     if (obj.get("architectures")) |v| {
         if (v == .array) {
@@ -1769,6 +2252,90 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     if (isJinaV5TextEmbeddingConfig(&obj)) {
         manifest.model_type = .embedder;
         manifest.model_type_origin = .config;
+        manifest.embedding_style = .jina_v5;
+    }
+}
+
+fn positiveJsonU32(value: std.json.Value) ?u32 {
+    if (value != .integer or value.integer <= 0) return null;
+    return std.math.cast(u32, value.integer);
+}
+
+fn applySquareVisionTarget(manifest: *ModelManifest, value: std.json.Value, overwrite: bool) void {
+    const size = positiveJsonU32(value) orelse return;
+    if (overwrite or manifest.vision_target_width == null) manifest.vision_target_width = size;
+    if (overwrite or manifest.vision_target_height == null) manifest.vision_target_height = size;
+}
+
+fn applyVisionTargetFromModelConfig(manifest: *ModelManifest, obj: std.json.ObjectMap) void {
+    const vision = obj.get("vision_config") orelse return;
+    if (vision != .object) return;
+    if (vision.object.get("image_size")) |size| applySquareVisionTarget(manifest, size, true);
+}
+
+fn applyPreprocessorSize(manifest: *ModelManifest, value: std.json.Value) void {
+    switch (value) {
+        // The loaded encoder/session owns spatial geometry. A processor
+        // sidecar may complete missing metadata but must not make discovery
+        // advertise dimensions different from those the executor will use.
+        .integer => applySquareVisionTarget(manifest, value, false),
+        .object => |object| {
+            if (object.get("width")) |width| {
+                if (manifest.vision_target_width == null) {
+                    if (positiveJsonU32(width)) |parsed| manifest.vision_target_width = parsed;
+                }
+            }
+            if (object.get("height")) |height| {
+                if (manifest.vision_target_height == null) {
+                    if (positiveJsonU32(height)) |parsed| manifest.vision_target_height = parsed;
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+test "vision preprocessor geometry cannot override the model executor contract" {
+    var manifest = ModelManifest{ .allocator = std.testing.allocator };
+    defer manifest.deinit();
+    try parseConfigJson(
+        &manifest,
+        std.testing.allocator,
+        "{\"vision_config\":{\"image_size\":336}}",
+    );
+    try parseVisionPreprocessorJson(
+        &manifest,
+        std.testing.allocator,
+        "{\"size\":{\"width\":224,\"height\":224},\"resample\":3}",
+    );
+    try std.testing.expectEqual(@as(?u32, 336), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, 336), manifest.vision_target_height);
+    try std.testing.expectEqual(VisionResample.bicubic, manifest.vision_resample);
+}
+
+fn parseVisionPreprocessorJson(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    json_bytes: []const u8,
+) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPreprocessorConfig;
+    const obj = parsed.value.object;
+    if (obj.get("size")) |size| {
+        applyPreprocessorSize(manifest, size);
+    } else if (obj.get("crop_size")) |size| {
+        applyPreprocessorSize(manifest, size);
+    }
+    if (obj.get("resample")) |resample| {
+        if (resample == .integer) {
+            manifest.vision_resample = switch (resample.integer) {
+                0 => .nearest,
+                2 => .bilinear,
+                3 => .bicubic,
+                else => manifest.vision_resample,
+            };
+        }
     }
 }
 
@@ -1826,6 +2393,26 @@ fn dupeJsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][
     return try items.toOwnedSlice(allocator);
 }
 
+fn dupeManifestStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    if (value != .array) return error.InvalidModelManifest;
+
+    var items = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+    try items.ensureTotalCapacity(allocator, value.array.items.len);
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidModelManifest;
+        items.appendAssumeCapacity(try allocator.dupe(u8, item.string));
+    }
+    if (items.items.len == 0) {
+        items.deinit(allocator);
+        return &.{};
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
 fn replaceOwnedStringArray(
     allocator: std.mem.Allocator,
     target: *[][]const u8,
@@ -1835,50 +2422,175 @@ fn replaceOwnedStringArray(
     target.* = replacement;
 }
 
-fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
-    defer parsed.deinit();
+fn parseEmbeddingTaskContractJson(value: std.json.Value) !EmbeddingTaskContract {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    if (std.mem.eql(u8, value.string, "symmetric")) return .symmetric;
+    // `required` is the legacy fail-closed spelling. `profiled` still starts in
+    // the unresolved state and becomes profiled only after both roles have
+    // actually been declared.
+    if (std.mem.eql(u8, value.string, "profiled") or
+        std.mem.eql(u8, value.string, "required")) return .required;
+    return error.InvalidEmbeddingTaskProfile;
+}
 
-    const obj = parsed.value.object;
+fn parseEmbeddingStyleJson(value: std.json.Value) !EmbeddingStyle {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    inline for (.{ "none", "jina_v5", "qwen3_embedding" }) |name| {
+        if (std.mem.eql(u8, value.string, name)) return @field(EmbeddingStyle, name);
+    }
+    return error.InvalidEmbeddingTaskProfile;
+}
 
-    if (obj.get("type")) |v| {
-        if (v == .string) {
-            const s = v.string;
-            inline for (.{ "embedder", "reranker", "chunker", "generator", "recognizer", "rewriter", "classifier", "reader", "transcriber" }) |name| {
-                if (std.mem.eql(u8, s, name)) {
-                    manifest.model_type = @field(ModelType, name);
-                    manifest.model_type_origin = .manifest;
-                }
-            }
+fn parseManifestModelTypeJson(value: std.json.Value) !ModelType {
+    if (value != .string) return error.InvalidModelManifest;
+    return std.meta.stringToEnum(ModelType, value.string) orelse error.InvalidModelManifest;
+}
+
+fn parseManifestPoolingJson(value: std.json.Value) !PoolingStrategy {
+    if (value != .string) return error.InvalidModelManifest;
+    return std.meta.stringToEnum(PoolingStrategy, value.string) orelse error.InvalidModelManifest;
+}
+
+fn parseManifestSparse3DOutputLayoutJson(value: std.json.Value) !Sparse3DOutputLayout {
+    if (value != .string) return error.InvalidModelManifest;
+    return parseSparse3DOutputLayout(value.string) orelse error.InvalidModelManifest;
+}
+
+fn parseEmbeddingProfileJson(manifest: *ModelManifest, value: std.json.Value) !void {
+    // An explicit profile replaces inferred config.json defaults. Mark it
+    // unresolved first so malformed or partial role mappings fail closed in
+    // finalizeEmbeddingProfile instead of silently reverting to raw text.
+    const inherited_contract = manifest.embedding_profile.task_contract;
+    const inherited_contract_explicit = manifest.model_manifest_declarations.embedding_task_contract;
+    manifest.embedding_profile.deinit(manifest.allocator);
+    manifest.embedding_profile.task_contract = if (inherited_contract_explicit)
+        inherited_contract
+    else
+        .required;
+    manifest.model_manifest_declarations.embedding_profile = true;
+    if (value != .object) return error.InvalidEmbeddingTaskProfile;
+
+    var fields = value.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "task_contract") and
+            !std.mem.eql(u8, field.key_ptr.*, "query") and
+            !std.mem.eql(u8, field.key_ptr.*, "document"))
+        {
+            return error.InvalidEmbeddingTaskProfile;
         }
     }
 
-    if (obj.get("tasks")) |v| {
-        const tasks = try dupeJsonStringArray(allocator, v);
-        if (tasks.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.tasks, tasks);
+    if (value.object.get("task_contract")) |contract| {
+        const parsed_contract = try parseEmbeddingTaskContractJson(contract);
+        if (inherited_contract_explicit and parsed_contract != inherited_contract)
+            return error.InvalidEmbeddingTaskProfile;
+        manifest.embedding_profile.task_contract = parsed_contract;
+        manifest.model_manifest_declarations.embedding_task_contract = true;
+    }
+    if (value.object.get("query")) |query| {
+        if (query != .object) return error.InvalidEmbeddingTaskProfile;
+        var query_fields = query.object.iterator();
+        while (query_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix") and
+                !std.mem.eql(u8, field.key_ptr.*, "instruction_template"))
+            {
+                return error.InvalidEmbeddingTaskProfile;
+            }
         }
+        if (query.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .query, prefix.string);
+            manifest.model_manifest_declarations.embedding_query_prefix = true;
+        }
+        if (query.object.get("instruction_template")) |template| {
+            if (template != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingInstructionTemplate(manifest, template.string);
+        }
+    }
+    if (value.object.get("document")) |document| {
+        if (document != .object) return error.InvalidEmbeddingTaskProfile;
+        var document_fields = document.object.iterator();
+        while (document_fields.next()) |field| {
+            if (!std.mem.eql(u8, field.key_ptr.*, "prefix"))
+                return error.InvalidEmbeddingTaskProfile;
+        }
+        if (document.object.get("prefix")) |prefix| {
+            if (prefix != .string) return error.InvalidEmbeddingTaskProfile;
+            try setEmbeddingProfilePrefix(manifest, .document, prefix.string);
+            manifest.model_manifest_declarations.embedding_document_prefix = true;
+        }
+    }
+}
+
+fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidModelManifest,
+    };
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidModelManifest,
+    };
+
+    if (obj.get("type")) |v| {
+        manifest.model_type = try parseManifestModelTypeJson(v);
+        manifest.model_type_origin = .manifest;
+        manifest.model_manifest_declarations.model_type = true;
+    }
+
+    if (obj.get("tasks")) |v| {
+        replaceOwnedStringArray(allocator, &manifest.tasks, try dupeManifestStringArray(allocator, v));
     }
 
     // Parse capabilities array
     if (obj.get("capabilities")) |v| {
-        const capabilities = try dupeJsonStringArray(allocator, v);
-        if (capabilities.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.capabilities, capabilities);
-        }
+        replaceOwnedStringArray(allocator, &manifest.capabilities, try dupeManifestStringArray(allocator, v));
     }
 
     if (obj.get("inputs")) |v| {
-        const inputs = try dupeJsonStringArray(allocator, v);
-        if (inputs.len > 0) {
-            replaceOwnedStringArray(allocator, &manifest.inputs, inputs);
-        }
+        replaceOwnedStringArray(allocator, &manifest.inputs, try dupeManifestStringArray(allocator, v));
+        manifest.model_manifest_declarations.inputs = true;
     }
 
     if (obj.get("sparse_3d_output_layout")) |v| {
-        if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+        manifest.sparse_3d_output_layout = try parseManifestSparse3DOutputLayoutJson(v);
+        if (obj.get("sparse_output_layout")) |legacy| {
+            if (try parseManifestSparse3DOutputLayoutJson(legacy) != manifest.sparse_3d_output_layout.?)
+                return error.InvalidModelManifest;
+        }
     } else if (obj.get("sparse_output_layout")) |v| {
-        if (v == .string) manifest.sparse_3d_output_layout = parseSparse3DOutputLayout(v.string);
+        manifest.sparse_3d_output_layout = try parseManifestSparse3DOutputLayoutJson(v);
+    }
+
+    // Embedding-pipeline overrides. These are the escape hatch for bare GGUF
+    // bundles (no sentence-transformers sidecars) and operator overrides.
+    if (obj.get("pooling")) |v| {
+        manifest.pooling = try parseManifestPoolingJson(v);
+        manifest.model_manifest_declarations.pooling = true;
+    }
+    if (obj.get("normalize")) |v| {
+        if (v != .bool) return error.InvalidModelManifest;
+        manifest.normalize = v.bool;
+        manifest.model_manifest_declarations.normalize = true;
+    }
+    if (obj.get("embedding_task_contract")) |v| {
+        manifest.embedding_profile.task_contract = try parseEmbeddingTaskContractJson(v);
+        manifest.model_manifest_declarations.embedding_task_contract = true;
+    }
+    if (obj.get("embedding_profile")) |v| try parseEmbeddingProfileJson(manifest, v);
+    // Legacy flat fields remain read-compatible. New manifests should use
+    // embedding_profile.query/document.prefix.
+    if (obj.get("query_prefix")) |v| {
+        try applyLegacyEmbeddingProfilePrefix(manifest, .query, v);
+    }
+    if (obj.get("document_prefix")) |v| {
+        try applyLegacyEmbeddingProfilePrefix(manifest, .document, v);
+    }
+    if (obj.get("embedding_style")) |v| {
+        manifest.embedding_style = try parseEmbeddingStyleJson(v);
+        manifest.model_manifest_declarations.embedding_style = true;
     }
 }
 
@@ -1913,7 +2625,11 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
             const gliner_model_type = try allocator.dupe(u8, v.string);
             if (manifest.gliner_model_type.len > 0) allocator.free(manifest.gliner_model_type);
             manifest.gliner_model_type = gliner_model_type;
-            manifest.model_type_origin = .config;
+            // The GLiNER family name is useful even when the operator has
+            // explicitly selected a public model type. Preserve that explicit
+            // type's provenance instead of making a sidecar appear authoritative.
+            if (!manifest.model_manifest_declarations.model_type)
+                manifest.model_type_origin = .config;
         }
     }
     if (obj.get("default_labels")) |v| {
@@ -1955,7 +2671,7 @@ fn parseGlinerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, jso
 }
 
 fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocator, model_dir_path: []const u8, json_bytes: []const u8) !void {
-    return parseInferenceBundleJsonInternal(manifest, allocator, null, model_dir_path, json_bytes);
+    _ = try parseInferenceBundleJsonInternal(manifest, allocator, null, model_dir_path, json_bytes);
 }
 
 fn parseInferenceBundleJsonWithCatalog(
@@ -1964,7 +2680,49 @@ fn parseInferenceBundleJsonWithCatalog(
     catalog: *const ArtifactCatalog,
     json_bytes: []const u8,
 ) !void {
-    return parseInferenceBundleJsonInternal(manifest, allocator, catalog, catalog.model_dir_path, json_bytes);
+    _ = try parseInferenceBundleJsonInternal(manifest, allocator, catalog, catalog.model_dir_path, json_bytes);
+}
+
+/// Reconcile the model family implied by Antfly bundle metadata with an
+/// explicit model_manifest.json declaration. Both files are executable Antfly
+/// contracts: agreement preserves the manifest's provenance, disagreement is
+/// invalid rather than letting parse order choose the runtime implementation.
+fn applyBundleContract(
+    allocator: std.mem.Allocator,
+    manifest: *ModelManifest,
+    bundle_type: ModelType,
+    bundle_inputs: []const []const u8,
+) !void {
+    // Validate the complete contract before mutating either field. This keeps a
+    // rejected bundle from partially changing a manifest when, for example,
+    // the declared type agrees but the declared input set does not.
+    if (manifest.model_manifest_declarations.model_type and manifest.model_type != bundle_type)
+        return error.InvalidModelManifest;
+    if (manifest.model_manifest_declarations.inputs and !stringSetEql(manifest.inputs, bundle_inputs))
+        return error.InvalidModelManifest;
+
+    if (!manifest.model_manifest_declarations.inputs)
+        try setManifestInputs(allocator, manifest, bundle_inputs);
+    if (!manifest.model_manifest_declarations.model_type) {
+        manifest.model_type = bundle_type;
+        manifest.model_type_origin = .bundle;
+    }
+}
+
+fn stringSetEql(lhs: []const []const u8, rhs: []const []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs) |candidate| {
+        var lhs_count: usize = 0;
+        var rhs_count: usize = 0;
+        for (lhs) |other| {
+            if (std.mem.eql(u8, candidate, other)) lhs_count += 1;
+        }
+        for (rhs) |other| {
+            if (std.mem.eql(u8, candidate, other)) rhs_count += 1;
+        }
+        if (lhs_count != rhs_count) return false;
+    }
+    return true;
 }
 
 fn parseInferenceBundleJsonInternal(
@@ -1973,13 +2731,13 @@ fn parseInferenceBundleJsonInternal(
     catalog: ?*const ArtifactCatalog,
     model_dir_path: []const u8,
     json_bytes: []const u8,
-) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+) !BundleParseResult {
+    const parsed = try parseBundleObject(allocator, json_bytes);
     defer parsed.deinit();
 
     const obj = parsed.value.object;
-    const family_value = obj.get("family") orelse return;
-    if (family_value != .string or family_value.string.len == 0) return;
+    const family_value = obj.get("family") orelse return error.InvalidInferenceBundle;
+    if (family_value != .string or family_value.string.len == 0) return error.InvalidInferenceBundle;
     const bundle_family = family_value.string;
 
     if (std.mem.eql(u8, bundle_family, "gliner2_split_bundle/v1")) {
@@ -1989,24 +2747,7 @@ fn parseInferenceBundleJsonInternal(
             encoder.? != .string or encoder.?.string.len == 0 or
             head.? != .string or head.?.string.len == 0)
         {
-            // Unmanaged local directories may intentionally contain a marker
-            // for an incomplete bundle. Managed publications must never let a
-            // receipt-backed bundle select artifacts absent from the receipt.
-            if (catalog != null) return;
-            const owned_family = try allocator.dupe(u8, bundle_family);
-            errdefer allocator.free(owned_family);
-            const wrapper = obj.get("wrapper");
-            const owned_wrapper = if (wrapper != null and wrapper.? == .string and wrapper.?.string.len > 0)
-                try allocator.dupe(u8, wrapper.?.string)
-            else
-                null;
-            errdefer if (owned_wrapper) |value| allocator.free(value);
-            try setManifestInputs(allocator, manifest, &.{"text"});
-            replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
-            if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
-            manifest.model_type = .recognizer;
-            manifest.model_type_origin = .bundle;
-            return;
+            return error.InvalidInferenceBundle;
         }
         const encoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, encoder.?.string);
         errdefer allocator.free(encoder_path);
@@ -2020,7 +2761,7 @@ fn parseInferenceBundleJsonInternal(
         else
             null;
         errdefer if (owned_wrapper) |value| allocator.free(value);
-        try setManifestInputs(allocator, manifest, &.{"text"});
+        try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
@@ -2030,14 +2771,12 @@ fn parseInferenceBundleJsonInternal(
         } else {
             setOptionalPath(allocator, &manifest.gliner_head_safetensors_path, head_path);
         }
-        manifest.model_type = .recognizer;
-        manifest.model_type_origin = .bundle;
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, "clipclap_gguf_bundle/v1")) {
-        const clip = obj.get("clip") orelse return;
-        const clap = obj.get("clap") orelse return;
-        if (clip != .string or clip.string.len == 0 or clap != .string or clap.string.len == 0) return;
+        const clip = obj.get("clip") orelse return error.InvalidInferenceBundle;
+        const clap = obj.get("clap") orelse return error.InvalidInferenceBundle;
+        if (clip != .string or clip.string.len == 0 or clap != .string or clap.string.len == 0) return error.InvalidInferenceBundle;
         const clip_path = try resolveBundlePath(allocator, catalog, model_dir_path, clip.string);
         errdefer allocator.free(clip_path);
         const clap_path = try resolveBundlePath(allocator, catalog, model_dir_path, clap.string);
@@ -2046,33 +2785,101 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(owned_family);
         const config_model_arch = try allocator.dupe(u8, "clipclap");
         errdefer allocator.free(config_model_arch);
-        try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
+        try applyBundleContract(allocator, manifest, .embedder, &.{ "text", "image", "audio" });
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         setOptionalPath(allocator, &manifest.gguf_path, clip_path);
         setOptionalPath(allocator, &manifest.audio_model_path, clap_path);
         manifest.native_arch_hint = .clip;
-        manifest.model_type_origin = .bundle;
         replaceOwnedString(allocator, &manifest.config_model_arch, config_model_arch);
-        return;
+        return .applied;
     }
     if (std.mem.eql(u8, bundle_family, "florence2_gguf_bundle/v1")) {
-        const model = obj.get("model") orelse obj.get("gguf") orelse return;
-        if (model == .string and model.string.len > 0) {
+        const model = obj.get("model") orelse obj.get("gguf") orelse return error.InvalidInferenceBundle;
+        if (model != .string or model.string.len == 0) return error.InvalidInferenceBundle;
+        {
             try applyFlorence2GgufBundle(
                 manifest,
                 allocator,
                 try resolveBundlePath(allocator, catalog, model_dir_path, model.string),
             );
         }
-        return;
+        return .applied;
+    }
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_safetensors_bundle_family) or
+        std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family))
+    {
+        const model = obj.get("model") orelse obj.get("safetensors");
+        const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
+        if (model == null or model.? != .string or model.?.string.len == 0) {
+            return error.InvalidInferenceBundle;
+        }
+        const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.?.string);
+        errdefer allocator.free(model_path);
+        const owned_family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(owned_family);
+        const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+        errdefer allocator.free(owned_arch);
+        try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+        replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+        setOptionalPath(allocator, &manifest.safetensors_path, model_path);
+        return .applied;
+    }
+    if (std.mem.eql(u8, bundle_family, qwen3_vl_gguf_bundle_family) or
+        std.mem.eql(u8, bundle_family, qwen3_vl_reranker_gguf_bundle_family))
+    {
+        const decoder = obj.get("decoder") orelse obj.get("model");
+        const projector = obj.get("projector") orelse obj.get("mmproj");
+        const is_reranker = std.mem.eql(u8, bundle_family, qwen3_vl_reranker_gguf_bundle_family);
+        if (decoder == null or projector == null or
+            decoder.? != .string or decoder.?.string.len == 0 or
+            projector.? != .string or projector.?.string.len == 0)
+        {
+            return error.InvalidInferenceBundle;
+        }
+
+        const decoder_path = try resolveBundlePath(allocator, catalog, model_dir_path, decoder.?.string);
+        errdefer allocator.free(decoder_path);
+        const projector_path = try resolveBundlePath(allocator, catalog, model_dir_path, projector.?.string);
+        errdefer allocator.free(projector_path);
+        const owned_family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(owned_family);
+        const owned_arch = try allocator.dupe(u8, "qwen3_vl");
+        errdefer allocator.free(owned_arch);
+        try applyBundleContract(allocator, manifest, if (is_reranker) .reranker else .generator, &.{ "text", "image" });
+
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+        replaceOwnedString(allocator, &manifest.config_model_arch, owned_arch);
+        setOptionalPath(allocator, &manifest.gguf_path, decoder_path);
+        setOptionalPath(allocator, &manifest.gguf_projector_path, projector_path);
+        return .applied;
     }
 
-    const owned_family = try allocator.dupe(u8, bundle_family);
-    replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
+    if (std.mem.eql(u8, bundle_family, "colqwen2_gguf_bundle/v1")) {
+        const model = obj.get("model") orelse return error.InvalidInferenceBundle;
+        if (model != .string or model.string.len == 0) return error.InvalidInferenceBundle;
+        const model_path = try resolveBundlePath(allocator, catalog, model_dir_path, model.string);
+        errdefer allocator.free(model_path);
+        if (obj.get("required_sidecars")) |sidecars| {
+            if (sidecars != .array) return error.InvalidInferenceBundle;
+            for (sidecars.array.items) |sidecar| {
+                if (sidecar != .string or sidecar.string.len == 0) return error.InvalidInferenceBundle;
+                const path = try resolveBundlePath(allocator, catalog, model_dir_path, sidecar.string);
+                allocator.free(path);
+            }
+        }
+        const family = try allocator.dupe(u8, bundle_family);
+        errdefer allocator.free(family);
+        try applyBundleContract(allocator, manifest, .reranker, &.{ "text", "image" });
+        replaceOwnedString(allocator, &manifest.inference_bundle_family, family);
+        setOptionalPath(allocator, &manifest.gguf_path, model_path);
+        return .applied;
+    }
+    return .unsupported_family;
 }
 
-fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) bool {
+fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) !bool {
     const required = [_][]const u8{
         "text_model.onnx",
         "visual_model.onnx",
@@ -2082,19 +2889,19 @@ fn completeClipclapDefaultOnnxPresent(catalog: *const ArtifactCatalog) bool {
         "audio_projection.onnx",
     };
     for (&required) |name| {
-        if (!catalog.exists(name)) return false;
+        if (!try catalog.exists(name)) return false;
     }
     return true;
 }
 
-fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) bool {
-    return !completeClipclapDefaultOnnxPresent(catalog);
+fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
+    return !try completeClipclapDefaultOnnxPresent(catalog);
 }
 
-fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) bool {
-    if (shouldUseClipclapGgufVariant(catalog)) return true;
+fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
+    if (try shouldUseClipclapGgufVariant(catalog)) return true;
     if (build_options.enable_cuda and !build_options.enable_onnx) {
-        return catalog.exists("antfly_inference_variants.json");
+        return try catalog.exists("antfly_inference_variants.json");
     }
     return false;
 }
@@ -2119,12 +2926,12 @@ fn parseInferenceVariantsJsonInternal(
     model_dir_path: []const u8,
     json_bytes: []const u8,
 ) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try parseBundleObject(allocator, json_bytes);
     defer parsed.deinit();
 
     const obj = parsed.value.object;
-    const variants_family = obj.get("family") orelse return;
-    if (variants_family != .string) return;
+    const variants_family = obj.get("family") orelse return error.InvalidInferenceBundle;
+    if (variants_family != .string or variants_family.string.len == 0) return error.InvalidInferenceBundle;
     if (std.mem.eql(u8, variants_family.string, "florence2_variants/v1")) {
         return parseFlorence2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, obj);
     }
@@ -2137,13 +2944,13 @@ fn parseInferenceVariantsJsonInternal(
         return parseFlorence2InferenceVariantsJson(manifest, allocator, catalog, model_dir_path, obj);
     }
     if (!std.mem.eql(u8, variants_family.string, "clipclap_variants/v1")) return;
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedClipclapGgufPair = null;
     errdefer if (selected) |*pair| pair.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isClipclapGgufVariant(variant)) continue;
+        if (!try isClipclapGgufVariant(variant)) continue;
         var pair = (try resolveExistingClipclapGgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -2167,6 +2974,7 @@ fn parseInferenceVariantsJsonInternal(
     errdefer allocator.free(family);
     const arch = try allocator.dupe(u8, "clipclap");
     errdefer allocator.free(arch);
+    try applyBundleContract(allocator, manifest, .embedder, &.{ "text", "image", "audio" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2175,16 +2983,14 @@ fn parseInferenceVariantsJsonInternal(
     setOptionalPath(allocator, &manifest.audio_model_path, pair.clap_path);
     pair.clap_path = "";
     manifest.native_arch_hint = .clip;
-    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
-    try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
 }
 
 fn parseOptionalInferenceVariantsFile(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     const variants_bytes = (try catalog.readOptional("antfly_inference_variants.json")) orelse return;
     defer allocator.free(variants_bytes);
-    try ignoreNonResourceMetadataError(parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes));
+    try parseInferenceVariantsJsonWithCatalog(manifest, allocator, catalog, variants_bytes);
 }
 
 fn parseGliner2InferenceVariantsJson(
@@ -2194,13 +3000,13 @@ fn parseGliner2InferenceVariantsJson(
     model_dir_path: []const u8,
     obj: std.json.ObjectMap,
 ) !void {
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedGliner2GgufPair = null;
     errdefer if (selected) |*pair| pair.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isGliner2GgufVariant(variant)) continue;
+        if (!try isGliner2GgufVariant(variant)) continue;
         var pair = (try resolveExistingGliner2GgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -2224,6 +3030,7 @@ fn parseGliner2InferenceVariantsJson(
     errdefer allocator.free(family);
     const wrapper = try allocator.dupe(u8, "gliner2");
     errdefer allocator.free(wrapper);
+    try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2233,9 +3040,6 @@ fn parseGliner2InferenceVariantsJson(
     pair.encoder_path = "";
     setOptionalPath(allocator, &manifest.gliner_head_gguf_path, pair.head_path);
     pair.head_path = "";
-    manifest.model_type = .recognizer;
-    manifest.model_type_origin = .bundle;
-    try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
 fn parseFlorence2InferenceVariantsJson(
@@ -2245,13 +3049,13 @@ fn parseFlorence2InferenceVariantsJson(
     model_dir_path: []const u8,
     obj: std.json.ObjectMap,
 ) !void {
-    const variants = obj.get("variants") orelse return;
-    if (variants != .array) return;
+    const variants = obj.get("variants") orelse return error.InvalidInferenceBundle;
+    if (variants != .array) return error.InvalidInferenceBundle;
 
     var selected: ?ResolvedFlorence2Gguf = null;
     errdefer if (selected) |*model| model.deinit(allocator);
     for (variants.array.items) |variant| {
-        if (!isFlorence2GgufVariant(variant)) continue;
+        if (!try isFlorence2GgufVariant(variant)) continue;
         var model = (try resolveExistingFlorence2GgufVariant(allocator, catalog, model_dir_path, variant)) orelse continue;
         if (variant.object.get("format")) |format| {
             if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
@@ -2287,6 +3091,7 @@ fn applyFlorence2GgufBundle(
     errdefer if (family.len > 0) allocator.free(family);
     var arch = try allocator.dupe(u8, "florence2");
     errdefer if (arch.len > 0) allocator.free(arch);
+    try applyBundleContract(allocator, manifest, .reader, &.{ "text", "image" });
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -2294,12 +3099,9 @@ fn applyFlorence2GgufBundle(
     setOptionalPath(allocator, &manifest.gguf_path, path);
     path = "";
     manifest.native_arch_hint = .florence;
-    manifest.model_type = .reader;
-    manifest.model_type_origin = .bundle;
     if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
     manifest.config_model_arch = arch;
     arch = "";
-    try setManifestInputs(allocator, manifest, &.{ "text", "image" });
 }
 
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
@@ -2365,17 +3167,11 @@ fn resolveExistingClipclapGgufVariant(
     if (clip != .string or clip.string.len == 0) return null;
     if (clap != .string or clap.string.len == 0) return null;
 
-    const clip_path = resolveBundlePath(allocator, catalog, model_dir_path, clip.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
-    errdefer allocator.free(clip_path);
-    const clap_path = resolveBundlePath(allocator, catalog, model_dir_path, clap.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const clip_path = (try resolveArtifact(allocator, catalog, model_dir_path, clip.string, .optional_variant)) orelse return null;
+    defer allocator.free(clip_path);
+    const clap_path = (try resolveArtifact(allocator, catalog, model_dir_path, clap.string, .optional_variant)) orelse return null;
     errdefer allocator.free(clap_path);
-    return .{ .clip_path = clip_path, .clap_path = clap_path };
+    return .{ .clip_path = try allocator.dupe(u8, clip_path), .clap_path = clap_path };
 }
 
 fn resolveExistingGliner2GgufVariant(
@@ -2389,17 +3185,11 @@ fn resolveExistingGliner2GgufVariant(
     if (encoder != .string or encoder.string.len == 0) return null;
     if (head != .string or head.string.len == 0) return null;
 
-    const encoder_path = resolveBundlePath(allocator, catalog, model_dir_path, encoder.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
-    errdefer allocator.free(encoder_path);
-    const head_path = resolveBundlePath(allocator, catalog, model_dir_path, head.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const encoder_path = (try resolveArtifact(allocator, catalog, model_dir_path, encoder.string, .optional_variant)) orelse return null;
+    defer allocator.free(encoder_path);
+    const head_path = (try resolveArtifact(allocator, catalog, model_dir_path, head.string, .optional_variant)) orelse return null;
     errdefer allocator.free(head_path);
-    return .{ .encoder_path = encoder_path, .head_path = head_path };
+    return .{ .encoder_path = try allocator.dupe(u8, encoder_path), .head_path = head_path };
 }
 
 fn resolveExistingFlorence2GgufVariant(
@@ -2411,38 +3201,64 @@ fn resolveExistingFlorence2GgufVariant(
     const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return null;
     if (model != .string or model.string.len == 0) return null;
 
-    const model_path = resolveBundlePath(allocator, catalog, model_dir_path, model.string) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
-    };
+    const model_path = (try resolveArtifact(allocator, catalog, model_dir_path, model.string, .optional_variant)) orelse return null;
     errdefer allocator.free(model_path);
     return .{ .model_path = model_path };
 }
 
-fn isClipclapGgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const clip = variant.object.get("clip") orelse return false;
-    const clap = variant.object.get("clap") orelse return false;
-    return clip == .string and clip.string.len > 0 and clap == .string and clap.string.len > 0;
+fn isClipclapGgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const clip = variant.object.get("clip") orelse return error.InvalidInferenceBundle;
+    const clap = variant.object.get("clap") orelse return error.InvalidInferenceBundle;
+    if (!(clip == .string and clip.string.len > 0 and clap == .string and clap.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
 }
 
-fn isGliner2GgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const encoder = variant.object.get("encoder") orelse return false;
-    const head = variant.object.get("head") orelse return false;
-    return encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0;
+fn isGliner2GgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const encoder = variant.object.get("encoder") orelse return error.InvalidInferenceBundle;
+    const head = variant.object.get("head") orelse return error.InvalidInferenceBundle;
+    if (!(encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
 }
 
-fn isFlorence2GgufVariant(variant: std.json.Value) bool {
-    if (variant != .object) return false;
-    const target = variant.object.get("target") orelse return false;
-    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
-    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return false;
-    return model == .string and model.string.len > 0;
+fn isFlorence2GgufVariant(variant: std.json.Value) !bool {
+    if (variant != .object) return error.InvalidInferenceBundle;
+    const target = variant.object.get("target") orelse return error.InvalidInferenceBundle;
+    if (target != .string) return error.InvalidInferenceBundle;
+    if (!std.mem.eql(u8, target.string, "gguf")) return false;
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return error.InvalidInferenceBundle;
+    if (!(model == .string and model.string.len > 0)) return error.InvalidInferenceBundle;
+    return true;
+}
+
+const ArtifactRequirement = enum { required, optional_variant };
+
+fn resolveArtifact(
+    allocator: std.mem.Allocator,
+    catalog: ?*const ArtifactCatalog,
+    model_dir_path: []const u8,
+    path: []const u8,
+    requirement: ArtifactRequirement,
+) !?[]const u8 {
+    // Validate owned metadata even when a managed receipt omits this variant.
+    if (!managed_receipt.artifactPathIsSafe(path)) return error.InvalidModelArtifactPath;
+    const resolved = if (catalog) |value|
+        try value.resolve(path)
+    else
+        managed_receipt.resolveContainedArtifactPath(allocator, std.Options.debug_io, model_dir_path, path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+    if (resolved) |value| return value;
+    if (requirement == .optional_variant) return null;
+    return if (catalog != null and catalog.?.receipt != null) error.ModelArtifactNotPublished else error.FileNotFound;
 }
 
 fn resolveBundlePath(
@@ -2451,13 +3267,7 @@ fn resolveBundlePath(
     model_dir_path: []const u8,
     path: []const u8,
 ) ![]const u8 {
-    if (catalog) |value| return (try value.resolve(path)) orelse error.FileNotFound;
-    return managed_receipt.resolveContainedArtifactPath(
-        allocator,
-        std.Options.debug_io,
-        model_dir_path,
-        path,
-    );
+    return (try resolveArtifact(allocator, catalog, model_dir_path, path, .required)).?;
 }
 
 fn setOptionalPath(allocator: std.mem.Allocator, slot: *?[]const u8, value: []const u8) void {
@@ -2468,6 +3278,131 @@ fn setOptionalPath(allocator: std.mem.Allocator, slot: *?[]const u8, value: []co
 fn replaceOwnedString(allocator: std.mem.Allocator, slot: *[]const u8, value: []const u8) void {
     if (slot.*.len > 0) allocator.free(slot.*);
     slot.* = value;
+}
+
+const EmbeddingProfileRole = enum { query, document };
+
+fn setEmbeddingProfilePrefix(
+    manifest: *ModelManifest,
+    role: EmbeddingProfileRole,
+    value: []const u8,
+) !void {
+    const transform = switch (role) {
+        .query => &manifest.embedding_profile.query,
+        .document => &manifest.embedding_profile.document,
+    };
+    const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
+    replaceOwnedString(manifest.allocator, &transform.prefix, owned);
+    transform.declared = true;
+}
+
+fn applyLegacyEmbeddingProfilePrefix(
+    manifest: *ModelManifest,
+    role: EmbeddingProfileRole,
+    value: std.json.Value,
+) !void {
+    if (value != .string) return error.InvalidEmbeddingTaskProfile;
+    const transform = switch (role) {
+        .query => &manifest.embedding_profile.query,
+        .document => &manifest.embedding_profile.document,
+    };
+    const declared = switch (role) {
+        .query => manifest.model_manifest_declarations.embedding_query_prefix,
+        .document => manifest.model_manifest_declarations.embedding_document_prefix,
+    };
+    // Legacy flat fields remain read-compatible, but a manifest cannot declare
+    // two different execution contracts for the same role. Identical duplicate
+    // declarations are accepted to support rolling manifest migrations.
+    if (declared) {
+        if (!std.mem.eql(u8, transform.prefix, value.string))
+            return error.InvalidEmbeddingTaskProfile;
+        return;
+    }
+    try setEmbeddingProfilePrefix(manifest, role, value.string);
+    switch (role) {
+        .query => manifest.model_manifest_declarations.embedding_query_prefix = true,
+        .document => manifest.model_manifest_declarations.embedding_document_prefix = true,
+    }
+}
+
+fn setEmbeddingInstructionTemplate(manifest: *ModelManifest, value: []const u8) !void {
+    const owned = if (value.len > 0) try manifest.allocator.dupe(u8, value) else "";
+    replaceOwnedString(manifest.allocator, &manifest.embedding_profile.instruction_template, owned);
+}
+
+fn markEmbeddingTaskProfileRequired(manifest: *ModelManifest) void {
+    if (!manifest.embedding_profile.isResolved()) manifest.embedding_profile.task_contract = .required;
+}
+
+fn hasEmbeddingExecutionContract(manifest: *const ModelManifest) bool {
+    const declarations = manifest.model_manifest_declarations;
+    return declarations.embedding_profile or
+        declarations.embedding_task_contract or
+        declarations.embedding_query_prefix or
+        declarations.embedding_document_prefix or
+        declarations.embedding_style or
+        manifest.embedding_style != .none or
+        manifest.embedding_profile.task_contract != .symmetric or
+        manifest.embedding_profile.query.declared or
+        manifest.embedding_profile.document.declared or
+        manifest.embedding_profile.instruction_template.len > 0;
+}
+
+fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
+    // Embedding transforms are an execution contract, not descriptive metadata.
+    // Validate the final resolved type after all manifests, sidecars, and bundle
+    // hints have been applied so contradictory sources cannot publish a model
+    // whose task-sensitive input rendering would be silently ignored.
+    if (manifest.model_type != .embedder and hasEmbeddingExecutionContract(manifest))
+        return error.InvalidEmbeddingTaskProfile;
+
+    // Known execution styles are trusted model-family evidence. Their default
+    // rendering contracts fill any sidecar fields the checkpoint omitted.
+    switch (if (manifest.model_manifest_declarations.embedding_profile) EmbeddingStyle.none else manifest.embedding_style) {
+        .qwen3_embedding => {
+            markEmbeddingTaskProfileRequired(manifest);
+            if (!manifest.embedding_profile.query.declared)
+                try setEmbeddingProfilePrefix(manifest, .query, qwen3_embedding_default_query_prefix);
+            if (!manifest.embedding_profile.document.declared)
+                try setEmbeddingProfilePrefix(manifest, .document, "");
+            if (manifest.embedding_profile.instruction_template.len == 0)
+                try setEmbeddingInstructionTemplate(manifest, qwen3_embedding_instruction_template);
+        },
+        .jina_v5 => {
+            markEmbeddingTaskProfileRequired(manifest);
+            if (!manifest.embedding_profile.query.declared)
+                try setEmbeddingProfilePrefix(manifest, .query, "Query: ");
+            if (!manifest.embedding_profile.document.declared)
+                try setEmbeddingProfilePrefix(manifest, .document, "Document: ");
+        },
+        .none => {},
+    }
+
+    // Validate an explicitly symmetric declaration before deriving the
+    // resolved state. Prefix setters must never rewrite declared intent.
+    const has_declared_transform = manifest.embedding_profile.query.declared or
+        manifest.embedding_profile.document.declared or
+        manifest.embedding_profile.instruction_template.len > 0;
+    if (manifest.model_manifest_declarations.embedding_task_contract and
+        manifest.embedding_profile.task_contract == .symmetric and
+        has_declared_transform)
+    {
+        return error.InvalidEmbeddingTaskProfile;
+    }
+    if (manifest.embedding_profile.query.declared and manifest.embedding_profile.document.declared)
+        manifest.embedding_profile.task_contract = .profiled;
+    if (has_declared_transform and manifest.embedding_profile.task_contract == .symmetric)
+        manifest.embedding_profile.task_contract = .required;
+    switch (manifest.embedding_profile.task_contract) {
+        .required => return error.MissingEmbeddingTaskProfile,
+        .profiled => if (!manifest.embedding_profile.query.declared or
+            !manifest.embedding_profile.document.declared)
+            return error.MissingEmbeddingTaskProfile,
+        .symmetric => {},
+    }
+    const template = manifest.embedding_profile.instruction_template;
+    if (template.len > 0 and std.mem.count(u8, template, "{instruction}") != 1)
+        return error.InvalidEmbeddingTaskProfile;
 }
 
 fn parseAddedTokens(manifest: *ModelManifest, json_bytes: []const u8) !void {
@@ -2591,6 +3526,19 @@ test "rerank model name overrides sequence classifier config" {
     try std.testing.expectEqual(ModelTypeOrigin.path, manifest.model_type_origin);
 }
 
+test "Qwen3-VL reranker path overrides its conditional-generation base role" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try parseConfigJson(&manifest, allocator,
+        \\{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl"}
+    );
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try applyImplicitModelTypeHints(&manifest, "/models/Qwen/Qwen3-VL-Reranker-2B");
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expect(manifest.isQwen3VlReranker());
+}
+
 test "Whisper conditional generation config remains a transcriber" {
     const allocator = std.testing.allocator;
     var manifest = ModelManifest{ .allocator = allocator };
@@ -2664,16 +3612,11 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         }
     }
 
-    // Gemma 4 models use <|turn> and may ship a tool-capable upstream
-    // template that requires Jinja features outside our rendering subset.
+    // Never silently replace a supplied template: doing so can discard tool
+    // history or change the model's thinking protocol.
     if (obj.get("sot_token")) |v| {
         if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
-            if (manifest.chat_template) |existing| {
-                if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
-                    allocator.free(existing);
-                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
-                }
-            } else {
+            if (manifest.chat_template == null) {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
             }
         }
@@ -2711,6 +3654,13 @@ fn jsonU32(val: std.json.Value) ?u32 {
         .integer => |i| @intCast(i),
         else => null,
     };
+}
+
+fn jsonBool(val: ?std.json.Value) bool {
+    return if (val) |value| switch (value) {
+        .bool => |enabled| enabled,
+        else => false,
+    } else false;
 }
 
 // -- Tests --
@@ -2772,7 +3722,7 @@ test "manifest treats jina embeddings v5 as qwen3 embedder with last pooling" {
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
     try std.testing.expect(manifest.normalize);
-    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_profile.document.prefix);
     try std.testing.expectEqualStrings("jina_embeddings_v5", manifest.config_model_arch);
     try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
 }
@@ -2794,7 +3744,634 @@ test "manifest treats merged jina qwen3 task repo as embedder" {
 
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
-    try std.testing.expectEqualStrings("Document: ", manifest.embedding_text_prefix);
+    try std.testing.expectEqualStrings("Document: ", manifest.embedding_profile.document.prefix);
+}
+
+test "NomicBERT config installs its asymmetric retrieval task profile" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseConfigJson(&manifest, allocator, "{\"model_type\":\"nomic_bert\"}");
+    try finalizeEmbeddingProfile(&manifest);
+    try std.testing.expect(manifest.hasEmbeddingTaskProfile());
+    try std.testing.expectEqualStrings("search_query: ", manifest.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("search_document: ", manifest.embedding_profile.document.prefix);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
+}
+
+test "model manifest accepts a declarative embedding profile" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseModelManifestJson(&manifest, allocator,
+        \\{
+        \\  "type":"embedder",
+        \\  "embedding_profile":{
+        \\    "task_contract":"profiled",
+        \\    "query":{"prefix":"query: ","instruction_template":"task={instruction}\nquery: "},
+        \\    "document":{"prefix":"passage: "}
+        \\  }
+        \\}
+    );
+    try finalizeEmbeddingProfile(&manifest);
+    try std.testing.expectEqual(EmbeddingTaskContract.profiled, manifest.embedding_profile.task_contract);
+    try std.testing.expectEqualStrings("query: ", manifest.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("passage: ", manifest.embedding_profile.document.prefix);
+    try std.testing.expectEqualStrings("task={instruction}\nquery: ", manifest.embedding_profile.instruction_template);
+}
+
+test "task-required embedding manifests fail without a complete profile" {
+    const allocator = std.testing.allocator;
+
+    var missing = ModelManifest{ .allocator = allocator };
+    defer missing.deinit();
+    try parseModelManifestJson(&missing, allocator,
+        \\{"type":"embedder","embedding_task_contract":"required"}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&missing));
+
+    var partial = ModelManifest{ .allocator = allocator };
+    defer partial.deinit();
+    try parseModelManifestJson(&partial, allocator,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
+}
+
+test "embedding execution contracts require an embedder model type" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"generator","embedding_style":"qwen3_embedding"}
+        ,
+        \\{"type":"reranker","embedding_task_contract":"symmetric"}
+        ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try parseModelManifestJson(&manifest, allocator, manifest_json);
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&manifest));
+    }
+}
+
+test "explicit symmetric embedding contracts reject role transforms" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_profile":{"task_contract":"symmetric","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+        \\{"type":"embedder","embedding_task_contract":"symmetric","query_prefix":"query: ","document_prefix":"document: "}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try parseModelManifestJson(&manifest, allocator, manifest_json);
+        try std.testing.expectError(error.InvalidEmbeddingTaskProfile, finalizeEmbeddingProfile(&manifest));
+    }
+}
+
+test "duplicate embedding contract declarations must agree" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEmbeddingTaskProfile,
+        parseModelManifestJson(&manifest, allocator,
+            \\{"type":"embedder","embedding_task_contract":"symmetric","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ),
+    );
+}
+
+test "canonical and legacy embedding prefixes must agree" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"query_prefix":"other: "}
+        ,
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"document_prefix":"other: "}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var matching = ModelManifest{ .allocator = allocator };
+    defer matching.deinit();
+    try parseModelManifestJson(&matching, allocator,
+        \\{"type":"embedder","embedding_profile":{"query":{"prefix":"query: "},"document":{"prefix":"document: "}},"query_prefix":"query: ","document_prefix":"document: "}
+    );
+    try finalizeEmbeddingProfile(&matching);
+    try std.testing.expectEqualStrings("query: ", matching.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("document: ", matching.embedding_profile.document.prefix);
+}
+
+test "sentence-transformers prompts only fill undeclared manifest roles" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseModelManifestJson(&manifest, allocator,
+        \\{"type":"embedder","query_prefix":"operator query: "}
+    );
+    try applySentenceTransformersPrompts(&manifest, allocator,
+        \\{"prompts":{"query":"upstream query: ","document":"upstream document: "}}
+    );
+
+    try std.testing.expectEqualStrings("operator query: ", manifest.embedding_profile.query.prefix);
+    try std.testing.expectEqualStrings("upstream document: ", manifest.embedding_profile.document.prefix);
+
+    var inferred = ModelManifest{ .allocator = allocator };
+    defer inferred.deinit();
+    try parseConfigJson(&inferred, allocator, "{\"model_type\":\"nomic_bert\"}");
+    try parseModelManifestJson(&inferred, allocator, "{\"query_prefix\":\"operator override: \"}");
+    try std.testing.expectEqualStrings("operator override: ", inferred.embedding_profile.query.prefix);
+}
+
+test "embedding task contract declarations reject unknown values and types" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_task_contract":true}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profile"}}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":1}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+}
+
+test "embedding execution-style declarations reject unknown values and types" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","embedding_style":true}
+        ,
+        \\{"type":"embedder","query_prefix":42,"document_prefix":""}
+        ,
+        \\{"type":"embedder","query_prefix":"query: ","document_prefix":42}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+}
+
+test "model manifest recognized execution fields reject invalid values" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embeder"}
+        ,
+        \\{"type":42}
+        ,
+        \\{"tasks":["embed",42]}
+        ,
+        \\{"capabilities":{}}
+        ,
+        \\{"inputs":true}
+        ,
+        \\{"sparse_3d_output_layout":"batch_sequnce"}
+        ,
+        \\{"sparse_output_layout":false}
+        ,
+        \\{"sparse_3d_output_layout":"batch_seq","sparse_output_layout":"seq_batch"}
+        ,
+        \\{"pooling":"lasst"}
+        ,
+        \\{"pooling":42}
+        ,
+        \\{"normalize":"true"}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidModelManifest,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var malformed = ModelManifest{ .allocator = allocator };
+    defer malformed.deinit();
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseModelManifestJson(&malformed, allocator, "{"),
+    );
+}
+
+test "loadFromDir fails closed on invalid explicit embedding metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+        ,
+        \\{"type":"embedder","pooling":"lasst"}
+        ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+    }, .{
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
+        error.MissingEmbeddingTaskProfile,
+        error.InvalidModelManifest,
+        error.InvalidEmbeddingTaskProfile,
+    }) |manifest_json, expected_error| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(expected_error, loadFromDir(allocator, model_dir));
+    }
+}
+
+test "loadListingFromDir fails closed on invalid explicit model manifests" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_task_contract":"requred"}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embeding"}
+        ,
+        \\{"type":"embedder","pooling":"lasst"}
+        ,
+        \\{"type":"embedder","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "}}}
+        ,
+        \\{"type":"generator","embedding_profile":{"task_contract":"profiled","query":{"prefix":"query: "},"document":{"prefix":"document: "}}}
+        ,
+    }, .{
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
+        error.InvalidModelManifest,
+        error.MissingEmbeddingTaskProfile,
+        error.InvalidEmbeddingTaskProfile,
+    }) |manifest_json, expected_error| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(expected_error, loadListingFromDir(allocator, model_dir));
+    }
+}
+
+test "loaders reject conflicting Antfly manifest and bundle contracts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    inline for (.{
+        "{\"type\":\"generator\"}",
+        "{\"type\":\"embedder\",\"inputs\":[\"text\"]}",
+    }) |manifest_json| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "model");
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/model_manifest.json",
+            .data = manifest_json,
+        });
+        try tmp.dir.writeFile(io, .{
+            .sub_path = "model/antfly_inference_bundle.json",
+            .data = "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}",
+        });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model/clip.gguf", .data = "clip" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "model/clap.gguf", .data = "clap" });
+
+        const model_dir = try std.fs.path.join(
+            allocator,
+            &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" },
+        );
+        defer allocator.free(model_dir);
+
+        try std.testing.expectError(error.InvalidModelManifest, loadFromDir(allocator, model_dir));
+        try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(allocator, model_dir));
+        try std.testing.expectEqual(null, try loadListingCandidateFromDir(allocator, model_dir));
+    }
+}
+
+test "explicit embedding profiles reject malformed fields without family fallback" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":42}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":42},"document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":"query: ","document":{"prefix":""}}}
+        ,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: ","unknown":true},"document":{"prefix":""}}}
+        ,
+    }) |manifest_json| {
+        var manifest = ModelManifest{ .allocator = allocator };
+        defer manifest.deinit();
+        try std.testing.expectError(
+            error.InvalidEmbeddingTaskProfile,
+            parseModelManifestJson(&manifest, allocator, manifest_json),
+        );
+    }
+
+    var partial = ModelManifest{ .allocator = allocator };
+    defer partial.deinit();
+    try parseModelManifestJson(&partial, allocator,
+        \\{"type":"embedder","embedding_style":"qwen3_embedding","embedding_profile":{"query":{"prefix":"query: "}}}
+    );
+    try std.testing.expectError(error.MissingEmbeddingTaskProfile, finalizeEmbeddingProfile(&partial));
+}
+
+test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{
+        \\  "architectures": ["Qwen3ForCausalLM"],
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 28,
+        \\  "num_attention_heads": 16,
+        \\  "max_position_embeddings": 32768,
+        \\  "tie_word_embeddings": true
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/modules.json",
+        .data =
+        \\[
+        \\  {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+        \\  {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+        \\  {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"}
+        \\]
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/1_Pooling/config.json",
+        .data =
+        \\{"word_embedding_dimension": 1024, "pooling_mode_cls_token": false,
+        \\ "pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": true,
+        \\ "include_prompt": true}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config_sentence_transformers.json",
+        .data =
+        \\{"prompts": {"query": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:", "document": ""},
+        \\ "default_prompt_name": null, "similarity_fn_name": "cosine"}
+        ,
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expect(manifest.normalize);
+    try std.testing.expectEqualStrings("", manifest.embedding_profile.document.prefix);
+    try std.testing.expectEqualStrings(
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+        manifest.embedding_profile.query.prefix,
+    );
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+}
+
+test "model manifest execution fields override qwen sentence-transformers sidecars" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_size":1024}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/modules.json",
+        .data =
+        \\[
+        \\  {"idx":1,"path":"1_Pooling","type":"sentence_transformers.models.Pooling"},
+        \\  {"idx":2,"path":"2_Normalize","type":"sentence_transformers.models.Normalize"}
+        \\]
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/1_Pooling/config.json",
+        .data =
+        \\{"pooling_mode_lasttoken":true}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config_sentence_transformers.json",
+        .data =
+        \\{"prompts":{"query":"upstream query: ","document":"upstream document: "}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/model_manifest.json",
+        .data =
+        \\{
+        \\  "type":"embedder",
+        \\  "pooling":"mean",
+        \\  "normalize":false,
+        \\  "embedding_style":"none",
+        \\  "embedding_profile":{
+        \\    "task_contract":"profiled",
+        \\    "query":{"prefix":"operator query: "},
+        \\    "document":{"prefix":"operator document: "}
+        \\  }
+        \\}
+        ,
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var full = try loadFromDir(allocator, dir_path);
+    defer full.deinit();
+    var listing = try loadListingFromDir(allocator, dir_path);
+    defer listing.deinit();
+
+    for ([_]*const ModelManifest{ &full, &listing }) |manifest| {
+        try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+        try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+        try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
+        try std.testing.expect(!manifest.normalize);
+        try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
+        try std.testing.expectEqualStrings("operator query: ", manifest.embedding_profile.query.prefix);
+        try std.testing.expectEqualStrings("operator document: ", manifest.embedding_profile.document.prefix);
+    }
+}
+
+test "GLiNER sidecars preserve explicit model type provenance" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/model_manifest.json",
+        .data = "{\"type\":\"recognizer\"}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/gliner_config.json",
+        .data = "{\"model_type\":\"gliner2\"}",
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var full = try loadFromDir(allocator, dir_path);
+    defer full.deinit();
+    var listing = try loadListingFromDir(allocator, dir_path);
+    defer listing.deinit();
+
+    for ([_]*const ModelManifest{ &full, &listing }) |manifest| {
+        try std.testing.expectEqual(ModelType.recognizer, manifest.model_type);
+        try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+        try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+    }
+}
+
+test "listing candidate rejection classification fails operational errors visible" {
+    inline for (.{
+        error.FileNotFound,
+        error.InvalidManagedDownload,
+        error.IncompleteManagedDownload,
+        error.InvalidModelManifest,
+        error.InvalidEmbeddingTaskProfile,
+        error.MissingEmbeddingTaskProfile,
+    }) |err| {
+        try std.testing.expect(isListingCandidateRejection(err));
+    }
+
+    inline for (.{
+        error.OutOfMemory,
+        error.AccessDenied,
+        error.ReadFailed,
+        error.IncompleteRead,
+        error.StatFailed,
+        error.Unexpected,
+    }) |err| {
+        try std.testing.expect(!isListingCandidateRejection(err));
+    }
+}
+
+test "bare qwen3 config without sidecars stays generative" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": 1024}
+        ,
+    });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
+    try std.testing.expect(!manifest.isLastTokenDecoderEmbedder());
+}
+
+test "model_manifest.json embedding overrides configure a gguf qwen3 embedder" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    const manifest_json =
+        \\{
+        \\  "type": "embedder",
+        \\  "pooling": "last",
+        \\  "normalize": true,
+        \\  "document_prefix": "",
+        \\  "embedding_style": "qwen3_embedding"
+        \\}
+    ;
+    try parseModelManifestJson(&manifest, allocator, manifest_json);
+    try finalizeEmbeddingProfile(&manifest);
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expect(manifest.isLastTokenDecoderEmbedder());
+    // No explicit query prefix: falls back to the model-card default
+    // instruction so GGUF bundles match sentence-transformers queries.
+    try std.testing.expectEqualStrings(
+        qwen3_embedding_default_query_prefix,
+        manifest.queryPrefix(),
+    );
 }
 
 test "load sparse fixture preserves max position embeddings" {
@@ -2837,6 +4414,25 @@ test "loadFromDir infers SPLADE sparse output layout from pooling sidecar" {
     defer manifest.deinit();
 
     try std.testing.expectEqual(Sparse3DOutputLayout.batch_seq, manifest.sparse_3d_output_layout.?);
+}
+
+test "loadFromDir honors SentenceTransformers pooling metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model/1_Pooling");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/1_Pooling/config.json", .data = "{\"pooling_mode_cls_token\":true,\"pooling_mode_mean_tokens\":false}" });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(PoolingStrategy.cls, manifest.pooling);
 }
 
 test "manifest from model_manifest.json" {
@@ -2926,7 +4522,7 @@ test "manifest detects incomplete colqwen bundle" {
 
     const bundle_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_bundle.json" });
     defer allocator.free(bundle_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\"}" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = bundle_path, .data = "{\"family\":\"colqwen2_gguf_bundle/v1\",\"model\":\"model.gguf\"}" });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
@@ -2955,15 +4551,82 @@ test "manifest detects incomplete colqwen bundle" {
 
 test "manifest parses Antfly inference bundle marker" {
     const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
 
-    try parseInferenceBundleJson(&manifest, allocator, ".",
-        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2"}
+    try parseInferenceBundleJson(&manifest, allocator, model_dir,
+        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2","encoder":"encoder.gguf","head":"head.gguf"}
     );
 
     try std.testing.expectEqualStrings("gliner2_split_bundle/v1", manifest.inference_bundle_family);
     try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+}
+
+test "Antfly bundles must agree with explicit manifest contracts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const gliner_bundle =
+        \\{"family":"gliner2_split_bundle/v1","wrapper":"gliner2","encoder":"encoder.gguf","head":"head.gguf"}
+    ;
+
+    var matching = ModelManifest{ .allocator = allocator };
+    defer matching.deinit();
+    try parseModelManifestJson(&matching, allocator, "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try parseInferenceBundleJson(&matching, allocator, model_dir, gliner_bundle);
+    try std.testing.expectEqual(ModelType.recognizer, matching.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, matching.model_type_origin);
+    try std.testing.expect(matching.model_manifest_declarations.inputs);
+    try std.testing.expectEqualStrings("text", matching.inputs[0]);
+
+    var conflicting = ModelManifest{ .allocator = allocator };
+    defer conflicting.deinit();
+    try parseModelManifestJson(&conflicting, allocator, "{\"type\":\"embedder\"}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&conflicting, allocator, model_dir, gliner_bundle),
+    );
+    try std.testing.expectEqual(ModelType.embedder, conflicting.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, conflicting.model_type_origin);
+    try std.testing.expectEqualStrings("", conflicting.inference_bundle_family);
+
+    var conflicting_inputs = ModelManifest{ .allocator = allocator };
+    defer conflicting_inputs.deinit();
+    try parseModelManifestJson(
+        &conflicting_inputs,
+        allocator,
+        "{\"inputs\":[\"image\"]}",
+    );
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&conflicting_inputs, allocator, model_dir, gliner_bundle),
+    );
+    try std.testing.expectEqual(ModelType.embedder, conflicting_inputs.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.default, conflicting_inputs.model_type_origin);
+    try std.testing.expectEqualStrings("image", conflicting_inputs.inputs[0]);
+    try std.testing.expectEqualStrings("", conflicting_inputs.inference_bundle_family);
+
+    var duplicate_inputs = ModelManifest{ .allocator = allocator };
+    defer duplicate_inputs.deinit();
+    try parseModelManifestJson(&duplicate_inputs, allocator, "{\"inputs\":[\"text\",\"text\"]}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&duplicate_inputs, allocator, model_dir,
+            \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"encoder.gguf"}
+        ),
+    );
+    try std.testing.expectEqual(ModelType.embedder, duplicate_inputs.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.default, duplicate_inputs.model_type_origin);
 }
 
 test "manifest parses clipclap gguf bundle marker" {
@@ -3016,11 +4679,127 @@ test "manifest parses florence2 gguf bundle marker" {
     try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
     try std.testing.expectEqual(ModelType.reader, manifest.model_type);
     try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    // A bundle marker selects the executor but does not invent preprocessing
+    // metadata. Exact producer transforms are published only after config or
+    // preprocessor sidecars establish the model-owned spatial contract.
+    try std.testing.expectEqual(@as(?u32, null), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, null), manifest.vision_target_height);
     try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
     try std.testing.expect(manifest.gguf_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/florence2-q4_k/florence-2-base.Q4_K.gguf"));
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "qwen3-vl");
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/decoder.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/mmproj-Q8_0.gguf", .data = "projector" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/model.safetensors", .data = "weights" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "qwen3-vl" });
+    defer allocator.free(model_dir);
+
+    var generation = ModelManifest{ .allocator = allocator };
+    defer generation.deinit();
+    try parseInferenceBundleJson(&generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_gguf_bundle/v1","decoder":"decoder.gguf","projector":"mmproj-Q8_0.gguf"}
+    );
+    try std.testing.expect(generation.isQwen3VlGgufBundle());
+    try std.testing.expect(!generation.isQwen3VlRerankerGgufBundle());
+    try std.testing.expectEqual(ModelType.generator, generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, generation.model_type_origin);
+    try std.testing.expectEqualStrings("qwen3_vl", generation.config_model_arch);
+    try std.testing.expect(generation.hasInput("text"));
+    try std.testing.expect(generation.hasInput("image"));
+    try std.testing.expect(generation.gguf_path != null);
+    try std.testing.expect(generation.gguf_projector_path != null);
+    try std.testing.expect(generation.hasIncompleteQwen3VlGgufBundle());
+    try std.testing.expectEqual(NativeWeightArtifactKind.gguf, generation.nativeWeightArtifactKind().?);
+
+    generation.config_path = try allocator.dupe(u8, "config.json");
+    generation.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    try std.testing.expect(!generation.hasIncompleteQwen3VlGgufBundle());
+
+    var safetensors_generation = ModelManifest{ .allocator = allocator };
+    defer safetensors_generation.deinit();
+    try parseInferenceBundleJson(&safetensors_generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expect(safetensors_generation.isQwen3VlGenerationSafetensorsBundle());
+    try std.testing.expect(!safetensors_generation.isQwen3VlReranker());
+    try std.testing.expect(safetensors_generation.isQwen3VlBundle());
+    try std.testing.expectEqual(ModelType.generator, safetensors_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.bundle, safetensors_generation.model_type_origin);
+    try std.testing.expectEqualStrings("qwen3_vl", safetensors_generation.config_model_arch);
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_generation.nativeWeightArtifactKind().?);
+    try std.testing.expect(safetensors_generation.hasIncompleteQwen3VlGgufBundle());
+
+    safetensors_generation.config_path = try allocator.dupe(u8, "config.json");
+    safetensors_generation.tokenizer_json_path = try allocator.dupe(u8, "tokenizer.json");
+    safetensors_generation.tokenizer_config_path = try allocator.dupe(u8, "tokenizer_config.json");
+    safetensors_generation.preprocessor_config_path = try allocator.dupe(u8, "preprocessor_config.json");
+    try std.testing.expect(!safetensors_generation.hasIncompleteQwen3VlGgufBundle());
+
+    var reranker = ModelManifest{ .allocator = allocator };
+    defer reranker.deinit();
+    try parseInferenceBundleJson(&reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_gguf_bundle/v1","model":"decoder.gguf","mmproj":"mmproj-Q8_0.gguf"}
+    );
+    try std.testing.expect(reranker.isQwen3VlGgufBundle());
+    try std.testing.expect(reranker.isQwen3VlRerankerGgufBundle());
+    try std.testing.expect(reranker.isQwen3VlReranker());
+    try std.testing.expectEqual(ModelType.reranker, reranker.model_type);
+
+    var safetensors_reranker = ModelManifest{ .allocator = allocator };
+    defer safetensors_reranker.deinit();
+    try parseInferenceBundleJson(&safetensors_reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expect(safetensors_reranker.isQwen3VlRerankerSafetensorsBundle());
+    try std.testing.expect(safetensors_reranker.isQwen3VlReranker());
+    try std.testing.expect(safetensors_reranker.isQwen3VlBundle());
+    try std.testing.expectEqual(ModelType.reranker, safetensors_reranker.model_type);
+    try std.testing.expectEqual(NativeWeightArtifactKind.safetensors, safetensors_reranker.nativeWeightArtifactKind().?);
+    try std.testing.expect(safetensors_reranker.hasIncompleteQwen3VlGgufBundle());
+
+    var declared_generation = ModelManifest{ .allocator = allocator };
+    defer declared_generation.deinit();
+    try parseModelManifestJson(&declared_generation, allocator, "{\"type\":\"generator\",\"inputs\":[\"image\",\"text\"]}");
+    try parseInferenceBundleJson(&declared_generation, allocator, model_dir,
+        \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expectEqual(ModelType.generator, declared_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, declared_generation.model_type_origin);
+    try std.testing.expect(declared_generation.model_manifest_declarations.inputs);
+
+    var declared_reranker = ModelManifest{ .allocator = allocator };
+    defer declared_reranker.deinit();
+    try parseModelManifestJson(&declared_reranker, allocator, "{\"type\":\"reranker\",\"inputs\":[\"image\",\"text\"]}");
+    try parseInferenceBundleJson(&declared_reranker, allocator, model_dir,
+        \\{"family":"qwen3_vl_reranker_safetensors_bundle/v1","model":"model.safetensors"}
+    );
+    try std.testing.expectEqual(ModelType.reranker, declared_reranker.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, declared_reranker.model_type_origin);
+    try std.testing.expect(declared_reranker.model_manifest_declarations.inputs);
+
+    var conflicting_generation = ModelManifest{ .allocator = allocator };
+    defer conflicting_generation.deinit();
+    try parseModelManifestJson(&conflicting_generation, allocator, "{\"type\":\"reranker\",\"inputs\":[\"text\",\"image\"]}");
+    try std.testing.expectError(
+        error.InvalidModelManifest,
+        parseInferenceBundleJson(&conflicting_generation, allocator, model_dir,
+            \\{"family":"qwen3_vl_safetensors_bundle/v1","model":"model.safetensors"}
+        ),
+    );
+    try std.testing.expectEqual(ModelType.reranker, conflicting_generation.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, conflicting_generation.model_type_origin);
+    try std.testing.expectEqualStrings("", conflicting_generation.inference_bundle_family);
 }
 
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
@@ -3474,6 +5253,9 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
     try std.testing.expectEqual(ModelType.reader, manifest.model_type);
     try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqual(@as(?u32, 768), manifest.vision_target_width);
+    try std.testing.expectEqual(@as(?u32, 768), manifest.vision_target_height);
+    try std.testing.expectEqual(VisionResample.bilinear, manifest.vision_resample);
     try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
     try expectCanonicalPath(allocator, q4_path, manifest.gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
@@ -3523,7 +5305,7 @@ test "manifest uses clipclap variants when default ONNX bundle is partial" {
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
-    try std.testing.expect(shouldUseClipclapGgufVariant(&catalog));
+    try std.testing.expect(try shouldUseClipclapGgufVariant(&catalog));
 }
 
 test "manifest keeps default clipclap ONNX when six model files are present" {
@@ -3550,7 +5332,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
-    try std.testing.expect(!shouldUseClipclapGgufVariant(&catalog));
+    try std.testing.expect(!try shouldUseClipclapGgufVariant(&catalog));
 }
 
 test "manifest distilbert detection" {
@@ -3578,17 +5360,6 @@ test "manifest late interaction generation preference detects qwen2" {
     try parseConfigJson(&manifest_inst, allocator, config_json);
 
     try std.testing.expect(manifest_inst.prefersGenerationEncodingForLateInteraction());
-}
-
-test "gemma4 gguf tool chat template uses built-in fallback" {
-    const gguf_tool_template =
-        "{%- macro format_parameters(properties, required, filter_keys=false) -%}" ++
-        "{%- set ns = namespace(found_first=false) -%}" ++
-        "{%- set captured_content -%}{{ message.get('content') }}{%- endset -%}";
-
-    try std.testing.expect(shouldUseBuiltInGemma4GgufChatTemplate("gemma4", gguf_tool_template));
-    try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("llama", gguf_tool_template));
-    try std.testing.expect(!shouldUseBuiltInGemma4GgufChatTemplate("gemma4", "{{ bos_token }}{{ messages[0]['content'] }}"));
 }
 
 test "manifest detects layoutlmv3 as classifier-native bundle" {
@@ -3839,10 +5610,8 @@ test "managed bundle metadata cannot reference unreceipted artifacts" {
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
-    var manifest = try loadFromDir(allocator, model_dir);
-    defer manifest.deinit();
-    try std.testing.expectEqualStrings("", manifest.inference_bundle_family);
-    try std.testing.expectEqual(@as(?[]const u8, null), manifest.audio_model_path);
+    try std.testing.expectError(error.ModelArtifactNotPublished, loadFromDir(allocator, model_dir));
+    try std.testing.expectEqual(@as(?ModelManifest, null), try loadListingCandidateFromDir(allocator, model_dir));
 }
 
 test "managed explicit bundles retain their receipted artifact route" {
@@ -4195,7 +5964,7 @@ test "manifest treats gemma4 unified config as generator" {
     try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
-test "gemma4 tokenizer config replaces unsupported upstream chat template" {
+test "gemma4 tokenizer config preserves upstream chat template" {
     const allocator = std.testing.allocator;
     var manifest = ModelManifest{ .allocator = allocator };
     manifest.chat_template = try allocator.dupe(u8, "{%- macro format_parameters(properties, required) -%}{%- endmacro -%}");
@@ -4206,8 +5975,7 @@ test "gemma4 tokenizer config replaces unsupported upstream chat template" {
     );
 
     try std.testing.expect(manifest.chat_template != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
+    try std.testing.expectEqualStrings("{%- macro format_parameters(properties, required) -%}{%- endmacro -%}", manifest.chat_template.?);
 }
 
 test "built-in gemma4 chat template renders explicit thinking modes" {
@@ -4221,21 +5989,21 @@ test "built-in gemma4 chat template renders explicit thinking modes" {
 
     var default_context = try jinja.chatTemplateContext(arena, &messages, .{ .bos_token = "<bos>" });
     const default_prompt = try template.render(arena, &default_context);
-    try std.testing.expect(std.mem.endsWith(u8, default_prompt, "<|channel>thought\n<channel|>"));
+    try std.testing.expectEqualStrings("<bos><|turn>user\nhello<turn|>\n<|turn>model\n", default_prompt);
 
     var enabled_context = try jinja.chatTemplateContext(arena, &messages, .{
         .bos_token = "<bos>",
         .enable_thinking = true,
     });
     const enabled_prompt = try template.render(arena, &enabled_context);
-    try std.testing.expect(std.mem.endsWith(u8, enabled_prompt, "<|channel>thought\n<channel|>"));
+    try std.testing.expectEqualStrings("<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\n", enabled_prompt);
 
     var disabled_context = try jinja.chatTemplateContext(arena, &messages, .{
         .bos_token = "<bos>",
         .enable_thinking = false,
     });
     const disabled_prompt = try template.render(arena, &disabled_context);
-    try std.testing.expect(std.mem.endsWith(u8, disabled_prompt, "<|channel>final\n<channel|>"));
+    try std.testing.expectEqualStrings(default_prompt, disabled_prompt);
 }
 
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
@@ -4277,6 +6045,8 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     defer manifest.deinit();
 
     try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectEqualStrings("gemma4", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
     try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
     try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
     try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
@@ -4306,6 +6076,63 @@ test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
     try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
     try std.testing.expectEqual(bert.ModelType.roberta, manifest.bert_model_type);
+}
+
+test "qwen3 embedding GGUF metadata configures last pooling and full context" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(PoolingStrategy.last, manifest.pooling);
+    try std.testing.expectEqualStrings("qwen3", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expect(manifest.normalize);
+    // qwen3.context_length must reach maxTextSequenceLength(); the BERT-era
+    // 512 default would silently truncate long embedding inputs.
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+    try std.testing.expectEqual(@as(usize, 32768), manifest.maxTextSequenceLength());
+}
+
+test "model manifest execution fields override qwen GGUF metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "model_manifest.json",
+        .data =
+        \\{"type":"embedder","pooling":"mean","normalize":false,"embedding_style":"none"}
+        ,
+    });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+    try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
+    try std.testing.expect(!manifest.normalize);
+    try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
+    try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
 }
 
 test "colocated GGUF does not overwrite selected safetensors BERT config" {
@@ -4426,6 +6253,32 @@ fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
+fn buildTestGgufWithQwen3Embedding(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 9);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
+    try appendTestMetadataU32(allocator, &data, "qwen3.context_length", 32768);
+    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", 3);
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<|endoftext|>",
+        "hello",
+        "world",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 1, 1 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 0);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_eos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
 fn appendTestLe(comptime T: type, allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), value: T) !void {
     const bytes = std.mem.asBytes(&std.mem.nativeToLittle(T, value));
     try data.appendSlice(allocator, bytes);
@@ -4482,4 +6335,48 @@ fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
+}
+
+test "bundle contracts reject malformed known metadata but ignore unknown families atomically" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    const invalid = [_][]const u8{
+        "[]",                                                              "null",                                                      "{", "{}", "{\"family\":12}",
+        "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\"}", "{\"family\":\"florence2_gguf_bundle/v1\",\"model\":false}",
+    };
+    for (invalid) |bytes| try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceBundleJson(&manifest, allocator, ".", bytes));
+    try std.testing.expectEqual(BundleParseResult.unsupported_family, try parseInferenceBundleJsonInternal(
+        &manifest,
+        allocator,
+        null,
+        ".",
+        "{\"family\":\"future/v99\",\"model\":\"absent.gguf\"}",
+    ));
+    try std.testing.expectEqualStrings("", manifest.inference_bundle_family);
+    try std.testing.expectEqual(ModelTypeOrigin.default, manifest.model_type_origin);
+}
+
+test "optional bundle variants preserve failures and clean up partially resolved pairs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clip.gguf", .data = "clip" });
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    const Check = struct {
+        fn run(a: std.mem.Allocator, path: []const u8, complete: bool) !void {
+            var man = ModelManifest{ .allocator = a };
+            defer man.deinit();
+            try parseInferenceVariantsJson(&man, a, path, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}]}");
+            try std.testing.expectEqual(complete, man.isClipclapGgufBundle());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clap.gguf", .data = "clap" });
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\"}]}"));
+    try std.testing.expectError(error.InvalidModelArtifactPath, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"../escape.gguf\",\"clap\":\"clap.gguf\"}]}"));
 }

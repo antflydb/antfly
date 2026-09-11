@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -236,6 +237,160 @@ def test_text_quickstart_and_document_artifact(serverless_api):
         "machine-learning",
         "theory-relativity",
     }
+
+
+@pytest.mark.parametrize(
+    "text_query",
+    [
+        {"query": "Korean"},
+        {"match": "Korean history major events"},
+        {"match": "Korean", "analyzer": "standard"},
+        {"term": "korean"},
+        {"prefix": "kore"},
+    ],
+    ids=["query-string", "match", "analyzed-match", "term", "prefix"],
+)
+def test_public_quickstart_default_field_searches_dynamic_strings(
+    backup_api, text_query
+):
+    # No explicit schema: both fields must participate in the default text index.
+    table = f"quickstart_default_field_{time.time_ns()}"
+    backup_api.create_table(table, num_shards=1)
+    batch = backup_api.batch_write(
+        table,
+        inserts={
+            "title-hit": {"title": "Korean history", "body": "dynasties"},
+            "body-hit": {"title": "Chronology", "body": "Korean history"},
+            "noise": {"title": "Gardening", "body": "flowers"},
+        },
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == 3
+    result = backup_api.query_table(
+        table,
+        {"full_text_search": text_query, "fields": ["title"], "limit": 10},
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert {hit["_id"] for hit in hits} == {"title-hit", "body-hit"}
+    # Return projection does not supply or narrow the query's search field.
+    assert all(set(hit["_source"]) == {"title"} for hit in hits)
+    narrowed = backup_api.query_table(
+        table,
+        {"full_text_search": {"match": "Korean", "field": "title"}, "limit": 10},
+    )
+    assert [hit["_id"] for hit in narrowed["responses"][0]["hits"]["hits"]] == [
+        "title-hit"
+    ]
+
+
+@pytest.mark.fresh_antfly_process
+def test_public_quickstart_query_string_boolean_controls(stateful_api):
+    table = f"quickstart_boolean_{time.time_ns()}"
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "both": {"body": "alpha beta"},
+            "alpha_only": {"body": "alpha gamma"},
+            "beta_only": {"body": "beta delta"},
+        },
+        sync_level="full_index",
+    )
+    cases = [
+        ({"query": "alpha"}, {"both", "alpha_only"}),
+        ({"match": "alpha beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha"}, {"both", "alpha_only"}),
+        ({"query": "alpha beta"}, {"both"}),
+        ({"query": "body:alpha AND body:beta"}, {"both"}),
+        ({"query": "body:alpha AND body:alpha"}, {"both", "alpha_only"}),
+        (
+            {
+                "conjuncts": [
+                    {"match": "alpha", "field": "body"},
+                    {"match": "beta", "field": "body"},
+                ]
+            },
+            {"both"},
+        ),
+        ({"query": "body:alpha OR body:beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha AND NOT body:beta"}, {"alpha_only"}),
+        ({"query": "NOT body:alpha"}, {"beta_only"}),
+        ({"query": "(body:alpha OR body:beta) AND body:gamma"}, {"alpha_only"}),
+        ({"query": "body:alpha AND body:missing"}, set()),
+    ]
+
+    def assert_controls():
+        for query, expected in cases:
+            result = stateful_api.query_table(
+                table, {"full_text_search": query, "limit": 10}
+            )
+            hits = result["responses"][0]["hits"]["hits"]
+            assert {hit["_id"] for hit in hits} == expected, query
+            assert len(hits) == len(expected), query
+
+    assert_controls()
+    if stateful_api.supports_restart:
+        stateful_api.restart_server()
+        assert_controls()
+
+
+def test_public_quickstart_rag_stream_requires_evidence(
+    backup_api, inference_generator
+):
+    from test_retrieval import _parse_sse_events
+
+    table = f"quickstart_rag_default_field_{time.time_ns()}"
+    backup_api.create_table(table, num_shards=1)
+    backup_api.batch_write(
+        table,
+        inserts={
+            "doc:a": {
+                "title": "Korean history",
+                "body": "The Joseon dynasty followed the Goryeo dynasty.",
+            },
+            "doc:b": {"title": "Gardening", "body": "flowers"},
+        },
+        sync_level="full_index",
+    )
+    response = backup_api._request(
+        "POST",
+        "/agents/retrieval",
+        {
+            "query": "What are the major events in Korean history?",
+            "stream": True,
+            "generator": {
+                "provider": "antfly",
+                "model": "local-generator",
+                "api_url": inference_generator,
+                "api_key": "test-key",
+            },
+            "steps": {"generation": {"enabled": True}},
+            "queries": [
+                {
+                    "table": table,
+                    # The exact legal query shape rejected during the real rerun.
+                    "full_text_search": {"match": "Korean history major events"},
+                    "fields": ["title", "body"],
+                    "limit": 5,
+                }
+            ],
+        },
+    )
+    response.raise_for_status()
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    events = _parse_sse_events(response.text)
+    assert not [data for event, data in events if event == "error"], response.text
+    done = [data for event, data in events if event == "done"]
+    assert len(done) == 1, response.text
+    assert events[-1][0] == "done", response.text
+    assert done[0]["status"] == "completed"
+    assert [hit["_id"] for hit in done[0]["hits"]] == ["doc:a"]
+    assert done[0]["generation"].strip()
+    assert any(event == "hit" and data["_id"] == "doc:a" for event, data in events)
+    assert any(
+        event == "generation" and isinstance(data, str) and data.strip()
+        for event, data in events
+    )
 
 
 def test_public_search_fields_projection(serverless_api):
@@ -760,7 +915,7 @@ def test_public_managed_semantic_full_index_pipeline(backup_api, openai_embedder
         table_name,
         index_name,
         timeout_s=30.0,
-        interval_s=0.25,
+        interval_s=0.01,
         until="complete",
     )
     index = backup_api.get_index(table_name, index_name)
@@ -987,8 +1142,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=30.0,
         until="complete",
     )
+    # Each of the ten first-page documents deterministically produces two
+    # chunks with the fixture configuration. Hold the provider immediately
+    # after that first publishable page so sibling activation is exercised at
+    # a stable, non-empty serving boundary instead of depending on host load.
     progressive_openai_embedder.rate_limit_after_next_requests(
-        300, input_substring="progressive publication document"
+        20, input_substring="progressive publication document"
     )
 
     # Match the quickstart's index-before-load ordering. Separate durable write
@@ -1159,16 +1318,52 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     first_incarnation = partial_status["readiness"]["incarnation"]
     first_floor = int(partial_status["searchable_vectors"])
     first_coverage_floor = int(partial_status["source_coverage"]["covered"])
+    first_settled_floor = sum(
+        int(partial_status["source_coverage"].get(field) or 0)
+        for field in ("covered", "skipped", "failed")
+    )
     first_last_artifacts = first_floor
+    first_last_covered = first_coverage_floor
+    first_last_settled = first_settled_floor
     first_last_status = partial_status
     first_continuity_samples = 0
+    # The deterministic Zig coverage holds the writer-cache lock and proves
+    # that status does not wait on it. Keep this process-level check as a
+    # bounded liveness assertion, not a sub-second performance benchmark on a
+    # shared CI runner where the client or server process can be descheduled.
+    status_request_bound_s = 5.0
+
+    def serving_status_summary(status: dict) -> dict:
+        readiness = status.get("readiness") or {}
+        coverage = status.get("source_coverage") or {}
+        publication = status.get("publication") or {}
+        activity = status.get("activity") or {}
+        return {
+            "incarnation": readiness.get("incarnation"),
+            "state": readiness.get("state"),
+            "queryable": readiness.get("queryable"),
+            "published_revision": readiness.get("published_revision"),
+            "target_revision": readiness.get("target_revision"),
+            "searchable_vectors": status.get("searchable_vectors"),
+            "total_indexed": status.get("total_indexed"),
+            "publication": publication,
+            "source_coverage": coverage,
+            "runtime_present": status.get("runtime_present"),
+            "runtime_fresh": status.get("runtime_fresh"),
+            "activity_phase": activity.get("phase"),
+        }
 
     def assert_first_serving_continuity() -> dict:
-        nonlocal first_last_artifacts, first_last_status, first_continuity_samples
+        nonlocal \
+            first_last_artifacts, \
+            first_last_covered, \
+            first_last_settled, \
+            first_last_status, \
+            first_continuity_samples
         request_started = time.monotonic()
         status = backup_api.get_index(table_name, index_name)["status"]
         request_elapsed = time.monotonic() - request_started
-        assert request_elapsed < 1.0, (
+        assert request_elapsed < status_request_bound_s, (
             f"status request for {index_name} took {request_elapsed:.3f}s"
         )
         readiness = status.get("readiness") or {}
@@ -1176,16 +1371,61 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         assert readiness.get("incarnation") == first_incarnation, status
         assert readiness.get("queryable") is True, status
         searchable = int(status.get("searchable_vectors", 0))
+        regression_query = None
+        if searchable < first_last_artifacts:
+            regression_query = backup_api.query_table(
+                table_name,
+                {
+                    "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                    "indexes": [index_name],
+                    "limit": 1,
+                },
+            )
         assert searchable >= first_last_artifacts, json.dumps(
-            {"previous": first_last_status, "current": status},
+            {
+                "previous": serving_status_summary(first_last_status),
+                "current": serving_status_summary(status),
+                "query": regression_query,
+                "server_logs": backup_api.debug_logs(),
+            },
             indent=2,
             sort_keys=True,
         )
         first_last_artifacts = searchable
-        first_last_status = status
         covered = int((status.get("source_coverage") or {}).get("covered", 0))
-        assert covered >= first_coverage_floor, status
+        assert covered >= first_last_covered, status
+        first_last_covered = covered
+        coverage = status.get("source_coverage") or {}
+        settled = sum(
+            int(coverage.get(field) or 0) for field in ("covered", "skipped", "failed")
+        )
+        assert settled >= first_last_settled, json.dumps(
+            {
+                "previous": serving_status_summary(first_last_status),
+                "current": serving_status_summary(status),
+                "server_logs": backup_api.debug_logs(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        first_last_settled = settled
+        first_last_status = status
         first_continuity_samples += 1
+        if first_continuity_samples % 8 == 0:
+            continuity_query = backup_api.query_table(
+                table_name,
+                {
+                    "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                    "indexes": [index_name],
+                    "limit": 1,
+                },
+            )
+            continuity_hits = continuity_query["responses"][0]["hits"]["hits"]
+            assert continuity_hits, {
+                "status": status,
+                "query": continuity_query,
+            }
+            assert int(continuity_hits[0]["_id"].removeprefix("doc:")) < 10
         return status
 
     assert_first_serving_continuity()
@@ -1234,10 +1474,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     )
     assert __import__("time").monotonic() - activation_started < 5.0
     second_incarnation = activated["readiness"]["incarnation"]
+    second_publication_samples = deque(maxlen=3)
 
     def second_index_has_published_artifact() -> dict | None:
         assert_first_serving_continuity()
         status = backup_api.get_index(table_name, second_index_name)["status"]
+        second_publication_samples.append(status)
         readiness = status.get("readiness") or {}
         pending_reasons = readiness.get("pending_reasons") or []
         assert "runtime_unavailable" not in pending_reasons, json.dumps(
@@ -1258,7 +1500,15 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=30.0,
         interval_s=0.05,
     )
-    assert second_partial is not None
+    assert second_partial is not None, json.dumps(
+        {
+            "activated": activated,
+            "recent_publication_samples": list(second_publication_samples),
+            "server_logs": backup_api.debug_logs(),
+        },
+        indent=2,
+        sort_keys=True,
+    )
     assert (
         backup_api.get_index(table_name, index_name)["status"]["readiness"]["complete"]
         is False
@@ -1288,7 +1538,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             request_started = time.monotonic()
             sampled = backup_api.get_index(table_name, sampled_index)["status"]
             request_elapsed = time.monotonic() - request_started
-            assert request_elapsed < 1.0, (
+            assert request_elapsed < status_request_bound_s, (
                 f"status request for {sampled_index} took {request_elapsed:.3f}s"
             )
             sampled_readiness = sampled.get("readiness") or {}
@@ -1318,14 +1568,45 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     assert first_continuity_samples >= 5
 
     progressive_openai_embedder.allow_rate_limited_requests()
-    complete = backup_api.wait_index_ready(
-        table_name,
-        index_name,
-        timeout_s=120.0,
-        interval_s=0.1,
-        until="complete",
-        require_query_fresh=True,
-    )
+    try:
+        complete = backup_api.wait_index_ready(
+            table_name,
+            index_name,
+            timeout_s=120.0,
+            interval_s=0.1,
+            until="complete",
+            require_query_fresh=True,
+        )
+    except AssertionError:
+        print(
+            json.dumps(
+                {
+                    "progressive_completion_status": backup_api.get_index(
+                        table_name, index_name
+                    )["status"]
+                },
+                indent=2,
+            )
+        )
+        try:
+            print(
+                json.dumps(
+                    {
+                        "progressive_completion_query": backup_api.query_table(
+                            table_name,
+                            {
+                                "embeddings": {index_name: [1.0, 0.0, 0.0]},
+                                "indexes": [index_name],
+                                "limit": 1,
+                            },
+                        )
+                    },
+                    indent=2,
+                )
+            )
+        except Exception as exc:
+            print(f"progressive_completion_query_error: {exc}")
+        raise
     assert complete["readiness"]["state"] == "ready"
     assert complete["readiness"]["queryable"] is True
     assert complete["readiness"]["complete"] is True

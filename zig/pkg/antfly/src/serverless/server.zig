@@ -39,7 +39,10 @@ fn listenerHttpxConfig(cfg: ListenerConfig, http_runtime: ?*httpx.HttpRuntime) h
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
-        .request_body_buffer_budget_bytes = cfg.max_request_bytes,
+        // Content-encoding middleware may briefly retain both the encoded body
+        // and its decoded replacement. Keep the aggregate ceiling large enough
+        // for one maximum-size request to complete without preallocating it.
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes *| 2,
         .max_connections = cfg.max_connections,
         .http_runtime = http_runtime,
     }).normalized();
@@ -131,7 +134,7 @@ pub const ServerlessServer = struct {
 
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopListenerWithDeadline(deadline);
-        self.stack.runtime.stop();
+        self.stack.runtime.stopWithDeadline(deadline);
     }
 
     pub fn baseUri(self: *ServerlessServer, alloc: std.mem.Allocator) ![]u8 {
@@ -169,6 +172,10 @@ pub const ServerlessServer = struct {
         return if (self.listener_task) |*task| task.runtimeFailure() else null;
     }
 
+    pub fn runtimeFailure(self: *ServerlessServer) ?anyerror {
+        return self.stack.runtime.runtimeFailure();
+    }
+
     pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {
         return self.owned_http_runtime;
     }
@@ -181,6 +188,7 @@ test "serverless server module compiles" {
     const normalized = listenerHttpxConfig(.{ .max_connections = 0 }, null);
     try std.testing.expectEqual(@as(u32, 1000), normalized.max_connections);
     try std.testing.expectEqual(normalized.max_connections, normalized.max_request_tasks);
+    try std.testing.expectEqual(normalized.max_body_size * 2, normalized.request_body_buffer_budget_bytes);
 }
 
 test "serverless server starts managed runtime and serves listener requests" {

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceToolType(str, Enum):
+class InferenceToolType(StrEnum):
     FUNCTION = "function"
 
     def __str__(self) -> str:

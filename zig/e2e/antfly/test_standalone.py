@@ -238,15 +238,26 @@ class EmbeddedInferenceStandaloneServer:
         ]
         for flag_name, value in (
             ("--inference-host-budget-mb", self.inference_budget_mb.get("host", 0)),
-            ("--inference-backend-budget-mb", self.inference_budget_mb.get("backend", 0)),
-            ("--inference-combined-budget-mb", self.inference_budget_mb.get("combined", 0)),
+            (
+                "--inference-backend-budget-mb",
+                self.inference_budget_mb.get("backend", 0),
+            ),
+            (
+                "--inference-combined-budget-mb",
+                self.inference_budget_mb.get("combined", 0),
+            ),
             ("--inference-kv-budget-mb", self.inference_budget_mb.get("kv", 0)),
-            ("--inference-scratch-budget-mb", self.inference_budget_mb.get("scratch", 0)),
+            (
+                "--inference-scratch-budget-mb",
+                self.inference_budget_mb.get("scratch", 0),
+            ),
         ):
             if value > 0:
                 command.extend([flag_name, str(value)])
         if self.process_memory_budget_mb > 0:
-            command.extend(["--process-memory-budget-mb", str(self.process_memory_budget_mb)])
+            command.extend(
+                ["--process-memory-budget-mb", str(self.process_memory_budget_mb)]
+            )
         self.proc = self.port_reservations.handoff_to(
             (self.public_port, self.health_port),
             lambda: subprocess.Popen(
@@ -259,11 +270,15 @@ class EmbeddedInferenceStandaloneServer:
         if not _wait_for_server(self.url):
             logs = _read_log_tail(self.log_path)
             self.stop()
-            raise RuntimeError(f"Standalone API server failed to start at {self.url}\n{logs}")
+            raise RuntimeError(
+                f"Standalone API server failed to start at {self.url}\n{logs}"
+            )
         if not _wait_for_server(self.public_url, path="/readyz"):
             logs = _read_log_tail(self.log_path)
             self.stop()
-            raise RuntimeError(f"Standalone runtime failed readiness at {self.public_url}\n{logs}")
+            raise RuntimeError(
+                f"Standalone runtime failed readiness at {self.public_url}\n{logs}"
+            )
 
     def debug_logs(self) -> str:
         self.log_file.flush()
@@ -317,7 +332,9 @@ def _finish_standalone_server(
     try:
         server.stop()
     except Exception as exc:
-        cleanup_failure = f"standalone inference cleanup raised {type(exc).__name__}: {exc}"
+        cleanup_failure = (
+            f"standalone inference cleanup raised {type(exc).__name__}: {exc}"
+        )
     else:
         if server.forced_kill or server.returncode != 0:
             cleanup_failure = (
@@ -337,7 +354,9 @@ def _finish_standalone_server(
 @pytest.fixture(scope="session")
 def embedded_standalone_runtime():
     if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_TESTS"):
-        pytest.skip("Set ANTFLY_INFERENCE_STANDALONE_TESTS=1 to run live inference standalone tests")
+        pytest.skip(
+            "Set ANTFLY_INFERENCE_STANDALONE_TESTS=1 to run live inference standalone tests"
+        )
 
     binary = _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
@@ -345,16 +364,25 @@ def embedded_standalone_runtime():
             f"Standalone inference was explicitly enabled but the Antfly binary was not found: {binary}"
         )
 
-    models_dir = Path(
-        os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODELS_DIR", str(DEFAULT_INFERENCE_MODELS_DIR))
-    ).expanduser().resolve()
+    models_dir = (
+        Path(
+            os.environ.get(
+                "ANTFLY_INFERENCE_STANDALONE_MODELS_DIR",
+                str(DEFAULT_INFERENCE_MODELS_DIR),
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
     if not models_dir.exists():
         pytest.fail(
             "Standalone inference was explicitly enabled but its models directory was not found: "
             f"{models_dir}"
         )
 
-    model_name = os.environ.get("ANTFLY_INFERENCE_STANDALONE_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME)
+    model_name = os.environ.get(
+        "ANTFLY_INFERENCE_STANDALONE_MODEL_NAME", DEFAULT_INFERENCE_MODEL_NAME
+    )
     if not _model_exists(models_dir, model_name):
         pytest.fail(
             "Standalone inference was explicitly enabled but its generator model was not found under "
@@ -362,16 +390,25 @@ def embedded_standalone_runtime():
         )
 
     inference_budget_mb = {
-        "host": _env_int("ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_HOST_BUDGET_MB),
+        "host": _env_int(
+            "ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB",
+            DEFAULT_INFERENCE_STANDALONE_HOST_BUDGET_MB,
+        ),
         "backend": _env_int(
-            "ANTFLY_INFERENCE_STANDALONE_BACKEND_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_BACKEND_BUDGET_MB",
+            DEFAULT_INFERENCE_STANDALONE_BACKEND_BUDGET_MB,
         ),
         "combined": _env_int(
-            "ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB",
+            DEFAULT_INFERENCE_STANDALONE_COMBINED_BUDGET_MB,
         ),
-        "kv": _env_int("ANTFLY_INFERENCE_STANDALONE_KV_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB),
+        "kv": _env_int(
+            "ANTFLY_INFERENCE_STANDALONE_KV_BUDGET_MB",
+            DEFAULT_INFERENCE_STANDALONE_KV_BUDGET_MB,
+        ),
         "scratch": _env_int(
-            "ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB", DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB
+            "ANTFLY_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB",
+            DEFAULT_INFERENCE_STANDALONE_SCRATCH_BUDGET_MB,
         ),
     }
     process_memory_budget_mb = _env_int(
@@ -393,7 +430,9 @@ def embedded_standalone_runtime():
     warmup_performed = False
     primary_failure: BaseException | None = None
     try:
-        if not _integration_enabled("ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"):
+        if not _integration_enabled(
+            "ANTFLY_INFERENCE_STANDALONE_SKIP_GENERATOR_WARMUP"
+        ):
             try:
                 _warm_inference_generator(
                     server.inference_api_url,
@@ -417,6 +456,7 @@ def embedded_standalone_runtime():
             "process_memory_budget_mb": process_memory_budget_mb,
             "warmup_performed": warmup_performed,
             "logs": server.debug_logs,
+            "process": server.proc,
         }
     except BaseException as exc:
         # A skipped test has no primary failure to preserve; a teardown defect
@@ -480,7 +520,9 @@ def embedded_standalone_api(embedded_standalone_runtime):
                 response = self.s.get(f"{self.url}/tables", timeout=30)
             return self._check(response)
 
-        def create_index(self, table_name: str, index_name: str, config: dict[str, object]) -> dict:
+        def create_index(
+            self, table_name: str, index_name: str, config: dict[str, object]
+        ) -> dict:
             with self._request_lock:
                 response = self.s.post(
                     f"{self.url}/tables/{table_name}/indexes/{index_name}",
@@ -529,7 +571,9 @@ def embedded_standalone_api(embedded_standalone_runtime):
             if sync_level is not None:
                 payload["sync_level"] = sync_level
             with self._request_lock:
-                response = self.s.post(f"{self.url}/tables/{table_name}/batch", json=payload, timeout=30)
+                response = self.s.post(
+                    f"{self.url}/tables/{table_name}/batch", json=payload, timeout=30
+                )
             return self._check(response)
 
     yield Api(session, base_url)
@@ -542,7 +586,9 @@ def embedded_standalone_cli(embedded_standalone_runtime):
     env = os.environ.copy()
     env["ANTFLY_URL"] = embedded_standalone_runtime["public_url"]
 
-    def run_cli(*args: str, check: bool = True, timeout_s: float = 180.0) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        *args: str, check: bool = True, timeout_s: float = 180.0
+    ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             [binary] + list(args),
             capture_output=True,
@@ -579,12 +625,167 @@ def _parse_cli_json(stdout: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _inference_worker_pid(parent_pid: int) -> int | None:
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    workers = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if (
+            len(parts) == 3
+            and int(parts[1]) == parent_pid
+            and parts[2].endswith("inference _worker")
+        ):
+            workers.append(int(parts[0]))
+    assert len(workers) <= 1, workers
+    return workers[0] if workers else None
+
+
+@pytest.mark.parametrize("failure", ["kill", "disconnect"])
+def test_standalone_inference_worker_isolation(embedded_standalone_runtime, failure):
+    if os.name != "posix":
+        pytest.skip("Process fault injection requires POSIX signals")
+    runtime = embedded_standalone_runtime
+    process = runtime["process"]
+    worker = _inference_worker_pid(process.pid)
+    if worker is None:
+        pytest.skip("This build has only cooperatively interruptible backends")
+    base = runtime["base_url"]
+    table = f"worker_isolation_{failure}"
+    response = requests.post(f"{base}/tables/{table}", json={}, timeout=10)
+    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{base}/tables/{table}/batch",
+            json={
+                "inserts": {"canary": {"body": "AZURE-731"}},
+                "sync_level": "full_text",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        def check_database():
+            assert process.poll() is None, runtime["logs"]()
+            response = requests.post(
+                f"{base}/tables/{table}/query",
+                json={"full_text_search": {"match_all": {}}, "limit": 1},
+                timeout=5,
+            )
+            response.raise_for_status()
+            assert (
+                response.json()["responses"][0]["hits"]["hits"][0]["_id"] == "canary"
+            ), response.text
+
+        check_database()
+        baseline = requests.post(
+            f"{runtime['inference_api_url']}/generate",
+            json={
+                "model": runtime["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "What is the capital of France? Answer with the city name.",
+                    }
+                ],
+                "max_tokens": 128,
+                "temperature": 0,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=60,
+        )
+        baseline.raise_for_status()
+        assert "paris" in baseline.json()["choices"][0]["message"]["content"].lower(), (
+            baseline.text
+        )
+        response = requests.post(
+            f"{runtime['inference_api_url']}/generate",
+            json={
+                "model": runtime["model"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Count from 1 to 10000, one number at a time, without skipping any numbers.",
+                    }
+                ],
+                "max_tokens": 8192,
+                "temperature": 0,
+                "stream": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            stream=True,
+            timeout=60,
+        )
+        try:
+            response.raise_for_status()
+            lines = response.iter_lines(chunk_size=1, decode_unicode=True)
+            first = next(line for line in lines if line.startswith("data: "))
+            assert first != "data: [DONE]", first
+            check_database()
+            if failure == "kill":
+                os.kill(worker, signal.SIGKILL)
+                completed = False
+                try:
+                    completed = any(line == "data: [DONE]" for line in lines)
+                except requests.RequestException:
+                    pass  # A broken stream is an explicit failure, not success.
+                assert not completed, (
+                    "Worker death must not fabricate a completed response"
+                )
+        finally:
+            response.close()
+        check_database()
+
+        # The next request may race with the old generation draining, but must
+        # recover without restarting the database or replaying the old request.
+        deadline = time.monotonic() + 90
+        while True:
+            response = requests.post(
+                f"{runtime['inference_api_url']}/generate",
+                json={
+                    "model": runtime["model"],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the capital of France? Answer with the city name.",
+                        }
+                    ],
+                    "max_tokens": 128,
+                    "temperature": 0,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=60,
+            )
+            if response.ok:
+                assert (
+                    "paris"
+                    in response.json()["choices"][0]["message"]["content"].lower()
+                ), response.text + "\n" + runtime["logs"]()
+                break
+            assert time.monotonic() < deadline, response.text
+            time.sleep(0.1)
+        if failure == "kill":
+            assert _inference_worker_pid(process.pid) != worker
+        check_database()
+    finally:
+        requests.delete(f"{base}/tables/{table}", timeout=10).raise_for_status()
+
+
 def test_standalone_inference_process_envelope_composition(embedded_standalone_runtime):
     budget_mb = embedded_standalone_runtime["process_memory_budget_mb"]
     if budget_mb <= 0:
-        pytest.skip("Set ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB to validate composition")
+        pytest.skip(
+            "Set ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB to validate composition"
+        )
 
-    assert embedded_standalone_runtime["warmup_performed"], "real generator warmup must complete"
+    assert embedded_standalone_runtime["warmup_performed"], (
+        "real generator warmup must complete"
+    )
     expected_bytes = budget_mb * 1024 * 1024
     logs = embedded_standalone_runtime["logs"]()
     assert "effective_source=explicit" in logs
@@ -607,8 +808,12 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
             return False
         return r.status_code == 200
 
-    if not wait_until(lambda: True if healthz_ok() else None, timeout_s=15.0, interval_s=0.25):
-        raise AssertionError(f"standalone health server did not come up at {health_url}\nlogs:\n{logs()}")
+    if not wait_until(
+        lambda: True if healthz_ok() else None, timeout_s=15.0, interval_s=0.25
+    ):
+        raise AssertionError(
+            f"standalone health server did not come up at {health_url}\nlogs:\n{logs()}"
+        )
 
     healthz = requests.get(f"{health_url}/healthz", timeout=5)
     assert healthz.status_code == 200
@@ -624,15 +829,16 @@ def test_standalone_health_endpoints(embedded_standalone_runtime):
     assert metrics.status_code == 200
     assert metrics.headers["Content-Type"].startswith("text/plain")
     body = metrics.text
-    # Core raft host metrics written by StandaloneHealthSource.
-    assert "antfly_raft_hosted_groups" in body
-    assert "antfly_raft_reconcile_rounds_total" in body
-    # Managed service metrics.
-    assert "antfly_service_queued_updates" in body
-    assert "antfly_service_applied_updates_total" in body
+    # Standalone composes data-runtime, supervisor, and public admission
+    # metrics. Metadata-node raft-host/service metrics live on that node.
+    assert "antfly_data_server_up 1\n" in body
+    assert "antfly_runtime_supervisor_state 1\n" in body
+    assert "antfly_runtime_supervisor_cancelled 0\n" in body
+    assert "antfly_admission_query_capacity_requests" in body
+    assert "antfly_admission_inference_capacity_requests" in body
     # Prometheus exposition format sanity.
-    assert "# HELP antfly_raft_hosted_groups" in body
-    assert "# TYPE antfly_raft_hosted_groups gauge" in body
+    assert "# HELP antfly_data_server_up" in body
+    assert "# TYPE antfly_data_server_up gauge" in body
 
     unknown = requests.get(f"{health_url}/does-not-exist", timeout=5)
     assert unknown.status_code == 404
@@ -664,7 +870,7 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
             created_tables.add(table_name)
             assert created["name"] == table_name
             assert_created_index(
-        embedded_standalone_api.create_index(
+                embedded_standalone_api.create_index(
                     table_name,
                     "semantic_idx",
                     {
@@ -678,9 +884,9 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                         },
                     },
                 ),
-        "semantic_idx",
-        'embeddings',
-    )
+                "semantic_idx",
+                "embeddings",
+            )
 
         docs = {
             f"doc-{i:02d}": {
@@ -700,7 +906,9 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
         def observe_pending_embedding_work() -> dict | None:
             for table_name in hot_tables:
                 try:
-                    detail = embedded_standalone_api.get_index(table_name, "semantic_idx")
+                    detail = embedded_standalone_api.get_index(
+                        table_name, "semantic_idx"
+                    )
                 except (requests.RequestException, ValueError):
                     continue
                 latest_index_statuses[table_name] = detail
@@ -734,7 +942,9 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
 
         def dropped_tables_are_absent() -> bool:
             try:
-                names = {table["name"] for table in embedded_standalone_api.list_tables()}
+                names = {
+                    table["name"] for table in embedded_standalone_api.list_tables()
+                }
             except (requests.RequestException, ValueError):
                 return False
             return not names.intersection(hot_tables)
@@ -758,7 +968,9 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
         survivor_doc = embedded_standalone_api.lookup_key(survivor, "doc:survivor")
         assert survivor_doc["title"] == "surviving table remains writable"
 
-        response = requests.get(f"{embedded_standalone_runtime['base_url']}/status", timeout=30)
+        response = requests.get(
+            f"{embedded_standalone_runtime['base_url']}/status", timeout=30
+        )
         response.raise_for_status()
     finally:
         for table_name in sorted(created_tables):
@@ -768,7 +980,122 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                 pass
 
 
-def test_standalone_retrieval_generation_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):
+def test_standalone_gemma_agent_tools_via_cli(
+    embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime
+):
+    """Qualify real model tools, not a planner's synthetic tool-call counter."""
+    if "gemma-4" not in embedded_standalone_runtime["model"].lower():
+        pytest.skip("requires a Gemma 4 tool-capable generator")
+    table = f"gemma_agent_tools_{time.time_ns()}"
+    # This value is never supplied in a user prompt or a canned tool response.
+    canary = f"AZURE-{time.time_ns()}"
+    embedded_standalone_api.create_table(table, num_shards=1)
+    try:
+        embedded_standalone_api.batch_write(
+            table,
+            inserts={
+                "anatomy": {
+                    "title": "anatomy",
+                    "body": f"The anatomy verification code is {canary}.",
+                },
+                "noise": {
+                    "title": "physics",
+                    "body": "There is no verification code here.",
+                },
+            },
+            sync_level="full_index",
+        )
+        generator = json.dumps(
+            {
+                "provider": "antfly",
+                "model": embedded_standalone_runtime["model"],
+                "max_tokens": 512,
+                "temperature": 0,
+            }
+        )
+        common = (
+            "agents",
+            "query-builder",
+            "--table",
+            table,
+            "--fields",
+            "title,body",
+            "--mode",
+            "full_text",
+            "--intent",
+            "Find the anatomy document and report its verification code.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+        )
+        response = embedded_standalone_api.s.post(
+            f"{embedded_standalone_api.url}/agents/query-builder",
+            json={
+                "table": table,
+                "schema_fields": ["title", "body"],
+                "mode": "full_text",
+                "intent": "Find the anatomy document and report its verification code.",
+                "generator": json.loads(generator),
+                "max_internal_iterations": 4,
+            },
+            timeout=240,
+        )
+        assert response.status_code == 200, response.text
+        api_plan = response.json()
+        assert api_plan["status"] == "completed", response.text
+        assert all(value is not None for value in api_plan["query_request"].values())
+        built = embedded_standalone_cli(*common, timeout_s=240)
+        plan = json.loads(built.stdout)
+        assert plan["status"] == "completed"
+        assert plan["query_request"]["table"] == table
+        assert any(
+            step["name"] == "submit_query" and step["kind"] == "tool_call"
+            for step in plan["steps"]
+        )
+        assert "generation" not in plan
+
+        executed = embedded_standalone_cli(
+            *common, "--execute", "--no-streaming", timeout_s=300
+        )
+        result = json.loads(executed.stdout)
+        assert result["status"] == "completed"
+        assert canary in result["generation"], json.dumps(result)
+        assert "anatomy" in _hit_ids(result)
+        assert any(
+            (step.get("details") or {}).get("selection_source") == "model_tool_call"
+            and (step.get("details") or {}).get("tool_call_id")
+            for step in result["steps"]
+        )
+
+        streamed = embedded_standalone_cli(
+            "agents",
+            "retrieval",
+            "--table",
+            table,
+            "--intent",
+            "Report the anatomy verification code from the database.",
+            "--generator",
+            generator,
+            "--max-internal-iterations",
+            "8",
+            "--generate",
+            "--streaming",
+            timeout_s=240,
+        )
+        assert "event: error" not in streamed.stdout
+        assert "event: done" in streamed.stdout
+        assert "build_query" in streamed.stdout
+        assert "submit_query" in streamed.stdout
+        assert "model_tool_call" in streamed.stdout
+        assert canary in streamed.stdout
+    finally:
+        embedded_standalone_api.delete_table(table)
+
+
+def test_standalone_retrieval_generation_with_live_inference(
+    embedded_standalone_api, embedded_standalone_runtime
+):
     table_name = f"standalone_generation_{time.time_ns()}"
     created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -816,12 +1143,14 @@ def test_standalone_retrieval_generation_with_live_inference(embedded_standalone
         lambda: (
             response
             if (
-                (response := _post_json_with_timeout(
-                    embedded_standalone_api,
-                    "/agents/retrieval",
-                    payload,
-                    timeout_s=180,
-                )).get("hits")
+                (
+                    response := _post_json_with_timeout(
+                        embedded_standalone_api,
+                        "/agents/retrieval",
+                        payload,
+                        timeout_s=180,
+                    )
+                ).get("hits")
                 and response.get("generation")
             )
             else None
@@ -839,7 +1168,9 @@ def test_standalone_retrieval_generation_with_live_inference(embedded_standalone
     assert result["steps"][-1]["name"] == "generation"
 
 
-def test_standalone_retrieval_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_runtime):
+def test_standalone_retrieval_streaming_with_live_inference(
+    embedded_standalone_api, embedded_standalone_runtime
+):
     table_name = f"standalone_streaming_{time.time_ns()}"
     created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -905,7 +1236,9 @@ def test_standalone_retrieval_streaming_with_live_inference(embedded_standalone_
     assert any(isinstance(chunk, str) and chunk.strip() for chunk in generation_chunks)
 
 
-def test_standalone_cli_retrieval_non_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime):
+def test_standalone_cli_retrieval_non_streaming_with_live_inference(
+    embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime
+):
     table_name = f"standalone_cli_generation_{time.time_ns()}"
     created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -939,26 +1272,28 @@ def test_standalone_cli_retrieval_non_streaming_with_live_inference(embedded_sta
         lambda: (
             parsed
             if (
-                (completed := embedded_standalone_cli(
-                    "agents",
-                    "retrieval",
-                    "--table",
-                    table_name,
-                    "--full-text-search",
-                    "body:Korean",
-                    "--prompt",
-                    "What are the major events in Korean history?",
-                    "--generator",
-                    generator_json,
-                    "--classify",
-                    "--reasoning",
-                    "--generate",
-                    "--followup",
-                    "--confidence",
-                    "--no-streaming",
-                    check=False,
-                    timeout_s=240.0,
-                )).returncode
+                (
+                    completed := embedded_standalone_cli(
+                        "agents",
+                        "retrieval",
+                        "--table",
+                        table_name,
+                        "--full-text-search",
+                        "body:Korean",
+                        "--prompt",
+                        "What are the major events in Korean history?",
+                        "--generator",
+                        generator_json,
+                        "--classify",
+                        "--reasoning",
+                        "--generate",
+                        "--followup",
+                        "--confidence",
+                        "--no-streaming",
+                        check=False,
+                        timeout_s=240.0,
+                    )
+                ).returncode
                 == 0
                 and (parsed := _parse_cli_json(completed.stdout))
                 and parsed.get("generation")
@@ -983,7 +1318,9 @@ def test_standalone_cli_retrieval_non_streaming_with_live_inference(embedded_sta
     assert result["followup_questions"]
 
 
-def test_standalone_cli_retrieval_streaming_with_live_inference(embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime):
+def test_standalone_cli_retrieval_streaming_with_live_inference(
+    embedded_standalone_api, embedded_standalone_cli, embedded_standalone_runtime
+):
     table_name = f"standalone_cli_streaming_{time.time_ns()}"
     created = embedded_standalone_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -1040,6 +1377,15 @@ def test_standalone_cli_retrieval_streaming_with_live_inference(embedded_standal
 
     events = _parse_sse_events(result.stdout)
     assert any(event == "hit" for event, _ in events)
-    assert any(event == "reasoning" and isinstance(data, str) and data.strip() for event, data in events)
-    assert any(event == "generation" and isinstance(data, str) and data.strip() for event, data in events)
-    assert any(event == "followup" and isinstance(data, str) and data.strip() for event, data in events)
+    assert any(
+        event == "reasoning" and isinstance(data, str) and data.strip()
+        for event, data in events
+    )
+    assert any(
+        event == "generation" and isinstance(data, str) and data.strip()
+        for event, data in events
+    )
+    assert any(
+        event == "followup" and isinstance(data, str) and data.strip()
+        for event, data in events
+    )

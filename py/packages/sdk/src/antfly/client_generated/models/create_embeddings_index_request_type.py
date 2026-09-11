@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class CreateEmbeddingsIndexRequestType(str, Enum):
+class CreateEmbeddingsIndexRequestType(StrEnum):
     EMBEDDINGS = "embeddings"
 
     def __str__(self) -> str:

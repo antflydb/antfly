@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class FieldMappingType(str, Enum):
+class FieldMappingType(StrEnum):
     BLOB = "blob"
     BOOL = "bool"
     BOOLEAN = "boolean"

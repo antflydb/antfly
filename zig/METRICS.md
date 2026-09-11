@@ -34,10 +34,35 @@ Current LSM cache kinds:
 Current slices:
 
 - `lsm.block_table_cache`
+- `lsm.compaction_work`
+- `lsm.table_builder_working_set`
+- `lsm.in_memory_state`
+- `lsm.wal_write_working_set`
+- `lsm.wal_retention`
+- `lsm.recovery_working_set`
 - `hbc.node_metadata_cache`
+- `dense.search_working_set`
+- `dense.apply_working_set`
+- `dense.routing_working_set`
+- `derived.replay_window`
 - `full_text.pending_segments`
+- `full_text.build_working_set`
+- `full_text.segment_residency`
+- `document_extraction.working_set`
 - `derived.backlog`
 - `text_merge.buffers`
+- `algebraic.tensor_accumulators`
+- `sparse.apply_working_set`
+- `lite.native_page_cache`
+- `lite.native_link_cache`
+- `lite.docstore_snapshot_cache`
+- `inference.prompt_cache`
+- `inference.tokenizer_cache`
+- `inference.model_residency`
+- `inference.kv_working_set`
+- `inference.scratch_working_set`
+- `dense_repair.working_set`
+- `shard_transition.working_set`
 
 Each slice exports:
 

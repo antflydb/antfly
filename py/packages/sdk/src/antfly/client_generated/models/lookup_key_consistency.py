@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class LookupKeyConsistency(str, Enum):
+class LookupKeyConsistency(StrEnum):
     LEADER_LEASE = "leader_lease"
     READ_INDEX = "read_index"
     STALE = "stale"

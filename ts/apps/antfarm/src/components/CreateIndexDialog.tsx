@@ -1192,17 +1192,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           case "ollama":
             embedderConfig = { provider: "ollama", model, url };
             break;
-          case "gemini":
-            embedderConfig = { provider: "gemini", model, api_key };
-            break;
-          case "vertex":
-            embedderConfig = { provider: "vertex", model };
-            break;
           case "openai":
             embedderConfig = { provider: "openai", model, api_key, url };
-            break;
-          case "openrouter":
-            embedderConfig = { provider: "openrouter", model, api_key };
             break;
           case "bedrock":
             embedderConfig = {
@@ -1210,12 +1201,6 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
               model,
               region,
             };
-            break;
-          case "cohere":
-            embedderConfig = { provider: "cohere", model, api_key };
-            break;
-          case "mock":
-            embedderConfig = { provider: "mock", model };
             break;
           case "antfly":
             embedderConfig = { provider: "antfly", model };

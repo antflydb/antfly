@@ -18,7 +18,7 @@ const platform = @import("antfly_platform");
 const compat = inference.io.compat;
 const c_file = inference.util.c_file;
 
-const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig");
+const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig").Command(@import("inference_internal"));
 const run_gemma4_lora_pilot_workflow = @import("run_gemma4_lora_pilot_workflow.zig");
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;

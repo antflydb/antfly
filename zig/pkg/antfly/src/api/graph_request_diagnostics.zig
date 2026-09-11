@@ -45,6 +45,13 @@ pub const Scope = struct {
     }
 };
 
+pub fn reset() void {
+    graph_query.reset();
+    distinct_budget.reset();
+    path_weight.reset();
+    work_budget.reset();
+}
+
 test "nested request scopes restore their caller diagnostics" {
     var outer: Context = .{};
     const outer_scope = Scope.init(&outer);

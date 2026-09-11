@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class GraphDistinctBudgetExceededErrorDimension(str, Enum):
+class GraphDistinctBudgetExceededErrorDimension(StrEnum):
     DISTINCT_IDENTITIES = "distinct_identities"
     DISTINCT_STATE_BYTES = "distinct_state_bytes"
 

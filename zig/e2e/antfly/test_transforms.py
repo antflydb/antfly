@@ -34,7 +34,9 @@ def _raise_thread_errors(errors: list[Exception]) -> None:
         raise AssertionError("\n\n".join(str(err) for err in errors))
 
 
-def _transform(key: str, *operations: dict[str, object], upsert: bool = False) -> dict[str, object]:
+def _transform(
+    key: str, *operations: dict[str, object], upsert: bool = False
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "key": key,
         "operations": list(operations),
@@ -115,7 +117,9 @@ def test_transform_min_keeps_lowest_value_and_upserts(stateful_api):
 
     stateful_api.batch_write(
         table_name,
-        transforms=[_transform("item-1", _op("$min", "priority", 10), _op("$min", "missing", 7))],
+        transforms=[
+            _transform("item-1", _op("$min", "priority", 10), _op("$min", "missing", 7))
+        ],
         sync_level="write",
     )
     doc = stateful_api.lookup_key(table_name, "item-1")
@@ -208,13 +212,17 @@ def test_transform_concurrent_max_updates(stateful_api):
         try:
             stateful_api.batch_write(
                 table_name,
-                transforms=[_transform("concurrent-item", _op("$max", "version", version))],
+                transforms=[
+                    _transform("concurrent-item", _op("$max", "version", version))
+                ],
                 sync_level="write",
             )
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(version,)) for version in range(1, 21)]
+    threads = [
+        threading.Thread(target=worker, args=(version,)) for version in range(1, 21)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -318,7 +326,9 @@ def test_transform_multiple_operators(stateful_api):
     "operator",
     ("$push", "$pull", "$pop", "$mul", "$currentDate", "$rename"),
 )
-def test_unsupported_transform_is_rejected_without_partial_mutation(stateful_api, operator):
+def test_unsupported_transform_is_rejected_without_partial_mutation(
+    stateful_api, operator
+):
     table_name = f"transforms_unsupported_{time.time_ns()}"
     stateful_api.create_table(table_name, num_shards=1)
     stateful_api.batch_write(
@@ -434,7 +444,9 @@ def test_serverless_table_transforms_follow_latest_then_published(serverless_api
     except requests.HTTPError:
         pass
 
-    published_after = wait_until(published_after_transform, timeout_s=10.0, interval_s=0.1)
+    published_after = wait_until(
+        published_after_transform, timeout_s=10.0, interval_s=0.1
+    )
     assert published_after is not None
     published_after_docs = _docs_by_id(published_after)
     assert published_after_docs["doc-a"]["status"] == "updated"

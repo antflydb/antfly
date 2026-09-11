@@ -21,9 +21,9 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const db_mod = @import("db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const query_api = @import("../api/query.zig");
-const table_reads_api = @import("../api/table_reads.zig");
+const local_query = @import("antfly_source_root").antfly_sources.local_query;
 const distributed_graph = @import("../api/distributed_graph.zig");
 
 pub fn execute(
@@ -97,27 +97,20 @@ fn executeSearch(
 
     owned.req.cancellation = requestCancellationToken(request);
 
-    // Preserve the generation actually used by DB.search in the encoded wire
-    // response. This validation belongs to the provider because the DB and its
-    // identity namespace do not cross the ABI as typed implementation state.
-    owned.req = db.searchRequestAtCurrentIdentityGeneration(owned.req) catch |err|
+    // Capture the token and result under the same DB read lease.
+    const captured = db.searchWithCapturedRequest(alloc, owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
-
-    var result = db.search(alloc, owned.req) catch |err|
-        return fail(err, executeOperation(request.dialect), out_failure);
+    var result = captured.result;
     defer result.deinit();
 
-    var response = query_api.encodeQueryResponses(
+    const response = query_api.encodeQueryResponses(
         alloc,
         table_name,
-        owned.req,
+        captured.request,
         .{},
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
-    defer response.deinit(alloc);
-
-    const bytes = alloc.dupe(u8, response.json) catch |err|
-        return fail(err, encodeOperation(request.dialect), out_failure);
+    const bytes = response.json;
     out_response.* = .{
         .buffer = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) },
         .identity_read_generation = response.identity_read_generation orelse 0,
@@ -138,7 +131,7 @@ fn executeGraphExpand(
         return fail(err, .parse_graph_expand, out_failure);
     defer parsed.deinit(alloc);
     applyControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphExpand(alloc, db, table_name, parsed) catch |err|
+    var result = local_query.executeStorageKernelGraphExpand(alloc, db, table_name, parsed) catch |err|
         return fail(err, .execute_graph_expand, out_failure);
     defer result.deinit(alloc);
     const response = distributed_graph.encodeGraphExpandResponse(alloc, result) catch |err|
@@ -158,7 +151,7 @@ fn executeGraphHydrate(
         return fail(err, .parse_graph_hydrate, out_failure);
     defer parsed.deinit(alloc);
     applyControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphHydrate(alloc, db, parsed) catch |err|
+    var result = local_query.executeStorageKernelGraphHydrate(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_hydrate, out_failure);
     defer result.deinit(alloc);
     const response = distributed_graph.encodeGraphHydrateResponse(alloc, result) catch |err|
@@ -178,7 +171,7 @@ fn executeGraphEdges(
         return fail(err, .parse_graph_edges, out_failure);
     defer parsed.deinit(alloc);
     applyControls(request, &parsed);
-    var result = table_reads_api.executeStorageKernelGraphEdges(alloc, db, parsed) catch |err|
+    var result = local_query.executeStorageKernelGraphEdges(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_edges, out_failure);
     defer result.deinit(alloc);
     const response = distributed_graph.encodeGraphEdgesResponse(alloc, result) catch |err|
@@ -194,7 +187,7 @@ fn executeTextStats(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = table_reads_api.executeStorageKernelTextStats(
+    const response = local_query.executeStorageKernelTextStats(
         std.heap.c_allocator,
         db,
         table_name,
@@ -210,7 +203,7 @@ fn executeAlgebraicPartials(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = table_reads_api.executeStorageKernelAlgebraicPartials(
+    const response = local_query.executeStorageKernelAlgebraicPartials(
         std.heap.c_allocator,
         db,
         request.request_json.slice(),
@@ -226,7 +219,7 @@ fn executePreflight(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = table_reads_api.executeStorageKernelPreflight(
+    const response = local_query.executeStorageKernelPreflight(
         std.heap.c_allocator,
         db,
         table_name,

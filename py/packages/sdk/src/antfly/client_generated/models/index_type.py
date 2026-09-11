@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class IndexType(str, Enum):
+class IndexType(StrEnum):
     ALGEBRAIC = "algebraic"
     EMBEDDINGS = "embeddings"
     FULL_TEXT = "full_text"

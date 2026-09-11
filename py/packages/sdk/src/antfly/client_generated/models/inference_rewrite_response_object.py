@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceRewriteResponseObject(str, Enum):
+class InferenceRewriteResponseObject(StrEnum):
     LIST = "list"
 
     def __str__(self) -> str:

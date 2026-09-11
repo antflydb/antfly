@@ -6,6 +6,8 @@ The model documentation owns the detailed commands and acceptance criteria.
 
 ## Model families
 
+- `embedder/` contains shared embedding endpoint/sparse benchmarks and
+  model-specific reference, parity, and qualification tooling.
 - `gemma4/` contains Gemma4 Metal/CUDA benchmarks, qualification gates,
   speculative decoding checks, LoRA workflows, tests, and fixtures.
 - `gliner2/` contains GLiNER2 training, parity, release-readiness, hardware

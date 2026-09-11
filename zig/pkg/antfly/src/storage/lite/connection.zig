@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const group_ids = @import("../../common/group_ids.zig");
 
 const Allocator = std.mem.Allocator;

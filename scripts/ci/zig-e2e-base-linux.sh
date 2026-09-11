@@ -52,7 +52,10 @@ if ! ./zig-out/bin/antfly --version; then
 fi
 
 export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
-export ANTFLY_LSM_OPEN_DEBUG="${ANTFLY_LSM_OPEN_DEBUG:-1}"
+# Detailed per-phase LSM open traces are intentionally opt-in. CI preserves
+# bounded failure logs and phase metrics without multiplying every successful
+# index open into several info lines. Set ANTFLY_LSM_OPEN_DEBUG=1 to diagnose a
+# specific startup/open stall.
 e2e_suite="${ANTFLY_E2E_SUITE:-all}"
 case "$e2e_suite" in
   all|antfly|inference) ;;

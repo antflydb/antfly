@@ -13,7 +13,7 @@
 // limitations.
 
 //! Opaque internal ABI for staging `.aflite` and `.afb` inputs. The heavy Lite
-//! storage implementation lives in the standalone codegen unit; the remote CLI
+//! storage implementation lives in the storage codegen unit; the remote CLI
 //! sees only this handle and borrowed string results.
 
 const builtin = @import("builtin");
@@ -48,7 +48,6 @@ pub const Result = extern struct {
 };
 
 pub const CreateContext = extern struct {
-    allocator: *const anyopaque,
     input_path_ptr: [*]const u8,
     input_path_len: usize,
     table_name_ptr: [*]const u8,
@@ -124,10 +123,8 @@ pub fn stageInputRestoreBackup(
         };
     }
 
-    var allocator_copy = allocator;
     var result = Result{};
     const status = antfly_restore_staging_create(&.{
-        .allocator = &allocator_copy,
         .input_path_ptr = input_path.ptr,
         .input_path_len = input_path.len,
         .table_name_ptr = table_name.ptr,

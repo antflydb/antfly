@@ -186,7 +186,9 @@ def test_single_process_pause_retains_listener_port(server_type: type):
         server.port_reservations.close()
 
 
-def test_stateful_server_releases_requested_port_when_spawn_fails(monkeypatch: pytest.MonkeyPatch):
+def test_stateful_server_releases_requested_port_when_spawn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
     requested_port = find_free_port()
 
     def fail_to_spawn(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
@@ -304,7 +306,9 @@ def test_single_process_servers_release_port_when_setup_fails(
     def fail_tempdir(*args: Any, **kwargs: Any):
         raise OSError(errno.ENOSPC, "cannot create temporary directory")
 
-    monkeypatch.setattr(LoopbackPortReservations, "reserve_requested", record_listener_port)
+    monkeypatch.setattr(
+        LoopbackPortReservations, "reserve_requested", record_listener_port
+    )
     monkeypatch.setattr(tempfile, "TemporaryDirectory", fail_tempdir)
     with pytest.raises(OSError) as exc_info:
         server_type("/missing-antfly", "127.0.0.1", 0)

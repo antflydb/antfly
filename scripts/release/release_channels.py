@@ -55,9 +55,12 @@ class ReleaseSpec:
     npm_version: str
     python_version: str
     container_tag: str
+    release_line: str | None = None
+    source_ref: str | None = None
+    source_ref_head: str | None = None
 
     def document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "schema_version": 4,
             "tag": self.tag,
             "version": self.tag.removeprefix("v"),
@@ -71,6 +74,23 @@ class ReleaseSpec:
                 "container": self.container_tag,
             },
         }
+        source_provenance = (
+            self.release_line,
+            self.source_ref,
+            self.source_ref_head,
+        )
+        if any(value is not None for value in source_provenance):
+            if not all(value is not None for value in source_provenance):
+                raise SystemExit("release spec has incomplete source provenance")
+            document.update(
+                {
+                    "schema_version": 5,
+                    "release_line": self.release_line,
+                    "source_ref": self.source_ref,
+                    "source_ref_head": self.source_ref_head,
+                }
+            )
+        return document
 
 
 def parse_version(tag: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
@@ -154,6 +174,9 @@ def build_release_spec(
     policy: dict[str, Any] | None = None,
     *,
     allow_legacy: bool = False,
+    release_line: str | None = None,
+    source_ref: str | None = None,
+    source_ref_head: str | None = None,
 ) -> ReleaseSpec:
     for name, commit in (
         ("source", source_commit),
@@ -161,6 +184,18 @@ def build_release_spec(
     ):
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             raise SystemExit(f"invalid {name} commit: {commit}")
+    source_provenance = (release_line, source_ref, source_ref_head)
+    if any(value is not None for value in source_provenance):
+        if not all(value is not None for value in source_provenance):
+            raise SystemExit("release spec has incomplete source provenance")
+        if release_line != "nightly" and not re.fullmatch(
+            r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", str(release_line)
+        ):
+            raise SystemExit(f"invalid release line: {release_line}")
+        if not re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", str(source_ref)):
+            raise SystemExit(f"invalid release source ref: {source_ref}")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(source_ref_head)):
+            raise SystemExit(f"invalid release source ref head: {source_ref_head}")
     channel_name, _ = resolve_channel(
         tag, requested_channel, policy, allow_legacy=allow_legacy
     )
@@ -173,6 +208,9 @@ def build_release_spec(
         npm_version=registry["npm_version"],
         python_version=registry["python_version"],
         container_tag=registry["container_tag"],
+        release_line=release_line,
+        source_ref=source_ref,
+        source_ref_head=source_ref_head,
     )
 
 
@@ -457,6 +495,9 @@ def main() -> int:
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--source-commit")
     parser.add_argument("--build-controller-commit")
+    parser.add_argument("--release-line")
+    parser.add_argument("--source-ref")
+    parser.add_argument("--source-ref-head")
     parser.add_argument("--allow-legacy", action="store_true")
     args = parser.parse_args()
 
@@ -469,6 +510,10 @@ def main() -> int:
     if args.command == "spec":
         if not args.source_commit or not args.build_controller_commit:
             parser.error("spec requires --source-commit and --build-controller-commit")
+        if not args.release_line or not args.source_ref or not args.source_ref_head:
+            parser.error(
+                "spec requires --release-line, --source-ref, and --source-ref-head"
+            )
         spec = build_release_spec(
             args.tag,
             args.channel,
@@ -476,6 +521,9 @@ def main() -> int:
             args.build_controller_commit,
             policy,
             allow_legacy=args.allow_legacy,
+            release_line=args.release_line,
+            source_ref=args.source_ref,
+            source_ref_head=args.source_ref_head,
         )
         print(json.dumps(spec.document(), indent=2, sort_keys=True))
         return 0

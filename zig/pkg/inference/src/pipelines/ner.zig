@@ -47,10 +47,12 @@ pub const NerConfig = struct {
 };
 
 pub const NerPipeline = struct {
+    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
     config: NerConfig,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     pub fn usesDistributedGpuHosted(self: *const NerPipeline) bool {
         return self.config.distributed.enabled and
@@ -76,36 +78,70 @@ pub const NerPipeline = struct {
         };
     }
 
-    /// Recognize entities in a single text. Caller owns the returned slice.
-    pub fn recognize(self: *NerPipeline, text: []const u8) ![]Entity {
-        const alloc = self.allocator;
-        const max_len = self.config.max_length;
-        var run_permit = try self.session.admit(.{
-            .batch = 1,
-            .sequence = max_len,
-            .input_bytes = std.math.mul(usize, max_len, 24) catch
-                return error.ResourceLimitExceeded,
-            .host_preprocess_bytes = std.math.mul(usize, max_len, 32) catch
-                return error.ResourceLimitExceeded,
-        });
-        defer run_permit.deinit();
-
-        // Tokenize
-        var enc = try self.tok.encodeForModel(alloc, text, max_len);
+    /// Returns the exact non-padding sequence length that `recognize` sends
+    /// to the token-classification model for one input.
+    pub fn inputTokenCount(self: *NerPipeline, text: []const u8) !usize {
+        var enc = try self.tok.encodeForModel(self.allocator, text, self.config.max_length);
         defer enc.deinit();
 
-        // Convert i32 -> i64
-        const ids_i64 = try alloc.alloc(i64, max_len);
-        defer alloc.free(ids_i64);
-        const mask_i64 = try alloc.alloc(i64, max_len);
-        defer alloc.free(mask_i64);
-        for (0..max_len) |j| {
-            ids_i64[j] = @intCast(enc.ids[j]);
-            mask_i64[j] = @intCast(enc.attention_mask[j]);
+        var count: usize = 0;
+        for (enc.attention_mask) |mask| count += @intFromBool(mask != 0);
+        return count;
+    }
+
+    /// Recognize entities in a single text. Caller owns the returned slice.
+    pub fn recognize(self: *NerPipeline, text: []const u8) ![]Entity {
+        const rows = try self.recognizeWindow(&.{text});
+        defer self.allocator.free(rows);
+        return rows[0];
+    }
+
+    fn windowRequest(self: *NerPipeline, count: usize) !@import("../backends/session.zig").RunRequest {
+        const elements = std.math.mul(usize, count, self.config.max_length) catch return error.ResourceLimitExceeded;
+        return .{
+            .batch = count,
+            .sequence = self.config.max_length,
+            .input_bytes = std.math.mul(usize, elements, 24) catch return error.ResourceLimitExceeded,
+            .host_preprocess_bytes = std.math.mul(usize, elements, 32) catch return error.ResourceLimitExceeded,
+        };
+    }
+
+    fn recognizeWindow(self: *NerPipeline, texts: []const []const u8) ![][]Entity {
+        const alloc = self.allocator;
+        const max_len = self.config.max_length;
+        if (max_len == 0 or texts.len == 0) return error.InvalidInputShape;
+        const elements = std.math.mul(usize, texts.len, max_len) catch return error.ResourceLimitExceeded;
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
+        var run_permit = try self.session.admit(try self.windowRequest(texts.len));
+        defer run_permit.deinit();
+        if (self.execution_control) |control| try control.check();
+
+        // Tokenization remains caller-owned and sequential. Only the model
+        // forward is fused, so tokenizer scratch and span offsets are isolated.
+        const encoded = try alloc.alloc(@import("inference_tokenizer").EncodeResult, texts.len);
+        var encoded_count: usize = 0;
+        defer {
+            for (encoded[0..encoded_count]) |*enc| enc.deinit();
+            alloc.free(encoded);
+        }
+        for (texts, encoded) |text, *enc| {
+            if (self.execution_control) |control| try control.check();
+            enc.* = try self.tok.encodeForModel(alloc, text, max_len);
+            encoded_count += 1;
+            if (enc.ids.len != max_len or enc.attention_mask.len != max_len) return error.InvalidInputShape;
         }
 
-        // Build input tensors (batch=1)
-        const shape = [_]i64{ 1, @intCast(max_len) };
+        // Convert i32 -> i64
+        const ids_i64 = try alloc.alloc(i64, elements);
+        defer alloc.free(ids_i64);
+        const mask_i64 = try alloc.alloc(i64, elements);
+        defer alloc.free(mask_i64);
+        for (encoded, 0..) |enc, row| for (0..max_len) |j| {
+            ids_i64[row * max_len + j] = @intCast(enc.ids[j]);
+            mask_i64[row * max_len + j] = @intCast(enc.attention_mask[j]);
+        };
+
+        const shape = [_]i64{ @intCast(texts.len), @intCast(max_len) };
         var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape, ids_i64);
         defer input_ids_tensor.deinit();
         var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape, mask_i64);
@@ -124,7 +160,7 @@ pub const NerPipeline = struct {
         }
 
         const inputs = if (needs_token_type) blk: {
-            const zeros = try alloc.alloc(i64, max_len);
+            const zeros = try alloc.alloc(i64, elements);
             defer alloc.free(zeros);
             @memset(zeros, 0);
             token_type_tensor = try Tensor.initInt64(alloc, "token_type_ids", &shape, zeros);
@@ -132,7 +168,8 @@ pub const NerPipeline = struct {
         } else &[_]Tensor{ input_ids_tensor, attention_mask_tensor };
 
         // Run inference
-        var outputs = try run_permit.run(inputs, alloc);
+        if (texts.len > 1 and !@import("../server/tensor_microbatch.zig").eligible(self.session, inputs)) return error.UnsupportedBatchShape;
+        var outputs = if (self.batch_dispatch) |dispatch| try dispatch.run(alloc, self.session, &run_permit, null, inputs, self.execution_control) else try run_permit.runWithControl(inputs, alloc, self.execution_control);
         defer {
             for (outputs) |*o| o.deinit();
             alloc.free(outputs);
@@ -140,17 +177,32 @@ pub const NerPipeline = struct {
 
         if (outputs.len == 0) return error.NoOutputTensors;
 
-        // Output shape: [1, seq_len, num_labels]
+        // Output shape: [batch, seq_len, num_labels]. Validate before slicing.
         const output = &outputs[0];
         const output_shape = output.shape;
-        if (output_shape.len != 3) return error.UnexpectedOutputShape;
+        if (output.dtype != .f32 or output_shape.len != 3 or output_shape[0] != texts.len or output_shape[1] != max_len or output_shape[2] <= 0) return error.UnexpectedOutputShape;
 
         const seq_len: usize = @intCast(output_shape[1]);
         const num_labels: usize = @intCast(output_shape[2]);
         const data = output.asFloat32();
+        const row_elements = std.math.mul(usize, seq_len, num_labels) catch return error.UnexpectedOutputShape;
+        if (data.len != (std.math.mul(usize, texts.len, row_elements) catch return error.UnexpectedOutputShape)) return error.UnexpectedOutputShape;
 
         // Decode token predictions into entities
-        return self.aggregateEntities(text, enc.offsets, enc.attention_mask, data, seq_len, num_labels);
+        const results = try alloc.alloc([]Entity, texts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |entities| {
+                for (entities) |entity| alloc.free(entity.text);
+                alloc.free(entities);
+            }
+            alloc.free(results);
+        }
+        for (texts, encoded, results, 0..) |text, enc, *result, row| {
+            result.* = try self.aggregateEntities(text, enc.offsets, enc.attention_mask, data[row * row_elements ..][0..row_elements], seq_len, num_labels);
+            initialized += 1;
+        }
+        return results;
     }
 
     /// Recognize entities in a batch of texts.
@@ -168,9 +220,21 @@ pub const NerPipeline = struct {
             alloc.free(results);
         }
 
-        for (texts, 0..) |text, i| {
-            results[i] = try self.recognize(text);
-            initialized += 1;
+        while (initialized < texts.len) {
+            var count = @min(@as(usize, if (self.batch_dispatch != null) 8 else 1), texts.len - initialized);
+            while (count > 1 and !try self.session.fitsRun(try self.windowRequest(count))) count = (count + 1) / 2;
+            const rows = self.recognizeWindow(texts[initialized..][0..count]) catch |err| switch (err) {
+                // This is a preparation-time rejection, never a model retry.
+                error.UnsupportedBatchShape => {
+                    results[initialized] = try self.recognize(texts[initialized]);
+                    initialized += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            @memcpy(results[initialized..][0..count], rows);
+            alloc.free(rows);
+            initialized += count;
         }
 
         return results;
@@ -205,6 +269,7 @@ pub const NerPipeline = struct {
         // Skip [CLS] (index 0) and process tokens
         var i: usize = 1;
         while (i < seq_len) : (i += 1) {
+            if (self.execution_control) |control| if (i % 32 == 0) try control.check();
             if (attention_mask[i] == 0) break; // padding
             // Skip [SEP] token (last real token)
             if (i + 1 < seq_len and attention_mask[i + 1] == 0) break;
@@ -355,6 +420,84 @@ fn areCompatibleEntityTypes(a: []const u8, b: []const u8) bool {
     var prefix_len: usize = 0;
     while (prefix_len < min_len and a[prefix_len] == b[prefix_len]) : (prefix_len += 1) {}
     return prefix_len == min_len;
+}
+
+test "NER request arrays fuse bounded forwards and preserve per-text spans" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        largest: usize = 0,
+        fn encode(_: *anyopaque, allocator: std.mem.Allocator, text: []const u8, width: usize) !@import("inference_tokenizer").EncodeResult {
+            const ids = try allocator.alloc(i32, width);
+            errdefer allocator.free(ids);
+            const mask = try allocator.alloc(i32, width);
+            errdefer allocator.free(mask);
+            const offsets = try allocator.alloc([2]u32, width);
+            @memset(ids, 0);
+            @memset(mask, 0);
+            @memset(offsets, .{ 0, 0 });
+            ids[1] = text[0];
+            mask[0] = 1; // CLS
+            mask[1] = 1;
+            mask[2] = 1; // SEP
+            offsets[1] = .{ 0, 1 };
+            return .{ .ids = ids, .attention_mask = mask, .offsets = offsets, .allocator = allocator };
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, 2 } }};
+        }
+        fn independent(_: *anyopaque, _: []const Tensor) bool {
+            return true;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn forward(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const rows: usize = @intCast(inputs[0].shape[0]);
+            self.calls += 1;
+            self.largest = @max(self.largest, rows);
+            const width: usize = @intCast(inputs[0].shape[1]);
+            const data = try allocator.alloc(f32, rows * width * 2);
+            defer allocator.free(data);
+            for (0..rows * width) |i| {
+                data[i * 2] = 0;
+                data[i * 2 + 1] = 10;
+            }
+            var tensor = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(rows), @intCast(width), 2 }, data);
+            errdefer tensor.deinit();
+            const result = try allocator.alloc(Tensor, 1);
+            result[0] = tensor;
+            return result;
+        }
+        fn dispatch(_: *anyopaque, _: @import("../server/executor_microbatch.zig").Task, allocator: std.mem.Allocator, _: backends.Session, permit: ?*@import("../backends/session.zig").RunPermit, _: ?*std.atomic.Mutex, inputs: []const Tensor, _: ?@import("../execution_control.zig").InferenceExecutionControl) ![]Tensor {
+            return permit.?.run(inputs, allocator);
+        }
+    };
+    var probe = Probe{};
+    var pipeline = NerPipeline{
+        .allocator = alloc,
+        .session = .{ .ptr = &probe, .vtable = &.{ .run = Probe.forward, .inputInfo = Probe.info, .outputInfo = Probe.info, .backend = Probe.backend, .close = Probe.close, .independentBatchRows = Probe.independent } },
+        .tok = .{ .ptr = &probe, .vtable = &.{ .encode = undefined, .encodeInto = undefined, .encodeForModel = Probe.encode, .encodeGeneration = undefined, .decode = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } },
+        .batch_dispatch = .{ .ptr = &probe, .task = .extract, .run_fn = Probe.dispatch },
+        .config = .{ .max_length = 4, .id2label = &.{ "O", "B-TOKEN" } },
+    };
+    const texts = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+    const results = try pipeline.recognizeBatch(&texts);
+    defer {
+        for (results) |entities| {
+            for (entities) |entity| alloc.free(entity.text);
+            alloc.free(entities);
+        }
+        alloc.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqual(@as(usize, 8), probe.largest);
+    for (texts, results) |text, entities| {
+        try std.testing.expectEqual(@as(usize, 1), entities.len);
+        try std.testing.expectEqualStrings(text, entities[0].text);
+    }
 }
 
 test "parseBioTag" {

@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferencePredictorTask(str, Enum):
+class InferencePredictorTask(StrEnum):
     BINARY_CLASSIFICATION = "binary_classification"
     MULTICLASS = "multiclass"
     RANKING = "ranking"

@@ -253,11 +253,9 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # Physical storage and distributed control form the initial bounded-memory
-  # group. The split storage kernel gives physical codegen its own archive
-  # and an 18 GiB Darwin scheduler claim, so the 20 GiB release budget cannot
-  # admit another compiler unit beside it. Downstream units retain overlap once
-  # the storage claim is released.
+  # Runtime archives carry measured max-RSS admission claims. Independent units
+  # can compile concurrently when they fit the release memory budget; there are
+  # no artificial ordering dependencies between those compilations.
   run_zig_build_steps_with_retry archive antfly capi
 )
 

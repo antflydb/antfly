@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OpenAIGeneratorConfig")
@@ -16,6 +17,7 @@ class OpenAIGeneratorConfig:
     """Configuration for the OpenAI generative AI provider.
 
     Attributes:
+        provider (OpenAIGeneratorConfigProvider):
         model (str): The name of the OpenAI model to use. Default: 'gpt-4.1'. Example: gpt-4.1.
         url (str | Unset): The URL of the OpenAI API endpoint.
         api_key (str | Unset): The OpenAI API key.
@@ -26,6 +28,7 @@ class OpenAIGeneratorConfig:
         presence_penalty (float | Unset): Penalty for token presence (-2.0 to 2.0).
     """
 
+    provider: OpenAIGeneratorConfigProvider
     model: str = "gpt-4.1"
     url: str | Unset = UNSET
     api_key: str | Unset = UNSET
@@ -37,6 +40,8 @@ class OpenAIGeneratorConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        provider = self.provider.value
+
         model = self.model
 
         url = self.url
@@ -57,6 +62,7 @@ class OpenAIGeneratorConfig:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "provider": provider,
                 "model": model,
             }
         )
@@ -80,6 +86,8 @@ class OpenAIGeneratorConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        provider = OpenAIGeneratorConfigProvider(d.pop("provider"))
+
         model = d.pop("model")
 
         url = d.pop("url", UNSET)
@@ -97,6 +105,7 @@ class OpenAIGeneratorConfig:
         presence_penalty = d.pop("presence_penalty", UNSET)
 
         open_ai_generator_config = cls(
+            provider=provider,
             model=model,
             url=url,
             api_key=api_key,

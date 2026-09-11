@@ -173,13 +173,11 @@ pub const Eval = struct {
             },
             .for_stmt => |for_stmt| {
                 if (for_stmt.open_strip_left) self.stripTrailingWhitespace();
-                if (for_stmt.open_strip_right) self.strip_next = true;
 
                 const iterable = try self.evalExpr(for_stmt.iterable);
                 const items = switch (iterable) {
                     .list => |l| l,
                     else => {
-                        if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                         if (for_stmt.close_strip_right) self.strip_next = true;
                         return;
                     },
@@ -187,7 +185,7 @@ pub const Eval = struct {
 
                 if (items.len == 0) {
                     for (for_stmt.else_body) |child| try self.execNode(child);
-                    if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
+                    if (for_stmt.else_body.len != 0 and for_stmt.close_strip_left) self.stripTrailingWhitespace();
                     if (for_stmt.close_strip_right) self.strip_next = true;
                     return;
                 }
@@ -225,9 +223,13 @@ pub const Eval = struct {
                     loop_map.put(self.arena, "revindex0", Value.int(@intCast(items.len - i - 1))) catch return;
                     scope.put(self.arena, "loop", .{ .map = loop_map }) catch return;
 
+                    // The whitespace adjacent to a for/endfor tag is part of
+                    // the repeated body. Jinja applies both controls on every
+                    // iteration, not just at the outer loop boundary.
+                    if (for_stmt.open_strip_right) self.strip_next = true;
                     for (for_stmt.body) |child| try self.execNode(child);
+                    if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                 }
-                if (for_stmt.close_strip_left) self.stripTrailingWhitespace();
                 if (for_stmt.close_strip_right) self.strip_next = true;
             },
             .set_stmt => |set| {
@@ -249,6 +251,32 @@ pub const Eval = struct {
                     }
                 }
                 if (set.strip_right) self.strip_next = true;
+            },
+            .capture_stmt => |capture| {
+                if (capture.open_strip_left) self.stripTrailingWhitespace();
+                // Capture into a separate buffer, retaining the enclosing
+                // scope so namespace mutations have normal Jinja semantics.
+                const outer_output = self.output;
+                const outer_fence = self.strip_fence;
+                const outer_strip = self.strip_next;
+                self.output = .empty;
+                self.strip_fence = 0;
+                self.strip_next = capture.open_strip_right;
+                const captured = blk: {
+                    defer {
+                        self.output = outer_output;
+                        self.strip_fence = outer_fence;
+                        self.strip_next = outer_strip or capture.close_strip_right;
+                    }
+                    for (capture.body) |child| try self.execNode(child);
+                    if (capture.close_strip_left) self.stripTrailingWhitespace();
+                    break :blk try self.output.toOwnedSlice(self.arena);
+                };
+                if (self.scope_depth > 0) {
+                    if (self.scopes[self.scope_depth - 1]) |scope| {
+                        try scope.put(self.arena, capture.name, Value.str(captured));
+                    }
+                }
             },
             .macro_stmt => |mac| {
                 if (mac.strip_left) self.stripTrailingWhitespace();
@@ -320,6 +348,10 @@ pub const Eval = struct {
                 };
             },
             .call => |c| {
+                if (c.func.* == .name) {
+                    if (std.mem.eql(u8, c.func.name, "raise_exception")) return error.TemplateException;
+                    if (std.mem.eql(u8, c.func.name, "range")) return self.evalRange(c.args);
+                }
                 // Method calls: obj.method(args)
                 if (c.func.* == .get_attr) {
                     const obj = try self.evalExpr(c.func.get_attr.obj);
@@ -334,7 +366,7 @@ pub const Eval = struct {
                     return try self.callMacro(func_val.macro, c.args, c.kwargs);
                 }
 
-                // raise_exception and other unknown functions are no-ops
+                // Unrecognized optional template helpers evaluate as undefined.
                 return .undefined;
             },
             .filter => |f| {
@@ -702,6 +734,12 @@ pub const Eval = struct {
     // --- Method calls ---
 
     fn evalMethodCall(self: *Eval, obj: Value, method: []const u8, args: []const *ast.Expr) anyerror!Value {
+        if (obj == .map and std.mem.eql(u8, method, "get")) {
+            if (args.len < 1 or args.len > 2) return error.InvalidArguments;
+            const key = try self.evalExpr(args[0]);
+            if (key != .string) return error.InvalidArguments;
+            return obj.map.get(key.string) orelse if (args.len == 2) try self.evalExpr(args[1]) else .none;
+        }
         if (obj == .string) {
             if (std.mem.eql(u8, method, "split")) {
                 if (args.len > 0) {
@@ -713,6 +751,28 @@ pub const Eval = struct {
             }
         }
         return .undefined;
+    }
+
+    fn evalRange(self: *Eval, args: []const *ast.Expr) !Value {
+        if (args.len < 1 or args.len > 3) return error.InvalidArguments;
+        var values = [_]i64{ 0, 0, 1 };
+        for (args, 0..) |arg, i| {
+            const value = try self.evalExpr(arg);
+            if (value != .integer) return error.InvalidArguments;
+            values[if (args.len == 1) 1 else i] = value.integer;
+        }
+        const start: i128 = values[0];
+        const stop: i128 = values[1];
+        const step: i128 = values[2];
+        if (step == 0) return error.InvalidArguments;
+        const distance = if (step > 0) stop - start else start - stop;
+        const stride = if (step > 0) step else -step;
+        const count = if (distance <= 0) 0 else @divTrunc(distance + stride - 1, stride);
+        // Bound allocations even for untrusted artifact templates.
+        if (count > 100_000) return error.RangeTooLarge;
+        const items = try self.arena.alloc(Value, @intCast(count));
+        for (items, 0..) |*item, i| item.* = Value.int(@intCast(start + @as(i128, @intCast(i)) * step));
+        return .{ .list = items };
     }
 
     fn stringSplit(self: *Eval, s: []const u8, sep: []const u8) !Value {
@@ -1012,6 +1072,38 @@ test "eval for strip whitespace" {
     try std.testing.expectEqualStrings("ab", result);
 }
 
+test "for tag whitespace control is applied on every iteration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const items = [_]Value{ Value.str("a"), Value.str("b") };
+    var ctx = ValueMap{};
+    try ctx.put(a, "items", .{ .list = &items });
+
+    const parser = @import("parser.zig");
+    const nodes = try parser.Parser.parse("{% for x in items %}{{ x }}\n{%- endfor %}", a);
+    var eval = Eval.init(a, &ctx);
+    const result = try eval.exec(nodes);
+    try std.testing.expectEqualStrings("ab", result);
+}
+
+test "for opening right-strip does not escape an empty loop body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const items = [_]Value{};
+    var ctx = ValueMap{};
+    try ctx.put(a, "items", .{ .list = &items });
+
+    const parser = @import("parser.zig");
+    const nodes = try parser.Parser.parse("A{% for x in items -%} skipped{% else %}  else{% endfor %}  Z", a);
+    var eval = Eval.init(a, &ctx);
+    const result = try eval.exec(nodes);
+    try std.testing.expectEqualStrings("A  else  Z", result);
+}
+
 test "eval set strip whitespace" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1086,7 +1178,7 @@ test "eval filter trim" {
     try std.testing.expectEqualStrings("hello", result);
 }
 
-test "eval raise_exception is silent" {
+test "eval raise_exception fails the render" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1095,11 +1187,10 @@ test "eval raise_exception is silent" {
     try ctx.put(a, "x", Value.bln(true));
 
     const parser = @import("parser.zig");
-    // raise_exception in a conditional branch should produce no output
+    // A rejected input must not silently produce a different prompt.
     const nodes = try parser.Parser.parse("{%- if x -%}{{ raise_exception('bad') }}{%- endif -%}", a);
     var eval = Eval.init(a, &ctx);
-    const result = try eval.exec(nodes);
-    try std.testing.expectEqualStrings("", result);
+    try std.testing.expectError(error.TemplateException, eval.exec(nodes));
 }
 
 test "eval slice" {

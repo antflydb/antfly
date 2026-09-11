@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceReadObjectObject(str, Enum):
+class InferenceReadObjectObject(StrEnum):
     READ = "read"
 
     def __str__(self) -> str:

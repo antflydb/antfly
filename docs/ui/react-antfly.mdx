@@ -1,5 +1,6 @@
 ---
 title: React Antfly
+unlisted: true
 description: UI components for building search applications with React and Antfly
 ---
 
@@ -37,7 +38,7 @@ import {
 } from '@antfly/components';
 
 const MySearchApp = () => (
-  <Antfly url="http://localhost:8080" table="movies">
+  <Antfly url="http://127.0.0.1:8080" table="movies">
     <QueryBox id="mainSearch" mode="live" placeholder="Search movies..." />
     <Facet id="actors" fields={["actors"]} />
     <Facet id="releasedYear" fields={["releasedYear"]} />
@@ -64,7 +65,7 @@ The `<Antfly>` component is the root provider that manages the search state and 
 
 ```jsx
 <Antfly
-  url="http://localhost:8080"
+  url="http://127.0.0.1:8080"
   table="your_table"
   headers={{
     Authorization: "Bearer your-token"
@@ -326,7 +327,7 @@ const summarizer = {
 - `id` (string, required): Unique identifier
 - `searchBoxId` (string, required): ID of the QueryBox that provides the search value
 - `summarizer` (object, required): LLM configuration
-  - `provider`: "ollama", "openai", "anthropic", "bedrock", "google"
+- `provider`: "antfly", "ollama", "openai", "gemini", or "vertex"
   - `model`: Model name
   - `api_key`: API key (if required)
 - `systemPrompt` (string): Custom system prompt for the LLM
@@ -785,7 +786,7 @@ function MyComponent() {
   // Start streaming
   const handleAsk = () => {
     startStream({
-      url: 'http://localhost:8080/db/v1',
+      url: 'http://127.0.0.1:8080/db/v1',
       request: {
         query: 'how does raft work',
         queries: [{
@@ -799,9 +800,9 @@ function MyComponent() {
           model: 'qwen2.5:7b'
         },
         steps: {
-          generation: { enabled: true },
-          classification: { enabled: true, with_reasoning: true },
-          followup: { enabled: true }
+          generation: {},
+          classification: { with_reasoning: true },
+          followup: {}
         }
       },
       headers: { 'X-API-Key': 'key' }
@@ -987,7 +988,7 @@ const MyApp = () => {
 
   return (
     <Antfly
-      url="http://localhost:8080"
+      url="http://127.0.0.1:8080"
       table="data"
       onChange={(values) => {
         const qs = toUrlQueryString(values);
@@ -1090,7 +1091,7 @@ import {
 
 const MovieSearch = () => {
   return (
-    <Antfly url="http://localhost:8080" table="movies">
+    <Antfly url="http://127.0.0.1:8080" table="movies">
       <div className="search-container">
         <header>
           <QueryBox id="search" mode="live" placeholder="Search movies...">

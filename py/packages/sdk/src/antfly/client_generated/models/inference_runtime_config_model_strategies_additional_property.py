@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceRuntimeConfigModelStrategiesAdditionalProperty(str, Enum):
+class InferenceRuntimeConfigModelStrategiesAdditionalProperty(StrEnum):
     BOUNDED = "bounded"
     EAGER = "eager"
     LAZY = "lazy"

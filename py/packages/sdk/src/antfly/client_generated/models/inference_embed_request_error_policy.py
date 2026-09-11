@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceEmbedRequestErrorPolicy(str, Enum):
+class InferenceEmbedRequestErrorPolicy(StrEnum):
     FAIL_FAST = "fail_fast"
     PER_ITEM = "per_item"
 

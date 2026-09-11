@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("patch_zig_0_16_build_runner_maxrss.py")
-SPEC = importlib.util.spec_from_file_location("patch_zig_0_16_build_runner_maxrss", SCRIPT)
+SPEC = importlib.util.spec_from_file_location(
+    "patch_zig_0_16_build_runner_maxrss", SCRIPT
+)
 assert SPEC and SPEC.loader
 patcher = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = patcher
@@ -26,7 +28,9 @@ class BuildRunnerPatchTest(unittest.TestCase):
     def test_patches_exactly_one_zig_0_16_wake_loop(self):
         source = self.root / "build_runner.zig"
         destination = self.root / "patched" / "build_runner.zig"
-        source.write_text("before\n" + patcher.OLD_WAKE_LOOP + "after\n", encoding="utf-8")
+        source.write_text(
+            "before\n" + patcher.OLD_WAKE_LOOP + "after\n", encoding="utf-8"
+        )
 
         patcher.patch_build_runner(source, destination)
 

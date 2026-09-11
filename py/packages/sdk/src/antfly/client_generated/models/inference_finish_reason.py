@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class InferenceFinishReason(str, Enum):
+class InferenceFinishReason(StrEnum):
     CONTENT_FILTER = "content_filter"
     FUNCTION_CALL = "function_call"
     LENGTH = "length"

@@ -19,6 +19,43 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const tables_api = @import("../api/tables.zig");
+const metadata_api = @import("api.zig");
+const doc_identity = @import("../storage/db/doc_identity.zig");
+
+pub const IndexActivationTarget = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: metadata_api.MetadataClusterIncarnation,
+    metadata_epoch: u64,
+    table_id: u64,
+    group_id: u64,
+    identity_namespace: doc_identity.Namespace,
+    table_name: []const u8,
+    index_name: []const u8,
+    indexes_json: []const u8,
+    indexes_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+pub const IndexActivationProgress = struct {
+    pub const State = enum {
+        accepted,
+        observed,
+        stale,
+        action_required,
+    };
+    pub const FailureCode = enum {
+        invalid_target,
+        conflicting_target,
+        unsupported,
+        publication_failed,
+        internal,
+    };
+
+    state: State,
+    /// Identity observation and serving authority are independent. An owner
+    /// can accept the exact incarnation before its first generation serves.
+    serviceable: bool = false,
+    error_code: ?FailureCode = null,
+};
 
 pub const ShardDbAdapter = struct {
     ptr: *anyopaque,
@@ -40,6 +77,14 @@ pub const ShardDbAdapter = struct {
             table_name: []const u8,
             group_id: u64,
         ) anyerror!?restore_state_contract.State = null,
+        /// Hand an idempotent catalog index activation to the resident group
+        /// owner. Acceptance means the process-lifetime owner durably owns the
+        /// retry; corpus work and publication remain asynchronous.
+        activate_index: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: IndexActivationTarget,
+        ) anyerror!IndexActivationProgress = null,
     };
 
     pub fn fetchMedianKey(self: ShardDbAdapter, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
@@ -65,6 +110,15 @@ pub const ShardDbAdapter = struct {
     ) !?restore_state_contract.State {
         const read = self.vtable.restore_state orelse return error.StorageKernelOwnerUnavailable;
         return try read(self.ptr, alloc, table_name, group_id);
+    }
+
+    pub fn activateIndex(
+        self: ShardDbAdapter,
+        alloc: std.mem.Allocator,
+        target: IndexActivationTarget,
+    ) !IndexActivationProgress {
+        const activate = self.vtable.activate_index orelse return error.UnsupportedOperation;
+        return try activate(self.ptr, alloc, target);
     }
 };
 

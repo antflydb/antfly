@@ -17,7 +17,7 @@ const http_client = @import("api/http_client.zig");
 const internal_transition_wire = @import("api/internal_transition_wire.zig");
 const provisioned_storage = @import("api/provisioned_storage.zig");
 const table_write_source = @import("api/table_write_source.zig");
-const table_writes = @import("api/table_writes.zig");
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 
 test {
     _ = batch;
@@ -27,3 +27,6 @@ test {
     _ = table_write_source;
     _ = table_writes;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

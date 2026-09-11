@@ -1,7 +1,7 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SortProfileSortLifecycleState(str, Enum):
+class SortProfileSortLifecycleState(StrEnum):
     ACCELERATED = "accelerated"
     COVERED = "covered"
     DECLARED = "declared"

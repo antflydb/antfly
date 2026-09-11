@@ -754,7 +754,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} q6_high_row_mm_matrix={d}\n",
         .{
             provider_stats.metal_runtime_q4_k_linear_reduce,
             provider_stats.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -771,6 +771,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q6_k_linear_reduce_rows_9_64,
             provider_stats.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+            provider_stats.metal_runtime_q6_k_high_row_mm_matrix_dispatches,
         },
     );
     // Counter names and their order come from the shared table so this line
@@ -2135,17 +2136,29 @@ pub fn prewarmSharedDecoderRuntime(
     session: backends.Session,
     gpt_config: gpt_mod.Config,
 ) !bool {
+    return prewarmSharedDecoderRuntimeWithControl(allocator, session, gpt_config, null);
+}
+
+pub fn prewarmSharedDecoderRuntimeWithControl(
+    allocator: std.mem.Allocator,
+    session: backends.Session,
+    gpt_config: gpt_mod.Config,
+    control: ?@import("../execution_control.zig").InferenceExecutionControl,
+) !bool {
+    if (control) |active| try active.update(.preparing_weights, 0, 1);
     if (!supportsSession(session)) return false;
     if (gemma4_runtime.shouldSkipSharedDecoderPrewarm(gpt_config)) return false;
 
-    var cb = try session_factory.getComputeBackend(session, allocator);
-    defer cb.deinit();
+    var managed = try session_factory.getComputeBackendWithControl(session, allocator, control);
+    defer managed.deinit();
+    const cb = &managed.backend;
 
     // A4B uses the graph fallback rather than the prepared dense-family
     // decoder, so its bounded mapped-page warmup is the complete shared
     // pre-publication prepare operation when explicitly enabled.
     if (a4bMappedLayer0PrewarmEnabled(gpt_config)) {
-        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        try prewarmA4bMappedLayer0(cb, gpt_config);
+        if (control) |active| try active.update(.preparing_weights, 1, 1);
         return true;
     }
     // Multi-row prefill and the prepared A4B decoder share the provider's
@@ -2161,10 +2174,22 @@ pub fn prewarmSharedDecoderRuntime(
         configured_layer_count,
     );
     if (prepare.prepared) {
-        try prewarmEmbeddingWeight(&cb, gpt_config);
-        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        try cb.checkExecutionControl();
+        try prewarmEmbeddingWeight(cb, gpt_config);
+        try cb.checkExecutionControl();
+        try prewarmA4bMappedLayer0(cb, gpt_config);
     }
+    if (control) |active| try active.update(.preparing_weights, 1, 1);
     return prepare.prepared;
+}
+
+test "Metal prewarm checks request lifetime before session inspection" {
+    try std.testing.expectError(error.Timeout, prewarmSharedDecoderRuntimeWithControl(
+        std.testing.allocator,
+        undefined,
+        .{},
+        .{ .deadline_ns = 0 },
+    ));
 }
 
 pub fn createModelExecutor(
@@ -2215,6 +2240,7 @@ fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {
         .supports_sample_decode = true,
         .supports_greedy_decode = true,
         .state_ownership = .runtime_owned_host_cache,
+        .interruption = .process_required,
     };
 }
 
@@ -2315,6 +2341,7 @@ fn runtimePrefill(
     request: model_runtime.PrefillRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     runtime_ctx.drainPipelinedDecode();
     if (request.input_ids.len == 0 or request.query_seq_len == 0) return error.EmptyPrompt;
     if (request.input_ids.len != request.query_seq_len) return error.UnsupportedShape;
@@ -2324,6 +2351,7 @@ fn runtimePrefill(
     timing_stats.prefill_calls += 1;
     const prepare_started_at = monotonicNowNs();
     const decode_context = try runtime_ctx.preparePrefill(request.seq_len, request.query_seq_len, request.attention_mode);
+    try request.check();
     timing_stats.prefill_prepare_nanos += @intCast(monotonicNowNs() - prepare_started_at);
     // The qualified A4B fast path owns qLen=1 decode only. Let canonical
     // prefill establish its dynamic packed-weight slots first, then install
@@ -2345,6 +2373,7 @@ fn runtimePrefill(
         std.debug.print("prefill-trace: runtimePrefill qlen={d} seq={d} ready={}\n", .{ request.query_seq_len, request.seq_len, decoder_runtime_ready });
     }
     if (decoder_runtime_ready and request.query_seq_len == 1) {
+        try request.check();
         const token_id = request.input_ids[request.input_ids.len - 1];
         const direct_started_at = monotonicNowNs();
         if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, token_id, request.seq_len, &decode_context)) |output| {
@@ -2354,6 +2383,7 @@ fn runtimePrefill(
         timing_stats.prefill_direct_last_logits_nanos += @intCast(monotonicNowNs() - direct_started_at);
     }
     if (decoder_runtime_ready) {
+        try request.check();
         if (decoderRuntimePrefillTraceRequested()) {
             std.debug.print("prefill-trace: runtimePrefill entering direct family path\n", .{});
         }
@@ -2402,6 +2432,7 @@ fn runtimePrefill(
         timing_stats.prefill_direct_family_quant_attn_nanos += delta.quant_attn_nanos;
         timing_stats.prefill_direct_family_block_apply_nanos += delta.block_apply_nanos;
     }
+    try request.check();
     const fallback_started_at = monotonicNowNs();
     const logits = try forwardLastLogits(
         runtime_ctx,
@@ -2423,9 +2454,11 @@ fn runtimeDecode(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.ModelOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     runtime_ctx.drainPipelinedDecode();
     runtime_ctx.clearGreedyDeviceToken();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
+    try request.check();
 
     if (runtime_ctx.decoderRuntimeExecutorEnabled()) {
         if (try runtime_ctx.forwardDecoderRuntimeLastLogits(allocator, request.token_id, step.seq_len, &step.decode_context)) |output| {
@@ -2445,6 +2478,7 @@ fn runtimeDecodeSample(
     request: model_runtime.SampledDecodeRequest,
 ) !model_runtime.SampledDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.decode.check();
     if (request.sampling.isPureGreedy()) {
         const greedy = try runtimeDecodeGreedy(ctx, allocator, request.decode);
         return .{ .token_id = greedy.token_id };
@@ -2455,6 +2489,7 @@ fn runtimeDecodeSample(
     runtime_ctx.clearGreedyDeviceToken();
     const begin_started_at = monotonicNowNs();
     const step = try runtime_ctx.beginDecodeStep(request.decode.position, request.decode.attention_mode);
+    try request.decode.check();
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
     if (runtime_ctx.decoderRuntimeExecutorEnabled()) {
         const direct_started_at = monotonicNowNs();
@@ -2527,6 +2562,7 @@ fn runtimeDecodeGreedy(
     request: model_runtime.DecodeRequest,
 ) !model_runtime.GreedyDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    try request.check();
     timing_stats.decode_greedy_calls += 1;
     if (pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)) {
         const pipelined_started_at = monotonicNowNs();
@@ -2537,6 +2573,7 @@ fn runtimeDecodeGreedy(
     }
     const begin_started_at = monotonicNowNs();
     const step = try runtime_ctx.beginDecodeStep(request.position, request.attention_mode);
+    try request.check();
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
 
     const direct_started_at = monotonicNowNs();

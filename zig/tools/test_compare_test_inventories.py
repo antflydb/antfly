@@ -20,9 +20,7 @@ class CompareTestInventoriesTest(unittest.TestCase):
         self.assertEqual(
             frozenset({"storage.db.test.one", "storage.db.test.two"}),
             inventories.parse_inventory(
-                "diagnostic\n"
-                "TEST\tstorage.db.test.one\n"
-                "TEST\tstorage.db.test.two\n"
+                "diagnostic\nTEST\tstorage.db.test.one\nTEST\tstorage.db.test.two\n"
             ),
         )
 

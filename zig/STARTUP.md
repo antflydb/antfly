@@ -235,7 +235,7 @@ Opt-in structured timing covers:
 - `IndexManager.load()` per-index open and backfill timings
 - derived catch-up collection and apply timings
 
-`bench/storage/open_bench.zig` makes those timings comparable across changes.
+`open_bench` (built with `zig build antfly-storage-bench`) makes those timings comparable across changes.
 
 Status: complete.
 
@@ -255,9 +255,9 @@ Status: in progress.
 
 Current benchmark signal:
 
-- `bench/storage/open_bench.zig --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
+- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
   - `open_ms=9.056`
-- `bench/storage/open_bench.zig --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
+- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
   - `open_ms=5.622`
 
 That is roughly a `1.6x` improvement on the replay-heavy reopen case before

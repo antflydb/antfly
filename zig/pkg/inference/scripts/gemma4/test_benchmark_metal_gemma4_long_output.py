@@ -131,7 +131,14 @@ class ParserContractTests(unittest.TestCase):
             for repo in (source, parent):
                 subprocess.run(["git", "init", "-q", str(repo)], check=True)
                 subprocess.run(
-                    ["git", "-C", str(repo), "config", "user.email", "benchmark@test.invalid"],
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "config",
+                        "user.email",
+                        "benchmark@test.invalid",
+                    ],
                     check=True,
                 )
                 subprocess.run(
@@ -159,11 +166,15 @@ class ParserContractTests(unittest.TestCase):
                 ],
                 check=True,
             )
-            subprocess.run(["git", "-C", str(parent), "commit", "-q", "-am", "parent"], check=True)
+            subprocess.run(
+                ["git", "-C", str(parent), "commit", "-q", "-am", "parent"], check=True
+            )
             self.assertEqual(canonical_git_submodule_violations(parent), ())
             marker = parent / "deps/child/untracked.txt"
             marker.write_text("before\n")
-            self.assertIn("dirty worktree", canonical_git_submodule_violations(parent)[0])
+            self.assertIn(
+                "dirty worktree", canonical_git_submodule_violations(parent)[0]
+            )
             with self.assertRaisesRegex(BenchmarkContractError, "clean submodules"):
                 validate_canonical_git_worktree(parent)
             marker.write_text("mutated during benchmark\n")
@@ -182,7 +193,11 @@ class ParserContractTests(unittest.TestCase):
             BENCHMARK.read_text(),
         )
         rendered = subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "gemma4_metal_long_output.py"), "render-prompt"],
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "gemma4_metal_long_output.py"),
+                "render-prompt",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -279,7 +294,9 @@ class ParserContractTests(unittest.TestCase):
 
             outside = Path(raw) / "libggml-metal-injected.dylib"
             outside.write_bytes(b"injected")
-            with self.assertRaisesRegex(BenchmarkContractError, "outside pinned bundle"):
+            with self.assertRaisesRegex(
+                BenchmarkContractError, "outside pinned bundle"
+            ):
                 audit_llama_loaded_libraries(
                     "\n".join(lines + [f"dyld[123]: <INJECTED> {outside}"]),
                     bundle,
@@ -339,7 +356,9 @@ class HarnessContractTests(unittest.TestCase):
         self.llama_bundle = self.tmp / "llama-bundle"
         self.llama_bundle.mkdir()
         self.llama = self.llama_bundle / "llama-completion"
-        (self.llama_bundle / "libggml-metal.test.dylib").write_bytes(b"fake metal backend")
+        (self.llama_bundle / "libggml-metal.test.dylib").write_bytes(
+            b"fake metal backend"
+        )
         self.zig = self.tmp / "zig"
 
         executable(
@@ -540,7 +559,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
                 "MAX_CV": "0.01",
                 "EXPECTED_TOKEN_IDS_SHA256": TOKEN_IDS_SHA256,
                 "EXPECTED_PROMPT_TOKEN_IDS_SHA256": PROMPT_TOKEN_IDS_SHA256,
-                "EXPECTED_LLAMA_CPP_SHA256": hashlib.sha256(self.llama.read_bytes()).hexdigest(),
+                "EXPECTED_LLAMA_CPP_SHA256": hashlib.sha256(
+                    self.llama.read_bytes()
+                ).hexdigest(),
                 "EXPECTED_LLAMA_CPP_BUNDLE_SHA256": llama_bundle_manifest_sha256(
                     llama_bundle_manifest(self.llama_bundle)
                 ),
@@ -555,7 +576,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         env.pop("FAKE_ANTFLY_DECODE_MS", None)
         env.pop("FAKE_LLAMA_PROMPT_DRIFT", None)
         for name in tuple(env):
-            if name.startswith(("LLAMA_ARG_", "LLAMA_LOG_", "GGML_", "DYLD_", "GIT_")) or name in (
+            if name.startswith(
+                ("LLAMA_ARG_", "LLAMA_LOG_", "GGML_", "DYLD_", "GIT_")
+            ) or name in (
                 "LD_LIBRARY_PATH",
                 "LD_PRELOAD",
             ):
@@ -612,7 +635,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         )
         return env
 
-    def run_harness(self, out: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_harness(
+        self, out: Path, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(BENCHMARK)],
             env=env or self.environment(out),
@@ -631,7 +656,10 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.assertEqual(summary["output_tokens"], 300)
         self.assertLessEqual(summary["total_ratio"], 1.10)
         self.assertGreaterEqual(summary["decode_ratio"], 0.90)
-        self.assertEqual(summary["total_ratio"], summary["paired_ratios"]["total_latency_ratio"]["median"])
+        self.assertEqual(
+            summary["total_ratio"],
+            summary["paired_ratios"]["total_latency_ratio"]["median"],
+        )
         self.assertTrue(summary["cv_gate"]["passed"])
         self.assertFalse(summary["confidence_gate"]["required"])
         self.assertFalse(summary["canonical_policy"])
@@ -679,7 +707,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
             summary["cross_implementation_generated_token_contract"],
             "unavailable_in_pinned_llama_completion",
         )
-        self.assertEqual(summary["llama_prompt_token_ids_sha256"], PROMPT_TOKEN_IDS_SHA256)
+        self.assertEqual(
+            summary["llama_prompt_token_ids_sha256"], PROMPT_TOKEN_IDS_SHA256
+        )
         self.assertTrue(summary["no_mtp"])
         self.assertTrue(summary["route_contract_passed"])
         row = summary["rows"][0]
@@ -709,17 +739,30 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.assertEqual(row["q6_k_linear_reduce_rows_1"], 300)
         self.assertEqual(row["q4_0_linear_reduce_encode_us"], 1234)
         metadata = summary["metadata"]
-        self.assertEqual(metadata["schema"], "antfly.gemma4_metal_long_output.metadata.v4")
+        self.assertEqual(
+            metadata["schema"], "antfly.gemma4_metal_long_output.metadata.v4"
+        )
         self.assertEqual(metadata["llama_cpp_build"], 10182)
         self.assertEqual(metadata["llama_cpp_commit"], "afeebe103")
-        self.assertEqual(metadata["llama_cpp_full_commit"], "afeebe103bd99cda8f5dfaefcabadf890db7fda7")
-        self.assertEqual(metadata["llama_cpp_binary_sha256"], hashlib.sha256(self.llama.read_bytes()).hexdigest())
-        self.assertEqual(metadata["llama_cpp_bundle_root"], str(self.llama_bundle.resolve()))
+        self.assertEqual(
+            metadata["llama_cpp_full_commit"],
+            "afeebe103bd99cda8f5dfaefcabadf890db7fda7",
+        )
+        self.assertEqual(
+            metadata["llama_cpp_binary_sha256"],
+            hashlib.sha256(self.llama.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            metadata["llama_cpp_bundle_root"], str(self.llama_bundle.resolve())
+        )
         self.assertEqual(
             metadata["llama_cpp_bundle_sha256"],
             llama_bundle_manifest_sha256(llama_bundle_manifest(self.llama_bundle)),
         )
-        self.assertEqual(metadata["antfly_binary_sha256"], hashlib.sha256(self.antfly.read_bytes()).hexdigest())
+        self.assertEqual(
+            metadata["antfly_binary_sha256"],
+            hashlib.sha256(self.antfly.read_bytes()).hexdigest(),
+        )
         self.assertEqual(metadata["antfly_model_argument"], str(self.model.resolve()))
         self.assertEqual(metadata["llama_model_argument"], str(self.model.resolve()))
         self.assertEqual(metadata["zig_bin"], str(self.zig))
@@ -766,15 +809,33 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.assertIn("built with AppleClang", metadata["llama_cpp_version_output"])
         repo_root = SCRIPT_DIR.parents[4]
         git_status = subprocess.check_output(
-            ["git", "-C", str(repo_root), "status", "--porcelain=v1", "--untracked-files=all"],
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
             env={**os.environ, "LC_ALL": "C"},
         )
         tracked_diff = subprocess.check_output(
-            ["git", "-C", str(repo_root), "diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "HEAD",
+                "--",
+            ],
             env={**os.environ, "LC_ALL": "C"},
         )
         empty_status_sha256 = hashlib.sha256(b"").hexdigest()
-        self.assertEqual(metadata["git_dirty"], metadata["git_status_sha256"] != empty_status_sha256)
+        self.assertEqual(
+            metadata["git_dirty"], metadata["git_status_sha256"] != empty_status_sha256
+        )
         # Other agents may be editing this shared worktree while this test runs. Preserve the
         # stronger live comparison whenever the status snapshot is still the recorded one.
         if metadata["git_status_sha256"] == hashlib.sha256(git_status).hexdigest():
@@ -795,7 +856,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         )
         self.assertEqual(
             metadata["benchmark_parser_sha256"],
-            hashlib.sha256((SCRIPT_DIR / "gemma4_metal_long_output.py").read_bytes()).hexdigest(),
+            hashlib.sha256(
+                (SCRIPT_DIR / "gemma4_metal_long_output.py").read_bytes()
+            ).hexdigest(),
         )
         self.assertEqual(
             set(metadata["metal_policy_env"]),
@@ -823,21 +886,36 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
             },
         )
         self.assertTrue(summary["policy_route_expectations"]["q4_0_mmv_portfolio"])
-        self.assertEqual(summary["policy_route_expectations"]["generated_flash_prefill_calls"], 35)
-        self.assertEqual(summary["policy_route_expectations"]["generated_flash_prefill_hd512_calls"], 7)
+        self.assertEqual(
+            summary["policy_route_expectations"]["generated_flash_prefill_calls"], 35
+        )
+        self.assertEqual(
+            summary["policy_route_expectations"]["generated_flash_prefill_hd512_calls"],
+            7,
+        )
         self.assertFalse(summary["policy_route_expectations"]["prefill_direct_kv"])
         self.assertTrue(summary["policy_route_expectations"]["fast_prepared_frame"])
-        self.assertEqual(summary["policy_route_expectations"]["q4_0_mmv_variant"], "nr4-nsg2")
+        self.assertEqual(
+            summary["policy_route_expectations"]["q4_0_mmv_variant"], "nr4-nsg2"
+        )
         self.assertTrue(summary["policy_route_expectations"]["swa_scan_clamp"])
-        self.assertEqual(summary["llama_backend_expectations"]["metal_device"], "Apple M4")
+        self.assertEqual(
+            summary["llama_backend_expectations"]["metal_device"], "Apple M4"
+        )
         self.assertEqual(summary["llama_backend_expectations"]["offloaded_layers"], 43)
-        self.assertEqual(summary["antfly_backend_expectations"]["metal_device"], "Apple M4")
-        self.assertTrue(summary["antfly_backend_expectations"]["device_registry_id_positive"])
+        self.assertEqual(
+            summary["antfly_backend_expectations"]["metal_device"], "Apple M4"
+        )
+        self.assertTrue(
+            summary["antfly_backend_expectations"]["device_registry_id_positive"]
+        )
         self.assertEqual(
             summary["antfly_backend_expectations"]["device_registry_id"], 123456789
         )
 
-        with self.assertRaisesRegex(BenchmarkContractError, "immutable benchmark metadata pin"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "immutable benchmark metadata pin"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01, "0" * 64)
 
         antfly_json = out / "antfly-1.json"
@@ -887,7 +965,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.assertFalse(summary["policy_route_expectations"]["prefill_direct_kv"])
         self.assertFalse(summary["policy_route_expectations"]["fast_prepared_frame"])
         self.assertFalse(summary["policy_route_expectations"]["q4_0_mmv_portfolio"])
-        self.assertEqual(summary["policy_route_expectations"]["q4_0_mmv_variant"], "any")
+        self.assertEqual(
+            summary["policy_route_expectations"]["q4_0_mmv_variant"], "any"
+        )
         self.assertFalse(summary["policy_route_expectations"]["swa_scan_clamp"])
         policy_env = summary["metadata"]["metal_policy_env"]
         self.assertEqual(policy_env["TERMITE_METAL_DISABLE_SWA_SCAN_CLAMP"], "1")
@@ -922,7 +1002,12 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
     def test_exact_flash_prefill_route_counts_are_required(self) -> None:
         for field, log_key, observed, expected_message in (
             ("generated_flash_prefill", "generated_flash_prefill", 34, "34/7"),
-            ("generated_flash_prefill_hd512", "generated_flash_prefill_hd512", 6, "35/6"),
+            (
+                "generated_flash_prefill_hd512",
+                "generated_flash_prefill_hd512",
+                6,
+                "35/6",
+            ),
         ):
             with self.subTest(field=field):
                 out = self.tmp / f"wrong-{field}"
@@ -988,7 +1073,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
                 "ggml_metal_init: skipped device: Apple M4",
             )
         )
-        with self.assertRaisesRegex(BenchmarkContractError, "Metal found-device marker"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "Metal found-device marker"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
     def test_llama_device_identity_and_full_offload_are_required(self) -> None:
@@ -1013,7 +1100,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         metadata = json.loads(metadata_path.read_text())
         metadata["benchmark_parser_sha256"] = "0" * 64
         metadata_path.write_text(json.dumps(metadata))
-        with self.assertRaisesRegex(BenchmarkContractError, "benchmark source hash mismatch"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "benchmark source hash mismatch"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
     def test_both_engines_are_bound_to_the_hashed_gguf(self) -> None:
@@ -1023,7 +1112,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         metadata = json.loads(metadata_path.read_text())
         metadata["antfly_model_argument"] = str(self.tmp / "different-model.gguf")
         metadata_path.write_text(json.dumps(metadata))
-        with self.assertRaisesRegex(BenchmarkContractError, "does not match the hashed GGUF"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "does not match the hashed GGUF"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
     def test_execution_order_tampering_is_rejected(self) -> None:
@@ -1035,7 +1126,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         record["implementation"] = "antfly"
         records[1] = json.dumps(record)
         order_path.write_text("\n".join(records) + "\n")
-        with self.assertRaisesRegex(BenchmarkContractError, "execution order does not match"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "execution order does not match"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
     def test_odd_run_count_fails_before_benchmark(self) -> None:
@@ -1057,7 +1150,11 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         cases = (
             ("PROMPT", "alternate prompt", "PROMPT must be unset"),
             ("GIT_DIR", "/tmp/alternate-git-dir", "canonical benchmark Git override"),
-            ("EXPECTED_LLAMA_CPP_BUILD", "10181", "EXPECTED_LLAMA_CPP_BUILD must be 10182"),
+            (
+                "EXPECTED_LLAMA_CPP_BUILD",
+                "10181",
+                "EXPECTED_LLAMA_CPP_BUILD must be 10182",
+            ),
             (
                 "EXPECTED_LLAMA_CPP_SHA256",
                 "0" * 64,
@@ -1085,7 +1182,11 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
                 "EXPECT_GENERATED_FLASH_PREFILL_CALLS must be 35",
             ),
             ("EXPECT_FAST_PREPARED_FRAME", "0", "EXPECT_FAST_PREPARED_FRAME must be 1"),
-            ("EXPECT_Q4_0_MMV_VARIANT", "any", "EXPECT_Q4_0_MMV_VARIANT must be nr4-nsg2"),
+            (
+                "EXPECT_Q4_0_MMV_VARIANT",
+                "any",
+                "EXPECT_Q4_0_MMV_VARIANT must be nr4-nsg2",
+            ),
             (
                 "EXPECT_LLAMA_OFFLOADED_LAYERS",
                 "42",
@@ -1145,7 +1246,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         payload = json.loads(antfly_json.read_text())
         payload["metal"]["device"] = "Apple M3"
         antfly_json.write_text(json.dumps(payload))
-        with self.assertRaisesRegex(BenchmarkContractError, "Antfly Metal device='Apple M3'"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "Antfly Metal device='Apple M3'"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
         payload["metal"]["device"] = "Apple M4"
@@ -1173,12 +1276,15 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
             ((1.10, 0.90, float("nan")), "max_cv"),
             ((1.10, 0.90, 1.0), "max_cv"),
         ):
-            with self.subTest(args=args), self.assertRaisesRegex(
-                BenchmarkContractError, message
+            with (
+                self.subTest(args=args),
+                self.assertRaisesRegex(BenchmarkContractError, message),
             ):
                 build_result(out, 2, OUTPUT_TOKENS, *args)
 
-    def test_required_digest_pins_and_auto_gqa_policy_fail_before_benchmark(self) -> None:
+    def test_required_digest_pins_and_auto_gqa_policy_fail_before_benchmark(
+        self,
+    ) -> None:
         cases = (
             ("EXPECTED_LLAMA_CPP_SHA256", "", "64-character SHA-256 pin"),
             ("EXPECTED_LLAMA_CPP_BUNDLE_SHA256", "", "64-character SHA-256 pin"),
@@ -1299,7 +1405,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         with self.assertRaisesRegex(BenchmarkContractError, "artifact hash mismatch"):
             build_result(artifact_out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
         prompt_path.write_text(original_prompt)
-        self.antfly.write_text(self.antfly.read_text() + "\n# changed after benchmark\n")
+        self.antfly.write_text(
+            self.antfly.read_text() + "\n# changed after benchmark\n"
+        )
         with self.assertRaisesRegex(BenchmarkContractError, "artifact hash mismatch"):
             build_result(artifact_out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
@@ -1333,10 +1441,14 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         metadata = json.loads(metadata_path.read_text())
         metadata["git_status_sha256_end"] = "0" * 64
         metadata_path.write_text(json.dumps(metadata))
-        with self.assertRaisesRegex(BenchmarkContractError, "Git state changed during benchmark"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "Git state changed during benchmark"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
-    def test_repository_local_output_directory_is_rejected_before_creation(self) -> None:
+    def test_repository_local_output_directory_is_rejected_before_creation(
+        self,
+    ) -> None:
         out = SCRIPT_DIR / ".gemma4-benchmark-contract-test-output"
         self.assertFalse(out.exists())
         env = self.environment(out)
@@ -1369,7 +1481,9 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.assertTrue(summary["confidence_gate"]["required"])
         self.assertTrue(summary["confidence_gate"]["eligible"])
         self.assertTrue(summary["confidence_gate"]["total_latency_upper_below_parity"])
-        self.assertTrue(summary["confidence_gate"]["decode_throughput_lower_above_parity"])
+        self.assertTrue(
+            summary["confidence_gate"]["decode_throughput_lower_above_parity"]
+        )
         self.assertEqual(summary["confidence_gate"]["total_latency_parity_wins"], 6)
         self.assertEqual(summary["confidence_gate"]["decode_throughput_parity_wins"], 6)
         self.assertTrue(summary["confidence_gate"]["exact_sign_tests_passed"])
@@ -1401,13 +1515,17 @@ print(f"0.17.923.567 I common_perf_print: graphs reused = {tokens - 3}")
         self.run_harness(out)
         antfly_log = out / "antfly-1.log"
         antfly_log.write_text(
-            antfly_log.read_text().replace("mmv_variant_fallbacks=0", "mmv_variant_fallbacks=1")
+            antfly_log.read_text().replace(
+                "mmv_variant_fallbacks=0", "mmv_variant_fallbacks=1"
+            )
         )
         antfly_json = out / "antfly-1.json"
         payload = json.loads(antfly_json.read_text())
         payload["metal"]["q4_0_policy"]["mmv_variant_fallbacks"] = 1
         antfly_json.write_text(json.dumps(payload))
-        with self.assertRaisesRegex(BenchmarkContractError, "MMV portfolio fallbacks=1"):
+        with self.assertRaisesRegex(
+            BenchmarkContractError, "MMV portfolio fallbacks=1"
+        ):
             build_result(out, 2, OUTPUT_TOKENS, 1.10, 0.90, 0.01)
 
     def test_comparator_hash_pin_fails_before_benchmark(self) -> None:

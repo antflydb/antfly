@@ -125,8 +125,12 @@ test "raft scheduler ready priority cannot starve consensus ticks" {
 
 test {
     _ = runtime_loop;
+    std.testing.refAllDecls(@import("raft/host.zig"));
     _ = hosted_shard_ops;
     _ = service;
     _ = shard_ops;
     std.testing.refAllDecls(transition_service);
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");
