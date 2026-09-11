@@ -9,9 +9,10 @@ before/after comparison and representative request latencies.
 
 ```sh
 zig build antfly-system-catalog-bench
+zig build antfly-system-catalog-routing-bench
 ```
 
-This target builds its own ReleaseFast executable. It reports five-sample medians
+`antfly-system-catalog-bench` builds its own ReleaseFast executable. It reports five-sample medians
 for indexed versus scanned name lookup and table-rename planning at 1,000,
 10,000, and 100,000 tables. Tenant offboarding measures planning and applying a
 database drop with 1,000 or 10,000 empty namespaces while retaining another
@@ -20,6 +21,12 @@ includes construction of the planner's indexes; lookup reuses an owned index.
 Tenant-management microbenchmarks additionally compare repeated related-record
 scans with indexed projection, and per-command index rebuilding with a retained
 reader. Those comparisons isolate algorithm costs, not HTTP or Raft latency.
+
+The routing target compares cloning/rebuilding a compact routing generation for
+each request with retaining its existing indexes at 10, 1,000, and 10,000 tables.
+It uses ReleaseFast and `c_allocator`, 100 requests per sample, and three target
+keys. These are component costs, not HTTP latency. The catalog target also
+compares whole-state copy/index rebuilding with affected-record apply/undo.
 
 ## Live application workflows
 
@@ -89,6 +96,11 @@ uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
 uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
   --scenario management --deployment cluster --tenant-counts 10 100 1000 \
   --samples 10 --concurrency 4 --output /tmp/catalog-management.json
+# Standalone tenant DDL alongside readers, plus durable restart verification.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario management --deployment standalone --tenant-counts 10 100 1000 \
+  --samples 10 --concurrency 4 --restart-after-ddl \
+  --output /tmp/catalog-standalone-recovery.json
 # Compare clustered keys with keys distributed across entity ranges.
 uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
   --scenario resolution --entity-shards 8 --entity-key-layout spread \
@@ -125,3 +137,10 @@ Management reads and DDL are measured through the public API. Catalog and
 resolution setup observes visibility-pending create acknowledgements with GET
 and then waits for published shard leaders. It never replays a create to obtain
 its response, and it does not retry measured requests or ambiguous writes.
+
+`--restart-after-ddl` is optional and requires standalone mode. At each management
+checkpoint it restarts after the mixed workload, verifies every database name/ID,
+and checks that deleted temporary namespaces remain absent. Restart/readiness and
+validation duration are separate from request samples. Compare binaries with
+identical flag settings; use a separate recovery run when comparing steady
+latency without checkpoint restarts.

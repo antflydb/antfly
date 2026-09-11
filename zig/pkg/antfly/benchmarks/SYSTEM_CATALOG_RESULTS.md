@@ -287,6 +287,126 @@ These are algorithm comparisons within the new harness, not measured DDL timings
 from the previous server binary. Distributed DDL still includes Raft; standalone
 publication still clones and checkpoints the complete catalog.
 
+## Retained routing generations and standalone row transactions (2026-09-10)
+
+This comparison starts at `0182d591b`, after the previous round's final main
+merge. Both baseline and updated revisions contain main `1d6e3ac69`. The local
+baseline executable was preserved before editing; raw results retain its hash.
+Routing/partitioning measurements use `d0fc594ee`. Final standalone measurements
+use `bbbde23cb`, which additionally removes redundant fsyncs after fully durable
+LSM commits. These are sequential Debug-server runs on the same shared host;
+this task ran no compiler, test suite, or second benchmark during measurement.
+They are small-sample observations, not production capacity guarantees.
+
+Raw settings, binary hashes, all measurements, the intermediate diagnostic run,
+and microbenchmark output are in
+[the generation/transaction workload artifact](system_catalog_generation_workloads_2026_09_10.json).
+
+### Tenant provisioning and DDL alongside readers
+
+Standalone; 10, 100, then 1,000 tenants. The paired runs use 10 samples after two
+warmups, four concurrent clients, and no restart between checkpoints. Point
+operations target one tenant; create/drop and rename timings cover the complete
+round trip. The concurrent scenario runs two readers alongside two DDL clients.
+
+| Operation, 1,000 tenants | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| Named database GET | 0.426 / 0.642 | 0.352 / 0.370 |
+| List databases | 9.281 / 9.535 | 8.686 / 9.226 |
+| Namespace create/drop | 70.572 / 71.047 | 1.037 / 2.293 |
+| Rename round trip | 70.585 / 71.384 | 1.364 / 1.440 |
+| Concurrent reads | 35.807 / 175.851 | 0.976 / 2.934 |
+| Concurrent namespace create/drop | 121.214 / 207.876 | 2.059 / 3.446 |
+
+The rename median is about 52× lower, and namespace create/drop about 68× lower.
+Final rename medians at 10/100/1,000 tenants are 1.416/1.305/1.364 ms: unrelated
+logical inventory no longer drives mutation cost. Small point-read timings remain
+mixed: at 10 tenants, named GET rose from 0.395 to 0.550 ms. Whole listings still
+perform work proportional to their output.
+
+An intermediate run exposed duplicate local WAL/index syncs after an already
+fully durable commit. Its 1,000-tenant rename median was 4.201 ms. The final local
+path relies on the LSM's synchronous WAL commit; borrowed stores, including Lite,
+retain explicit sync. Recovery tests reopen without a graceful backend flush.
+The intermediate run also restarted at each checkpoint, so it is retained as a
+diagnostic, not substituted into the paired table above.
+
+A separate final 1,000-tenant run performs mixed DDL and then restarts the server.
+It verified all 1,001 database names/IDs and absence of deleted namespaces in
+995.7 ms, including restart, readiness, listing, and validation. Recovery is
+reported separately from steady request latency. This is graceful process
+restart timing; the unit suite separately tests WAL recovery without a graceful
+flush, failed publication rollback, ambiguous sync fencing, and legacy local/Lite
+migration.
+
+### Applications with wide schemas
+
+Standalone; 10 then 100 tables, each with 200 extra schema fields. Ten samples,
+two warmups, four concurrent readers, and 20 lines per NDJSON request. Fixture
+creation/readiness is excluded. Both before/after runs completed successfully.
+
+| Operation, 100 tables | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| Qualified document lookup | 1.450 / 1.606 | 0.481 / 0.624 |
+| Qualified query | 2.479 / 2.589 | 1.075 / 1.338 |
+| Qualified join | 5.773 / 6.088 | 3.268 / 5.154 |
+| NDJSON ×20, repeated target | 34.980 / 35.629 | 12.185 / 13.007 |
+| Concurrent document lookup | 2.986 / 6.515 | 1.116 / 1.459 |
+| Scoped table listing | 535.201 / 537.323 | 509.441 / 538.604 |
+| Table rename | 11.488 / 11.744 | 0.581 / 0.633 |
+
+Routing reuse improves the selected-table read path. Scoped listings still
+materialize schemas/status for every returned table, and their p95 did not
+improve. This standalone success does not resolve the earlier clustered
+100-table storage-read or intermittent empty-graph failures documented above.
+
+### Distributed entity resolution
+
+Three metadata and three data nodes, three document shards, eight entity shards,
+spread keys, and curated redirects. Two warmup documents and five measured
+documents per size; ten steady graph reads per mode. The write-to-graph interval
+includes background resolution, publication, hydration, and polling.
+
+| Mentions per document | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| 10 | 1674.170 / 2032.154 | 1424.014 / 1628.979 |
+| 100 | 1757.840 / 1949.177 | 1476.476 / 1737.838 |
+
+Both sizes completed. These medians are about 15–16% lower; steady graph-read
+results were mixed and are retained in the artifact. A deterministic transport
+regression independently forces parallel hosted fanout and verifies each shard's
+wire body contains only its owning keys. For 100 keys spread across eight shards,
+that changes 800 transmitted key entries to 100; it is not an eightfold latency
+claim. The existing multi-node E2E covers redirects crossing shard owners.
+
+### Isolated routing and mutation costs
+
+Five-sample ReleaseFast medians; fixture/index construction is outside warm
+measurements. Routing uses `c_allocator`, 100 requests per sample, one range per
+table, and three keys in the target table. The rebuilt path clones compact rows
+and rebuilds indexes for each request; the retained path acquires/releases the
+published generation and performs the same key routing.
+
+| Catalog size | Rebuilt routing request (µs) | Retained routing request (µs) |
+| --- | --- | --- |
+| 10 tables | 2.036 | 0.123 |
+| 1,000 tables | 126.337 | 0.109 |
+| 10,000 tables | 1305.845 | 0.094 |
+
+The mutation harness uses its existing `page_allocator`. At 10,000 tenants,
+copying the logical state and rebuilding indexes for a rename took 7276.250 µs;
+applying and undoing an affected-record delta took 8.500 µs. These measurements
+isolate allocation/index work. They exclude metadata RPCs, Raft, fsync, storage
+reads, and HTTP serialization; they must not be presented as server speedups.
+
+Validation of this implementation: 430 focused query/join/routing/sort tests
+passed with zero leaks; 83 catalog API/standalone tests, 23 metadata durability
+and transport tests, six remote-routing/cache tests, and all 31 selected E2E
+cases passed. The standalone follow-up also passed all 42 tests after removing
+redundant syncs. The full Antfly build, Python lint/formatting, and Zig formatting
+passed. These counts describe overlapping focused targets, not a summed total
+or a claim that every repository test was run.
+
 ## Reproduction
 
 See [workloads and commands](SYSTEM_CATALOG.md). Run the resolution scenario
