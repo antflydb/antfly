@@ -751,9 +751,15 @@ def inventory_with_readers(api, path, count, args):
         timings = []
         try:
             barrier.wait()
+            next_request = time.perf_counter()
             while len(timings) < args.samples or (
                 not scanner and not scan_finished.is_set()
             ):
+                if not scanner and args.listing_reader_rate:
+                    time.sleep(max(0, next_request - time.perf_counter()))
+                    next_request = max(
+                        next_request + 1 / args.listing_reader_rate, time.perf_counter()
+                    )
                 start = time.perf_counter_ns()
                 value = client.request("GET", path if scanner else path + "/needle")
                 if scanner and len(value) != count:
@@ -778,6 +784,11 @@ def inventory_with_readers(api, path, count, args):
         "inventory": summary(results[0]),
         "detail": summary([t for result in results[1:] for t in result]),
         "readers": args.concurrency,
+        "target_detail_requests_per_second": (
+            args.listing_reader_rate * args.concurrency
+            if args.listing_reader_rate
+            else None
+        ),
     }
 
 
@@ -903,6 +914,12 @@ def main():
         action="store_true",
         help="Run an inventory scanner alongside --concurrency detail readers",
     )
+    parser.add_argument(
+        "--listing-reader-rate",
+        type=int,
+        default=0,
+        help="Concurrent detail requests per second per reader (0 saturates); late requests do not accumulate an unbounded backlog",
+    )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
         "--resolution-workload",
@@ -934,6 +951,8 @@ def main():
         parser.error("--restart-after-ddl requires --deployment standalone")
     if args.listing_page_size < 0 or args.listing_page_size > 1000:
         parser.error("--listing-page-size must be between 0 and 1000")
+    if args.listing_reader_rate < 0:
+        parser.error("--listing-reader-rate must be nonnegative")
     if args.schema_fields < 0:
         parser.error("--schema-fields must be nonnegative")
     binary = args.binary.resolve(strict=True)

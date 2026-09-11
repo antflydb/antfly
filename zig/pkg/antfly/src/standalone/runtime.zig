@@ -734,6 +734,7 @@ const LocalStandaloneMetadata = struct {
     catalog_path: []const u8,
     catalog_store: ?*antfly.storage_backend_erased.Store,
     owned_catalog_backend: ?antfly.lsm_backend.BackendHandle = null,
+    owned_catalog_cache: ?*antfly.lsm_backend.Cache = null,
     owned_catalog_store: ?antfly.storage_backend_erased.Store = null,
     catalog_rows_initialized: bool = false,
     catalog_listing_indexes_initialized: bool = false,
@@ -883,7 +884,12 @@ const LocalStandaloneMetadata = struct {
         if (catalog_store == null) {
             const root = try std.fmt.allocPrint(alloc, "{s}.store", .{catalog_path});
             defer alloc.free(root);
-            self.owned_catalog_backend = try antfly.lsm_backend.BackendHandle.open(alloc, root, .{ .wal_sync_on_commit = true });
+            // Ordered listing indexes are small, repeatedly read metadata.
+            // Reuse immutable blocks instead of reopening them for every table.
+            const cache = try alloc.create(antfly.lsm_backend.Cache);
+            cache.* = antfly.lsm_backend.Cache.init(alloc, 8 * 1024 * 1024);
+            self.owned_catalog_cache = cache;
+            self.owned_catalog_backend = try antfly.lsm_backend.BackendHandle.open(alloc, root, .{ .wal_sync_on_commit = true, .cache = cache });
             self.owned_catalog_store = try self.owned_catalog_backend.?.backend.runtimeStore(alloc, .{ .name = "system/metadata" });
         }
         try self.loadPersistedCatalog();
@@ -894,6 +900,10 @@ const LocalStandaloneMetadata = struct {
     fn deinit(self: *LocalStandaloneMetadata) void {
         if (self.owned_catalog_store) |*store| store.deinit();
         if (self.owned_catalog_backend) |*backend| backend.close();
+        if (self.owned_catalog_cache) |cache| {
+            cache.deinit();
+            self.alloc.destroy(cache);
+        }
         if (self.routing_generation) |generation| generation.release();
         if (self.system_catalog_state) |*state| state.deinit();
         self.extension_catalog.deinit();
