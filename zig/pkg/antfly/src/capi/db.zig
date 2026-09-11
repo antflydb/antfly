@@ -774,6 +774,7 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
                 .dense_k = if (req.dense) |query| query.k else 0,
                 .sparse_k = if (req.sparse) |query| query.k else 0,
             },
+            req.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
             &failure,
@@ -5415,26 +5416,22 @@ fn replicatedBatchStorageKernelJsonAtRaftEntry(
 
 pub fn storageOwnerQueryJson(
     owner: ?*anyopaque,
-    request: *const kernel_owner_abi.JsonOperationRequest,
+    request: *const kernel_owner_abi.QueryOperationRequest,
     out_response: *kernel_owner_abi.QueryOwnedResponse,
     out_failure: *kernel_owner_abi.FailureIdentity,
 ) callconv(.c) kernel_owner_abi.Status {
     out_response.* = .{};
     out_failure.* = .{};
-    if (request.version != kernel_owner_abi.abi_version)
+    if (request.control.version != kernel_owner_abi.abi_version)
         return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
     const handle = asHandle(owner) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    const table_name = storageOwnerOperationTableName(handle, request) orelse
+    const table_name = storageOwnerTableName(handle, request.control.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    const request_slice: capi.Slice = .{
-        .ptr = request.request_json.ptr,
-        .len = @intCast(request.request_json.len),
-    };
     const status = searchStorageKernelQueryJson(
         handle,
         table_name,
-        request_slice,
+        request,
         out_response,
         out_failure,
     );
@@ -8653,13 +8650,20 @@ fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
 fn searchStorageKernelQueryJson(
     handle: *Handle,
     table_name: []const u8,
-    request_json: capi.Slice,
+    request: *const kernel_owner_abi.QueryOperationRequest,
     out_response: *kernel_owner_abi.QueryOwnedResponse,
     out_failure: *kernel_owner_abi.FailureIdentity,
 ) kernel_owner_abi.Status {
     out_failure.* = .{};
+    const request_json: capi.Slice = .{ .ptr = request.control.request_json.ptr, .len = @intCast(request.control.request_json.len) };
+    const controls: db_mod.types.SearchRequest = .{
+        .execution_deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .cancellation = ownerQueryCancellation(&request.control),
+    };
+    table_reads_api.checkQueryDeadline(controls) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(.{}) catch |err|
+        handle.prepareSearchRequest(controls) catch |err|
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
@@ -8667,9 +8671,10 @@ fn searchStorageKernelQueryJson(
             table_name,
             request_json.bytes(),
             .internal,
-            .{},
-            null,
-            null,
+            request.execution_options,
+            controls.execution_deadline_ns,
+            request.control.cancellation_ctx,
+            request.control.cancellation_fn,
             out_failure,
         ) catch |err| {
             // A valid provider failure already carries the exact envelope.
@@ -8696,6 +8701,11 @@ fn searchStorageKernelQueryJson(
         request_json.bytes(),
     ) catch |err| return storageOwnerQueryFailure(err, .parse_internal_request, out_failure);
     defer owned.deinit(handle.alloc);
+    if (controls.execution_deadline_ns) |deadline| {
+        owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed| @min(parsed, deadline) else deadline;
+    }
+    owned.req.cancellation = controls.cancellation;
+    antfly.local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
 
     stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err|
         return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
@@ -8705,6 +8715,8 @@ fn searchStorageKernelQueryJson(
     var result = handle.db.search(handle.alloc, owned.req) catch |err|
         return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     defer result.deinit();
+    table_reads_api.checkQueryDeadline(owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
 
     var response = query_api.encodeQueryResponses(
         handle.alloc,
@@ -8714,6 +8726,8 @@ fn searchStorageKernelQueryJson(
         result,
     ) catch |err| return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
     defer response.deinit(handle.alloc);
+    table_reads_api.checkQueryDeadline(owned.req) catch |err|
+        return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
 
     const buffer = dupBytes(response.json) catch |err|
         return storageOwnerQueryFailure(err, .encode_internal_response, out_failure);
@@ -8723,6 +8737,16 @@ fn searchStorageKernelQueryJson(
         .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
     };
     return .ok;
+}
+
+fn ownerQueryCancellation(request: *const kernel_owner_abi.ControlledJsonOperationRequest) db_mod.types.CancellationToken {
+    if (request.cancellation_fn == null) return .none;
+    return .{ .ptr = request, .is_cancelled_fn = struct {
+        fn requested(ptr: *const anyopaque) bool {
+            const control: *const kernel_owner_abi.ControlledJsonOperationRequest = @ptrCast(@alignCast(ptr));
+            return control.cancellation_fn.?(control.cancellation_ctx) != 0;
+        }
+    }.requested };
 }
 
 fn storageOwnerQueryFailure(
@@ -8755,6 +8779,7 @@ fn searchPublicQueryJson(
             request_json.bytes(),
             .public,
             .{},
+            null,
             null,
             null,
             &failure,

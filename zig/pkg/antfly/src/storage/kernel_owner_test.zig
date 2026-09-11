@@ -426,6 +426,29 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
+    try std.testing.expectError(error.Timeout, owner.queryJsonWithOptions("docs", query_json, .{
+        .execution_deadline_ns = 1,
+    }));
+    const MidQueryCancellation = struct {
+        checks: usize = 0,
+        fn requested(ctx: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.checks += 1;
+            // First admission succeeds; cancellation changes as the request
+            // crosses from the owner into the physical query provider.
+            return @intFromBool(self.checks >= 2);
+        }
+    };
+    var cancellation: MidQueryCancellation = .{};
+    try std.testing.expectError(error.Cancelled, owner.queryJsonWithOptions("docs", query_json, .{
+        .cancellation_ctx = &cancellation,
+        .cancellation_fn = MidQueryCancellation.requested,
+    }));
+    try std.testing.expect(cancellation.checks >= 2);
+    // A canceled operation must release all borrowed controls and read state.
+    var after_cancel = try owner.queryJson("docs", query_json);
+    after_cancel.deinit();
+
     try std.testing.expectError(error.InvalidArgument, owner.queryJson("articles", query_json));
     try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", "{"));
 
@@ -436,10 +459,10 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     var invalid_query_failure: abi.FailureIdentity = .{};
     const invalid_query_status = abi.antfly_storage_owner_query_json(
         owner.handle,
-        &.{
+        &.{ .control = .{
             .table_name = .fromSlice("docs"),
             .request_json = .fromSlice("{"),
-        },
+        } },
         &invalid_query_response,
         &invalid_query_failure,
     );
@@ -1517,4 +1540,61 @@ test "interactive admission state is shared with the physical owner" {
     _ = activity.interactive_generate_inflight.fetchAdd(1, .monotonic);
     defer _ = activity.interactive_generate_inflight.fetchSub(1, .monotonic);
     try std.testing.expectEqual(generating + 1, abi.antfly_storage_interactive_activity(1, 0));
+}
+
+test "storage query wire preserves empty projection and decoded sort profile lifetime" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../api/local_query_contract.zig");
+    const query = @import("../api/query_contract.zig");
+    const types = @import("db/types.zig");
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
+        .include_all_fields = false,
+        .include_stored = false,
+    });
+    defer alloc.free(wire);
+    var request = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer request.deinit(alloc);
+    try std.testing.expect(!request.req.include_all_fields);
+    try std.testing.expect(!request.req.include_stored);
+    try std.testing.expectEqual(@as(usize, 0), request.req.fields.len);
+
+    const native: types.SearchResult = .{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .sort_profile = .{
+            .plan = "ordered_scan",
+            .source = "native_doc_values",
+            .candidate_source = "primary_key",
+            .candidate_count = 13,
+            .require_native = true,
+            .sort_rejection_field = .init("nested.created_at"),
+        },
+    };
+    var decoded = blk: {
+        var encoded = try query.encodeQueryResponses(alloc, "docs", .{ .profile = true }, .{}, native);
+        defer encoded.deinit(alloc);
+        break :blk try contract.parseStorageKernelSearchResult(alloc, encoded.json);
+    };
+    defer decoded.deinit();
+    const profile = decoded.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ordered_scan", profile.plan);
+    try std.testing.expectEqualStrings("native_doc_values", profile.source);
+    try std.testing.expectEqualStrings("primary_key", profile.candidate_source);
+    try std.testing.expectEqual(@as(u64, 13), profile.candidate_count);
+    try std.testing.expect(profile.require_native);
+    try std.testing.expectEqualStrings("nested.created_at", profile.sort_rejection_field.slice());
+    // Replacing a decoded profile frees the previous string block, including
+    // when the replacement's source strings alias the current owned block.
+    try decoded.setOwnedSortProfile(profile);
+    try std.testing.expectEqualStrings("ordered_scan", decoded.sort_profile.?.plan);
+    var allocation_wire = try query.encodeQueryResponses(alloc, "docs", .{ .profile = true }, .{}, native);
+    defer allocation_wire.deinit(alloc);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn decode(failing: std.mem.Allocator, bytes: []const u8) !void {
+            var result = try @import("../api/local_query_contract.zig").parseStorageKernelSearchResult(failing, bytes);
+            defer result.deinit();
+            try result.setOwnedSortProfile(result.sort_profile.?);
+        }
+    }.decode, .{allocation_wire.json});
 }

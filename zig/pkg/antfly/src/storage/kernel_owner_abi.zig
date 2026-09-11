@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 48;
+pub const abi_version: u32 = 49;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1296,6 +1296,14 @@ pub const ControlledJsonOperationRequest = extern struct {
     cancellation_fn: ?CancellationCheckFn = null,
 };
 
+/// Search-specific scalars and borrowed execution controls. Keep controls out
+/// of JSON: process-local callbacks and absolute monotonic deadlines must not
+/// be lost or reconstructed as a fresh timeout at a compiled boundary.
+pub const QueryOperationRequest = extern struct {
+    control: ControlledJsonOperationRequest = .{},
+    execution_options: LocalQueryExecutionOptions = .{},
+};
+
 pub const ArtifactOperation = enum(u32) {
     corrupt_embedding = 0,
     reprocess_document = 1,
@@ -1699,7 +1707,7 @@ pub extern fn antfly_storage_snapshot_destroy(snapshot: ?*anyopaque) callconv(.c
 
 pub extern fn antfly_storage_owner_query_json(
     owner: ?*anyopaque,
-    request: *const JsonOperationRequest,
+    request: *const QueryOperationRequest,
     out_response: *QueryOwnedResponse,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;

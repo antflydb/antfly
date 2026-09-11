@@ -76,40 +76,36 @@ fn executeSearch(
     } catch |err| return fail(err, parseOperation(request.dialect), out_failure);
     defer owned.deinit(alloc);
 
-    if (request.execution_options.enabled != 0) {
-        owned.req.include_stored = request.execution_options.include_stored != 0;
-        owned.req.return_mode = switch (request.execution_options.return_mode) {
-            .parent => .parent,
-            .chunk => .chunk,
-            .parent_with_chunks => .parent_with_chunks,
-            .unit => .unit,
-            .unit_with_chunks => .unit_with_chunks,
-            .member => .member,
-        };
-        owned.req.max_chunks_per_parent = request.execution_options.max_chunks_per_parent;
-        if (request.execution_options.dense_k != 0) {
-            for (@constCast(owned.req.dense_queries)) |*query| query.query.k = request.execution_options.dense_k;
-        }
-        if (request.execution_options.sparse_k != 0) {
-            for (@constCast(owned.req.sparse_queries)) |*query| query.query.k = request.execution_options.sparse_k;
-        }
+    @import("local_query_controls.zig").applyExecutionOptions(&owned.req, request.execution_options);
+    if (request.has_execution_deadline != 0) {
+        owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed_deadline|
+            @min(parsed_deadline, request.execution_deadline_ns)
+        else
+            request.execution_deadline_ns;
     }
-
     owned.req.cancellation = requestCancellationToken(request);
+    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+        return fail(err, executeOperation(request.dialect), out_failure);
 
     // Capture the token and result under the same DB read lease.
     const captured = db.searchWithCapturedRequest(alloc, owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
     var result = captured.result;
     defer result.deinit();
+    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+        return fail(err, executeOperation(request.dialect), out_failure);
 
-    const response = query_api.encodeQueryResponses(
+    var response = query_api.encodeQueryResponses(
         alloc,
         table_name,
         captured.request,
         .{},
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
+    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err| {
+        response.deinit(alloc);
+        return fail(err, executeOperation(request.dialect), out_failure);
+    };
     const bytes = response.json;
     out_response.* = .{
         .buffer = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) },

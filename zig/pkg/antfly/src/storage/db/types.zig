@@ -2220,9 +2220,36 @@ pub const SearchResult = struct {
     /// relying on `identity_read_generation` being globally common.
     shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
+    /// Decoded profiles own their strings here. Native profiles borrow static
+    /// labels; both representations follow the SearchResult's move lifetime.
+    sort_profile_storage: ?[]u8 = null,
     graph_results: []GraphSearchResult = &.{},
 
+    /// Clone all profile strings in one allocation. Reflection keeps future
+    /// string fields in the ownership contract without a second field list.
+    pub fn setOwnedSortProfile(self: *SearchResult, profile: SortProfile) !void {
+        var length: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) length = try std.math.add(usize, length, @field(profile, field.name).len);
+        }
+        const storage = try self.alloc.alloc(u8, length);
+        var owned = profile;
+        var offset: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) {
+                const value = @field(profile, field.name);
+                @memcpy(storage[offset..][0..value.len], value);
+                @field(owned, field.name) = storage[offset..][0..value.len];
+                offset += value.len;
+            }
+        }
+        if (self.sort_profile_storage) |previous| self.alloc.free(previous);
+        self.sort_profile_storage = storage;
+        self.sort_profile = owned;
+    }
+
     pub fn deinit(self: *SearchResult) void {
+        if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);

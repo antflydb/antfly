@@ -30,6 +30,7 @@ pub fn executeJsonAlloc(
     request_json: []const u8,
     dialect: abi.LocalQueryDialect,
     execution_options: abi.LocalQueryExecutionOptions,
+    execution_deadline_ns: ?u64,
     cancellation_ctx: ?*anyopaque,
     cancellation_fn: ?abi.CancellationCheckFn,
     out_failure: *abi.FailureIdentity,
@@ -41,6 +42,8 @@ pub fn executeJsonAlloc(
         .table_name = .fromSlice(table_name),
         .request_json = .fromSlice(request_json),
         .execution_options = execution_options,
+        .has_execution_deadline = @intFromBool(execution_deadline_ns != null),
+        .execution_deadline_ns = execution_deadline_ns orelse 0,
         .cancellation_ctx = cancellation_ctx,
         .cancellation_fn = cancellation_fn,
     }, .validate_provider_response, out_failure);

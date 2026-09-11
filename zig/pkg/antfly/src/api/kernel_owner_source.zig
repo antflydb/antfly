@@ -2125,12 +2125,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !client.QueryResponse {
+        try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
         const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
         defer alloc.free(request_json);
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
-        return try lease.owner().queryJson(table_name, request_json);
+        try table_reads.checkQueryDeadline(req);
+        var cancellation = req.cancellation;
+        var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
+            .execution_deadline_ns = req.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution = .{
+                .enabled = 1,
+                .include_stored = @intFromBool(req.include_stored),
+                .return_mode = switch (req.return_mode) {
+                    .parent => .parent,
+                    .chunk => .chunk,
+                    .parent_with_chunks => .parent_with_chunks,
+                    .unit => .unit,
+                    .unit_with_chunks => .unit_with_chunks,
+                    .member => .member,
+                },
+                .max_chunks_per_parent = req.max_chunks_per_parent,
+                .dense_k = if (req.dense) |dense| dense.k else 0,
+                .sparse_k = if (req.sparse) |sparse| sparse.k else 0,
+            },
+        });
+        errdefer response.deinit();
+        try table_reads.checkQueryDeadline(req);
+        return response;
     }
 
     fn unsupportedTopLevelLookup(

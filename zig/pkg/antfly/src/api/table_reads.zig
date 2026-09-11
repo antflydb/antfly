@@ -4086,7 +4086,7 @@ pub const ProvisionedTableReadSource = struct {
     /// Even a one-shard compiled storage query must return its raw SearchResult
     /// through the coarse ABI before these stages run.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
-        return req.reranker != null or req.aggregations_json.len > 0;
+        return req.reranker != null or req.pruner != null or req.aggregations_json.len > 0;
     }
 
     fn preflightQuery(
@@ -19313,6 +19313,9 @@ test "provisioned table read source managed runtime config carries inference url
 
 test "provisioned single-group queries retain coordinator-owned finalization" {
     try std.testing.expect(!ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{}));
+    try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+        .pruner = .{ .min_absolute_score = 10 },
+    }));
     try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
         .aggregations_json = "{}",
     }));

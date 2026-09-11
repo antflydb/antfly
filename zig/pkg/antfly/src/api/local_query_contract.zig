@@ -3258,12 +3258,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     var first = true;
     const has_named_embeddings = req.dense_queries.len > 0 or req.sparse_queries.len > 0;
 
-    if (!req.include_all_fields and
-        (req.fields.len > 0 or
-            req.hierarchy_children != null or
-            req.hierarchy_grouped_matches or
-            req.hierarchy_group_level == .unit))
-    {
+    if (!req.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.hierarchy_children != null or
@@ -4511,13 +4506,52 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
 
-    return .{
+    // The hit errdefer above already owns its cleanup until we return.
+    errdefer {
+        for (graph_results) |*graph_result| graph_result.deinit(alloc);
+        if (graph_results.len > 0) alloc.free(graph_results);
+    }
+    var result: db_mod.types.SearchResult = .{
         .alloc = alloc,
         .hits = hits,
         .total_hits = total_hits,
         .total_hits_relation = total_hits_relation,
         .graph_results = graph_results,
     };
+    if (response.profile) |profile| {
+        if (profile != .object) return error.InvalidRemoteResponse;
+        if (profile.object.get("sort")) |value| {
+            if (value != .null) {
+                var sort = try std.json.parseFromValue(metadata_openapi.SortProfile, alloc, value, .{ .ignore_unknown_fields = true });
+                defer sort.deinit();
+                try result.setOwnedSortProfile(try remoteSortProfile(sort.value));
+            }
+        }
+    }
+    return result;
+}
+
+/// Restore the public diagnostics that the provider actually returned. All
+/// strings are cloned by SearchResult before the response arena is released.
+fn remoteSortProfile(wire: metadata_openapi.SortProfile) !db_mod.types.SortProfile {
+    var profile: db_mod.types.SortProfile = .{};
+    inline for (@typeInfo(db_mod.types.SortProfile).@"struct".fields) |field| {
+        if (@hasField(metadata_openapi.SortProfile, field.name)) {
+            if (@field(wire, field.name)) |value| {
+                if (field.type == []const u8) {
+                    @field(profile, field.name) = if (@typeInfo(@TypeOf(value)) == .@"enum") @tagName(value) else value;
+                } else if (field.type == db_mod.types.SortProfileField) {
+                    if (value.len > profile.sort_rejection_field.bytes.len) return error.InvalidRemoteResponse;
+                    @field(profile, field.name) = .init(value);
+                } else if (@typeInfo(field.type) == .int) {
+                    @field(profile, field.name) = std.math.cast(field.type, value) orelse return error.InvalidRemoteResponse;
+                } else {
+                    @field(profile, field.name) = value;
+                }
+            }
+        }
+    }
+    return profile;
 }
 
 pub fn parseStorageKernelSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {

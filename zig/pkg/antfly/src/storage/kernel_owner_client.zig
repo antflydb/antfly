@@ -554,14 +554,25 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_restore_repair(self.handle, request));
     }
 
+    pub const QueryOptions = struct {
+        execution_deadline_ns: ?u64 = null,
+        cancellation_ctx: ?*anyopaque = null,
+        cancellation_fn: ?abi.CancellationCheckFn = null,
+        execution: abi.LocalQueryExecutionOptions = .{},
+    };
+
     pub fn queryJson(self: *Owner, table_name: []const u8, request_json: []const u8) !QueryResponse {
+        return self.queryJsonWithOptions(table_name, request_json, .{});
+    }
+
+    pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
         var response: QueryResponse = .{};
         var failure: abi.FailureIdentity = .{};
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
             &.{
-                .table_name = .fromSlice(table_name),
-                .request_json = .fromSlice(request_json),
+                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+                .execution_options = options.execution,
             },
             &response.response,
             &failure,

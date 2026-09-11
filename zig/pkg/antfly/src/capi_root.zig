@@ -59,6 +59,7 @@ pub const testing = @import("common/test_directory.zig");
 pub const local_write = @import("antfly_source_root").antfly_sources.local_write;
 
 pub const local_query_contract = @import("api/local_query_contract.zig");
+pub const local_query_controls = @import("storage/local_query_controls.zig");
 
 pub const inference_provider = @import("standalone/inference_provider.zig");
 
