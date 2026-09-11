@@ -195,6 +195,12 @@ evolved wide schemas. It measures complete inventory, first-page latency and a
 validated complete cursor walk separately. It also runs one inventory scanner
 alongside detail readers that remain active until the scan finishes, reporting
 both latency distributions and detail throughput.
+Repeat it with `--listing-reader-rate 100` to cap each reader at a target of
+100 requests per second (800 total with the default eight readers). These are
+paced, closed-loop clients: slow responses reduce delivered traffic, and missed
+deadlines do not accumulate an unbounded backlog. Compare both target and actual
+throughput; equal target rates do not guarantee equal delivered load. Keep the
+uncapped run as a separate saturation experiment.
 The second models a schema browser opening one table while unrelated tenant
 inventory grows. Both include a one-table prefix control and an empty default
 namespace. Add `--deployment cluster` to exercise durable metadata projections

@@ -75,6 +75,9 @@ produce 1,000 frames / 106,000 bytes; a 64-group cap produces 16 / 88,288; a
 frames / 880,720 bytes versus 10,000 / 1,060,000. Thus the main expected benefit
 is fewer HTTP requests, queue items, wakeups and allocations; payload bytes fall
 about 17%. Per-group consensus processing and metadata report proposals remain.
+See the [recorded observations](system_catalog_report_workloads_2026_09_11.json)
+and [measurement limitations](SYSTEM_CATALOG_RESULTS.md#node-level-heartbeat-framing)
+for the isolated encoding run; these are not live transport measurements.
 
 Before enabling live bundling, measure a three-node cluster with 100/1,000/10,000
 mostly idle tenant ranges, then repeat with a small hot subset doing writes and

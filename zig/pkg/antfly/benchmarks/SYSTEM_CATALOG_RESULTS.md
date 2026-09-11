@@ -581,6 +581,149 @@ formatting/lint passed. The global license scan still reports inherited failures
 new files were checked individually. These are focused, overlapping checks, not
 a claim that the complete repository suite passed.
 
+## Report storage, bounded standalone captures, and detail encoding — 2026-09-11
+
+This round compares `f393d9cda` with normalized report storage at `c4fe1e215`
+and the final standalone cache/ordered-range capture at `13829ab83`. The latter
+binary SHA-256 is `0c488a127056aed42d5cf2199859769f407b8d05318e5a95c780b601da1be960`;
+the baseline is `da72be79c6565d2cf8772595502a04b6a8ea289df83fe6376f97a1a764d1f3a4`.
+The [observation artifact](system_catalog_report_workloads_2026_09_11.json)
+contains settings, hashes, percentiles, and intermediate standalone runs.
+Live workloads use Debug binaries, ten measured requests after three warmups,
+and a shared macOS ARM64 host. This task's builds, tests and benchmark scenarios
+ran sequentially during final measurements; other host activity is uncontrolled.
+With ten live samples, the harness's nearest-rank p95 is the maximum observation.
+
+### Metadata status application
+
+A separate ReleaseFast component workload uses the production C allocator and
+seven samples. Every store contains both group summaries and detailed runtime
+observations. Every measured apply changes the compact header; a cached heartbeat
+keeps all report observations unchanged. Fresh-clock updates advance all report
+timestamps; sparse/all-group updates change report terms. Timing includes local
+transaction commit, not command encoding, network transfer or Raft replication.
+The baseline worktree adds only this benchmark and its build target plus a latent
+write-stat accessor correction to the unoptimized production code.
+
+| Groups | Apply workload | Before p50 (ms) | After p50 (ms) | Before / after WAL bytes per apply |
+| --- | --- | --- | --- | --- |
+| 1,000 | Cached heartbeat | 9.875 | 0.836 | 812,339 / 184 |
+| 1,000 | Fresh clocks | 13.104 | 0.947 | 1,792,439 / 105,720 |
+| 1,000 | One group changes | 9.222 | 0.938 | 813,319 / 138,643 |
+| 1,000 | All groups change | 13.628 | 1.672 | 1,792,439 / 992,752 |
+| 10,000 | Cached heartbeat | 95.250 | 9.086 | 8,120,339 / 184 |
+| 10,000 | Fresh clocks | 118.539 | 15.447 | 17,929,539 / 1,053,249 |
+| 10,000 | One group changes | 93.266 | 8.884 | 8,121,319 / 858,643 |
+| 10,000 | All groups change | 118.055 | 29.195 | 17,929,539 / 9,923,563 |
+
+The production layout uses stable slots in 64-group pages, a fixed directory for
+selected-entry access, separate payload and clock pages, and structural digests.
+It rewrites changed pages and compact membership, copies unchanged encoded page
+entries, and reuses freed slots without renumbering unrelated observations.
+Selected catalog reads enumerate actual reporters rather than probing every
+store/range combination. A 64 MiB immutable block cache serves metadata reads.
+Wire StoreRecord commands still contain 812,091 bytes at 1,000 groups and
+8,120,091 at 10,000; incoming hashing remains proportional to report count.
+These measurements do not establish lower Raft bandwidth or heartbeat RPC cost.
+
+Full-store reconstruction is a measured tradeoff: 0.256 → 0.307 ms at 1,000 groups
+and 2.618 → 3.639 ms at 10,000. The first one-row-per-group implementation regressed
+these reads badly. With the same C allocator its uncached cursor version took
+4.904 / 50.735 ms; cache plus batched point reads still took 2.679 / 31.021 ms.
+That prompted stable pages before shipping. Earlier diagnostic runs used the
+Zig testing allocator and are not mixed into the production-allocator comparison.
+Pages bound group count, not arbitrary bytes in a single report. Selected reads
+decode only their directory entries; broad snapshots still reconstruct all data.
+
+### Application discovery workloads
+
+Standalone keeps name/range indexes in the catalog transaction, captures selected
+records into owned memory under the lock, and encodes the response after unlocking.
+Its owned store has an 8 MiB immutable block cache. Broad inventory visits selected
+range prefixes in storage order; narrow pages bound unrelated cursor skips.
+Details construct typed enrichment summaries and redact producer configuration
+before the final encode, avoiding a full-response JSON parse/redaction/re-encode.
+
+| Workload | Before p50 (ms) | After p50 (ms) |
+| --- | --- | --- |
+| Detail beside 200 distinct, 200-field schemas | 5.086 | 1.649 |
+| Full inventory of those 200 tables | 510.985 | 490.905 |
+| First 25-row page of those 200 tables | 26.232 | 26.342 |
+| Complete cursor walk of those 200 tables | 490.047 | 463.533 |
+| Detail beside 1,000 narrow-schema tables | 0.897 | 0.695 |
+| Full inventory of 1,000 narrow-schema tables | 113.707 | 117.298 |
+| First 25-row page of 1,000 narrow-schema tables | 4.631 | 4.318 |
+| Complete cursor walk of 1,000 narrow-schema tables | 191.693 | 193.240 |
+
+The 100-table narrow-schema inventory regressed 12.072 → 14.031 ms; its first
+page regressed 3.885 → 4.519 ms. The initial 1,000-table inventory took 141.590 ms;
+the cache reduced it to 132.226 ms, then ordered range traversal to 117.298 ms,
+still 3.2% above baseline. Do not interpret the detail win as a universal scan win.
+
+With eight saturated detail readers beside the wide 200-table inventory, detail
+throughput rose 981 → 1,588 requests/s, and detail p50/p95 fell 7.271/10.292 →
+4.661/6.898 ms. Inventory p50/p95 worsened 670.158/1,099.720 → 864.253/1,248.471 ms.
+The updated server completes more competing detail work; this is a saturation
+comparison, not equal delivered traffic or a claim of improved scan fairness.
+
+At a target cap of 100 requests/s for each of eight readers, achieved aggregate
+rates were 632 → 517 requests/s. Detail p50/p95 improved 5.222/8.027 → 2.434/5.156 ms;
+inventory p50/p95 measured 489.244/1,002.467 → 499.889/1,171.778 ms. These closed-loop
+clients missed the target in both runs and delivered different traffic, so this
+is not an equal-load comparison or evidence that scan fairness improved.
+
+### Clustered public API
+
+The matched 30-table, 200-field workload uses three metadata and three data nodes
+on one host, with ten samples after three warmups. Setup and shard readiness are
+outside the measured requests.
+
+| Workload | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| One-table namespace | 27.411 / 184.113 | 24.716 / 192.628 |
+| Prefix selecting one table | 27.123 / 177.296 | 25.087 / 33.098 |
+| Full inventory | 98.808 / 244.103 | 91.278 / 488.188 |
+| Single-table detail | 26.372 / 48.001 | 25.336 / 248.265 |
+| Empty default namespace | 33.127 / 209.267 | 22.906 / 197.940 |
+| First 25-row page | 73.354 / 430.162 | 68.201 / 501.894 |
+| Complete cursor walk | 126.200 / 338.385 | 102.054 / 531.791 |
+
+Medians improved modestly; several tails worsened. This does not establish a
+cluster-wide latency improvement or resolve the earlier 100-table storage-read
+failure. The local report-apply improvement does not remove read barriers,
+per-group transport work, scheduling or serialization from clustered requests.
+
+### Node-level heartbeat framing
+
+The [heartbeat investigation](HEARTBEAT_BUNDLING.md) traces existing store-report
+bundling and the Raft transport's per-group split. Using the existing codec, a
+256-group cap reduces 1,000 one-group frames / 106,000 bytes to four frames /
+88,072 bytes. At 10,000 groups it reduces 10,000 frames to 40. The isolated
+ReleaseFast, page-allocator encoding run measured 20.817 → 0.200 ms at 10,000
+groups. Allocator/frame overhead dominates this component comparison; it is not
+HTTP throughput or production transport latency. The raw artifact retains all
+caps and sizes. No production Raft transport semantics changed in this PR.
+Route-aware retries, bounded queue ownership and failure/latency workloads are
+specified before a separate live transport-bundling change.
+
+### Final validation
+
+The full Antfly build and 65 metadata-storage, 58 standalone and 57 API tests
+passed. New regressions cover selected replication statuses/action hints,
+legacy normalization, unchanged/clock-only/sparse report updates, slot reuse,
+duplicate observations, reincarnation, snapshot wire compatibility and repair,
+other-group preservation, reopen without cache, bounded selected allocation,
+and standalone captured-data ownership across rename/drop/reopen. Existing typed
+redaction assertions pass with the single-encode detail path.
+
+All 21 selected E2E cases passed in 76.50 seconds on the final `13829ab83` production
+sources: `test_system_catalog.py`, `test_schema_migration.py`, `test_exact_sort.py`,
+and the exact-star/scoped-permission-and-row-filter cases in `test_auth.py`.
+Changed-file Zig/Python formatting, Python lint/compile checks and diff whitespace
+checks passed. No public generated contracts changed in this round; earlier SDK
+and generated checks remain in the preceding history. These focused checks are
+not a complete repository-suite pass.
+
 ## Reproduction
 
 See [workloads and commands](SYSTEM_CATALOG.md). Run the resolution scenario

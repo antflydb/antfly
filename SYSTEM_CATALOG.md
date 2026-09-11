@@ -407,7 +407,9 @@ Standalone maintains ordered namespace/name and table/range indexes in the
 same durable transaction as catalog mutations. It rebuilds those derived rows
 once after startup, seeks only the requested page, and copies selected records
 into an owned arena under the mutex. Serialization runs after releasing that
-mutex. Rollback and ambiguous-durability fencing cover index changes too. The
+mutex. Selected range prefixes are visited in storage order, reusing one cursor
+and bounding unrelated skips before the next seek. Logical table result order
+is unchanged. Rollback and ambiguous-durability fencing cover index changes too. The
 owned standalone catalog retains immutable index blocks in an 8 MiB cache;
 borrowed stores, including Lite, retain their owner's cache policy.
 
