@@ -134,6 +134,10 @@ pub const CatalogSource = struct {
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        /// Retained, immutable snapshot and indexes. The returned reference is
+        /// owned by the caller. Authoritative captures must still cross the
+        /// source's read barrier; an eventual cache hit never proves absence.
+        acquire_routing_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -208,6 +212,7 @@ pub const CatalogSource = struct {
                 .await_route = self.vtable.await_route,
             },
             .io = self.io,
+            .acquire_generation = self.vtable.acquire_routing_generation,
         };
     }
 
@@ -316,6 +321,7 @@ pub const CatalogRouteAuthority = struct {
 };
 
 pub const CatalogRoutingSource = struct {
+    acquire_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
     io: ?runtime_io_abi.Borrow = null,
     projection: CatalogProjectionSource,
     authority: CatalogRouteAuthority,
@@ -361,6 +367,57 @@ pub const OwnedRoutingSnapshot = struct {
     }
 };
 
+/// A published routing generation owns its bytes and indexes independently of
+/// its publisher. Readers retain under the publisher's lock, then route without
+/// copying the catalog or holding that lock. Retirement only drops the cache's
+/// reference; active requests keep their original identity and topology fences.
+pub const RoutingGeneration = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    alloc: std.mem.Allocator,
+    indexed: RoutingSession,
+
+    pub fn create(alloc: std.mem.Allocator, snapshot: metadata_api.CatalogRoutingSnapshot, budget: RoutingBudget) !*RoutingGeneration {
+        const self = try alloc.create(RoutingGeneration);
+        errdefer alloc.destroy(self);
+        self.* = .{ .alloc = alloc, .indexed = undefined };
+        const owned = OwnedRoutingSnapshot{
+            .source = .{ .ptr = self, .snapshot = unsupportedRoutingSnapshot, .free_snapshot = freeSnapshot },
+            .value = try cloneRoutingSnapshot(alloc, snapshot, budget),
+        };
+        self.indexed = try RoutingSession.initOwned(alloc, emptyCatalogSource(), owned, false, budget);
+        return self;
+    }
+
+    fn freeSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *RoutingGeneration = @ptrCast(@alignCast(ptr));
+        freeClonedRoutingSnapshot(self.alloc, snapshot);
+    }
+
+    pub fn retain(self: *RoutingGeneration) void {
+        std.debug.assert(self.refs.fetchAdd(1, .monotonic) > 0);
+    }
+
+    pub fn release(self: *RoutingGeneration) void {
+        const previous = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        const alloc = self.alloc;
+        self.indexed.deinit();
+        alloc.destroy(self);
+    }
+
+    /// Transfers the caller's reference into a session. Maps and snapshot are
+    /// read-only borrowed views; only the original generation frees them.
+    pub fn session(self: *RoutingGeneration, alloc: std.mem.Allocator, base: CatalogSource, authoritative: bool) RoutingSession {
+        var result = self.indexed;
+        result.alloc = alloc;
+        result.base = base;
+        result.authoritative = authoritative;
+        result.generation = self;
+        return result;
+    }
+};
+
 /// Immutable request-scoped catalog capability. A session captures one
 /// projection and uses it for every table touched by the request,
 /// including graph targets discovered after the source table was admitted.
@@ -371,6 +428,7 @@ pub const RoutingSession = struct {
     base: CatalogSource,
     snapshot: OwnedRoutingSnapshot,
     authoritative: bool,
+    generation: ?*RoutingGeneration = null,
     table_indexes: std.StringHashMapUnmanaged(usize) = .empty,
     table_id_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
@@ -383,6 +441,13 @@ pub const RoutingSession = struct {
         base: CatalogSource,
         deadline_ns: ?u64,
     ) !RoutingSession {
+        try base.budget(deadline_ns).checkpoint();
+        if (base.vtable.acquire_routing_generation) |acquire| {
+            const generation = try acquire(base.ptr, deadline_ns, true);
+            errdefer generation.release();
+            try base.budget(deadline_ns).checkpoint();
+            return generation.session(alloc, base, true);
+        }
         const routing = try base.routingSource();
         return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, base.budget(deadline_ns));
     }
@@ -398,25 +463,19 @@ pub const RoutingSession = struct {
     ) !RoutingSession {
         const budget = base.budget(deadline_ns);
         try budget.checkpoint();
-        const routing = try base.routingSource();
-        var snapshot = try routing.eventualSnapshot(deadline_ns);
-        const candidate = routePlanFromSnapshotWithBudget(alloc, snapshot.value, table_name, query, budget) catch |err| {
-            snapshot.deinit();
+        var session = if (base.vtable.acquire_routing_generation) |acquire|
+            (try acquire(base.ptr, deadline_ns, false)).session(alloc, base, false)
+        else blk: {
+            const routing = try base.routingSource();
+            break :blk try initOwned(alloc, base, try routing.eventualSnapshot(deadline_ns), false, budget);
+        };
+        const found = session.hasRoute(table_name, query, budget) catch |err| {
+            session.deinit();
             return err;
         };
-        if (candidate) |plan_value| {
-            var plan = plan_value;
-            plan.deinit(alloc);
-            return try initOwned(alloc, base, snapshot, false, budget);
-        }
-        snapshot.deinit();
-        return try initOwned(
-            alloc,
-            base,
-            try routing.linearizableSnapshot(deadline_ns),
-            true,
-            budget,
-        );
+        if (found) return session;
+        session.deinit();
+        return try init(alloc, base, deadline_ns);
     }
 
     fn initOwned(
@@ -426,9 +485,9 @@ pub const RoutingSession = struct {
         authoritative: bool,
         budget: RoutingBudget,
     ) !RoutingSession {
-        try budget.checkpoint();
         var snapshot = snapshot_value;
         errdefer snapshot.deinit();
+        try budget.checkpoint();
         var self: RoutingSession = .{
             .alloc = alloc,
             .base = base,
@@ -515,6 +574,11 @@ pub const RoutingSession = struct {
     }
 
     pub fn deinit(self: *RoutingSession) void {
+        if (self.generation) |generation| {
+            generation.release();
+            self.* = undefined;
+            return;
+        }
         self.alloc.free(self.range_refs);
         self.table_range_refs.deinit(self.alloc);
         self.table_indexes.deinit(self.alloc);
@@ -664,6 +728,58 @@ pub const RoutingSession = struct {
         return null;
     }
 
+    fn rangeForKey(ranges: []const *const metadata_table_manager.RangeRecord, key: []const u8) ?usize {
+        var low: usize = 0;
+        var high = ranges.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (std.mem.order(u8, ranges[mid].start_key, key) != .gt) low = mid + 1 else high = mid;
+        }
+        if (low == 0 or !rangeContainsKey(ranges[low - 1].*, key)) return null;
+        return low - 1;
+    }
+
+    fn hasRoute(self: *const RoutingSession, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !bool {
+        try budget.checkpoint();
+        const table_index = self.table_indexes.get(table_name) orelse return false;
+        const table = self.snapshot.value.tables[table_index];
+        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        return switch (query) {
+            .table => true,
+            .all_ranges => ranges.len > 0,
+            .key => |key| rangeForKey(ranges, key) != null,
+            .group => |id| if (self.group_indexes.get(id)) |index| self.snapshot.value.ranges[index].table_id == table.table_id else false,
+            .span => |span| blk: {
+                for (ranges, 0..) |range, i| {
+                    try budget.checkpointIndex(i);
+                    if (rangeOverlapsSpan(range.*, span.from_key, span.to_key)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
+        try budget.checkpoint();
+        const table_index = self.table_indexes.get(table_name) orelse return null;
+        const table = &self.snapshot.value.tables[table_index];
+        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        var one: [1]*const metadata_table_manager.RangeRecord = undefined;
+        const selected = switch (query) {
+            .table => &.{},
+            .key => |key| if (rangeForKey(ranges, key)) |index| ranges[index .. index + 1] else return null,
+            .group => |id| blk: {
+                const index = self.group_indexes.get(id) orelse return null;
+                const range = &self.snapshot.value.ranges[index];
+                if (range.table_id != table.table_id) return null;
+                one[0] = range;
+                break :blk &one;
+            },
+            else => ranges,
+        };
+        return routePlanFromIndexedRanges(alloc, self.snapshot.value, table, selected, self.topology_epochs.get(table.table_id).?, query, budget);
+    }
+
     fn resolvePinnedRoute(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -676,7 +792,7 @@ pub const RoutingSession = struct {
             if (self.base.budget(deadline_ns).nowNs() >= deadline) return .timed_out;
         }
         const budget = self.base.budget(deadline_ns);
-        const resolved = routePlanFromSnapshotWithBudget(alloc, self.snapshot.value, table_name, query, budget) catch |err| switch (err) {
+        const resolved = self.routePlan(alloc, table_name, query, budget) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return .timed_out,
             else => return err,
         };
@@ -2178,6 +2294,24 @@ fn resolveRouteObserved(
     query: RouteQuery,
     deadline_ns: ?u64,
 ) !ObservedRouteResult {
+    if (routing.acquire_generation) |acquire| {
+        const budget = RoutingBudget{ .deadline_ns = deadline_ns, .io = routing.io };
+        for ([_]bool{ false, true }) |authoritative| {
+            const generation = acquire(routing.projection.ptr, deadline_ns, authoritative) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                else => return err,
+            };
+            var session = generation.session(alloc, emptyCatalogSource(), authoritative);
+            defer session.deinit();
+            const plan = session.routePlan(alloc, table_name, query, budget) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                else => return err,
+            };
+            if (plan) |value| return .{ .found = value };
+            if (authoritative) return .{ .not_found = session.snapshot.value.change_token };
+        }
+        unreachable;
+    }
     var eventual = routing.eventualSnapshot(deadline_ns) catch |err| switch (err) {
         error.CatalogRoutingSnapshotTimeout => return .timed_out,
         else => return err,
@@ -2301,6 +2435,19 @@ pub fn routePlanFromSnapshotWithBudget(
 
     sortRangeRefs(ranges);
     try budget.checkpoint();
+    const epoch = try topologyEpochFromSortedRangesWithBudget(table.*, ranges, budget);
+    return routePlanFromIndexedRanges(alloc, snapshot, table, ranges, epoch, query, budget);
+}
+
+fn routePlanFromIndexedRanges(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+    query: RouteQuery,
+    budget: RoutingBudget,
+) !?CatalogRoutePlan {
     var groups = std.ArrayListUnmanaged(CatalogGroupRoute).empty;
     defer groups.deinit(alloc);
     for (ranges, 0..) |range, index| {
@@ -2332,7 +2479,6 @@ pub fn routePlanFromSnapshotWithBudget(
         try budget.checkpoint();
         return null;
     }
-    const topology_epoch = try topologyEpochFromSortedRangesWithBudget(table.*, ranges, budget);
     const owned_groups = try groups.toOwnedSlice(alloc);
     errdefer alloc.free(owned_groups);
     try budget.checkpoint();
@@ -3971,4 +4117,31 @@ test "catalog resolved filter validation accepts preserved split identity domain
     var state = TestState{ .statuses = statuses[0..] };
     try validateDocIdentityReadyForTableStrict(std.testing.allocator, FakeCatalog.iface(&state), "docs");
     try validateResolvedDocFilterContextForGroups(std.testing.allocator, FakeCatalog.iface(&state), "docs", &.{ 7001, 7002 }, 7, 7001, 7001);
+}
+
+test "system catalog routing generation survives retirement and bounds request allocation" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = try a.alloc(metadata_table_manager.TableRecord, 10000);
+    const ranges = try a.alloc(metadata_table_manager.RangeRecord, tables.len);
+    for (tables, ranges, 0..) |*table, *range, i| {
+        table.* = .{ .table_id = i + 1, .name = try std.fmt.allocPrint(a, "table-{d}", .{i}) };
+        range.* = .{ .table_id = i + 1, .group_id = i + 7001, .start_key = "" };
+    }
+    const generation = try RoutingGeneration.create(alloc, .{ .metadata_group_id = 1, .catalog_revision = 17, .tables = tables, .ranges = ranges }, .{});
+    generation.retain();
+    // Only the request's reference survives publisher retirement.
+    generation.release();
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    var session = generation.session(bounded.allocator(), emptyCatalogSource(), true);
+    defer session.deinit();
+    var result = try session.routePlan(bounded.allocator(), "table-9999", .all_ranges, .{});
+    defer if (result) |*plan| plan.deinit(bounded.allocator());
+    try std.testing.expectEqual(@as(u64, 17), result.?.catalog_revision);
+    try std.testing.expectEqual(@as(u64, 10000), result.?.table_id);
+    try std.testing.expectEqual(@as(usize, 1), result.?.groups.len);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.routePlan(bounded.allocator(), "table-9999", .table, .{ .deadline_ns = 1 }));
 }

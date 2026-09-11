@@ -411,7 +411,7 @@ def catalog_scenario(args, binary: Path) -> dict:
 
 def management_scenario(args, binary: Path) -> dict:
     """Tenant discovery and DDL against an increasing unrelated inventory."""
-    with server(binary, args.deployment) as (api, startup, _instance):
+    with server(binary, args.deployment) as (api, startup, instance):
         checkpoints = []
         created = 0
         serial = 0
@@ -495,9 +495,36 @@ def management_scenario(args, binary: Path) -> dict:
             writes = [x for _, writes in results for x in writes]
             if writes:
                 measured["concurrent_namespace_create_drop"] = summary(writes)
+            recovery = None
+            if args.restart_after_ddl:
+                # Exercise durable publication after mixed create/drop/rename
+                # traffic. Recovery is reported separately from steady latency.
+                identities = {
+                    row["name"]: row["database_id"]
+                    for row in api.request("GET", "/databases")
+                }
+                start = time.perf_counter_ns()
+                instance.restart()
+                recovered = {
+                    row["name"]: row["database_id"]
+                    for row in api.request("GET", "/databases")
+                }
+                if recovered != identities:
+                    raise RuntimeError("catalog identities changed across restart")
+                for tenant_path in {path, "/databases/tenant_0"}:
+                    namespaces = api.request("GET", tenant_path + "/namespaces")
+                    if {row["name"] for row in namespaces} != {"public"}:
+                        raise RuntimeError(
+                            "deleted namespaces reappeared after restart"
+                        )
+                recovery = {
+                    "elapsed_ms": (time.perf_counter_ns() - start) / 1e6,
+                    "verified_databases": len(recovered),
+                }
             checkpoints.append(
                 {
                     "tenant_count": count,
+                    "restart_recovery": recovery,
                     "database_create": summary(setup),
                     "operations": measured,
                 }
@@ -699,6 +726,11 @@ def main():
         default="standalone",
         help="Catalog scenario deployment",
     )
+    parser.add_argument(
+        "--restart-after-ddl",
+        action="store_true",
+        help="Verify standalone catalog recovery after each management checkpoint",
+    )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
         "--resolution-workload",
@@ -726,6 +758,8 @@ def main():
     parser.add_argument("--readiness-timeout", type=positive, default=115)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.restart_after_ddl and args.deployment != "standalone":
+        parser.error("--restart-after-ddl requires --deployment standalone")
     if args.schema_fields < 0:
         parser.error("--schema-fields must be nonnegative")
     binary = args.binary.resolve(strict=True)

@@ -6773,6 +6773,10 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
+                slot.err = err;
+                return;
+            };
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = switch (route) {
                 .local => source.requireSearchResultLocal(arena, group_id, table_name_inner, group_req, consistency_inner) catch |err| {
@@ -31507,4 +31511,109 @@ test "system catalog document lookup batches partition keys without broadening e
     try std.testing.expect(excluded.filter_doc_ids_positive);
     request.full_text = .{ .match_all = {} };
     try std.testing.expect(!isDocumentLookupBatch(request));
+}
+
+test "system catalog parallel hosted candidate fanout sends only owned keys" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 8, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+
+        fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, allocator: std.mem.Allocator, _: u64) !?[]u8 {
+            return try allocator.dupe(u8, "http://remote.test");
+        }
+    };
+
+    const Capture = struct {
+        keys_seen: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const left = std.mem.indexOf(u8, req.body, "doc:a") != null;
+            const right = std.mem.indexOf(u8, req.body, "doc:z") != null;
+            _ = self.calls.fetchAdd(1, .monotonic);
+            _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
+            try std.testing.expect(left != right);
+            // Stop after wire capture; both fibers must still finish. This
+            // exercises the real parallel dispatch and serializer, not merely
+            // the partition helper or the final result set.
+            return error.CapturedCandidateRequest;
+        }
+    };
+    var capture = Capture{};
+    var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
+    defer routing.deinit();
+    var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+    _ = hosted.withIo(&io_impl);
+    const req: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
+    try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
+    var generations = [_]?u64{ null, null };
+    try std.testing.expectError(error.CapturedCandidateRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+    try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
 }

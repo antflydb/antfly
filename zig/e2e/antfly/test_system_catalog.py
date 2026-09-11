@@ -21,7 +21,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
-
 from helpers import wait_until
 
 
@@ -392,3 +391,32 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
     for path in paths:
         api.delete(path)
     api.delete(f"/databases/{database}")
+
+
+def test_catalog_ddl_burst_recovers_exact_resource_identities(stateful_api):
+    """Tenant provisioning, rename, and offboarding survive one restart."""
+    api = stateful_api
+    prefix = "catalog_burst_" + uuid.uuid4().hex[:10]
+    survivors = {}
+    retired = []
+    for i in range(12):
+        name = f"{prefix}_{i}"
+        created = api.post(f"/databases/{name}", {})
+        renamed = name + "_renamed"
+        api.post(f"/databases/{name}/rename", {"name": renamed})
+        assert api._request("GET", f"/databases/{name}").status_code == 404
+        if i % 3 == 0:
+            api.delete(f"/databases/{renamed}")
+            retired.append(renamed)
+        else:
+            survivors[renamed] = created["database_id"]
+            api.post(f"/databases/{renamed}/namespaces/temporary", {})
+            api.delete(f"/databases/{renamed}/namespaces/temporary")
+    api.restart_server()
+    for name in retired:
+        assert api._request("GET", f"/databases/{name}").status_code == 404
+    for name, identity in survivors.items():
+        assert api.get(f"/databases/{name}")["database_id"] == identity
+        namespaces = api.get(f"/databases/{name}/namespaces")
+        assert {row["name"] for row in namespaces} == {"public"}
+        api.delete(f"/databases/{name}")

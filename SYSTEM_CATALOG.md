@@ -111,8 +111,9 @@ request-owned, never a process-wide name cache with a time-based expiry.
 
 Catalog records, revisions, and table topology commit through metadata Raft.
 Logical and physical name indexes are local derived projections maintained in
-the same transaction as authoritative mutations. Standalone persists the same state in its atomic catalog
-checkpoint and rollback boundary. Create and restore publish table topology
+the same transaction as authoritative mutations. Standalone persists table,
+range, and logical-resource rows together with a versioned revision record in one
+storage-engine transaction. Create and restore publish table topology
 and the logical binding together. Reopen and snapshot installation retain the
 catalog. System catalog admission requires topology protocol version 5;
 existing atomic table operations retain their version-3 gate.
@@ -151,8 +152,8 @@ and related labels. Listings scan covering kind/parent rows sequentially, avoidi
 a separate primary-record seek for every result; related tablespaces are fetched
 once. Covering rows are disposable derived records, maintained atomically and
 validated/rebuilt with the other catalog indexes. Standalone owns equivalent child/name/ID/reference indexes.
-Response formatting uses an index instead of repeated inventory scans. Its
-atomic standalone checkpoint still persists the complete catalog state.
+Response formatting uses an index instead of repeated inventory scans.
+Standalone updates only affected rows and their in-memory indexes.
 
 A writable projection rebuilds name indexes from validated authoritative records
 before its first catalog point read after open or snapshot installation. Read-only
@@ -176,16 +177,35 @@ Table listings build an identity map and select scope, prefix, and authorized
 tables before per-table status collection and public schema materialization.
 The administrative snapshot remains the source of topology information.
 
-Standalone owns name and ID indexes with each immutable catalog state and a
-physical-name index with its table manager. Indexes are rebuilt before checkpoint
-publication and restored with rollback state; their keys borrow the owned records.
-Resolution and mutation planning use the owned indexes under the existing
-metadata lock. Physical collision checks use the table manager’s name/ID indexes;
-planning enumerates only affected children. Legacy adoption retains physical names
-in the mutation arena so replacing a table-manager record cannot invalidate a
-pending binding. Publication still clones, indexes,
-and checkpoints the complete standalone state, so total standalone mutation
-cost remains proportional to catalog size.
+Standalone owns name, ID, child-position, physical-name, and counted tablespace
+reference indexes. A mutation clones only affected records and reserves index
+capacity before changing them under the metadata mutex. Undo is allocation-free;
+a successful durable commit releases the old records. Readers cannot observe
+partially applied deltas. Legacy adoption retains physical names in the mutation
+arena so replacement cannot invalidate a pending binding.
+
+Local standalone stores catalog rows in an LSM directory beside the legacy file
+(`local-metadata.json.store`), using the existing engine's WAL, recovery, and
+compaction. Lite uses its existing `system/metadata` namespace. Startup prefers
+the versioned row catalog; without it, startup reads the legacy JSON file or Lite
+`catalog` value. The first successful mutation atomically imports the legacy
+state and publishes the new head. Subsequent DDL writes changed rows and the head,
+not a full catalog checkpoint. The legacy input is retained but no longer
+updated; downgrading after migration requires restoring a compatible backup.
+Extension mutations snapshot their own extension section; unrelated table and
+logical-resource inventories are excluded. Reopen validates row keys and rebuilds
+derived indexes once. A commit/sync failure with an uncertain outcome fences
+catalog reads and mutations until restart instead of claiming rollback.
+
+Routing generations own compact table/range records and immutable indexes.
+Eventual cache hits retain a generation instead of cloning the catalog and
+sorting ranges again. Point routing and fence rechecks use the same capability.
+Authoritative captures still cross a read barrier; indexes can be reused only
+when the observed incarnation/revision matches exactly. A cache TTL never proves
+absence. Active sessions retain their generation through cache invalidation and
+publication; their storage identity and topology fences remain unchanged.
+Standalone captures records under its metadata mutex and builds indexes outside
+that lock, publishing the cache only if its revision is still current.
 
 ## Grants and row filters
 

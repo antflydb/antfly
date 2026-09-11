@@ -2298,6 +2298,16 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     }));
     b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
+    const system_catalog_routing_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-routing-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/system_catalog_routing_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    antfly_imports.configure(b, system_catalog_routing_bench.root_module, true, true);
+    b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });

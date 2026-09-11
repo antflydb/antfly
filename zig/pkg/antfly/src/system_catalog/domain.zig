@@ -273,7 +273,8 @@ pub const StateIndex = struct {
     ids: std.AutoHashMapUnmanaged(Id, Resource) = .empty,
     children: std.AutoHashMapUnmanaged(Parent, std.ArrayListUnmanaged(Resource)) = .empty,
     storage_names: std.StringHashMapUnmanaged(Resource) = .empty,
-    tablespace_users: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    tablespace_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    child_positions: std.AutoHashMapUnmanaged(Id, usize) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, state: State) !StateIndex {
         var self: StateIndex = .{};
@@ -293,7 +294,10 @@ pub const StateIndex = struct {
                 if (storage.found_existing) return error.InvalidCatalogRecord;
                 storage.value_ptr.* = r;
             }
-            if (r.tablespace_id != 0) try self.tablespace_users.put(alloc, r.tablespace_id, {});
+            if (r.tablespace_id != 0) {
+                const count = try self.tablespace_users.getOrPutValue(alloc, r.tablespace_id, 0);
+                count.value_ptr.* += 1;
+            }
         }
         if (!self.ids.contains(.{ .kind = .database, .id = default_database_id })) try self.appendChild(alloc, default_database);
         if (!self.ids.contains(.{ .kind = .namespace, .id = default_namespace_id })) try self.appendChild(alloc, default_namespace);
@@ -302,7 +306,55 @@ pub const StateIndex = struct {
     fn appendChild(self: *StateIndex, alloc: std.mem.Allocator, resource: Resource) !void {
         const entry = try self.children.getOrPut(alloc, .{ .kind = resource.kind, .parent = resource.parent_id });
         if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try self.child_positions.put(alloc, .{ .kind = resource.kind, .id = resource.id }, entry.value_ptr.items.len);
         try entry.value_ptr.append(alloc, resource);
+    }
+    /// Reserve every index before publishing a delta. Applying or undoing the
+    /// prepared delta subsequently allocates nothing.
+    fn reserve(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
+        const n: u32 = @intCast(resources.len);
+        try self.names.ensureUnusedCapacity(alloc, n);
+        try self.ids.ensureUnusedCapacity(alloc, n);
+        try self.storage_names.ensureUnusedCapacity(alloc, n);
+        try self.tablespace_users.ensureUnusedCapacity(alloc, n);
+        try self.child_positions.ensureUnusedCapacity(alloc, n);
+        for (resources) |r| {
+            const entry = try self.children.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id });
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            // Reserve for the whole delta even when multiple siblings share a
+            // parent. Capacity only grows; rollback can restore removed rows.
+            try entry.value_ptr.ensureUnusedCapacity(alloc, resources.len);
+        }
+    }
+    fn remove(self: *StateIndex, r: Resource) void {
+        _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
+        _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
+        if (r.kind == .table) _ = self.storage_names.remove(r.storage_name);
+        if (r.tablespace_id != 0) {
+            const count = self.tablespace_users.getPtr(r.tablespace_id).?;
+            count.* -= 1;
+            if (count.* == 0) _ = self.tablespace_users.remove(r.tablespace_id);
+        }
+        const position = self.child_positions.fetchRemove(.{ .kind = r.kind, .id = r.id }).?.value;
+        const children = self.children.getPtr(.{ .kind = r.kind, .parent = r.parent_id }).?;
+        _ = children.swapRemove(position);
+        if (position < children.items.len) {
+            const moved = children.items[position];
+            self.child_positions.getPtr(.{ .kind = moved.kind, .id = moved.id }).?.* = position;
+        }
+    }
+    fn insert(self: *StateIndex, r: Resource) void {
+        self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
+        self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
+        if (r.kind == .table) self.storage_names.putAssumeCapacity(r.storage_name, r);
+        if (r.tablespace_id != 0) {
+            const count = self.tablespace_users.getOrPutAssumeCapacity(r.tablespace_id);
+            if (!count.found_existing) count.value_ptr.* = 0;
+            count.value_ptr.* += 1;
+        }
+        const children = self.children.getPtr(.{ .kind = r.kind, .parent = r.parent_id }).?;
+        self.child_positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, children.items.len);
+        children.appendAssumeCapacity(r);
     }
     pub fn list(self: *const StateIndex, kind: Kind, parent: u64) []const Resource {
         return if (self.children.get(.{ .kind = kind, .parent = parent })) |value| value.items else &.{};
@@ -313,6 +365,7 @@ pub const StateIndex = struct {
         self.children.deinit(alloc);
         self.storage_names.deinit(alloc);
         self.tablespace_users.deinit(alloc);
+        self.child_positions.deinit(alloc);
         self.names.deinit(alloc);
         self.ids.deinit(alloc);
         self.* = undefined;
@@ -350,6 +403,125 @@ pub const IndexedState = struct {
         self.* = undefined;
     }
 };
+
+/// Standalone's writer-owned catalog. Each resource owns its strings; a
+/// transaction reserves indexes and clones only changed records before apply.
+/// Readers borrow it under the metadata mutex. Undo and commit cannot allocate.
+pub const MutableState = struct {
+    alloc: std.mem.Allocator,
+    value: State,
+    index: StateIndex,
+    rows: std.ArrayListUnmanaged(Resource),
+    positions: std.AutoHashMapUnmanaged(StateIndex.Id, usize),
+
+    pub fn clone(alloc: std.mem.Allocator, state: State) !MutableState {
+        var self = MutableState{ .alloc = alloc, .value = state, .index = .{}, .rows = .empty, .positions = .empty };
+        errdefer self.deinit();
+        const resources = state.resources;
+        try self.rows.ensureUnusedCapacity(alloc, resources.len + 2);
+        try self.positions.ensureUnusedCapacity(alloc, @intCast(resources.len + 2));
+        for (resources) |r| {
+            if (self.positions.contains(.{ .kind = r.kind, .id = r.id })) return error.InvalidCatalogRecord;
+            const owned = try cloneResource(alloc, r);
+            self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
+            self.rows.appendAssumeCapacity(owned);
+        }
+        for ([_]Resource{ default_database, default_namespace }) |r| {
+            if (self.positions.contains(.{ .kind = r.kind, .id = r.id })) continue;
+            const owned = try cloneResource(alloc, r);
+            self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
+            self.rows.appendAssumeCapacity(owned);
+        }
+        self.value.resources = self.rows.items;
+        self.index = try StateIndex.init(alloc, self.value);
+        return self;
+    }
+    pub fn deinit(self: *MutableState) void {
+        self.index.deinit(self.alloc);
+        for (self.rows.items) |r| freeResource(self.alloc, r);
+        self.rows.deinit(self.alloc);
+        self.positions.deinit(self.alloc);
+        self.* = undefined;
+    }
+    fn take(self: *MutableState, kind: Kind, id: u64) ?Resource {
+        const removed = self.positions.fetchRemove(.{ .kind = kind, .id = id }) orelse return null;
+        const r = self.rows.swapRemove(removed.value);
+        if (removed.value < self.rows.items.len) {
+            const moved = self.rows.items[removed.value];
+            self.positions.getPtr(.{ .kind = moved.kind, .id = moved.id }).?.* = removed.value;
+        }
+        self.index.remove(r);
+        self.value.resources = self.rows.items;
+        return r;
+    }
+    fn put(self: *MutableState, r: Resource) void {
+        self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
+        self.rows.appendAssumeCapacity(r);
+        self.index.insert(r);
+        self.value.resources = self.rows.items;
+    }
+    pub const Change = struct {
+        previous: std.ArrayListUnmanaged(Resource) = .empty,
+        inserted: std.ArrayListUnmanaged(Resource) = .empty,
+        revision: u64,
+        next_id: u64,
+        pub fn finish(self: *Change, state: *MutableState, committed: bool) void {
+            if (!committed) {
+                for (self.inserted.items) |r| if (state.take(r.kind, r.id)) |removed| freeResource(state.alloc, removed);
+                for (self.previous.items) |r| state.put(r);
+                state.value.revision = self.revision;
+                state.value.next_id = self.next_id;
+            } else for (self.previous.items) |r| freeResource(state.alloc, r);
+            self.previous.deinit(state.alloc);
+            self.inserted.deinit(state.alloc);
+            self.* = undefined;
+        }
+    };
+    pub fn apply(self: *MutableState, delta: Delta) !Change {
+        var change = Change{ .revision = self.value.revision, .next_id = self.value.next_id };
+        errdefer change.previous.deinit(self.alloc);
+        errdefer {
+            for (change.inserted.items) |r| freeResource(self.alloc, r);
+            change.inserted.deinit(self.alloc);
+        }
+        const revision = try std.math.add(u64, self.value.revision, 1);
+        try change.previous.ensureUnusedCapacity(self.alloc, delta.removes.len + delta.upserts.len);
+        try change.inserted.ensureUnusedCapacity(self.alloc, delta.upserts.len);
+        for (delta.upserts) |r| change.inserted.appendAssumeCapacity(try cloneResource(self.alloc, r));
+        try self.rows.ensureUnusedCapacity(self.alloc, delta.upserts.len);
+        // rows may have moved even if a later reservation fails.
+        self.value.resources = self.rows.items;
+        try self.positions.ensureUnusedCapacity(self.alloc, @intCast(delta.upserts.len));
+        try self.index.reserve(self.alloc, change.inserted.items);
+        // No fallible operation is allowed after the first removal.
+        for (delta.removes) |r| if (self.take(r.kind, r.id)) |old| change.previous.appendAssumeCapacity(old);
+        for (change.inserted.items) |r| {
+            if (self.take(r.kind, r.id)) |old| change.previous.appendAssumeCapacity(old);
+            self.put(r);
+        }
+        self.value.revision = revision;
+        self.value.next_id = delta.next_id;
+        return change;
+    }
+};
+
+fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
+    var r = source;
+    r.name = try alloc.dupe(u8, source.name);
+    errdefer alloc.free(r.name);
+    r.storage_name = try alloc.dupe(u8, source.storage_name);
+    errdefer alloc.free(r.storage_name);
+    r.location_json = try alloc.dupe(u8, source.location_json);
+    errdefer alloc.free(r.location_json);
+    if (source.placement_policy.placement_role) |role| r.placement_policy.placement_role = try alloc.dupe(u8, role);
+    return r;
+}
+fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
+    alloc.free(r.name);
+    alloc.free(r.storage_name);
+    alloc.free(r.location_json);
+    if (r.placement_policy.placement_role) |role| alloc.free(role);
+}
 
 /// A deterministic single-command delta. All data is borrowed from the request
 /// and snapshot; the allocator owns only the delta arrays.
@@ -838,4 +1010,41 @@ test "system catalog database drop removes all empty namespaces without losing a
     try std.testing.expectEqual(@as(usize, 3), next.value.resources.len);
     try std.testing.expect(next.value.byId(.table, 13) != null);
     try std.testing.expect(next.value.byId(.namespace, 12) == null);
+}
+
+test "system catalog mutable delta keeps reverse indexes and rolls back without allocation" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const resources = [_]Resource{
+                .{ .kind = .tablespace, .id = 10, .name = "hot" },
+                .{ .kind = .database, .id = 11, .name = "first", .tablespace_id = 10 },
+                .{ .kind = .database, .id = 12, .name = "second", .tablespace_id = 10 },
+            };
+            var state = try MutableState.clone(alloc, .{ .revision = 1, .next_id = 20, .resources = &resources });
+            defer state.deinit();
+            var updated = resources[1];
+            updated.name = "renamed";
+            updated.tablespace_id = 0;
+            var upserts = [_]Resource{updated};
+            const delta = Delta{ .upserts = &upserts, .removes = &.{}, .next_id = 20 };
+            var change = state.apply(delta) catch |err| {
+                try std.testing.expect(state.index.find(.database, 0, "first") != null);
+                try std.testing.expect(state.index.find(.database, 0, "renamed") == null);
+                try std.testing.expectEqual(@as(u64, 1), state.value.revision);
+                return err;
+            };
+            try std.testing.expect(state.index.find(.database, 0, "first") == null);
+            try std.testing.expect(state.index.find(.database, 0, "renamed") != null);
+            try std.testing.expectEqual(@as(usize, 1), state.index.tablespace_users.get(10).?);
+            change.finish(&state, false);
+            try std.testing.expect(state.index.find(.database, 0, "renamed") == null);
+            try std.testing.expectEqual(@as(usize, 2), state.index.tablespace_users.get(10).?);
+            try std.testing.expectEqual(@as(u64, 1), state.value.revision);
+            try std.testing.expectEqual(@as(usize, 3), state.index.list(.database, 0).len);
+            var committed = try state.apply(delta);
+            committed.finish(&state, true);
+            try std.testing.expectEqual(@as(u64, 2), state.value.revision);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

@@ -19202,6 +19202,7 @@ const RemoteMetadataSource = struct {
         /// blocks mutation invalidation or protocol bookkeeping.
         ref_count: std.atomic.Value(usize) = .init(1),
         snapshot: antfly.metadata_api.CatalogRoutingSnapshot,
+        generation: *antfly.public_api.table_catalog.RoutingGeneration,
 
         fn create(
             alloc: std.mem.Allocator,
@@ -19218,7 +19219,8 @@ const RemoteMetadataSource = struct {
         ) !*@This() {
             const entry = try alloc.create(@This());
             errdefer alloc.destroy(entry);
-            entry.* = .{ .snapshot = try cloneRoutingSnapshotOwnedUntil(alloc, source, deadline_ns, io) };
+            const generation = try antfly.public_api.table_catalog.RoutingGeneration.create(alloc, source, antfly.public_api.table_catalog.RoutingBudget.initIo(deadline_ns, io));
+            entry.* = .{ .snapshot = generation.indexed.snapshot.value, .generation = generation };
             return entry;
         }
 
@@ -19231,7 +19233,7 @@ const RemoteMetadataSource = struct {
             const previous = self.ref_count.fetchSub(1, .acq_rel);
             std.debug.assert(previous > 0);
             if (previous != 1) return;
-            freeRoutingSnapshotOwned(alloc, &self.snapshot);
+            self.generation.release();
             alloc.destroy(self);
         }
     };
@@ -19263,6 +19265,7 @@ const RemoteMetadataSource = struct {
     cached_snapshot_at_ms: u64 = 0,
     cached_routing_snapshot: ?*RoutingSnapshotCacheEntry = null,
     cached_routing_snapshot_at_ms: u64 = 0,
+    authoritative_routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
     routing_refresh_mutex: std.atomic.Mutex = .unlocked,
     // Incremented only by authoritative replacement or invalidation. An
     // ordinary snapshot request captures this before I/O and may not publish
@@ -19359,6 +19362,7 @@ const RemoteMetadataSource = struct {
         lockAtomic(&self.cache_mutex);
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         if (self.cached_routing_snapshot) |snapshot| snapshot.release(self.alloc);
+        if (self.authoritative_routing_generation) |generation| generation.release();
         self.alloc.free(self.linearizable_snapshot_unsupported_until_ns);
         self.alloc.free(self.routing_protocol_states);
         for (self.base_uris) |uri| self.alloc.free(uri);
@@ -19839,6 +19843,7 @@ const RemoteMetadataSource = struct {
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
+                .acquire_routing_generation = remoteAcquireRoutingGeneration,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
@@ -20307,6 +20312,52 @@ const RemoteMetadataSource = struct {
             .metadata_incarnation = head.metadata_incarnation orelse
                 return error.MetadataIncarnationUnavailable,
         };
+    }
+
+    fn cachedRoutingGenerationFresh(self: *RemoteMetadataSource, deadline_ns: ?u64) !?*antfly.public_api.table_catalog.RoutingGeneration {
+        const now_ms: u64 = @intCast(@divTrunc(self.awakeNs(), std.time.ns_per_ms));
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.cache_mutex.unlock();
+        const entry = self.cached_routing_snapshot orelse return null;
+        if (now_ms -| self.cached_routing_snapshot_at_ms > metadata_snapshot_cache_ttl_ms) return null;
+        entry.generation.retain();
+        return entry.generation;
+    }
+
+    fn remoteAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*antfly.public_api.table_catalog.RoutingGeneration {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        if (!authoritative) {
+            if (try self.cachedRoutingGenerationFresh(deadline_ns)) |generation| return generation;
+        }
+        // Preserve singleflight refresh, incarnation validation and read
+        // barriers in the existing capture path. Only cache misses copy data.
+        var snapshot = try self.remoteRoutingSnapshotWithMode(deadline_ns, authoritative);
+        defer freeRoutingSnapshotOwned(self.alloc, &snapshot);
+        if (!authoritative) {
+            if (try self.cachedRoutingGenerationFresh(deadline_ns)) |generation| return generation;
+        }
+        if (!authoritative or snapshot.change_token.revision == 0)
+            return try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, self.catalogSource().budget(deadline_ns));
+        // The read barrier has already completed. Reuse indexes only for the
+        // exact incarnation/revision it observed, never based on cache age.
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        if (self.authoritative_routing_generation) |generation| {
+            if (std.meta.eql(generation.indexed.snapshot.value.change_token, snapshot.change_token)) {
+                generation.retain();
+                self.cache_mutex.unlock();
+                return generation;
+            }
+        }
+        self.cache_mutex.unlock();
+        const next = try antfly.public_api.table_catalog.RoutingGeneration.create(self.alloc, snapshot, self.catalogSource().budget(deadline_ns));
+        errdefer next.release();
+        if (!self.lockBefore(&self.cache_mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        const previous = self.authoritative_routing_generation;
+        self.authoritative_routing_generation = next;
+        next.retain();
+        self.cache_mutex.unlock();
+        if (previous) |generation| generation.release();
+        return next;
     }
 
     fn remoteRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -40800,6 +40851,18 @@ test "remote routing capture cache and session share a virtual deadline clock" {
     try std.testing.expectEqual(calls_after_capture, stub.calls);
     var session = try antfly.public_api.table_catalog.RoutingSession.init(alloc, source.catalogSource(), deadline);
     defer session.deinit();
+    const calls_before_authority = stub.calls;
+    var same_generation = try antfly.public_api.table_catalog.RoutingSession.init(alloc, source.catalogSource(), deadline);
+    defer same_generation.deinit();
+    try std.testing.expect(same_generation.generation.? == session.generation.?);
+    try std.testing.expect(stub.calls > calls_before_authority);
+    const first = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, deadline, false);
+    defer first.release();
+    const second = try RemoteMetadataSource.remoteAcquireRoutingGeneration(&source, deadline, false);
+    defer second.release();
+    try std.testing.expect(first == second);
+    source.invalidateCache();
+    try std.testing.expectEqual(@as(u64, 9), first.indexed.snapshot.value.catalog_revision);
     try std.testing.expectEqual(@as(u64, 0), session.catalog().budget(deadline).nowNs());
     try session.catalog().budget(deadline).checkpoint();
     vopr_io.monotonic_ns = deadline;

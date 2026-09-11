@@ -64,6 +64,36 @@ pub fn main() !void {
         }
         std.debug.print("tables={d} samples={d} rename_median_ms={d:.3} scan_lookup_ns={d:.1} indexed_lookup_ns={d:.1}\n", .{ n, samples, median(&rename_ns) / 1e6, median(&scan_ns) / lookups, median(&indexed_ns) / lookups });
     }
+    // Apply a logical rename with unrelated tenant inventory. Include owned
+    // strings, indexes and rollback records; omit durability and HTTP costs.
+    for ([_]usize{ 10, 1000, 10000 }) |n| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const resources = try a.alloc(catalog.Resource, n);
+        for (resources, 0..) |*r, i| r.* = .{ .kind = .database, .id = i + 100, .name = try std.fmt.allocPrint(a, "tenant-{d}", .{i}) };
+        const state: catalog.State = .{ .revision = 1, .next_id = n + 100, .resources = resources };
+        var mutable = try catalog.MutableState.clone(alloc, state);
+        defer mutable.deinit();
+        var replacement = resources[n - 1];
+        replacement.name = "renamed";
+        var upserts = [_]catalog.Resource{replacement};
+        const delta: catalog.Delta = .{ .upserts = &upserts, .removes = &.{}, .next_id = state.next_id };
+        var copy_ns: [samples]i96 = undefined;
+        var delta_ns: [samples]i96 = undefined;
+        for (0..samples) |sample| {
+            var start = std.Io.Clock.now(.awake, io).nanoseconds;
+            const owned = try catalog.applyDeltaStateAlloc(alloc, state, delta);
+            var indexed = try catalog.IndexedState.init(alloc, owned);
+            indexed.deinit();
+            copy_ns[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+            start = std.Io.Clock.now(.awake, io).nanoseconds;
+            var change = try mutable.apply(delta);
+            change.finish(&mutable, false);
+            delta_ns[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+        }
+        std.debug.print("tenants={d} samples={d} copied_apply_us={d:.3} delta_apply_undo_us={d:.3}\n", .{ n, samples, median(&copy_ns) / 1000, median(&delta_ns) / 1000 });
+    }
     // Tenant offboarding: many empty namespaces in one database, alongside
     // another database's tables. Include both planning and standalone apply.
     for ([_]usize{ 1000, 10000 }) |n| {
