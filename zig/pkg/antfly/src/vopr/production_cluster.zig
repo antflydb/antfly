@@ -42,6 +42,8 @@ const http_disconnect = @import("http_disconnect.zig");
 const usermgr = @import("../usermgr/user_manager.zig");
 const db_types = @import("../storage/db/types.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const production_ha = @import("production_ha.zig");
+const metadata_workflow = @import("../metadata/table_workflow.zig");
 
 // The composed deployment uses the same service identity as the metadata
 // quorum fixture. Leaving this unset does not model an unauthenticated legacy
@@ -706,6 +708,14 @@ pub const Fixture = struct {
     phase: Phase = .created,
     teardown_started: bool = false,
     active_split_enabled: bool = true,
+    ha_scaling_enabled: bool = false,
+    ha_owners: ?*production_ha.Owners = null,
+    ha_shard_db: hosted_shard_ops.HostedShardDbAdapter = undefined,
+    ha_scaling_sound: bool = false,
+    ha_scaling_stage: u8 = 0,
+    ha_scale_out_complete: bool = false,
+    ha_scale_in_complete: bool = false,
+    ha_auto_merge_complete: bool = false,
     graph_enabled: bool = false,
     graph_hydration_enabled: bool = false,
     graph_cancellation_enabled: bool = false,
@@ -1667,6 +1677,8 @@ pub const Fixture = struct {
                 .name = "system/distributed-join-jobs",
             });
             self.join_job_store_count += 1;
+            if (index == 0 and self.ha_scaling_enabled)
+                self.ha_owners = try production_ha.Owners.create(alloc, self.sim.io(), self.data_roots[index]);
             try self.initializeDataServer(index);
             self.data_server_count += 1;
             self.data_raft_listener_count += 1;
@@ -1786,6 +1798,10 @@ pub const Fixture = struct {
         }
         self.data_raft_uris[index] = try self.alloc.dupe(u8, self.data_raft_listeners[index].base_uri);
         self.data_raft_uri_live[index] = true;
+        // This listener is externally owned, so DataServer cannot infer its
+        // address. Keep the advertised endpoint in the borrowed registration
+        // config across normal registration and process reconstruction.
+        self.data_servers[index].store_registration.?.raft_url = self.data_raft_uris[index];
         self.data_raft_ports[index] = (try parseHttpBaseUriAddress(self.data_raft_uris[index])).getPort();
         errdefer {
             self.alloc.free(self.data_raft_uris[index]);
@@ -1846,7 +1862,15 @@ pub const Fixture = struct {
         }
         if (replicas == 0) return .status_unavailable;
         if (!leader_known) return .leader_unknown;
-        if (replicas != 2) return .voter_count_mismatch;
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return .status_unavailable;
+        const intents = try self.metadata.?.cluster.node(leader).listProjectedPlacementIntents(self.alloc);
+        defer self.metadata.?.cluster.node(leader).freeProjectedPlacementIntents(self.alloc, intents);
+        var expected: usize = 0;
+        for (intents) |intent| {
+            if (intent.record.group_id == group_id) expected += 1;
+        }
+        if (expected == 0) return .status_unavailable;
+        if (replicas != expected) return .voter_count_mismatch;
         return .ready;
     }
 
@@ -3102,6 +3126,10 @@ pub const Fixture = struct {
 
     fn runWorkload(self: *Fixture) void {
         self.runWorkloadInner() catch |err| {
+            if (self.ha_scaling_enabled) {
+                std.log.err("production HA scaling failed stage={} phase={s}: {s}", .{ self.ha_scaling_stage, @tagName(self.phase), @errorName(err) });
+                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            }
             self.failure = err;
         };
         self.workload_body_done = self.failure == null;
@@ -3222,7 +3250,12 @@ pub const Fixture = struct {
         else
             null;
         defer if (durable_tenant_body) |body| self.alloc.free(body);
-        const effective_tenant_body = durable_tenant_body orelse tenant_batch_body;
+        // Keep the independent tenant range below the two-document split
+        // minimum while exercising automatic policy on the populated docs range.
+        const effective_tenant_body = if (self.ha_scaling_enabled)
+            \\{"inserts":{"tenant:q":{"title":"production-tenant"}},"sync_level":"write"}
+        else
+            durable_tenant_body orelse tenant_batch_body;
         for (initial_groups) |group_id| {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
@@ -3401,6 +3434,7 @@ pub const Fixture = struct {
             }
         }
 
+        if (self.ha_scaling_enabled) return self.runHAScaling();
         if (!self.active_split_enabled or self.graph_stale_snapshot_retry_exhaustion_enabled) return;
 
         // A full distributed witness must do more than host a static
@@ -5619,6 +5653,344 @@ pub const Fixture = struct {
         try self.refreshDataServerMetadataSnapshots();
     }
 
+    fn haReconcile(self: *Fixture, workflow: *metadata_workflow.TableWorkflow) !void {
+        try self.runOneControlRound();
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (self.data_server_live[index] and !self.data_server_paused[index])
+                try server.runStoreStatusRoundOnly();
+        }
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return;
+        _ = self.metadata.?.cluster.node(leader).reconcileOnceEnsuringLease(workflow.controlLoop()) catch |err| switch (err) {
+            error.NotLeader, error.MetadataMutationOutcomeUnknown => return,
+            else => return err,
+        };
+    }
+
+    fn haSetReplicaCount(self: *Fixture, count: u16, workflow: *metadata_workflow.TableWorkflow) !void {
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        var node = self.metadata.?.cluster.node(leader);
+        const tables = try node.listProjectedTables(self.alloc);
+        defer node.freeProjectedTables(self.alloc, tables);
+        for (tables) |table| {
+            if (table.table_id != metadata_vopr.VoprPublicClusterFixture.table_id) continue;
+            var desired = table;
+            desired.desired_replica_count = count;
+            try node.upsertTable(desired);
+        }
+        try self.metadata.?.cluster.stepAll();
+        try workflow.bootstrapDesiredFromCommitted(&node);
+    }
+
+    fn haReplicaCountConverged(self: *Fixture, expected: usize) !bool {
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return false;
+        var snapshot = try self.metadata.?.cluster.node(leader).adminSnapshot();
+        defer self.metadata.?.cluster.node(leader).freeAdminSnapshot(&snapshot);
+        var range_count: usize = 0;
+        for (snapshot.ranges) |range| {
+            const docs = range.table_id == metadata_vopr.VoprPublicClusterFixture.table_id;
+            if (docs) range_count += 1;
+            const replica_target = if (docs) expected else 2;
+            const reported = for (snapshot.merged_group_statuses) |status| {
+                if (status.group_id == range.group_id) break status;
+            } else return false;
+            if (!reported.leader_known or !reported.readiness_from_leader or
+                !reported.voter_count_known or !reported.voter_set_known or reported.joint_consensus or
+                reported.voter_count != replica_target or reported.healthy_voter_reports != replica_target)
+            {
+                std.debug.print("HA convergence group={d} expected={d} voters={d} healthy={d} leader={} readiness={} known={} set={} joint={}\n", .{ range.group_id, replica_target, reported.voter_count, reported.healthy_voter_reports, reported.leader_known, reported.readiness_from_leader, reported.voter_count_known, reported.voter_set_known, reported.joint_consensus });
+                return false;
+            }
+            var count: usize = 0;
+            var committed: u64 = 0;
+            for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
+                const raft = server.data_raft orelse continue;
+                const status = raft.host.http_host.host.raftStatus(range.group_id) orelse continue;
+                committed = @max(committed, status.hard.commit_index);
+                count += 1;
+            }
+            if (count != replica_target or committed == 0) return false;
+            for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
+                const raft = server.data_raft orelse continue;
+                const status = raft.host.http_host.host.raftStatus(range.group_id) orelse continue;
+                if (status.applied_index < committed) return false;
+            }
+        }
+        return range_count != 0;
+    }
+
+    fn haVerifyAcknowledged(self: *Fixture) !void {
+        if (!try self.lookupContains("docs", "doc:c", "production-left") or
+            !try self.lookupContains("docs", "doc:k", "production-split") or
+            !try self.lookupContains("docs", "doc:d", "production-promoted") or
+            !try self.lookupContains("docs", "doc:x", "production-right") or
+            !try self.lookupContains("tenant_b_docs", "tenant:q", "production-tenant"))
+            return error.ProductionHAScalingLostAcknowledgedWrite;
+        // Public reads can use a valid routing snapshot while the restarted
+        // metadata quorum is electing. Advance the real control plane before
+        // consulting its committed range projection, with a bounded recovery.
+        for (0..256) |_| {
+            if (self.metadata.?.cluster.currentMetadataLeaderIndex() != null) break;
+            try self.runOneControlRound();
+        } else return error.MetadataLeaderUnavailable;
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        const ranges = try self.metadata.?.cluster.node(leader).listProjectedRanges(self.alloc);
+        defer self.metadata.?.cluster.node(leader).freeProjectedRanges(self.alloc, ranges);
+        var ordered: std.ArrayListUnmanaged(metadata_table_manager.RangeRecord) = .empty;
+        defer ordered.deinit(self.alloc);
+        for (ranges) |range| if (range.table_id == metadata_vopr.VoprPublicClusterFixture.table_id) {
+            try ordered.append(self.alloc, range);
+        };
+        std.mem.sort(metadata_table_manager.RangeRecord, ordered.items, {}, struct {
+            fn less(_: void, left: metadata_table_manager.RangeRecord, right: metadata_table_manager.RangeRecord) bool {
+                return std.mem.lessThan(u8, left.start_key, right.start_key);
+            }
+        }.less);
+        if (ordered.items.len == 0 or !std.mem.eql(u8, ordered.items[0].start_key, "doc:a") or
+            ordered.items[ordered.items.len - 1].end_key != null)
+            return error.ProductionHAScalingInvalidRangeCover;
+        for (ordered.items, 0..) |range, index| {
+            if (range.end_key) |end| {
+                if (!std.mem.lessThan(u8, range.start_key, end) or index + 1 == ordered.items.len or
+                    !std.mem.eql(u8, end, ordered.items[index + 1].start_key))
+                    return error.ProductionHAScalingInvalidRangeCover;
+            } else if (index + 1 != ordered.items.len) return error.ProductionHAScalingInvalidRangeCover;
+        }
+        // Every document belongs to exactly one published range. Test the
+        // boundaries as well as application keys to catch overlap/gaps.
+        for ([_][]const u8{ "doc:a", "doc:c", "doc:k", "doc:m", "doc:x", "doc:z" }) |key| {
+            var owners: usize = 0;
+            for (ranges) |range| {
+                if (range.table_id != metadata_vopr.VoprPublicClusterFixture.table_id) continue;
+                if (std.mem.order(u8, key, range.start_key) == .lt) continue;
+                if (range.end_key) |end| if (std.mem.order(u8, key, end) != .lt) continue;
+                owners += 1;
+            }
+            if (owners != 1) return error.ProductionHAScalingInvalidRangeCover;
+        }
+    }
+
+    fn setHAScalingStage(self: *Fixture, stage: u8) void {
+        self.ha_scaling_stage = stage;
+        const labels = [_][]const u8{
+            "initializing",                   "establish standby and scale out", "admit automatic split",
+            "fence and promote during split", "verify promoted HA primary",      "merge split siblings",
+            "drain scaled-in owner",          "verify final replicas",
+        };
+        std.debug.print("production HA/scaling stage {d}: {s}\n", .{ stage, labels[stage] });
+    }
+
+    fn runHAScaling(self: *Fixture) !void {
+        const owners = self.ha_owners.?;
+        self.setHAScalingStage(1);
+        var workflow = metadata_workflow.TableWorkflow.init(self.alloc);
+        defer workflow.deinit();
+        workflow.controlLoop().setClock(self.backend_runtimes[0].ptr().clock());
+        workflow.loop.reconciler.config.monotonic_clock = self.backend_runtimes[0].ptr().monotonicClock();
+        self.ha_shard_db = hosted_shard_ops.HostedShardDbAdapter.init(
+            self.alloc,
+            try self.metadata.?.externalCatalogSource(0),
+            self.transition_routers[0].router(),
+            self.executor.executor(),
+            null,
+        );
+        _ = self.ha_shard_db.withInternalServiceAuth(internal_service_secret, internal_service_issuer);
+        self.metadata.?.cluster.external_shard_db_adapter = self.ha_shard_db.adapter();
+        try self.haSetReplicaCount(2, &workflow);
+        const initial_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        try self.metadata.?.cluster.node(initial_leader).requestNodeShutdown(3);
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse continue;
+            const intents = try self.metadata.?.cluster.node(leader).listProjectedPlacementIntents(self.alloc);
+            defer self.metadata.?.cluster.node(leader).freeProjectedPlacementIntents(self.alloc, intents);
+            var retiring = false;
+            for (intents) |intent| if (intent.record.local_node_id == 3) {
+                retiring = true;
+            };
+            if (!retiring and try self.haReplicaCountConverged(2)) break;
+        } else return error.ProductionHABaselineDrainTimeout;
+        try self.stopDataServerForRestart(2);
+        try owners.startPrimary(self.backend_runtimes[0].ptr());
+        try owners.write(self.executor.executor(), owners.primary_uri.?,
+            \\{"inserts":{"ha:before":{"title":"ha-before-scaling"}},"sync_level":"write"}
+        );
+        try owners.startStandby(self.backend_runtimes[1].ptr());
+        try owners.catchUp(self.executor.executor(), owners.primary_uri.?);
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:before", "ha-before-scaling");
+        try owners.standbyAdmin(self.executor.executor(), 409);
+
+        // Add capacity by starting a real owner with a fresh registration
+        // incarnation, then let the controller bootstrap/catch up its replicas.
+        const scale_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        try self.metadata.?.cluster.node(scale_leader).cancelNodeShutdown(3);
+        try self.restartDataServer(2);
+        try self.haSetReplicaCount(3, &workflow);
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            if (try self.haReplicaCountConverged(3)) break;
+        } else return error.ProductionHAScaleOutTimeout;
+        self.ha_scale_out_complete = true;
+        self.setHAScalingStage(2);
+
+        // Real DataServer status and median-key RPCs drive automatic admission.
+        // No split key, destination, or placement is supplied by this history.
+        workflow.loop.reconciler.config.max_shard_size_bytes = 1;
+        workflow.loop.reconciler.config.max_shards_per_table = 3;
+        workflow.loop.reconciler.config.shard_cooldown_millis = 1;
+        var admitted: ?u64 = null;
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse continue;
+            const records = try self.metadata.?.cluster.node(leader).listProjectedSplitTransitions(self.alloc);
+            defer self.metadata.?.cluster.node(leader).freeProjectedSplitTransitions(self.alloc, records);
+            for (records) |record| {
+                if (record.table_contract.table_id != metadata_vopr.VoprPublicClusterFixture.table_id) continue;
+                // Only scalar identities are needed after releasing projection.
+                admitted = record.transition_id;
+                break;
+            }
+            if (admitted != null) break;
+        } else return error.ProductionHAAutomaticSplitAdmissionTimeout;
+        const transition_id = admitted.?;
+        self.phase = .split_requested;
+        self.setHAScalingStage(3);
+        workflow.loop.reconciler.config.max_shard_size_bytes = 0;
+        for (0..256) |_| {
+            const phase = try self.metadata.?.externalDataSplitPhase(transition_id);
+            if (phase) |p| {
+                if (p == .bootstrap_peer or p == .replay_deltas or p == .cutover_ready) break;
+                if (p == .finalized) return error.ProductionHASplitFinishedBeforePromotion;
+            }
+            try self.runOneControlRound();
+        } else return error.ProductionHASplitOverlapTimeout;
+
+        // Freeze the old writer at its actual durable tail, catch up to that
+        // exact boundary, then lose the metadata leader before promotion.
+        try owners.write(self.executor.executor(), owners.primary_uri.?,
+            \\{"inserts":{"ha:during":{"title":"ha-during-split"}},"sync_level":"write"}
+        );
+        const previous_applied = owners.observed_progress.applied_lsn;
+        try owners.fence(self.executor.executor(), owners.primary_uri.?);
+        try owners.catchUp(self.executor.executor(), owners.primary_uri.?);
+        if (owners.observed_progress.applied_lsn <= previous_applied) return error.ProductionHAStreamingProgressMissing;
+        try std.testing.expectError(error.HAFencedPrimary, owners.primary_server.?.write_source.ha_write_gate.?.check());
+        const old_metadata_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        // Retire the old process's callback admission before reconstruction;
+        // the new metadata owner must reinstall its production shard RPCs.
+        self.transition_registrations[old_metadata_leader].?.deinit();
+        self.transition_registrations[old_metadata_leader] = null;
+        try self.metadata.?.cluster.restartNode(old_metadata_leader);
+        self.transition_registrations[old_metadata_leader] = try self.metadata.?.replaceExternalTransitionOps(
+            old_metadata_leader,
+            self.transition_adapters[old_metadata_leader].adapter(),
+        );
+        owners.stopPrimary();
+        try owners.promote(self.executor.executor());
+        self.setHAScalingStage(4);
+        try owners.write(self.executor.executor(), owners.uri.?,
+            \\{"inserts":{"ha:after":{"title":"ha-after-promotion"}},"sync_level":"write"}
+        );
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:before", "ha-before-scaling");
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:during", "ha-during-split");
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:after", "ha-after-promotion");
+        var post_promotion = try self.client.fetchBatchResponse(self.data_api_uris[0], "docs",
+            \\{"inserts":{"doc:d":{"title":"production-promoted"}},"sync_level":"write"}
+        );
+        defer post_promotion.deinit(self.alloc);
+        if (post_promotion.status != 201 and post_promotion.status != 202)
+            return error.ProductionHAPromotedWriteRejected;
+        try self.haVerifyAcknowledged();
+
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse continue;
+            const records = try self.metadata.?.cluster.node(leader).listProjectedSplitTransitions(self.alloc);
+            defer self.metadata.?.cluster.node(leader).freeProjectedSplitTransitions(self.alloc, records);
+            const ranges = try self.metadata.?.cluster.node(leader).listProjectedRanges(self.alloc);
+            defer self.metadata.?.cluster.node(leader).freeProjectedRanges(self.alloc, ranges);
+            var published: usize = 0;
+            for (ranges) |range| if (range.table_id == metadata_vopr.VoprPublicClusterFixture.table_id) {
+                published += 1;
+            };
+            if (records.len == 0 and published == 3 and try self.haReplicaCountConverged(3)) break;
+        } else return error.ProductionHASplitRecoveryTimeout;
+        self.split_finalized = true;
+        self.split_published = true;
+        self.split_sound = true;
+        self.setHAScalingStage(5);
+        try self.haVerifyAcknowledged();
+
+        // Lower utilization through the policy threshold, allowing production
+        // planning to pick adjacent ranges and execute its merge protocol.
+        workflow.loop.reconciler.config.max_shard_size_bytes = 1 << 40;
+        workflow.loop.reconciler.config.min_shard_size_bytes = 1 << 39;
+        workflow.loop.reconciler.config.min_shard_merge_age_millis = 0;
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse continue;
+            var snapshot = try self.metadata.?.cluster.node(leader).adminSnapshot();
+            defer self.metadata.?.cluster.node(leader).freeAdminSnapshot(&snapshot);
+            var ranges: usize = 0;
+            for (snapshot.ranges) |range| if (range.table_id == metadata_vopr.VoprPublicClusterFixture.table_id) {
+                ranges += 1;
+            };
+            // The two original populated ranges have independent document-ID
+            // namespaces. Automatic merging may reunite the split siblings,
+            // but must not merge those unrelated namespaces.
+            if (ranges == 2 and snapshot.merge_transitions.len == 0) break;
+        } else return error.ProductionHAAutomaticMergeTimeout;
+        self.ha_auto_merge_complete = true;
+        self.setHAScalingStage(6);
+        try self.haVerifyAcknowledged();
+
+        workflow.loop.reconciler.config.max_shard_size_bytes = 0;
+        try self.haSetReplicaCount(2, &workflow);
+        const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        try self.metadata.?.cluster.node(leader).requestNodeShutdown(3);
+        for (0..256) |_| {
+            try self.haReconcile(&workflow);
+            if (!try self.haReplicaCountConverged(2)) continue;
+            const current = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse continue;
+            const intents = try self.metadata.?.cluster.node(current).listProjectedPlacementIntents(self.alloc);
+            defer self.metadata.?.cluster.node(current).freeProjectedPlacementIntents(self.alloc, intents);
+            var draining = false;
+            for (intents) |intent| if (intent.record.local_node_id == 3) {
+                draining = true;
+            };
+            if (!draining) break;
+        } else return error.ProductionHAScaleInTimeout;
+        self.ha_scale_in_complete = true;
+        self.setHAScalingStage(7);
+        try self.haVerifyAcknowledged();
+        const final_leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
+        const final_ranges = try self.metadata.?.cluster.node(final_leader).listProjectedRanges(self.alloc);
+        defer self.metadata.?.cluster.node(final_leader).freeProjectedRanges(self.alloc, final_ranges);
+        for (final_ranges) |range| {
+            if (range.table_id != metadata_vopr.VoprPublicClusterFixture.table_id) continue;
+            for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
+                const raft = server.data_raft orelse continue;
+                if (raft.host.http_host.host.raftStatus(range.group_id) == null) continue;
+                for ([_][]const u8{ "doc:c", "doc:k", "doc:x", "doc:d" }, [_][]const u8{ "production-left", "production-split", "production-right", "production-promoted" }) |key, value| {
+                    if (std.mem.lessThan(u8, key, range.start_key)) continue;
+                    if (range.end_key) |end| if (!std.mem.lessThan(u8, key, end)) continue;
+                    var result = (try server.read_source.source().lookupGroupLocal(self.alloc, range.group_id, "docs", key, .{}, .stale)) orelse
+                        return error.ProductionHAScalingReplicaMissingAcknowledgedWrite;
+                    defer result.deinit(self.alloc);
+                    if (std.mem.indexOf(u8, result.json, value) == null)
+                        return error.ProductionHAScalingReplicaValueMismatch;
+                }
+            }
+        }
+        try self.stopDataServerForRestart(2);
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:before", "ha-before-scaling");
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:during", "ha-during-split");
+        try owners.verify(self.executor.executor(), owners.uri.?, "ha:after", "ha-after-promotion");
+        self.ha_scaling_sound = owners.promoted_sound and self.ha_scale_out_complete and self.ha_scale_in_complete and self.ha_auto_merge_complete;
+    }
+
     fn waitForSplitFinalized(self: *Fixture) !void {
         for (0..30_000) |_| {
             if (try self.metadata.?.externalDataSplitFinalized(split_transition_id)) return;
@@ -6005,6 +6377,8 @@ pub const Fixture = struct {
             self.data_server_live[server_index] = false;
         }
         self.data_server_count = 0;
+        if (self.ha_owners) |owners| owners.destroy();
+        self.ha_owners = null;
         if (self.auth_manager_live) {
             self.auth_manager.deinit();
             self.auth_manager_live = false;
@@ -6209,6 +6583,7 @@ pub const Fixture = struct {
         self.global_query_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
         self.driver_stop = true;
+        if (self.ha_owners) |owners| owners.beginTeardown();
         if (self.public_executor_live) self.public_executor.beginShutdown();
         if (self.transition_executor_live) self.transition_executor.beginShutdown();
         if (self.executor_live) self.executor.beginShutdown();

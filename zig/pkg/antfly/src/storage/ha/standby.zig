@@ -27,7 +27,6 @@ const replication_record = @import("replication_record.zig");
 const wal_mod = @import("../wal.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };
 const progress_version: u16 = 1;
@@ -127,8 +126,9 @@ pub const ApplyOptions = struct {
     /// Zero preserves the historical unbounded behavior. Runtime callers that
     /// share a control-plane lock must set a finite record limit.
     max_records: usize = 0,
-    /// Absolute monotonic deadline. Zero disables the elapsed-time limit. The
-    /// deadline is checked after each durable record so every successful call
+    /// Absolute deadline in the progress WAL's monotonic clock domain. Zero
+    /// disables the elapsed-time limit. The deadline is checked after each
+    /// durable record so every successful call
     /// makes progress even when one record itself exceeds the target window.
     deadline_ns: u64 = 0,
 };
@@ -156,6 +156,8 @@ pub const Standby = struct {
     progress_wal_path: [:0]u8,
     receive_log: replication_log.ReplicationLog,
     progress_wal: wal_mod.WAL,
+    /// Borrowed durability dependencies must survive conversion to a primary.
+    progress_wal_options: wal_mod.WalOptions,
     progress_state: Progress,
     operation_mutex: std.atomic.Mutex = .unlocked,
     state_mutex: std.atomic.Mutex = .unlocked,
@@ -188,6 +190,7 @@ pub const Standby = struct {
             .progress_wal_path = owned_progress_wal_path,
             .receive_log = receive_log,
             .progress_wal = progress_wal,
+            .progress_wal_options = options.progress_wal_options,
             .progress_state = .{},
         };
         receive_path_owned_locally = false;
@@ -446,6 +449,11 @@ pub const Standby = struct {
         }
     }
 
+    /// Construct an apply deadline using the same clock as durable progress.
+    pub fn applyDeadlineAfter(self: *const Standby, duration_ns: u64) u64 {
+        return self.progress_wal.clock.nowNs() +| duration_ns;
+    }
+
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
         try self.lockExclusive();
         defer self.unlockExclusive();
@@ -490,7 +498,7 @@ pub const Standby = struct {
 
             applied_count += 1;
             expected_lsn += 1;
-            if (applyWindowExhausted(applied_count, platform_time.monotonicNs(), options)) break;
+            if (applyWindowExhausted(applied_count, self.progress_wal.clock.nowNs(), options)) break;
         }
 
         return applied_count;

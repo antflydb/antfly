@@ -306,6 +306,9 @@ pub const Reconciler = struct {
         min_shard_merge_age_millis: u64 = 5 * 60 * std.time.ms_per_s,
         median_key_lookup: ?MedianKeyLookup = null,
         clock: platform_clock.Clock = platform_clock.Clock.real(),
+        /// Cooldowns use elapsed time independently of wall-clock corrections.
+        /// Borrow the deployment clock when running on an injected runtime.
+        monotonic_clock: ?platform_clock.Clock = null,
     };
 
     pub fn init(alloc: std.mem.Allocator) Reconciler {
@@ -339,7 +342,7 @@ pub const Reconciler = struct {
         placement_candidate_info: []const @import("state.zig").CandidatePlacementInfo,
         current: CurrentMetadataState,
     ) !ReconciliationPlan {
-        const now_monotonic_ms = monotonicMillis();
+        const now_monotonic_ms = if (self.config.monotonic_clock) |clock| clock.nowRealtimeMs() else monotonicMillis();
         const now_realtime_ms = self.config.clock.nowRealtimeMs();
         self.cleanupExpiredShardCooldowns(now_monotonic_ms);
         try self.recordCompletedTransitionCooldowns(current, now_monotonic_ms);
@@ -7371,6 +7374,28 @@ test "metadata reconciler does not split during joint consensus" {
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+}
+
+test "metadata reconciler cooldown expiry borrows monotonic time independently of wall time" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    var wall: platform_clock.ManualClock = .{};
+    var elapsed: platform_clock.ManualClock = .{};
+    elapsed.advanceMs(100);
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .clock = wall.clock(),
+        .monotonic_clock = elapsed.clock(),
+    });
+    defer reconciler.deinit();
+    try reconciler.shard_cooldowns.put(std.testing.allocator, 41, 200);
+    wall.advanceMs(24 * 60 * 60 * 1000);
+    var before = try reconciler.computePlan(&manager, &.{}, &.{}, .{});
+    defer before.deinit(std.testing.allocator);
+    try std.testing.expect(reconciler.shard_cooldowns.contains(41));
+    elapsed.advanceMs(100);
+    var after = try reconciler.computePlan(&manager, &.{}, &.{}, .{});
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expect(!reconciler.shard_cooldowns.contains(41));
 }
 
 test "metadata reconciler plans an automatic merge from adjacent small fresh groups" {

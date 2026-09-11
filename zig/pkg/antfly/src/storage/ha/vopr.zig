@@ -14,11 +14,12 @@ const replication_log = @import("replication_log.zig");
 const replication_record = @import("replication_record.zig");
 const fencing = @import("fencing.zig");
 const rejoin = @import("rejoin.zig");
+const storage_io = @import("../lsm_backend/storage_io.zig");
+const wal_mod = @import("../wal.zig");
+const storage_clock = @import("../sim_runtime.zig");
 
 const stream_slot = "standby-a";
 const seed_slot = "seed-b";
-
-var path_nonce: std.atomic.Value(u64) = .init(0);
 
 const append_id = vopr.id.stable("transition", "storage.ha.primary.append");
 const receive_id = vopr.id.stable("transition", "storage.ha.standby.receive_next");
@@ -45,34 +46,11 @@ const rejoin_safe_id = vopr.id.stable("property", "storage.ha.former_primary_nev
 const complete_id = vopr.id.stable("property", "storage.ha.campaign_completed");
 
 const Paths = struct {
-    primary_log: [:0]u8,
-    primary_slots: [:0]u8,
-    standby_log: [:0]u8,
-    standby_progress: [:0]u8,
-    fence_wal: [:0]u8,
-
-    fn init(allocator: std.mem.Allocator) !Paths {
-        const nonce = path_nonce.fetchAdd(1, .monotonic);
-        const primary_log = try path(allocator, nonce, "primary-log");
-        errdefer allocator.free(primary_log);
-        const primary_slots = try path(allocator, nonce, "primary-slots");
-        errdefer allocator.free(primary_slots);
-        const standby_log = try path(allocator, nonce, "standby-log");
-        errdefer allocator.free(standby_log);
-        const standby_progress = try path(allocator, nonce, "standby-progress");
-        errdefer allocator.free(standby_progress);
-        const fence_wal = try path(allocator, nonce, "fence-wal");
-        return .{ .primary_log = primary_log, .primary_slots = primary_slots, .standby_log = standby_log, .standby_progress = standby_progress, .fence_wal = fence_wal };
-    }
-
-    fn deinit(self: Paths, allocator: std.mem.Allocator) void {
-        var io_impl = std.Io.Threaded.init(allocator, .{}); // vopr-audit: allow(native_thread_or_io) real HA storage remains an explicit native differential backend
-        defer io_impl.deinit();
-        inline for (.{ self.primary_log, self.primary_slots, self.standby_log, self.standby_progress, self.fence_wal }) |item| {
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), item) catch {};
-            allocator.free(item);
-        }
-    }
+    primary_log: [:0]const u8 = "/ha/primary/log",
+    primary_slots: [:0]const u8 = "/ha/primary/slots",
+    standby_log: [:0]const u8 = "/ha/standby/log",
+    standby_progress: [:0]const u8 = "/ha/standby/progress",
+    fence_wal: [:0]const u8 = "/ha/fence",
 };
 
 const ApplyModel = struct {
@@ -93,7 +71,7 @@ const ApplyModel = struct {
 pub fn Scenario(comptime action_budget: u64) type {
     return struct {
         pub const name: []const u8 = "ha-lifecycle";
-        pub const version: u32 = 1;
+        pub const version: u32 = 2;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = progress_ordered_id, .name = "storage.ha.progress_is_ordered", .kind = .always },
             .{ .id = applied_prefix_id, .name = "storage.ha.applied_payloads_are_primary_prefix", .kind = .always },
@@ -108,6 +86,9 @@ pub fn Scenario(comptime action_budget: u64) type {
         const State = struct {
             allocator: std.mem.Allocator,
             paths: Paths,
+            vopr_io: vopr.vopr_io.VoprIo,
+            storage: storage_io.IoStorage,
+            wal_options: wal_mod.WalOptions,
             original_identity: standby_mod.Identity,
             primary: primary_mod.Primary,
             standby: standby_mod.Standby,
@@ -139,7 +120,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                 self.fence_store.close();
                 self.standby.close();
                 self.primary.close();
-                self.paths.deinit(self.allocator);
+                self.vopr_io.deinit();
             }
         };
 
@@ -150,8 +131,15 @@ pub fn Scenario(comptime action_budget: u64) type {
             errdefer allocator.destroy(state);
             state.* = undefined;
             state.allocator = allocator;
-            state.paths = try Paths.init(allocator);
-            errdefer state.paths.deinit(allocator);
+            state.paths = .{};
+            state.vopr_io = try vopr.vopr_io.VoprIo.init(.{ .file_allocator = allocator });
+            errdefer state.vopr_io.deinit();
+            state.storage = storage_io.IoStorage.init(state.vopr_io.io());
+            state.wal_options = .{
+                .backend = .lsm,
+                .storage = state.storage.storage(),
+                .clock = ioClock(&state.vopr_io),
+            };
             state.original_identity = .{
                 .cluster_id = 100,
                 .shard_id = 10,
@@ -159,12 +147,12 @@ pub fn Scenario(comptime action_budget: u64) type {
                 .timeline_id = 1,
                 .epoch = 1,
             };
-            state.primary = try primary_mod.Primary.open(allocator, state.paths.primary_log.ptr, state.paths.primary_slots.ptr, state.original_identity, .{});
+            state.primary = try primary_mod.Primary.open(allocator, state.paths.primary_log.ptr, state.paths.primary_slots.ptr, state.original_identity, primaryOptions(state.wal_options));
             errdefer state.primary.close();
             try state.primary.createSlot(stream_slot, 0);
-            state.standby = try standby_mod.Standby.open(allocator, state.paths.standby_log.ptr, state.paths.standby_progress.ptr, state.original_identity, .{});
+            state.standby = try standby_mod.Standby.open(allocator, state.paths.standby_log.ptr, state.paths.standby_progress.ptr, state.original_identity, standbyOptions(state.wal_options));
             errdefer state.standby.close();
-            state.fence_store = try fencing.Store.open(allocator, state.paths.fence_wal.ptr, .{});
+            state.fence_store = try fencing.Store.open(allocator, state.paths.fence_wal.ptr, .{ .wal_options = state.wal_options });
             errdefer state.fence_store.close();
             state.faults = try vopr.fault.Controller.init(allocator, 2, .{
                 .max_simultaneous_node_failures = 1,
@@ -366,6 +354,7 @@ pub fn Scenario(comptime action_budget: u64) type {
 
         pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
             const state = world.state;
+            try state.vopr_io.ensureNoCapabilityViolation();
             const progress = state.standby.currentProgress();
             const ordered = progress.safe_read_lsn <= progress.applied_lsn and progress.applied_lsn <= progress.received_lsn;
             try sink.check(allocator, progress_ordered_id, ordered);
@@ -402,10 +391,26 @@ pub fn replay(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !
     return vopr.replay.exact(CliScenario, allocator, artifact);
 }
 
-fn path(allocator: std.mem.Allocator, nonce: u64, part: []const u8) ![:0]u8 {
-    // The process-local address prevents a prior aborted test process from
-    // colliding with a fresh replay whose nonce starts at zero again.
-    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/ha-vopr-{x}-{d}-{s}", .{ @intFromPtr(&path_nonce), nonce, part }, 0); // vopr-audit: allow(unstable_identity) pointer value isolates native differential scratch paths and never enters trace semantics
+fn ioClock(vopr_io: *vopr.vopr_io.VoprIo) storage_clock.Clock {
+    return .{ .ctx = vopr_io, .now_ns_fn = ioNow, .sleep_ns_fn = ioSleep };
+}
+
+fn ioNow(ctx: ?*anyopaque) u64 {
+    const vopr_io: *vopr.vopr_io.VoprIo = @ptrCast(@alignCast(ctx.?));
+    return @intCast(@max(0, std.Io.Clock.now(.awake, vopr_io.io()).nanoseconds));
+}
+
+fn ioSleep(ctx: ?*anyopaque, ns: u64) void {
+    const vopr_io: *vopr.vopr_io.VoprIo = @ptrCast(@alignCast(ctx.?));
+    vopr_io.advance(ns) catch unreachable;
+}
+
+fn primaryOptions(options: wal_mod.WalOptions) primary_mod.OpenOptions {
+    return .{ .replication_log_options = .{ .wal_options = options }, .slot_store_options = .{ .wal_options = options } };
+}
+
+fn standbyOptions(options: wal_mod.WalOptions) standby_mod.OpenOptions {
+    return .{ .receive_log_options = .{ .wal_options = options }, .progress_wal_options = options };
 }
 
 fn partitionSpec() vopr.fault.Spec {
@@ -455,7 +460,7 @@ fn restartPrimary(state: anytype, events: *vopr.event.Sink, allocator: std.mem.A
     try state.faults.start(spec, events, allocator);
     const backup_before = backupSlotSnapshot(state);
     state.primary.close();
-    state.primary = try primary_mod.Primary.open(allocator, state.paths.primary_log.ptr, state.paths.primary_slots.ptr, state.original_identity, .{});
+    state.primary = try primary_mod.Primary.open(allocator, state.paths.primary_log.ptr, state.paths.primary_slots.ptr, state.original_identity, primaryOptions(state.wal_options));
     state.backup_pin_valid = state.backup_pin_valid and std.meta.eql(backup_before, backupSlotSnapshot(state));
     state.primary_restarts += 1;
     _ = try state.faults.consumeOneShot(.node, spec.resource_id, events, allocator);
@@ -465,7 +470,7 @@ fn restartStandby(state: anytype, events: *vopr.event.Sink, allocator: std.mem.A
     const spec = nodeCrashSpec("storage.ha.standby.restart");
     try state.faults.start(spec, events, allocator);
     state.standby.close();
-    state.standby = try standby_mod.Standby.open(allocator, state.paths.standby_log.ptr, state.paths.standby_progress.ptr, state.original_identity, .{});
+    state.standby = try standby_mod.Standby.open(allocator, state.paths.standby_log.ptr, state.paths.standby_progress.ptr, state.original_identity, standbyOptions(state.wal_options));
     state.standby_restarts += 1;
     _ = try state.faults.consumeOneShot(.node, spec.resource_id, events, allocator);
 }
@@ -572,6 +577,35 @@ fn expectEvent(artifact: *const vopr.trace.Trace, name: []const u8) !void {
 test "HA VOPR replays crash standby fencing retention backup and promotion lifecycles" {
     try runRecordReplay(32, 0xA17F_AA11);
     try runRecordReplay(32, 0xA17F_AA12);
+}
+
+test "HA VOPR bounded standby apply uses the virtual WAL clock" {
+    const HaScenario = Scenario(32);
+    var world = try HaScenario.init(std.testing.allocator);
+    defer HaScenario.deinit(&world, std.testing.allocator);
+    const state = world.state;
+    for (0..6) |_| {
+        _ = try state.primary.append(.{ .payload = "document" });
+        try receiveNext(state);
+    }
+    const Apply = struct {
+        fn run(ctx: *anyopaque, _: replication_record.RecordView) !void {
+            const vopr_io: *vopr.vopr_io.VoprIo = @ptrCast(@alignCast(ctx));
+            try vopr_io.advance(10);
+        }
+    };
+    try state.standby.lockExclusive();
+    defer state.standby.unlockExclusive();
+    // Three records reach virtual time 30. A host-clock read incorrectly
+    // expires the deadline after only the first record.
+    try std.testing.expectEqual(@as(u64, 25), state.standby.applyDeadlineAfter(25));
+    try std.testing.expectEqual(@as(usize, 3), try state.standby.applyAvailableLockedWithOptions(&state.vopr_io, Apply.run, .{ .deadline_ns = state.standby.applyDeadlineAfter(25) }));
+    try std.testing.expectEqual(@as(u64, 3), state.standby.currentProgress().safe_read_lsn);
+    try std.testing.expectEqual(@as(u64, 35), state.standby.applyDeadlineAfter(5));
+    try std.testing.expectEqual(@as(usize, 1), try state.standby.applyAvailableLockedWithOptions(&state.vopr_io, Apply.run, .{ .deadline_ns = state.standby.applyDeadlineAfter(5) }));
+    try std.testing.expectEqual(@as(usize, 2), try state.standby.applyAvailableLockedWithOptions(&state.vopr_io, Apply.run, .{ .deadline_ns = 60 }));
+    try std.testing.expectEqual(@as(u64, 6), state.standby.currentProgress().safe_read_lsn);
+    try state.vopr_io.ensureNoCapabilityViolation();
 }
 
 test "HA VOPR preserves exact progress and property streams across fresh worlds" {
