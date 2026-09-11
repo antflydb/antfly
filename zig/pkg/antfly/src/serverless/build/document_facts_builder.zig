@@ -406,6 +406,18 @@ test "serverless document facts hydrate only touched bodies and preserve exact c
     defer cold_artifacts.deinit();
     pages.artifacts = &cold_artifacts;
     const cold_root = try facts.loadRoot(a, &pages, updated_ref);
+    // GC must preserve stage trees and their shared body identities, not only
+    // the main point index. All stages here contain just the unchanged tail.
+    for (0..4) |stage| {
+        var pending = try facts.pendingCursor(a, pages.store(), cold_root, stage, "");
+        defer pending.deinit();
+        const record = (try pending.next()).?;
+        try std.testing.expectEqualStrings("c", record.key);
+        const body = try facts.readBodyAlloc(a, &pages, (try facts.Fact.decode(record.value)).body);
+        defer a.free(body);
+        try std.testing.expectEqualStrings(docs[2].body, body);
+        try std.testing.expectEqual(null, try pending.next());
+    }
     const all = try materializeAllAlloc(a, &pages, cold_root);
     defer materializer.freeDocuments(a, all);
     try std.testing.expectEqual(@as(usize, 2), all.len);

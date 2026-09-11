@@ -40,6 +40,12 @@ const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const work_lease = @import("../build/work_lease.zig");
+const InventoryPublication = struct {
+    artifacts: *artifacts_mod.ArtifactStore,
+    cancellation: CancellationToken,
+    maintenance: ?maintenance_cancellation.Token = null,
+};
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
@@ -373,7 +379,7 @@ pub const CatalogService = struct {
     pub fn buildStatusUntil(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
         try maintenance_cancellation.check(cancellation);
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status, null);
         defer plan.deinit(self.alloc);
         const effective_policy = plan.policy;
         var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -448,20 +454,17 @@ pub const CatalogService = struct {
         const enrichment_completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, plan.table_definition.indexes_json, cancellation);
         const pipeline = enrichment_pipeline.builtinPipelineForPolicy(effective_policy);
         const enrichment_active_stage = chooseActiveEnrichmentStage(pipeline, enrichment_completion);
-        const atomic_enrichment_progress = if (enrichment_active_stage) |stage|
+        var atomic_enrichment_progress = if (enrichment_active_stage) |stage|
             try self.progress.getEnrichmentStageProgress(namespace, stage)
         else
             null;
+        defer if (atomic_enrichment_progress) |*value| value.deinit(self.progress.allocator);
         const enrichment_head_version = if (atomic_enrichment_progress) |value|
             value.head_version
-        else if (enrichment_active_stage) |stage|
-            try self.progress.getEnrichmentStageHeadVersion(namespace, stage)
         else
             null;
         const enrichment_doc_offset = if (atomic_enrichment_progress) |value|
             value.doc_offset
-        else if (enrichment_active_stage) |stage|
-            (try self.progress.getEnrichmentStageDocOffset(namespace, stage)) orelse 0
         else
             0;
         const enrichment_in_progress =
@@ -589,8 +592,9 @@ pub const CatalogService = struct {
         defer freeIndexConfigPublicationStatuses(self.alloc, index_config_actions);
         const head_republish_recommended = plan.forceRepublishFromHead();
         const pending_materialization_rebuild =
-            !head_republish_recommended and
-            (plan.artifact_actions.any() or plan.derived_output_actions.any());
+            pending_materialization_families.any() or
+            (!head_republish_recommended and
+                (plan.artifact_actions.any() or plan.derived_output_actions.any()));
         const graph_metric_readiness = try graphMetricReadinessAlloc(
             self.alloc,
             published_head.manifest,
@@ -834,10 +838,9 @@ pub const CatalogService = struct {
 
     pub fn buildNamespaceWithCancellation(self: *CatalogService, namespace: []const u8, cancellation: CancellationToken) !builder_mod.BuildResult {
         try cancellation.check();
-        const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
-        defer plan.deinit(self.alloc);
-        return self.builder.publishNamespaceWithMetricAndPlanWithCancellation(namespace, policy.vector_distance_metric, plan, cancellation);
+        var fallback: ?std.Io.Threaded = if (self.builder.io == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        return self.buildNamespaceGuardedUntil(namespace, null, .{ .io = self.builder.io orelse fallback.?.io(), .cooperative = cancellation });
     }
 
     pub fn buildNamespaceGuarded(
@@ -854,15 +857,32 @@ pub const CatalogService = struct {
         publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !builder_mod.BuildResult {
+        var fallback: ?std.Io.Threaded = if (self.builder.io == null and cancellation == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        const io = if (cancellation) |token| token.io else self.builder.io orelse fallback.?.io();
+        try maintenance_cancellation.check(cancellation);
+        if (publication_guard == null) {
+            var nonce: [16]u8 = undefined;
+            io.random(&nonce);
+            const owner = std.fmt.bytesToHex(&nonce, .lower);
+            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse return error.WorkLeaseLost;
+            defer _ = held.release() catch false;
+            return self.buildNamespaceGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+        }
+        var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+        const protected = protection.token(io);
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = protected };
+        var scoped = self.artifacts.*;
+        scoped.upload_scope = .{ .domain = graph_page_store.PageStore.namespaceDomain(namespace), .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io) };
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
-        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
+        var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication, .{ .artifacts = &scoped, .cancellation = bridge.token(), .maintenance = protected });
         defer plan.deinit(self.alloc);
         return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
             publication_guard,
-            cancellation,
+            protected,
         );
     }
 
@@ -913,6 +933,8 @@ pub const CatalogService = struct {
         self: *CatalogService,
         namespace: []const u8,
         table: catalog_types.TableNamespaceRecord,
+        publication: InventoryPublication,
+        previous_artifacts: []const manifest_mod.ArtifactRef,
     ) !?external_source_manifest.Plan {
         var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
         defer binding.deinit(self.alloc);
@@ -926,6 +948,9 @@ pub const CatalogService = struct {
             .namespace = namespace,
             .table_name = table.table_name,
             .binding = binding.binding,
+            .artifacts = publication.artifacts,
+            .previous_artifacts = previous_artifacts,
+            .cancellation = publication.cancellation,
         });
     }
 
@@ -934,13 +959,22 @@ pub const CatalogService = struct {
         namespace: []const u8,
         policy: catalog_types.NamespacePolicy,
         purpose: PublicationPlanPurpose,
+        publication: ?InventoryPublication,
     ) !publication_plan.TablePublicationPlan {
         const tables = try self.listTablesAlloc(self.alloc);
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
             const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
-            var targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
+            var external_binding = try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
+            defer if (external_binding) |*binding| binding.deinit(self.alloc);
+            const default_indexes = table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}");
+            // A read-only external inventory has no implicit managed text or
+            // graph artifacts. Keep explicitly configured sidecar targets, but
+            // do not repeatedly request a default local index for remote rows.
+            var targets: builder_mod.Builder.PublicationTargets = if (external_binding != null and default_indexes)
+                .{ .published_search_sources = .{}, .include_graph = false }
+            else if (default_indexes)
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -973,7 +1007,7 @@ pub const CatalogService = struct {
                     .before_policy = manifest.stats.policy,
                     .after_policy = effective_policy,
                 });
-                const completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, table.indexes_json, null);
+                const completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, table.indexes_json, if (publication) |context| context.maintenance else null);
                 const can_republish_chunk_preview = impact.rebuild_chunk_preview and
                     (!effective_policy.chunk_preview_enabled or completion.chunk_preview_complete);
                 const can_republish_chunk_embeddings = impact.rebuild_chunk_embeddings and
@@ -987,7 +1021,11 @@ pub const CatalogService = struct {
                     manifest.stats.indexes_json,
                     table.indexes_json,
                 );
-                metadata_republish.published_search_sources_changed = !publishedSearchSourcesMatch(
+                // Inventory publication cannot fulfill managed sidecar
+                // readiness. Preserve configured targets and pending status,
+                // but let the lake sidecar workflow materialize them instead
+                // of repeatedly publishing an identical remote inventory.
+                metadata_republish.published_search_sources_changed = !isExternalManifest(manifest) and !publishedSearchSourcesMatch(
                     targets.published_search_sources,
                     manifest.stats.published_search_sources,
                 );
@@ -999,7 +1037,16 @@ pub const CatalogService = struct {
                 metadata_republish.chunk_preview_policy_changed = can_republish_chunk_preview;
                 metadata_republish.chunk_embeddings_policy_changed = can_republish_chunk_embeddings;
                 metadata_republish.rerank_terms_policy_changed = can_republish_rerank_terms;
-                metadata_republish.graph_metric_policy_changed = try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
+                metadata_republish.graph_metric_policy_changed = !isExternalManifest(manifest) and
+                    try graphMetricMaterializationStaleAlloc(self.alloc, manifest, table.indexes_json);
+                // Pending indexes are interpreted under their published policy.
+                // Even an incomplete newly enabled stage needs this publication
+                // before its worker can discover work. Derived-output readiness
+                // must not gate the policy/index transition itself.
+                const before_facts_policy = try document_facts_builder.fingerprint(self.alloc, manifest.stats.policy, manifest.stats.indexes_json);
+                const after_facts_policy = try document_facts_builder.fingerprint(self.alloc, effective_policy, table.indexes_json);
+                metadata_republish.document_facts_policy_changed = !isExternalManifest(manifest) and
+                    !std.mem.eql(u8, &before_facts_policy, &after_facts_policy);
 
                 const full_text_index_actions = try planFullTextIndexActionsAlloc(
                     self.alloc,
@@ -1094,7 +1141,7 @@ pub const CatalogService = struct {
                 );
                 errdefer table_definition.deinit(self.alloc);
                 var external_source_plan = if (purpose == .publication)
-                    try self.externalSourcePlanForTableAlloc(namespace, table)
+                    try self.externalSourcePlanForTableAlloc(namespace, table, publication.?, manifest.artifacts)
                 else
                     null;
                 errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
@@ -1154,7 +1201,7 @@ pub const CatalogService = struct {
             );
             errdefer table_definition.deinit(self.alloc);
             var external_source_plan = if (purpose == .publication)
-                try self.externalSourcePlanForTableAlloc(namespace, table)
+                try self.externalSourcePlanForTableAlloc(namespace, table, publication.?, &.{})
             else
                 null;
             errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
@@ -2300,6 +2347,10 @@ fn enrichmentCompletionAlloc(
     try token.check();
     var manifest = try self.manifests.getAlloc(namespace, head_version);
     defer manifest.deinit(self.alloc);
+    // Read-only external inventories have no managed document bodies or WAL
+    // enrichment queue. Their lake sidecars are built from the pinned source,
+    // not from document facts. Do not mistake that valid layout for corruption.
+    if (isExternalManifest(manifest)) return .{};
     const idx = findArtifactIndex(manifest, .document_facts) orelse return error.DocumentFactsNotFound;
     for (manifest.artifacts[idx + 1 ..]) |artifact| if (artifact.kind == .document_facts) return error.InvalidDocumentFactsRoot;
     var reads: u64 = (builder_mod.GraphBuildLimits{}).max_input_bytes;
@@ -2316,6 +2367,14 @@ fn enrichmentCompletionAlloc(
     const result = try enrichmentCompletionFromFactsAlloc(self.alloc, &pages, root, policy, indexes_json);
     try token.check();
     return result;
+}
+
+fn isExternalManifest(manifest: manifest_mod.Manifest) bool {
+    const source = manifest.base_source orelse return false;
+    return switch (source) {
+        .external_parquet, .external_iceberg, .external_lance => true,
+        else => false,
+    };
 }
 
 fn enrichmentCompletionFromFactsAlloc(
@@ -3278,6 +3337,36 @@ test "serverless catalog service republishes head when derived output policy cha
     try std.testing.expectEqual(@as(u64, 1), after.published_wal_end_lsn);
     try std.testing.expect(!after.materialized_derived_outputs.containsKind(.chunk_preview));
     try std.testing.expect(!after.publish_recommended);
+
+    // Incomplete stages must refresh the maintained pending indexes too. In
+    // particular lexical sparse has no derived-output republish flag of its
+    // own, and waiting for a stage to complete before publishing its policy
+    // would deadlock its worker against the old empty pending index.
+    _ = try catalog.setPolicy("docs", .{ .enrichment_enabled = true, .enrichment_pipeline_version = 2, .chunk_preview_enabled = true, .chunk_preview_pipeline_version = 2 });
+    var enabled = try catalog.buildStatus("docs");
+    defer enabled.deinit(alloc);
+    try std.testing.expect(enabled.publish_recommended);
+    var refresh = try catalog.buildTable("docs");
+    defer refresh.deinit(alloc);
+    try std.testing.expect(refresh.published);
+    try std.testing.expectEqual(@as(u64, 1), refresh.wal_end_lsn);
+    var refreshed = try manifest_store.getAlloc("docs", refresh.version);
+    defer refreshed.deinit(alloc);
+    var reads: u64 = 4096;
+    var writes: u64 = 0;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain("docs"),
+        .artifacts = &artifact_store,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    const root = try document_facts.loadRoot(alloc, &pages, refreshed.artifacts[findArtifactIndex(refreshed, .document_facts).?]);
+    try std.testing.expectEqual(@as(u64, 1), root.counts[3]);
+    try std.testing.expectEqual(@as(u64, 1), root.counts[4]);
+    try std.testing.expect(root.pending_pages[0] != null and root.pending_pages[1] != null);
+    var stable = try catalog.buildStatus("docs");
+    defer stable.deinit(alloc);
+    try std.testing.expect(!stable.publish_recommended);
 }
 
 test "serverless catalog service republishes head when graph index metadata changes without new wal" {
@@ -3585,9 +3674,11 @@ test "serverless catalog service reports chunk embeddings changes as pending mat
 
     var status = try catalog.buildStatus("docs");
     defer status.deinit(alloc);
-    try std.testing.expect(!status.head_republish_recommended);
+    // Publish the new pending index first, while keeping derived readiness
+    // explicitly pending until the worker has produced embeddings.
+    try std.testing.expect(status.head_republish_recommended);
     try std.testing.expect(status.pending_materialization_rebuild);
-    try std.testing.expect(!status.publish_recommended);
+    try std.testing.expect(status.publish_recommended);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.artifact_actions.dense_vector);
     try std.testing.expectEqual(catalog_types.DerivedOutputPublicationAction.recompute, status.derived_output_actions.chunk_embeddings);
     try std.testing.expectEqual(catalog_types.DerivedOutputResolution.pending_materialization, status.derived_output_resolutions.chunk_embeddings);
@@ -3960,8 +4051,7 @@ test "serverless catalog service defers small publish tails while enrichment is 
     var build_first = try builder.publishNamespace("docs");
     defer build_first.deinit(alloc);
 
-    try std.testing.expect(try progress_store.compareAndSwapEnrichmentHeadVersion("docs", null, 1));
-    try std.testing.expect(try progress_store.compareAndSwapEnrichmentDocOffset("docs", null, 0));
+    try std.testing.expect(try progress_store.compareAndSwapEnrichmentStageProgress("docs", .lexical_sparse, null, .{ .head_version = 1, .doc_offset = 0, .pipeline_version = 1 }));
 
     const derived = [_]api_types.DocumentMutation{
         .{ .kind = .upsert, .doc_id = "doc-a", .body = "{\"text\":\"alpha bravo\",\"sparse_embedding\":{\"alpha\":0.5,\"bravo\":0.5},\"_enrichment\":{\"lexical_sparse\":true,\"lexical_sparse_version\":1}}" },
@@ -5262,9 +5352,10 @@ test "serverless catalog service fails closed for current external binding witho
     var catalog: CatalogService = undefined;
     catalog.alloc = alloc;
     catalog.external_source_plan_resolver = null;
+    var unused_artifacts: artifacts_mod.ArtifactStore = undefined;
     try std.testing.expectError(
         error.ExternalSourcePlanResolverUnavailable,
-        catalog.externalSourcePlanForTableAlloc("events", table),
+        catalog.externalSourcePlanForTableAlloc("events", table, .{ .artifacts = &unused_artifacts, .cancellation = .none }, &.{}),
     );
 }
 
@@ -5314,6 +5405,84 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
     try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+
+    const ScopedResolver = struct {
+        progress: *progress_store_mod.ProgressStore,
+        shared_artifacts: *artifacts_mod.ArtifactStore,
+        io: std.Io,
+        fn resolve(ptr: *anyopaque, a: Allocator, request: publication_plan.ExternalSourcePlanResolveRequest) !?external_source_manifest.Plan {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.shared_artifacts.upload_scope == null);
+            const scope = request.artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
+            try std.testing.expectEqual(graph_page_store.PageStore.namespaceDomain(request.namespace), scope.domain);
+            var contender = try work_lease.acquireHeld(try self.progress.workLeaseProvider(), self.io, request.namespace, "discovery-contender", 30 * std.time.ns_per_s);
+            defer if (contender) |*held| {
+                _ = held.release() catch false;
+            };
+            if (contender != null) return error.ExternalInventoryResolvedWithoutLease;
+            try request.cancellation.check();
+            const published = try @import("../build/external_source_publish.zig").publishInventoryAlloc(a, request.artifacts, request.binding, .{
+                .format = .parquet,
+                .source_id = @constCast(request.binding.table_id),
+                .source_uri = @constCast(request.binding.source_uri),
+                .snapshot_id = @constCast("discovered-snapshot"),
+                .schema_fingerprint = @constCast(request.binding.schema_fingerprint),
+                .files = &.{},
+            }, .{ .artifact_name = "events.external-files", .previous_artifacts = request.previous_artifacts, .cancellation = request.cancellation });
+            errdefer {
+                var owned = published;
+                owned.deinit(a);
+            }
+            for (request.previous_artifacts) |prior| {
+                if (prior.kind == .external_base_source) try std.testing.expectEqualStrings(prior.artifact_id, published.plan.artifacts[0].artifact_id);
+            }
+            return published.plan;
+        }
+    };
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    builder.setIo(io_impl.io());
+    var resolver = ScopedResolver{ .progress = &progress_store, .shared_artifacts = &artifact_store, .io = io_impl.io() };
+    catalog.setExternalSourcePlanResolver(.{ .ptr = &resolver, .vtable = &.{ .resolve = ScopedResolver.resolve } });
+    var published = try catalog.buildTable("events");
+    defer published.deinit(alloc);
+    try std.testing.expect(published.published);
+    var head = try manifest_store.getAlloc("events", published.version);
+    defer head.deinit(alloc);
+    const inventory = head.artifacts[findManifestArtifactIndex(head, .external_base_source).?];
+    const scope = (try artifacts_mod.store.uploadScopeFromArtifactId(inventory.artifact_id)).?;
+    try std.testing.expectEqual(head.publication_fencing_token, scope.fencingToken());
+    var unchanged = try catalog.buildTable("events");
+    defer unchanged.deinit(alloc);
+    if (unchanged.published) return error.UnexpectedExternalRepublish;
+    // Metadata changes still publish, but must not manufacture an empty local
+    // document/facts snapshot or lose the authenticated remote inventory.
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", "{}"));
+    var metadata = try catalog.buildTable("events");
+    defer metadata.deinit(alloc);
+    try std.testing.expect(metadata.published);
+    var metadata_head = try manifest_store.getAlloc("events", metadata.version);
+    defer metadata_head.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), metadata_head.artifacts.len);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.external_base_source, metadata_head.artifacts[0].kind);
+    try std.testing.expectEqualStrings(inventory.artifact_id, metadata_head.artifacts[0].artifact_id);
+    try std.testing.expectEqualStrings("{}", metadata_head.stats.read_schema_json);
+    var metadata_unchanged = try catalog.buildTable("events");
+    defer metadata_unchanged.deinit(alloc);
+    try std.testing.expect(!metadata_unchanged.published);
+
+    const graph_indexes = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", graph_indexes));
+    var configured = try catalog.buildTable("events");
+    defer configured.deinit(alloc);
+    try std.testing.expect(configured.published);
+    var configured_unchanged = try catalog.buildTable("events");
+    defer configured_unchanged.deinit(alloc);
+    try std.testing.expect(!configured_unchanged.published);
+    var configured_status = try catalog.tableBuildStatus("events");
+    defer configured_status.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_configured);
+    try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_pending);
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

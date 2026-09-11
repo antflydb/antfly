@@ -24,6 +24,11 @@ pub const ResolveRequest = struct {
     namespace: []const u8,
     table_name: []const u8,
     binding: catalog_binding.Binding,
+    /// Borrowed, request-local publication authority. Discovery must not keep
+    /// a shared mutable artifact-store pointer or upload before fencing.
+    artifacts: *@import("../artifacts/store.zig").ArtifactStore,
+    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
 };
 
 pub const Resolver = struct {

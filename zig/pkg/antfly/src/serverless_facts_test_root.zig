@@ -13,6 +13,9 @@
 // limitations.
 
 test {
+    _ = @import("serverless/build/external_source_plan_resolver.zig");
+    _ = @import("serverless/build/external_source_publish.zig");
+    _ = @import("serverless/build/external_source_read_authority.zig");
     _ = @import("serverless/build/document_facts.zig");
     _ = @import("serverless/build/document_facts_builder.zig");
     _ = @import("serverless/build/document_facts_publication_bench.zig");
@@ -22,4 +25,8 @@ test {
     _ = @import("serverless/build/builder.zig");
     _ = @import("serverless/build/compactor.zig");
     _ = @import("serverless/catalog/service.zig");
+    _ = @import("serverless/catalog/progress_store.zig");
+    _ = @import("serverless/catalog/fs_progress_store.zig");
+    _ = @import("serverless/catalog/object_progress_store.zig");
+    _ = @import("serverless/enrichment/worker.zig");
 }

@@ -559,7 +559,6 @@ pub const OwnedStack = struct {
         self.external_source_object_store_resolver = .{};
         self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
         self.external_source_plan_resolver = build_mod.ExternalSourcePublicationPlanResolver.init(
-            &self.artifacts,
             self.external_source_object_store_resolver.resolver(),
             .{},
         );

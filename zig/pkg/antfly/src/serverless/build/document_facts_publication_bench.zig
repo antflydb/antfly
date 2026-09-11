@@ -26,6 +26,82 @@ const builder_mod = @import("builder.zig");
 const publication_plan = @import("publication_plan.zig");
 const api_codec = @import("../api/codec.zig");
 const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
+const document_facts = @import("document_facts.zig");
+const page_tree = @import("../graph_segment/page_tree.zig");
+
+test "serverless pending work index qualification benchmark" {
+    if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
+    var runtime = std.Io.Threaded.init(a, .{});
+    defer runtime.deinit();
+    for ([_]usize{ 1024, 16384 }) |count| try pendingWorkBenchmark(runtime.io(), count);
+}
+
+fn pendingWorkBenchmark(io: std.Io, count: usize) !void {
+    var memory = page_tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    const ids = try a.alloc([16]u8, count);
+    defer a.free(ids);
+    const replacements = try a.alloc(document_facts.Replacement, count);
+    defer a.free(replacements);
+    const complete = document_facts.Fact{
+        .body = .{ .digest = @splat(1), .attempt = @splat(1), .bytes = 128 * 1024 * 1024 },
+        .last_lsn = 1,
+        .last_timestamp_ns = 1,
+    };
+    for (replacements, 0..) |*replacement, i| {
+        const id = try std.fmt.bufPrint(&ids[i], "doc-{d:0>12}", .{i});
+        var fact = complete;
+        if (i >= count - 4) fact.pending = 1;
+        replacement.* = .{ .id = id, .value = fact };
+    }
+    const empty = document_facts.Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    var initial = try document_facts.planAlloc(a, store, empty, replacements, 1);
+    defer initial.deinit();
+    var root = try initial.publish(store, empty);
+    const Sample = struct { full_ns: i96, pending_ns: i96, full_reads: usize, pending_reads: usize };
+    var samples: [5]Sample = undefined;
+    for (0..6) |round| {
+        // A new unrelated publication must not make the completed prefix part
+        // of the worker's scan again. Body blobs deliberately do not exist:
+        // this measures routing work, not body cache or transport throughput.
+        var changed = complete;
+        changed.last_lsn = round + 2;
+        var update = try document_facts.planAlloc(a, store, root, &.{.{ .id = &ids[0], .value = changed }}, round + 2);
+        defer update.deinit();
+        const next = try update.publish(store, root);
+        try std.testing.expectEqualDeep(root.pending_pages, next.pending_pages);
+        root = next;
+        memory.reads = 0;
+        const full_start = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        var full = try page_tree.Cursor.init(a, store, root.page, "", null);
+        defer full.deinit();
+        var full_pending: usize = 0;
+        while (try full.next()) |record| {
+            if ((try document_facts.Fact.decode(record.value)).pending & 1 != 0) full_pending += 1;
+        }
+        const full_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - full_start;
+        const full_reads = memory.reads;
+        memory.reads = 0;
+        const pending_start = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        var pending = try document_facts.pendingCursor(a, store, root, 0, "");
+        defer pending.deinit();
+        var found: usize = 0;
+        while (try pending.next()) |_| found += 1;
+        const pending_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - pending_start;
+        try std.testing.expectEqual(@as(usize, 4), found);
+        try std.testing.expectEqual(full_pending, found);
+        try std.testing.expectEqual(@as(usize, 1), memory.reads);
+        if (round != 0) samples[round - 1] = .{ .full_ns = full_ns, .pending_ns = pending_ns, .full_reads = full_reads, .pending_reads = memory.reads };
+    }
+    std.mem.sort(Sample, &samples, {}, struct {
+        fn less(_: void, lhs: Sample, rhs: Sample) bool {
+            return lhs.full_ns < rhs.full_ns;
+        }
+    }.less);
+    const median = samples[2];
+    std.debug.print("pending_work_qualification docs={} pending=4 full_scan_ns={} indexed_scan_ns={} full_page_reads={} indexed_page_reads={} samples=5\n", .{ count, median.full_ns, median.pending_ns, median.full_reads, median.pending_reads });
+}
 
 const Counts = struct { gets: u64 = 0, read_bytes: u64 = 0, puts: u64 = 0, write_bytes: u64 = 0, stats: u64 = 0, verifies: u64 = 0 };
 const CountingStore = struct {

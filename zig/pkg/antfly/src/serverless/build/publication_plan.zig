@@ -89,6 +89,8 @@ pub const MetadataRepublishReasons = struct {
     chunk_embeddings_policy_changed: bool = false,
     rerank_terms_policy_changed: bool = false,
     graph_metric_policy_changed: bool = false,
+    /// Refresh maintained work indexes before workers consume a new pipeline.
+    document_facts_policy_changed: bool = false,
 
     pub fn any(self: MetadataRepublishReasons) bool {
         return self.read_schema_migration or
@@ -98,7 +100,8 @@ pub const MetadataRepublishReasons = struct {
             self.chunk_preview_policy_changed or
             self.chunk_embeddings_policy_changed or
             self.rerank_terms_policy_changed or
-            self.graph_metric_policy_changed;
+            self.graph_metric_policy_changed or
+            self.document_facts_policy_changed;
     }
 };
 

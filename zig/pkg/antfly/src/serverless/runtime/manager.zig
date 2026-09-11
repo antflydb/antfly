@@ -469,7 +469,7 @@ pub const ManagedRuntime = struct {
             .cancellation = cancellation,
         }, maintenance) catch |err| switch (err) {
             error.FileNotFound => return false,
-            error.EnrichmentProgressChanged => {
+            error.EnrichmentProgressChanged, error.EnrichmentPolicyChanged => {
                 stats.enrichment_conflicts += 1;
                 return true;
             },
@@ -552,7 +552,7 @@ pub const ManagedRuntime = struct {
                 return;
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(@max(self.cfg.tick_interval_ms, 1))),
+                .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => continue,

@@ -1057,11 +1057,12 @@ test "serverless retention follows publication lineage around lower orphan" {
     try putTestManifestWithLineage(&manifests, 2, 2, orphan_artifact, true, 1);
     try putTestManifestWithLineage(&manifests, 3, 3, head_artifact, true, 1);
     try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
+    const expected_progress: catalog_mod.EnrichmentStageProgress = .{ .head_version = 3, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .after_doc_id = "a\x00b" };
     try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
         "docs",
         .lexical_sparse,
         null,
-        .{ .head_version = 3, .doc_offset = 1 },
+        expected_progress,
     ));
     var progress_client = memory.client();
     var progress_before = try progress_client.listObjects("progress-lineage", .{ .prefix = "tenant/docs/ENRICHMENT/" });
@@ -1075,10 +1076,9 @@ test "serverless retention follows publication lineage around lower orphan" {
     const versions = try manifests.listVersionsAlloc("docs");
     defer alloc.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 3 }, versions);
-    try std.testing.expectEqual(
-        @as(?catalog_mod.EnrichmentStageProgress, .{ .head_version = 3, .doc_offset = 1 }),
-        try progress.getEnrichmentStageProgress("docs", .lexical_sparse),
-    );
+    var retained_progress = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer retained_progress.deinit(progress.allocator);
+    try std.testing.expect(expected_progress.eql(retained_progress));
     var progress_after = try progress_client.listObjects("progress-lineage", .{ .prefix = "tenant/docs/ENRICHMENT/" });
     defer progress_after.deinit(alloc);
     try std.testing.expectEqual(progress_before.entries.len, progress_after.entries.len);

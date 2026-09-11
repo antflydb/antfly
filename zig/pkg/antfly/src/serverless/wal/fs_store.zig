@@ -587,8 +587,8 @@ test "serverless fs WAL conditional append is atomic across store instances" {
         fn run(self: *@This(), index: usize) void {
             if (self.ready_count.fetchAdd(1, .release) == 1) self.ready.set(self.io);
             self.start.waitUncancelable(self.io);
-            var operation_buf: [32]u8 = undefined;
-            const operation_id = std.fmt.bufPrint(&operation_buf, "enrich-v1/1/1/{d}/1", .{index}) catch {
+            var operation_buf: [128]u8 = undefined;
+            const operation_id = @import("../enrichment/operation_id.zig").format(&operation_buf, 1, 1, index, 1) catch {
                 _ = self.errors.fetchAdd(1, .monotonic);
                 return;
             };

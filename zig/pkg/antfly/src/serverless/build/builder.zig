@@ -420,7 +420,7 @@ pub const Builder = struct {
 
         if (records.len == 0) {
             if (plan.external_source_plan) |external_plan| {
-                if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?)) {
+                if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?) or plan.forceRepublishFromHead()) {
                     return try self.publishExternalManifestWithoutWal(
                         namespace,
                         current_head,
@@ -475,7 +475,7 @@ pub const Builder = struct {
             const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
             const last_record = records[records.len - 1];
             if (plan.external_source_plan) |external_plan| {
-                if (!externalSourcePlanMatchesManifest(external_plan, current)) {
+                if (!externalSourcePlanMatchesManifest(external_plan, current) or plan.forceRepublishFromHead()) {
                     return try self.publishExternalManifestWithoutWal(
                         namespace,
                         current_head,
@@ -7547,13 +7547,14 @@ test "serverless builder publishes initial external manifest without wal records
     // logical manifest name changes. Consume a stale enrichment record in the
     // same publication and prove the renamed external plan is not mistaken
     // for the current plan merely because its content identity is unchanged.
+    var stale_operation_buffer: [128]u8 = undefined;
     try std.testing.expectEqual(
         @as(?u64, 1),
         try wal_store.appendIdempotentIfLatest(
             "events",
             99,
             "ignored-stale-enrichment",
-            "enrich-v1/2/1/0/1",
+            try @import("../enrichment/operation_id.zig").format(&stale_operation_buffer, 2, 1, 0, 1),
             0,
         ),
     );

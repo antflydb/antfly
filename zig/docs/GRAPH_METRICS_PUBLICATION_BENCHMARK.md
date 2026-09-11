@@ -12,6 +12,35 @@ Set `ANTFLY_DOCUMENT_FACTS_BENCH_DOCS=1024` or `16384`, and optionally
 lives in `pkg/antfly/src/serverless/build/document_facts_publication_bench.zig`
 and is not included in the production binary.
 
+## Pending-work routing qualification
+
+```sh
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'pending work index qualification benchmark'
+```
+
+The in-memory page-store fixture compares a complete facts scan with the new
+per-stage pending cursor. Four pending documents follow a completed prefix.
+Before each sample an unrelated completed document is updated and a new facts
+root is published. The pending tree must retain its exact identity. Body blobs
+deliberately do not exist: this isolates routing work and does **not** measure
+enrichment, object-storage latency, or model throughput. One warmup and five
+samples are used; the table reports the median full-scan sample and its paired
+indexed measurement, locally on September 11, 2026.
+
+| Documents | Pending | Full scan (µs) | Pending index (µs) | Full page reads | Pending page reads |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 4 | 72.791 | 6.167 | 4 | 1 |
+| 16,384 | 4 | 1,028.750 | 3.292 | 53 | 1 |
+
+The structural result is one leaf read regardless of completed-prefix size;
+the microsecond timings are not a cloud performance promise. A worker no longer
+uses its bounded scan allowance on completed documents, including completed
+bodies larger than the worker's soft batch allowance. The tradeoff is maintained
+stage trees at publication: changed pending facts update their affected trees,
+while identical trees and update results share immutable pages. The root grows
+from 256 to 512 bytes. Separate regression tests cover source changes, exact
+stage counters, shared-page GC, and allocation failures.
+
 ## Workload and measurement boundary
 
 - Filesystem-backed artifacts, WAL, manifests and progress/leases; ReleaseFast.
@@ -90,8 +119,14 @@ metric computation can still require graph work, but not a document-facts scan.
 
 | Documents | Hub degree | Metadata median (ms) | Artifact GETs | Read bytes | Artifact PUTs | Write bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,024 | 1 | 3.596 | 6 | 1,546 | 0 | 0 |
-| 16,384 | 1 | 3.863 | 6 | 1,546 | 0 | 0 |
+| 1,024 | 1 | 3.194 | 6 | 2,314 | 0 | 0 |
+| 16,384 | 1 | 3.551 | 6 | 2,314 | 0 | 0 |
+
+These metadata rows were refreshed after adding the 512-byte pending-index
+root. The three facts-root reads add 768 bytes in total, with no additional
+artifact requests. The matching degree-one WAL rerun measured 6.537/8.213 ms,
+22/30 GETs and 7/11 PUTs for 1,024/16,384 documents. The larger root adds 1,024
+read bytes and 256 written bytes per WAL sample; request counts remain unchanged.
 
 These are logical artifact-store counters; they do not count provider-internal
 authentication reads. Namespace bootstrap is excluded. No before/after latency

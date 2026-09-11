@@ -784,11 +784,12 @@ pub const Scenario = struct {
                 .body = "{\"text\":\"stale-derived-overwrite\"}",
             });
             defer self.alloc.free(stale_mutation);
+            var enrichment_operation_buffer: [128]u8 = undefined;
             if (try self.wal.appendIdempotentIfLatest(
                 "docs",
                 101,
                 stale_mutation,
-                "enrich-v1/1/1/0/1",
+                try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 1, 1, "doc-a", 1),
                 1,
             ) != 2) return error.StaleEnrichmentAppendNotRecorded;
 

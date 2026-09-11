@@ -57,11 +57,40 @@ Graph-only updates do not hydrate unrelated bodies.
 Catalog enrichment completion reads exact pending counters from a pinned facts
 root. When the requested enrichment semantics differ, it streams authoritative
 bodies under a read budget to calculate the new counts; an unreadable source is
-an error, never an indication that enrichment is complete. Workers likewise
-read facts, not the flat compaction base plus its latest-only mutation segment.
-Each worker batch resumes by authenticated subtree rank in O(tree height),
-holds at most one body at a time, and bounds both scans and source bytes. Source
+an error, never an indication that enrichment is complete. A semantic policy
+change schedules a facts publication even while the new stage is incomplete;
+workers must not interpret an old index under a new pipeline version.
+
+The current facts root (`AFDFACT2`, metadata version 2, 512 bytes) owns the point
+index and four ordered per-stage pending indexes. Each pending entry carries the
+same source-fenced fact as the point index. Publication updates these trees and
+their exact counters atomically, including body changes that leave a pending bit
+set. Identical tree updates share immutable pages; retention traverses all five
+roots as a shared graph. Workers read only pending entries, not completed
+prefixes, flat compaction bases or latest-only mutation segments.
+
+Worker progress is a single CAS-protected, versioned per-stage record. Its
+exclusive document-key cursor survives unrelated HEAD changes and wraps at the
+end of the pending index, so failed documents remain retryable without blocking
+later work. Numeric offsets are diagnostic, not the resume authority. Source
 read pins and publication/WAL fences protect every emitted full-body upsert.
+Idempotency keys include the source HEAD, stage, pipeline version and document
+key digest, so retrying or wrapping the cursor cannot alias another document.
+
+The 64 MiB source allowance is a soft batch target, not a document-size limit.
+One pending document may exceed it within the shared 512 MiB input/output and
+1 GiB working-set limits. Configured allocation denial is distinct from actual
+allocator exhaustion. Under `skip_document`, recoverable failures advance the
+durable cursor and increment failure counters; the source remains pending for
+a later cycle. Increasing capacity can therefore recover it without deleting
+or rewriting the source. `fail_stage` remains an explicit stop-on-error policy.
+
+Publication thresholds are coalescing targets, not indefinite visibility gates.
+The background publisher gives below-target WAL batches a one-second maximum
+coalescing delay by default, then makes them eligible even if enrichment is
+waiting for publication. New arrivals and metadata-only HEAD changes do not
+extend the deadline. Expiry never overrides admission budgets or lease fences.
+The deadline is process-local scheduling state; a restart can begin a new delay.
 
 All newly written publication artifacts, including flat search/document
 segments, use namespace- and attempt-scoped identities. Existing immutable
@@ -74,6 +103,20 @@ cannot delete a newer candidate that reused the same numeric version. Stores
 without conditional removal fail closed. Unscoped synthetic/old candidate
 references are conservatively retained; current production writers do not
 create such uploads.
+
+External inventory discovery receives a request-local scoped artifact
+capability only after catalog publication acquires the namespace lease and pins
+the source HEAD. Remote discovery and policy-refresh reads checkpoint that
+authority. An unchanged inventory can reuse an authenticated reference from the
+pinned current manifest; restoring identical bytes from an obsolete publication
+creates a new attempt-scoped identity. A delayed collector of that obsolete
+inventory therefore cannot remove the newly published one. Shared resolver and
+artifact-store instances are never mutated to install request authority.
+External inventory publication does not manufacture managed document facts or
+implicitly request local text/graph indexes. Explicit sidecar configurations
+remain visible: missing graph metrics report pending, but do not cause an
+inventory-only publisher to create endless identical HEADs. Sidecar readiness
+and inventory metadata publication are separate responsibilities.
 
 ### Incremental serverless graph roots
 

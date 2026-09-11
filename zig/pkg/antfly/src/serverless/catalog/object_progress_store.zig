@@ -470,11 +470,13 @@ pub const ObjectProgressStore = struct {
 
         const current = try self.tryReadStageProgressCurrent(key);
         defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
-        const current_value = if (current) |entry| entry.value else null;
+        var current_value = if (current) |entry| entry.value else null;
+        defer if (current_value) |*value| value.deinit(self.alloc);
         if (!stageProgressOptionalEql(current_value, expected)) return false;
         if (current_value) |value| {
             if (desired.head_version < value.head_version) return false;
-            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+            if (desired.revision < value.revision or desired.completed_cycles < value.completed_cycles) return false;
+            if (desired.head_version == value.head_version and desired.revision == value.revision and desired.doc_offset < value.doc_offset) return false;
         }
         // The provider version token is the cross-process CAS primitive. Do
         // not silently degrade an existing-object update to an unconditional
@@ -483,7 +485,7 @@ pub const ObjectProgressStore = struct {
             if (entry.etag == null) return error.MissingObjectEtag;
         }
 
-        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ desired.head_version, desired.doc_offset });
+        const payload = try desired.encodeAlloc(self.alloc);
         defer self.alloc.free(payload);
         var result = self.client.putObject(self.bucket, key, payload, .{
             .content_type = "text/plain",
@@ -635,14 +637,16 @@ pub const ObjectProgressStore = struct {
     }
 
     fn tryReadStageProgressCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentStageProgress {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .max_response_bytes = progress_store.EnrichmentStageProgress.max_encoded_bytes }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(self.alloc);
+        var value = try progress_store.EnrichmentStageProgress.decodeAlloc(self.alloc, result.body);
+        errdefer value.deinit(self.alloc);
         return .{
-            .value = try parseStageProgress(result.body),
-            .etag = if (result.metadata.etag) |value| try self.alloc.dupe(u8, value) else null,
+            .value = value,
+            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
         };
     }
 
@@ -905,20 +909,12 @@ pub const ObjectProgressStore = struct {
     }
 };
 
-fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
-    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
-    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
-    return .{ .head_version = head_version, .doc_offset = doc_offset };
-}
-
 fn stageProgressOptionalEql(
     lhs: ?progress_store.EnrichmentStageProgress,
     rhs: ?progress_store.EnrichmentStageProgress,
 ) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+    return lhs.?.eql(rhs.?);
 }
 
 fn keyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8, suffix: []const u8) ![]u8 {
@@ -960,6 +956,19 @@ fn enrichmentStageHeadOffsetKeyAlloc(
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+test "serverless enrichment stage cursor object CAS preserves key across heads and permits fenced wrap" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "enrichment-cursor");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{std.mem.span(path)});
+    defer a.free(uri);
+    var impl = try ObjectProgressStore.initFileUri(a, uri);
+    var store = impl.progressStore();
+    defer store.deinit();
+    try progress_store.testEnrichmentCursorCompareAndSwap(&store);
 }
 
 test "serverless manifest read pins persist across object owners and reject acquisition across retirement" {

@@ -590,14 +590,16 @@ pub const FsProgressStore = struct {
         try namespace_lock.lock(lock_io, .exclusive);
         defer namespace_lock.unlock(lock_io);
 
-        const current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
+        var current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
+        defer if (current) |*value| value.deinit(self.alloc);
         if (!stageProgressOptionalEql(current, expected)) return false;
         if (current) |value| {
             if (desired.head_version < value.head_version) return false;
-            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+            if (desired.revision < value.revision or desired.completed_cycles < value.completed_cycles) return false;
+            if (desired.head_version == value.head_version and desired.revision == value.revision and desired.doc_offset < value.doc_offset) return false;
         }
         try self.writeStageProgressUnlocked(namespace, stage, desired);
         return true;
@@ -653,9 +655,11 @@ pub const FsProgressStore = struct {
     ) !progress_store.EnrichmentStageProgress {
         const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
         defer self.alloc.free(path);
-        const raw = try readFileAlloc(self.alloc, path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, self.alloc, .limited(progress_store.EnrichmentStageProgress.max_encoded_bytes));
         defer self.alloc.free(raw);
-        return try parseStageProgress(raw);
+        return try progress_store.EnrichmentStageProgress.decodeAlloc(self.alloc, raw);
     }
 
     fn writeStageProgressUnlocked(
@@ -667,7 +671,7 @@ pub const FsProgressStore = struct {
         const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
         defer self.alloc.free(path);
         try ensureParentDir(path);
-        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ value.head_version, value.doc_offset });
+        const payload = try value.encodeAlloc(self.alloc);
         defer self.alloc.free(payload);
         try writeFileAtomically(path, payload);
     }
@@ -917,20 +921,12 @@ pub const FsProgressStore = struct {
     }
 };
 
-fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
-    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
-    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
-    return .{ .head_version = head_version, .doc_offset = doc_offset };
-}
-
 fn stageProgressOptionalEql(
     lhs: ?progress_store.EnrichmentStageProgress,
     rhs: ?progress_store.EnrichmentStageProgress,
 ) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+    return lhs.?.eql(rhs.?);
 }
 
 fn threadedIo() std.Io.Threaded {
@@ -1090,6 +1086,16 @@ test "serverless manifest read pins persist across filesystem owners and use mon
     try std.testing.expectEqual(@as(?u64, 200), try store.getManifestReadDeadline("docs", 1));
     try store.pruneManifestReadDeadlines("docs", 2, 201, .none);
     try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 1));
+}
+
+test "serverless enrichment stage cursor filesystem CAS preserves key across heads and permits fenced wrap" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "enrichment-cursor");
+    defer cleanupTmp(path);
+    var impl = try FsProgressStore.init(std.testing.allocator, std.mem.span(path));
+    var store = impl.progressStore();
+    defer store.deinit();
+    try progress_store.testEnrichmentCursorCompareAndSwap(&store);
 }
 
 test "serverless manifest GC floor persists across filesystem owners and rejects rollback" {

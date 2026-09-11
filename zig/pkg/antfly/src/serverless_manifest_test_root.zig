@@ -22,4 +22,5 @@ test {
     _ = object_storage;
     _ = @import("serverless/build/retention.zig");
     _ = @import("serverless/catalog/fs_progress_store.zig");
+    _ = @import("serverless/catalog/progress_store.zig");
 }

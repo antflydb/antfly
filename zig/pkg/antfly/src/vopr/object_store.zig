@@ -190,9 +190,10 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     // A provider that omits an ETag must not turn the conditional append into
     // an unconditional whole-log replacement.
     faults.omitEtagFromNextGet();
+    var enrichment_operation_buffer: [128]u8 = undefined;
     try std.testing.expectError(
         error.MissingObjectEtag,
-        wal.appendIdempotentIfLatest("docs", 21, "derived", "enrich-v1/1/1/0/1", 1),
+        wal.appendIdempotentIfLatest("docs", 21, "derived", try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 1, 1, "doc-a", 1), 1),
     );
     try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
 
@@ -211,6 +212,9 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     const first_progress = progress_store.EnrichmentStageProgress{
         .head_version = 1,
         .doc_offset = 1,
+        .revision = 1,
+        .pipeline_version = 1,
+        .after_doc_id = "a",
     };
     try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
         "docs",
@@ -225,13 +229,12 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
             "docs",
             .lexical_sparse,
             first_progress,
-            .{ .head_version = 1, .doc_offset = 2 },
+            .{ .head_version = 1, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .after_doc_id = "b" },
         ),
     );
-    try std.testing.expectEqual(
-        @as(?progress_store.EnrichmentStageProgress, first_progress),
-        try progress.getEnrichmentStageProgress("docs", .lexical_sparse),
-    );
+    var retained_progress = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer retained_progress.deinit(progress.allocator);
+    try std.testing.expect(first_progress.eql(retained_progress));
 
     faults.resetClientAfterCrash();
     try std.testing.expectEqual(@as(u64, 1), try manifests.getHead("docs"));
@@ -389,13 +392,14 @@ test "serverless object store VOPR consumes stale enrichment generation without 
         .body = "{\"text\":\"stale-derived-overwrite\"}",
     });
     defer alloc.free(stale_mutation);
+    var enrichment_operation_buffer: [128]u8 = undefined;
     try std.testing.expectEqual(
         @as(?u64, 2),
         try wal.appendIdempotentIfLatest(
             "docs",
             101,
             stale_mutation,
-            "enrich-v1/1/1/0/1",
+            try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 1, 1, "doc-a", 1),
             1,
         ),
     );
@@ -444,7 +448,7 @@ test "serverless object store VOPR consumes stale enrichment generation without 
             "docs",
             102,
             stale_mutation,
-            "enrich-v1/2/1/0/1",
+            try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 2, 1, "doc-a", 1),
             2,
         ),
     );
