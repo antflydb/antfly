@@ -774,8 +774,26 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           vopr-test
+          vopr-build
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      - name: Test VOPR corpus retention and reuse
+        timeout-minutes: 10
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
+          python3 scripts/ci/zig_vopr_qualification.py --binary zig/zig-out/bin/vopr --output "$RUNNER_TEMP/vopr-qualification"
+
+      - name: Retain VOPR qualification diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualification-diagnostics
+          path: |
+            ${{ runner.temp }}/vopr-qualification/**/*.json
+            ${{ runner.temp }}/vopr-qualification/**/*.log
+          retention-days: 90
 
       - name: Run Zig integration tests
         working-directory: zig

@@ -3036,7 +3036,7 @@ still checks an ordered payload model; it does not yet apply into the
 production cluster's DB. Its restart actions close and reopen owners; they
 do not yet inject power loss between individual storage operations.
 
-The separate `ha-scaling` scenario (`production-ha-scaling`, version 1)
+The separate `ha-scaling` scenario (`production-ha-scaling`, version 2)
 composes the production metadata quorum, three Raft-backed DataServers, and
 separate production HA primary/standby DataServers on the shared VOPR scheduler.
 HA is the documented single-primary mode: promotion does not replace a Raft
@@ -3103,7 +3103,20 @@ builds one ReleaseSafe runner, then runs two shards each of `ha`, `raft`,
 `distributed-data`, and `ha-scaling`. Per-shard history budgets are 1000,
 1000, 12, and 2 respectively; the dispatch input can override them. Each shard
 uses one worker and records its exact seed, revision, command, initial corpus,
-and completion status in `run.json`.
+and completion status in `run.json`, including the executable SHA-256 and
+restored trace digests. Shard 0 uses bounded-fair mutation and shard 1 uses
+adversarial mutation. Initial histories use the scenario's baseline generator
+(cooperative scheduling for HA/scaling). `--exploration-policy cooperative`
+selects the cooperative mutation suffix explicitly for comparisons.
+
+A bounded-fair suffix randomizes runnable work, ages continuously enabled
+alternatives, and services the oldest overdue alternative after a 256-choice
+window. An adversarial suffix first prefers time advancement and delays a
+selected ready actor for 128 choices, then restores fair scheduling so the
+scenario can demonstrate recovery. Exact replay uses the recorded choices.
+Each `*.schedule.json` records the mutation point, replacement, suffix seed,
+policy bounds and parent digest, or both parents and the selected splice point.
+Scheduling provenance follows retained traces into the next campaign.
 
 Scheduled campaigns use `--defer-diagnostics`: every finding still retains its
 trace, flight recording, and aggregate summary, but automatic reduction and
@@ -3111,14 +3124,27 @@ counterfactual searches run separately through `vopr recipe`. This keeps one
 production finding from consuming the entire scheduled budget before reports
 are published.
 
+The workflow caches the built runner by source revision and target, then keys
+each scenario's working corpus by that executable's SHA-256. Unchanged
+revisions reuse the exact runner, including its fiber identities; a different
+runner starts a fresh corpus rather than treating an old executable layout as
+a new replay divergence. Older artifacts remain available for diagnosis with
+their retained executable.
+
 The workflow restores the last compatible scenario corpus, copies it into a
 fresh run directory, and uploads reports, traces, logs, and diagnostics even
 when the campaign fails. A separate job replays and merges the uploaded shard
 corpora, deduplicates them, and saves a bounded working corpus for the next run.
-The merge chooses its compatibility authority by exact replay with the current
-runner, preferring fresh histories. Duplicate-only campaigns can use a replayed
-seed; divergent candidates remain inputs for quarantine instead of aborting
-the merge before valid histories are retained. If no candidate replays, the job
+The CLI chooses its compatibility authority by exact replay with the current
+runner, preferring fresh histories. It deduplicates bytes before validation and
+replays each unique compatible candidate once, streaming retained bytes to disk
+before opening the next candidate. `validation.json` identifies the current
+input and cumulative replay/byte cost. The default validation budget is eight
+million recorded transitions (`corpus-merge --max-replay-transitions`); the
+wrapper also enforces an independent 110-minute wall-clock budget.
+Duplicate-only campaigns can use a replayed seed; divergent candidates remain
+inputs for quarantine instead of aborting the merge before valid histories are
+retained. If no candidate replays, the job
 fails with an authority-selection log and leaves the uploaded shard traces
 available for diagnosis without publishing a working corpus.
 The working corpus keeps up to 128 clean traces for HA/Raft, eight for
@@ -3129,9 +3155,42 @@ Incompatible versions are quarantined for review; unexpected replay errors or
 replay divergence fail the run and preserve evidence. A still-reproducing
 finding in the initial corpus also fails the campaign. Campaign timeouts leave
 room for artifact upload; interrupted runs never acquire a stale success report.
+The wrapper gives campaign subprocesses 230 minutes, sends TERM on cancellation
+or timeout, then kills the process group after a 30-second grace period and
+reaps the child. Each history writes a small phase report, and its generated
+trace is saved atomically before exact replay starts. Small reports and logs
+upload separately before large traces.
+Only a completed validation manifest can publish a working corpus.
 
-Run and merged-corpus artifacts are retained for 90 days. The cache is an
-acceleration/resumption mechanism and can be evicted; download the retained
+An exhausted history remains a failing soak. HA/scaling records it explicitly
+as `transition-budget-exhausted`; this does not by itself diagnose starvation
+or a production deadlock. Its cleanup property runs after cancellation and
+owner release and checks remaining tasks, file handles, sockets, queued
+executor work and transport closes. A partial history can no longer pass
+cleanup merely because it did not complete. Cutoff logs name the active
+operation and wait owner, plus task dependencies and actual sleep deadlines
+with their clock domains. `campaign --scenario ha-scaling --transitions N`
+can target startup and intermediate cancellation boundaries explicitly.
+
+`scripts/ci/zig_vopr_qualification.py` runs a small real campaign, validates and
+retains it, copies the corpus into a new run, and requires the second campaign
+to consume compatible entries. It also checks duplicates, incompatible and
+malformed traces, replay divergence, rejection without a valid authority,
+validation-budget exhaustion and exact replay of bounded startup cleanup.
+This gate runs in PR CI and before scheduled soaks. Full operational
+qualification requires two successful default-budget Linux workflow runs; the
+second dispatch must set `require_seed=true` and report nonzero consumed seeds
+for every shard. A local gate alone is not full-soak evidence.
+
+The executable, run and merged-corpus artifacts are retained for 90 days.
+Fiber callsite identities are scoped to a pinned executable layout; keep the
+original executable when investigating older traces. The diagnostic dispatch
+accepts `diagnostic_run`, `diagnostic_shard` and `diagnostic_trace`, downloads
+that run's executable and trace, and captures native Linux operation boundaries
+and suspended owner stacks without rebuilding the runner. Its output is
+diagnostic replay evidence, not a new soak qualification.
+
+The cache is an acceleration/resumption mechanism and can be evicted; download the retained
 corpus artifact to resume manually after eviction. Scheduling a workflow does
 not establish that a nightly budget has completed: use its uploaded `run.json`,
 `results.json`, and corpus `index.json` as evidence. Replaying a single trace

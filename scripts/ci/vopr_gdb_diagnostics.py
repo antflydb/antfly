@@ -17,7 +17,7 @@ def suspended_tasks(world):
         if status == "finished":
             continue
         gdb.write(
-            f"VOPR pending task={task['id']} parent={task['identity_parent']} "
+            f"VOPR pending task={task['id']} scope={task['identity_parent']} "
             f"owner={task['resource_owner_id']} status={status} "
             f"start={task['start']} sleep={task['sleep']} "
             f"awaited={task['waiting_on_future']} external={task['external_id']}\n"

@@ -9,6 +9,10 @@ on:
         description: Histories per shard (0 uses scenario budgets)
         type: number
         default: 0
+      require_seed:
+        description: Require replay-compatible entries restored from an earlier run
+        type: boolean
+        default: false
 
       diagnostic_run:
         description: Inspect an earlier soak with its original executable (empty runs a new soak)
@@ -46,6 +50,8 @@ jobs:
     if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
+    outputs:
+      binary_sha256: ${{ steps.binary.outputs.sha256 }}
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -64,16 +70,54 @@ jobs:
           use-cache: false
       - name: Test soak orchestration
         run: python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
+      - name: Restore the pinned runner for this revision
+        id: runner_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
       - name: Build campaign runner
+        if: steps.runner_cache.outputs.cache-hit != 'true'
         working-directory: zig
         run: zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all
+      - name: Restore executable
+        if: steps.runner_cache.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p zig/zig-out/bin
+          tar -C zig/zig-out/bin -xzf "$RUNNER_TEMP/vopr-cached-runner/vopr.tar.gz"
+      - name: Identify the exact runner
+        id: binary
+        run: |
+          digest="$(sha256sum zig/zig-out/bin/vopr)"
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+      - name: Exercise campaign merge restore and reuse
+        run: python3 scripts/ci/zig_vopr_qualification.py --binary zig/zig-out/bin/vopr --output "$RUNNER_TEMP/vopr-qualification"
+      - name: Retain qualification diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualification-diagnostics
+          path: |
+            ${{ runner.temp }}/vopr-qualification/**/*.json
+            ${{ runner.temp }}/vopr-qualification/**/*.log
+          retention-days: 90
       - name: Package executable
-        run: tar -C zig/zig-out/bin -czf "$RUNNER_TEMP/vopr.tar.gz" vopr
+        if: steps.runner_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/vopr-cached-runner"
+          tar -C zig/zig-out/bin -czf "$RUNNER_TEMP/vopr-cached-runner/vopr.tar.gz" vopr
+      - name: Preserve the runner layout for subsequent campaigns
+        if: steps.runner_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-runner
-          path: ${{ runner.temp }}/vopr.tar.gz
-          retention-days: 7
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          retention-days: 90
           overwrite: true
 
   campaign:
@@ -95,6 +139,10 @@ jobs:
             histories: 12
           - scenario: ha-scaling
             histories: 2
+          - shard: 0
+            policy: bounded-fair
+          - shard: 1
+            policy: adversarial
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,9 +156,9 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--${{ github.run_id }}-${{ github.run_attempt }}
+          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--
+            vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--
       - name: Run retained-corpus campaign
         timeout-minutes: 240
         working-directory: zig
@@ -120,6 +168,8 @@ jobs:
           HISTORY_BUDGET: ${{ inputs.histories }}
           DEFAULT_HISTORY_BUDGET: ${{ matrix.histories }}
           RUN_NUMBER: ${{ github.run_number }}
+          EXPLORATION_POLICY: ${{ matrix.policy }}
+          REQUIRE_SEED: ${{ inputs.require_seed }}
         run: |
           # Dispatch can supply the string "0", which is truthy in expressions.
           # Normalize the sentinel and the absent scheduled input explicitly.
@@ -127,15 +177,38 @@ jobs:
             HISTORY_BUDGET="$DEFAULT_HISTORY_BUDGET"
           fi
           seed=$((0xa17f5500 + RUN_NUMBER * 65536 + SHARD))
+          reuse_args=()
+          if [ "${REQUIRE_SEED:-false}" = "true" ]; then reuse_args+=(--require-seed); fi
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" run \
             --scenario "$SCENARIO" --histories "$HISTORY_BUDGET" --seed "$seed" \
-            --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run"
+            --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run" \
+            --exploration-policy "${EXPLORATION_POLICY:-bounded-fair}" "${reuse_args[@]}"
+      - name: Retain small campaign diagnostics first
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-diagnostics-${{ matrix.scenario }}--${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/vopr-run/run.json
+            ${{ runner.temp }}/vopr-run/results.*
+            ${{ runner.temp }}/vopr-run/*.log
+            ${{ runner.temp }}/vopr-run/*.schedule.json
+            ${{ runner.temp }}/vopr-run/*.progress.json
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
       - name: Retain reports, replay traces, and failure diagnostics
         if: always()
+        timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-run-${{ matrix.scenario }}--${{ matrix.shard }}
-          path: ${{ runner.temp }}/vopr-run
+          path: |
+            ${{ runner.temp }}/vopr-run/*.voprtrace
+            ${{ runner.temp }}/vopr-run/*.schedule.json
+            ${{ runner.temp }}/vopr-run/*.flight.json
+            ${{ runner.temp }}/vopr-run/quarantine
           retention-days: 90
           overwrite: true
           if-no-files-found: error
@@ -170,13 +243,26 @@ jobs:
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
             --inputs "$RUNNER_TEMP/vopr-shards" --output "$RUNNER_TEMP/vopr-corpus" \
             --retained "$RUNNER_TEMP/vopr-corpus-retained"
+      - name: Retain small corpus diagnostics first
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-corpus-diagnostics-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/vopr-corpus/*.json
+            ${{ runner.temp }}/vopr-corpus/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
       - name: Publish corpus for the next scheduled run
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--${{ github.run_id }}-${{ github.run_attempt }}
+          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain merged corpus and quarantine review evidence
         if: always()
+        timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-corpus-${{ matrix.scenario }}

@@ -317,7 +317,9 @@ pub const VoprIo = struct {
     ///
     /// This is deliberately outside canonical trace generation: it requests
     /// cancellation for every task, then executes a deterministic cleanup
-    /// suffix so task defers release the production objects they own. Merely
+    /// suffix so task defers release the production objects they own. Drain
+    /// queued executor work and transport closes as well: canceled fibers can
+    /// leave these ready after the last task has finished. Merely
     /// destroying fiber stacks would leak those objects, while calling
     /// `Future.cancel` from the harness fiber cannot await unfinished work.
     pub fn cancelAndDrainTasksForTeardown(
@@ -336,7 +338,7 @@ pub const VoprIo = struct {
         var last_task_actor: ?ids.StableId = null;
         var task_resume_streak: usize = 0;
         const max_task_resume_streak = 16;
-        while (!self.tasks.isQuiescent()) {
+        while (!quiescent(self)) {
             if (transitions_executed == transition_budget)
                 return error.VoprIoTeardownTransitionBudgetExceeded;
             enabled.items.clearRetainingCapacity();
@@ -463,6 +465,10 @@ pub const VoprIo = struct {
         any_future: *std.Io.AnyFuture,
     ) ?task_mod.TaskSnapshot {
         return self.tasks.futureSnapshot(any_future);
+    }
+
+    pub fn taskSnapshotAt(self: *const VoprIo, index: usize) ?task_mod.TaskSnapshot {
+        return self.tasks.snapshotAt(index);
     }
 
     /// Standard health adapter for every scenario borrowing this runtime. It
@@ -1798,6 +1804,41 @@ test "VoprIo composes atomic executor work into its scheduler" {
     try std.testing.expect(backend.scheduler().quiescent());
 }
 
+test "VoprIo teardown drains executor work and stream closes after fibers finish" {
+    const Context = struct {
+        completed: bool = false,
+        released: bool = false,
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.completed = true;
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.released = true;
+        }
+    };
+    var backend = try VoprIo.init(.{});
+    defer backend.deinit();
+    _ = backend.io();
+    const pair = try backend.network.createPair(.{ .family = .ip4, .mode = .stream }, 1);
+    try std.testing.expect(backend.network.close(&.{ pair[0].handle, pair[1].handle }));
+    var context = Context{};
+    try backend.executor().submit(.{
+        .id = ids.stable("test", "teardown-executor"),
+        .name = "test.teardown-executor",
+        .context = &context,
+        .run_fn = Context.run,
+        .deinit_fn = Context.release,
+    });
+    try std.testing.expect(backend.tasks.isQuiescent());
+    try std.testing.expect(!backend.network.isQuiescent());
+    const count = try backend.cancelAndDrainTasksForTeardown(std.testing.allocator, 16);
+    try std.testing.expect(count >= 2);
+    try std.testing.expect(context.completed and context.released);
+    try std.testing.expect(backend.scheduler().quiescent());
+    try std.testing.expectEqual(@as(usize, 0), backend.resourceSnapshot().open_sockets);
+}
+
 test "VoprIo scheduler controls nested futures and virtual sleep" {
     const Shared = struct {
         io: std.Io,
@@ -1892,6 +1933,15 @@ test "VoprIo teardown cancellation unwinds task ownership from the harness fiber
     }
     try std.testing.expect(!shared.child_cleaned);
     try std.testing.expect(!shared.parent_cleaned);
+    const parent = sim.futureTaskSnapshot(future.any_future.?).?;
+    try std.testing.expectEqual(task_mod.Status.waiting_future, parent.status);
+    const child_id = parent.awaited_task_id orelse return error.MissingTeardownWaitEdge;
+    var task_index: usize = 0;
+    const child = while (sim.taskSnapshotAt(task_index)) |snapshot| : (task_index += 1) {
+        if (snapshot.id == child_id) break snapshot;
+    } else return error.MissingTeardownChildOwner;
+    try std.testing.expectEqual(std.Io.Clock.awake, child.sleep_clock.?);
+    try std.testing.expectEqual(@as(i96, 60 * std.time.ns_per_s), child.sleep_deadline_ns.?);
 
     const cleanup_transitions = try sim.cancelAndDrainTasksForTeardown(std.testing.allocator, 8);
     try std.testing.expect(cleanup_transitions != 0);
