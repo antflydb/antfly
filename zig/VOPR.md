@@ -3176,7 +3176,9 @@ can target startup and intermediate cancellation boundaries explicitly.
 retains it, copies the corpus into a new run, and requires the second campaign
 to consume compatible entries. It also checks duplicates, incompatible and
 malformed traces, replay divergence, rejection without a valid authority,
-validation-budget exhaustion and exact replay of bounded startup cleanup.
+validation-budget exhaustion and exact replay of cleanup at transition budgets
+1, 2, 4, 8, 16, 32 and 8,192. The larger cut cancels active Raft/HTTP owners,
+timers and external waits as well as the early deployment-admission boundaries.
 This gate runs in PR CI and before scheduled soaks. Full operational
 qualification requires two successful default-budget Linux workflow runs; the
 second dispatch must set `require_seed=true` and report nonzero consumed seeds
@@ -3198,7 +3200,9 @@ Fiber callsite identities are scoped to a pinned executable layout; keep the
 original executable when investigating older traces. The diagnostic dispatch
 accepts `diagnostic_run`, `diagnostic_shard` and `diagnostic_trace`, downloads
 that run's executable and trace, and captures native Linux operation boundaries
-and suspended owner stacks without rebuilding the runner. Its output is
+and suspended owner stacks without rebuilding the runner. Version 2 is inspected
+before finalization releases owners; older executables are inspected at deinit.
+Its output is
 diagnostic replay evidence, not a new soak qualification.
 
 The cache is an acceleration/resumption mechanism and can be evicted; download the retained

@@ -8,6 +8,7 @@ import gdb
 
 production_fixture = None
 inspection_failed = False
+tasks_inspected = False
 
 
 def request_details():
@@ -79,10 +80,19 @@ def suspended_tasks(fixture):
 
 
 def boundary():
-    global production_fixture, inspection_failed
+    global production_fixture, inspection_failed, tasks_inspected
     frame = gdb.newest_frame()
     gdb.write(f"VOPR boundary: {frame.name()}\n")
-    if frame.name() == "vopr.full_cluster.Scenario.deinit":
+    if frame.name() in (
+        "vopr.full_cluster.HAScalingScenario.finalize",
+        "vopr.full_cluster.Scenario.deinit",
+    ):
+        # Version 2 releases production owners during finalization. Inspect
+        # there, before deinit can encounter the already-freed fixture. Older
+        # retained executables have no finalizer and still use deinit.
+        if tasks_inspected:
+            return
+        tasks_inspected = True
         try:
             if production_fixture is None:
                 gdb.write("  no production fixture reached before teardown\n")
@@ -127,6 +137,7 @@ for expression in (
     "stopDataServerForRestart",
     "restartDataServer",
     "runHAScaling",
+    "full_cluster.HAScalingScenario.finalize",
     "full_cluster.Scenario.deinit",
     "production_cluster.*beginTeardown",
     "production_ha.*(startPrimary|startStandby|catchUp|write|verify|promote)",

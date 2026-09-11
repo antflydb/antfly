@@ -172,7 +172,9 @@ def qualify(binary, output):
         and progress["exact_replays"] == 0,
         "validation cutoff lost its progress evidence",
     )
-    for budget in (1, 2, 4, 8, 16, 32):
+    # Early cuts cover cancellation before deployment admission; the larger
+    # cut also cancels active Raft/HTTP owners, timers and external waits.
+    for budget in (1, 2, 4, 8, 16, 32, 8192):
         cutoff = output / f"startup-cutoff-{budget}"
         cutoff.mkdir()
         command = [
