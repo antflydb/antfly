@@ -730,6 +730,123 @@ checks passed. No public generated contracts changed in this round; earlier SDK
 and generated checks remain in the preceding history. These focused checks are
 not a complete repository-suite pass.
 
+## Complete apply checkpoints and placement reads — 2026-09-11
+
+This follow-up corrects the preceding report benchmark's scope: that benchmark
+timed the inner projection transaction and omitted the outer applied watermark,
+which still stored the full committed batch. Its 184-byte cached-heartbeat WAL
+result was not the complete local apply cost. The corrected harness times
+`SnapshotBuilder.applyBatch`, including command decoding, checkpoint persistence,
+projections and transaction commit. Wire encoding remains outside the interval.
+
+The matched baseline is `9f828fc4d33cd062a906540c62a576cf7973d049` with only the
+final benchmark harness substituted. Updated production sources are
+`052c79c4a7d51becbf3dd78f04337be16e909cc3`, including main at `2bd96e33e`.
+Both use ReleaseFast, the C allocator and seven samples on the same shared
+macOS ARM64 host. Runs were sequential with no builds or tests from this task
+overlapping measurement. The [raw observations](system_catalog_checkpoint_workloads_2026_09_11.json)
+retain all sizes and scenarios, the discarded digest prototype, validation and
+the final live workload's binary hash. The harness emits medians, not individual
+sample timings.
+
+### Durable progress without retained replay batches
+
+Metadata now stores a versioned 26-byte checkpoint containing applied index,
+input kind and input byte count in the same transaction as projected state.
+The Raft log owns replay entries. The in-memory checkpoint map also retains only
+this compact value. Legacy index-plus-batch rows remain readable and upgrade
+on the next successful apply or snapshot installation. Logical snapshot wire
+format is unchanged. Tests cover reopening, snapshot progress, legacy import,
+format validation and failed-apply preservation of durable and cached progress.
+
+| Groups | Scenario | Before p50 (ms) | After p50 (ms) | WAL bytes/apply before / after |
+| --- | --- | --- | --- | --- |
+| 1,000 | Cached heartbeat | 1.354 | 1.046 | 812,381 / 277 |
+| 1,000 | Fresh clocks | 1.414 | 1.024 | 917,917 / 105,813 |
+| 1,000 | One group changes | 1.382 | 0.988 | 950,840 / 138,736 |
+| 1,000 | All groups change | 2.238 | 1.808 | 1,804,949 / 992,845 |
+| 10,000 | Cached heartbeat | 15.000 | 11.226 | 8,120,381 / 277 |
+| 10,000 | Fresh clocks | 24.547 | 16.674 | 9,173,446 / 1,053,342 |
+| 10,000 | One group changes | 15.391 | 11.450 | 8,978,840 / 858,736 |
+| 10,000 | All groups change | 41.055 | 31.197 | 18,043,760 / 9,923,656 |
+
+An intermediate 58-byte checkpoint also hashed the complete input with SHA-256.
+It achieved the write reduction but cached apply at 10,000 groups measured
+16.276 ms, above the 15.000 ms baseline. Recovery did not consume the diagnostic
+digest, so the final design removes that extra full-input pass. It retains the
+normal storage integrity checks. This intermediate result is recorded separately
+and is not the shipped implementation.
+
+The command wire remains 812,091 bytes at 1,000 groups and 8,120,091 at 10,000.
+Decoding and report comparison still scale with incoming reports. These local
+measurements exclude Raft replication, network transport and registered service
+callback fanout; they do not establish production throughput or reduced network
+bandwidth. The shared host had low disk headroom and uncontrolled other activity.
+
+### Placement checks without full report hydration
+
+Placement compare-and-upsert reads the store header for node identity and drain
+state in its existing transaction. It no longer reconstructs unrelated group
+summaries and runtime reports. Seven samples each contain 100 independent read
+transactions; reported per-operation medians include transaction open and close.
+
+| Reported groups/store | Before p50 (ms) | After p50 (ms) |
+| --- | --- | --- |
+| 100 | 0.036910 | 0.003640 |
+| 1,000 | 0.329340 | 0.005330 |
+| 10,000 | 3.882020 | 0.031450 |
+
+Full-store reads remain available where required, such as termination debt.
+Their 10,000-group observation was 3.954 / 3.575 ms; this unchanged code path's
+timing variation is not attributed to the checkpoint change.
+
+### Contract and validation follow-up
+
+Both listing routes now declare and return a JSON error for stale-cursor HTTP
+409 responses. The TypeScript `tables.list()` contract is `Promise<TableStatus[]>`
+and rejects bodyless error responses. Regressions exercise JSON/bodyless errors,
+successful empty listings, generated Go 409 decoders and public HTTP pagination.
+
+The final Antfly build and 134 focused tests passed: 66 metadata storage, 57 API
+and 11 managed-host tests. All 21 selected catalog/schema-migration/exact-sort/
+scoped-auth E2E cases passed in 78.27 seconds on the final Debug binary with SHA-256
+`7dc98e2246ac2b83dbe12f2360a39d5f6e83ee70efd35e67bf60da5a685c240e`.
+The first E2E attempt hit the fixture disk-headroom safeguard; removing obsolete
+build artifacts allowed the final run without lowering that safeguard.
+
+The TypeScript suite passed 282 tests with one skipped. SDK build/typecheck,
+Antfarm typecheck, Go `oapi` tests, Python generated checks, public and Zig
+OpenAPI generation/checks, and changed-file Zig/TypeScript/Python checks passed.
+These are focused validations, not a complete repository-suite pass.
+
+### Final clustered application observation
+
+The final Debug binary also completed the discovery workload with three metadata
+and three data nodes, 30 unrelated tables, 200-field schemas and 25-row pages.
+Ten measured requests follow three warmups; setup and readiness are outside timing.
+
+| Operation | p50 (ms) | p95 (ms) |
+| --- | --- | --- |
+| One-table namespace | 27.836 | 214.649 |
+| Prefix selecting one table | 20.191 | 220.997 |
+| Full inventory | 81.466 | 283.404 |
+| Single-table detail | 27.035 | 197.666 |
+| Empty default namespace | 12.786 | 23.545 |
+| First 25-row page | 68.904 | 206.459 |
+| Complete cursor walk | 102.777 | 312.533 |
+
+This is a final application validation observation, not a paired speedup claim.
+It does not establish improved cluster-wide latency or resolve the earlier
+100-table storage-read failure. Settings and binary provenance are embedded in
+the raw artifact. Run it from `zig/` with:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario listing --deployment cluster --table-counts 30 --schema-fields 200 \
+  --listing-page-size 25 --samples 10 --warmup 3 \
+  --output /tmp/catalog-checkpoint-cluster.json
+```
+
 ## Reproduction
 
 See [workloads and commands](SYSTEM_CATALOG.md). Run the resolution scenario
