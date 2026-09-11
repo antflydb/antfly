@@ -1,11 +1,39 @@
 # Zig E2E flakes
 
+## 2026-09-11: unit CI retention assertion races legitimate consumer progress (#694)
+
+Run `34543627560`, x86 job `103092055515`, failed the provider-restart storage
+test because its negative index-progress assertion raced a healthy derived
+consumer. The revised test explicitly waits for that consumer, then verifies
+that enrichment's independent durable checkpoint retains the failed source
+record and that restart generates both searchable embeddings. Three focused
+retention checks pass; see `../FLAKES.md` for the original log and contract.
+
+## 2026-09-10: 299/300 identifies replacement persistence and abort outcome defects (#694)
+
+The `9e5b558ce` mixed run finished at 23:57 UTC with quickstart **100/100**,
+backup/restore **99/100**, and retry exhaustion **100/100**. Complete logs and the
+one preserved failure root are in
+`/private/tmp/ci694-authority-complete-results.tar.gz`; the downloaded archive's
+SHA-256 matches the runner copy. This remains failed acceptance.
+
+The failed shard's durable Raft history contains an overwritten term-2 prepare
+at index 4 on node 4, while nodes 5 and 6 retain the new leader's term-3 no-op.
+Review reproduced the missing persistence-watermark invalidation. All three
+transaction records are aborted; a second regression reproduced an unknown
+prepare outcome escaping despite a confirmed coordinator abort. The fixes bind
+persistence to entry identity and preserve the proven abort decision, with
+existing bounded stateless retries and unchanged deadlines. See `../FLAKES.md`
+for the before/after regressions and exact history. Fresh 100-per-scenario
+acceptance must include these fixes as well as the forwarding and placement
+review changes below.
+
 ## 2026-09-10: review closes forwarding and placement authority gaps (#694)
 
-The `9e5b558ce` mixed soak has a backup seed-write `409 write outcome unknown`
-and therefore fails acceptance. The first failure is preserved in
+The `9e5b558ce` mixed soak had a backup seed-write `409 write outcome unknown`
+and therefore failed acceptance. The first failure is preserved in
 `/private/tmp/ci694-first-final-failure.tar.gz`; the durable transaction records
-show abort on all three groups. Its original transport/apply cause is unresolved.
+show abort on all three groups. The subsequent investigation is recorded above.
 
 Independent deterministic review probes reproduced Raft transport starvation
 from sharing its executor with forwarded writes, and changed placement bypassing

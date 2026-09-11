@@ -4,6 +4,66 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Provider-restart regression races an independent index consumer (#694)
+
+The x86 job in run `34543627560` failed
+`db restart after provider failure resumes enrichment from retained async replay`
+at an assertion that the derived consumer remained below the failed enrichment
+source sequence. Production explicitly permits that consumer to advance while
+enrichment remains behind; `truncateReplaySequenceAsync` retains replay through
+the durable enrichment checkpoint. The test now stops at observed provider
+failure, waits for the derived consumer to reach the source sequence, then
+asserts retention and actual embedding/search recovery after reopening. This
+exercises the adverse ordering directly instead of racing a negative progress
+assertion. The three focused retention/restart tests pass with no skips or leaks
+(`/private/tmp/ci694-replay-retention-fixed.log`). Original CI log:
+`/private/tmp/ci694-26ff-x86-ci.log`.
+
+## Leadership replacement skips persistence and loses a confirmed abort outcome (#694)
+
+The `9e5b558ce` Linux soak completed **299/300**: quickstart 100/100,
+backup/restore 99/100, retry exhaustion 100/100. Its seed failure is preserved in
+`/private/tmp/ci694-authority-complete-results.tar.gz` (SHA-256
+`5be3b103ec4dc4d07a6abc5779c7bac5131496c16120f84c98923679d1396881`).
+Decoded Raft records for group `8476403407145147734` show node 4 persisting a
+term-2 prepare at index 4, then leadership changing to node 6 in term 3. Nodes 5
+and 6 retain a term-3 no-op at index 4; node 4's final checkpoint incorrectly
+retains the old term-2 prepare. All three transaction records are aborted.
+The read-only decoder and output source are `/private/tmp/ci694-decode-raft.py`
+and `/private/tmp/ci694-seed-failure-state.tsv`.
+
+`RaftLog` replaced conflicting entries without moving back its stable/persisting
+watermarks. Ready therefore omitted a replacement at a previously durable index,
+allowing memory and restart history to disagree. The deterministic regression
+fails before the fix with expected first unstable index 2, observed 3
+(`/private/tmp/ci694-raft-replacement-before.log`). Replacement now invalidates
+both watermarks from the conflict; persistence completions require matching
+index and term. Borrowed append clones before changing the old suffix so an
+allocation failure cannot leave partial mutation. Duplicate appends preserve
+matching entries and acknowledge only the supplied prefix; committed conflicts
+remain errors. Regressions cover stale/in-flight completions, apply fencing,
+matching prefixes, and persistence/restart in both storage modes.
+
+The superseded prepare also exposed a transaction outcome error. After the
+coordinator confirms its durable abort, a prepare's unknown Raft/transport outcome
+does not make the transaction decision unknown. These failures now return the
+existing participant-unavailable conflict only after `abortParticipants`
+confirms abort; an unconfirmed abort still propagates `AbortDecisionNotDurable`.
+The existing bounded stateless retry owner may then create a fresh transaction.
+No prepare is replayed blindly, and commit ambiguity remains conservative. The
+coordinator regression failed with `RaftBatchWriteOutcomeUnknown` before the fix
+(`/private/tmp/ci694-prepare-abort-before.log`); it covers direct abort success,
+abort confirmation through status, and pending/committed decisions that cannot
+authorize a fresh attempt. Production retry limits and deadlines are unchanged.
+
+Validation: all 395 Raft library tests, 19 transaction coordinator/participant
+contracts, four existing stateless retry-bound contracts, and 176 data-runtime
+tests pass without skips or leaks. Logs: `/private/tmp/ci694-raft-final.log`,
+`/private/tmp/ci694-transaction-contracts-fixed.log`,
+`/private/tmp/ci694-abort-retry-contracts.log`, and
+`/private/tmp/ci694-raft-replacement-data-runtime.log`. Fresh Linux acceptance
+remains required for this combined revision.
+
 ## Review follow-up: forwarding capacity and equal placement counters (#694)
 
 Review reproduced two independent defects on `9e5b558ce`. Saturating the shared
@@ -35,10 +95,9 @@ unchanged placement with a different counter, and authoritative deletion.
 All 176 data-runtime tests and 62 backend-runtime/capacity tests pass with no
 skips or leaks (`/private/tmp/ci694-review-fixes-data-runtime.log` and
 `/private/tmp/ci694-review-fixes-lane-lifecycle.log`). Fresh Linux acceptance is
-required. The prior `9e5b558ce` soak has a seed-write outcome failure; its preserved
-transaction records are aborted on all three shards, which does not establish
-the source of the original ambiguity. Additional bounded prepare/apply outcome
-diagnostics preserve that distinction without changing retries or deadlines.
+required. The prior `9e5b558ce` soak finished 299/300; the subsequent durable-log
+and transaction-decision investigation is recorded above. Bounded prepare/apply
+outcome diagnostics retain the relevant phase without changing deadlines.
 
 ## Metadata cache incorrectly orders peer-local lifecycle counters (#694)
 

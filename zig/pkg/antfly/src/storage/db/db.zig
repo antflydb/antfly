@@ -82604,8 +82604,8 @@ test "db restart after provider failure resumes enrichment from retained async r
     {
         // Permit one document to establish a durable enrichment watermark,
         // then keep returning a retryable provider error for the next
-        // document. The managed-index consumer must remain behind that source
-        // revision until enrichment has published its terminal outcome.
+        // document. The independent managed-index consumer may pass the source
+        // revision, but enrichment's durable watermark must retain its replay.
         var gated = GateDenseEmbedder{};
         var db = try DB.open(alloc, std.mem.span(path), .{
             .enrichment = .{
@@ -82641,21 +82641,20 @@ test "db restart after provider failure resumes enrichment from retained async r
         }
         try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
-        // Stop at the observed provider failure boundary and attempt the same
-        // asynchronous truncation that a derived consumer completion would
-        // request. The consumer is intentionally not allowed to reach the
-        // failed source revision: doing so could make a later same-revision
-        // artifact unreplayable. Enrichment's durable watermark must retain
-        // the source record across restart without spending the test budget on
-        // provider retry backoff.
+        // Stop at the observed provider failure boundary, then explicitly let
+        // the independent index consumer catch up. Replay retention must hold
+        // even in this ordering; racing an assertion against its progress does
+        // not test the enrichment checkpoint that owns the retained debt.
         db.enrichment_runtime.?.stop();
+        db.executor.notifySequence(failed_target_sequence);
+        try db.executor.waitForIndexes(failed_target_sequence, &.{"dv_v1"});
         try truncateReplaySequenceAsync(db.async_context, failed_target_sequence);
 
         const failed_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, failed_stats);
         try std.testing.expectEqual(first_applied_sequence, failed_stats.enrichment.applied_sequence);
         try std.testing.expectEqual(failed_target_sequence, failed_stats.enrichment.target_sequence);
-        try std.testing.expect((db.executor.appliedSequence("dv_v1") orelse 0) < failed_target_sequence);
+        try std.testing.expect((db.executor.appliedSequence("dv_v1") orelse 0) >= failed_target_sequence);
 
         const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, first_applied_sequence + 1);
         defer {

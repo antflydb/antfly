@@ -7379,6 +7379,12 @@ pub fn build(b: *std.Build) void {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    const api_transaction_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);

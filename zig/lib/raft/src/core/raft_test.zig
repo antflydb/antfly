@@ -2497,3 +2497,64 @@ test "raw node async storage writes emits local append then local apply" {
     try std.testing.expectEqual(message_mod.MessageType.storage_apply, rd.messages[0].msg_type);
     try std.testing.expectEqual(message_mod.LocalApplyThread, rd.messages[0].to);
 }
+
+test "raw node persists replacement before apply and restart" {
+    for ([_]bool{ false, true }) |async_storage_writes| {
+        var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        try storage.append(&.{
+            .{ .index = 1, .term = 2, .data = @constCast("begin") },
+            .{ .index = 2, .term = 2, .data = @constCast("uncommitted prepare") },
+        });
+        storage.setHardState(.{ .current_term = 2, .voted_for = 1, .commit_index = 1 });
+        const cfg = raft_mod.Config{
+            .id = 1,
+            .group_id = 7,
+            .peers = &.{ 1, 2, 3 },
+            .election_tick = 10,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+            .async_storage_writes = async_storage_writes,
+            .applied = 1,
+        };
+        var node = try raw_node_mod.RawNode.init(std.testing.allocator, cfg, storage.storage());
+        defer node.deinit();
+        try node.step(.{
+            .msg_type = .append_entries,
+            .from = 3,
+            .to = 1,
+            .term = 3,
+            .log_index = 1,
+            .log_term = 2,
+            .commit_index = 2,
+            .entries = @constCast(&[_]types.Entry{.{ .index = 2, .term = 3 }}),
+        });
+        const rd = node.ready();
+        try std.testing.expectEqual(@as(usize, 1), rd.entries.len);
+        try std.testing.expectEqual(@as(types.Index, 2), rd.entries[0].index);
+        try std.testing.expectEqual(@as(types.Term, 3), rd.entries[0].term);
+        if (async_storage_writes) {
+            try std.testing.expectEqual(@as(usize, 0), rd.committed_entries.len);
+            try std.testing.expectEqual(message_mod.MessageType.storage_append, rd.messages[0].msg_type);
+            // RawNode.step releases the previous Ready's owned messages.
+            // Retain only the completion that this test will deliver.
+            const responses = rd.messages[0].responses;
+            var completion = try responses[responses.len - 1].clone(std.testing.allocator);
+            defer completion.deinit(std.testing.allocator);
+            try storage.append(rd.messages[0].entries);
+            if (rd.hard_state) |hard_state| storage.setHardState(hard_state);
+            try node.step(completion);
+            const apply = node.ready();
+            try std.testing.expectEqual(@as(usize, 1), apply.committed_entries.len);
+            try std.testing.expectEqual(@as(types.Term, 3), apply.committed_entries[0].term);
+        } else {
+            try storage.append(rd.entries);
+            if (rd.hard_state) |hard_state| storage.setHardState(hard_state);
+            node.advance(rd);
+        }
+        var restarted = try raw_node_mod.RawNode.init(std.testing.allocator, cfg, storage.storage());
+        defer restarted.deinit();
+        try std.testing.expectEqual(@as(types.Term, 3), restarted.raft.log.term(2).?);
+        try std.testing.expectEqual(@as(usize, 0), restarted.raft.log.entriesFrom(2)[0].data.len);
+    }
+}

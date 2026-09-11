@@ -693,7 +693,10 @@ pub const Raft = struct {
             if (self.pending_snapshot) |*snapshot| snapshot.deinit(self.alloc);
             self.pending_snapshot = null;
         }
-        if (rd.entries.len > 0) self.log.stableTo(rd.entries[rd.entries.len - 1].index);
+        if (rd.entries.len > 0) {
+            const persisted = rd.entries[rd.entries.len - 1];
+            self.log.stableTo(persisted.index, persisted.term);
+        }
         if (rd.committed_entries.len > 0) {
             self.log.appliedTo(rd.committed_entries[rd.committed_entries.len - 1].index);
             self.reduceUncommittedSizeEntries(rd.committed_entries);
@@ -822,7 +825,7 @@ pub const Raft = struct {
 
     fn handleStorageAppendResponse(self: *Raft, msg: message.Message) void {
         if (msg.term != 0 and msg.term != self.hard_state.current_term) return;
-        if (msg.log_index > 0) self.log.stableTo(msg.log_index);
+        if (msg.log_index > 0) self.log.stableTo(msg.log_index, msg.log_term);
         if (msg.snapshot != null) {
             if (self.pending_snapshot) |*snapshot| snapshot.deinit(self.alloc);
             self.pending_snapshot = null;
