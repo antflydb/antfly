@@ -830,6 +830,17 @@ test "http frame sender borrows capacity and drains a refused partial startup" {
     try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
     try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
     try std.testing.expect(driver.sender_io == null);
-    var probe = try lane.io().concurrent(Unused.done, .{});
+    // Awaiting the rolled-back future joins its body, but Threaded publishes
+    // completion before decrementing its busy count. Observe eventual capacity
+    // reuse through the public API instead of racing that worker bookkeeping.
+    const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s;
+    var probe = while (true) {
+        break lane.io().concurrent(Unused.done, .{}) catch {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline)
+                return error.TestBorrowedSenderCapacityNotReleased;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+    };
     probe.await(lane.io());
 }
