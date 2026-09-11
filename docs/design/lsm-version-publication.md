@@ -1,5 +1,45 @@
 # LSM version publication
 
+## Read-side ownership across storage and runtime boundaries
+
+Publication decisions read the generation's produced/skipped/failed tuple and
+range cardinality through one pinned store transaction. Atomic writes alone do
+not make independent point reads coherent: a concurrent first write can look
+like a corrupt partial tuple, and an outcome transition can yield an impossible
+sum. Target selection, completion admission, and repair classification use the
+same snapshot for related source/artifact counts. Status tuple hydration also
+uses a single revision. Genuine partial tuples and malformed counters remain
+errors; they are not retried as empty generations. Single-key metadata reads
+retain the cheaper live-probe path. No persisted format changes are needed.
+
+The NDJSON scan sink owns a reverse runtime dispatcher. Passing it as an argument
+through the storage dispatcher does not translate its nested callbacks' errors.
+Both callback directions now use the checked native boundary and stable status
+ABI. Local consumers retain private Zig errors; foreign consumers receive stable
+error classes/details. Slices remain borrowed and zero-copy, callbacks remain
+synchronous for backpressure, and the first consumer failure stops iteration.
+Separate static-library tests exercise both callback directions; sparse tests
+import the storage implementation directly rather than the application root.
+Hand-written streaming routes declare response-streaming capability at
+registration, independently from request-body mode. The exported route manifest
+then lends the HTTP response sink to the API kernel; an internal NDJSON scan
+must not fall through the buffered-only default and attempt to use a raw socket
+that belongs to another runtime. A manifest regression covers the real internal
+scan route and its buffered-query neighbor.
+
+Local arm64 ReleaseFast hot-metadata microbenchmark, 10,000 four-counter reads
+with the production allocator: LSM took 7.52 ms with independent probes versus
+3.66 ms with one snapshot; memory took 5.01 ms versus 2.35 ms. These are small
+in-memory counter fixtures, not cold-storage or end-to-end ingest measurements.
+Debug regressions retain leak checks and deterministically interleave atomic
+counter creation/transitions with pinned reads on both backends.
+
+```sh
+python3 tools/run_bounded_zig_build.py build runtime-scan-sink-test
+python3 tools/run_bounded_zig_build.py build antfly-storage-test -Doptimize=ReleaseFast -- 'derived coverage snapshot'
+python3 tools/run_bounded_zig_build.py build sparse-test
+```
+
 ## Logical-generation scheduling and unknown metadata
 
 ### Abandoned output ownership and bounded deletion

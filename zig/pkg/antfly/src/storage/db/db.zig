@@ -15376,31 +15376,16 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return false;
-        const produced = (try loadDerivedCoverageOutcomeCounterFromStore(
-            alloc,
-            self.core.store,
-            index_name,
-            generation,
-            "produced",
-        )) orelse return false;
-        const skipped = (try loadDerivedCoverageOutcomeCounterFromStore(
-            alloc,
-            self.core.store,
-            index_name,
-            generation,
-            "skipped",
-        )) orelse return false;
-        const terminal_failed = (try loadDerivedCoverageOutcomeCounterFromStore(
-            alloc,
-            self.core.store,
-            index_name,
-            generation,
-            "terminal_failed",
-        )) orelse return false;
+        var coverage_txn = try self.core.store.beginReadTxn();
+        defer coverage_txn.abort();
+        const counters = try DerivedCoverageCounters.load(alloc, &coverage_txn, index_name, generation);
+        const produced = counters.produced orelse return false;
+        const skipped = counters.skipped orelse return false;
+        const terminal_failed = counters.terminal_failed orelse return false;
         // Do not fall back to a primary-store scan on query admission. Modern
         // managed writes maintain this counter atomically; a missing legacy
         // counter simply leaves the durable repair owner in charge.
-        const source_total = (try range_cardinality.load(alloc, self.core.store)) orelse return false;
+        const source_total = (try range_cardinality.loadFromTxn(&coverage_txn)) orelse return false;
         const assessment = types.evaluateDerivedCoverageAssessment(
             policy,
             source_total,
@@ -15420,7 +15405,7 @@ pub const DB = struct {
                 // counter—not `produced`—is the active HBC cardinality
                 // authority.
                 const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
-                    (try loadDenseArtifactTargetCounter(alloc, self.core.store, index_name)) orelse break :blk false
+                    (try loadDenseArtifactTargetCounterFromTxn(alloc, &coverage_txn, index_name)) orelse break :blk false
                 else
                     produced;
                 // Posting cache freshness is intentionally absent here.
@@ -20776,11 +20761,14 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return .indeterminate;
-        const produced = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "produced");
-        const skipped = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "skipped");
-        const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(alloc, self.core.store, index_name, generation, "terminal_failed");
+        var coverage_txn = try self.core.store.beginReadTxn();
+        defer coverage_txn.abort();
+        const counters = try DerivedCoverageCounters.load(alloc, &coverage_txn, index_name, generation);
+        const produced = counters.produced;
+        const skipped = counters.skipped;
+        const terminal_failed = counters.terminal_failed;
 
-        const source_total = try range_cardinality.loadOrCount(alloc, self.core.store, self.core.index_manager.byte_range);
+        const source_total = try range_cardinality.loadOrCountFromTxn(alloc, &coverage_txn, self.core.index_manager.byte_range);
         const applied_sequence = try self.managedIndexAppliedSequence(alloc, index_name);
         const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg.*, applied_sequence);
         const replay_current = applied_sequence >= target_sequence;
@@ -28903,6 +28891,17 @@ pub const DB = struct {
         return std.mem.readInt(u64, raw[0..8], .little);
     }
 
+    fn loadDenseArtifactTargetCounterFromTxn(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, index_name: []const u8) !?u64 {
+        const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
+        return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
     fn initializeDenseArtifactTargetCounterForAdmission(
         self: *DB,
         cfg: types.IndexConfig,
@@ -33627,9 +33626,12 @@ pub const DB = struct {
 
     fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
         item.coverage_config_hash = config_hash;
-        const produced = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "produced");
-        const skipped = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "skipped");
-        const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(self.core.alloc, self.core.store, index_name, generation, "terminal_failed");
+        var coverage_txn = try self.core.store.beginReadTxn();
+        defer coverage_txn.abort();
+        const counters = try DerivedCoverageCounters.load(self.core.alloc, &coverage_txn, index_name, generation);
+        const produced = counters.produced;
+        const skipped = counters.skipped;
+        const terminal_failed = counters.terminal_failed;
 
         const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
             @as(u2, @intFromBool(skipped != null)) +
@@ -52203,6 +52205,118 @@ fn loadDerivedCoverageOutcomeCounterFromStore(
     return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
 }
 
+fn loadDerivedCoverageOutcomeCounterFromTxn(
+    alloc: Allocator,
+    txn: *docstore_mod.DocStore.Txn,
+    index_name: []const u8,
+    generation: u64,
+    outcome: []const u8,
+) !?u64 {
+    const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+    defer alloc.free(counter_key);
+    const raw = txn.get(counter_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+}
+
+/// Outcome creation and transitions are atomic writes. All members must be
+/// read from one revision too; independent point reads can manufacture a
+/// partial tuple or an impossible sum while a worker commits between reads.
+const DerivedCoverageCounters = struct {
+    produced: ?u64,
+    skipped: ?u64,
+    terminal_failed: ?u64,
+
+    fn load(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, index_name: []const u8, generation: u64) !@This() {
+        return .{
+            .produced = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "produced"),
+            .skipped = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "skipped"),
+            .terminal_failed = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "terminal_failed"),
+        };
+    }
+};
+
+test "db derived coverage snapshot stays coherent across atomic creation and transitions" {
+    // Debug retains leak instrumentation; optimized timing uses the server's
+    // allocator rather than measuring testing-allocator bookkeeping.
+    const alloc = if (builtin.mode == .ReleaseFast) std.heap.smp_allocator else std.testing.allocator;
+    inline for (.{ mem_backend_mod.Backend, lsm_backend_mod.Backend }) |Backend| {
+        var backend = Backend.init(alloc, if (Backend == mem_backend_mod.Backend) .{} else .{ .wal_enabled = false });
+        defer backend.close();
+        var runtime_store = try backend.runtimeStore(alloc, .{ .name = "coverage" });
+        defer runtime_store.deinit();
+        var store = try docstore_mod.DocStore.openRuntime(alloc, &runtime_store);
+        defer store.close();
+        const names = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+        var keys: [3][]u8 = undefined;
+        var initialized: usize = 0;
+        defer for (keys[0..initialized]) |key| alloc.free(key);
+        for (names, 0..) |name, i| {
+            keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, "dense", 7, name);
+            initialized += 1;
+        }
+        var before = try store.beginReadTxn();
+        defer before.abort();
+        try std.testing.expectEqual(@as(?u64, null), (try DerivedCoverageCounters.load(alloc, &before, "dense", 7)).produced);
+        var values: [4][8]u8 = undefined;
+        var writes: [4]docstore_mod.KVPair = undefined;
+        for (keys, 0..) |key, i| {
+            writes[i] = .{ .key = key, .value = internal_keys.encodeDerivedCoverageOutcomeCount(&values[i], if (i == 0) 1 else 0) };
+        }
+        writes[3] = .{ .key = &internal_keys.range_document_count_key, .value = internal_keys.encodeDerivedCoverageOutcomeCount(&values[3], 1) };
+        try store.putBatch(&writes, &.{});
+        const absent = try DerivedCoverageCounters.load(alloc, &before, "dense", 7);
+        try std.testing.expectEqual(@as(?u64, null), absent.produced);
+        try std.testing.expectEqual(@as(?u64, null), absent.skipped);
+        try std.testing.expectEqual(@as(?u64, null), absent.terminal_failed);
+        try std.testing.expectEqual(@as(?u64, null), try range_cardinality.loadFromTxn(&before));
+
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        // Move a source between outcomes and add a new source in one commit.
+        _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[0], 0);
+        _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[1], 2);
+        _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[3], 2);
+        try store.putBatch(&writes, &.{});
+        const old = try DerivedCoverageCounters.load(alloc, &pinned, "dense", 7);
+        try std.testing.expectEqual(@as(?u64, 1), old.produced);
+        try std.testing.expectEqual(@as(?u64, 0), old.skipped);
+        try std.testing.expectEqual(@as(?u64, 0), old.terminal_failed);
+        try std.testing.expectEqual(@as(?u64, 1), try range_cardinality.loadFromTxn(&pinned));
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        const next = try DerivedCoverageCounters.load(alloc, &current, "dense", 7);
+        try std.testing.expectEqual(@as(?u64, 0), next.produced);
+        try std.testing.expectEqual(@as(?u64, 2), next.skipped);
+        try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.loadFromTxn(&current));
+
+        if (builtin.mode == .ReleaseFast) {
+            const iterations = 10_000;
+            var independent_sum: u64 = 0;
+            const independent_start = std.Io.Clock.awake.now(std.testing.io);
+            for (0..iterations) |_| {
+                for (names) |name| independent_sum += (try loadDerivedCoverageOutcomeCounterFromStore(alloc, &store, "dense", 7, name)).?;
+                independent_sum += (try range_cardinality.load(alloc, &store)).?;
+            }
+            const independent_ns = independent_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+            var snapshot_sum: u64 = 0;
+            const snapshot_start = std.Io.Clock.awake.now(std.testing.io);
+            for (0..iterations) |_| {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                const counters = try DerivedCoverageCounters.load(alloc, &txn, "dense", 7);
+                snapshot_sum += counters.produced.? + counters.skipped.? + counters.terminal_failed.? + (try range_cardinality.loadFromTxn(&txn)).?;
+            }
+            const snapshot_ns = snapshot_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+            try std.testing.expectEqual(@as(u64, iterations * 4), independent_sum);
+            try std.testing.expectEqual(independent_sum, snapshot_sum);
+            std.debug.print("coverage read benchmark backend={s} iterations={d} independent_ns={d} snapshot_ns={d}\n", .{ @typeName(Backend), iterations, independent_ns, snapshot_ns });
+        }
+    }
+}
+
 fn scanDerivedCoverageOutcomeFromStore(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -61143,9 +61257,12 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         }
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
-    const produced = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "produced");
-    const skipped = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "skipped");
-    const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "terminal_failed");
+    var coverage_txn = try ctx.store.beginReadTxn();
+    defer coverage_txn.abort();
+    const counters = try DerivedCoverageCounters.load(ctx.alloc, &coverage_txn, index_name, generation);
+    const produced = counters.produced;
+    const skipped = counters.skipped;
+    const terminal_failed = counters.terminal_failed;
     const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
         @as(u2, @intFromBool(skipped != null)) +
         @as(u2, @intFromBool(terminal_failed != null));
@@ -61161,14 +61278,14 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         else
             false;
         if (requires_artifact_coverage) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            return try DB.loadDenseArtifactTargetCounterFromTxn(ctx.alloc, &coverage_txn, index_name);
         }
         // A fresh generation on an empty table has no outcome rows to create
         // the counter tuple. The range-local primary cardinality distinguishes
         // that valid zero target from missing accounting on a non-empty range.
-        const source_count = try range_cardinality.loadOrCount(
+        const source_count = try range_cardinality.loadOrCountFromTxn(
             ctx.alloc,
-            ctx.store,
+            &coverage_txn,
             ctx.index_manager.byte_range,
         );
         return if (source_count == 0) 0 else null;
@@ -61186,9 +61303,9 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         return error.InvalidDerivedCoverageCounter;
     const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
         return error.InvalidDerivedCoverageCounter;
-    const source_count = try range_cardinality.loadOrCount(
+    const source_count = try range_cardinality.loadOrCountFromTxn(
         ctx.alloc,
-        ctx.store,
+        &coverage_txn,
         ctx.index_manager.byte_range,
     );
     if (accounted != source_count) return null;
@@ -108287,6 +108404,16 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
 
     // Corrupt counters fail explicitly instead of wrapping into a false proof.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ std.math.maxInt(u64), 1, 0 });
+    try std.testing.expectError(
+        error.InvalidDerivedCoverageCounter,
+        denseTargetCountForIndexContext(db.async_context, config.name),
+    );
+
+    // A genuinely partial persisted tuple remains corruption. Snapshot reads
+    // must prevent races without turning this state into a valid new epoch.
+    const missing_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, config.name, generation, "skipped");
+    defer alloc.free(missing_key);
+    try db.core.store.delete(missing_key);
     try std.testing.expectError(
         error.InvalidDerivedCoverageCounter,
         denseTargetCountForIndexContext(db.async_context, config.name),

@@ -112,19 +112,7 @@ pub const ScanResponse = struct {
 /// Backpressure-aware byte sink for NDJSON scans. `start` is invoked exactly
 /// once after routing proves the table exists and before the first byte (also
 /// for an empty result). A write error aborts storage iteration immediately.
-pub const ScanStreamSink = struct {
-    context: ?*anyopaque,
-    start_fn: *const fn (?*anyopaque) anyerror!void,
-    write_fn: *const fn (?*anyopaque, []const u8) anyerror!void,
-
-    pub fn start(self: ScanStreamSink) !void {
-        try self.start_fn(self.context);
-    }
-
-    pub fn write(self: ScanStreamSink, bytes: []const u8) !void {
-        if (bytes.len != 0) try self.write_fn(self.context, bytes);
-    }
-};
+pub const ScanStreamSink = @import("../runtime_scan_sink.zig").ScanStreamSink;
 
 pub const ContentHashEntry = struct {
     id: []u8,

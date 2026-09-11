@@ -608,6 +608,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const scan_sink_provider = b.addLibrary(.{
+        .name = "runtime-scan-sink-test-provider",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const scan_sink_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scan_sink_test_mod.linkLibrary(scan_sink_provider);
+    const scan_sink_tests = b.addTest(.{
+        .root_module = scan_sink_test_mod,
+        .filters = &.{"scan sink"},
+    });
+    const run_scan_sink_tests = b.addRunArtifact(scan_sink_tests);
+    b.step("runtime-scan-sink-test", "Run scan callbacks across independent error domains").dependOn(&run_scan_sink_tests.step);
+
     const api_cluster_secret_status_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_cluster_test_root.zig"),
         .target = target,
@@ -1379,6 +1401,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
+        "linked API route manifest preserves internal scan response streaming",
+        "scan stream preserves chunk backpressure without buffered fallback",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
@@ -3831,6 +3855,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_runtime_io_abi_tests.step);
+    unit_test_step.dependOn(&run_scan_sink_tests.step);
 
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);

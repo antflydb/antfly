@@ -1625,6 +1625,14 @@ pub const Server = struct {
         try self.route(.POST, path, handler);
     }
 
+    /// Buffered request, streaming response. Native contexts already own the
+    /// transport; route-manifest adapters use this declaration to lend that
+    /// capability to independently compiled handlers. This is not a streamed
+    /// request body (see postStreaming).
+    pub fn postResponseStreaming(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.post(path, handler);
+    }
+
     pub fn postStreaming(self: *Self, path: []const u8, handler: anytype) !void {
         try self.routeStreaming(.POST, path, handler);
     }

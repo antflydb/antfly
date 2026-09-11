@@ -1043,7 +1043,7 @@ pub const AntflyApiHandler = struct {
         try server.post(group_prefix ++ routes.shard_ops_execute_suffix, httpx.Handler.bind(self, internalExecuteTransition));
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
-        try server.post(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
+        try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
         try server.post(table_prefix ++ routes.vector_worker_suffix, httpx.Handler.bind(self, internalGroupVectorWorker));
@@ -6790,6 +6790,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
             try self.inner.post(prefix ++ path, handler_fn);
+        }
+
+        pub fn postResponseStreaming(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            try self.inner.postResponseStreaming(prefix ++ path, handler_fn);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {

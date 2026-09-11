@@ -4697,7 +4697,7 @@ test "compaction admitted pinned execution handoff benchmark" {
 }
 
 test "compaction suspended broad directory continuation retains a wake deadline" {
-    const lsm = @import("../../root.zig").lsm_backend;
+    const lsm = @import("../lsm_backend.zig");
     const alloc = std.testing.allocator;
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -4716,7 +4716,7 @@ test "compaction suspended broad directory continuation retains a wake deadline"
     {
         try std.testing.expect(backend.mu.tryLock());
         defer backend.mu.unlock();
-        try std.testing.expect(!try lsm.compaction.maybeCompactRunsScheduled(lsm.Backend, &backend, 1));
+        try std.testing.expect(!try maybeCompactRunsScheduled(lsm.Backend, &backend, 1));
     }
     try std.testing.expect(backend.pending_directory_closure != null);
     manager.foreground_query_sessions.store(1, .release);
