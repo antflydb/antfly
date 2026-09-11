@@ -911,10 +911,16 @@ pub const Store = struct {
             self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
         }
         if (explicit_map_key) |map_key| {
-            if (self.idempotency.get(map_key)) |job_id| {
+            existing: {
+                const job_id = self.idempotency.get(map_key) orelse break :existing;
                 const encoded = self.jobs.get(job_id) orelse return error.CorruptRestoreJobStore;
                 var parsed = try std.json.parseFromSlice(JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
+                // A bounded periodic prune may not have reached this key yet.
+                if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) {
+                    try self.retireExpiredJobLocked(parsed.value);
+                    break :existing;
+                }
                 const same_request = std.mem.eql(u8, parsed.value.request_fingerprint, fingerprint);
                 const reauthorize = destinationReauthorizationMatches(parsed.value, req);
                 if (!same_request and !reauthorize) return error.IdempotencyConflict;
@@ -1023,23 +1029,51 @@ pub const Store = struct {
         if (self.replicated) |replicated| {
             const key = try jobKey(alloc, job_id);
             defer alloc.free(key);
-            const committed = replicated.create(alloc, key, encoded, self.replicated_leadership_term) catch
-                return .{ .unknown = encoded };
-            var state = std.json.parseFromSlice(JobState, alloc, committed, .{ .ignore_unknown_fields = true }) catch {
-                alloc.free(committed);
-                return .{ .unknown = encoded };
-            };
-            defer state.deinit();
-            if (state.value.job_id != job_id or
-                !std.mem.eql(u8, state.value.idempotency_namespace, req.idempotency_namespace) or
-                !std.mem.eql(u8, state.value.idempotency_key, req.idempotency_key.?) or
-                !std.mem.eql(u8, state.value.request_fingerprint, fingerprint))
-            {
-                alloc.free(committed);
-                return error.IdempotencyConflict;
+            var retired_expired = false;
+            while (true) {
+                const committed = replicated.create(alloc, key, encoded, self.replicated_leadership_term) catch
+                    return .{ .unknown = encoded };
+                var state = std.json.parseFromSlice(JobState, alloc, committed, .{ .ignore_unknown_fields = true }) catch {
+                    alloc.free(committed);
+                    return .{ .unknown = encoded };
+                };
+                defer state.deinit();
+                if (state.value.job_id != job_id or
+                    !std.mem.eql(u8, state.value.idempotency_namespace, req.idempotency_namespace) or
+                    !std.mem.eql(u8, state.value.idempotency_key, req.idempotency_key.?))
+                {
+                    alloc.free(committed);
+                    return error.IdempotencyConflict;
+                }
+                validateProgressState(state.value) catch {
+                    alloc.free(committed);
+                    return .{ .unknown = encoded };
+                };
+                // Older caches could forget an expired row without deleting it.
+                // Retire that exact key under the same leadership fence, then
+                // retry conditional creation once. Never accept expired history
+                // or compare a new request against its expired fingerprint.
+                if (isTerminal(state.value.phase) and state.value.expires_at_ms <= nowMillis()) {
+                    if (retired_expired) {
+                        alloc.free(committed);
+                        return .{ .unknown = encoded };
+                    }
+                    self.retireExpiredJobLocked(state.value) catch {
+                        alloc.free(committed);
+                        return .{ .unknown = encoded };
+                    };
+                    alloc.free(committed);
+                    retired_expired = true;
+                    continue;
+                }
+                if (!std.mem.eql(u8, state.value.request_fingerprint, fingerprint)) {
+                    alloc.free(committed);
+                    return error.IdempotencyConflict;
+                }
+                alloc.free(encoded);
+                encoded = committed;
+                break;
             }
-            alloc.free(encoded);
-            encoded = committed;
         }
         var admitted = std.json.parseFromSlice(JobState, alloc, encoded, .{ .ignore_unknown_fields = true }) catch |err| {
             if (self.replicated != null) return .{ .unknown = encoded };
@@ -1221,21 +1255,7 @@ pub const Store = struct {
             if (parsed.value.job_id != job_id) return error.CorruptRestoreJobStore;
             try validateProgressState(parsed.value);
             if (isTerminal(parsed.value.phase) and parsed.value.expires_at_ms <= nowMillis()) {
-                const map_key = if (parsed.value.idempotency_explicit)
-                    try idempotencyMapKeyAlloc(alloc, parsed.value.idempotency_namespace, parsed.value.idempotency_key)
-                else
-                    null;
-                defer if (map_key) |value_key| alloc.free(value_key);
-                if (self.jobs.fetchRemove(job_id)) |removed| {
-                    self.retained_bytes -= removed.value.len;
-                    self.alloc.free(removed.value);
-                    _ = self.job_revisions.remove(job_id);
-                    self.markStoreMutationLocked();
-                    self.removeHistoryLocked(job_id);
-                }
-                if (map_key) |value_key| {
-                    if (self.idempotency.fetchRemove(value_key)) |removed| self.alloc.free(removed.key);
-                }
+                try self.retireExpiredJobLocked(parsed.value);
                 return;
             }
             // Keep expiry handling above this fast path. Unchanged polls
@@ -1738,6 +1758,33 @@ pub const Store = struct {
         if (try self.jobs.fetchPut(self.alloc, job_id, owned)) |previous| self.alloc.free(previous.value);
         self.markJobMutationLocked(job_id);
         self.retained_bytes = next_bytes;
+    }
+
+    /// Keep the cache and key reservation intact unless durable deletion is
+    /// confirmed. The store mutex orders same-leader re-admission; replicated
+    /// deletion fences other leaders with replicated_leadership_term.
+    fn retireExpiredJobLocked(self: *Store, state: JobState) !void {
+        std.debug.assert(isTerminal(state.phase));
+        const job_id = state.job_id;
+        const key = try jobKey(self.alloc, job_id);
+        defer self.alloc.free(key);
+        const map_key = if (state.idempotency_explicit)
+            try idempotencyMapKeyAlloc(self.alloc, state.idempotency_namespace, state.idempotency_key)
+        else
+            null;
+        defer if (map_key) |value| self.alloc.free(value);
+        try self.persistDeleteLocked(key);
+        // No fallible work after the durable boundary.
+        if (self.jobs.fetchRemove(job_id)) |removed| {
+            self.retained_bytes -= removed.value.len;
+            self.alloc.free(removed.value);
+            _ = self.job_revisions.remove(job_id);
+            self.markStoreMutationLocked();
+            self.removeHistoryLocked(job_id);
+        }
+        if (map_key) |value| {
+            if (self.idempotency.fetchRemove(value)) |removed| self.alloc.free(removed.key);
+        }
     }
 
     fn pruneExpiredLocked(self: *Store, now_ms: u64, limit: usize) !bool {
@@ -2327,6 +2374,8 @@ const TestReplicatedPersistence = struct {
     fail_load_private: bool = false,
     fail_put_private: bool = false,
     timeout_after_create: bool = false,
+    fail_delete: bool = false,
+    timeout_after_delete: bool = false,
     fail_delete_many: bool = false,
     private_failure_count: usize = 0,
     last_private_failure: ?ReplicatedPersistence.LocalFailure = null,
@@ -2425,6 +2474,7 @@ const TestReplicatedPersistence = struct {
 
     fn delete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        if (self.fail_delete) return error.RestoreJobPersistenceUnavailable;
         self.last_mutation_term = leadership_term;
         if (self.required_leadership_term) |required| {
             if (leadership_term != required) return error.NotLeader;
@@ -2433,6 +2483,7 @@ const TestReplicatedPersistence = struct {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
         }
+        if (self.timeout_after_delete) return error.MetadataMutationOutcomeUnknown;
     }
 
     fn deleteMany(ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) !void {
@@ -2533,6 +2584,127 @@ test "replicated restore persistence maps private callback errors to stable unav
     try std.testing.expectEqual(@as(usize, 2), persistence.private_failure_count);
     try std.testing.expectEqual(ReplicatedPersistence.LocalOperation.put, persistence.last_private_failure.?.operation);
     try std.testing.expectEqualStrings("TestRestoreJobPutPrivateFailure", @errorName(persistence.last_private_failure.?.err));
+}
+
+test "restore admission recovers generated identity after polled expiry" {
+    const alloc = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    const req: StartRequest = .{
+        .scope = .table,
+        .table_name = "docs",
+        .backup_id = "daily",
+        .location = "file:///daily",
+        .connection = "local-reader",
+        .idempotency_namespace = "principal:admin:table:docs",
+        .idempotency_key = "reusable-after-retention",
+    };
+    const initial = try store.start(alloc, req);
+    defer alloc.free(initial);
+    var parsed = try std.json.parseFromSlice(JobState, alloc, initial, .{});
+    defer parsed.deinit();
+    parsed.value.phase = .succeeded;
+    parsed.value.not_before_ms = 0;
+    parsed.value.expires_at_ms = 0;
+    const expired = try encode(alloc, parsed.value);
+    defer alloc.free(expired);
+    const key = try jobKey(alloc, parsed.value.job_id);
+    defer alloc.free(key);
+    try TestReplicatedPersistence.put(&persistence, key, expired, 0);
+    try std.testing.expectEqual(@as(?[]u8, null), try store.load(alloc, parsed.value.job_id));
+    const retried = try store.start(alloc, req);
+    defer alloc.free(retried);
+    var retry_state = try std.json.parseFromSlice(JobState, alloc, retried, .{});
+    defer retry_state.deinit();
+    try std.testing.expectEqual(Phase.queued, retry_state.value.phase);
+}
+
+test "restore expiry preserves durable ownership through deletion faults and stale caches" {
+    const Path = enum { poll, cached_retry, uncached_retry };
+    const Fault = enum { none, before_delete, after_delete, leadership_loss };
+    for (std.enums.values(Path)) |path| {
+        for (std.enums.values(Fault)) |fault| {
+            const alloc = std.testing.allocator;
+            var persistence = TestReplicatedPersistence.init(alloc);
+            defer persistence.deinit();
+            var store = Store.initWithIo(alloc, std.testing.io);
+            defer store.deinit();
+            try store.attachReplicated(persistence.persistence());
+            try store.prepareReplicatedLeadership(alloc, 7);
+            var req: StartRequest = .{
+                .scope = .table,
+                .table_name = "docs",
+                .backup_id = "daily",
+                .location = "file:///daily",
+                .connection = "local-reader",
+                .idempotency_namespace = "principal:admin:table:docs",
+                .idempotency_key = "reuse",
+            };
+            const initial = try store.start(alloc, req);
+            defer alloc.free(initial);
+            var parsed = try std.json.parseFromSlice(JobState, alloc, initial, .{});
+            defer parsed.deinit();
+            parsed.value.phase = .succeeded;
+            parsed.value.not_before_ms = 0;
+            parsed.value.expires_at_ms = 0;
+            const job_id = parsed.value.job_id;
+            const expired = try encode(alloc, parsed.value);
+            defer alloc.free(expired);
+            try store.storeLocked(job_id, expired);
+            if (path == .uncached_retry) store.clearInMemoryLocked();
+            // Exercise targeted expiry independently of periodic batch order.
+            store.next_prune_at_ms = std.math.maxInt(u64);
+            persistence.fail_delete = fault == .before_delete;
+            persistence.timeout_after_delete = fault == .after_delete;
+            persistence.required_leadership_term = if (fault == .leadership_loss) 8 else 7;
+            req.backup_id = "next-day";
+            if (fault != .none) {
+                const expected_error = switch (fault) {
+                    .before_delete => error.RestoreJobPersistenceUnavailable,
+                    .after_delete => error.MetadataMutationOutcomeUnknown,
+                    .leadership_loss => error.NotLeader,
+                    .none => unreachable,
+                };
+                switch (path) {
+                    .poll => try std.testing.expectError(expected_error, store.load(alloc, job_id)),
+                    .cached_retry => try std.testing.expectError(expected_error, store.startRecoverable(alloc, req)),
+                    .uncached_retry => {
+                        const admission = try store.startRecoverable(alloc, req);
+                        switch (admission) {
+                            .unknown => |value| alloc.free(value),
+                            .accepted => |value| {
+                                alloc.free(value);
+                                return error.TestUnexpectedResult;
+                            },
+                        }
+                    },
+                }
+                if (path != .uncached_retry) {
+                    try std.testing.expectEqualStrings(expired, store.jobs.get(job_id).?);
+                    try std.testing.expectEqual(@as(u32, 1), store.idempotency.count());
+                }
+            }
+            persistence.fail_delete = false;
+            persistence.timeout_after_delete = false;
+            persistence.required_leadership_term = 7;
+            if (path == .poll) try std.testing.expectEqual(@as(?[]u8, null), try store.load(alloc, job_id));
+            const retried = try store.start(alloc, req);
+            defer alloc.free(retried);
+            var result = try std.json.parseFromSlice(JobState, alloc, retried, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(Phase.queued, result.value.phase);
+            try std.testing.expectEqualStrings("next-day", result.value.backup_id);
+            try std.testing.expectEqual(@as(u32, 1), persistence.rows.count());
+            try std.testing.expectEqual(@as(u32, 1), store.jobs.count());
+            try std.testing.expectEqual(@as(usize, 1), store.history.items.len);
+            const runnable = try store.takePendingIds(alloc, 2);
+            defer alloc.free(runnable);
+            try std.testing.expectEqualSlices(u64, &.{job_id}, runnable);
+        }
+    }
 }
 
 test "restore admission recovers generated identity after an unknown commit without duplicating jobs" {

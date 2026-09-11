@@ -4,6 +4,39 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: restore expiry must retire durable idempotency ownership (#694)
+
+Fresh review of `0126d8b30` reproduced an expiry regression: after a terminal
+job's seven-day retention period, a detail poll evicted only the local record.
+Conditional admission then rediscovered the expired durable row, returned it
+as accepted, and queued no work. The next detail poll returned not found.
+The deterministic polled-expiry regression passed with main's restore-store
+implementation (`c3bc001353`) and failed on the PR with
+`expected .queued, found .succeeded`. Evidence:
+`/private/tmp/ci694-review-expiry-base-focused.log` and
+`/private/tmp/ci694-review-expiry-test.log`.
+
+Expiry now confirms durable deletion under the store's leadership term before
+releasing the cache and key reservation. Re-admission checks the requested key
+even when bounded periodic pruning has not reached it. Conditional creation
+also retires matching expired records left by older caches, then retries
+creation once; it never accepts an expired record or deletes a different key
+after a hash collision. Failed or uncertain deletion preserves cached ownership.
+The ordinary admission path adds no extra persistence round.
+
+Regressions cover polling, cached retry, and an uncached durable record across
+successful deletion, failure before deletion, an unknown outcome after deletion,
+and leadership loss. They verify a changed request can reuse an expired key and
+creates exactly one durable job, history entry, and runnable item. Run
+`zig build antfly-api-restore-jobs-test -Doptimize=Debug`.
+Short-lived E2E soaks do not exercise the retention boundary.
+
+Validation: **26 restore-store tests** (including the 12 fault combinations)
+and **36 restore HTTP tests** passed in native Debug with no skips, failures,
+or leaks. Both focused builds completed all 14 steps. Zig formatting and
+`git diff --check` pass. Logs: `/private/tmp/ci694-expiry-fixed-tests.log` and
+`/private/tmp/ci694-expiry-http-tests.log`.
+
 ## 2026-09-11: recoverable restore admission and bounded progress retirement (#694)
 
 Review found a remaining admission gap: a Raft wait can time out before an

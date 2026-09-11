@@ -1,5 +1,21 @@
 # Zig E2E flakes
 
+## 2026-09-11: expired restore key reuse found during soak review (#694)
+
+Review of `0126d8b30` found a seven-day expiry case outside the short-lived E2E
+scenarios: polling forgot the local job without deleting its durable key, so
+conditional re-admission returned expired history and never queued a restore.
+The deterministic regression passes with main's restore-store implementation
+and fails on that PR revision. Expiry now confirms durable retirement before
+releasing local ownership, and admission recovers expired records left behind
+by older caches. Fault regressions cover deletion failure, unknown deletion
+outcomes, leadership loss, and exactly-once requeue after recovery. See
+`../FLAKES.md` for evidence and the focused Debug command.
+
+The native Debug soak started at 2026-09-11 16:31:39 UTC uses `0126d8b30`.
+Its results are historical for this fix; fresh acceptance must use a rebuilt
+binary. Issue #705's separate heap-corruption failure remains unresolved.
+
 ## 2026-09-11: restore admission recovery and range cleanup (#694)
 
 The second retained `0259bab66` metadata backup failure contains two jobs for
