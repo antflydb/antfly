@@ -708,7 +708,7 @@ bundling and the Raft transport's per-group split. Using the existing codec, a
 ReleaseFast, page-allocator encoding run measured 20.817 → 0.200 ms at 10,000
 groups. Allocator/frame overhead dominates this component comparison; it is not
 HTTP throughput or production transport latency. The raw artifact retains all
-caps and sizes. No production Raft transport semantics changed in this PR.
+caps and sizes. At that revision, production transport still sent isolated frames.
 Route-aware retries, bounded queue ownership and failure/latency workloads are
 specified before a separate live transport-bundling change.
 
@@ -846,6 +846,121 @@ uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
   --listing-page-size 25 --samples 10 --warmup 3 \
   --output /tmp/catalog-checkpoint-cluster.json
 ```
+
+## Bounded manifests, runtime references and routed heartbeats — 2026-09-11
+
+Production sources: baseline `6e5cc393a`, updated `a0b3dfe0a`, with `main` merged
+through `6ae2ddb37`. The baseline report fixture was adjusted to the same reporter
+incarnation (77) and status generation (1), and the production heartbeat harness
+was copied unchanged to it. No baseline production code changed. Updated builds
+used the sources subsequently committed as `a0b3dfe0a`.
+
+[Raw component and clustered observations](system_catalog_bounded_reports_2026_09_11.json)
+retain settings and all measured group counts. Component benchmarks use
+ReleaseFast and seven-sample medians. Builds, tests and benchmark scenarios from
+this task did not overlap the timed measurements; unrelated host activity was
+uncontrolled. These are local development measurements.
+
+### Report apply and bounded persistence
+
+The apply interval includes command decoding, projection, checkpoint persistence
+and transaction commit. It excludes proposal encoding, replication, network and
+registered service callback fanout. Both fixtures change the capacity header on
+every sample. Report allocation uses the C allocator.
+
+| 10,000 groups per store | Before apply p50 (ms) | After apply p50 (ms) | Before WAL bytes | After WAL bytes |
+| --- | --- | --- | --- | --- |
+| Cached full report | 12.708 | 13.184 | 304 | 304 |
+| Fresh observation clocks | 17.802 | 16.572 | 1,053,369 | 253,295 |
+| One changed group | 12.174 | 13.108 | 858,763 | 61,841 |
+| Every group changed | 33.241 | 33.084 | 9,923,683 | 9,616,373 |
+
+Membership now lives in 64-group pages of 48-byte entries; a small root directory
+changes only when live pages change. Sparse payload updates no longer rewrite
+an 800 KB membership row, and observation clocks no longer have redundant hashes
+in that row. The one-group case writes 13.9 times fewer WAL bytes. This is a
+write-amplification improvement, not a universal CPU improvement: cached and
+one-group apply medians increased modestly. Full-store hydration measured
+4.185 → 3.535 ms; the unchanged header-only drain path measured 0.0333 → 0.0070 ms,
+too small and noisy to attribute to a new optimization.
+
+The additional runtime-reference scenario transmits a 1,230,124-byte Raft command
+instead of 8,210,124 bytes, an 85% reduction. It retains committed runtime
+observations and sends current group facts. Apply writes 304 WAL bytes but takes
+21.206 ms, versus 13.184 ms for the updated full cached report. Reading and
+reconstructing the retained observations costs CPU; removing an extra owned clone
+did not eliminate that tradeoff. Changed runtime observations still use full
+reports. No distributed heartbeat-latency improvement is claimed.
+
+Projection-cache tests separately verify that header-only changes retain report
+arrays, payload changes reload only their store, and unrelated stores retain
+ownership. The bounded invalidation queue falls back to a full refresh after
+overflow, snapshot replacement or failure. These allocation/ownership regressions
+do not measure complete reconciliation latency; consumer snapshot cloning remains.
+
+### Production heartbeat host
+
+The counting driver measures production route lookup, grouping and encoding,
+excluding HTTP and receiver work. Routes are installed outside timing; the
+allocator is the page allocator in both runs.
+
+| Ready groups sharing a route | Frames before → after | Host send p50 before → after (ms) |
+| --- | --- | --- |
+| 100 | 100 → 1 | 0.293 → 0.007 |
+| 1,000 | 1,000 → 4 | 2.546 → 0.052 |
+| 10,000 | 10,000 → 40 | 20.193 → 0.516 |
+
+At 10,000 groups, encoded bytes fall from 1,060,000 to 880,720. Group/source/route
+identity, terms and contexts are retained. Failures become per-group retries with
+current route lookup and bounded retained bytes. Per-group ticks and consensus
+processing remain. Deterministic tests cover mixed routes, source identity,
+endpoint metadata, ordering, byte/group caps, read contexts and retry route removal.
+This is not a measurement of network throughput, hot-group latency, elections or
+10,000 simultaneously running ranges. The larger workload matrix in
+[heartbeat bundling](HEARTBEAT_BUNDLING.md) remains production capacity validation.
+
+### Final live discovery observation
+
+A disposable three-metadata/three-data-node Debug cluster completed the 30-table,
+200-field discovery workload, with ten samples after three warmups. Startup,
+provisioning and readiness are outside timing. Binary SHA-256:
+`6c8adc2ea7836472d12808f0bd961190f0ad0d2e768df1249275af2fc6c26100`.
+
+| Operation | p50 (ms) | p95 (ms) |
+| --- | --- | --- |
+| One-table namespace | 24.491 | 172.589 |
+| Prefix selecting one table | 15.761 | 24.273 |
+| Full inventory | 78.945 | 83.925 |
+| Single-table detail | 26.711 | 376.566 |
+| Empty default namespace | 27.041 | 32.957 |
+| First 25-row page | 65.592 | 383.748 |
+| Complete cursor walk | 83.349 | 375.142 |
+
+This is an unpaired final application observation. It establishes that the
+workload completed, not a cluster-wide speedup or resolution of earlier
+100-table storage-read failures. Large tails remain.
+
+### Validation and compatibility boundary
+
+The measured server sources built successfully with 68 metadata-storage, 58 API
+and 102 metadata-service tests passing. All 395 Raft tests passed, including the
+new failure and frame-boundary regressions. The 22 selected catalog, migration,
+sorting and authorization E2E cases passed in 75.61 seconds on the recorded binary.
+The subsequent compatibility clarification passed 59 standalone tests (including
+main JSON/Lite checkpoints and current HA logical seeds) and all 101 catalog/store
+tests after removing obsolete development-index cleanup.
+
+TypeScript passed 282 tests with one skipped; SDK and Antfarm type checks passed.
+Go `oapi`, ten Python response tests, Python/Zig generation checks and changed-file
+formatting passed. The embedded Antfarm bundle was regenerated with the pinned
+toolchain. These checks do not constitute a full repository-suite run.
+
+New catalog errors use the required shared `error` field and stable `code`.
+Seven resource-mutation operations now expose typed committed-but-not-yet-visible
+HTTP 202 responses in generated clients. Compatibility remains for shipped
+`main` records, watermarks and standalone checkpoints, plus the current logical
+HA seed import contract. Intermediate catalog layouts from this unmerged PR are
+not supported migration inputs.
 
 ## Reproduction
 

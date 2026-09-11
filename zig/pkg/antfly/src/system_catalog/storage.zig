@@ -221,19 +221,15 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
     defer index.deinit(alloc);
     const prefix = try namePrefixAlloc(alloc, group_id);
     defer alloc.free(prefix);
-    const legacy_prefix = try keyAlloc(alloc, group_id, "name:");
-    defer alloc.free(legacy_prefix);
-    for ([_][]const u8{ prefix, legacy_prefix }) |p| {
-        const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, p);
-        defer {
-            for (rows) |row| {
-                alloc.free(row.key);
-                alloc.free(row.value);
-            }
-            alloc.free(rows);
+    const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
         }
-        for (rows) |row| try txn.delete(row.key);
+        alloc.free(rows);
     }
+    for (rows) |row| try txn.delete(row.key);
     for (state.value.resources) |resource| {
         const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
         defer alloc.free(key);

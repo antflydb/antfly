@@ -750,6 +750,9 @@ const LocalStandaloneMetadata = struct {
     routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
 
     const PersistedCatalog = struct {
+        // Current HA logical seeds carry this state. Checkpoints written by
+        // main omit it. This is an active restore contract, not a migration
+        // promise for catalog layouts from earlier revisions of this PR.
         system_catalog: system_catalog.State = .{},
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
@@ -10611,7 +10614,7 @@ test "system catalog standalone routing generation retains old identity through 
     try std.testing.expect(current.table_indexes.contains("new"));
 }
 
-test "system catalog standalone migrates legacy local and Lite catalogs atomically" {
+test "system catalog standalone imports main checkpoints and current logical seeds atomically" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10621,63 +10624,70 @@ test "system catalog standalone migrates legacy local and Lite catalogs atomical
         .{ .kind = .database, .id = 10, .name = "analytics" },
         .{ .kind = .namespace, .id = 11, .parent_id = 10, .name = "public" },
     };
-    const legacy = try std.json.Stringify.valueAlloc(alloc, LocalStandaloneMetadata.PersistedCatalog{
+    const logical_seed = try std.json.Stringify.valueAlloc(alloc, LocalStandaloneMetadata.PersistedCatalog{
         .epoch = 7,
         .system_catalog = .{ .revision = 3, .next_id = 12, .resources = &resources },
         .tables = &.{.{ .table_id = 77, .name = "legacy" }},
         .ranges = &.{.{ .table_id = 77, .group_id = 7001, .start_key = "" }},
     }, .{});
-    defer alloc.free(legacy);
-    for ([_]antfly.common.config.StorageEngine{ .local, .lite }) |engine| {
-        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}{s}", .{ tmp.sub_path, @tagName(engine), if (engine == .lite) ".aflite" else ".json" });
-        defer alloc.free(path);
-        {
-            var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{}) else null;
-            defer if (lite) |*handle| handle.deinit();
-            const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
-            if (store) |target| {
-                var txn = try target.beginWrite();
+    defer alloc.free(logical_seed);
+    // Main's JSON checkpoint has no system_catalog field. The current HA
+    // seed does; both enter the same atomic row import path.
+    const main_checkpoint = "{\"epoch\":7,\"tables\":[{\"table_id\":77,\"name\":\"legacy\"}],\"ranges\":[{\"table_id\":77,\"group_id\":7001,\"start_key\":\"\"}]}";
+    for ([_]bool{ true, false }) |from_main| {
+        const input = if (from_main) main_checkpoint else logical_seed;
+        for ([_]antfly.common.config.StorageEngine{ .local, .lite }) |engine| {
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}-{s}{s}", .{ tmp.sub_path, if (from_main) "main" else "seed", @tagName(engine), if (engine == .lite) ".aflite" else ".json" });
+            defer alloc.free(path);
+            {
+                var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.openOrCreate(alloc, path, .{}) else null;
+                defer if (lite) |*handle| handle.deinit();
+                const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
+                if (store) |target| {
+                    var txn = try target.beginWrite();
+                    var txn_open = true;
+                    defer if (txn_open) txn.abort();
+                    try txn.put("catalog", input);
+                    try txn.commit();
+                    txn_open = false;
+                    try target.sync(true);
+                } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, input);
+                var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
+                defer metadata.deinit();
+                try std.testing.expect(!metadata.catalog_rows_initialized);
+                const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = if (from_main) .{ .action = .create, .kind = .database, .name = "warehouse" } else .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
+                alloc.free(renamed);
+                try std.testing.expect(metadata.catalog_rows_initialized);
+            }
+            {
+                var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
+                defer if (lite) |*handle| handle.deinit();
+                const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
+                var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
+                defer metadata.deinit();
+                try std.testing.expect(metadata.catalog_rows_initialized);
+                const warehouse = metadata.system_catalog_state.?.index.find(.database, 0, "warehouse").?;
+                if (!from_main) try std.testing.expectEqual(@as(u64, 10), warehouse.id);
+                try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "analytics") == null);
+                try std.testing.expectEqualStrings("legacy", metadata.manager.tables.get(77).?.name);
+                try std.testing.expectEqual(@as(u64, 77), metadata.manager.ranges.get(7001).?.table_id);
+                // The old source still exists; a malformed new-format head must
+                // fail closed instead of silently returning that stale catalog.
+                const durable = try metadata.durableCatalogStore();
+                var txn = try durable.beginWrite();
                 var txn_open = true;
                 defer if (txn_open) txn.abort();
-                try txn.put("catalog", legacy);
+                try txn.put(LocalStandaloneMetadata.catalog_head_key, "{\"version\":999,\"epoch\":8,\"revision\":4,\"next_id\":12}");
                 try txn.commit();
                 txn_open = false;
-                try target.sync(true);
-            } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, legacy);
-            var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
-            defer metadata.deinit();
-            try std.testing.expect(!metadata.catalog_rows_initialized);
-            const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
-            alloc.free(renamed);
-            try std.testing.expect(metadata.catalog_rows_initialized);
-        }
-        {
-            var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
-            defer if (lite) |*handle| handle.deinit();
-            const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
-            var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
-            defer metadata.deinit();
-            try std.testing.expect(metadata.catalog_rows_initialized);
-            try std.testing.expectEqual(@as(u64, 10), metadata.system_catalog_state.?.index.find(.database, 0, "warehouse").?.id);
-            try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "analytics") == null);
-            try std.testing.expectEqualStrings("legacy", metadata.manager.tables.get(77).?.name);
-            try std.testing.expectEqual(@as(u64, 77), metadata.manager.ranges.get(7001).?.table_id);
-            // The old source still exists; a malformed new-format head must
-            // fail closed instead of silently returning that stale catalog.
-            const durable = try metadata.durableCatalogStore();
-            var txn = try durable.beginWrite();
-            var txn_open = true;
-            defer if (txn_open) txn.abort();
-            try txn.put(LocalStandaloneMetadata.catalog_head_key, "{\"version\":999,\"epoch\":8,\"revision\":4,\"next_id\":12}");
-            try txn.commit();
-            txn_open = false;
-            try durable.sync(true);
-        }
-        {
-            var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
-            defer if (lite) |*handle| handle.deinit();
-            const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
-            try std.testing.expectError(error.InvalidCatalogRecord, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine));
+                try durable.sync(true);
+            }
+            {
+                var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
+                defer if (lite) |*handle| handle.deinit();
+                const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
+                try std.testing.expectError(error.InvalidCatalogRecord, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine));
+            }
         }
     }
 }

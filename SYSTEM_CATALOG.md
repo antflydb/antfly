@@ -118,6 +118,12 @@ and the logical binding together. Reopen and snapshot installation retain the
 catalog. System catalog admission requires topology protocol version 5;
 existing atomic table operations retain their version-3 gate.
 
+Catalog failures use the shared JSON `error` field plus a machine-readable `code`.
+Resource mutations that have committed but are not yet visible return typed HTTP
+202 with `status: "committed_visibility_pending"`; clients observe the resource
+with GET rather than replaying the mutation. The OpenAPI contract and generated
+clients preserve this outcome.
+
 Data nodes read the catalog directly from a remembered metadata endpoint,
 without a preceding status RPC. Each successful read returns metadata group and
 incarnation evidence. The reader validates it against its pinned identity and
@@ -411,6 +417,9 @@ records, the standalone catalog input, and applied-batch watermarks. Intermediat
 catalog layouts introduced only during this unmerged PR are not upgrade inputs.
 There are no migrations between those development layouts; recreate disposable
 development data when changing between them.
+The logical catalog JSON reader also serves current HA seed import, including
+the new catalog resources. That active restore contract remains supported; it
+is not a migration between development layouts.
 
 Cached store heartbeats may reference committed runtime observations by exact
 reporter incarnation and status generation. A separate internal heartbeat endpoint
