@@ -16,11 +16,14 @@
 
 import json
 import tempfile
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+import requests
 from helpers import wait_until
 
 
@@ -420,3 +423,37 @@ def test_catalog_ddl_burst_recovers_exact_resource_identities(stateful_api):
         namespaces = api.get(f"/databases/{name}/namespaces")
         assert {row["name"] for row in namespaces} == {"public"}
         api.delete(f"/databases/{name}")
+
+
+def test_concurrent_catalog_drop_never_reclassifies_private_tables(stateful_api):
+    api = stateful_api
+    database = "private_" + uuid.uuid4().hex[:12]
+    api.post(f"/databases/{database}", {})
+    marker = "private listing " + database
+    stopped = threading.Event()
+    ready = threading.Barrier(5, timeout=30)
+
+    def list_default():
+        with requests.Session() as client:
+            client.headers.update(api.s.headers)
+            ready.wait()
+            while not stopped.is_set():
+                response = client.get(api.url + "/tables", timeout=30)
+                response.raise_for_status()
+                assert all(row.get("description") != marker for row in response.json())
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            readers = [pool.submit(list_default) for _ in range(4)]
+            try:
+                ready.wait()
+                for i in range(40):
+                    path = f"/databases/{database}/namespaces/public/tables/t{i}"
+                    api.post(path, {"description": marker})
+                    api.delete(path)
+            finally:
+                stopped.set()
+                for reader in readers:
+                    reader.result()
+    finally:
+        api.delete(f"/databases/{database}")

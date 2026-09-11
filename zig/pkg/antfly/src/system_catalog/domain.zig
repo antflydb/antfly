@@ -312,6 +312,7 @@ pub const StateIndex = struct {
     /// Reserve every index before publishing a delta. Applying or undoing the
     /// prepared delta subsequently allocates nothing.
     fn reserve(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) !void {
+        errdefer self.pruneEmptyParents(alloc, resources);
         const n: u32 = @intCast(resources.len);
         try self.names.ensureUnusedCapacity(alloc, n);
         try self.ids.ensureUnusedCapacity(alloc, n);
@@ -324,6 +325,16 @@ pub const StateIndex = struct {
             // Reserve for the whole delta even when multiple siblings share a
             // parent. Capacity only grows; rollback can restore removed rows.
             try entry.value_ptr.ensureUnusedCapacity(alloc, resources.len);
+        }
+    }
+    // Called only after commit/undo, never while rollback may need capacity.
+    fn pruneEmptyParents(self: *StateIndex, alloc: std.mem.Allocator, resources: []const Resource) void {
+        for (resources) |r| {
+            const key: Parent = .{ .kind = r.kind, .parent = r.parent_id };
+            const children = self.children.getPtr(key) orelse continue;
+            if (children.items.len != 0) continue;
+            children.deinit(alloc);
+            _ = self.children.remove(key);
         }
     }
     fn remove(self: *StateIndex, r: Resource) void {
@@ -471,7 +482,10 @@ pub const MutableState = struct {
                 for (self.previous.items) |r| state.put(r);
                 state.value.revision = self.revision;
                 state.value.next_id = self.next_id;
-            } else for (self.previous.items) |r| freeResource(state.alloc, r);
+            }
+            state.index.pruneEmptyParents(state.alloc, self.previous.items);
+            state.index.pruneEmptyParents(state.alloc, self.inserted.items);
+            if (committed) for (self.previous.items) |r| freeResource(state.alloc, r);
             self.previous.deinit(state.alloc);
             self.inserted.deinit(state.alloc);
             self.* = undefined;
@@ -779,7 +793,15 @@ pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: 
     return out.toOwnedSlice(alloc);
 }
 
+pub const TableList = struct {
+    database: []const u8 = default_database_name,
+    namespace: []const u8 = default_namespace_name,
+    prefix: ?[]const u8 = null,
+};
+
 pub const Call = union(enum) {
+    list_tables: TableList,
+    export_snapshot: void,
     read: Read,
     snapshot: void,
     resolve: Target,
@@ -1047,4 +1069,23 @@ test "system catalog mutable delta keeps reverse indexes and rolls back without 
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "system catalog tenant churn reclaims committed and rolled back parent buckets" {
+    const alloc = std.testing.allocator;
+    var state = try MutableState.clone(alloc, .{});
+    defer state.deinit();
+    const initial = state.index.children.count();
+    for (0..1000) |_| {
+        for ([_]Action{ .create, .drop }) |action| {
+            var delta = try planWithReader(alloc, MemoryReader{ .index = &state.index, .tables = &.{} }, state.value.next_id, .{ .kind = .database, .action = action, .name = "ephemeral" });
+            defer delta.deinit(alloc);
+            var rollback = try state.apply(delta);
+            rollback.finish(&state, false);
+            var commit = try state.apply(delta);
+            commit.finish(&state, true);
+        }
+        try std.testing.expectEqual(initial, state.index.children.count());
+        try std.testing.expectEqual(@as(usize, 2), state.value.resources.len);
+    }
 }

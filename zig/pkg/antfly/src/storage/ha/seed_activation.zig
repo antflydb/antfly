@@ -1448,6 +1448,12 @@ fn prepareMaterializedTestStaging(
     const topology_json = try std.json.Stringify.valueAlloc(alloc, seed_materialization.Topology{
         .generation = generation,
         .catalog = .{
+            .system_catalog = .{ .revision = 7, .next_id = 6, .resources = &.{
+                .{ .kind = .database, .id = 3, .name = "analytics", .tablespace_id = 5 },
+                .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "serving" },
+                .{ .kind = .tablespace, .id = 5, .name = "hot" },
+                .{ .kind = .table, .id = identity.table_id, .parent_id = 4, .name = "events", .storage_name = "docs" },
+            } },
             .epoch = 1,
             .tables = &.{.{
                 .table_id = identity.table_id,
@@ -1974,6 +1980,19 @@ test "storage.ha bound activation keeps immutable transport separate from mutabl
     defer alloc.free(expected_live_path);
     try std.testing.expectEqualStrings(expected_live_path, activated.generation_path);
 
+    const logical_catalog_path = try std.fs.path.join(alloc, &.{ activated.generation_path, "metadata/local-metadata.json" });
+    defer alloc.free(logical_catalog_path);
+    const logical_json = try readFileAlloc(std.testing.io, alloc, logical_catalog_path, 64 * 1024);
+    defer alloc.free(logical_json);
+    var logical = try std.json.parseFromSlice(seed_materialization.LogicalCatalog, alloc, logical_json, .{});
+    defer logical.deinit();
+    const state = logical.value.system_catalog.?;
+    try std.testing.expectEqual(@as(u64, 7), state.revision);
+    try std.testing.expectEqual(@as(u64, 6), state.next_id);
+    try std.testing.expectEqual(@as(u64, 5), state.find(.database, 0, "analytics").?.tablespace_id);
+    const binding_row = state.find(.table, 4, "events").?;
+    try std.testing.expectEqual(testIdentity().table_id, binding_row.id);
+    try std.testing.expectEqualStrings("docs", binding_row.storage_name);
     const raw_catalog_path = try std.fs.path.join(alloc, &.{ raw_generation_path, seed_materialization.topology_name });
     defer alloc.free(raw_catalog_path);
     // The checksummed catalog envelope can exceed the legacy 1 KiB fixture

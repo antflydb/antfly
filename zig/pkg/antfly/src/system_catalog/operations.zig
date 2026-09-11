@@ -101,6 +101,19 @@ pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
+        .list_tables => |request| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const result = try store.listSystemCatalogTables(alloc, svc.metadata_group_id, request);
+            errdefer alloc.free(result);
+            try context.ensureActive();
+            break :blk result;
+        },
+        .export_snapshot => blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.exportSystemCatalog(alloc, svc.metadata_group_id);
+        },
         .read => |request| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;

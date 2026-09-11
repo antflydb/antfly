@@ -2947,6 +2947,7 @@ pub const ApiHttpServer = struct {
         return distributed_join.partitionForJoinValue(value, partition_count);
     }
 
+    table_definition_cache: tables_api.DefinitionCache = .{},
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
@@ -3640,6 +3641,7 @@ pub const ApiHttpServer = struct {
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
+        self.table_definition_cache.deinit();
         self.* = undefined;
     }
 
@@ -15101,6 +15103,49 @@ pub const ApiHttpServer = struct {
 
     /// Select borrowed physical records before collecting per-table status or
     /// materializing public schemas. The arena owns the index and selection.
+    pub fn encodeCatalogTableList(self: *ApiHttpServer, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+        var legacy: ?metadata_api.AdminSnapshot = null;
+        defer if (legacy) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        var labels: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var snapshot: metadata_api.AdminSnapshot = undefined;
+        if (self.source.vtable.system_catalog != null) {
+            const bytes = try self.source.systemCatalog(arena, context, .{ .list_tables = request });
+            const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena, bytes, .{});
+            snapshot = try listing.adminSnapshot(arena);
+            var selected: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
+            for (listing.entries) |entry| {
+                const key = try (system_catalog.Target{ .database = request.database, .namespace = request.namespace, .table = entry.name }).resourceNameAlloc(arena);
+                if (!try tablePermissionCurrentlyAllowed(identity, key, .read)) continue;
+                try selected.append(arena, entry.table);
+                try labels.put(arena, entry.table.name, entry.name);
+            }
+            snapshot.tables = selected.items;
+        } else {
+            // Compatibility is explicit: only sources without a logical
+            // catalog may interpret an unbound physical table as legacy.
+            legacy = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
+            const selected = try selectCatalogTables(arena, legacy.?, .{}, request.database, request.namespace, request.prefix, identity);
+            snapshot = selected.snapshot;
+            labels = selected.labels;
+        }
+        const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, null);
+        defer if (storage_statuses) |items| tables_api.freeTableStorageStatuses(self.alloc, items);
+        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = self.alloc };
+        defer definitions.deinit();
+        const listed = try tables_api.buildTableListWithDefinitions(arena, &snapshot, null, storage_statuses, &definitions);
+        for (listed) |*item| item.name = labels.get(item.name) orelse return error.InvalidCatalogRecord;
+        std.mem.sort(metadata_openapi.TableStatus, listed, {}, struct {
+            fn less(_: void, l: metadata_openapi.TableStatus, r: metadata_openapi.TableStatus) bool {
+                return std.mem.lessThan(u8, l.name, r.name);
+            }
+        }.less);
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(self.alloc, listed, .{});
+    }
+
     pub fn selectCatalogTables(arena: std.mem.Allocator, snapshot: metadata_api.AdminSnapshot, state: system_catalog.State, database: []const u8, namespace_name: []const u8, prefix: ?[]const u8, identity: ?AuthenticatedIdentity) !struct { snapshot: metadata_api.AdminSnapshot, labels: std.StringHashMapUnmanaged([]const u8) } {
         const namespace = try state.namespaceFor(database, namespace_name);
         var bindings = std.AutoHashMapUnmanaged(u64, system_catalog.Resource).empty;
@@ -15195,22 +15240,8 @@ pub const ApiHttpServer = struct {
 
         switch (operation) {
             .list_tables => {
-                var snapshot = (try self.source.adminSnapshot()) orelse
-                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-                defer self.source.freeAdminSnapshot(&snapshot);
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const arena = arena_impl.allocator();
-                const state: system_catalog.State = if (self.source.vtable.system_catalog != null) blk: {
-                    const bytes = try self.source.systemCatalog(arena, .{}, .snapshot);
-                    break :blk try std.json.parseFromSliceLeaky(system_catalog.State, arena, bytes, .{});
-                } else .{};
-                const selected = try selectCatalogTables(arena, snapshot, state, "default", "public", null, authenticated_identity);
-                const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &selected.snapshot, null);
-                defer if (storage_statuses) |items| self.alloc.free(items);
-                const listed = try tables_api.buildTableListWithStorageStatuses(arena, &selected.snapshot, null, storage_statuses);
-                for (listed) |*item| item.name = selected.labels.get(item.name) orelse return error.InvalidCatalogRecord;
-                return try contextualJsonResponse(self.alloc, 200, listed);
+                const body = try self.encodeCatalogTableList(.{}, .{}, authenticated_identity);
+                return contextual_operations.json(body, false);
             },
             .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body, authenticated_identity),
             .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
@@ -48430,4 +48461,30 @@ test "system catalog NDJSON reuses one query definition without administrative s
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 20), fake.queries);
     try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+}
+
+test "system catalog table listing never joins stale topology with current bindings" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.StaleTopologyMustNotBeRead;
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(input == .list_tables);
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").TableListing{ .revision = 9, .entries = &.{} }, .{});
+        }
+    };
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.admin, .system_catalog = Fake.catalog } }, null, null);
+    defer server.deinit();
+    const body = try server.encodeCatalogTableList(.{}, .{}, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("[]", body);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

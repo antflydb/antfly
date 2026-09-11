@@ -229,6 +229,32 @@ def wait_for_catalog_shards(
     return (time.perf_counter() - start) * 1000
 
 
+def listing_table_config(args):
+    table_config = {"num_shards": 1}
+    if args.schema_fields:
+        table_config["schema"] = {
+            "document_schemas": {
+                "default": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "body": {
+                                "type": "string",
+                                "x-antfly-types": ["text"],
+                                "x-antfly-include-in-all": True,
+                            },
+                            **{
+                                f"field_{field}": {"type": "string"}
+                                for field in range(args.schema_fields)
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    return table_config
+
+
 def catalog_scenario(args, binary: Path) -> dict:
     with server(binary, args.deployment) as (api, startup, instance):
         scope = "/databases/benchmark/namespaces/serving"
@@ -240,28 +266,7 @@ def catalog_scenario(args, binary: Path) -> dict:
             {"placement_policy_json": json.dumps({"desired_replica_count": 1})},
         )
         api.request("PUT", scope + "/tablespace", {"tablespace_name": "benchmark"})
-        table_config = {"num_shards": 1}
-        if args.schema_fields:
-            table_config["schema"] = {
-                "document_schemas": {
-                    "default": {
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "body": {
-                                    "type": "string",
-                                    "x-antfly-types": ["text"],
-                                    "x-antfly-include-in-all": True,
-                                },
-                                **{
-                                    f"field_{field}": {"type": "string"}
-                                    for field in range(args.schema_fields)
-                                },
-                            },
-                        }
-                    }
-                }
-            }
+        table_config = listing_table_config(args)
         previous = 0
         checkpoints = []
         for count in sorted(set(args.table_counts)):
@@ -712,12 +717,71 @@ def resolution_scenario(args, binary: Path) -> dict:
         }
 
 
+def listing_scenario(args, binary: Path) -> dict:
+    """Tenant discovery alongside unrelated, wide application schemas."""
+    with server(binary, args.deployment) as (api, startup, instance):
+        api.request("POST", "/databases/listing", {})
+        small = "/databases/listing/namespaces/small"
+        large = "/databases/listing/namespaces/large"
+        for scope in (small, large):
+            api.request("POST", scope, {})
+        config = listing_table_config(args)
+        api.request("POST", small + "/tables/selected", config)
+        checkpoints = []
+        previous = 0
+        for count in sorted(set(args.table_counts)):
+            print(f"listing: provisioning {count} unrelated tables", file=sys.stderr)
+            for i in range(previous, count):
+                name = "needle" if i == 0 else f"table_{i}"
+                definition = json.loads(json.dumps(config))
+                if args.listing_distinct_schemas and "schema" in definition:
+                    definition["schema"]["document_schemas"]["default"]["schema"][
+                        "properties"
+                    ][f"application_{i}"] = {"type": "string"}
+                created = api.request("POST", large + "/tables/" + name, definition)
+                wait_for_catalog_shards(
+                    api, instance, created, args, large + "/tables/" + name
+                )
+            previous = count
+
+            def listing(path, expected):
+                rows = api.request("GET", path)
+                if len(rows) != expected:
+                    raise RuntimeError(f"listing mismatch: {len(rows)} != {expected}")
+                if path.startswith(small) and rows[0]["name"] != "selected":
+                    raise RuntimeError("unrelated table leaked into small namespace")
+
+            checkpoints.append(
+                {
+                    "unrelated_tables": count,
+                    "small_namespace": api.measure(
+                        lambda: listing(small + "/tables", 1), args.samples, args.warmup
+                    ),
+                    "selective_prefix": api.measure(
+                        lambda: listing(large + "/tables?prefix=needle", 1),
+                        args.samples,
+                        args.warmup,
+                    ),
+                    "large_namespace": api.measure(
+                        lambda count=count: listing(large + "/tables", count),
+                        args.samples,
+                        args.warmup,
+                    ),
+                }
+            )
+        return {
+            "deployment": args.deployment,
+            "startup_ms": startup,
+            "checkpoints": checkpoints,
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ZIG_ROOT / "zig-out/bin/antfly")
     parser.add_argument(
         "--scenario",
-        choices=["all", "catalog", "management", "resolution"],
+        choices=["all", "catalog", "management", "resolution", "listing"],
         default="all",
     )
     parser.add_argument(
@@ -730,6 +794,11 @@ def main():
         "--restart-after-ddl",
         action="store_true",
         help="Verify standalone catalog recovery after each management checkpoint",
+    )
+    parser.add_argument(
+        "--listing-distinct-schemas",
+        action="store_true",
+        help="Use distinct definitions in the scoped listing workload",
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
@@ -776,6 +845,7 @@ def main():
     }
     for name, run in [
         ("catalog", catalog_scenario),
+        ("listing", listing_scenario),
         ("resolution", resolution_scenario),
         ("management", management_scenario),
     ]:

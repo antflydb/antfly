@@ -6969,8 +6969,11 @@ pub const DataServer = struct {
             alloc.free(records);
         }
 
-        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
-        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        const exported = try self.write_source.catalog.exportCatalog(alloc);
+        defer alloc.free(exported);
+        var parsed_export = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, alloc, exported, .{ .allocate = .alloc_always });
+        defer parsed_export.deinit();
+        const metadata_snapshot = parsed_export.value;
         if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
             return error.HASeedSnapshotEmptyCatalog;
         const group_ids = try alloc.alloc(
@@ -6985,7 +6988,7 @@ pub const DataServer = struct {
         }
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
-        if (metadata_snapshot.status.metadata_epoch == 0 or
+        if (metadata_snapshot.epoch == 0 or
             metadata_snapshot.tables.len == 0 or
             metadata_snapshot.ranges.len == 0 or
             group_ids.len != metadata_snapshot.ranges.len)
@@ -7110,7 +7113,8 @@ pub const DataServer = struct {
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
-                .epoch = metadata_snapshot.status.metadata_epoch,
+                .epoch = metadata_snapshot.epoch,
+                .system_catalog = metadata_snapshot.system_catalog,
                 .tables = metadata_snapshot.tables,
                 .ranges = metadata_snapshot.ranges,
                 .extension_packages = metadata_snapshot.extension_packages,
@@ -19841,6 +19845,7 @@ const RemoteMetadataSource = struct {
             .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
+                .export_catalog = remoteExportCatalog,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
                 .acquire_routing_generation = remoteAcquireRoutingGeneration,
@@ -20287,6 +20292,10 @@ const RemoteMetadataSource = struct {
             return try cloneAdminSnapshotOwned(self.alloc, parsed.value);
         }
         return last_err;
+    }
+
+    fn remoteExportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        return remoteSystemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
 
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -34630,6 +34639,7 @@ const TestHASeedSnapshotProvider = struct {
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
+                .system_catalog = .{},
                 .epoch = 7,
                 .tables = &.{.{
                     .table_id = 20,
@@ -34700,6 +34710,7 @@ test "storage.ha data runtime default seed snapshot derives standalone groups fr
                 .ptr = undefined,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
+                    .export_catalog = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).exportCatalog,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
@@ -34910,6 +34921,7 @@ test "data server wires configured HA executors into API server" {
                 .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
+                    .export_catalog = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).exportCatalog,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                     .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,

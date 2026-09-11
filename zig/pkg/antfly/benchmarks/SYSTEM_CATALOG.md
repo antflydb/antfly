@@ -144,3 +144,28 @@ and checks that deleted temporary namespaces remain absent. Restart/readiness an
 validation duration are separate from request samples. Compare binaries with
 identical flag settings; use a separate recovery run when comparing steady
 latency without checkpoint restarts.
+
+
+### Scoped discovery and application schema diversity
+
+The `listing` scenario models a tenant dashboard with one selected table beside
+an expanding namespace, a prefix search returning one table, and an inventory
+view returning every table in the large namespace. It verifies row counts and
+scope isolation. Provisioning and shard readiness are excluded from latency.
+Use both shared application schemas and independently evolved schemas:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario listing --schema-fields 200 --table-counts 10 100 \
+  --samples 10 --warmup 2 --output /tmp/catalog-listing.json
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario listing --schema-fields 200 --listing-distinct-schemas \
+  --table-counts 10 100 --samples 10 --warmup 2 \
+  --output /tmp/catalog-listing-distinct.json
+```
+
+The second command adds a different declared property to each large-namespace
+table. This prevents a shared-schema benchmark from hiding cache-capacity costs.
+Returned JSON size still grows with selected tables and schema width. The
+bounded cache can evict definitions beyond its entry or byte budget; compare
+larger inventories separately when sizing an application workload.

@@ -124,11 +124,18 @@ pub const CatalogSource = struct {
         return self.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io });
     }
 
+    pub fn exportCatalog(self: CatalogSource, alloc: std.mem.Allocator) ![]u8 {
+        // A missing capability cannot prove that no logical catalog exists.
+        const capture = self.vtable.export_catalog orelse return error.UnsupportedOperation;
+        return capture(self.ptr, alloc);
+    }
+
     pub const VTable = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        export_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 = null,
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         /// First-class table/range routing capability. First-party sources must
         /// override the unsupported defaults; test doubles that never route may
@@ -943,6 +950,20 @@ pub fn TestAdminRoutingAdapter(
 ) type {
     if (!builtin.is_test) @compileError("TestAdminRoutingAdapter is test-only");
     return struct {
+        pub fn exportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            var snapshot = try admin_snapshot(ptr);
+            defer free_admin_snapshot(ptr, &snapshot);
+            return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").Export{
+                .epoch = snapshot.status.metadata_epoch,
+                .tables = snapshot.tables,
+                .ranges = snapshot.ranges,
+                .extension_packages = snapshot.extension_packages,
+                .installed_extensions = snapshot.installed_extensions,
+                .extension_members = snapshot.extension_members,
+                .extension_dependencies = snapshot.extension_dependencies,
+            }, .{});
+        }
+
         pub fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
             if (deadline_ns) |deadline| {
                 if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;

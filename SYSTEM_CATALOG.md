@@ -280,6 +280,36 @@ bindings. `location_json` remains opaque metadata: it does not migrate files or
 select a storage engine. A future physical-location feature needs its own
 versioned storage and migration contract.
 
+## Coherent listing and portable state
+
+Table listing selects logical names and physical records in one metadata read
+transaction, or under the standalone metadata mutex. Namespace and prefix
+selection happens before loading full table definitions. Legacy default-scope
+fallback checks binding absence in that same observation; a concurrent drop
+cannot expose a private physical table as an unbound public table. Metadata
+uses the table-to-range index and returns runtime reports for selected groups.
+HTTP and MCP share this projection and authorize logical names before collecting
+runtime status or materializing public schemas.
+
+The API server retains immutable schema projections by a length-framed SHA-256
+of the write and read schema bytes. The cache holds at most 256 entries and
+64 MiB of owned arenas; compiler scratch is released after compilation. Leases
+keep evicted generations alive until response serialization finishes. Index
+incarnations, permissions, dynamic field observations, storage counters, and
+replication status remain request data. Schema changes select a new entry;
+renaming a table or using the same schema elsewhere can reuse an entry.
+
+Portable HA topology version 4 captures logical catalog state, physical topology,
+and extension records together. It preserves database/namespace names, immutable
+table bindings, tablespaces, revision, and the next logical ID. Materialization
+validates references and rebuilds derived indexes at the destination. Version 3
+seeds without logical state remain readable; new exports require the explicit
+coherent-export capability and cannot silently fall back to a physical snapshot.
+
+Standalone delta application retains rollback capacity only until the change
+finishes. Commit and undo then reclaim empty parent buckets, so repeatedly
+creating and dropping tenants does not retain per-tenant child arrays.
+
 ## Clients and validation
 
 Generated Go, Python, TypeScript, and Zig clients expose the scoped routes and

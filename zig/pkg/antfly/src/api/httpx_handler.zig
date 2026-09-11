@@ -5181,36 +5181,15 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = ctx.allocator;
-        var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-        defer self.api_server.source.freeAdminSnapshot(&snapshot);
-        if (params.pattern != null) {
-            _ = ctx.status(400);
-            return ctx.text("unsupported table pattern");
-        }
-        var arena_impl = std.heap.ArenaAllocator.init(alloc);
-        defer arena_impl.deinit();
-        const arena = arena_impl.allocator();
-        const route = try system_catalog_routes.parseAlloc(arena, http_server_mod.stripApiPrefix(ctx.request.uri.path));
-        const catalog_bytes = self.api_server.source.systemCatalog(arena, operationContext(ctx, authenticated_identity), .snapshot) catch |err| blk: {
-            if (route == null and err == error.UnsupportedOperation) break :blk null;
-            return err;
-        };
-        const state: system_catalog.State = if (catalog_bytes) |bytes| try std.json.parseFromSliceLeaky(system_catalog.State, arena, bytes, .{}) else .{};
-        const selected = try ApiHttpServer.selectCatalogTables(arena, snapshot, state, if (route) |v| v.database else "default", if (route) |v| v.namespace else "public", params.prefix, authenticated_identity);
-        const storage_statuses = try self.api_server.collectTableStorageStatuses(alloc, &selected.snapshot, null);
-        defer if (storage_statuses) |items| alloc.free(items);
-        const listed = try tables_api.buildTableListWithStorageStatuses(arena, &selected.snapshot, null, storage_statuses);
-        for (listed) |*item| item.name = selected.labels.get(item.name) orelse return error.InvalidCatalogRecord;
-        std.mem.sort(metadata_openapi.TableStatus, listed, {}, struct {
-            fn less(_: void, l: metadata_openapi.TableStatus, rr: metadata_openapi.TableStatus) bool {
-                return std.mem.lessThan(u8, l.name, rr.name);
-            }
-        }.less);
-        return ctx.openApiJson(listed);
+        if (params.pattern != null) return textResponse(ctx, 400, "unsupported table pattern");
+        const route = try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
+        const body = try self.api_server.encodeCatalogTableList(operationContext(ctx, authenticated_identity), .{
+            .database = if (route) |value| value.database else "default",
+            .namespace = if (route) |value| value.namespace else "public",
+            .prefix = params.prefix,
+        }, authenticated_identity);
+        defer self.api_server.alloc.free(body);
+        return jsonResponse(ctx, 200, body);
     }
 
     pub fn getTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

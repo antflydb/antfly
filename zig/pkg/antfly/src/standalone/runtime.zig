@@ -915,6 +915,7 @@ const LocalStandaloneMetadata = struct {
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
+                .export_catalog = exportCatalog,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .acquire_routing_generation = acquireRoutingGeneration,
                 .routing_snapshot = catalogRoutingSnapshot,
@@ -1311,6 +1312,54 @@ const LocalStandaloneMetadata = struct {
         return table.*;
     }
 
+    fn exportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+        return systemCatalog(ptr, alloc, .{}, .export_snapshot);
+    }
+
+    fn listCatalogTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: system_catalog.TableList) ![]u8 {
+        const projection = @import("../system_catalog/projection.zig");
+        try system_catalog.validateName(request.database);
+        try system_catalog.validateName(request.namespace);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const index = &self.system_catalog_state.?.index;
+        const namespace = try index.namespaceFor(request.database, request.namespace);
+        var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
+        var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (index.list(.table, namespace.id)) |binding| {
+            try context.ensureActive();
+            if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
+            const table = self.manager.tables.get(binding.id) orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
+            try entries.append(a, .{ .name = binding.name, .table = table });
+            try selected.put(a, table.table_id, {});
+        }
+        // Unbound pre-catalog tables belong to default.public only. Resolve
+        // absence against the same locked state as the physical record.
+        if (namespace.id == system_catalog.default_namespace_id) {
+            var tables = self.manager.tables.valueIterator();
+            while (tables.next()) |table| {
+                try context.ensureActive();
+                if (index.byId(.table, table.table_id) != null) continue;
+                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, table.name, prefix)) continue;
+                try entries.append(a, .{ .name = table.name, .table = table.* });
+                try selected.put(a, table.table_id, {});
+            }
+        }
+        var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
+        var intents: std.ArrayListUnmanaged(antfly.raft.PlacementIntent) = .empty;
+        var it = self.manager.ranges.valueIterator();
+        while (it.next()) |range| {
+            if (!selected.contains(range.table_id)) continue;
+            try ranges.append(a, range.*);
+            try intents.append(a, .{ .record = .{ .group_id = range.group_id, .replica_id = 1, .local_node_id = self.local_node_id, .bootstrap_mode = .persisted, .metadata_version = self.epoch }, .store_id = self.store_id, .peer_node_ids = &.{} });
+        }
+        var stores = [_]antfly.metadata.StoreRecord{.{ .store_id = self.store_id, .node_id = self.local_node_id, .api_url = self.api_url, .role = "data", .health_class = "healthy", .live = true }};
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = self.systemCatalogState().revision, .entries = entries.items, .ranges = ranges.items, .stores = &stores, .placement_intents = intents.items }, .{});
+    }
+
     fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
@@ -1319,6 +1368,23 @@ const LocalStandaloneMetadata = struct {
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
         try context.ensureActive();
         switch (call) {
+            .list_tables => |request| return self.listCatalogTablesLocked(alloc, context, request),
+            .export_snapshot => {
+                const tables = try self.manager.listTables(alloc);
+                defer self.manager.freeTables(alloc, tables);
+                const ranges = try self.manager.listRanges(alloc);
+                defer self.manager.freeRanges(alloc, ranges);
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").Export{
+                    .epoch = self.epoch,
+                    .tables = tables,
+                    .ranges = ranges,
+                    .system_catalog = self.systemCatalogState(),
+                    .extension_packages = self.extension_catalog.packages.items,
+                    .installed_extensions = self.extension_catalog.installed.items,
+                    .extension_members = self.extension_catalog.members.items,
+                    .extension_dependencies = self.extension_catalog.dependencies.items,
+                }, .{});
+            },
             .read => |request| {
                 var empty = try system_catalog.StateIndex.init(alloc, .{});
                 defer empty.deinit(alloc);
@@ -9824,18 +9890,11 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     const alloc = std.testing.allocator;
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
-    var metadata = LocalStandaloneMetadata{
-        .alloc = alloc,
-        .manager = antfly.metadata.TableManager.init(alloc),
-        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
-        .local_node_id = 1,
-        .store_id = 1,
-        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
-        .replica_root_dir = try alloc.dupe(u8, "."),
-        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-linearizable-snapshot-catalog"),
-        .catalog_store = null,
-        .backend_runtime = backend_runtime.ptr(),
-    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", catalog_path, backend_runtime.ptr(), null, .local);
     defer metadata.deinit();
     try metadata.manager.upsertTable(.{ .table_id = 7, .name = "docs" });
     try metadata.manager.upsertRange(.{
@@ -9874,18 +9933,7 @@ test "standalone schema mutation supports atomic merge patch and version CAS" {
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
-    var metadata = LocalStandaloneMetadata{
-        .alloc = alloc,
-        .manager = antfly.metadata.TableManager.init(alloc),
-        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
-        .local_node_id = 1,
-        .store_id = 1,
-        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
-        .replica_root_dir = try alloc.dupe(u8, "."),
-        .catalog_path = try alloc.dupe(u8, catalog_path),
-        .catalog_store = null,
-        .backend_runtime = backend_runtime.ptr(),
-    };
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", catalog_path, backend_runtime.ptr(), null, .local);
     defer metadata.deinit();
     try metadata.manager.upsertTable(.{
         .table_id = 7,
@@ -9975,18 +10023,7 @@ test "standalone metadata finalizes schema migration from resident runtime evide
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
-    var metadata = LocalStandaloneMetadata{
-        .alloc = alloc,
-        .manager = antfly.metadata.TableManager.init(alloc),
-        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
-        .local_node_id = 1,
-        .store_id = 1,
-        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
-        .replica_root_dir = try alloc.dupe(u8, "."),
-        .catalog_path = try alloc.dupe(u8, catalog_path),
-        .catalog_store = null,
-        .backend_runtime = backend_runtime.ptr(),
-    };
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://127.0.0.1:8080", ".", catalog_path, backend_runtime.ptr(), null, .local);
     defer metadata.deinit();
     try metadata.manager.upsertTable(.{
         .table_id = 7,
@@ -10220,6 +10257,35 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     try std.testing.expectEqualStrings("table:stable-test-identity", table.name);
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "analytics", .table = "events" })) == null);
     try std.testing.expectError(error.DatabaseNotEmpty, source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .drop, .kind = .database, .name = "warehouse" } } }));
+    const projection = @import("../system_catalog/projection.zig");
+    const listing_bytes = try source.systemCatalog(alloc, .{}, .{ .list_tables = .{ .database = "warehouse" } });
+    defer alloc.free(listing_bytes);
+    var listing = try std.json.parseFromSlice(projection.TableListing, alloc, listing_bytes, .{});
+    defer listing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listing.value.entries.len);
+    try std.testing.expectEqualStrings("events", listing.value.entries[0].name);
+    try std.testing.expectEqual(table.table_id, listing.value.entries[0].table.table_id);
+    const exported = try metadata.catalogSource().exportCatalog(alloc);
+    defer alloc.free(exported);
+    var seed = try std.json.parseFromSlice(antfly.ha.seed_materialization.LogicalCatalog, alloc, exported, .{});
+    defer seed.deinit();
+    try std.testing.expect(seed.value.system_catalog != null);
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seeded.json", .{tmp.sub_path});
+    defer alloc.free(destination);
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, destination, .{});
+        defer file.close(std.testing.io);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, seed.value, .{ .emit_null_optional_fields = false });
+        defer alloc.free(encoded);
+        try file.writeStreamingAll(std.testing.io, encoded);
+    }
+    var seeded = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", destination, backend.ptr(), null, .local);
+    defer seeded.deinit();
+    const restored = (try seeded.resolveSystemCatalogLocked(.{ .database = "warehouse", .table = "events" })).?;
+    try std.testing.expectEqual(table.table_id, restored.table_id);
+    try std.testing.expectEqualStrings(table.name, restored.name);
+    try std.testing.expectEqual(metadata.systemCatalogState().next_id, seeded.systemCatalogState().next_id);
+    try std.testing.expectEqual(metadata.systemCatalogState().revision, seeded.systemCatalogState().revision);
     const previous_store = metadata.owned_catalog_store;
     metadata.owned_catalog_store = null;
     defer metadata.owned_catalog_store = previous_store;

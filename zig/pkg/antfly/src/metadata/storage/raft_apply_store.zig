@@ -2621,6 +2621,95 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, try view.read(request), .{});
     }
 
+    /// Arena-owned rows from one transaction; used by portable export and
+    /// scoped listing so neither can join independently captured generations.
+    fn catalogRowsTxn(comptime T: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, comptime prefixFn: anytype, comptime decode: anytype) ![]T {
+        var buf: [192]u8 = undefined;
+        const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, try prefixFn(&buf, group_id));
+        const out = try alloc.alloc(T, rows.len);
+        for (rows, out) |row, *value| value.* = try decode(alloc, row.value);
+        return out;
+    }
+
+    pub fn exportSystemCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var state = try system_catalog_storage.loadState(a, &txn, group_id);
+        defer state.deinit();
+        var buf: [160]u8 = undefined;
+        const revision = txn.get(try catalogRevisionKeyForGroup(&buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        return std.json.Stringify.valueAlloc(alloc, @import("../../system_catalog/projection.zig").Export{
+            .epoch = if (revision) |bytes| if (bytes.len == 8) @max(1, std.mem.readInt(u64, bytes[0..8], .little)) else return error.InvalidCatalogRecord else 1,
+            .system_catalog = state.value,
+            .tables = try self.listTablesTxn(a, &txn, group_id),
+            .ranges = try self.listRangesTxnUntil(a, &txn, group_id, null, null),
+            .extension_packages = try catalogRowsTxn(extension_domain.PackageManifest, a, &txn, group_id, extensionPackagePrefixForGroup, decodeExtensionPackageRecord),
+            .installed_extensions = try catalogRowsTxn(extension_domain.InstalledExtension, a, &txn, group_id, installedExtensionPrefixForGroup, decodeInstalledExtensionRecord),
+            .extension_members = try catalogRowsTxn(extension_domain.ExtensionMember, a, &txn, group_id, extensionMemberPrefixForGroup, decodeExtensionMemberRecord),
+            .extension_dependencies = try catalogRowsTxn(extension_domain.ExtensionDependency, a, &txn, group_id, extensionDependencyPrefixForGroup, decodeExtensionDependencyRecord),
+        }, .{});
+    }
+
+    pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.TableList) ![]u8 {
+        const projection = @import("../../system_catalog/projection.zig");
+        try system_catalog.validateName(request.database);
+        try system_catalog.validateName(request.namespace);
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = try system_catalog_storage.readMeta(a, &txn, group_id) };
+        const namespace = try view.namespaceFor(request.database, request.namespace);
+        var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
+        for (try view.children(.table, namespace.id, 0)) |binding| {
+            if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
+            var buf: [160]u8 = undefined;
+            const table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group_id, binding.id)));
+            if (table.table_id != binding.id or !std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
+            try entries.append(a, .{ .name = binding.name, .table = table });
+        }
+        if (namespace.id == system_catalog.default_namespace_id) {
+            // Legacy absence is checked in this transaction, never inferred
+            // by comparing an old topology snapshot with a newer binding list.
+            var buf: [160]u8 = undefined;
+            const rows = try docstore.DocStore.scanPrefixTxn(a, &txn, try tablePrefixForGroup(&buf, group_id));
+            for (rows) |row| {
+                const identity = try decodeTableIdentity(a, row.value);
+                if (try view.byId(.table, identity.table_id) != null) continue;
+                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, identity.name, prefix)) continue;
+                try entries.append(a, .{ .name = identity.name, .table = try decodeTableRecord(a, row.value) });
+            }
+        }
+        var ranges: std.ArrayListUnmanaged(metadata.RangeRecord) = .empty;
+        var intents: std.ArrayListUnmanaged(raft_reconciler.PlacementIntent) = .empty;
+        for (entries.items) |entry| {
+            for (try self.indexedTableRangeIdsTxn(a, &txn, group_id, entry.table.table_id)) |id| {
+                var buf: [192]u8 = undefined;
+                const range = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&buf, group_id, id)));
+                if (range.table_id != entry.table.table_id or range.group_id != id) return error.InvalidDerivedCatalogIndex;
+                try ranges.append(a, range);
+                const prefix = try std.fmt.bufPrint(&buf, "\x00\x00__metadata__:metadata_placement:{d}:{d}:", .{ group_id, id });
+                for (try docstore.DocStore.scanPrefixTxn(a, &txn, prefix)) |row| try intents.append(a, try decodePlacementIntent(a, row.value));
+            }
+        }
+        const stores = try catalogRowsTxn(metadata.StoreRecord, a, &txn, group_id, storePrefixForGroup, decodeStoreRecord);
+        var selected_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (ranges.items) |range| try selected_groups.put(a, range.group_id, {});
+        for (stores) |*store| {
+            var reports: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
+            for (store.runtime_statuses) |report| if (selected_groups.contains(report.group_id)) try reports.append(a, report);
+            store.runtime_statuses = reports.items;
+        }
+        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = view.meta.revision, .entries = entries.items, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items }, .{});
+    }
+
     pub fn systemCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog_storage.OwnedState {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -16420,6 +16509,30 @@ test "system catalog publishes names and table topology atomically and fences st
     const renamed = (try store.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
     defer metadata_table_manager.freeTable(alloc, renamed);
     try std.testing.expectEqual(@as(u64, 42), renamed.table_id);
+    {
+        const projection = @import("../../system_catalog/projection.zig");
+        const bytes = try store.listSystemCatalogTables(alloc, 21, .{ .database = "reports" });
+        defer alloc.free(bytes);
+        var listing = try std.json.parseFromSlice(projection.TableListing, alloc, bytes, .{});
+        defer listing.deinit();
+        try std.testing.expectEqual(@as(u64, 3), listing.value.revision);
+        try std.testing.expectEqual(@as(usize, 1), listing.value.entries.len);
+        try std.testing.expectEqualStrings("events", listing.value.entries[0].name);
+        try std.testing.expectEqual(@as(u64, 42), listing.value.entries[0].table.table_id);
+        try std.testing.expectEqual(@as(usize, 1), listing.value.ranges.len);
+        const exported = try store.exportSystemCatalog(alloc, 21);
+        defer alloc.free(exported);
+        var portable = try std.json.parseFromSlice(projection.Export, alloc, exported, .{});
+        defer portable.deinit();
+        try std.testing.expectEqual(@as(u64, 3), portable.value.system_catalog.revision);
+        try std.testing.expect(portable.value.system_catalog.find(.database, 0, "reports") != null);
+        try std.testing.expectEqual(@as(u64, 42), portable.value.tables[0].table_id);
+        // Selecting no tables must not allocate the unrelated 256 KiB definition.
+        var buffer: [32 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const empty = try store.listSystemCatalogTables(bounded.allocator(), 21, .{ .database = "reports", .prefix = "absent" });
+        try std.testing.expect(std.mem.indexOf(u8, empty, "events") == null);
+    }
     // The predecessor catalog revision cannot admit a destructive mutation.
     try applySystemCatalogTestCommand(&store, 4, .{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .database, .name = "stale" } });
     var snapshot = try store.systemCatalogSnapshot(alloc, 21);
