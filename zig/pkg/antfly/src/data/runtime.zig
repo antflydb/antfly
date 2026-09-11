@@ -8526,12 +8526,13 @@ pub const DataServer = struct {
     fn lsmMaintenanceWorkerMain(self: *DataServer) void {
         var consecutive_lock_deferrals: usize = 0;
         while (!self.lsm_maintenance_stop.load(.acquire)) {
-            const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             const now_ns = self.backgroundMonotonicNs();
             if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) {
                 self.sleepLsmMaintenanceWorker();
                 continue;
             }
+            // Consume accepted work only when its retry boundary is eligible.
+            const woke = self.lsm_maintenance_wake.swap(false, .acq_rel);
             if (!woke and !self.backgroundMaintenanceDue(now_ns)) {
                 self.sleepLsmMaintenanceWorker();
                 continue;
@@ -8546,7 +8547,7 @@ pub const DataServer = struct {
             // allocation-accounted build lane, and commonly frees a larger
             // decoded-vector cache when it publishes. Attempt it before the
             // soft-pressure gate that protects optional LSM maintenance.
-            const vector_now_ns = platform_time.monotonicNs();
+            const vector_now_ns = self.backgroundMonotonicNs();
             if (self.vectorBlockMaintenanceDue(vector_now_ns)) {
                 // Projection publication is part of dense-index readiness.
                 // Invalidate the cached status before entering a potentially
@@ -8686,6 +8687,12 @@ pub const DataServer = struct {
                 }
             }
             self.lsm_maintenance_active.store(false, .release);
+            // Due hints and pending wakes are advisory: a selected round can
+            // still make no progress or fail admission. Bound the outer loop
+            // as well as its inner batch so clocks, cancellation, and other
+            // owners can run before the next attempt. The iteration releases
+            // its reservation before the next loop sleeps on this deadline.
+            self.deferLsmMaintenance(self.backgroundMonotonicNs(), lsm_maintenance_worker_retry_sleep_ns);
         }
         self.lsm_maintenance_active.store(false, .release);
     }
@@ -24730,6 +24737,131 @@ test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
     try std.testing.expect(lifecycle_done);
     if (lifecycle_failure) |err| return err;
     try vopr_io.ensureNoCapabilityViolation();
+}
+
+test "DataServer LSM maintenance yields with idle work and failed attempts beyond host uptime" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |fail_attempt| {
+        // Keep the borrowed clock far ahead of host uptime. Readiness checks
+        // and renewed deadlines must remain in this same clock domain.
+        const initial_ns: i64 = 100 * 365 * 24 * 60 * 60 * std.time.ns_per_s;
+        var runtime = try vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = initial_ns });
+        defer runtime.deinit();
+        const io = runtime.io();
+        var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+            .backend = .manual,
+            .borrowed_io = .{
+                .general = io,
+                .raft_inbound = io,
+                .raft_outbound = io,
+                .api = io,
+                .inference = io,
+                .control = io,
+            },
+        });
+        defer backend_runtime.deinit();
+
+        const Attempts = struct {
+            server: *DataServer = undefined,
+            fail: bool,
+            count: usize = 0,
+            times: [2]u64 = undefined,
+            yielded: bool = false,
+            reservation_held_while_waiting: bool = false,
+
+            fn charge(ptr: *anyopaque, _: DataServerWorkKind, _: u64) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.times[self.count] = self.server.backgroundMonotonicNs();
+                self.count += 1;
+                // Bound even the broken busy loop so the regression reports
+                // a failure rather than hanging the test process.
+                if (self.count == self.times.len) self.server.lsm_maintenance_stop.store(true, .release);
+                if (self.fail) {
+                    // Work can remain requested while its resource/cost
+                    // admission fails; a pending wake must not bypass retry.
+                    self.server.lsm_maintenance_wake.store(true, .release);
+                    return error.TestMaintenanceAttemptFailed;
+                }
+            }
+        };
+        var attempts = Attempts{ .fail = fail_attempt };
+        var server: DataServer = .{
+            .alloc = alloc,
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                "/vopr/maintenance-retry-boundary",
+                antfly.public_api.table_catalog.emptyCatalogSource(),
+                antfly.raft.read_gate.alreadyReadSafeBarrier(),
+            ),
+            .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                "/vopr/maintenance-retry-boundary",
+                antfly.public_api.table_catalog.emptyCatalogSource(),
+            ),
+            .status_source = undefined,
+            .api_server_cfg = undefined,
+            .query_async_limit = .limited(8),
+            .work_cost_port = .{ .ptr = &attempts, .charge_fn = Attempts.charge },
+            .listener_cfg = undefined,
+            .backend_runtime = backend_runtime.ptr(),
+        };
+        defer server.deinit();
+        attempts.server = &server;
+
+        const Lifecycle = struct {
+            fn run(target: *DataServer, observations: *Attempts) !void {
+                try target.startLsmMaintenanceWorker();
+                defer target.stopLsmMaintenanceBackground();
+                const worker_io = target.backend_runtime.?.io().?;
+                while (observations.count < observations.times.len) {
+                    try worker_io.sleep(.fromMilliseconds(10), .awake);
+                    if (observations.count == 1) {
+                        observations.yielded = true;
+                        observations.reservation_held_while_waiting = observations.reservation_held_while_waiting or
+                            target.provisioned_storage.resource_manager.sliceStats(.lsm_compaction_work).used_bytes != 0;
+                    }
+                }
+            }
+        };
+        var future = io.async(Lifecycle.run, .{ &server, &attempts });
+        defer {
+            server.lsm_maintenance_stop.store(true, .release);
+            _ = runtime.cancelAndDrainTasksForTeardown(alloc, 10_000) catch @panic("maintenance test cleanup failed");
+            _ = future.cancel(io) catch {};
+        }
+        var enabled: vopr.transition.List = .{};
+        defer enabled.deinit(alloc);
+        var events: vopr.event.Sink = .{};
+        defer events.deinit(alloc);
+        for (0..1_000) |_| {
+            if (runtime.scheduler().quiescent()) break;
+            enabled.items.clearRetainingCapacity();
+            try runtime.scheduler().enumerateReady(&enabled, alloc);
+            try enabled.canonicalize();
+            if (enabled.items.items.len == 0) return error.VoprMaintenanceRetryDeadlock;
+            var selected = enabled.items.items[0];
+            for (enabled.items.items) |candidate| {
+                if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                    selected = candidate;
+                    break;
+                }
+            }
+            try runtime.scheduler().executeReady(selected.id, &events, alloc);
+        }
+        try std.testing.expect(runtime.scheduler().quiescent());
+        try future.await(io);
+        try std.testing.expectEqual(@as(usize, 2), attempts.count);
+        try std.testing.expect(attempts.times[1] > attempts.times[0]);
+        try std.testing.expect(attempts.yielded);
+        try std.testing.expect(!attempts.reservation_held_while_waiting);
+        try std.testing.expectEqual(
+            attempts.times[if (fail_attempt) 0 else 1] + DataServer.vector_block_maintenance_interval_ns,
+            server.vector_block_maintenance_next_eligible_ns.load(.acquire),
+        );
+        try std.testing.expect(server.lsm_maintenance_future == null);
+        try std.testing.expect(server.dense_publication_future == null);
+        try runtime.ensureNoCapabilityViolation();
+    }
 }
 
 test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo" {

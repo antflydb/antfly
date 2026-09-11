@@ -76,9 +76,9 @@ jobs:
           use-cache: false
       - name: Test soak orchestration
         run: python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
-      - name: Test production transport clocks and determinism boundaries
+      - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
-        run: zig build antfly-raft-transport-test vopr-determinism-audit -Doptimize=ReleaseSafe -j1 --summary all
+        run: zig build antfly-raft-transport-test vopr-runtime-test vopr-determinism-audit -Doptimize=ReleaseSafe -j1 --summary all
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5

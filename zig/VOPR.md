@@ -3204,6 +3204,16 @@ expiry on virtual time, and delivers a subsequent request to prove the
 serialized drain owner was released. Queued requests do not retain the enqueue
 caller's borrowed cancellation or delivery-tracker pointers.
 
+The DataServer maintenance worker also uses its borrowed monotonic clock for
+vector-publication deadlines. An adversarial history advanced virtual time past
+host uptime and exposed an outer-loop spin: readiness checked virtual time,
+but publication kept its deadline in host time. Every bounded maintenance
+attempt now establishes a retry boundary, including idle and failed attempts,
+and releases its reservation before waiting. Accepted wakes survive that
+backoff until the next eligible attempt. A far-future virtual-clock
+regression verifies independent task progress, reservation release, renewed
+deadlines, and worker cancellation; the determinism audit covers this worker.
+
 The executable, run and merged-corpus artifacts are retained for 90 days.
 Fiber callsite identities are scoped to a pinned executable layout; keep the
 original executable when investigating older traces. The diagnostic dispatch

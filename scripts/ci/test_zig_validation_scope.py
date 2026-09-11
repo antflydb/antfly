@@ -37,6 +37,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig/pkg/antfly/src/raft/host.zig",
             "zig/pkg/antfly/src/raft/reconciler.zig",
             "zig/pkg/antfly/src/raft/vopr_harness.zig",
+            "zig/pkg/antfly/src/data/runtime.zig",
             "zig/build.zig",
             "scripts/ci/zig_vopr_soak.py",
             "scripts/ci/test_zig_vopr_soak.py",

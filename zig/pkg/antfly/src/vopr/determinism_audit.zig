@@ -59,6 +59,10 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/upgrade_compatibility.zig", .bytes = @embedFile("upgrade_compatibility.zig") },
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },
     .{
+        .path = "data/runtime.zig#maintenance-worker",
+        .bytes = region(@embedFile("../data/runtime.zig"), "    fn lsmMaintenanceWorkerMain(", "    pub fn baseUri("),
+    },
+    .{
         .path = "raft/host.zig#monotonic-clock",
         .bytes = region(@embedFile("../raft/host.zig"), "    pub fn monotonicNs(", "    pub fn listGroupIds("),
     },
