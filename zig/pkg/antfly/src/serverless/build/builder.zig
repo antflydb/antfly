@@ -426,6 +426,7 @@ pub const Builder = struct {
                         current_head,
                         next_version,
                         start_lsn,
+                        current_manifest,
                         plan,
                         publication_guard,
                         cancellation,
@@ -438,6 +439,7 @@ pub const Builder = struct {
                     current_head,
                     next_version,
                     start_lsn,
+                    current_manifest,
                     plan,
                     publication_guard,
                     cancellation,
@@ -481,6 +483,7 @@ pub const Builder = struct {
                         current_head,
                         next_version,
                         start_lsn,
+                        current_manifest,
                         plan,
                         publication_guard,
                         cancellation,
@@ -777,14 +780,24 @@ pub const Builder = struct {
         current_head: u64,
         version: u64,
         start_lsn: u64,
+        current: ?manifest_mod.Manifest,
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
         consumed_record: ?wal_mod.Record,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
-        var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
+        var manifest = reconcile: {
+            if (current) |prior| if (plan.external_source_plan) |external_plan| {
+                if (externalSourceDescriptorMatchesManifest(external_plan, prior))
+                    break :reconcile try @import("external_publication_metadata.zig").reconcileAlloc(self.alloc, prior, plan);
+            };
+            break :reconcile try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
+        };
         defer manifest.deinit(self.alloc);
+        manifest.version = version;
+        manifest.wal_start_lsn = start_lsn;
+        manifest.wal_end_lsn = start_lsn - 1;
         if (consumed_record) |record| {
             manifest.built_at_ns = record.timestamp_ns;
             manifest.wal_start_lsn = record.lsn;
@@ -1961,16 +1974,7 @@ fn externalSourcePlanMatchesManifest(
     plan: external_source_manifest.Plan,
     manifest: manifest_mod.Manifest,
 ) bool {
-    const current = manifest.base_source orelse return false;
-    if (std.meta.activeTag(plan.base_source) != std.meta.activeTag(current)) return false;
-    const sources_match = switch (plan.base_source) {
-        .external_parquet => |planned| externalSourceDescriptorMatches(planned, current.external_parquet),
-        .external_iceberg => |planned| externalSourceDescriptorMatches(planned, current.external_iceberg),
-        .external_lance => |planned| externalSourceDescriptorMatches(planned, current.external_lance),
-        else => false,
-    };
-    if (!sources_match or plan.artifacts.len == 0) return false;
-
+    if (!externalSourceDescriptorMatchesManifest(plan, manifest) or plan.artifacts.len == 0) return false;
     // External plans own the external metadata refs, while a published
     // manifest may also carry unrelated document and search artifacts. Match
     // the owned refs as an exact multiset so
@@ -1997,6 +2001,17 @@ fn externalSourcePlanMatchesManifest(
         if (planned_occurrences != current_occurrences) return false;
     }
     return true;
+}
+
+fn externalSourceDescriptorMatchesManifest(plan: external_source_manifest.Plan, manifest: manifest_mod.Manifest) bool {
+    const current = manifest.base_source orelse return false;
+    if (std.meta.activeTag(plan.base_source) != std.meta.activeTag(current)) return false;
+    return switch (plan.base_source) {
+        .external_parquet => |planned| externalSourceDescriptorMatches(planned, current.external_parquet),
+        .external_iceberg => |planned| externalSourceDescriptorMatches(planned, current.external_iceberg),
+        .external_lance => |planned| externalSourceDescriptorMatches(planned, current.external_lance),
+        else => false,
+    };
 }
 
 fn artifactRefEql(left: manifest_mod.ArtifactRef, right: manifest_mod.ArtifactRef) bool {
@@ -7641,6 +7656,98 @@ test "serverless builder publishes initial external manifest without wal records
         },
     }));
     try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("events"));
+}
+
+test "serverless external metadata publication retains sidecars without payload IO and invalidates source replacements" {
+    const alloc = std.testing.allocator;
+    const metadata = @import("external_publication_metadata.zig");
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "external-metadata-artifacts");
+    const manifest_root = tmpPath(&manifest_root_buf, "external-metadata-manifests");
+    const wal_root = tmpPath(&wal_root_buf, "external-metadata-wal");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+    var initial = try metadata.testing.fixtureAlloc(alloc, 16384);
+    defer initial.deinit(alloc);
+    try manifest_store.put(initial);
+    try std.testing.expect(try progress_store.compareAndSwapHead("docs", null, initial.version));
+    var external = try external_source_manifest.planAlloc(alloc, .parquet_prefix, "s3://warehouse/docs", "parquet-31", "schema-v3", .{
+        .name = "docs.external-files",
+        .artifact_id = "inventory-docs",
+        .byte_len = 128,
+        .checksum = "a" ** 64,
+    });
+    defer external.deinit(alloc);
+    var plan: publication_plan.TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = .{} },
+        .external_source_plan = external,
+        .table_definition = .{ .indexes_json = @constCast(metadata.testing.indexes), .read_schema_json = @constCast("{}") },
+        .metadata_republish = .{ .read_schema_migration = true },
+    };
+    // No artifact objects exist: any attempt to hydrate a sidecar/body would
+    // fail. Publication must use the pinned manifest metadata alone.
+    var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var same = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer same.deinit(alloc);
+    var same_head = try manifest_store.getAlloc("docs", same.version);
+    defer same_head.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 6), same_head.artifacts.len);
+    try std.testing.expectEqual(initial.stats.document_count, same_head.stats.document_count);
+    try std.testing.expectEqualStrings(initial.artifacts[4].artifact_id, findArtifactRefByName(same_head.artifacts, .graph_metric_segment, "9:graph_idx6:degree").?.artifact_id);
+    plan.metadata_republish = .{};
+    var noop = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer noop.deinit(alloc);
+    try std.testing.expect(!noop.published);
+
+    plan.table_definition.indexes_json = @constCast("{\"body_text\":{\"type\":\"full_text\",\"field\":\"title\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":40}}}}");
+    plan.metadata_republish.index_definitions_changed = true;
+    var selected = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer selected.deinit(alloc);
+    var selected_head = try manifest_store.getAlloc("docs", selected.version);
+    defer selected_head.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), selected_head.artifacts.len);
+    try std.testing.expect(findArtifactIndex(selected_head, .graph_segment) != null);
+    try std.testing.expect(findArtifactRefByName(selected_head.artifacts, .graph_metric_segment, "9:graph_idx6:degree") != null);
+    try std.testing.expect(selected_head.stats.published_search_sources.findVector() == null);
+    try std.testing.expect(selected_head.stats.published_search_sources.findText() == null);
+    plan.metadata_republish = .{};
+    var selected_noop = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer selected_noop.deinit(alloc);
+    try std.testing.expect(!selected_noop.published);
+
+    var replacement = try external_source_manifest.planAlloc(alloc, .parquet_prefix, "s3://warehouse/docs", "parquet-32", "schema-v3", .{
+        .name = "docs.external-files",
+        .artifact_id = "inventory-replacement",
+        .byte_len = 256,
+        .checksum = "f" ** 64,
+    });
+    defer replacement.deinit(alloc);
+    plan.external_source_plan = replacement;
+    var changed = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer changed.deinit(alloc);
+    var changed_head = try manifest_store.getAlloc("docs", changed.version);
+    defer changed_head.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), changed_head.artifacts.len);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.external_base_source, changed_head.artifacts[0].kind);
+    try std.testing.expectEqual(@as(u32, 0), changed_head.stats.graph_segment_count);
+    var changed_noop = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    defer changed_noop.deinit(alloc);
+    try std.testing.expect(!changed_noop.published);
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

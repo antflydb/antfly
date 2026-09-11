@@ -25,7 +25,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // update amplification. Branch packing always makes progress with >=2 entries.
 pub const max_page_bytes = 1024 * 1024;
 pub const target_page_bytes = 32 * 1024;
-pub const max_key_bytes = 256 * 1024;
+// Leave room for an ordered u64 prefix without reducing the accepted document
+// identifier size in the document facts index.
+pub const max_key_bytes = 256 * 1024 + 8;
 pub const max_record_bytes = max_page_bytes / 2 - header_bytes;
 pub const max_height = 16;
 const header_bytes = 56;

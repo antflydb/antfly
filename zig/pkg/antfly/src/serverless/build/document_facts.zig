@@ -22,6 +22,17 @@ const page_store = @import("../graph_segment/page_store.zig");
 const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
 
+pub const max_document_id_bytes = 256 * 1024;
+pub const max_pending_key_bytes = max_document_id_bytes + 8;
+
+pub fn pendingOrderKeyAlloc(alloc: Allocator, lsn: u64, id: []const u8) ![]u8 {
+    if (id.len == 0 or id.len > max_document_id_bytes) return error.InvalidDocumentFact;
+    const key = try alloc.alloc(u8, 8 + id.len);
+    std.mem.writeInt(u64, key[0..8], lsn, .big);
+    @memcpy(key[8..], id);
+    return key;
+}
+
 pub const BodyRef = struct {
     digest: [32]u8,
     attempt: [16]u8,
@@ -74,20 +85,21 @@ pub const Root = struct {
     policy_fingerprint: [32]u8,
     wal_end_lsn: u64 = 0,
     page: ?tree.Ref = null,
-    /// Ordered ready-to-process documents for each Fact.pending bit.
+    /// Ready-to-process documents ordered by (WAL LSN, document ID). New WAL
+    /// arrivals cannot extend an existing scan cycle's immutable upper bound.
     pending_pages: [4]?tree.Ref = @splat(null),
     document_count: u64 = 0,
     /// Presence counters followed by pending counters, in Fact bit order.
     counts: [7]u64 = @splat(0),
 
     pub const encoded_bytes = 512;
-    pub const metadata_version = 2;
+    pub const metadata_version = 3;
     pub fn eql(a: Root, b: Root) bool {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
         var out = [_]u8{0} ** encoded_bytes;
-        @memcpy(out[0..8], "AFDFACT2");
+        @memcpy(out[0..8], "AFDFACT3");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);
         std.mem.writeInt(u64, out[80..88], self.wal_end_lsn, .little);
@@ -106,7 +118,7 @@ pub const Root = struct {
         return out;
     }
     pub fn decode(bytes: []const u8) !Root {
-        if (bytes.len != encoded_bytes or !std.mem.eql(u8, bytes[0..8], "AFDFACT2") or bytes[8] > 31 or
+        if (bytes.len != encoded_bytes or !std.mem.eql(u8, bytes[0..8], "AFDFACT3") or bytes[8] > 31 or
             !std.mem.allEqual(u8, bytes[9..16], 0) or
             !std.mem.allEqual(u8, bytes[472..512], 0)) return error.InvalidDocumentFactsRoot;
         var root = Root{
@@ -162,11 +174,15 @@ pub const PendingCursor = struct {
         self.cursor.deinit();
     }
     /// Borrowed until next/deinit, with the same lifetime as a tree record.
-    pub fn next(self: *PendingCursor) !?tree.Cursor.Record {
+    pub const Record = struct { key: []const u8, order_key: []const u8, value: []const u8 };
+
+    pub fn next(self: *PendingCursor) !?Record {
         const record = (try self.cursor.next()) orelse return null;
         const fact = try Fact.decode(record.value);
-        if (fact.pending & self.stage_bit == 0 or fact.last_lsn > self.wal_end_lsn) return error.InvalidDocumentFact;
-        return record;
+        if (fact.pending & self.stage_bit == 0 or fact.last_lsn > self.wal_end_lsn or
+            record.key.len <= 8 or record.key.len > max_pending_key_bytes or
+            std.mem.readInt(u64, record.key[0..8], .big) != fact.last_lsn) return error.InvalidDocumentFact;
+        return .{ .key = record.key[8..], .order_key = record.key, .value = record.value };
     }
 };
 
@@ -200,11 +216,14 @@ pub const Plan = struct {
     source: Root,
     next: Root,
     changes: []tree.Mutation,
-    /// Borrow key/value bytes from changes; only these slices are owned.
+    /// Own ordering keys; values borrow the corresponding primary changes.
     pending_changes: [4][]tree.Mutation,
 
     pub fn deinit(self: *Plan) void {
-        for (self.pending_changes) |changes| self.alloc.free(changes);
+        for (self.pending_changes) |changes| {
+            for (changes) |change| self.alloc.free(change.key);
+            self.alloc.free(changes);
+        }
         for (self.changes) |change| {
             self.alloc.free(change.key);
             if (change.value) |value| self.alloc.free(value);
@@ -220,10 +239,6 @@ pub const Plan = struct {
         for (&next.pending_pages, current.pending_pages, self.pending_changes, 0..) |*page, prior, changes, i| {
             // Identical pending sets often cover every enabled stage during
             // bootstrap. Share their immutable result, not repeated PUTs.
-            if (std.meta.eql(prior, current.page) and sameChanges(changes, self.changes)) {
-                page.* = next.page;
-                continue;
-            }
             const shared = for (0..i) |j| {
                 if (std.meta.eql(prior, current.pending_pages[j]) and sameChanges(changes, self.pending_changes[j])) break j;
             } else null;
@@ -257,13 +272,16 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
     }
     var next = source;
     var pending: [4]std.ArrayListUnmanaged(tree.Mutation) = @splat(.empty);
-    defer for (&pending) |*items| items.deinit(alloc);
+    defer for (&pending) |*items| {
+        for (items.items) |change| alloc.free(change.key);
+        items.deinit(alloc);
+    };
     next.wal_end_lsn = next_wal_lsn;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
     for (replacements) |replacement| {
         try store.check(store.ptr);
-        if (replacement.id.len == 0 or replacement.id.len > tree.max_key_bytes) return error.InvalidDocumentFact;
+        if (replacement.id.len == 0 or replacement.id.len > max_document_id_bytes) return error.InvalidDocumentFact;
         const slot = try seen.getOrPut(alloc, replacement.id);
         if (slot.found_existing) return error.DuplicateDocumentFactReplacement;
         const prior = try lookup(alloc, store, source, replacement.id);
@@ -282,22 +300,23 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
                 count.* += 1;
             };
         }
-        for (&pending, 0..) |*items, i| {
-            const mask = (if (prior) |fact| fact.pending else @as(u4, 0)) |
-                (if (replacement.value) |fact| fact.pending else @as(u4, 0));
-            if (mask & (@as(u4, 1) << @intCast(i)) != 0) try items.ensureUnusedCapacity(alloc, 1);
-        }
-        const key = try alloc.dupe(u8, replacement.id);
-        errdefer alloc.free(key);
-        const value = if (replacement.value) |fact| try alloc.dupe(u8, &fact.encode()) else null;
-        errdefer if (value) |bytes| alloc.free(bytes);
-        try changes.append(alloc, .{ .key = key, .value = value });
+        const value = value: {
+            const key = try alloc.dupe(u8, replacement.id);
+            errdefer alloc.free(key);
+            const bytes = if (replacement.value) |fact| try alloc.dupe(u8, &fact.encode()) else null;
+            errdefer if (bytes) |owned| alloc.free(owned);
+            try changes.append(alloc, .{ .key = key, .value = bytes });
+            break :value bytes;
+        };
         // The main change now owns these bytes, including on a later error.
         for (&pending, 0..) |*items, i| {
             const bit = @as(u4, 1) << @intCast(i);
             const was_pending = if (prior) |fact| fact.pending & bit != 0 else false;
             const is_pending = if (replacement.value) |fact| fact.pending & bit != 0 else false;
-            if (was_pending or is_pending) items.appendAssumeCapacity(.{ .key = key, .value = if (is_pending) value else null });
+            if (was_pending and (!is_pending or prior.?.last_lsn != replacement.value.?.last_lsn))
+                try appendPendingChange(alloc, items, prior.?.last_lsn, replacement.id, null);
+            if (is_pending)
+                try appendPendingChange(alloc, items, replacement.value.?.last_lsn, replacement.id, value);
         }
     }
     std.mem.sort(tree.Mutation, changes.items, {}, struct {
@@ -311,9 +330,18 @@ pub fn planAlloc(alloc: Allocator, store: tree.Store, source: Root, replacements
         }
     }.less);
     var pending_changes: [4][]tree.Mutation = @splat(&.{});
-    errdefer for (pending_changes) |items| alloc.free(items);
+    errdefer for (pending_changes) |items| {
+        for (items) |change| alloc.free(change.key);
+        alloc.free(items);
+    };
     for (&pending_changes, &pending) |*owned, *items| owned.* = try items.toOwnedSlice(alloc);
     return .{ .alloc = alloc, .source = source, .next = next, .changes = try changes.toOwnedSlice(alloc), .pending_changes = pending_changes };
+}
+
+fn appendPendingChange(alloc: Allocator, changes: *std.ArrayListUnmanaged(tree.Mutation), lsn: u64, id: []const u8, value: ?[]const u8) !void {
+    const key = try pendingOrderKeyAlloc(alloc, lsn, id);
+    errdefer alloc.free(key);
+    try changes.append(alloc, .{ .key = key, .value = value });
 }
 
 pub const body_header_bytes = 16;
@@ -469,9 +497,9 @@ test "serverless document facts update only touched paths and maintain exact sou
     var first = try planAlloc(a, store, empty, &.{ .{ .id = "a", .value = fact }, .{ .id = "b", .value = fact } }, 1);
     defer first.deinit();
     const root = try first.publish(store, empty);
-    try std.testing.expectEqual(@as(usize, 1), memory.writes);
-    try std.testing.expectEqual(root.page, root.pending_pages[0]);
-    try std.testing.expectEqual(root.page, root.pending_pages[1]);
+    try std.testing.expectEqual(@as(usize, 2), memory.writes);
+    try std.testing.expect(!std.meta.eql(root.page, root.pending_pages[0]));
+    try std.testing.expectEqual(root.pending_pages[0], root.pending_pages[1]);
     try std.testing.expectEqual(@as(u64, 2), root.document_count);
     try std.testing.expectEqual([7]u64{ 2, 0, 2, 2, 2, 0, 0 }, root.counts);
     try std.testing.expect(root.eql(try Root.decode(&root.encode())));
@@ -502,7 +530,7 @@ test "serverless document facts update only touched paths and maintain exact sou
     std.mem.writeInt(u64, invalid[96 + 5 * 8 ..][0..8], 0, .little);
     try std.testing.expectError(error.InvalidDocumentFactsRoot, Root.decode(&invalid));
     invalid = updated.encode();
-    invalid[7] = '1';
+    invalid[7] = '2';
     try std.testing.expectError(error.InvalidDocumentFactsRoot, Root.decode(&invalid));
     try std.testing.expectError(error.DuplicateDocumentFactReplacement, planAlloc(a, store, root, &.{ .{ .id = "a", .value = fact }, .{ .id = "a", .value = null } }, 2));
 }
@@ -574,22 +602,85 @@ test "serverless document facts allocation failures preserve source and release 
     try std.testing.checkAllAllocationFailures(a, Exercise.run, .{ memory.store(), source });
 }
 
-test "serverless document facts pending cursors reject wrong-stage and future-source entries" {
+test "serverless document facts pending cursors reject wrong-stage future-source and forged ordering entries" {
     const a = std.testing.allocator;
     var memory = tree.testing.MemoryStore{ .alloc = a };
     defer memory.deinit();
     const store = memory.store();
     var fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 1 }, .last_lsn = 1, .last_timestamp_ns = 0 };
-    for (0..2) |case| {
-        if (case == 1) {
-            fact.pending = 1;
-            fact.last_lsn = 2;
-        }
+    for (0..4) |case| {
+        fact.pending = if (case == 0) 0 else 1;
+        fact.last_lsn = if (case == 1) 2 else 1;
         const value = fact.encode();
-        const page = (try tree.apply(a, store, null, &.{.{ .key = "a", .value = &value }})).?;
+        const key = try pendingOrderKeyAlloc(a, if (case == 2) 0 else fact.last_lsn, "a");
+        defer a.free(key);
+        const page = (try tree.apply(a, store, null, &.{.{ .key = if (case == 3) key[0..8] else key, .value = &value }})).?;
         const root = Root{ .domain = store.domain, .policy_fingerprint = @splat(1), .wal_end_lsn = 1, .page = page, .pending_pages = .{ page, null, null, null }, .document_count = 1, .counts = .{ 0, 0, 0, 1, 0, 0, 0 } };
         var cursor = try pendingCursor(a, store, root, 0, "");
         defer cursor.deinit();
         try std.testing.expectError(error.InvalidDocumentFact, cursor.next());
     }
+}
+
+test "serverless document facts LSN ordering freezes membership despite middle-key arrivals and replaces old pending keys" {
+    const a = std.testing.allocator;
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    const empty = Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    const old = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 12 }, .last_lsn = 1, .last_timestamp_ns = 1, .pending = 15 };
+    var tail = old;
+    tail.last_lsn = 2;
+    var initial = try planAlloc(a, store, empty, &.{ .{ .id = "a", .value = old }, .{ .id = "z", .value = tail } }, 2);
+    defer initial.deinit();
+    const source = try initial.publish(store, empty);
+    const bound = try pendingOrderKeyAlloc(a, 2, "z");
+    defer a.free(bound);
+    var middle = old;
+    middle.last_lsn = 3;
+    var changed = old;
+    changed.last_lsn = 4;
+    changed.body.digest = @splat(7);
+    var update = try planAlloc(a, store, source, &.{ .{ .id = "m", .value = middle }, .{ .id = "a", .value = changed } }, 4);
+    defer update.deinit();
+    for (update.pending_changes) |changes| try std.testing.expectEqual(@as(usize, 3), changes.len);
+    const current = try update.publish(store, source);
+    for (0..4) |stage| {
+        var cursor = try pendingCursor(a, store, current, stage, "");
+        defer cursor.deinit();
+        const first = (try cursor.next()).?;
+        try std.testing.expectEqualStrings("z", first.key);
+        try std.testing.expectEqualSlices(u8, bound, first.order_key);
+        const second = (try cursor.next()).?;
+        try std.testing.expectEqualStrings("m", second.key);
+        try std.testing.expect(std.mem.order(u8, second.order_key, bound) == .gt);
+        const third = (try cursor.next()).?;
+        try std.testing.expectEqualStrings("a", third.key);
+        try std.testing.expectEqual(changed, try Fact.decode(third.value));
+        try std.testing.expectEqual(null, try cursor.next());
+        var resumed = try pendingCursor(a, store, current, stage, bound);
+        defer resumed.deinit();
+        try std.testing.expectEqualStrings("z", (try resumed.next()).?.key);
+    }
+}
+
+test "serverless document facts pending ordering preserves maximum accepted document identifiers" {
+    const a = std.testing.allocator;
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    const empty = Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    const id = try a.alloc(u8, max_document_id_bytes);
+    defer a.free(id);
+    @memset(id, 'k');
+    const fact = Fact{ .body = .{ .digest = @splat(3), .attempt = @splat(1), .bytes = 12 }, .last_lsn = 1, .last_timestamp_ns = 1, .pending = 1 };
+    var initial = try planAlloc(a, store, empty, &.{.{ .id = id, .value = fact }}, 1);
+    defer initial.deinit();
+    const current = try initial.publish(store, empty);
+    var cursor = try pendingCursor(a, store, current, 0, "");
+    defer cursor.deinit();
+    const record = (try cursor.next()).?;
+    try std.testing.expectEqualSlices(u8, id, record.key);
+    try std.testing.expectEqual(@as(usize, max_pending_key_bytes), record.order_key.len);
+    try std.testing.expectEqual(fact, (try lookup(a, store, current, id)).?);
 }

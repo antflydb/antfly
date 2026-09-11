@@ -264,32 +264,54 @@ pub const SparseEnricher = struct {
         var previous = try self.progress.getEnrichmentStageProgress(namespace, cfg.stage);
         defer if (previous) |*value| value.deinit(self.progress.allocator);
         if (previous) |value| if (value.head_version > head) return error.EnrichmentProgressChanged;
-        const same_pipeline = if (previous) |value| value.pipeline_version == cfg.pipeline_version else false;
-        const after = if (same_pipeline) previous.?.after_doc_id else null;
+        const same_pipeline = if (previous) |value| value.pipeline_version == cfg.pipeline_version and
+            std.mem.eql(u8, &value.policy_fingerprint, &facts.policy_fingerprint) else false;
+        if (same_pipeline) if (previous.?.cycle_upper_order_key) |key| {
+            if (key.len <= 8 or std.mem.readInt(u64, key[0..8], .big) > facts.wal_end_lsn)
+                return error.InvalidEnrichmentStageProgress;
+        };
+        const after = if (same_pipeline) previous.?.after_order_key else null;
         var next_key: ?[]u8 = if (after) |key| try self.alloc.dupe(u8, key) else null;
         defer if (next_key) |key| self.alloc.free(key);
+        var cycle_upper: ?[]u8 = if (same_pipeline) upper: {
+            break :upper if (previous.?.cycle_upper_order_key) |key| try self.alloc.dupe(u8, key) else null;
+        } else null;
+        defer if (cycle_upper) |key| self.alloc.free(key);
         var next_offset: u64 = if (same_pipeline and previous.?.head_version == head) previous.?.doc_offset else 0;
         var cycles: u64 = if (previous) |value| value.completed_cycles else 0;
         var stats = EnrichmentRunStats{};
         var expected_latest_lsn = latest_lsn;
         if (pending_count != 0) {
+            if (cycle_upper == null) {
+                // Capture one finite cycle under the pinned source. Rank seek
+                // is O(tree height), not a scan of the pending population.
+                var tail = try document_facts.pendingCursorAtRank(self.alloc, pages.store(), facts, stage_index, pending_count - 1);
+                defer tail.deinit();
+                const last = (try tail.next()) orelse return error.InvalidDocumentFactsRoot;
+                cycle_upper = try self.alloc.dupe(u8, last.order_key);
+            }
             var cursor = try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
             defer cursor.deinit();
             var scanned: usize = 0;
             while (scanned < cfg.scan_batch_size) {
-                const record = (cursor.next() catch |err| {
+                const maybe_record = cursor.next() catch |err| {
                     if (err == error.ArtifactReadBudgetExceeded and scanned > 0) break;
                     return err;
-                }) orelse {
-                    // Wrap on the next pass. A failing prefix cannot monopolize
-                    // pending work even when every pass sees a different HEAD.
+                };
+                if (maybe_record == null or std.mem.order(u8, maybe_record.?.order_key, cycle_upper.?) == .gt) {
+                    // New WAL records sort after this finite cycle across HEADs,
+                    // irrespective of document ID ordering or arrival rate.
+                    // Wrap on the next pass to revisit failures and updates.
                     if (next_key) |key| self.alloc.free(key);
                     next_key = null;
+                    self.alloc.free(cycle_upper.?);
+                    cycle_upper = null;
                     next_offset = 0;
                     cycles = try std.math.add(u64, cycles, 1);
                     break;
-                };
-                if (after) |key| if (std.mem.eql(u8, record.key, key)) continue;
+                }
+                const record = maybe_record.?;
+                if (after) |key| if (std.mem.eql(u8, record.order_key, key)) continue;
                 try pin.check();
                 const fact = try document_facts.Fact.decode(record.value);
                 // The batch allowance is soft. The first pending body may use
@@ -299,7 +321,7 @@ pub const SparseEnricher = struct {
                 var body_read_remaining = fact.body.bytes;
                 var body_pages = pages;
                 body_pages.remaining_read_bytes = &body_read_remaining;
-                const completed_key = try self.alloc.dupe(u8, record.key);
+                const completed_key = try self.alloc.dupe(u8, record.order_key);
                 var owns_completed_key = true;
                 errdefer if (owns_completed_key) self.alloc.free(completed_key);
                 expected_latest_lsn = self.processPendingDocument(namespace, cfg, &pin, &body_pages, fact, record.key, head, expected_latest_lsn, &stats) catch |err| failed: {
@@ -319,6 +341,8 @@ pub const SparseEnricher = struct {
         } else {
             if (next_key) |key| self.alloc.free(key);
             next_key = null;
+            if (cycle_upper) |key| self.alloc.free(key);
+            cycle_upper = null;
             next_offset = 0;
         }
         try pin.check();
@@ -327,7 +351,9 @@ pub const SparseEnricher = struct {
             .doc_offset = next_offset,
             .revision = try std.math.add(u64, if (previous) |value| value.revision else 0, 1),
             .pipeline_version = cfg.pipeline_version,
-            .after_doc_id = next_key,
+            .policy_fingerprint = facts.policy_fingerprint,
+            .after_order_key = next_key,
+            .cycle_upper_order_key = cycle_upper,
             .completed_cycles = cycles,
             .failed_documents = try std.math.add(u64, if (previous) |value| value.failed_documents else 0, stats.failed_documents),
         };
@@ -1596,14 +1622,18 @@ test "serverless enrichment pending key cursor admits large bodies and preserves
     try std.testing.expectEqual(@as(usize, 0), rejected.wal_appends);
     var checkpoint = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
     defer checkpoint.deinit(a);
-    try std.testing.expectEqualStrings("a-large", checkpoint.after_doc_id.?);
+    try std.testing.expectEqualStrings("a-large", checkpoint.after_order_key.?[8..]);
+    try std.testing.expectEqualStrings("z-small", checkpoint.cycle_upper_order_key.?[8..]);
     try std.testing.expectEqual(@as(u64, 1), checkpoint.failed_documents);
     // Reopen durable progress and publish unrelated data before the next tick.
     var reopened_impl = try catalog_mod.FsProgressStore.init(a, std.mem.span(manifest_path));
     var reopened = reopened_impl.progressStore();
     defer reopened.deinit();
     enricher.progress = &reopened;
-    var unrelated = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &.{.{ .kind = .upsert, .doc_id = "0-complete", .body = "{\"text\":\"already complete\",\"sparse_embedding\":{\"done\":1},\"_enrichment\":{\"lexical_sparse_version\":1}}" }} });
+    var unrelated = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &.{
+        .{ .kind = .upsert, .doc_id = "0-complete", .body = "{\"text\":\"already complete\",\"sparse_embedding\":{\"done\":1},\"_enrichment\":{\"lexical_sparse_version\":1}}" },
+        .{ .kind = .upsert, .doc_id = "m", .body = "{\"text\":\"new tail\"}" },
+    } });
     unrelated.deinit(a);
     var next_head = try publishEnrichmentFixture(&builder);
     next_head.deinit(a);
@@ -1619,10 +1649,22 @@ test "serverless enrichment pending key cursor admits large bodies and preserves
     try std.testing.expectEqualStrings("z-small", healthy_mutation.doc_id);
     var with_healthy = try publishEnrichmentFixture(&builder);
     with_healthy.deinit(a);
-    // End-of-range wraps the durable key; capacity can change without editing
-    // the rejected document. The larger-than-soft-budget body now succeeds.
+    var arrival = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 3, .mutations = &.{.{ .kind = .upsert, .doc_id = "mm", .body = "{\"text\":\"new tail\"}" }} });
+    arrival.deinit(a);
+    var arrival_head = try publishEnrichmentFixture(&builder);
+    arrival_head.deinit(a);
+    // The old cycle wraps even though its range now has an ever-growing tail.
+    // Capacity can recover without editing the rejected document.
     const wrapped = try enricher.runNamespaceWithConfig("docs", cfg);
     try std.testing.expectEqual(@as(usize, 0), wrapped.wal_appends);
+    var wrapped_progress = (try reopened.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer wrapped_progress.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), wrapped_progress.completed_cycles);
+    try std.testing.expectEqual(null, wrapped_progress.cycle_upper_order_key);
+    arrival = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 4, .mutations = &.{.{ .kind = .upsert, .doc_id = "mmm", .body = "{\"text\":\"new tail\"}" }} });
+    arrival.deinit(a);
+    arrival_head = try publishEnrichmentFixture(&builder);
+    arrival_head.deinit(a);
     const retried = try enricher.runNamespaceWithConfig("docs", cfg);
     try std.testing.expectEqual(@as(usize, 1), retried.enriched_documents);
     try std.testing.expectEqual(@as(usize, 0), retried.failed_documents);
@@ -1632,6 +1674,73 @@ test "serverless enrichment pending key cursor admits large bodies and preserves
     defer large_mutation.deinit(a);
     try std.testing.expectEqualStrings("a-large", large_mutation.doc_id);
     try std.testing.expect(large_mutation.body.?.len > cfg.max_source_read_bytes);
+
+    // An update behind the cursor must also be revisited within the finite
+    // cycle while each subsequent pass adds another higher pending key.
+    var recovered_head = try publishEnrichmentFixture(&builder);
+    recovered_head.deinit(a);
+    var update = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 5, .mutations = &.{.{ .kind = .upsert, .doc_id = "a-large", .body = "{\"text\":\"updated behind cursor\"}" }} });
+    update.deinit(a);
+    var saw_updated = false;
+    for (4..9) |i| {
+        const id_buf = [_]u8{'m'} ** 16;
+        const id = id_buf[0..i];
+        arrival = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = i + 10, .mutations = &.{.{ .kind = .upsert, .doc_id = id, .body = "{\"text\":\"new tail\"}" }} });
+        arrival.deinit(a);
+        arrival_head = try publishEnrichmentFixture(&builder);
+        arrival_head.deinit(a);
+        const pass = try enricher.runNamespaceWithConfig("docs", cfg);
+        if (pass.wal_appends == 0) continue;
+        const records = try wal.readFromAlloc("docs", try wal.latestLsn("docs"));
+        defer wal_mod.freeRecords(a, records);
+        var mutation = try api_codec.decodeMutationAlloc(a, records[0].payload);
+        defer mutation.deinit(a);
+        if (std.mem.eql(u8, mutation.doc_id, "a-large")) {
+            try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "updated behind cursor") != null);
+            saw_updated = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_updated);
+    // A policy-version transition discards both coordinates of the old cycle,
+    // even when that bound is beyond every key in the new pending source.
+    recovered_head = try publishEnrichmentFixture(&builder);
+    recovered_head.deinit(a);
+    update = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 30, .mutations = &.{.{ .kind = .upsert, .doc_id = "a-large", .body = "{\"text\":\"new policy pending\"}" }} });
+    update.deinit(a);
+    recovered_head = try publishEnrichmentFixture(&builder);
+    recovered_head.deinit(a);
+    var before_reset = (try reopened.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer before_reset.deinit(a);
+    var old_policy = before_reset;
+    old_policy.revision += 1;
+    old_policy.pipeline_version = cfg.pipeline_version + 1;
+    old_policy.after_order_key = "\xff\xff\xff\xff\xff\xff\xff\xffzzzz";
+    old_policy.cycle_upper_order_key = "\xff\xff\xff\xff\xff\xff\xff\xffzzzz";
+    try std.testing.expect(try reopened.compareAndSwapEnrichmentStageProgress("docs", .lexical_sparse, before_reset, old_policy));
+    const reset = try enricher.runNamespaceWithConfig("docs", cfg);
+    try std.testing.expectEqual(@as(usize, 1), reset.enriched_documents);
+    var after_reset = (try reopened.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer after_reset.deinit(a);
+    try std.testing.expectEqualStrings("mmmm", after_reset.after_order_key.?[8..]);
+    try std.testing.expect(std.mem.order(u8, after_reset.cycle_upper_order_key.?, old_policy.cycle_upper_order_key.?) == .lt);
+    try std.testing.expectEqual(cfg.pipeline_version, after_reset.pipeline_version);
+    recovered_head = try publishEnrichmentFixture(&builder);
+    recovered_head.deinit(a);
+    // Extraction-policy semantics can change without a pipeline version bump.
+    // The facts fingerprint is an equally strong cycle reset boundary.
+    var old_semantics = after_reset;
+    old_semantics.revision += 1;
+    old_semantics.policy_fingerprint[0] ^= 1;
+    old_semantics.after_order_key = old_policy.after_order_key;
+    old_semantics.cycle_upper_order_key = old_policy.cycle_upper_order_key;
+    try std.testing.expect(try reopened.compareAndSwapEnrichmentStageProgress("docs", .lexical_sparse, after_reset, old_semantics));
+    const semantic_reset = try enricher.runNamespaceWithConfig("docs", cfg);
+    try std.testing.expectEqual(@as(usize, 1), semantic_reset.enriched_documents);
+    var after_semantic_reset = (try reopened.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer after_semantic_reset.deinit(a);
+    try std.testing.expectEqualStrings("mmmmm", after_semantic_reset.after_order_key.?[8..]);
+    try std.testing.expectEqual(after_reset.policy_fingerprint, after_semantic_reset.policy_fingerprint);
 }
 
 test "serverless enrichment WAL fence rejects a user mutation that lands during model work" {

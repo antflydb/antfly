@@ -22,33 +22,46 @@ const work_lease = @import("../build/work_lease.zig");
 pub const PublicationFence = head_coordination.Fence;
 
 pub const EnrichmentStageProgress = struct {
-    pub const max_encoded_bytes = 56 + @import("../graph_segment/page_tree.zig").max_key_bytes;
+    pub const max_encoded_bytes = 92 + 2 * @import("../build/document_facts.zig").max_pending_key_bytes;
     head_version: u64,
     doc_offset: u64,
     revision: u64 = 0,
     pipeline_version: u32 = 0,
-    after_doc_id: ?[]const u8 = null,
+    policy_fingerprint: [32]u8 = @splat(0),
+    after_order_key: ?[]const u8 = null,
+    /// Inclusive, immutable key boundary of the current scan cycle.
+    cycle_upper_order_key: ?[]const u8 = null,
     completed_cycles: u64 = 0,
     failed_documents: u64 = 0,
 
     pub fn deinit(self: *EnrichmentStageProgress, alloc: Allocator) void {
-        if (self.after_doc_id) |key| alloc.free(key);
+        if (self.after_order_key) |key| alloc.free(key);
+        if (self.cycle_upper_order_key) |key| alloc.free(key);
         self.* = undefined;
     }
 
     pub fn eql(lhs: EnrichmentStageProgress, rhs: EnrichmentStageProgress) bool {
         if (lhs.head_version != rhs.head_version or lhs.doc_offset != rhs.doc_offset or lhs.revision != rhs.revision or
             lhs.pipeline_version != rhs.pipeline_version or lhs.completed_cycles != rhs.completed_cycles or lhs.failed_documents != rhs.failed_documents) return false;
-        if (lhs.after_doc_id == null or rhs.after_doc_id == null) return lhs.after_doc_id == null and rhs.after_doc_id == null;
-        return std.mem.eql(u8, lhs.after_doc_id.?, rhs.after_doc_id.?);
+        if (!std.mem.eql(u8, &lhs.policy_fingerprint, &rhs.policy_fingerprint)) return false;
+        return optionalKeyEql(lhs.after_order_key, rhs.after_order_key) and optionalKeyEql(lhs.cycle_upper_order_key, rhs.cycle_upper_order_key);
+    }
+
+    fn optionalKeyEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+        if (lhs == null or rhs == null) return lhs == null and rhs == null;
+        return std.mem.eql(u8, lhs.?, rhs.?);
     }
 
     pub fn encodeAlloc(self: EnrichmentStageProgress, alloc: Allocator) ![]u8 {
-        const key = self.after_doc_id orelse "";
-        if (self.after_doc_id != null and (key.len == 0 or key.len > @import("../graph_segment/page_tree.zig").max_key_bytes)) return error.InvalidEnrichmentStageProgress;
-        const key_len: u32 = if (self.after_doc_id == null) std.math.maxInt(u32) else @intCast(key.len);
-        const out = try alloc.alloc(u8, 56 + key.len);
-        @memcpy(out[0..8], "AFESCAN1");
+        const key = self.after_order_key orelse "";
+        const upper = self.cycle_upper_order_key orelse "";
+        if (self.after_order_key != null and (key.len <= 8 or key.len > @import("../build/document_facts.zig").max_pending_key_bytes)) return error.InvalidEnrichmentStageProgress;
+        if (self.cycle_upper_order_key != null and (upper.len <= 8 or upper.len > @import("../build/document_facts.zig").max_pending_key_bytes)) return error.InvalidEnrichmentStageProgress;
+        if (self.after_order_key != null and (self.cycle_upper_order_key == null or std.mem.order(u8, key, upper) == .gt)) return error.InvalidEnrichmentStageProgress;
+        const key_len: u32 = if (self.after_order_key == null) std.math.maxInt(u32) else @intCast(key.len);
+        const upper_len: u32 = if (self.cycle_upper_order_key == null) std.math.maxInt(u32) else @intCast(upper.len);
+        const out = try alloc.alloc(u8, 92 + key.len + upper.len);
+        @memcpy(out[0..8], "AFESCAN3");
         std.mem.writeInt(u64, out[8..16], self.head_version, .little);
         std.mem.writeInt(u64, out[16..24], self.doc_offset, .little);
         std.mem.writeInt(u64, out[24..32], self.revision, .little);
@@ -56,15 +69,26 @@ pub const EnrichmentStageProgress = struct {
         std.mem.writeInt(u64, out[40..48], self.failed_documents, .little);
         std.mem.writeInt(u32, out[48..52], self.pipeline_version, .little);
         std.mem.writeInt(u32, out[52..56], key_len, .little);
-        @memcpy(out[56..], key);
+        std.mem.writeInt(u32, out[56..60], upper_len, .little);
+        @memcpy(out[60..92], &self.policy_fingerprint);
+        @memcpy(out[92..][0..key.len], key);
+        @memcpy(out[92 + key.len ..], upper);
         return out;
     }
 
     pub fn decodeAlloc(alloc: Allocator, raw: []const u8) !EnrichmentStageProgress {
-        if (raw.len < 56 or !std.mem.eql(u8, raw[0..8], "AFESCAN1")) return error.InvalidEnrichmentStageProgress;
+        if (raw.len < 92 or !std.mem.eql(u8, raw[0..8], "AFESCAN3")) return error.InvalidEnrichmentStageProgress;
         const key_len = std.mem.readInt(u32, raw[52..56], .little);
-        if (key_len != std.math.maxInt(u32) and (key_len == 0 or key_len > @import("../graph_segment/page_tree.zig").max_key_bytes)) return error.InvalidEnrichmentStageProgress;
-        if (raw.len - 56 != if (key_len == std.math.maxInt(u32)) @as(usize, 0) else key_len) return error.InvalidEnrichmentStageProgress;
+        const upper_len = std.mem.readInt(u32, raw[56..60], .little);
+        if (key_len != std.math.maxInt(u32) and (key_len <= 8 or key_len > @import("../build/document_facts.zig").max_pending_key_bytes)) return error.InvalidEnrichmentStageProgress;
+        if (upper_len != std.math.maxInt(u32) and (upper_len <= 8 or upper_len > @import("../build/document_facts.zig").max_pending_key_bytes)) return error.InvalidEnrichmentStageProgress;
+        const key_bytes: usize = if (key_len == std.math.maxInt(u32)) 0 else key_len;
+        const upper_bytes: usize = if (upper_len == std.math.maxInt(u32)) 0 else upper_len;
+        if (raw.len - 92 != key_bytes + upper_bytes) return error.InvalidEnrichmentStageProgress;
+        if (key_bytes != 0 and (upper_bytes == 0 or std.mem.order(u8, raw[92..][0..key_bytes], raw[92 + key_bytes ..]) == .gt)) return error.InvalidEnrichmentStageProgress;
+        const key = if (key_bytes == 0) null else try alloc.dupe(u8, raw[92..][0..key_bytes]);
+        errdefer if (key) |owned| alloc.free(owned);
+        const upper = if (upper_bytes == 0) null else try alloc.dupe(u8, raw[92 + key_bytes ..]);
         return .{
             .head_version = std.mem.readInt(u64, raw[8..16], .little),
             .doc_offset = std.mem.readInt(u64, raw[16..24], .little),
@@ -72,56 +96,81 @@ pub const EnrichmentStageProgress = struct {
             .completed_cycles = std.mem.readInt(u64, raw[32..40], .little),
             .failed_documents = std.mem.readInt(u64, raw[40..48], .little),
             .pipeline_version = std.mem.readInt(u32, raw[48..52], .little),
-            .after_doc_id = if (key_len == std.math.maxInt(u32)) null else try alloc.dupe(u8, raw[56..]),
+            .policy_fingerprint = raw[60..92].*,
+            .after_order_key = key,
+            .cycle_upper_order_key = upper,
         };
     }
 };
 
 test "serverless enrichment stage cursor codec owns binary keys and bounds malformed lengths" {
     const a = std.testing.allocator;
-    const value: EnrichmentStageProgress = .{ .head_version = 9, .doc_offset = 7, .revision = 12, .pipeline_version = 3, .completed_cycles = 4, .failed_documents = 5, .after_doc_id = "a\x00\xffb" };
+    const value: EnrichmentStageProgress = .{ .head_version = 9, .doc_offset = 7, .revision = 12, .pipeline_version = 3, .policy_fingerprint = @splat(17), .completed_cycles = 4, .failed_documents = 5, .after_order_key = "00000001a\x00\xffb", .cycle_upper_order_key = "00000001z\x00\xff" };
     const encoded = try value.encodeAlloc(a);
     defer a.free(encoded);
     var decoded = try EnrichmentStageProgress.decodeAlloc(a, encoded);
     defer decoded.deinit(a);
     try std.testing.expect(value.eql(decoded));
-    try std.testing.expect(decoded.after_doc_id.?.ptr != value.after_doc_id.?.ptr);
+    try std.testing.expect(decoded.after_order_key.?.ptr != value.after_order_key.?.ptr);
+    try std.testing.expect(decoded.cycle_upper_order_key.?.ptr != value.cycle_upper_order_key.?.ptr);
     var none = value;
-    none.after_doc_id = null;
+    none.after_order_key = null;
+    none.cycle_upper_order_key = null;
     const empty = try none.encodeAlloc(a);
     defer a.free(empty);
     var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     var decoded_none = try EnrichmentStageProgress.decodeAlloc(denied.allocator(), empty);
     defer decoded_none.deinit(a);
     try std.testing.expect(none.eql(decoded_none));
-    const max_key = @import("../graph_segment/page_tree.zig").max_key_bytes;
+    const max_key = @import("../build/document_facts.zig").max_pending_key_bytes;
     const large = try a.alloc(u8, max_key + 1);
     defer a.free(large);
     @memset(large, 'k');
     var invalid = value;
-    invalid.after_doc_id = "";
+    invalid.after_order_key = "";
     try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
-    invalid.after_doc_id = large;
+    invalid.after_order_key = large;
     try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
-    invalid.after_doc_id = large[0..max_key];
+    invalid.after_order_key = large[0..max_key];
+    invalid.cycle_upper_order_key = large[0..max_key];
     const largest = try invalid.encodeAlloc(a);
     defer a.free(largest);
     var largest_decoded = try EnrichmentStageProgress.decodeAlloc(a, largest);
     defer largest_decoded.deinit(a);
     try std.testing.expect(invalid.eql(largest_decoded));
+    invalid = value;
+    invalid.cycle_upper_order_key = null;
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
+    invalid.cycle_upper_order_key = "a";
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
+    invalid.cycle_upper_order_key = "";
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
+    invalid.cycle_upper_order_key = large;
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, invalid.encodeAlloc(denied.allocator()));
     for ([_]u32{ 0, 1, max_key + 1 }) |length| {
         std.mem.writeInt(u32, empty[52..56], length, .little);
         try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(denied.allocator(), empty));
     }
+    std.mem.writeInt(u32, empty[52..56], std.math.maxInt(u32), .little);
+    for ([_]u32{ 0, 1, max_key + 1 }) |length| {
+        std.mem.writeInt(u32, empty[56..60], length, .little);
+        try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(denied.allocator(), empty));
+    }
+    const malformed = try a.dupe(u8, encoded);
+    defer a.free(malformed);
+    malformed[92 + value.after_order_key.?.len + 8] = '0';
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(denied.allocator(), malformed));
+    std.mem.writeInt(u32, malformed[56..60], std.math.maxInt(u32), .little);
+    try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(denied.allocator(), malformed[0 .. 92 + value.after_order_key.?.len]));
     try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(a, encoded[0..55]));
-    encoded[7] = '2';
+    encoded[7] = '1';
     try std.testing.expectError(error.InvalidEnrichmentStageProgress, EnrichmentStageProgress.decodeAlloc(a, encoded));
 }
 
 test "serverless enrichment stage cursor codec releases allocations at every failure point" {
     const Exercise = struct {
         fn run(alloc: Allocator) !void {
-            const value: EnrichmentStageProgress = .{ .head_version = 2, .doc_offset = 3, .revision = 4, .pipeline_version = 1, .after_doc_id = "binary\x00key" };
+            const value: EnrichmentStageProgress = .{ .head_version = 2, .doc_offset = 3, .revision = 4, .pipeline_version = 1, .after_order_key = "00000001binary\x00key", .cycle_upper_order_key = "00000001z\x00bound" };
             const encoded = try value.encodeAlloc(alloc);
             defer alloc.free(encoded);
             var decoded = try EnrichmentStageProgress.decodeAlloc(alloc, encoded);
@@ -378,7 +427,7 @@ pub const ProgressStore = struct {
 
     /// A single durable, revision-fenced key cursor for one stage. The key
     /// survives HEAD changes while the offset is only a current-head diagnostic.
-    /// The returned key is owned: release it with value.deinit(self.allocator).
+    /// Both returned keys are owned: release with value.deinit(self.allocator).
     pub fn getEnrichmentStageProgress(
         self: *ProgressStore,
         namespace: []const u8,
@@ -417,15 +466,22 @@ pub const ProgressStore = struct {
 /// Exercise the erased capability too: its validation must allow the same
 /// revision-fenced wrap that the durable backend accepts.
 pub fn testEnrichmentCursorCompareAndSwap(store: *ProgressStore) !void {
-    const first: EnrichmentStageProgress = .{ .head_version = 1, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .after_doc_id = "a\x00" };
+    const first: EnrichmentStageProgress = .{ .head_version = 1, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .policy_fingerprint = @splat(3), .after_order_key = "00000001a\x00", .cycle_upper_order_key = "00000001z\x00" };
     try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, null, first));
-    const second: EnrichmentStageProgress = .{ .head_version = 2, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .after_doc_id = "b\x00" };
+    const second: EnrichmentStageProgress = .{ .head_version = 2, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .policy_fingerprint = @splat(3), .after_order_key = "00000001b\x00", .cycle_upper_order_key = "00000001z\x00" };
     try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, first, second));
     var reread = (try store.getEnrichmentStageProgress("cursor", .lexical_sparse)).?;
     defer reread.deinit(store.allocator);
     try std.testing.expect(second.eql(reread));
-    try std.testing.expect(reread.after_doc_id.?.ptr != second.after_doc_id.?.ptr);
+    try std.testing.expect(reread.after_order_key.?.ptr != second.after_order_key.?.ptr);
+    try std.testing.expect(reread.cycle_upper_order_key.?.ptr != second.cycle_upper_order_key.?.ptr);
+    var wrong_boundary = second;
+    wrong_boundary.cycle_upper_order_key = "00000001y\x00";
     const wrapped: EnrichmentStageProgress = .{ .head_version = 2, .doc_offset = 0, .revision = 3, .pipeline_version = 1, .completed_cycles = 1 };
+    try std.testing.expect(!try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, wrong_boundary, wrapped));
+    wrong_boundary = second;
+    wrong_boundary.policy_fingerprint[0] ^= 1;
+    try std.testing.expect(!try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, wrong_boundary, wrapped));
     try std.testing.expect(!try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, first, wrapped));
     try std.testing.expect(try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, reread, wrapped));
     try std.testing.expect(!try store.compareAndSwapEnrichmentStageProgress("cursor", .lexical_sparse, second, wrapped));

@@ -61,19 +61,29 @@ an error, never an indication that enrichment is complete. A semantic policy
 change schedules a facts publication even while the new stage is incomplete;
 workers must not interpret an old index under a new pipeline version.
 
-The current facts root (`AFDFACT2`, metadata version 2, 512 bytes) owns the point
-index and four ordered per-stage pending indexes. Each pending entry carries the
-same source-fenced fact as the point index. Publication updates these trees and
-their exact counters atomically, including body changes that leave a pending bit
-set. Identical tree updates share immutable pages; retention traverses all five
-roots as a shared graph. Workers read only pending entries, not completed
-prefixes, flat compaction bases or latest-only mutation segments.
+The current facts root (`AFDFACT3`, metadata version 3, 512 bytes) owns the point
+index and four per-stage pending indexes ordered by `(WAL LSN, document ID)`.
+Each pending entry carries the same source-fenced fact as the point index, with
+its LSN authenticated against the ordering key. Publication updates these trees
+and their exact counters atomically; a changed pending document removes its old
+ordering key and enters at its new source LSN. Identical stage indexes can share
+immutable pages; retention traverses all five roots as a shared graph. Workers
+read only pending entries, not completed prefixes, flat compaction bases or
+latest-only mutation segments.
 
-Worker progress is a single CAS-protected, versioned per-stage record. Its
-exclusive document-key cursor survives unrelated HEAD changes and wraps at the
-end of the pending index, so failed documents remain retryable without blocking
-later work. Numeric offsets are diagnostic, not the resume authority. Source
-read pins and publication/WAL fences protect every emitted full-body upsert.
+Worker progress is a single CAS-protected, versioned per-stage record
+(`AFESCAN3`). It owns both an exclusive ordering-key cursor and the inclusive
+upper key captured once per cycle by a tree-height-bounded rank lookup. New WAL
+arrivals sort beyond this boundary, regardless of their document IDs, and
+cannot extend the active cycle. Existing pending documents updated during a
+cycle move to the next cycle; failed unchanged documents remain available on
+wrap. Both keys survive unrelated HEAD changes and reset when pipeline or facts
+policy semantics change. Numeric offsets are diagnostic, not the resume
+authority. This design needs no historical snapshot owner or additional GC
+retention. Source read pins and publication/WAL fences protect every emitted
+full-body upsert.
+Serverless remains latest-format-only: older facts and cursor encodings are
+rejected rather than interpreted as the new queue ordering.
 Idempotency keys include the source HEAD, stage, pipeline version and document
 key digest, so retrying or wrapping the cursor cannot alias another document.
 
@@ -117,6 +127,14 @@ implicitly request local text/graph indexes. Explicit sidecar configurations
 remain visible: missing graph metrics report pending, but do not cause an
 inventory-only publisher to create endless identical HEADs. Sidecar readiness
 and inventory metadata publication are separate responsibilities.
+
+For an unchanged external source descriptor, metadata publication reconciles
+existing sidecars against the requested index definitions. Compatible physical
+artifacts, search descriptors and document counts survive; graph metrics also
+require the retained parent graph checksum and computation fingerprint to
+match. Changed dependencies are removed individually, while source replacement
+invalidates the prior sidecars. This reconciliation has no artifact-store or
+row-source capability: metadata refresh cannot silently hydrate remote bodies.
 
 ### Incremental serverless graph roots
 

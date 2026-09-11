@@ -29,11 +29,109 @@ const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
 const document_facts = @import("document_facts.zig");
 const page_tree = @import("../graph_segment/page_tree.zig");
 
+test "serverless external metadata retention qualification benchmark" {
+    if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
+    const metadata = @import("external_publication_metadata.zig");
+    var runtime = std.Io.Threaded.init(a, .{});
+    defer runtime.deinit();
+    for ([_]u64{ 1024, 16384 }) |count| {
+        var source = try metadata.testing.fixtureAlloc(a, count);
+        defer source.deinit(a);
+        var plan = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
+        plan.table_definition = .{
+            .schema_json = source.stats.schema_json,
+            .read_schema_json = @constCast("{\"description\":\"metadata-only refresh\"}"),
+            .indexes_json = source.stats.indexes_json,
+        };
+        plan.policy = source.stats.policy;
+        var samples: [5]i96 = undefined;
+        for (0..6) |round| {
+            const start = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds();
+            var result = try metadata.reconcileAlloc(a, source, plan);
+            defer result.deinit(a);
+            const elapsed = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds() - start;
+            try std.testing.expectEqual(@as(usize, 5), result.artifacts.len);
+            try std.testing.expectEqual(count, result.stats.document_count);
+            if (round != 0) samples[round - 1] = elapsed;
+        }
+        std.mem.sort(i96, &samples, {}, std.sort.asc(i96));
+        std.debug.print("external_metadata_retention docs={} retained_sidecars=5 median_ns={} artifact_io_capability=false samples=5\n", .{ count, samples[2] });
+    }
+}
+
 test "serverless pending work index qualification benchmark" {
     if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
     var runtime = std.Io.Threaded.init(a, .{});
     defer runtime.deinit();
     for ([_]usize{ 1024, 16384 }) |count| try pendingWorkBenchmark(runtime.io(), count);
+}
+
+test "serverless pending cycle boundary qualification benchmark" {
+    if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
+    var runtime = std.Io.Threaded.init(a, .{});
+    defer runtime.deinit();
+    for ([_]usize{ 1024, 16384 }) |count| {
+        try pendingCycleBoundaryBenchmark(runtime.io(), count, 4);
+        try pendingCycleBoundaryBenchmark(runtime.io(), count, count);
+    }
+}
+
+fn pendingCycleBoundaryBenchmark(io: std.Io, count: usize, pending_count: usize) !void {
+    var memory = page_tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    const store = memory.store();
+    const ids = try a.alloc([16]u8, count);
+    defer a.free(ids);
+    const replacements = try a.alloc(document_facts.Replacement, count);
+    defer a.free(replacements);
+    for (replacements, 0..) |*replacement, i| {
+        const id = try std.fmt.bufPrint(&ids[i], "doc-{d:0>12}", .{i});
+        replacement.* = .{ .id = id, .value = .{
+            .body = .{ .digest = @splat(1), .attempt = @splat(1), .bytes = 1024 },
+            .last_lsn = 1,
+            .last_timestamp_ns = 1,
+            .pending = if (i >= count - pending_count) 1 else 0,
+        } };
+    }
+    const empty = document_facts.Root{ .domain = store.domain, .policy_fingerprint = @splat(1) };
+    var initial = try document_facts.planAlloc(a, store, empty, replacements, 1);
+    defer initial.deinit();
+    const root = try initial.publish(store, empty);
+    const Sample = struct { scan_ns: i96, seek_ns: i96, scan_reads: usize, seek_reads: usize };
+    var samples: [5]Sample = undefined;
+    for (0..6) |round| {
+        memory.reads = 0;
+        const scan_start = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        var scan = try document_facts.pendingCursor(a, store, root, 0, "");
+        defer scan.deinit();
+        var visited: usize = 0;
+        while (try scan.next()) |_| visited += 1;
+        const scan_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - scan_start;
+        const scan_reads = memory.reads;
+        try std.testing.expectEqual(pending_count, visited);
+
+        // Capture an owned cycle boundary by authenticated subtree rank, not
+        // by traversing the pending set. This cost occurs once per cycle;
+        // resumed passes use the durable key without another tail lookup.
+        memory.reads = 0;
+        const seek_start = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        var tail = try document_facts.pendingCursorAtRank(a, store, root, 0, root.counts[3] - 1);
+        defer tail.deinit();
+        const last = (try tail.next()).?;
+        const upper = try a.dupe(u8, last.order_key);
+        defer a.free(upper);
+        const seek_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() - seek_start;
+        try std.testing.expectEqualStrings(&ids[count - 1], upper[8..]);
+        try std.testing.expect(memory.reads <= root.pending_pages[0].?.height + 1);
+        if (round != 0) samples[round - 1] = .{ .scan_ns = scan_ns, .seek_ns = seek_ns, .scan_reads = scan_reads, .seek_reads = memory.reads };
+    }
+    std.mem.sort(Sample, &samples, {}, struct {
+        fn less(_: void, lhs: Sample, rhs: Sample) bool {
+            return lhs.seek_ns < rhs.seek_ns;
+        }
+    }.less);
+    const median = samples[2];
+    std.debug.print("pending_cycle_boundary docs={} pending={} scan_ns={} boundary_seek_ns={} scan_page_reads={} boundary_page_reads={} samples=5\n", .{ count, pending_count, median.scan_ns, median.seek_ns, median.scan_reads, median.seek_reads });
 }
 
 fn pendingWorkBenchmark(io: std.Io, count: usize) !void {

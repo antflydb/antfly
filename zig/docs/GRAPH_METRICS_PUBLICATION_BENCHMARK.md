@@ -138,6 +138,75 @@ The same run's degree-one WAL medians were 6.913 ms and 8.750 ms respectively;
 their artifact counts/bytes matched the earlier qualification table. The new
 metadata path's artifact work was constant across the 16x namespace increase.
 
+## External metadata retention qualification
+
+An unchanged external source now reconciles sidecars from the old and requested
+index definitions instead of publishing an inventory-only manifest. Compatible
+text, vector and graph artifacts retain their complete physical metadata;
+graph metrics additionally require a retained parent graph, matching source
+checksum and matching computation fingerprint. Changed dependencies are
+invalidated individually. A changed external source still starts without the
+old sidecars.
+
+The metadata reconciler accepts no artifact-store or row-source capability.
+Consequently it cannot read document bodies or rebuild artifacts. This focused
+ReleaseFast benchmark changes read metadata on an owned manifest containing
+text, vector, graph, degree and PageRank sidecars. One warmup precedes five
+samples; the table reports median reconciliation latency, excluding discovery,
+leases, manifest persistence and HEAD publication.
+
+| Document count in manifest | Retained sidecars | Median (ms) | Artifact I/O |
+| ---: | ---: | ---: | --- |
+| 1,024 | 5 | 0.288 | None; no capability supplied |
+| 16,384 | 5 | 0.269 | None; no capability supplied |
+
+This measures metadata work, not a cloud latency SLO or a before/after speedup.
+The relevant scaling property is dependence on configured artifacts, not the
+external document count.
+
+```sh
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'external metadata retention qualification benchmark'
+```
+
+## Finite enrichment cycle qualification
+
+The current pending index orders entries by `(WAL LSN, document ID)`. Capturing
+the last ordering key once per cycle fences out new mutations even when their
+document IDs would sort inside the previous document-key range. It uses subtree
+record counts to seek the last rank, not a full pending scan. Resumed batches
+reuse the durable ordering-key boundary and read the current pinned root.
+
+An in-memory ReleaseFast benchmark compares full pending traversal against
+capturing an owned boundary key, excluding bootstrap and body reads. One warmup
+precedes five samples. Timing pairs below are from the median boundary sample.
+
+| Documents | Pending | Full scan (µs) | Boundary capture (µs) | Scan pages | Boundary pages |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 4 | 4.209 | 2.375 | 1 | 1 |
+| 1,024 | 1,024 | 76.375 | 11.500 | 5 | 2 |
+| 16,384 | 4 | 3.917 | 3.000 | 1 | 1 |
+| 16,384 | 16,384 | 1,142.208 | 9.083 | 58 | 2 |
+
+The eight-byte LSN prefix increases full-index page count (58 rather than 54
+in the preceding all-pending fixture), but boundary capture still reads only
+two pages at this size. Four pending entries behind 16,380 completed documents
+remain one page / 3.375 µs versus a 53-page / 1,026.333 µs primary-index scan.
+These are routing measurements, not end-to-end model or object-store latency.
+The ordered pending tree is distinct from the document-ID point tree; equivalent
+stage trees still share pages, but no longer share the point tree at bootstrap.
+
+A matching degree-one publication rerun measured 6.723/8.304 ms for
+1,024/16,384 documents, with the same 22/30 GETs, 201,930/324,238 read bytes,
+7/11 PUTs and 58,724/138,853 written bytes as the preceding qualification.
+Managed metadata-only publication measured 3.284/3.479 ms, still six GETs,
+2,314 bytes and zero PUTs. This fixture has no pending enrichment population;
+it verifies that the queue format does not add work to unrelated publication,
+not the write cost of moving a pending entry between LSN positions.
+
+```sh
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'pending cycle boundary qualification benchmark' --test-filter 'pending work index qualification benchmark'
+```
+
 ## Focused correctness checks
 
 ```sh

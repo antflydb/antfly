@@ -1323,16 +1323,20 @@ fn lakeTextIndexSpecsAlloc(alloc: Allocator, index_root: std.json.ObjectMap, all
     var it = index_root.iterator();
     while (it.next()) |entry| {
         if (!isFullTextIndexConfig(entry.value_ptr.*)) continue;
+        try specs.ensureUnusedCapacity(alloc, 1);
         const config_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
         errdefer alloc.free(config_json);
-        try specs.append(alloc, .{
+        specs.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .config_json = config_json,
         });
     }
     if (specs.items.len == 0 and allow_default) {
-        try specs.append(alloc, .{
-            .name = try alloc.dupe(u8, default_full_text_index_name),
+        try specs.ensureUnusedCapacity(alloc, 1);
+        const name = try alloc.dupe(u8, default_full_text_index_name);
+        errdefer alloc.free(name);
+        specs.appendAssumeCapacity(.{
+            .name = name,
             .config_json = try alloc.dupe(u8, "{\"type\":\"full_text\"}"),
         });
     }
@@ -1370,7 +1374,8 @@ fn listEmbeddingIndexesAlloc(alloc: Allocator, index_root: std.json.ObjectMap) !
             .bool => |flag| flag,
             else => return error.InvalidTableIndexMetadata,
         } else false;
-        try specs.append(alloc, .{
+        try specs.ensureUnusedCapacity(alloc, 1);
+        specs.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .sparse = sparse,
         });
@@ -1749,21 +1754,29 @@ fn makeDecision(
     reason: []const u8,
     artifact_id: []const u8,
 ) !Decision {
+    const name = try alloc.dupe(u8, desired.name);
+    errdefer alloc.free(name);
+    const owned_reason = try alloc.dupe(u8, reason);
+    errdefer alloc.free(owned_reason);
     return .{
-        .name = try alloc.dupe(u8, desired.name),
+        .name = name,
         .sidecar_kind = desired.binding.sidecar_kind,
         .action = action,
-        .reason = try alloc.dupe(u8, reason),
+        .reason = owned_reason,
         .artifact_id = if (artifact_id.len == 0) &.{} else try alloc.dupe(u8, artifact_id),
     };
 }
 
 fn makeDropDecision(alloc: Allocator, published: PublishedArtifact) !Decision {
+    const name = try alloc.dupe(u8, published.name);
+    errdefer alloc.free(name);
+    const reason = try alloc.dupe(u8, "published artifact is no longer desired");
+    errdefer alloc.free(reason);
     return .{
-        .name = try alloc.dupe(u8, published.name),
+        .name = name,
         .sidecar_kind = published.binding.sidecar_kind,
         .action = .drop,
-        .reason = try alloc.dupe(u8, "published artifact is no longer desired"),
+        .reason = reason,
         .artifact_id = try alloc.dupe(u8, published.artifact.artifact_id),
     };
 }
@@ -1903,7 +1916,7 @@ fn executeRebuildOperationAlloc(
     };
 }
 
-fn bindingsEqual(a: source_binding.Binding, b: source_binding.Binding) bool {
+pub fn bindingsEqual(a: source_binding.Binding, b: source_binding.Binding) bool {
     return a.sidecar_kind == b.sidecar_kind and
         a.source_kind == b.source_kind and
         a.row_ref_kind == b.row_ref_kind and
@@ -1945,25 +1958,27 @@ fn cloneBindingAlloc(alloc: Allocator, binding: source_binding.Binding) !source_
 
 fn cloneBuildSpecAlloc(alloc: Allocator, build_spec: BuildSpec) !BuildSpec {
     return switch (build_spec) {
-        .text => |spec| .{ .text = .{
-            .text_column = try alloc.dupe(u8, spec.text_column),
-            .config_json = try alloc.dupe(u8, spec.config_json),
-        } },
-        .vector => |spec| .{ .vector = .{
-            .vector_column = try alloc.dupe(u8, spec.vector_column),
-            .embedding_name = if (spec.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else null,
-        } },
+        .text => |spec| blk: {
+            const column = try alloc.dupe(u8, spec.text_column);
+            errdefer alloc.free(column);
+            break :blk .{ .text = .{ .text_column = column, .config_json = try alloc.dupe(u8, spec.config_json) } };
+        },
+        .vector => |spec| blk: {
+            const column = try alloc.dupe(u8, spec.vector_column);
+            errdefer alloc.free(column);
+            break :blk .{ .vector = .{ .vector_column = column, .embedding_name = if (spec.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else null } };
+        },
         .sparse => |spec| .{ .sparse = .{
             .sparse_column = try alloc.dupe(u8, spec.sparse_column),
         } },
         .graph => |spec| .{ .graph = .{
             .graph_column = try alloc.dupe(u8, spec.graph_column),
         } },
-        .algebraic_group_by => |spec| .{ .algebraic_group_by = .{
-            .group_column = try alloc.dupe(u8, spec.group_column),
-            .value_column = if (spec.value_column.len == 0) &.{} else try alloc.dupe(u8, spec.value_column),
-            .op = spec.op,
-        } },
+        .algebraic_group_by => |spec| blk: {
+            const column = try alloc.dupe(u8, spec.group_column);
+            errdefer alloc.free(column);
+            break :blk .{ .algebraic_group_by = .{ .group_column = column, .value_column = if (spec.value_column.len == 0) &.{} else try alloc.dupe(u8, spec.value_column), .op = spec.op } };
+        },
         .algebraic_expression => |spec| blk: {
             const expressions = try alloc.alloc(algebraic_segment.ExpressionSpec, spec.expressions.len);
             errdefer alloc.free(expressions);
@@ -1975,8 +1990,10 @@ fn cloneBuildSpecAlloc(alloc: Allocator, build_spec: BuildSpec) !BuildSpec {
                 }
             }
             for (spec.expressions, expressions) |expression, *out| {
+                const name = try alloc.dupe(u8, expression.name);
+                errdefer alloc.free(name);
                 out.* = .{
-                    .name = try alloc.dupe(u8, expression.name),
+                    .name = name,
                     .value_column = if (expression.value_column.len == 0) &.{} else try alloc.dupe(u8, expression.value_column),
                     .op = expression.op,
                 };
@@ -3053,6 +3070,41 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
     defer metric.deinit(alloc);
     try std.testing.expectEqualStrings(graph_declaration.artifact.artifact_id, metric.source_graph_artifact_id);
     try std.testing.expect(metric.score(target_key) != null);
+
+    // Metadata-only publication must retain actual queryable lake payloads,
+    // not merely preserve names in a synthetic manifest. No RowSource is
+    // passed to the reconciler, so this cannot quietly rebuild remote rows.
+    const external_metadata = @import("external_publication_metadata.zig");
+    const manifest_types = @import("../manifest/types.zig");
+    const metadata_indexes = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}";
+    const sidecar_refs = try alloc.alloc(manifest_types.ArtifactRef, reconciled.artifacts.len);
+    defer alloc.free(sidecar_refs);
+    for (reconciled.artifacts, sidecar_refs) |sidecar, *ref| ref.* = sidecar.artifact;
+    const current_metadata = manifest_types.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 0,
+        .base_source = base_source,
+        .stats = .{ .document_count = 2, .text_segment_count = 1, .graph_segment_count = 1, .indexes_json = @constCast(metadata_indexes), .published_search_sources = .{ .text = .{ .index_name = "body_text" } } },
+        .artifacts = sidecar_refs,
+    };
+    var refreshed = try external_metadata.reconcileAlloc(alloc, current_metadata, .{
+        .targets = .{ .published_search_sources = .{} },
+        .table_definition = .{ .indexes_json = @constCast(metadata_indexes), .read_schema_json = @constCast("{}") },
+    });
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(current_metadata.artifacts.len, refreshed.artifacts.len);
+    const refreshed_metric = for (refreshed.artifacts) |ref| {
+        if (std.mem.eql(u8, ref.name, metric_artifact_name)) break ref;
+    } else return error.TestExpectedGraphMetric;
+    const refreshed_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, refreshed_metric.artifact_id, refreshed_metric.byte_len, refreshed_metric.checksum, .none);
+    defer alloc.free(refreshed_payload);
+    var refreshed_scores = try graph_metric_segment.decodeAlloc(alloc, refreshed_payload);
+    defer refreshed_scores.deinit(alloc);
+    try std.testing.expectEqual(metric.score(target_key).?, refreshed_scores.score(target_key).?);
+    try std.testing.expectEqualStrings(declaration.artifact.artifact_id, refreshed.artifacts[0].artifact_id);
 
     const degree_artifact_name = try graph_metric_segment.artifactNameAlloc(alloc, "graph_idx", "degree");
     defer alloc.free(degree_artifact_name);

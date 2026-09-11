@@ -164,6 +164,17 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
         null;
     errdefer if (base_source_copy) |*descriptor| base_source.freeOwnedDescriptor(alloc, descriptor);
 
+    var published_sources = try search_sources.clonePublishedSearchSourcesAlloc(alloc, src.stats.published_search_sources);
+    errdefer search_sources.deinitPublishedSearchSources(alloc, &published_sources);
+    var derived_outputs = try search_sources.cloneMaterializedDerivedOutputsAlloc(alloc, src.stats.derived_outputs);
+    errdefer search_sources.deinitMaterializedDerivedOutputs(alloc, &derived_outputs);
+    const schema_json: []u8 = if (src.stats.schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.schema_json);
+    errdefer if (schema_json.len != 0) alloc.free(schema_json);
+    const read_schema_json: []u8 = if (src.stats.read_schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.read_schema_json);
+    errdefer if (read_schema_json.len != 0) alloc.free(read_schema_json);
+    const indexes_json: []u8 = if (src.stats.indexes_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.indexes_json);
+    errdefer if (indexes_json.len != 0) alloc.free(indexes_json);
+
     return .{
         .namespace = namespace,
         .version = src.version,
@@ -182,18 +193,12 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
             .vector_segment_count = src.stats.vector_segment_count,
             .sparse_segment_count = src.stats.sparse_segment_count,
             .graph_segment_count = src.stats.graph_segment_count,
-            .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
-                alloc,
-                src.stats.published_search_sources,
-            ),
-            .derived_outputs = try search_sources.cloneMaterializedDerivedOutputsAlloc(
-                alloc,
-                src.stats.derived_outputs,
-            ),
+            .published_search_sources = published_sources,
+            .derived_outputs = derived_outputs,
             .policy = src.stats.policy,
-            .schema_json = if (src.stats.schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.schema_json),
-            .read_schema_json = if (src.stats.read_schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.read_schema_json),
-            .indexes_json = if (src.stats.indexes_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.indexes_json),
+            .schema_json = schema_json,
+            .read_schema_json = read_schema_json,
+            .indexes_json = indexes_json,
         },
         .artifacts = artifacts,
     };

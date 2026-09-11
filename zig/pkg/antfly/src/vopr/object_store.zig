@@ -214,7 +214,8 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
         .doc_offset = 1,
         .revision = 1,
         .pipeline_version = 1,
-        .after_doc_id = "a",
+        .after_order_key = "00000001a",
+        .cycle_upper_order_key = "00000001z",
     };
     try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
         "docs",
@@ -229,7 +230,7 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
             "docs",
             .lexical_sparse,
             first_progress,
-            .{ .head_version = 1, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .after_doc_id = "b" },
+            .{ .head_version = 1, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .after_order_key = "00000001b", .cycle_upper_order_key = "00000001z" },
         ),
     );
     var retained_progress = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;

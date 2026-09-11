@@ -1057,7 +1057,7 @@ test "serverless retention follows publication lineage around lower orphan" {
     try putTestManifestWithLineage(&manifests, 2, 2, orphan_artifact, true, 1);
     try putTestManifestWithLineage(&manifests, 3, 3, head_artifact, true, 1);
     try std.testing.expect(try progress.compareAndSwapHead("docs", null, 3));
-    const expected_progress: catalog_mod.EnrichmentStageProgress = .{ .head_version = 3, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .after_doc_id = "a\x00b" };
+    const expected_progress: catalog_mod.EnrichmentStageProgress = .{ .head_version = 3, .doc_offset = 1, .revision = 1, .pipeline_version = 1, .after_order_key = "00000001a\x00b", .cycle_upper_order_key = "00000001z" };
     try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
         "docs",
         .lexical_sparse,
