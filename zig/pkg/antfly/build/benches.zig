@@ -157,7 +157,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const graph_metric_prepare_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/graph/metric_preparation_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     graph_metric_prepare_bench_mod.addImport("antfly_zig", antfly_mod);
     const graph_metric_prepare_bench = b.addExecutable(.{

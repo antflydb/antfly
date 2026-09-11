@@ -301,6 +301,10 @@ def main(argv: list[str]) -> int:
     # references. Only the modular join is a cached build producer.
     if options.depfile is not None and args[:1] != ["--joined-only"]:
         parser.error("--depfile requires --joined-only")
+    if options.depfile is not None and len(args) > 1:
+        # Build-runner output paths are relative to its working directory,
+        # unlike the legacy repository-relative command-line defaults.
+        args[1] = str(Path(args[1]).absolute())
     with record_dependencies(options.depfile):
         return generate(args)
 

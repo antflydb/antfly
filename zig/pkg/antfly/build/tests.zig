@@ -1503,6 +1503,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, graph_metric_command_test_mod, true, true);
+    graph_metric_command_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     graph_metric_command_test_mod.addImport("antfly-zig", antfly_mod);
     graph_metric_command_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const graph_metric_command_tests = b.addTest(.{
