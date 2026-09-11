@@ -33,6 +33,8 @@ const Run = repository_mod.Run;
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
 pub var test_private_read_versions: bool = false;
+pub var test_current_point_unlocked_hook: ?*const fn (*anyopaque) anyerror!void = null;
+pub var test_current_point_rank_walk: bool = false;
 const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
@@ -2590,6 +2592,28 @@ fn getCurrentPointRetainedLocked(
         }
     }
 
+    // Writer reads resolve their overlay/memtables first, then pin the exact
+    // current SST directory at that same serialized boundary. Reuse indexed
+    // candidate discovery and do storage I/O outside the writer mutex. A new
+    // call pins a new tip; this is not a transaction-wide read snapshot.
+    if (@hasDecl(BackendType, "createReadVersionFromDirectory") and !(builtin.is_test and test_current_point_rank_walk)) {
+        const view = try RunReadView.pin(backend, runtimeScratchAllocator(allocator));
+        defer view.release(backend);
+        if (view.directory()) |directory| {
+            unlockBackend(BackendType, backend, builtin.os.tag != .freestanding);
+            defer if (builtin.os.tag != .freestanding) {
+                _ = lockBackend(BackendType, backend);
+            };
+            if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
+            return getOwnedDirectoryPoint(backend, directory, held_values, allocator, namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
+        // Only flat oracle fixtures can reach the fallback with SSTs.
+        if (run_store.count(backend) == 0) return null;
+    }
+
     var run_index: usize = 0;
     while (run_index < run_store.count(backend) and run_store.at(backend, run_index).*.level == 0) : (run_index += 1) {
         if (try getFromRunPointRetainedLocked(backend, run_store.at(backend, run_index), run_index, held_blocks, held_values, allocator, namespace, key)) |value| return value;
@@ -2654,6 +2678,35 @@ fn getFromRunPointRetainedLocked(
         return owned;
     }
     return null;
+}
+
+/// Return a transaction-owned value without retaining a whole SST epoch.
+/// Decoded allocations already transferred to held_values are reused (also
+/// when the value is a subslice of a wide decoded block). Cache/in-memory
+/// borrows are copied before their temporary block and directory pins end.
+fn getOwnedDirectoryPoint(
+    backend: anytype,
+    directory: *const @import("run_directory.zig").Directory,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) ![]const u8 {
+    var blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty;
+    defer releaseHeldBlocks(&blocks, backend.allocator);
+    var hint: ?BorrowedReadHint = null;
+    const first_owned = held_values.items.len;
+    const value = try getFromDirectoryPoint(backend, directory, &.{}, &hint, &blocks, held_values, allocator, namespace, key);
+    const address = @intFromPtr(value.ptr);
+    for (held_values.items[first_owned..]) |owned| {
+        const base = @intFromPtr(owned.ptr);
+        if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
+    }
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try held_values.append(allocator, owned);
+    recordPointValueCopy(backend);
+    return owned;
 }
 
 fn readManyCurrentSortedPointByRunLocked(
@@ -3029,6 +3082,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
         read_view: RunReadView,
+        owns_version_reader: bool = false,
 
         /// Pin the published topology and exact immutable generations under
         /// the backend lock. SST I/O runs after releasing that lock.
@@ -3067,13 +3121,21 @@ fn CurrentReadLayout(comptime BackendType: type) type {
         }
 
         fn init(backend: *BackendType, allocator: Allocator) !@This() {
-            return @This().captureSources(backend, allocator, true, false);
+            // A write transaction is only a lifecycle pin, not a version
+            // reader. Keep its captured memtables alive while batch I/O is
+            // unlocked, including across intervening writes and reclamation.
+            try retainReadReader(BackendType, backend, .current_scan);
+            errdefer releaseReadReader(BackendType, backend, .current_scan);
+            var layout = try @This().captureSources(backend, allocator, true, false);
+            layout.owns_version_reader = true;
+            return layout;
         }
 
         fn deinit(self: *@This()) void {
             if (self.mutable_snapshot) |snapshot| snapshot.release(self.backend);
             self.read_view.release(self.backend);
             releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
+            if (self.owns_version_reader) releaseReadReader(BackendType, self.backend, .current_scan);
             self.* = undefined;
         }
 
@@ -3083,10 +3145,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
             const backend = self.backend;
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
-            if (self.mutable_snapshot) |snapshot| snapshot.release(backend);
-            self.read_view.release(backend);
-            releaseImmutableMemtableSnapshotList(BackendType, backend, self.immutable_memtables);
-            self.* = undefined;
+            self.deinit();
         }
     };
 }
@@ -3104,7 +3163,14 @@ fn readManySortedCurrentWithLayoutLocked(
 ) !BatchCursorReadResult {
     const LocalCursor = MergeCursor(BackendType, State);
 
-    if (layout.read_view.directory()) |directory| return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, true);
+    if (layout.read_view.directory()) |directory| {
+        unlockBackend(BackendType, backend, builtin.os.tag != .freestanding);
+        defer if (builtin.os.tag != .freestanding) {
+            _ = lockBackend(BackendType, backend);
+        };
+        if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
+        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false);
+    }
 
     switch (chooseMultiGetPlan(keys, .stable_probe)) {
         .cursor => {},
@@ -4551,7 +4617,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (miss_count > 0) {
                 const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
                 defer self.metadata_allocator.free(miss_values);
-                if (miss_count > max_current_batch_read_keys_per_backend_lock) {
+                if (@hasDecl(BackendType, "createReadVersionFromDirectory") or miss_count > max_current_batch_read_keys_per_backend_lock) {
                     const locked = lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);

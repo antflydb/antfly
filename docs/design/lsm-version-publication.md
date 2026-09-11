@@ -1,5 +1,45 @@
 # LSM version publication
 
+## Indexed current-tip reads inside write transactions
+
+Scalar reads in both bound and namespace write transactions resolve their local
+overlay, then the live mutable/immutable memtables under the backend mutex. If
+those do not decide the key, they pin the current immutable SST directory at
+that same boundary. Candidate discovery and table I/O then use the ordinary
+indexed read path outside the writer mutex. Each call captures a fresh tip;
+opening a write transaction does not freeze its subsequent committed reads.
+
+Bound write batches pin one complete view for all unresolved keys, including
+batches smaller than the lock-chunk threshold. This view owns a version-reader
+pin independently of the write transaction's lifecycle pin, so retiring mutable
+generations cannot be reclaimed during unlocked I/O. Chunks read that same view
+outside the mutex, so concurrent flushes cannot mix generations within a batch.
+Namespace batches already use the indexed probe path. No production writer
+lookup scans every run to rediscover level boundaries or builds a flat run-set
+projection. The old rank walk remains only for the independent flat fixtures
+and the test-only benchmark control.
+
+The transaction owns returned values, not an entire retired SST epoch. Existing
+decoded allocations are reused, including wide-row subslices; cache and
+in-memory borrows receive one owned copy before temporary pins are released.
+Error and cancellation unwind reacquire the mutex before releasing the view.
+Regression tests cover overlays, tombstones, namespaces, concurrent flushes,
+coherent batches, cache/no-cache wide values, and allocation failure with more
+than sixteen overlapping candidates.
+
+Local arm64 ReleaseFast metadata-only benchmark, median of seven 100-lookup
+samples after warmup, using actual write-transaction reads into a gap inside a
+lower level: at 1,000 / 10,000 / 100,000 runs, the previous rank walk took
+7.12 / 216.09 / 2,917.87 microseconds per lookup, versus 0.16 / 0.17 / 0.26
+microseconds with indexed selection. Directory construction, SST I/O and
+contention are excluded; these are not end-to-end query throughput numbers.
+
+```sh
+cd zig
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'current writer directory'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'current writer directory point scaling benchmark'
+```
+
 ## Bounded memtable retirement
 
 Last-reader release, including owned replay-lane and bulk-current scans, hands
