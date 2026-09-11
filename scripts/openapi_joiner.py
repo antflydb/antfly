@@ -17,22 +17,20 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 
 import yaml
+
+from openapi_inputs import load_yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
 METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
 USERMGR_SPEC = ROOT / "specs/openapi/auth/api.yaml"
 ROOT_SPEC = ROOT / "openapi.yaml"
-GO_SCHEMA_SPEC = (ROOT / "specs/openapi/antfly/schema.yaml").resolve()
-GO_INDEX_SPEC = (ROOT / "specs/openapi/antfly/indexes.yaml").resolve()
-GO_INDEX_REF_PATHS = {
-    "indexes.yaml",
-    "specs/openapi/antfly/indexes.yaml",
-}
+GO_SCHEMA_SPEC = ROOT / "specs/openapi/antfly/schema.yaml"
 PATH_REWRITES = {
     "../auth/api.yaml": "specs/openapi/auth/api.yaml",
     "../shared/chunking.yaml": "specs/openapi/shared/chunking.yaml",
@@ -145,14 +143,6 @@ def join_specs(metadata_spec: dict, usermgr_spec: dict) -> dict:
     return joined
 
 
-def load_yaml(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"expected mapping at {path}")
-    return data
-
-
 def resolve_pointer(doc: object, pointer: str) -> object:
     value = doc
     for raw_part in pointer.lstrip("/").split("/"):
@@ -174,22 +164,20 @@ def split_ref(ref: str) -> tuple[str, str]:
     return path_part, f"#{pointer}"
 
 
+def schema_path(path: Path) -> Path:
+    # Normalize lexical aliases while preserving symlinks as cache inputs.
+    return Path(os.path.abspath(path))
+
+
 def resolve_ref_path(ref_path: str, source_path: Path | None) -> Path:
-    candidates: list[Path] = []
-    if source_path is not None:
-        candidates.append((source_path.parent / ref_path).resolve())
-    candidates.append((ROOT / ref_path).resolve())
-    for old_prefix, new_prefix in PATH_REWRITES.items():
-        if ref_path.startswith(old_prefix):
-            candidates.append(
-                (ROOT / ref_path.replace(old_prefix, new_prefix, 1)).resolve()
-            )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    if ref_path in GO_INDEX_REF_PATHS:
-        return GO_INDEX_SPEC
-    raise RuntimeError(f"unable to resolve ref path {ref_path!r} from {source_path}")
+    # Merged documents use repository-relative references. Inside an external
+    # schema, ordinary relative references belong to that schema's directory.
+    # Resolution must never depend on which candidate files happen to exist.
+    if source_path is None or schema_path(source_path) == ROOT_SPEC:
+        return schema_path(ROOT / rewrite_ref_path(ref_path))
+    if ref_path.startswith("specs/openapi/"):
+        return schema_path(ROOT / ref_path)
+    return schema_path(source_path.parent / ref_path)
 
 
 def rewrite_ref_path(ref_path: str) -> str:
@@ -202,56 +190,15 @@ def rewrite_ref_path(ref_path: str) -> str:
 def load_cached_yaml(cache: dict[Path, dict], path: Path) -> dict:
     doc = cache.get(path)
     if doc is None:
-        if path == GO_INDEX_SPEC and not path.exists():
-            # CI checks out the antfly monorepo. The bundled root spec carries the
-            # legacy Go index schemas that metadata/openapi.yaml still refs.
-            doc = load_yaml(ROOT_SPEC)
-        else:
-            doc = load_yaml(path)
+        doc = load_yaml(path)
         cache[path] = doc
     return doc
 
 
 def target_schema_name(source_path: Path, schema_name: str) -> str:
-    if source_path.resolve() == GO_SCHEMA_SPEC and schema_name == "AntflyType":
+    if schema_path(source_path) == GO_SCHEMA_SPEC and schema_name == "AntflyType":
         return "schemas-AntflyType"
     return schema_name
-
-
-def target_schema_name_for_ref(ref_path: str, schema_name: str) -> str:
-    rewritten = rewrite_ref_path(ref_path)
-    if (ROOT / rewritten).resolve() == GO_SCHEMA_SPEC and schema_name == "AntflyType":
-        return "schemas-AntflyType"
-    return schema_name
-
-
-def ensure_root_schema_from_fallback(
-    root_spec: dict,
-    root_schema_name: str,
-    cache: dict[Path, dict],
-    in_progress: set[tuple[Path, str]],
-    fallback_schemas: dict | None,
-) -> bool:
-    components = root_spec.setdefault("components", {})
-    root_schemas = components.setdefault("schemas", {})
-    existing = root_schemas.get(root_schema_name)
-    if existing is not None and not (
-        isinstance(existing, dict) and isinstance(existing.get("$ref"), str)
-    ):
-        return True
-    if fallback_schemas is None or root_schema_name not in fallback_schemas:
-        return False
-
-    schema_value = copy.deepcopy(fallback_schemas[root_schema_name])
-    root_schemas[root_schema_name] = bundle_refs(
-        schema_value,
-        root_spec,
-        ROOT_SPEC.resolve(),
-        cache,
-        in_progress,
-        fallback_schemas,
-    )
-    return True
 
 
 def ensure_root_schema(
@@ -260,11 +207,10 @@ def ensure_root_schema(
     source_path: Path,
     cache: dict[Path, dict],
     in_progress: set[tuple[Path, str]],
-    fallback_schemas: dict | None = None,
 ) -> None:
     components = root_spec.setdefault("components", {})
     root_schemas = components.setdefault("schemas", {})
-    resolved_source_path = source_path.resolve()
+    resolved_source_path = schema_path(source_path)
     root_schema_name = target_schema_name(resolved_source_path, schema_name)
     existing = root_schemas.get(root_schema_name)
     if existing is not None and not (
@@ -291,7 +237,6 @@ def ensure_root_schema(
             resolved_source_path,
             cache,
             in_progress,
-            fallback_schemas,
         )
         root_schemas[root_schema_name] = bundled
     finally:
@@ -304,7 +249,6 @@ def bundle_ref(
     source_path: Path | None,
     cache: dict[Path, dict],
     in_progress: set[tuple[Path, str]],
-    fallback_schemas: dict | None = None,
 ) -> str:
     if ref.startswith("#"):
         _, pointer = split_ref(f"{source_path or ROOT_SPEC}{ref}")
@@ -320,7 +264,6 @@ def bundle_ref(
                 source_path,
                 cache,
                 in_progress,
-                fallback_schemas,
             )
             return (
                 f"#/components/schemas/{target_schema_name(source_path, schema_name)}"
@@ -331,18 +274,8 @@ def bundle_ref(
     if not pointer.startswith("#/components/schemas/"):
         raise RuntimeError(f"unsupported external ref target {ref}")
     schema_name = pointer.rsplit("/", 1)[-1]
-    try:
-        resolved_path = resolve_ref_path(ref_path, source_path)
-    except RuntimeError:
-        root_schema_name = target_schema_name_for_ref(ref_path, schema_name)
-        if ensure_root_schema_from_fallback(
-            root_spec, root_schema_name, cache, in_progress, fallback_schemas
-        ):
-            return f"#/components/schemas/{root_schema_name}"
-        raise
-    ensure_root_schema(
-        root_spec, schema_name, resolved_path, cache, in_progress, fallback_schemas
-    )
+    resolved_path = resolve_ref_path(ref_path, source_path)
+    ensure_root_schema(root_spec, schema_name, resolved_path, cache, in_progress)
     return f"#/components/schemas/{target_schema_name(resolved_path, schema_name)}"
 
 
@@ -352,7 +285,6 @@ def bundle_refs(
     source_path: Path | None,
     cache: dict[Path, dict],
     in_progress: set[tuple[Path, str]],
-    fallback_schemas: dict | None = None,
 ) -> object:
     if isinstance(value, dict):
         if "$ref" in value and isinstance(value["$ref"], str):
@@ -362,7 +294,6 @@ def bundle_refs(
                 source_path,
                 cache,
                 in_progress,
-                fallback_schemas,
             )
             return value
         for key, child in list(value.items()):
@@ -375,13 +306,12 @@ def bundle_refs(
                             source_path,
                             cache,
                             in_progress,
-                            fallback_schemas,
                         )
             bundled_child = bundle_refs(
-                child, root_spec, source_path, cache, in_progress, fallback_schemas
+                child, root_spec, source_path, cache, in_progress
             )
             if (
-                source_path == ROOT_SPEC.resolve()
+                source_path == ROOT_SPEC
                 and key in (root_spec.get("components", {}).get("schemas", {}) or {})
                 and is_ref_to_section_key(bundled_child, "components/schemas", key)
             ):
@@ -391,24 +321,19 @@ def bundle_refs(
         return value
     if isinstance(value, list):
         for i, child in enumerate(value):
-            value[i] = bundle_refs(
-                child, root_spec, source_path, cache, in_progress, fallback_schemas
-            )
+            value[i] = bundle_refs(child, root_spec, source_path, cache, in_progress)
         return value
     return value
 
 
-def bundle_joined_spec(joined: dict, fallback_root: dict | None = None) -> dict:
+def bundle_joined_spec(joined: dict) -> dict:
     bundled = copy.deepcopy(joined)
     cache = {
-        METADATA_SPEC.resolve(): load_yaml(METADATA_SPEC),
-        USERMGR_SPEC.resolve(): load_yaml(USERMGR_SPEC),
-        ROOT_SPEC.resolve(): bundled,
+        schema_path(METADATA_SPEC): load_yaml(METADATA_SPEC),
+        schema_path(USERMGR_SPEC): load_yaml(USERMGR_SPEC),
+        ROOT_SPEC: bundled,
     }
-    fallback_schemas = None
-    if fallback_root is not None:
-        fallback_schemas = fallback_root.get("components", {}).get("schemas") or {}
-    bundle_refs(bundled, bundled, ROOT_SPEC.resolve(), cache, set(), fallback_schemas)
+    bundle_refs(bundled, bundled, ROOT_SPEC, cache, set())
     return bundled
 
 
@@ -496,7 +421,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "--compare":
         target = argv[1] if len(argv) > 1 else "openapi.yaml"
         current = load_yaml(ROOT / target)
-        joined = bundle_joined_spec(join_specs(metadata, usermgr), current)
+        joined = bundle_joined_spec(join_specs(metadata, usermgr))
         has_drift = compare_specs(joined, current)
         return 1 if has_drift else 0
 

@@ -56,6 +56,7 @@ pub const gemma4_real_autodiff = @import("gemma4_real_autodiff.zig");
 pub const gemma4_multimodal_real_autodiff = @import("gemma4_multimodal_real_autodiff.zig");
 pub const qwen2_real_autodiff = @import("qwen2_real_autodiff.zig");
 pub const recipe = @import("recipe.zig");
+pub const runners = @import("runners.zig");
 
 test {
     _ = lora;

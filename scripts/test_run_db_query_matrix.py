@@ -106,7 +106,13 @@ class QueryMatrixTest(unittest.TestCase):
             calls = self.run_fake(root)
             self.assertEqual(
                 calls[0],
-                ["zig", "build", "antfly-storage-bench", "antfly-api-bench"],
+                [
+                    "zig",
+                    "build",
+                    "-Doptimize=ReleaseFast",
+                    "antfly-storage-bench",
+                    "antfly-api-bench",
+                ],
             )
             self.assertEqual(len(calls), 18)
             self.assertEqual(Path(calls[-1][0]).name, "storage_bench")

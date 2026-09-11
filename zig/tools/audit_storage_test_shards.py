@@ -139,7 +139,7 @@ def main() -> int:
     for failure in failures:
         print(f"  {failure}")
     print(
-        "update storage/test_manifest.zig and the disjoint shard filters in zig/build.zig"
+        "update storage/test_manifest.zig and the disjoint shard filters in zig/pkg/antfly/build/tests.zig"
     )
     return 1
 
