@@ -37,10 +37,41 @@ const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig"
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const AppliedMetadataBatch = struct {
+/// Durable apply progress; the Raft log owns replay bytes.
+pub const AppliedMetadataCheckpoint = struct {
     commit_index: u64,
-    entries_bytes: []const u8,
+    input_kind: enum(u8) { committed_entries = 0, snapshot = 1 },
+    input_bytes: u64,
+
+    pub fn fromInput(commit_index: u64, kind: @FieldType(@This(), "input_kind"), bytes: []const u8) @This() {
+        return .{ .commit_index = commit_index, .input_kind = kind, .input_bytes = bytes.len };
+    }
 };
+
+const checkpoint_magic = "AMCKPT\x00\x00";
+const checkpoint_encoded_len = 26;
+fn encodeMetadataCheckpoint(value: AppliedMetadataCheckpoint) [checkpoint_encoded_len]u8 {
+    var bytes: [checkpoint_encoded_len]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], value.commit_index, .little);
+    @memcpy(bytes[8..16], checkpoint_magic);
+    bytes[16] = 1;
+    bytes[17] = @intFromEnum(value.input_kind);
+    std.mem.writeInt(u64, bytes[18..26], value.input_bytes, .little);
+    return bytes;
+}
+fn decodeMetadataCheckpoint(bytes: []const u8) !AppliedMetadataCheckpoint {
+    if (bytes.len < 8) return error.InvalidMetadataApplyBatch;
+    const index = std.mem.readInt(u64, bytes[0..8], .little);
+    // Legacy rows held the full encoded batch after the applied index. Read
+    // them without retaining that allocation; the next commit replaces them.
+    if (!std.mem.startsWith(u8, bytes[8..], checkpoint_magic)) return AppliedMetadataCheckpoint.fromInput(index, .committed_entries, bytes[8..]);
+    if (bytes.len != checkpoint_encoded_len or bytes[16] != 1) return error.InvalidMetadataApplyBatch;
+    return .{ .commit_index = index, .input_kind = switch (bytes[17]) {
+        0 => .committed_entries,
+        1 => .snapshot,
+        else => return error.InvalidMetadataApplyBatch,
+    }, .input_bytes = std.mem.readInt(u64, bytes[18..26], .little) };
+}
 
 pub const CatalogProjectionSnapshot = struct {
     metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
@@ -1817,8 +1848,8 @@ test "metadata raft apply store snapshot replaces one complete projection and pr
     defer target.freeSplitTransitions(std.testing.allocator, splits);
     try std.testing.expectEqual(@as(usize, 1), splits.len);
     try std.testing.expectEqual(@as(u64, 71), splits[0].transition_id);
-    const batch = (try target.latestBatch(group_id)).?;
-    try std.testing.expectEqual(@as(u64, 4), batch.commit_index);
+    const batch = (try target.latestCheckpoint(group_id)).?;
+    try std.testing.expectEqualDeep(AppliedMetadataCheckpoint.fromInput(4, .snapshot, snapshot), batch);
     const installed_snapshot = try target.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(installed_snapshot);
     try std.testing.expectEqualSlices(u8, snapshot, installed_snapshot);
@@ -2090,7 +2121,7 @@ pub const RaftApplyStore = struct {
     backend: lsm_backend.BackendHandle,
     block_cache: ?*lsm_backend.Cache = null,
     store: docstore.DocStore,
-    batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
+    checkpoints: std.AutoHashMapUnmanaged(u64, AppliedMetadataCheckpoint) = .empty,
     projected_placement_intents: std.ArrayListUnmanaged(ProjectedPlacementIntent) = .empty,
     loaded_placement_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     projection_listeners: std.ArrayListUnmanaged(RegisteredProjectionListener) = .empty,
@@ -2100,11 +2131,6 @@ pub const RaftApplyStore = struct {
     active_outcome: ?*CommittedApplyOutcome = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
-
-    const OwnedBatch = struct {
-        commit_index: u64,
-        entries_bytes: []u8,
-    };
 
     const ProjectedPlacementIntent = struct {
         metadata_group_id: u64,
@@ -2159,9 +2185,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
-        var it = self.batches.valueIterator();
-        while (it.next()) |batch| self.alloc.free(batch.entries_bytes);
-        self.batches.deinit(self.alloc);
+        self.checkpoints.deinit(self.alloc);
         self.verified_catalog_groups.deinit(self.alloc);
         for (self.projected_placement_intents.items) |*entry| freePlacementIntent(self.alloc, entry.intent);
         self.projected_placement_intents.deinit(self.alloc);
@@ -2200,12 +2224,11 @@ pub const RaftApplyStore = struct {
         return self.backend.snapshotMaintenanceStats();
     }
 
-    pub fn latestBatch(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataBatch {
-        const batch = (try self.ensureLoaded(group_id)) orelse return null;
-        return .{
-            .commit_index = batch.commit_index,
-            .entries_bytes = batch.entries_bytes,
-        };
+    pub fn latestCheckpoint(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataCheckpoint {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        return try self.ensureLoaded(group_id);
     }
 
     pub fn addProjectionListener(self: *RaftApplyStore, listener: ProjectionListener) !void {
@@ -5070,11 +5093,13 @@ pub const RaftApplyStore = struct {
         var key_buf: [128]u8 = undefined;
         const key = try keyForGroup(&key_buf, group_id);
         const value = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => {
+                txn.abort();
+                return null;
+            },
             else => return err,
         };
-        if (value.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
-        if (std.mem.readInt(u64, value[0..8], .little) != applied_index) return error.AppliedSnapshotIndexMismatch;
+        if ((try decodeMetadataCheckpoint(value)).commit_index != applied_index) return error.AppliedSnapshotIndexMismatch;
 
         const prepared = try std.heap.page_allocator.create(PreparedSnapshot);
         prepared.* = .{
@@ -5097,14 +5122,11 @@ pub const RaftApplyStore = struct {
         defer freeMetadataSnapshotRows(alloc, rows);
         try validateMetadataSnapshotRows(alloc, group_id, rows);
 
-        const empty_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
-        defer alloc.free(empty_entries);
-        const owned_entries = try self.alloc.dupe(u8, empty_entries);
-        errdefer self.alloc.free(owned_entries);
+        const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .snapshot, encoded);
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+        try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
 
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
@@ -5119,17 +5141,14 @@ pub const RaftApplyStore = struct {
         };
         defer freeMetadataSnapshotRows(alloc, derived_existing);
 
-        const watermark = try alloc.alloc(u8, @sizeOf(u64) + empty_entries.len);
-        defer alloc.free(watermark);
-        std.mem.writeInt(u64, watermark[0..8], commit_index, .little);
-        @memcpy(watermark[8..], empty_entries);
+        const watermark = encodeMetadataCheckpoint(checkpoint);
         var watermark_key_buf: [128]u8 = undefined;
         const watermark_key = try keyForGroup(&watermark_key_buf, group_id);
 
         const writes = try alloc.alloc(docstore.KVPair, rows.len + 1);
         defer alloc.free(writes);
         for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
-        writes[rows.len] = .{ .key = watermark_key, .value = watermark };
+        writes[rows.len] = .{ .key = watermark_key, .value = &watermark };
         const deletes = try alloc.alloc([]const u8, existing.len + derived_existing.len);
         defer alloc.free(deletes);
         for (existing, 0..) |row, i| deletes[i] = row.key;
@@ -5137,12 +5156,7 @@ pub const RaftApplyStore = struct {
         try self.store.putBatch(writes, deletes);
         _ = self.verified_catalog_groups.remove(group_id);
 
-        if (self.batches.getPtr(group_id)) |batch| {
-            self.alloc.free(batch.entries_bytes);
-            batch.* = .{ .commit_index = commit_index, .entries_bytes = owned_entries };
-        } else {
-            self.batches.putAssumeCapacity(group_id, .{ .commit_index = commit_index, .entries_bytes = owned_entries });
-        }
+        self.checkpoints.putAssumeCapacity(group_id, checkpoint);
         self.invalidateProjectedPlacementGroup(group_id);
         self.notifyMetadataSnapshotInstalled(group_id);
         for (existing) |row| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = row.key });
@@ -5318,19 +5332,14 @@ pub const RaftApplyStore = struct {
         entries_bytes: []const u8,
         collect_transition_deltas: bool,
     ) !CommittedApplyOutcome {
-        var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
-        defer self.alloc.free(value);
-        std.mem.writeInt(u64, value[0..8], commit_index, .little);
-        @memcpy(value[8..], entries_bytes);
-
-        const owned_entries = try self.alloc.dupe(u8, entries_bytes);
-        errdefer self.alloc.free(owned_entries);
+        const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .committed_entries, entries_bytes);
+        const value = encodeMetadataCheckpoint(checkpoint);
 
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         var apply_locked = true;
         defer if (apply_locked) self.apply_mutex.unlock(io);
-        try self.batches.ensureUnusedCapacity(self.alloc, 1);
+        try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
         std.debug.assert(self.active_outcome == null);
         var outcome = CommittedApplyOutcome{
             .alloc = self.alloc,
@@ -5344,7 +5353,7 @@ pub const RaftApplyStore = struct {
         const key = try keyForGroup(&key_buf, group_id);
         var txn = try self.store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.put(key, value);
+        try txn.put(key, &value);
         try self.projectEntriesTxn(&txn, group_id, entries_bytes);
         if (outcome.failure) |err| return err;
         if (outcomeChangesCatalog(outcome.projection_signals.items)) {
@@ -5366,18 +5375,7 @@ pub const RaftApplyStore = struct {
             self.endProjectionCommitBarriers(&outcome);
         try txn.commit();
 
-        if (self.batches.getPtr(group_id)) |existing| {
-            self.alloc.free(existing.entries_bytes);
-            existing.* = .{
-                .commit_index = commit_index,
-                .entries_bytes = owned_entries,
-            };
-        } else {
-            self.batches.putAssumeCapacity(group_id, .{
-                .commit_index = commit_index,
-                .entries_bytes = owned_entries,
-            });
-        }
+        self.checkpoints.putAssumeCapacity(group_id, checkpoint);
         self.active_outcome = null;
         self.dispatchCommittedOutcome(&outcome);
         self.endProjectionCommitBarriers(&outcome);
@@ -5387,26 +5385,17 @@ pub const RaftApplyStore = struct {
         return outcome;
     }
 
-    fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
-        if (self.batches.getPtr(group_id)) |batch| return batch;
-
+    fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?AppliedMetadataCheckpoint {
+        if (self.checkpoints.get(group_id)) |checkpoint| return checkpoint;
         var key_buf: [128]u8 = undefined;
-        const key = try keyForGroup(&key_buf, group_id);
-        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+        const encoded = self.store.get(self.alloc, try keyForGroup(&key_buf, group_id)) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
         defer self.alloc.free(encoded);
-        if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
-
-        const commit_index = std.mem.readInt(u64, encoded[0..8], .little);
-        const owned_entries = try self.alloc.dupe(u8, encoded[8..]);
-        errdefer self.alloc.free(owned_entries);
-        try self.batches.put(self.alloc, group_id, .{
-            .commit_index = commit_index,
-            .entries_bytes = owned_entries,
-        });
-        return self.batches.getPtr(group_id);
+        const checkpoint = try decodeMetadataCheckpoint(encoded);
+        try self.checkpoints.put(self.alloc, group_id, checkpoint);
+        return checkpoint;
     }
 
     fn keyForGroup(buf: []u8, group_id: u64) ![]const u8 {
@@ -7548,7 +7537,7 @@ pub const RaftApplyStore = struct {
         defer metadata_table_manager.freeNode(self.alloc, node);
         var drain_requested = !metadata_table_manager.nodeLifecycleActive(node.lifecycle);
         if (intent.store_id != 0) {
-            const store = (try self.loadStoreRecordTxn(txn, metadata_group_id, intent.store_id)) orelse return null;
+            const store = (try self.loadStoreHeaderTxn(txn, metadata_group_id, intent.store_id)) orelse return null;
             defer metadata_table_manager.freeStore(self.alloc, store);
             if (store.node_id != intent.record.local_node_id) return null;
             drain_requested = drain_requested or store.drain_requested;
@@ -7666,16 +7655,6 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         return try decodeStoredHeader(self.alloc, encoded);
-    }
-
-    fn loadStoreRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64) !?metadata.StoreRecord {
-        var key_buf: [160]u8 = undefined;
-        const key = try storeKeyForGroup(&key_buf, group_id, store_id);
-        const encoded = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        return try self.readStoredStoreTxn(self.alloc, txn, group_id, encoded);
     }
 
     fn notifyProjectionListeners(self: *RaftApplyStore, signal: ProjectionSignal) void {
@@ -12074,7 +12053,7 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
     return true;
 }
 
-test "metadata raft apply store persists batches across reopen" {
+test "metadata raft apply store persists compact checkpoints across reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12096,9 +12075,9 @@ test "metadata raft apply store persists batches across reopen" {
     {
         var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
         defer store.deinit();
-        const batch = (try store.latestBatch(21)) orelse return error.MissingMetadataBatch;
+        const batch = (try store.latestCheckpoint(21)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 13), batch.commit_index);
-        try std.testing.expectEqualStrings("metadata-batch", batch.entries_bytes);
+        try std.testing.expectEqualDeep(AppliedMetadataCheckpoint.fromInput(13, .committed_entries, "metadata-batch"), batch);
         const cursor = try store.captureCatalogCursor(21);
         try std.testing.expectEqual(@as(u64, 0), cursor.revision);
         try std.testing.expectEqual(@as(?metadata_incarnation.MetadataClusterIncarnation, null), cursor.metadata_incarnation);
@@ -12607,7 +12586,7 @@ test "metadata raft apply store publishes listeners only after commit" {
     try std.testing.expectError(error.ReservedGroupId, store.applyCommittedBatch(41, 2, entries));
     try std.testing.expectEqual(@as(usize, 0), capture.projections);
     try std.testing.expectEqual(@as(usize, 0), capture.keys);
-    try std.testing.expectEqual(@as(?AppliedMetadataBatch, null), try store.latestBatch(41));
+    try std.testing.expectEqual(@as(?AppliedMetadataCheckpoint, null), try store.latestCheckpoint(41));
     const tables = try store.listTables(std.testing.allocator, 41);
     defer store.freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 0), tables.len);
@@ -16979,7 +16958,7 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
         };
         try sm.stateMachine().applyReady(202, rd.snapshot, rd.committed_entries, &.{});
 
-        const batch = (try store.latestBatch(202)) orelse return error.MissingMetadataBatch;
+        const batch = (try store.latestCheckpoint(202)) orelse return error.MissingMetadataBatch;
         try std.testing.expectEqual(@as(u64, 1), batch.commit_index);
 
         const tables = try store.listTables(std.testing.allocator, 202);
@@ -17442,6 +17421,7 @@ test "system catalog store report workload benchmark" {
             var txn = try store.store.beginWriteTxn();
             errdefer txn.abort();
             _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_node = .{ .node_id = 30, .role = "data" } });
             try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = record });
             try txn.commit();
         }
@@ -17458,11 +17438,12 @@ test "system catalog store report workload benchmark" {
                 if (std.mem.eql(u8, scenario, "all_groups_change")) for (groups) |*group| {
                     group.raft_term += 1;
                 };
+                const command = try encodeTransitionCommand(alloc, .{ .upsert_store = record });
+                defer alloc.free(command);
+                const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = record.available_bytes, .entry_type = .normal, .data = command }});
+                defer alloc.free(entries);
                 const start = platform_time.monotonicNs();
-                var txn = try store.store.beginWriteTxn();
-                errdefer txn.abort();
-                try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = record });
-                try txn.commit();
+                try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = record.available_bytes, .entries_bytes = entries });
                 sample.* = platform_time.monotonicNs() - start;
             }
             std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
@@ -17478,6 +17459,18 @@ test "system catalog store report workload benchmark" {
         }
         std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
         std.debug.print("REPORT_BENCH groups={d} full_store_read_p50_ms={d:.3}\n", .{ count, @as(f64, @floatFromInt(elapsed[3])) / 1e6 });
+        for (&elapsed) |*sample| {
+            const start = platform_time.monotonicNs();
+            for (0..100) |_| {
+                var txn = try store.store.beginReadTxn();
+                defer txn.abort();
+                const draining = try store.placementTargetDrainRequestedTxn(&txn, 21, .{ .store_id = 20, .record = .{ .group_id = 100, .replica_id = 1, .local_node_id = 30, .bootstrap_mode = .persisted } });
+                try std.testing.expectEqual(@as(?bool, false), draining);
+            }
+            sample.* = platform_time.monotonicNs() - start;
+        }
+        std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+        std.debug.print("REPORT_BENCH groups={d} placement_drain_read_p50_ms={d:.6}\n", .{ count, @as(f64, @floatFromInt(elapsed[3])) / 1e8 });
     }
 }
 
@@ -17575,4 +17568,55 @@ test "system catalog report pages keep stable slots and bound sparse rewrites ac
         }
         try txn.commit();
     }
+}
+
+test "metadata raft apply store checkpoints validate format and import legacy watermarks" {
+    const alloc = std.testing.allocator;
+    const expected = AppliedMetadataCheckpoint.fromInput(13, .committed_entries, "legacy-batch");
+    const encoded = encodeMetadataCheckpoint(expected);
+    try std.testing.expectEqualDeep(expected, try decodeMetadataCheckpoint(&encoded));
+    var legacy: [20]u8 = undefined;
+    std.mem.writeInt(u64, legacy[0..8], 13, .little);
+    @memcpy(legacy[8..], "legacy-batch");
+    try std.testing.expectEqualDeep(expected, try decodeMetadataCheckpoint(&legacy));
+    var malformed = encoded;
+    malformed[16] = 2;
+    try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(&malformed));
+    malformed = encoded;
+    malformed[17] = 255;
+    try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(&malformed));
+    try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(encoded[0..25]));
+    try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(encoded[0..7]));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint-upgrade", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    var key_buf: [128]u8 = undefined;
+    const key = try RaftApplyStore.keyForGroup(&key_buf, 21);
+    try store.store.put(key, &legacy);
+    try std.testing.expectEqualDeep(expected, (try store.latestCheckpoint(21)).?);
+    try std.testing.expect((try store.snapshotBuilder().prepareSnapshot(99, 0)) == null);
+    const pinned = (try store.snapshotBuilder().prepareSnapshot(21, 13)).?;
+    defer pinned.deinit();
+    try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 14, .entries_bytes = "next-batch" });
+    const saved = try store.store.get(alloc, key);
+    defer alloc.free(saved);
+    try std.testing.expectEqual(checkpoint_encoded_len, saved.len);
+    const next = AppliedMetadataCheckpoint.fromInput(14, .committed_entries, "next-batch");
+    try std.testing.expectEqualDeep(next, try decodeMetadataCheckpoint(saved));
+    try std.testing.expectEqualDeep(next, (try store.latestCheckpoint(21)).?);
+    try std.testing.expectError(error.AppliedSnapshotIndexMismatch, store.snapshotBuilder().prepareSnapshot(21, 13));
+
+    const bad_command = try encodeTransitionCommand(alloc, .{ .apply_system_catalog = "{" });
+    defer alloc.free(bad_command);
+    const bad_entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 15, .entry_type = .normal, .data = bad_command }});
+    defer alloc.free(bad_entries);
+    try std.testing.expectError(error.UnexpectedEndOfInput, store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 15, .entries_bytes = bad_entries }));
+    const unchanged = try store.store.get(alloc, key);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualSlices(u8, saved, unchanged);
+    try std.testing.expectEqualDeep(next, (try store.latestCheckpoint(21)).?);
 }

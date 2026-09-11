@@ -9,10 +9,11 @@
   },
   "method": {
     "live": "Debug builds; ten samples, three warmups; macOS ARM64 shared host; sequential runs without this task's builds/tests overlapping measurement",
-    "report_component": "ReleaseFast; c_allocator; seven samples; apply including transaction commit; excludes wire encode, Raft replication and network",
+    "report_component": "ReleaseFast; c_allocator; seven samples; INNER PROJECTION transaction only. Omits outer committed-apply command decoding and full-batch watermark WAL write, as well as wire encode, Raft replication and network.",
     "heartbeat_component": "ReleaseFast; page_allocator; seven samples; binary encoding only, no HTTP driver"
   },
   "limitations": [
+    "Correction: metadata_report_component wal_bytes_per_apply and apply_p50_ms measure only the inner projection, not full production local apply. See the checkpoint follow-up for matched complete-apply measurements.",
     "Host load is uncontrolled. These are development measurements, not production capacity claims.",
     "Cached heartbeats change the compact header in every measured apply. Full StoreRecord command wire bytes remain unchanged.",
     "Full report reads reconstruct all observations; selected reads use a page directory. Pages bound group count, not arbitrary report byte size.",

@@ -5197,7 +5197,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         const page = self.api_server.encodeCatalogTablePage(operationContext(ctx, authenticated_identity), request, authenticated_identity) catch |err| switch (err) {
-            error.CatalogGenerationChanged => return textResponse(ctx, 409, "catalog changed; restart pagination"),
+            error.CatalogGenerationChanged => return jsonErrorResponse(ctx, 409, "catalog changed; restart pagination"),
             error.InvalidCatalogName => return textResponse(ctx, 400, "invalid catalog cursor"),
             else => return err,
         };

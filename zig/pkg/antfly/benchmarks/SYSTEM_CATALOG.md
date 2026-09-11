@@ -215,11 +215,17 @@ ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Dopt
 
 This opt-in storage workload uses 100, 1,000 and 10,000 groups per store. It
 measures committed metadata apply for cached report payloads, fresh observation
-clocks, one changed group, and every group changed, plus full-store hydration.
+clocks, one changed group, and every group changed, plus full-store hydration
+and placement drain checks. It calls `SnapshotBuilder.applyBatch`, including
+command decode, checkpoint persistence, projection and transaction commit. Wire
+encoding happens before timing. The earlier projection-only measurements omitted
+the full-batch checkpoint write; see the correction in the results history.
 Each apply changes the header's available-capacity counter; report clocks only
 advance in the fresh-clock case. Seven measured samples follow fixture creation. It uses `c_allocator`, matching
 the libc-linked ReleaseFast executable; correctness tests retain leak checking.
-Output includes local WAL bytes and the full wire record's size. This isolates
+Output includes local WAL bytes and the full wire record's size. Placement drain
+checks use 100 operations per sample and report the per-operation median of
+those samples, including opening/closing each read transaction. This isolates
 local apply/storage work: network receipt, Raft proposal encoding/replication,
 and periodic status collection are outside the interval. Use the same allocator,
 build mode and host load for comparisons. It is not a benchmark of distributed

@@ -14,7 +14,12 @@
 
 package oapi
 
-import "testing"
+import (
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
 
 func TestCatalogPaginationOptionalQueryParameters(t *testing.T) {
 	unpaged, err := NewListTablesRequest("http://localhost", &ListTablesParams{Prefix: "events"})
@@ -32,5 +37,29 @@ func TestCatalogPaginationOptionalQueryParameters(t *testing.T) {
 	}
 	if paged.URL.Query().Get("limit") != "25" || paged.URL.Query().Get("cursor") != cursor {
 		t.Fatalf("pagination parameters lost: %s", paged.URL)
+	}
+}
+
+func TestCatalogPaginationConflictResponse(t *testing.T) {
+	response := func() *http.Response {
+		return &http.Response{
+			StatusCode: 409,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":"catalog changed; restart pagination"}`)),
+		}
+	}
+	unscoped, err := ParseListTablesResponse(response())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unscoped.JSON409 == nil || unscoped.JSON409.Error != "catalog changed; restart pagination" {
+		t.Fatalf("missing conflict: %#v", unscoped)
+	}
+	scoped, err := ParseListNamespaceTablesResponse(response())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped.JSON409 == nil || scoped.JSON409.Error != "catalog changed; restart pagination" {
+		t.Fatalf("missing scoped conflict: %#v", scoped)
 	}
 }

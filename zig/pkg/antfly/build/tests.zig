@@ -1531,6 +1531,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &raft_unit_default_filters),
     });
     const run_raft_unit_tests = addFilteredTestRunArtifact(b, raft_unit_tests);
+    const checkpoint_host_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"managed host default"},
+    });
+    b.step("antfly-system-catalog-host-test", "Run metadata checkpoint host persistence regressions").dependOn(&b.addRunArtifact(checkpoint_host_tests).step);
 
     const raft_read_gate_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_read_gate_test_root.zig"),

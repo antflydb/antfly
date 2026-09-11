@@ -596,12 +596,18 @@ With ten live samples, the harness's nearest-rank p95 is the maximum observation
 
 ### Metadata status application
 
+**Correction from the checkpoint review:** the table below measured only the
+inner projection transaction. It omitted `applyCommittedBatchInternal`, including
+its full committed-entry watermark write and command decoding. The 184-byte WAL
+figure is projection-only, not the complete local heartbeat apply. The checkpoint
+follow-up below measures the full path and supersedes those broader claims.
+
 A separate ReleaseFast component workload uses the production C allocator and
 seven samples. Every store contains both group summaries and detailed runtime
 observations. Every measured apply changes the compact header; a cached heartbeat
 keeps all report observations unchanged. Fresh-clock updates advance all report
-timestamps; sparse/all-group updates change report terms. Timing includes local
-transaction commit, not command encoding, network transfer or Raft replication.
+timestamps; sparse/all-group updates change report terms. Timing includes the inner projection transaction commit, not the outer committed
+apply/checkpoint, command encoding, network transfer or Raft replication.
 The baseline worktree adds only this benchmark and its build target plus a latent
 write-stat accessor correction to the unoptimized production code.
 

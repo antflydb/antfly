@@ -1969,10 +1969,10 @@ test "managed host defaults metadata and data apply stores when durable state is
 
     const metadata_store = managed.owned_metadata_store orelse return error.MissingMetadataStore;
     const data_store = managed.owned_data_store orelse return error.MissingDataStore;
-    const metadata_batch = (try metadata_store.latestBatch(1100)) orelse return error.MissingMetadataBatch;
+    const metadata_batch = (try metadata_store.latestCheckpoint(1100)) orelse return error.MissingMetadataBatch;
     const data_batch = (try data_store.latestBatch(1101)) orelse return error.MissingDataBatch;
     try std.testing.expect(metadata_batch.commit_index > 0);
-    try std.testing.expect(metadata_batch.entries_bytes.len > 0);
+    try std.testing.expect(metadata_batch.input_bytes > 0);
     try std.testing.expect(data_batch.commit_index > 0);
     try std.testing.expect(data_batch.entry_count > 0);
 }
@@ -2085,10 +2085,10 @@ test "managed host default metadata and data apply stores survive restart" {
 
         const metadata_store = managed.owned_metadata_store orelse return error.MissingMetadataStore;
         const data_store = managed.owned_data_store orelse return error.MissingDataStore;
-        const metadata_batch = (try metadata_store.latestBatch(1200)) orelse return error.MissingMetadataBatch;
+        const metadata_batch = (try metadata_store.latestCheckpoint(1200)) orelse return error.MissingMetadataBatch;
         const data_batch = (try data_store.latestBatch(1201)) orelse return error.MissingDataBatch;
         try std.testing.expect(metadata_batch.commit_index > 0);
-        try std.testing.expect(metadata_batch.entries_bytes.len > 0);
+        try std.testing.expect(metadata_batch.input_bytes > 0);
         try std.testing.expect(data_batch.commit_index > 0);
         try std.testing.expect(data_batch.entry_count > 0);
     }

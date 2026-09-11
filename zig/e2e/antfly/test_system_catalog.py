@@ -507,6 +507,8 @@ def test_catalog_pagination_preserves_scope_order_and_detects_ddl(stateful_api):
             timeout=30,
         )
         assert response.status_code == 409, response.text
+        assert response.headers["Content-Type"].startswith("application/json")
+        assert "restart pagination" in response.json()["error"]
         assert len(api.get(path)) == len(names) + 1
     finally:
         for row in api.get(path):

@@ -3642,6 +3642,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5986,6 +5990,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:

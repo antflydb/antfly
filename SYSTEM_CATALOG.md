@@ -403,6 +403,18 @@ local format is versioned separately from the unchanged command/snapshot wire
 format. Directly opening a normalized data directory with an older binary is not
 a supported downgrade path; use the compatible logical snapshot format.
 
+Metadata apply commits a versioned 26-byte checkpoint in the same transaction
+as projected records. It contains the applied index, input kind (committed entries
+or snapshot), and input byte count for diagnostics. It is an apply watermark,
+not a state hash or quorum proof. Raft owns replay entries; the metadata store
+neither duplicates nor retains the full last batch. `latestCheckpoint` returns a
+value under the apply mutex. Legacy index-plus-batch rows remain readable and
+convert on the next successful apply or snapshot installation. Unsupported
+checkpoint versions and malformed records fail closed. Snapshot preparation
+checks the checkpoint index inside its pinned read transaction; logical snapshot
+wire projections are unchanged. Placement drain admission reads only the store
+header's node identity and drain flag; termination-debt checks still read reports.
+
 Standalone maintains ordered namespace/name and table/range indexes in the
 same durable transaction as catalog mutations. It rebuilds those derived rows
 once after startup, seeks only the requested page, and copies selected records
