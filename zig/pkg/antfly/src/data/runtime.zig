@@ -35120,6 +35120,7 @@ test "data server wires configured HA executors into API server" {
         .body = capture_body,
     });
     defer capture_resp.deinit(alloc);
+    if (capture_resp.status != 200) std.debug.print("HA seed capture failed: {s}\n", .{capture_resp.body});
     try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"state\":\"applied\"") != null);
