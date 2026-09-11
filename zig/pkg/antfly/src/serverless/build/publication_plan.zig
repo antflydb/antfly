@@ -81,6 +81,8 @@ pub const NamedArtifactAction = struct {
 };
 
 pub const MetadataRepublishReasons = struct {
+    /// Persist external selector/schema intent even without any local indexes.
+    external_schema_changed: bool = false,
     read_schema_migration: bool = false,
     index_definitions_changed: bool = false,
     published_search_sources_changed: bool = false,
@@ -93,7 +95,8 @@ pub const MetadataRepublishReasons = struct {
     document_facts_policy_changed: bool = false,
 
     pub fn any(self: MetadataRepublishReasons) bool {
-        return self.read_schema_migration or
+        return self.external_schema_changed or
+            self.read_schema_migration or
             self.index_definitions_changed or
             self.published_search_sources_changed or
             self.artifact_families_changed or

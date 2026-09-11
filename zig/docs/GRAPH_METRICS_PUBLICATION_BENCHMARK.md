@@ -154,7 +154,12 @@ manifest; `reconcileAlloc` includes that planning work and constructs an owned
 updated manifest. Neither API accepts an artifact-store or row-source capability,
 so neither can read document bodies or rebuild artifacts. This focused
 ReleaseFast benchmark changes read metadata on an owned manifest containing
-text, vector, graph, degree and PageRank sidecars. One warmup precedes five
+text, vector, graph, degree and PageRank sidecars. It measures unchanged
+`current` selection, `current` to a pin naming the same snapshot, and that pin
+back to `current`. Each case supplies an owned resolved source plan with the
+published snapshot and inventory identity, modeling the verified evidence from
+the guarded publisher. This benchmark does not perform that verification or
+remote discovery itself. One warmup precedes five
 samples for each API. Timings exclude result destruction, correctness assertions,
 discovery, leases, manifest persistence and HEAD publication. Reconciliation
 includes planning; the two timings should not be added together.
@@ -163,18 +168,29 @@ The rejected variant marks PageRank rejected under the current materializer
 policy. The unchanged full admission plan must preserve that rejection; this
 exercises the same complete-plan predicate used by actual materialization.
 Each sample verifies five retained references and five reuse actions with no
-outstanding work. Untimed probes remove the graph and check that its metrics
+outstanding work, including both selector transitions. Untimed probes remove
+the graph and check that its metrics
 require rebuilding, then remove all index declarations and verify that real
 drops remain pending until reconciliation applies them. The probe then verifies
 that a fresh plan reports no outstanding work. A retained rejection is terminal
 under an unchanged admission plan; it is not relabeled as a ready computation.
 
-| Document count in manifest | PageRank state | Retained sidecars | Plan median (ms) | Reconcile median (ms) | Artifact I/O |
-| ---: | --- | ---: | ---: | ---: | --- |
-| 1,024 | Ready | 5 | 0.182 | 0.199 | None; no capability supplied |
-| 1,024 | Rejected | 5 | 0.175 | 0.195 | None; no capability supplied |
-| 16,384 | Ready | 5 | 0.146 | 0.192 | None; no capability supplied |
-| 16,384 | Rejected | 5 | 0.154 | 0.189 | None; no capability supplied |
+All cases retain five sidecars and accept no artifact-I/O capability.
+
+| Document count in manifest | PageRank state | Selector transition | Plan median (ms) | Reconcile median (ms) |
+| ---: | --- | --- | ---: | ---: |
+| 1,024 | Ready | Unchanged current | 0.209 | 0.236 |
+| 1,024 | Ready | Current → pinned | 0.180 | 0.220 |
+| 1,024 | Ready | Pinned → current | 0.177 | 0.219 |
+| 1,024 | Rejected | Unchanged current | 0.177 | 0.212 |
+| 1,024 | Rejected | Current → pinned | 0.172 | 0.209 |
+| 1,024 | Rejected | Pinned → current | 0.167 | 0.210 |
+| 16,384 | Ready | Unchanged current | 0.159 | 0.185 |
+| 16,384 | Ready | Current → pinned | 0.153 | 0.179 |
+| 16,384 | Ready | Pinned → current | 0.167 | 0.208 |
+| 16,384 | Rejected | Unchanged current | 0.175 | 0.198 |
+| 16,384 | Rejected | Current → pinned | 0.159 | 0.186 |
+| 16,384 | Rejected | Pinned → current | 0.209 | 0.240 |
 
 This measures metadata work, not a cloud latency SLO or a before/after speedup.
 The document count is a manifest statistic in this fixture; the configured
@@ -184,6 +200,9 @@ timings do not establish that rejection handling or larger namespaces are faster
 the structural result is that complete-plan validation adds no artifact reads
 or document-count-dependent work. Regression tests separately check that changed
 plans drop rejections while retaining compatible ready computations.
+These publication cases include resolved source evidence. They do not imply
+that discovery-free status can prove a pin-to-current transition still names
+the published snapshot; status remains conservative without that evidence.
 
 ```sh
 ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'external metadata retention qualification benchmark'

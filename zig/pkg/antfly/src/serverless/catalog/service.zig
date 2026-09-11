@@ -1014,6 +1014,8 @@ pub const CatalogService = struct {
             defer published_head.deinit(self.alloc);
             if (published_head.manifest) |manifest| {
                 const head_version = published_head.manifest_version;
+                metadata_republish.external_schema_changed = external_binding != null and
+                    !std.mem.eql(u8, manifest.stats.schema_json, table.schema_json);
 
                 const impact = try impact_planner.planAlloc(self.alloc, .{
                     .before_schema_json = manifest.stats.schema_json,
@@ -5671,6 +5673,35 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, converged_status.artifact_actions.document_segment);
 
     const graph_indexes = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    const pinned_schema = try std.mem.replaceOwned(u8, alloc, current_schema, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"object_version_digest\",\"digest\":\"discovered-snapshot\"}");
+    defer alloc.free(pinned_schema);
+    // Selector intent must publish even without a text index to incidentally
+    // trigger schema migration. It then converges without inventory churn.
+    for ([_][]const u8{ "{}", graph_indexes }) |indexes| {
+        try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", indexes));
+        var initial_selection = try catalog.buildTable("events");
+        defer initial_selection.deinit(alloc);
+        for ([_][]const u8{ pinned_schema, current_schema }) |schema| {
+            try std.testing.expect(try catalog.setTableDefinition("events", schema, "{}", indexes));
+            var selection_plan = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+            defer selection_plan.deinit(alloc);
+            try std.testing.expect(selection_plan.metadata_republish.external_schema_changed);
+            try std.testing.expect(selection_plan.forceRepublishFromHead());
+            var selection = try catalog.buildTable("events");
+            defer selection.deinit(alloc);
+            try std.testing.expect(selection.published);
+            var selected_head = try manifest_store.getAlloc("events", selection.version);
+            defer selected_head.deinit(alloc);
+            try std.testing.expectEqualStrings(schema, selected_head.stats.schema_json);
+            try std.testing.expectEqualStrings(inventory.artifact_id, selected_head.artifacts[findManifestArtifactIndex(selected_head, .external_base_source).?].artifact_id);
+            var selection_unchanged = try catalog.buildTable("events");
+            defer selection_unchanged.deinit(alloc);
+            try std.testing.expect(!selection_unchanged.published);
+        }
+    }
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", "{}"));
+    var reset_indexes = try catalog.buildTable("events");
+    defer reset_indexes.deinit(alloc);
     try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", graph_indexes));
     var configured = try catalog.buildTable("events");
     defer configured.deinit(alloc);

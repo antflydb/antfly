@@ -141,6 +141,15 @@ match. Changed dependencies are removed individually, while source replacement
 invalidates the prior sidecars. This reconciliation has no artifact-store or
 row-source capability: metadata refresh cannot silently hydrate remote bodies.
 
+Snapshot selection intent is distinct from resolved source identity. Switching
+`current` to a pin naming the published snapshot, or switching that pin back to
+`current`, preserves compatible sidecars when the guarded publisher supplies a
+verified resolved source matching the published descriptor. A changed resolved
+snapshot still invalidates them. Catalog status does not discover external data:
+an explicit matching pin supplies evidence, but changing a pin to `current`
+remains conservatively pending until publication verifies its resolved source.
+Selector metadata itself is published even for graph-only or empty index sets.
+
 External lake planning and catalog search targets both use explicit index
 declarations. Empty objects (including whitespace variants) and graph-only
 configurations do not synthesize a text index; deleting the last explicitly

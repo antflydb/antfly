@@ -26,6 +26,7 @@ const metric_kernel = @import("lake_graph_metric.zig");
 const artifacts = @import("../artifacts/mod.zig");
 const sources = @import("../search_sources.zig");
 const external_binding = @import("../external_source/catalog_binding.zig");
+const base_source = @import("../manifest/base_source.zig");
 
 pub const NamedAction = struct {
     kind: manifests.ArtifactKind,
@@ -95,6 +96,8 @@ pub fn planAlloc(alloc: Allocator, maybe_current: ?manifests.Manifest, plan: pub
     const compatible_source = bindingsIdentifySameSource(
         if (binding) |value| value.binding else null,
         if (desired_binding) |value| value.binding else null,
+        descriptor,
+        if (plan.external_source_plan) |resolved| resolved.base_source else null,
     );
     // Real inventory publication persists the external table ID in schema.
     // The namespace fallback is for direct library publications with no schema;
@@ -283,19 +286,32 @@ fn isSidecar(kind: manifests.ArtifactKind) bool {
     };
 }
 
-fn bindingsIdentifySameSource(before: ?external_binding.Binding, after: ?external_binding.Binding) bool {
+/// Catalog selection intent is not immutable source identity. A resolved plan
+/// supplies stronger evidence than selector equality; absent that evidence,
+/// status may match an explicit pin against the published snapshot but cannot
+/// assume that changing a pin to "current" will resolve to the same snapshot.
+fn bindingsIdentifySameSource(
+    before: ?external_binding.Binding,
+    after: ?external_binding.Binding,
+    published: base_source.BaseSourceDescriptor,
+    resolved: ?base_source.BaseSourceDescriptor,
+) bool {
+    if (resolved) |value| if (!base_source.externalDescriptorsEqual(published, value)) return false;
     if (before == null or after == null) return before == null and after == null;
     const a = before.?;
     const b = after.?;
     if (a.format != b.format or a.write_policy != b.write_policy or
         !std.mem.eql(u8, a.table_id, b.table_id) or !std.mem.eql(u8, a.source_uri, b.source_uri) or
-        !std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint) or
-        std.meta.activeTag(a.snapshot_mode) != std.meta.activeTag(b.snapshot_mode)) return false;
-    return switch (a.snapshot_mode) {
-        .current => true,
-        .snapshot_id => |value| std.mem.eql(u8, value, b.snapshot_mode.snapshot_id),
-        .object_version_digest => |value| std.mem.eql(u8, value, b.snapshot_mode.object_version_digest),
+        !std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint)) return false;
+    const source = switch (published) {
+        .external_parquet, .external_iceberg, .external_lance => |value| value,
+        else => return false,
     };
+    if (b.manifestFormat() != source.format or
+        !std.mem.eql(u8, b.source_uri, source.source_uri) or
+        !std.mem.eql(u8, b.schema_fingerprint, source.schema_fingerprint)) return false;
+    if (b.snapshot_mode.pinnedSnapshotId()) |pin| return std.mem.eql(u8, pin, source.snapshot_id);
+    return resolved != null or a.snapshot_mode == .current;
 }
 
 pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publication.TablePublicationPlan) !manifests.Manifest {
@@ -634,6 +650,57 @@ test "serverless external metadata plan reports exact named work and converges a
     try std.testing.expect(!empty.pendingWork());
     try std.testing.expectEqual(publication.ArtifactAction.reuse, empty.familyAction(.text_segment));
     try std.testing.expectEqual(publication.ArtifactAction.reuse, empty.familyAction(.graph_segment));
+}
+
+test "serverless external source identity separates selectors from resolved evidence" {
+    for ([_]@import("../external_source/types.zig").Format{ .parquet, .iceberg, .lance }) |format| {
+        const before: external_binding.Binding = .{
+            .table_id = "docs",
+            .format = format,
+            .source_uri = "s3://warehouse/docs",
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v3",
+        };
+        var pinned = before;
+        pinned.snapshot_mode = if (format == .parquet) .{ .object_version_digest = "snapshot-31" } else .{ .snapshot_id = "snapshot-31" };
+        const source: base_source.ExternalBaseSource = .{
+            .format = before.manifestFormat(),
+            .source_uri = before.source_uri,
+            .snapshot_id = "snapshot-31",
+            .schema_fingerprint = before.schema_fingerprint,
+            .file_inventory_artifact = "inventory-31",
+        };
+        const published: base_source.BaseSourceDescriptor = switch (format) {
+            .parquet => .{ .external_parquet = source },
+            .iceberg => .{ .external_iceberg = source },
+            .lance => .{ .external_lance = source },
+        };
+        // An explicit pin can be checked against the local immutable HEAD.
+        try std.testing.expect(bindingsIdentifySameSource(before, pinned, published, null));
+        // Unpinning cannot assume where "current" points without discovery.
+        try std.testing.expect(!bindingsIdentifySameSource(pinned, before, published, null));
+        try std.testing.expect(bindingsIdentifySameSource(before, pinned, published, published));
+        try std.testing.expect(bindingsIdentifySameSource(pinned, before, published, published));
+        var different_pin = pinned;
+        different_pin.snapshot_mode = .{ .snapshot_id = "snapshot-32" };
+        try std.testing.expect(!bindingsIdentifySameSource(before, different_pin, published, null));
+        try std.testing.expect(!bindingsIdentifySameSource(before, different_pin, published, published));
+        // Exact resolved evidence wins over unchanged selector text, too.
+        inline for (.{ "source_uri", "snapshot_id", "schema_fingerprint", "file_inventory_artifact", "row_group_metadata_artifact", "delete_metadata_artifact" }) |field| {
+            var changed_source = source;
+            @field(changed_source, field) = "changed";
+            const changed: base_source.BaseSourceDescriptor = switch (format) {
+                .parquet => .{ .external_parquet = changed_source },
+                .iceberg => .{ .external_iceberg = changed_source },
+                .lance => .{ .external_lance = changed_source },
+            };
+            try std.testing.expect(!bindingsIdentifySameSource(before, before, published, changed));
+            try std.testing.expect(!bindingsIdentifySameSource(before, pinned, published, changed));
+        }
+        var other_table = pinned;
+        other_table.table_id = "different-logical-source";
+        try std.testing.expect(!bindingsIdentifySameSource(before, other_table, published, published));
+    }
 }
 
 test "serverless external metadata plan handles bootstrap source changes and terminal rejections without payload IO" {

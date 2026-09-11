@@ -32,11 +32,24 @@ const page_tree = @import("../graph_segment/page_tree.zig");
 test "serverless external metadata retention qualification benchmark" {
     if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
     const metadata = @import("external_publication_metadata.zig");
+    const external_manifest = @import("external_source_manifest.zig");
+    const SelectorCase = enum { unchanged, current_to_pinned, pinned_to_current };
+    const current_schema =
+        \\{"base_source":{"kind":"external","table_id":"docs","format":"parquet","uri":"s3://warehouse/docs","snapshot":"current","schema_fingerprint":"schema-v3","write_policy":"read_only"}}
+    ;
+    const pinned_schema =
+        \\{"base_source":{"kind":"external","table_id":"docs","format":"parquet","uri":"s3://warehouse/docs","snapshot":{"mode":"object_version_digest","digest":"parquet-31"},"schema_fingerprint":"schema-v3","write_policy":"read_only"}}
+    ;
     var runtime = std.Io.Threaded.init(a, .{});
     defer runtime.deinit();
-    for ([_]u64{ 1024, 16384 }) |count| for ([_]bool{ false, true }) |rejected| {
+    for ([_]u64{ 1024, 16384 }) |count| for ([_]bool{ false, true }) |rejected| for (std.enums.values(SelectorCase)) |selector| {
         var source = try metadata.testing.fixtureAlloc(a, count);
         defer source.deinit(a);
+        const before_schema = if (selector == .pinned_to_current) pinned_schema else current_schema;
+        const after_schema = if (selector == .current_to_pinned) pinned_schema else current_schema;
+        const owned_schema = try a.dupe(u8, before_schema);
+        a.free(source.stats.schema_json);
+        source.stats.schema_json = owned_schema;
         for (source.artifacts) |*ref| {
             if (ref.kind != .graph_metric_segment) continue;
             ref.materializer_fingerprint = @import("lake_graph_metric.zig").materializerFingerprint(.{});
@@ -47,11 +60,24 @@ test "serverless external metadata retention qualification benchmark" {
         }
         var plan = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
         plan.table_definition = .{
-            .schema_json = source.stats.schema_json,
+            .schema_json = @constCast(after_schema),
             .read_schema_json = @constCast("{\"description\":\"metadata-only refresh\"}"),
             .indexes_json = source.stats.indexes_json,
         };
         plan.policy = source.stats.policy;
+        // Model the verified resolver output supplied by the guarded publisher,
+        // not merely selector equality. Discovery and inventory verification
+        // are deliberately outside this metadata-only benchmark.
+        const inventory = source.artifacts[0];
+        const descriptor = source.base_source.?.external_parquet;
+        var resolved = try external_manifest.planAlloc(a, descriptor.format, descriptor.source_uri, descriptor.snapshot_id, descriptor.schema_fingerprint, .{
+            .artifact_id = inventory.artifact_id,
+            .checksum = inventory.checksum,
+            .byte_len = inventory.byte_len,
+            .name = inventory.name,
+        });
+        defer resolved.deinit(a);
+        plan.external_source_plan = resolved;
         var planning_samples: [5]i96 = undefined;
         var reconciliation_samples: [5]i96 = undefined;
         for (0..6) |round| {
@@ -109,7 +135,7 @@ test "serverless external metadata retention qualification benchmark" {
         try std.testing.expect(!applied.hasOutstandingWork());
         std.mem.sort(i96, &planning_samples, {}, std.sort.asc(i96));
         std.mem.sort(i96, &reconciliation_samples, {}, std.sort.asc(i96));
-        std.debug.print("external_metadata_retention docs={} rejected={} retained_sidecars=5 desired_actions=5 outstanding=false median_plan_ns={} median_reconcile_ns={} artifact_io_capability=false samples=5\n", .{ count, rejected, planning_samples[2], reconciliation_samples[2] });
+        std.debug.print("external_metadata_retention docs={} rejected={} selector={s} resolved_same_source=true retained_sidecars=5 desired_actions=5 outstanding=false median_plan_ns={} median_reconcile_ns={} artifact_io_capability=false samples=5\n", .{ count, rejected, @tagName(selector), planning_samples[2], reconciliation_samples[2] });
     };
 }
 

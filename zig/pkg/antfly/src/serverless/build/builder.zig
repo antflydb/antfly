@@ -2005,13 +2005,7 @@ fn externalSourcePlanMatchesManifest(
 
 fn externalSourceDescriptorMatchesManifest(plan: external_source_manifest.Plan, manifest: manifest_mod.Manifest) bool {
     const current = manifest.base_source orelse return false;
-    if (std.meta.activeTag(plan.base_source) != std.meta.activeTag(current)) return false;
-    return switch (plan.base_source) {
-        .external_parquet => |planned| externalSourceDescriptorMatches(planned, current.external_parquet),
-        .external_iceberg => |planned| externalSourceDescriptorMatches(planned, current.external_iceberg),
-        .external_lance => |planned| externalSourceDescriptorMatches(planned, current.external_lance),
-        else => false,
-    };
+    return manifest_base_source.externalDescriptorsEqual(plan.base_source, current);
 }
 
 fn artifactRefEql(left: manifest_mod.ArtifactRef, right: manifest_mod.ArtifactRef) bool {
@@ -2087,24 +2081,6 @@ test "serverless external source plan matching is exact over owned artifacts" {
     try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
     manifest.artifacts = current_artifacts[0..];
     try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
-}
-
-fn externalSourceDescriptorMatches(
-    planned: manifest_base_source.ExternalBaseSource,
-    current: manifest_base_source.ExternalBaseSource,
-) bool {
-    return planned.format == current.format and
-        std.mem.eql(u8, planned.source_uri, current.source_uri) and
-        std.mem.eql(u8, planned.snapshot_id, current.snapshot_id) and
-        std.mem.eql(u8, planned.schema_fingerprint, current.schema_fingerprint) and
-        optionalStringEql(planned.file_inventory_artifact, current.file_inventory_artifact) and
-        optionalStringEql(planned.row_group_metadata_artifact, current.row_group_metadata_artifact) and
-        optionalStringEql(planned.delete_metadata_artifact, current.delete_metadata_artifact);
-}
-
-fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
 }
 
 pub fn detectMaterializedDerivedOutputsAlloc(
@@ -7749,6 +7725,133 @@ test "serverless external metadata publication retains sidecars without payload 
     var changed_noop = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
     defer changed_noop.deinit(alloc);
     try std.testing.expect(!changed_noop.published);
+}
+
+test "serverless external selector transitions preserve resolved sidecars without payload IO" {
+    const alloc = std.testing.allocator;
+    const metadata = @import("external_publication_metadata.zig");
+    const current_schema = "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"docs\",\"format\":\"iceberg\",\"uri\":\"s3://warehouse/docs\",\"snapshot\":\"current\",\"schema_fingerprint\":\"schema-v3\"}}";
+    const pinned_schema = "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"docs\",\"format\":\"iceberg\",\"uri\":\"s3://warehouse/docs\",\"snapshot\":{\"mode\":\"snapshot_id\",\"id\":\"parquet-31\"},\"schema_fingerprint\":\"schema-v3\"}}";
+    const PayloadProbe = struct {
+        calls: usize = 0,
+        fn deny(ptr: *anyopaque) error{UnexpectedArtifactPayloadIo} {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedArtifactPayloadIo;
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return deny(ptr);
+        }
+        fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return deny(ptr);
+        }
+        fn range(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return deny(ptr);
+        }
+        fn stat(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return deny(ptr);
+        }
+        fn delete(ptr: *anyopaque, _: []const u8) !void {
+            return deny(ptr);
+        }
+        fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+            return deny(ptr);
+        }
+        const vtable: artifacts_mod.ArtifactStore.VTable = .{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = get,
+            .get_range_alloc = range,
+            .stat = stat,
+            .delete = delete,
+            .put_scoped = scoped,
+        };
+    };
+    // Exercise both identity dimensions independently: neither a matching
+    // snapshot label nor a matching inventory is sufficient on its own.
+    for ([_]bool{ false, true }) |replace_snapshot| {
+        var manifest_root_buf: [256]u8 = undefined;
+        var wal_root_buf: [256]u8 = undefined;
+        const manifest_root = tmpPath(&manifest_root_buf, "external-selector-manifests");
+        const wal_root = tmpPath(&wal_root_buf, "external-selector-wal");
+        defer cleanupTmp(manifest_root);
+        defer cleanupTmp(wal_root);
+        var probe: PayloadProbe = .{};
+        var artifact_store: artifacts_mod.ArtifactStore = .{ .allocator = alloc, .ptr = &probe, .vtable = &PayloadProbe.vtable };
+        var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+        var manifest_store = fs_manifests.manifestStore();
+        defer manifest_store.deinit();
+        var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+        var progress_store = fs_progress.progressStore();
+        defer progress_store.deinit();
+        var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+        var wal_store = fs_wal.walStore();
+        defer wal_store.deinit();
+        var initial = try metadata.testing.fixtureAlloc(alloc, 16384);
+        defer initial.deinit(alloc);
+        var source = initial.base_source.?.external_parquet;
+        source.format = .iceberg;
+        initial.base_source = .{ .external_iceberg = source };
+        // Only the borrowed view replaces schema ownership; the original
+        // fixture still owns and frees every allocated field exactly once.
+        var initial_view = initial;
+        initial_view.stats.schema_json = @constCast(current_schema);
+        try manifest_store.put(initial_view);
+        try std.testing.expect(try progress_store.compareAndSwapHead("docs", null, initial.version));
+        var external = try external_source_manifest.planAlloc(alloc, .iceberg, "s3://warehouse/docs", "parquet-31", "schema-v3", .{
+            .name = "docs.external-files",
+            .artifact_id = "inventory-docs",
+            .byte_len = 128,
+            .checksum = "a" ** 64,
+        });
+        defer external.deinit(alloc);
+        var plan: publication_plan.TablePublicationPlan = .{
+            .targets = .{ .published_search_sources = .{} },
+            .external_source_plan = external,
+            .table_definition = .{ .indexes_json = @constCast(metadata.testing.indexes), .schema_json = @constCast(pinned_schema) },
+            .metadata_republish = .{ .external_schema_changed = true },
+        };
+        var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+        for ([_][]const u8{ pinned_schema, current_schema }) |schema| {
+            plan.table_definition.schema_json = @constCast(schema);
+            var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+            defer result.deinit(alloc);
+            try std.testing.expect(result.published);
+            var head = try manifest_store.getAlloc("docs", result.version);
+            defer head.deinit(alloc);
+            try std.testing.expectEqualStrings(schema, head.stats.schema_json);
+            try std.testing.expectEqual(initial.artifacts.len, head.artifacts.len);
+            for (initial.artifacts) |expected| {
+                const actual = findArtifactRefByName(head.artifacts, expected.kind, expected.name) orelse return error.MissingRetainedSidecar;
+                try std.testing.expectEqualDeep(expected, actual);
+            }
+            try std.testing.expectEqual(initial.stats.document_count, head.stats.document_count);
+            try std.testing.expect(head.stats.published_search_sources.findText() != null);
+            try std.testing.expect(head.stats.published_search_sources.findVector() != null);
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        }
+
+        var replacement = try external_source_manifest.planAlloc(alloc, .iceberg, "s3://warehouse/docs", if (replace_snapshot) "snapshot-32" else "parquet-31", "schema-v3", .{
+            .name = "docs.external-files",
+            .artifact_id = if (replace_snapshot) "inventory-docs" else "inventory-replaced",
+            .byte_len = 128,
+            .checksum = if (replace_snapshot) "a" ** 64 else "f" ** 64,
+        });
+        defer replacement.deinit(alloc);
+        plan.external_source_plan = replacement;
+        var changed = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+        defer changed.deinit(alloc);
+        var changed_head = try manifest_store.getAlloc("docs", changed.version);
+        defer changed_head.deinit(alloc);
+        try std.testing.expect(changed.published);
+        try std.testing.expectEqual(@as(usize, 1), changed_head.artifacts.len);
+        try std.testing.expectEqual(manifest_mod.ArtifactKind.external_base_source, changed_head.artifacts[0].kind);
+        try std.testing.expect(changed_head.stats.published_search_sources.findText() == null);
+        try std.testing.expect(changed_head.stats.published_search_sources.findVector() == null);
+        try std.testing.expectEqual(@as(u32, 0), changed_head.stats.graph_segment_count);
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    }
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
