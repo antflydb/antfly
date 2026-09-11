@@ -40,14 +40,14 @@ pub const Resolver = struct {
             ptr: *anyopaque,
             alloc: Allocator,
             request: ResolveRequest,
-        ) anyerror!?external_source_manifest.Plan,
+        ) anyerror!external_source_manifest.Plan,
     };
 
     pub fn resolveAlloc(
         self: Resolver,
         alloc: Allocator,
         request: ResolveRequest,
-    ) !?external_source_manifest.Plan {
+    ) !external_source_manifest.Plan {
         return try self.vtable.resolve(self.ptr, alloc, request);
     }
 };

@@ -943,12 +943,9 @@ pub const CatalogService = struct {
     ) !?external_source_manifest.Plan {
         var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
         defer binding.deinit(self.alloc);
-        const resolver = self.external_source_plan_resolver orelse {
-            if (binding.binding.snapshot_mode.requiresDiscoveryPin()) {
-                return error.ExternalSourcePlanResolverUnavailable;
-            }
-            return null;
-        };
+        // A user pin selects data; it does not supply the immutable inventory
+        // required to publish it. Every external binding needs a resolved plan.
+        const resolver = self.external_source_plan_resolver orelse return error.ExternalSourcePlanResolverUnavailable;
         return try resolver.resolveAlloc(self.alloc, .{
             .namespace = namespace,
             .table_name = table.table_name,
@@ -5549,9 +5546,45 @@ test "serverless materialization readiness distinguishes absent drops from real 
 
 test "serverless catalog status stays local and write admission rejects read-only external tables" {
     const alloc = std.testing.allocator;
+    const NoArtifactAccess = struct {
+        calls: usize = 0,
+        fn denied(ptr: *anyopaque) error{UnexpectedArtifactAccess} {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedArtifactAccess;
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return denied(ptr);
+        }
+        fn range(ptr: *anyopaque, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
+            return denied(ptr);
+        }
+        fn stat(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
+            return denied(ptr);
+        }
+        fn delete(ptr: *anyopaque, _: []const u8) !void {
+            return denied(ptr);
+        }
+        fn store(self: *@This(), a: Allocator) artifacts_mod.ArtifactStore {
+            return .{ .allocator = a, .ptr = self, .vtable = &.{ .deinit = deinit, .put = put, .put_scoped = putScoped, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = delete } };
+        }
+    };
     const current_schema =
         \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
+    const pinned_schema = try std.mem.replaceOwned(u8, alloc, current_schema, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"object_version_digest\",\"digest\":\"discovered-snapshot\"}");
+    defer alloc.free(pinned_schema);
+    const iceberg_current = try std.mem.replaceOwned(u8, alloc, current_schema, "\"format\":\"parquet\"", "\"format\":\"iceberg\"");
+    defer alloc.free(iceberg_current);
+    const iceberg_pinned = try std.mem.replaceOwned(u8, alloc, iceberg_current, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"snapshot_id\",\"id\":\"31\"}");
+    defer alloc.free(iceberg_pinned);
 
     var artifact_root_buf: [256]u8 = undefined;
     var manifest_root_buf: [256]u8 = undefined;
@@ -5602,11 +5635,32 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
     try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
 
+    // A selector is not a resolved inventory. Neither current nor explicit
+    // pins may create a partial external HEAD without the resolver capability.
+    {
+        const actual_artifacts = artifact_store;
+        defer artifact_store = actual_artifacts;
+        var denied: NoArtifactAccess = .{};
+        artifact_store = denied.store(alloc);
+        for ([_][]const u8{ current_schema, pinned_schema, iceberg_current, iceberg_pinned }) |schema| {
+            _ = try catalog.setTableDefinition("events", schema, "", "{}");
+            var local_status = try catalog.tableBuildStatus("events");
+            defer local_status.deinit(alloc);
+            try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+            const versions = try manifest_store.listVersionsAlloc("events");
+            defer alloc.free(versions);
+            try std.testing.expectEqual(@as(usize, 0), versions.len);
+            try std.testing.expectError(error.FileNotFound, progress_store.getHead("events"));
+        }
+        try std.testing.expectEqual(@as(usize, 0), denied.calls);
+    }
+    _ = try catalog.setTableDefinition("events", current_schema, "", "{}");
+
     const ScopedResolver = struct {
         progress: *progress_store_mod.ProgressStore,
         shared_artifacts: *artifacts_mod.ArtifactStore,
         io: std.Io,
-        fn resolve(ptr: *anyopaque, a: Allocator, request: publication_plan.ExternalSourcePlanResolveRequest) !?external_source_manifest.Plan {
+        fn resolve(ptr: *anyopaque, a: Allocator, request: publication_plan.ExternalSourcePlanResolveRequest) !external_source_manifest.Plan {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(self.shared_artifacts.upload_scope == null);
             const scope = request.artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
@@ -5673,8 +5727,6 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, converged_status.artifact_actions.document_segment);
 
     const graph_indexes = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
-    const pinned_schema = try std.mem.replaceOwned(u8, alloc, current_schema, "\"snapshot\":\"current\"", "\"snapshot\":{\"mode\":\"object_version_digest\",\"digest\":\"discovered-snapshot\"}");
-    defer alloc.free(pinned_schema);
     // Selector intent must publish even without a text index to incidentally
     // trigger schema migration. It then converges without inventory churn.
     for ([_][]const u8{ "{}", graph_indexes }) |indexes| {
@@ -5727,6 +5779,32 @@ test "serverless catalog status stays local and write admission rejects read-onl
         try std.testing.expectEqual(case.graph, target_plan.targets.include_graph);
         try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, target_plan.artifact_actions.full_text);
         try std.testing.expectEqual(case.graph, target_plan.external_materialization.?.pending);
+    }
+
+    // The same capability requirement holds for metadata republishing an
+    // existing external HEAD. In particular, never turn its absent WAL into
+    // an empty managed document snapshot or drop its authenticated inventory.
+    {
+        const actual_artifacts = artifact_store;
+        defer artifact_store = actual_artifacts;
+        var denied: NoArtifactAccess = .{};
+        artifact_store = denied.store(alloc);
+        catalog.external_source_plan_resolver = null;
+        const before_head = try progress_store.getHead("events");
+        const before_versions = try manifest_store.listVersionsAlloc("events");
+        defer alloc.free(before_versions);
+        for ([_][]const u8{ current_schema, pinned_schema, iceberg_current, iceberg_pinned }) |schema| {
+            _ = try catalog.setTableDefinition("events", schema, "", "{}");
+            var local_status = try catalog.tableBuildStatus("events");
+            defer local_status.deinit(alloc);
+            try std.testing.expect(local_status.head_republish_recommended);
+            try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+            try std.testing.expectEqual(before_head, try progress_store.getHead("events"));
+            const after_versions = try manifest_store.listVersionsAlloc("events");
+            defer alloc.free(after_versions);
+            try std.testing.expectEqualSlices(u64, before_versions, after_versions);
+        }
+        try std.testing.expectEqual(@as(usize, 0), denied.calls);
     }
 }
 

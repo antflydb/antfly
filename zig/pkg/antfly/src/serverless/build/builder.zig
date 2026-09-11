@@ -403,6 +403,13 @@ pub const Builder = struct {
         defer head.deinit(self.alloc);
         const current_head = head.progress_version;
         const current_manifest = head.manifest;
+        // Source type owns dispatch. Missing resolution is an error, never an
+        // invitation to reconstruct external rows through the managed WAL.
+        const source_kind = try publicationSourceKindAlloc(self.alloc, plan, current_manifest);
+        const external_plan = if (source_kind == .external)
+            plan.external_source_plan orelse return error.ExternalSourcePlanRequired
+        else
+            null;
 
         const next_version: u64 = current_head + 1;
         const start_lsn: u64 = if (current_manifest) |current| current.wal_end_lsn + 1 else 1;
@@ -414,26 +421,10 @@ pub const Builder = struct {
         const applicable_records = try applicableWalRecordsForHeadAlloc(self.alloc, records, current_head);
         defer self.alloc.free(applicable_records);
 
-        if (applicable_records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
-            return error.ExternalTableReadOnly;
-        }
-
-        if (records.len == 0) {
-            if (plan.external_source_plan) |external_plan| {
-                if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?) or plan.forceRepublishFromHead()) {
-                    return try self.publishExternalManifestWithoutWal(
-                        namespace,
-                        current_head,
-                        next_version,
-                        start_lsn,
-                        current_manifest,
-                        plan,
-                        publication_guard,
-                        cancellation,
-                        null,
-                    );
-                }
-            } else if (current_head == 0 and plan.table_definition.base_source != null) {
+        if (external_plan) |resolved| {
+            if (applicable_records.len != 0) return error.ExternalTableReadOnly;
+            const last_record: ?wal_mod.Record = if (records.len == 0) null else records[records.len - 1];
+            if (current_manifest == null or !externalSourcePlanMatchesManifest(resolved, current_manifest.?) or plan.forceRepublishFromHead()) {
                 return try self.publishExternalManifestWithoutWal(
                     namespace,
                     current_head,
@@ -443,9 +434,28 @@ pub const Builder = struct {
                     plan,
                     publication_guard,
                     cancellation,
-                    null,
+                    last_record,
                 );
             }
+            if (last_record) |record| return try self.publishHeadConsumingIgnoredWal(
+                namespace,
+                current_head,
+                current_manifest.?,
+                record,
+                publication_guard,
+                cancellation,
+            );
+            return .{
+                .namespace = try self.alloc.dupe(u8, namespace),
+                .published = false,
+                .version = current_head,
+                .wal_start_lsn = start_lsn,
+                .wal_end_lsn = if (current_head == 0) 0 else start_lsn - 1,
+                .artifact_count = 0,
+            };
+        }
+
+        if (records.len == 0) {
             if (current_head != 0 and plan.forceRepublishFromHead()) {
                 return try self.republishHeadWithPlan(
                     namespace,
@@ -476,21 +486,6 @@ pub const Builder = struct {
         if (applicable_records.len == 0) {
             const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
             const last_record = records[records.len - 1];
-            if (plan.external_source_plan) |external_plan| {
-                if (!externalSourcePlanMatchesManifest(external_plan, current) or plan.forceRepublishFromHead()) {
-                    return try self.publishExternalManifestWithoutWal(
-                        namespace,
-                        current_head,
-                        next_version,
-                        start_lsn,
-                        current_manifest,
-                        plan,
-                        publication_guard,
-                        cancellation,
-                        last_record,
-                    );
-                }
-            }
             if (plan.forceRepublishFromHead()) {
                 return try self.republishHeadWithPlan(
                     namespace,
@@ -858,6 +853,7 @@ pub const Builder = struct {
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
+        if (try publicationSourceKindAlloc(self.alloc, plan, current) == .external) return error.ExternalSourcePlanRequired;
 
         var docs_cache: ?[]query_mod.QueryMaterializedDocument = null;
         defer if (docs_cache) |docs| query_mod.freeMaterializedDocuments(self.alloc, docs);
@@ -1947,10 +1943,34 @@ fn cloneTableDefinitionBaseSourceAlloc(
         null;
 }
 
-fn publicationPlanHasExternalBaseSource(plan: publication_plan.TablePublicationPlan) bool {
-    if (plan.external_source_plan != null) return true;
-    const base_source = plan.table_definition.base_source orelse return false;
-    return switch (base_source) {
+const PublicationSourceKind = enum { managed, external };
+
+fn publicationSourceKindAlloc(alloc: Allocator, plan: publication_plan.TablePublicationPlan, current: ?manifest_mod.Manifest) !PublicationSourceKind {
+    if (plan.external_source_plan) |resolved| {
+        if (!isExternalBaseSource(resolved.base_source)) return error.InvalidExternalSourceManifestPlan;
+        try resolved.base_source.validate();
+        const source = switch (resolved.base_source) {
+            .external_parquet, .external_iceberg, .external_lance => |value| value,
+            else => unreachable,
+        };
+        if (source.file_inventory_artifact == null or resolved.artifacts.len == 0) return error.InvalidExternalSourceManifestPlan;
+        for (resolved.artifacts) |ref| if (ref.kind != .external_base_source) return error.InvalidExternalSourceManifestPlan;
+        _ = try @import("../manifest/compatibility.zig").checkLakeBaseSource(resolved.base_source, resolved.artifacts, .{});
+        return .external;
+    }
+    if (plan.table_definition.base_source) |descriptor| if (isExternalBaseSource(descriptor)) return .external;
+    // The immutable HEAD remains authoritative even for library callers that
+    // omit a table definition. Storage-mode conversion is not WAL republishing.
+    if (current) |manifest| if (manifest.base_source) |descriptor| if (isExternalBaseSource(descriptor)) return .external;
+    // A floating external selector has no cached pinned base_source. Inspect
+    // declared intent too, so it cannot accidentally bootstrap managed storage.
+    var binding = try publication_plan.externalBindingFromSchemaJsonAlloc(alloc, plan.table_definition.schema_json);
+    defer if (binding) |*value| value.deinit(alloc);
+    return if (binding != null) .external else .managed;
+}
+
+fn isExternalBaseSource(descriptor: manifest_base_source.BaseSourceDescriptor) bool {
+    return switch (descriptor) {
         .external_parquet, .external_iceberg, .external_lance => true,
         else => false,
     };
@@ -7758,6 +7778,29 @@ test "serverless external selector transitions preserve resolved sidecars withou
         fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
             return deny(ptr);
         }
+        fn expectPlanRequired(self: *@This(), builder: *Builder, plan: publication_plan.TablePublicationPlan) !void {
+            return self.expectPublicationError(builder, plan, error.ExternalSourcePlanRequired);
+        }
+        fn expectPublicationError(self: *@This(), builder: *Builder, plan: publication_plan.TablePublicationPlan, expected_error: anyerror) !void {
+            const head_before = builder.progress.getHead("docs") catch |err| switch (err) {
+                error.FileNotFound => 0,
+                else => return err,
+            };
+            const versions_before = try builder.manifests.listVersionsAlloc("docs");
+            defer builder.alloc.free(versions_before);
+            const wal_before = try builder.wal.latestLsn("docs");
+            try std.testing.expectError(expected_error, builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan));
+            const head_after = builder.progress.getHead("docs") catch |err| switch (err) {
+                error.FileNotFound => 0,
+                else => return err,
+            };
+            const versions_after = try builder.manifests.listVersionsAlloc("docs");
+            defer builder.alloc.free(versions_after);
+            try std.testing.expectEqual(head_before, head_after);
+            try std.testing.expectEqualSlices(u64, versions_before, versions_after);
+            try std.testing.expectEqual(wal_before, try builder.wal.latestLsn("docs"));
+            try std.testing.expectEqual(@as(usize, 0), self.calls);
+        }
         const vtable: artifacts_mod.ArtifactStore.VTable = .{
             .deinit = deinit,
             .put = put,
@@ -7788,6 +7831,15 @@ test "serverless external selector transitions preserve resolved sidecars withou
         var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
         var wal_store = fs_wal.walStore();
         defer wal_store.deinit();
+        var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+        // A schema alone declares an external table; callers must not need
+        // the optional cached descriptor to prevent managed bootstrap.
+        for ([_][]const u8{ current_schema, pinned_schema }) |schema| {
+            try probe.expectPlanRequired(&builder, .{
+                .targets = .{ .published_search_sources = .{} },
+                .table_definition = .{ .schema_json = @constCast(schema) },
+            });
+        }
         var initial = try metadata.testing.fixtureAlloc(alloc, 16384);
         defer initial.deinit(alloc);
         var source = initial.base_source.?.external_parquet;
@@ -7797,8 +7849,25 @@ test "serverless external selector transitions preserve resolved sidecars withou
         // fixture still owns and frees every allocated field exactly once.
         var initial_view = initial;
         initial_view.stats.schema_json = @constCast(current_schema);
+        // A cached external descriptor is independently sufficient evidence,
+        // including low-level callers that omit the serialized schema.
+        try probe.expectPlanRequired(&builder, .{
+            .targets = .{ .published_search_sources = .{} },
+            .table_definition = .{ .base_source = initial.base_source },
+        });
         try manifest_store.put(initial_view);
         try std.testing.expect(try progress_store.compareAndSwapHead("docs", null, initial.version));
+        // Once HEAD is external, omitting the desired schema cannot switch
+        // publication to the managed path, including forced metadata work.
+        try probe.expectPlanRequired(&builder, .{ .targets = .{ .published_search_sources = .{} } });
+        try probe.expectPlanRequired(&builder, .{ .targets = .{ .published_search_sources = .{} }, .metadata_republish = .{ .read_schema_migration = true } });
+        try std.testing.expectError(error.ExternalSourcePlanRequired, builder.republishHeadWithTargets("docs", initial.version, .cosine, .{ .published_search_sources = .{} }));
+        try std.testing.expectEqual(initial.version, try progress_store.getHead("docs"));
+        const direct_versions = try manifest_store.listVersionsAlloc("docs");
+        defer alloc.free(direct_versions);
+        try std.testing.expectEqualSlices(u64, &.{initial.version}, direct_versions);
+        try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("docs"));
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
         var external = try external_source_manifest.planAlloc(alloc, .iceberg, "s3://warehouse/docs", "parquet-31", "schema-v3", .{
             .name = "docs.external-files",
             .artifact_id = "inventory-docs",
@@ -7812,7 +7881,6 @@ test "serverless external selector transitions preserve resolved sidecars withou
             .table_definition = .{ .indexes_json = @constCast(metadata.testing.indexes), .schema_json = @constCast(pinned_schema) },
             .metadata_republish = .{ .external_schema_changed = true },
         };
-        var builder = Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
         for ([_][]const u8{ pinned_schema, current_schema }) |schema| {
             plan.table_definition.schema_json = @constCast(schema);
             var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
@@ -7850,6 +7918,38 @@ test "serverless external selector transitions preserve resolved sidecars withou
         try std.testing.expect(changed_head.stats.published_search_sources.findText() == null);
         try std.testing.expect(changed_head.stats.published_search_sources.findVector() == null);
         try std.testing.expectEqual(@as(u32, 0), changed_head.stats.graph_segment_count);
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+        // Even an otherwise discardable enrichment record cannot bypass the
+        // external dispatch guard and publish a managed/stale-WAL manifest.
+        var operation_buffer: [128]u8 = undefined;
+        _ = try wal_store.appendIdempotentIfLatest(
+            "docs",
+            99,
+            "stale-enrichment-body-must-not-be-decoded",
+            try @import("../enrichment/operation_id.zig").format(&operation_buffer, 1, 1, 0, 1),
+            0,
+        );
+        try probe.expectPlanRequired(&builder, .{ .targets = .{ .published_search_sources = .{} } });
+        try probe.expectPlanRequired(&builder, .{ .targets = .{ .published_search_sources = .{} }, .metadata_republish = .{ .external_schema_changed = true } });
+        // A non-null resolution wrapper is not enough: an empty inventory
+        // plan must fail before examining or consuming the pending WAL.
+        var malformed_plan = plan;
+        malformed_plan.external_source_plan.?.artifacts = &.{};
+        try probe.expectPublicationError(&builder, malformed_plan, error.InvalidExternalSourceManifestPlan);
+        const mutation = try api_codec.encodeMutationAlloc(alloc, .{
+            .kind = .upsert,
+            .doc_id = "must-not-be-managed",
+            .body = "{\"body\":\"unpublished\"}",
+        });
+        defer alloc.free(mutation);
+        _ = try wal_store.append("docs", 100, mutation);
+        try probe.expectPlanRequired(&builder, .{ .targets = .{ .published_search_sources = .{} } });
+        // Supplying the resolution capability does not authorize ordinary
+        // user WAL against a read-only external table.
+        try std.testing.expectError(error.ExternalTableReadOnly, builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan));
+        try std.testing.expectEqual(changed.version, try progress_store.getHead("docs"));
+        try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
         try std.testing.expectEqual(@as(usize, 0), probe.calls);
     }
 }

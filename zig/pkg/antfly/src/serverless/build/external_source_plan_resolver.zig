@@ -130,7 +130,7 @@ pub const Resolver = struct {
         ptr: *anyopaque,
         alloc: Allocator,
         request: resolver_api.ResolveRequest,
-    ) !?external_source_manifest.Plan {
+    ) !external_source_manifest.Plan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const scope = request.artifacts.upload_scope orelse return error.ExternalInventoryPublicationScopeRequired;
         if (!std.mem.eql(u8, &scope.domain, &@import("../graph_segment/page_store.zig").PageStore.namespaceDomain(request.namespace))) return error.InvalidArtifactUploadScope;
@@ -531,7 +531,7 @@ test "serverless remote uri publication resolver pins parquet inventory into art
     var publication = Resolver.init(object_resolver.resolver(), .{
         .object_uri_base = "object://antfly/events",
     });
-    var plan = (try publication.planResolver().resolveAlloc(alloc, .{
+    var plan = try publication.planResolver().resolveAlloc(alloc, .{
         .artifacts = &artifacts,
         .namespace = "events",
         .table_name = "events",
@@ -543,7 +543,7 @@ test "serverless remote uri publication resolver pins parquet inventory into art
             .schema_fingerprint = "schema-v1",
             .write_policy = .read_only,
         },
-    })).?;
+    });
     defer plan.deinit(alloc);
 
     try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
@@ -640,7 +640,7 @@ test "serverless remote uri publication resolver pins iceberg data object identi
 
     artifacts.upload_scope = testScope();
     var publication = Resolver.init(object_resolver.resolver(), .{});
-    var plan = (try publication.planResolver().resolveAlloc(alloc, .{
+    var plan = try publication.planResolver().resolveAlloc(alloc, .{
         .artifacts = &artifacts,
         .namespace = "events",
         .table_name = "events",
@@ -652,7 +652,7 @@ test "serverless remote uri publication resolver pins iceberg data object identi
             .schema_fingerprint = "iceberg-schema:7",
             .write_policy = .read_only,
         },
-    })).?;
+    });
     defer plan.deinit(alloc);
 
     const artifact_bytes = artifact_impl.bytes orelse return error.ArtifactNotFound;

@@ -164,6 +164,13 @@ samples for each API. Timings exclude result destruction, correctness assertions
 discovery, leases, manifest persistence and HEAD publication. Reconciliation
 includes planning; the two timings should not be added together.
 
+External publication requires that resolved inventory plan even for a pinned
+snapshot. Separate guard regressions verify that missing resolution fails before
+managed WAL reads or artifact writes; the source-kind dispatch check is not
+treated as a meaningful standalone performance workload. This benchmark
+qualifies the unchanged metadata path after that check, not resolver latency or
+the guard's failure path.
+
 The rejected variant marks PageRank rejected under the current materializer
 policy. The unchanged full admission plan must preserve that rejection; this
 exercises the same complete-plan predicate used by actual materialization.
@@ -175,22 +182,24 @@ drops remain pending until reconciliation applies them. The probe then verifies
 that a fresh plan reports no outstanding work. A retained rejection is terminal
 under an unchanged admission plan; it is not relabeled as a ready computation.
 
-All cases retain five sidecars and accept no artifact-I/O capability.
+All cases retain five sidecars and accept no artifact-I/O capability. These
+results were requalified after making external resolution mandatory; they are
+not an isolated measurement of the source-kind dispatch check.
 
 | Document count in manifest | PageRank state | Selector transition | Plan median (ms) | Reconcile median (ms) |
 | ---: | --- | --- | ---: | ---: |
-| 1,024 | Ready | Unchanged current | 0.209 | 0.236 |
-| 1,024 | Ready | Current → pinned | 0.180 | 0.220 |
-| 1,024 | Ready | Pinned → current | 0.177 | 0.219 |
-| 1,024 | Rejected | Unchanged current | 0.177 | 0.212 |
-| 1,024 | Rejected | Current → pinned | 0.172 | 0.209 |
-| 1,024 | Rejected | Pinned → current | 0.167 | 0.210 |
-| 16,384 | Ready | Unchanged current | 0.159 | 0.185 |
-| 16,384 | Ready | Current → pinned | 0.153 | 0.179 |
-| 16,384 | Ready | Pinned → current | 0.167 | 0.208 |
-| 16,384 | Rejected | Unchanged current | 0.175 | 0.198 |
-| 16,384 | Rejected | Current → pinned | 0.159 | 0.186 |
-| 16,384 | Rejected | Pinned → current | 0.209 | 0.240 |
+| 1,024 | Ready | Unchanged current | 0.308 | 0.367 |
+| 1,024 | Ready | Current → pinned | 0.258 | 0.325 |
+| 1,024 | Ready | Pinned → current | 0.241 | 0.286 |
+| 1,024 | Rejected | Unchanged current | 0.234 | 0.291 |
+| 1,024 | Rejected | Current → pinned | 0.211 | 0.258 |
+| 1,024 | Rejected | Pinned → current | 0.208 | 0.254 |
+| 16,384 | Ready | Unchanged current | 0.190 | 0.241 |
+| 16,384 | Ready | Current → pinned | 0.196 | 0.237 |
+| 16,384 | Ready | Pinned → current | 0.183 | 0.229 |
+| 16,384 | Rejected | Unchanged current | 0.190 | 0.230 |
+| 16,384 | Rejected | Current → pinned | 0.181 | 0.221 |
+| 16,384 | Rejected | Pinned → current | 0.203 | 0.219 |
 
 This measures metadata work, not a cloud latency SLO or a before/after speedup.
 The document count is a manifest statistic in this fixture; the configured

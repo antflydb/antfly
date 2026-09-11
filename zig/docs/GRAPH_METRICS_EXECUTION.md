@@ -122,6 +122,15 @@ pinned current manifest; restoring identical bytes from an obsolete publication
 creates a new attempt-scoped identity. A delayed collector of that obsolete
 inventory therefore cannot remove the newly published one. Shared resolver and
 artifact-store instances are never mutated to install request authority.
+Every external publication, including an explicitly pinned snapshot, requires a
+resolved inventory plan. The resolver returns either a complete owned plan or
+an error; absence is not a successful result. Builder dispatch follows the
+requested source kind rather than whether an optional plan happens to exist.
+An external request without a resolved plan fails before reading the managed
+WAL or writing artifacts, and never falls back to publishing a managed snapshot.
+Build routes report missing resolution as HTTP 503 with a resolver-configuration
+message and no automatic retry interval.
+Discovery-free catalog status remains supported; it is not publication authority.
 External inventory publication does not manufacture managed document facts or
 implicitly request local text/graph indexes. Explicit sidecar configurations
 remain visible: missing graph metrics report pending, but do not cause an
