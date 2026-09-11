@@ -31,12 +31,13 @@ pub const TableListing = struct {
     ranges: []metadata.RangeRecord = &.{},
     stores: []metadata.StoreRecord = &.{},
     placement_intents: []raft.PlacementIntent = &.{},
+    replication_source_statuses: []metadata.ReplicationSourceStatusRecord = &.{},
 
     /// Borrow projection storage and allocate only the table reference array.
     pub fn adminSnapshot(self: @This(), alloc: std.mem.Allocator) !api.AdminSnapshot {
         const tables = try alloc.alloc(metadata.TableRecord, self.entries.len);
         for (self.entries, tables) |entry, *table| table.* = entry.table;
-        return .{ .status = .{ .metadata_group_id = 1, .metadata_epoch = self.revision, .metrics = .{} }, .tables = tables, .ranges = self.ranges, .stores = self.stores, .placement_intents = self.placement_intents, .split_transitions = &.{}, .merge_transitions = &.{} };
+        return .{ .status = .{ .metadata_group_id = 1, .metadata_epoch = self.revision, .metrics = .{} }, .tables = tables, .ranges = self.ranges, .stores = self.stores, .placement_intents = self.placement_intents, .replication_source_statuses = self.replication_source_statuses, .replication_source_action_hints = try api.deriveReplicationSourceActionHints(alloc, tables, self.replication_source_statuses), .split_transitions = &.{}, .merge_transitions = &.{} };
     }
 };
 

@@ -179,9 +179,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const system_catalog_store_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "metadata raft apply store", "system catalog" },
+    });
+    const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
+    system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const report_bench_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"store report workload benchmark"},
+    });
+    b.step("antfly-system-catalog-report-bench", "Run opt-in report apply and hydration workloads").dependOn(&b.addRunArtifact(report_bench_tests).step);
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "system catalog", "prepared query routing", "routing session pins every table" },
+        .filters = &.{ "system catalog", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder" },
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);

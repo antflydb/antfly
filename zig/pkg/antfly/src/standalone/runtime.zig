@@ -736,6 +736,7 @@ const LocalStandaloneMetadata = struct {
     owned_catalog_backend: ?antfly.lsm_backend.BackendHandle = null,
     owned_catalog_store: ?antfly.storage_backend_erased.Store = null,
     catalog_rows_initialized: bool = false,
+    catalog_listing_indexes_initialized: bool = false,
     catalog_durability_failed: bool = false,
     backend_runtime: *antfly.db.background_runtime.BackendRuntime,
     storage_engine: antfly.common.config.StorageEngine = .local,
@@ -1317,18 +1318,25 @@ const LocalStandaloneMetadata = struct {
         return systemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
 
-    fn listCatalogTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, input: system_catalog.TableList) ![]u8 {
+    const CatalogCapture = struct {
+        arena: std.heap.ArenaAllocator,
+        value: @import("../system_catalog/projection.zig").TableListing,
+    };
+    fn captureCatalogTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, input: system_catalog.TableList) !CatalogCapture {
         var request = input;
         const projection = @import("../system_catalog/projection.zig");
         try system_catalog.validateName(request.database);
         try system_catalog.validateName(request.namespace);
         var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
+        errdefer arena.deinit();
         const a = arena.allocator();
         if (request.revision) |expected| if (expected != self.systemCatalogState().revision) return error.CatalogGenerationChanged;
+        try self.ensureListingIndexesLocked();
+        const store = try self.durableCatalogStore();
+        var txn = try store.beginRead();
+        defer txn.abort();
         const index = &self.system_catalog_state.?.index;
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
-        var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
         var membership: [32]u8 = @splat(0);
         if (request.target) |target| {
             const table = (try self.resolveSystemCatalogLocked(target)) orelse return error.TableNotFound;
@@ -1348,52 +1356,77 @@ const LocalStandaloneMetadata = struct {
                 }
                 if (!std.mem.startsWith(u8, request.after.?, request.prefix orelse "")) return error.InvalidCatalogName;
             }
-            for (index.list(.table, namespace.id)) |binding| {
-                try context.ensureActive();
-                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
-                const table = self.manager.tables.get(binding.id) orelse return error.InvalidCatalogRecord;
-                if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
-                try entries.append(a, .{ .name = binding.name, .table = table });
-            }
-            // Unbound pre-catalog tables belong to default.public only. Resolve
-            // absence against the same locked state as the physical record.
             if (namespace.id == system_catalog.default_namespace_id) {
-                var tables = self.manager.tables.valueIterator();
-                while (tables.next()) |table| {
-                    try context.ensureActive();
-                    if (index.byId(.table, table.table_id) != null) continue;
-                    for (&membership, projection.legacyIdentity(table.table_id, table.name)) |*byte, identity_byte| byte.* ^= identity_byte;
-                    if (request.prefix) |prefix| if (!std.mem.startsWith(u8, table.name, prefix)) continue;
-                    try entries.append(a, .{ .name = table.name, .table = table.* });
-                }
+                const bytes = try txn.get(listing_membership_key);
+                if (bytes.len != 32) return error.InvalidCatalogRecord;
+                membership = bytes[0..32].*;
+            }
+            try projection.checkMembership(request, membership);
+            const base = try listingNamePrefix(a, namespace.id);
+            const prefix = try std.mem.concat(a, u8, &.{ base, request.prefix orelse "" });
+            const after = if (request.after) |name| try std.mem.concat(a, u8, &.{ base, name }) else prefix;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(if (std.mem.lessThan(u8, after, prefix)) prefix else after);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                const name = kv.key[base.len..];
+                if (request.after) |previous| if (!std.mem.lessThan(u8, previous, name)) continue;
+                try context.ensureActive();
+                if (kv.value.len != 8) return error.InvalidCatalogRecord;
+                const id = std.mem.readInt(u64, kv.value[0..8], .little);
+                const table = self.manager.tables.get(id) orelse return error.InvalidCatalogRecord;
+                try entries.append(a, .{ .name = try a.dupe(u8, name), .table = table });
+                if (request.limit) |limit| if (entries.items.len > limit) break;
             }
         }
         try projection.checkMembership(request, membership);
         const page = try projection.selectPage(entries.items, request, self.systemCatalogState().revision);
-        for (page.entries) |entry| try selected.put(a, entry.table.table_id, {});
+        for (page.entries) |*entry| {
+            entry.name = try a.dupe(u8, entry.name);
+            entry.table = try antfly.metadata.table_manager.cloneTable(a, entry.table);
+        }
         var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
         var intents: std.ArrayListUnmanaged(antfly.raft.PlacementIntent) = .empty;
-        var it = self.manager.ranges.valueIterator();
-        while (it.next()) |range| {
-            if (!selected.contains(range.table_id)) continue;
-            try ranges.append(a, range.*);
-            try intents.append(a, .{ .record = .{ .group_id = range.group_id, .replica_id = 1, .local_node_id = self.local_node_id, .bootstrap_mode = .persisted, .metadata_version = self.epoch }, .store_id = self.store_id, .peer_node_ids = &.{} });
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        for (page.entries) |entry| {
+            const prefix = try listingRangePrefix(a, entry.table.table_id);
+            var row = try cursor.seekAtOrAfter(prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                if (kv.value.len != 8) return error.InvalidCatalogRecord;
+                const id = std.mem.readInt(u64, kv.value[0..8], .little);
+                const range = self.manager.ranges.get(id) orelse return error.InvalidCatalogRecord;
+                if (range.table_id != entry.table.table_id) return error.InvalidCatalogRecord;
+                try ranges.append(a, try antfly.metadata.table_manager.cloneRange(a, range));
+                try intents.append(a, .{ .record = .{ .group_id = id, .replica_id = 1, .local_node_id = self.local_node_id, .bootstrap_mode = .persisted, .metadata_version = self.epoch }, .store_id = self.store_id, .peer_node_ids = &.{} });
+            }
         }
-        var stores = [_]antfly.metadata.StoreRecord{.{ .store_id = self.store_id, .node_id = self.local_node_id, .api_url = self.api_url, .role = "data", .health_class = "healthy", .live = true }};
+        const stores = try a.alloc(antfly.metadata.StoreRecord, 1);
+        stores[0] = .{ .store_id = self.store_id, .node_id = self.local_node_id, .api_url = try a.dupe(u8, self.api_url), .role = "data", .health_class = "healthy", .live = true };
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = self.systemCatalogState().revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = &stores, .placement_intents = intents.items }, .{});
+        return .{ .arena = arena, .value = .{ .revision = self.systemCatalogState().revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items } };
     }
 
     fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (!lockAtomicUntil(&self.mutex, context.deadline_ns)) return error.DeadlineExceeded;
-        defer self.mutex.unlock();
+        var locked = true;
+        defer if (locked) self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
         try context.ensureActive();
+        if (call == .table_status or call == .list_tables) {
+            var capture = try self.captureCatalogTablesLocked(alloc, context, if (call == .table_status) call.table_status.listing() else call.list_tables);
+            self.mutex.unlock();
+            locked = false;
+            defer capture.arena.deinit();
+            try context.ensureActive();
+            return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
+        }
         switch (call) {
-            .table_status => |target| return self.listCatalogTablesLocked(alloc, context, target.listing()),
-            .list_tables => |request| return self.listCatalogTablesLocked(alloc, context, request),
+            .table_status, .list_tables => unreachable,
             .export_snapshot => {
                 const tables = try self.manager.listTables(alloc);
                 defer self.manager.freeTables(alloc, tables);
@@ -2194,6 +2227,146 @@ const LocalStandaloneMetadata = struct {
         try txn.delete(key);
     }
 
+    const listing_index_prefix = "\x00\x00__standalone_listing_v1:";
+    const listing_membership_key = listing_index_prefix ++ "legacy_membership";
+    const ListingIdentity = struct { namespace: u64, name: []const u8, id: u64, legacy: bool };
+    fn listingIdentity(table: ?antfly.metadata.TableRecord, binding: ?system_catalog.Resource) ?ListingIdentity {
+        const row = table orelse return null;
+        return .{ .namespace = if (binding) |r| r.parent_id else system_catalog.default_namespace_id, .name = if (binding) |r| r.name else row.name, .id = row.table_id, .legacy = binding == null };
+    }
+    fn listingNamePrefix(alloc: std.mem.Allocator, namespace: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, listing_index_prefix ++ "name:{d}:", .{namespace});
+    }
+    fn listingNameKey(alloc: std.mem.Allocator, identity: ListingIdentity) ![]u8 {
+        return std.fmt.allocPrint(alloc, listing_index_prefix ++ "name:{d}:{s}", .{ identity.namespace, identity.name });
+    }
+    fn listingRangePrefix(alloc: std.mem.Allocator, table_id: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, listing_index_prefix ++ "range:{d}:", .{table_id});
+    }
+    fn listingRangeKey(alloc: std.mem.Allocator, row: antfly.metadata.RangeRecord) ![]u8 {
+        return std.fmt.allocPrint(alloc, listing_index_prefix ++ "range:{d}:{d}", .{ row.table_id, row.group_id });
+    }
+    fn putListingIdentity(alloc: std.mem.Allocator, txn: *antfly.storage_backend_erased.WriteTxn, identity: ListingIdentity) !void {
+        const key = try listingNameKey(alloc, identity);
+        defer alloc.free(key);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, identity.id, .little);
+        try txn.put(key, &id);
+    }
+    fn putListingRange(alloc: std.mem.Allocator, txn: *antfly.storage_backend_erased.WriteTxn, row: antfly.metadata.RangeRecord) !void {
+        const key = try listingRangeKey(alloc, row);
+        defer alloc.free(key);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, row.group_id, .little);
+        try txn.put(key, &id);
+    }
+    fn toggleListingIdentity(fingerprint: *[32]u8, identity: ListingIdentity) void {
+        if (!identity.legacy) return;
+        for (fingerprint, @import("../system_catalog/projection.zig").legacyIdentity(identity.id, identity.name)) |*byte, value| byte.* ^= value;
+    }
+    fn rebuildListingIndexesLocked(self: *LocalStandaloneMetadata, txn: *antfly.storage_backend_erased.WriteTxn) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(listing_index_prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, listing_index_prefix)) break;
+                try keys.append(a, try a.dupe(u8, kv.key));
+            }
+        }
+        for (keys.items) |key| try txn.delete(key);
+        var fingerprint: [32]u8 = @splat(0);
+        var tables = self.manager.tables.valueIterator();
+        while (tables.next()) |table| {
+            const identity = listingIdentity(table.*, self.system_catalog_state.?.index.byId(.table, table.table_id)).?;
+            try putListingIdentity(a, txn, identity);
+            toggleListingIdentity(&fingerprint, identity);
+        }
+        var ranges = self.manager.ranges.valueIterator();
+        while (ranges.next()) |range| try putListingRange(a, txn, range.*);
+        try txn.put(listing_membership_key, &fingerprint);
+    }
+    fn ensureListingIndexesLocked(self: *LocalStandaloneMetadata) !void {
+        if (self.catalog_listing_indexes_initialized) return;
+        const store = try self.durableCatalogStore();
+        var txn = try store.beginWrite();
+        var open = true;
+        defer if (open) txn.abort();
+        try self.rebuildListingIndexesLocked(&txn);
+        txn.commit() catch {
+            self.catalog_durability_failed = true;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        open = false;
+        if (self.catalog_store != null) store.sync(true) catch {
+            self.catalog_durability_failed = true;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        self.catalog_listing_indexes_initialized = true;
+    }
+    fn updateListingIndexesLocked(self: *LocalStandaloneMetadata, txn: *antfly.storage_backend_erased.WriteTxn, mutation: *const CatalogMutation) !void {
+        if (!self.catalog_listing_indexes_initialized or !self.catalog_rows_initialized) return self.rebuildListingIndexesLocked(txn);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var affected: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var tables = mutation.previous_tables.keyIterator();
+        while (tables.next()) |id| try affected.put(a, id.*, {});
+        if (mutation.catalog_change) |change| {
+            for (change.previous.items) |row| if (row.kind == .table) {
+                try affected.put(a, row.id, {});
+            };
+            for (change.inserted.items) |row| if (row.kind == .table) {
+                try affected.put(a, row.id, {});
+            };
+        }
+        const bytes = try txn.get(listing_membership_key);
+        if (bytes.len != 32) return error.InvalidCatalogRecord;
+        var fingerprint = bytes[0..32].*;
+        var ids = affected.keyIterator();
+        while (ids.next()) |id| {
+            const current_table = self.manager.tables.get(id.*);
+            const current_binding = self.system_catalog_state.?.index.byId(.table, id.*);
+            const previous_table = if (mutation.previous_tables.get(id.*)) |old| old else current_table;
+            var previous_binding = current_binding;
+            if (mutation.catalog_change) |change| {
+                for (change.inserted.items) |row| if (row.kind == .table and row.id == id.*) {
+                    previous_binding = null;
+                    break;
+                };
+                for (change.previous.items) |row| if (row.kind == .table and row.id == id.*) {
+                    previous_binding = row;
+                    break;
+                };
+            }
+            const old = listingIdentity(previous_table, previous_binding);
+            const next = listingIdentity(current_table, current_binding);
+            if (old != null and next != null and old.?.namespace == next.?.namespace and old.?.legacy == next.?.legacy and std.mem.eql(u8, old.?.name, next.?.name)) continue;
+            if (old) |identity| {
+                try txn.delete(try listingNameKey(a, identity));
+                toggleListingIdentity(&fingerprint, identity);
+            }
+            if (next) |identity| {
+                try putListingIdentity(a, txn, identity);
+                toggleListingIdentity(&fingerprint, identity);
+            }
+        }
+        if (!std.mem.eql(u8, bytes, &fingerprint)) try txn.put(listing_membership_key, &fingerprint);
+        var ranges = mutation.previous_ranges.iterator();
+        while (ranges.next()) |entry| {
+            const next = self.manager.ranges.get(entry.key_ptr.*);
+            if (entry.value_ptr.*) |old| {
+                if (next != null and next.?.table_id == old.table_id) continue;
+                try txn.delete(try listingRangeKey(a, old));
+            }
+            if (next) |row| try putListingRange(a, txn, row);
+        }
+    }
+
     fn persistMutationLocked(self: *LocalStandaloneMetadata, mutation: *CatalogMutation) !void {
         const store = try self.durableCatalogStore();
         var txn = try store.beginWrite();
@@ -2227,6 +2400,7 @@ const LocalStandaloneMetadata = struct {
             .extension_members = self.extension_catalog.members.items,
             .extension_dependencies = self.extension_catalog.dependencies.items,
         } });
+        try self.updateListingIndexesLocked(&txn, mutation);
         const state = self.systemCatalogState();
         const head = try std.json.Stringify.valueAlloc(self.alloc, CatalogHead{ .epoch = self.epoch, .revision = state.revision, .next_id = state.next_id }, .{});
         defer self.alloc.free(head);
@@ -2242,6 +2416,7 @@ const LocalStandaloneMetadata = struct {
         txn_open = false;
         mutation.committed = true;
         self.catalog_rows_initialized = true;
+        self.catalog_listing_indexes_initialized = true;
         // The owned LSM was opened with fully durable WAL commits. Syncing
         // its WAL/index again would add two redundant fsyncs to every DDL.
         // Borrowed stores (including Lite) retain the explicit sync boundary.
@@ -10470,4 +10645,55 @@ test "system catalog standalone migrates legacy local and Lite catalogs atomical
             try std.testing.expectError(error.InvalidCatalogRecord, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine));
         }
     }
+}
+
+test "system catalog standalone ordered pages own captured data across rename drop and restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const source = metadata.statusSource();
+    for ([_][]const u8{ "c", "a", "b" }) |name| {
+        const physical = try std.fmt.allocPrint(alloc, "table:{s}", .{name});
+        defer alloc.free(physical);
+        const result = try source.systemCatalog(alloc, .{}, .{ .mutate = .{
+            .mutation = .{ .action = .create, .kind = .table, .name = name },
+            .physical_name = physical,
+            .create_table_json = "{}",
+        } });
+        alloc.free(result);
+    }
+    var captured = try metadata.captureCatalogTablesLocked(alloc, .{}, .{ .limit = 1 });
+    defer captured.arena.deinit();
+    try std.testing.expectEqual(@as(usize, 1), captured.value.entries.len);
+    try std.testing.expectEqualStrings("a", captured.value.entries[0].name);
+    try std.testing.expectEqual(@as(usize, 1), captured.value.ranges.len);
+    const rename = try source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "a", .new_name = "z" } } });
+    alloc.free(rename);
+    try std.testing.expectError(error.CatalogGenerationChanged, source.systemCatalog(alloc, .{}, .{ .list_tables = .{ .limit = 1, .revision = captured.value.revision, .after_table_id = captured.value.next_table_id } }));
+    var dropped = try source.dropTableExact(alloc, "table:a");
+    defer dropped.deinit(alloc);
+    // The page is serialized after releasing the metadata mutex. Its names,
+    // schemas, ranges and store URL must survive a simultaneous mutation.
+    try std.testing.expectEqualStrings("a", captured.value.entries[0].name);
+    try std.testing.expectEqualStrings("table:a", captured.value.entries[0].table.name);
+    try std.testing.expectEqual(captured.value.entries[0].table.table_id, captured.value.ranges[0].table_id);
+    try std.testing.expectEqualStrings("http://localhost", captured.value.stores[0].api_url);
+    metadata.deinit();
+    metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    var page = try metadata.captureCatalogTablesLocked(alloc, .{}, .{ .prefix = "b", .limit = 1 });
+    defer page.arena.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.entries.len);
+    try std.testing.expectEqualStrings("b", page.value.entries[0].name);
+    try std.testing.expect(page.value.next_after == null);
+    var all = try metadata.captureCatalogTablesLocked(alloc, .{}, .{});
+    defer all.arena.deinit();
+    try std.testing.expectEqual(@as(usize, 2), all.value.entries.len);
+    try std.testing.expectEqualStrings("b", all.value.entries[0].name);
+    try std.testing.expectEqualStrings("c", all.value.entries[1].name);
 }

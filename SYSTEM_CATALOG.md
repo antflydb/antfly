@@ -369,21 +369,54 @@ can change between pages; pagination is not a retained historical snapshot.
 Metadata uses ordered logical-child and legacy-identity indexes to seek directly
 to the requested prefix/keyset boundary. It loads full definitions only after
 merging and truncating those candidate streams. Compact store headers exclude
-both group-summary and detailed-runtime arrays. Selected definitions and group
-reports use sorted batch reads, sharing LSM run/block work without decoding
-unrelated payloads. Logical result order is preserved independently of storage
-key order.
-The derived indexes are updated in the same transaction as primary records,
-reuse the versioned primary binary codec and compare report bytes to avoid
-rewriting unchanged rows, and rebuild atomically
-when their version marker changes. Standalone selects pages from borrowed
-identity/definition references under its lock before projecting runtime state.
+both group-summary and detailed-runtime arrays. Selected definitions use sorted
+batch reads. Runtime selection seeks each selected group's actual reporters,
+avoiding a probe for every store/group combination. Logical result order is
+preserved independently of storage key order.
+
+Store reports have a normalized local primary representation: one compact
+header, stable per-group slots in bounded 64-group payload/clock pages, and a
+sorted membership/slot/digest row per store. Reporter indexes map selected groups
+to actual stores and slots; fixed page directories locate only the selected
+binary record without decoding adjacent reports. Deleted slots are reused, so
+ordinary group churn does not renumber or rewrite unrelated pages. Structural SHA-256 digests exclude
+observation clocks from payload identity and include the reporter incarnation.
+Cached reports update only changed headers; fresh observations update clock pages
+without re-encoding unchanged payloads. Sparse changes rebuild only affected
+pages, copying the unchanged encoded members. Full status changes still require work
+proportional to the incoming report. Duplicate observations remain distinct so
+reconciliation can reject ambiguous evidence. Whole-store consumers deduplicate
+and batch-read pages and reconstruct the normal owned StoreRecord. Metadata uses
+the existing immutable LSM block/index cache with a 64 MiB retention budget per
+apply store (`block_cache_bytes`, zero disables). Active transaction leases can
+temporarily exceed retention; the cache is released after the backend closes.
+With caching disabled, nearby report keys reuse a bounded cursor instead of
+reloading the same block for each row.
+
+These primary rows commit together. Legacy full records migrate atomically;
+rebuilding derived indexes reconstructs reporter references without removing
+normalized primary pages. Raft
+snapshot export reconstructs the existing full-record wire format from one read
+transaction. Snapshot installation removes the replaced group's local report
+rows together with its old headers; other metadata groups remain intact. The
+local format is versioned separately from the unchanged command/snapshot wire
+format. Directly opening a normalized data directory with an older binary is not
+a supported downgrade path; use the compatible logical snapshot format.
+
+Standalone maintains ordered namespace/name and table/range indexes in the
+same durable transaction as catalog mutations. It rebuilds those derived rows
+once after startup, seeks only the requested page, and copies selected records
+into an owned arena under the mutex. Serialization runs after releasing that
+mutex. Rollback and ambiguous-durability fencing cover index changes too.
 
 Single-table reads resolve logical identity and capture status together behind
 one Raft read barrier; HTTP and MCP use the same operation. Create acknowledgements
 use its physical-identity form. All share the immutable schema cache. Labels are applied before encoding. Fresh
 runtime evidence is merged on reads; acknowledgements do not wait for runtime
-coverage. Cache admission weighs recent frequency against retained bytes, so
+coverage. Detail captures include selected replication-source checkpoints, errors,
+and action hints. Artifact enrichment summaries are typed before final encoding;
+producer configuration is removed before constructing public enrichment values,
+so detail responses need no full-response JSON parse/redaction/encode cycle. Cache admission weighs recent frequency against retained bytes, so
 one-pass inventories cannot replace equally useful residents. Concurrent misses
 for the same definition share one compilation. Retention remains limited to
 256 entries and 64 MiB, excluding active leases and compilation scratch. Access

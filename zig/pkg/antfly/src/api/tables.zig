@@ -692,11 +692,10 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
 ) !?[]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
-    const status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
-    const encoded = try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
-    defer alloc.free(encoded);
+    var status = (try buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), snapshot, table_name, storage_statuses)) orelse return null;
     const table = findTableByName(snapshot, table_name).?;
-    return try projectSingleTableStatusJson(alloc, encoded, table.indexes_json);
+    status.artifact_enrichments = try publicArtifactEnrichmentsAlloc(arena_impl.allocator(), table.indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
 }
 
 pub fn encodeSingleTableStatusWithDefinitions(
@@ -715,8 +714,8 @@ pub fn encodeSingleTableStatusWithDefinitions(
     for (snapshot.ranges) |*range| if (range.table_id == table.table_id) try ranges.append(a, range);
     var status = try buildTableStatusWithRanges(a, snapshot, table, findTableStorageStatus(storage_statuses, table_name), true, ranges.items, try definitions.get(table));
     status.name = label;
-    const bytes = try std.json.Stringify.valueAlloc(a, status, .{ .emit_null_optional_fields = false });
-    return try projectSingleTableStatusJson(alloc, bytes, table.indexes_json);
+    status.artifact_enrichments = try publicArtifactEnrichmentsAlloc(a, table.indexes_json);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
 }
 
 /// Content-addressed immutable definition projections. Runtime coverage and
@@ -2703,14 +2702,20 @@ fn projectInlineEnrichmentConfigsInTableStatusJson(alloc: std.mem.Allocator, enc
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
-fn projectSingleTableStatusJson(alloc: std.mem.Allocator, encoded: []const u8, indexes_json: []const u8) ![]u8 {
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, encoded, .{});
-    try attachArtifactEnrichmentsToTableStatus(arena, &parsed.value, indexes_json);
-    redactInlineEnrichmentProducerConfigsFromTableStatuses(&parsed.value);
-    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+fn publicArtifactEnrichmentsAlloc(alloc: std.mem.Allocator, indexes_json: []const u8) !?[]const indexes_openapi.EnrichmentConfig {
+    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, source, .{});
+    if (parsed != .object) return error.InvalidTableIndexMetadata;
+    var summaries = std.json.Array.init(alloc);
+    try collectArtifactEnrichmentSummaries(alloc, parsed, &summaries);
+    if (summaries.items.len == 0) return null;
+    const out = try alloc.alloc(indexes_openapi.EnrichmentConfig, summaries.items.len);
+    for (summaries.items, out) |item, *value| {
+        var redacted = item;
+        _ = redacted.object.swapRemove("producer_json");
+        value.* = try std.json.parseFromValueLeaky(indexes_openapi.EnrichmentConfig, alloc, redacted, .{ .ignore_unknown_fields = true });
+    }
+    return out;
 }
 
 /// Producer configuration is accepted on writes but is deliberately omitted
@@ -2744,26 +2749,6 @@ fn redactProducerConfigsFromEnrichmentArray(container: *std.json.Value, key: []c
     for (enrichments.array.items) |*enrichment| {
         if (enrichment.* == .object) _ = enrichment.object.swapRemove("producer_json");
     }
-}
-
-fn attachArtifactEnrichmentsToTableStatus(alloc: std.mem.Allocator, value: *std.json.Value, indexes_json: []const u8) !void {
-    if (value.* != .object) return;
-    const source = if (indexes_json.len > 0) indexes_json else default_indexes_json;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidTableIndexMetadata;
-
-    var enrichments = std.json.Array.init(alloc);
-    errdefer {
-        var owned: std.json.Value = .{ .array = enrichments };
-        deinitJsonValue(alloc, &owned);
-    }
-    try collectArtifactEnrichmentSummaries(alloc, parsed.value, &enrichments);
-    if (enrichments.items.len == 0) return;
-
-    const key = try alloc.dupe(u8, "artifact_enrichments");
-    errdefer alloc.free(key);
-    try value.object.put(alloc, key, .{ .array = enrichments });
 }
 
 fn collectArtifactEnrichmentSummaries(
@@ -6257,4 +6242,58 @@ test "system catalog cache admits recurring demand and keeps evicted leases vali
     try std.testing.expect(!old_resident);
     try std.testing.expectEqual(@as(i64, 1), original.schema.?.version.?);
     try std.testing.expect(cache.bytes <= DefinitionCache.max_bytes);
+}
+
+test "system catalog detail preserves replication runtime through its projection" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = default_indexes_json, .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        .replication_source_statuses = @constCast((&[_]metadata_table_manager.ReplicationSourceStatusRecord{.{
+            .table_id = 7,
+            .source_ordinal = 0,
+            .source_kind = "postgres",
+            .external_table = "users",
+            .cutover_mode = "slot_resumed",
+            .slot_name = "slot_old",
+            .publication_name = "pub_old",
+            .phase = "streaming",
+            .checkpoint = "lsn:0/10",
+            .last_error = "",
+        }})[0..]),
+        .replication_source_action_hints = @constCast((&[_]metadata_api.ReplicationSourceActionHint{.{
+            .table_id = 7,
+            .table_name = @constCast("docs"),
+            .source_ordinal = 0,
+            .action = "reseed_exact_cutover",
+            .reason = "existing_slot_non_exact_cutover",
+            .reseed_exact_cutover_path = @constCast("/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover"),
+        }})[0..]),
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const projection = @import("../system_catalog/projection.zig");
+    const entries = [_]projection.TableEntry{.{ .name = "docs", .table = snapshot.tables[0] }};
+    const listing: projection.TableListing = .{ .revision = 1, .entries = &entries, .ranges = snapshot.ranges, .replication_source_statuses = snapshot.replication_source_statuses };
+    const selected = try listing.adminSnapshot(arena.allocator());
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    var leases: DefinitionCache.Leases = .{ .cache = &cache, .alloc = std.testing.allocator };
+    defer leases.deinit();
+    const encoded = (try encodeSingleTableStatusWithDefinitions(std.testing.allocator, &selected, "docs", "docs", null, &leases)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replication_sources\":[{\"type\":\"postgres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"status\":{\"source_kind\":\"postgres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"cutover_mode\":\"slot_resumed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"action_hint\":{\"action\":\"reseed_exact_cutover\"") != null);
+
+    const listed = try encodeTableList(std.testing.allocator, &snapshot, null);
+    defer std.testing.allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"action_hint\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"status\":{\"source_kind\":\"postgres\"") == null);
 }
