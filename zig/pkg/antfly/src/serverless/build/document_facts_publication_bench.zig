@@ -37,11 +37,14 @@ test "serverless external metadata retention qualification benchmark" {
     for ([_]u64{ 1024, 16384 }) |count| for ([_]bool{ false, true }) |rejected| {
         var source = try metadata.testing.fixtureAlloc(a, count);
         defer source.deinit(a);
-        if (rejected) for (source.artifacts) |*ref| {
+        for (source.artifacts) |*ref| {
             if (ref.kind != .graph_metric_segment) continue;
             ref.materializer_fingerprint = @import("lake_graph_metric.zig").materializerFingerprint(.{});
-            if (std.mem.eql(u8, ref.name, "9:graph_idx4:rank")) ref.graph_metric_materialization_state = .rejected;
-        };
+            if (rejected and std.mem.eql(u8, ref.name, "9:graph_idx4:rank")) {
+                ref.graph_metric_materialization_state = .rejected;
+                ref.graph_metric_rejection_reason = .build_budget_exceeded;
+            }
+        }
         var plan = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
         plan.table_definition = .{
             .schema_json = source.stats.schema_json,
@@ -49,18 +52,64 @@ test "serverless external metadata retention qualification benchmark" {
             .indexes_json = source.stats.indexes_json,
         };
         plan.policy = source.stats.policy;
-        var samples: [5]i96 = undefined;
+        var planning_samples: [5]i96 = undefined;
+        var reconciliation_samples: [5]i96 = undefined;
         for (0..6) |round| {
-            const start = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds();
+            const planning_start = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds();
+            var readiness = try metadata.planAlloc(a, source, plan);
+            defer readiness.deinit(a);
+            const planning_elapsed = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds() - planning_start;
+            try std.testing.expectEqual(@as(usize, 5), readiness.retained_refs.len);
+            try std.testing.expectEqual(@as(usize, 5), readiness.desired_actions.len);
+            try std.testing.expectEqual(@as(usize, 0), readiness.removed.len);
+            try std.testing.expect(!readiness.hasOutstandingWork());
+            for (readiness.desired_actions) |action| try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, action.action);
+
+            const reconciliation_start = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds();
             var result = try metadata.reconcileAlloc(a, source, plan);
             defer result.deinit(a);
-            const elapsed = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds() - start;
+            const reconciliation_elapsed = std.Io.Timestamp.now(runtime.io(), .awake).toNanoseconds() - reconciliation_start;
             try std.testing.expectEqual(@as(usize, 5), result.artifacts.len);
             try std.testing.expectEqual(count, result.stats.document_count);
-            if (round != 0) samples[round - 1] = elapsed;
+            for (result.artifacts) |ref| {
+                const retained = for (readiness.retained_refs) |candidate| {
+                    if (candidate.kind == ref.kind and std.mem.eql(u8, candidate.name, ref.name)) break candidate;
+                } else return error.TestExpectedRetainedArtifact;
+                try std.testing.expectEqualStrings(retained.artifact_id, ref.artifact_id);
+                try std.testing.expectEqual(retained.graph_metric_materialization_state, ref.graph_metric_materialization_state);
+            }
+            if (round != 0) {
+                planning_samples[round - 1] = planning_elapsed;
+                reconciliation_samples[round - 1] = reconciliation_elapsed;
+            }
         }
-        std.mem.sort(i96, &samples, {}, std.sort.asc(i96));
-        std.debug.print("external_metadata_retention docs={} rejected={} retained_sidecars=5 median_ns={} artifact_io_capability=false samples=5\n", .{ count, rejected, samples[2] });
+        // Untimed contract probes: missing topology cannot leave a dependent
+        // metric marked ready, and actual drops remain pending until applied.
+        var missing_graph = source;
+        var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
+        defer refs.deinit(a);
+        for (source.artifacts) |ref| if (ref.kind != .graph_segment) try refs.append(a, ref);
+        missing_graph.artifacts = refs.items;
+        var missing = try metadata.planAlloc(a, missing_graph, plan);
+        defer missing.deinit(a);
+        try std.testing.expect(missing.hasOutstandingWork());
+        try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.action(.graph_segment, "graph_idx"));
+        try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.action(.graph_metric_segment, "9:graph_idx4:rank"));
+
+        var drop_request = plan;
+        drop_request.table_definition.indexes_json = @constCast("{}");
+        var dropping = try metadata.planAlloc(a, source, drop_request);
+        defer dropping.deinit(a);
+        try std.testing.expect(dropping.hasOutstandingWork());
+        try std.testing.expectEqual(@as(usize, 5), dropping.removed.len);
+        var dropped = try metadata.reconcileAlloc(a, source, drop_request);
+        defer dropped.deinit(a);
+        var applied = try metadata.planAlloc(a, dropped, drop_request);
+        defer applied.deinit(a);
+        try std.testing.expect(!applied.hasOutstandingWork());
+        std.mem.sort(i96, &planning_samples, {}, std.sort.asc(i96));
+        std.mem.sort(i96, &reconciliation_samples, {}, std.sort.asc(i96));
+        std.debug.print("external_metadata_retention docs={} rejected={} retained_sidecars=5 desired_actions=5 outstanding=false median_plan_ns={} median_reconcile_ns={} artifact_io_capability=false samples=5\n", .{ count, rejected, planning_samples[2], reconciliation_samples[2] });
     };
 }
 

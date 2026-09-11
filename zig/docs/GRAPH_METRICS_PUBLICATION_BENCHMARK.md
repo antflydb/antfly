@@ -148,31 +148,42 @@ checksum and matching computation fingerprint. Changed dependencies are
 invalidated individually. A changed external source still starts without the
 old sidecars.
 
-The metadata reconciler accepts no artifact-store or row-source capability.
-Consequently it cannot read document bodies or rebuild artifacts. This focused
+Catalog readiness and metadata publication use the same binding-aware plan.
+`planAlloc` returns retained references and desired actions without cloning a
+manifest; `reconcileAlloc` includes that planning work and constructs an owned
+updated manifest. Neither API accepts an artifact-store or row-source capability,
+so neither can read document bodies or rebuild artifacts. This focused
 ReleaseFast benchmark changes read metadata on an owned manifest containing
 text, vector, graph, degree and PageRank sidecars. One warmup precedes five
-samples; the table reports median reconciliation latency, excluding discovery,
-leases, manifest persistence and HEAD publication.
+samples for each API. Timings exclude result destruction, correctness assertions,
+discovery, leases, manifest persistence and HEAD publication. Reconciliation
+includes planning; the two timings should not be added together.
 
 The rejected variant marks PageRank rejected under the current materializer
 policy. The unchanged full admission plan must preserve that rejection; this
 exercises the same complete-plan predicate used by actual materialization.
+Each sample verifies five retained references and five reuse actions with no
+outstanding work. Untimed probes remove the graph and check that its metrics
+require rebuilding, then remove all index declarations and verify that real
+drops remain pending until reconciliation applies them. The probe then verifies
+that a fresh plan reports no outstanding work. A retained rejection is terminal
+under an unchanged admission plan; it is not relabeled as a ready computation.
 
-| Document count in manifest | PageRank state | Retained sidecars | Median (ms) | Artifact I/O |
-| ---: | --- | ---: | ---: | --- |
-| 1,024 | Ready | 5 | 0.297 | None; no capability supplied |
-| 1,024 | Rejected | 5 | 0.286 | None; no capability supplied |
-| 16,384 | Ready | 5 | 0.316 | None; no capability supplied |
-| 16,384 | Rejected | 5 | 0.246 | None; no capability supplied |
+| Document count in manifest | PageRank state | Retained sidecars | Plan median (ms) | Reconcile median (ms) | Artifact I/O |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 1,024 | Ready | 5 | 0.182 | 0.199 | None; no capability supplied |
+| 1,024 | Rejected | 5 | 0.175 | 0.195 | None; no capability supplied |
+| 16,384 | Ready | 5 | 0.146 | 0.192 | None; no capability supplied |
+| 16,384 | Rejected | 5 | 0.154 | 0.189 | None; no capability supplied |
 
 This measures metadata work, not a cloud latency SLO or a before/after speedup.
-The relevant scaling property is dependence on configured artifacts, not the
-external document count.
-The similar small-sample timings do not establish that rejection handling is
-faster; the structural result is that complete-plan validation adds no artifact
-reads or document-count-dependent work. Regression tests separately check that
-changed plans drop rejections while retaining compatible ready computations.
+The document count is a manifest statistic in this fixture; the configured
+artifact set is deliberately fixed. The relevant scaling property is dependence
+on configured artifacts, not the external document count. The small-sample
+timings do not establish that rejection handling or larger namespaces are faster;
+the structural result is that complete-plan validation adds no artifact reads
+or document-count-dependent work. Regression tests separately check that changed
+plans drop rejections while retaining compatible ready computations.
 
 ```sh
 ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'external metadata retention qualification benchmark'

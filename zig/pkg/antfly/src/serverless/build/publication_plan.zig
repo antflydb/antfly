@@ -175,6 +175,11 @@ pub const TablePublicationPlan = struct {
     sparse_index_actions: []NamedArtifactAction = &.{},
     graph_index_actions: []NamedArtifactAction = &.{},
     derived_output_actions: DerivedOutputActions = .{},
+    /// External sidecar readiness is computed from the same source/configuration
+    /// bindings as metadata publication, including families without public
+    /// aggregate actions (algebraic indexes and graph metrics). Null uses the
+    /// managed document/WAL action planner instead.
+    external_materialization: ?ExternalMaterializationReadiness = null,
 
     pub fn deinit(self: *TablePublicationPlan, alloc: Allocator) void {
         search_sources.deinitPublishedSearchSources(alloc, &self.targets.published_search_sources);
@@ -198,6 +203,13 @@ pub const TablePublicationPlan = struct {
     pub fn effectiveFullTextAction(self: TablePublicationPlan, text_artifact_present: bool) ArtifactAction {
         return collapseFullTextArtifactAction(self.full_text_index_actions, text_artifact_present, self.artifact_actions.full_text);
     }
+};
+
+pub const ExternalMaterializationReadiness = struct {
+    pending: bool,
+    graph_metrics_configured: usize,
+    graph_metrics_pending: usize,
+    graph_metrics_rejected: usize,
 };
 
 pub fn collapseFullTextArtifactAction(
@@ -258,8 +270,10 @@ pub fn externalBindingFromSchemaJsonAlloc(
 ) !?OwnedExternalTableBinding {
     if (schema_json.len == 0) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch
-        return error.InvalidExternalTableBinding;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExternalTableBinding,
+    };
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,

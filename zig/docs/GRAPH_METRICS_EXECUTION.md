@@ -126,7 +126,12 @@ External inventory publication does not manufacture managed document facts or
 implicitly request local text/graph indexes. Explicit sidecar configurations
 remain visible: missing graph metrics report pending, but do not cause an
 inventory-only publisher to create endless identical HEADs. Sidecar readiness
-and inventory metadata publication are separate responsibilities.
+and inventory metadata publication are separate responsibilities, but they now
+share one binding-aware metadata plan. Catalog status inspects its desired
+actions and retained references without cloning a manifest, discovering the
+remote source, or reading sidecar payloads. Missing or incompatible requested
+sidecars report rebuild work; obsolete attached sidecars report pending drops.
+Once those drops have been published, they no longer keep status pending.
 
 For an unchanged external source descriptor, metadata publication reconciles
 existing sidecars against the requested index definitions. Compatible physical
@@ -142,6 +147,8 @@ configurations do not synthesize a text index; deleting the last explicitly
 configured default-named index removes its sidecar and serving descriptor.
 Managed namespaces retain their existing implicit defaults. Defaults already
 persisted as declarations during table creation remain ordinary explicit indexes.
+Managed graph aliases also retain their existing reuse semantics; the external
+binding planner is not substituted for managed namespace action planning.
 
 Ready metric reuse depends on its computation and source identity. A budget
 rejection additionally depends on the complete ordered admission plan. Metadata

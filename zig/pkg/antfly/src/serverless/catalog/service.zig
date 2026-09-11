@@ -34,6 +34,7 @@ const graph_metric_segment = @import("../graph_metric_segment/mod.zig");
 const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const impact_planner = @import("../build/impact_planner.zig");
 const external_source_manifest = @import("../build/external_source_manifest.zig");
+const external_metadata = @import("../build/external_publication_metadata.zig");
 const publication_plan = @import("../build/publication_plan.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
@@ -594,8 +595,12 @@ pub const CatalogService = struct {
         const pending_materialization_rebuild =
             pending_materialization_families.any() or
             (!head_republish_recommended and
-                (plan.artifact_actions.any() or plan.derived_output_actions.any()));
-        const graph_metric_readiness = try graphMetricReadinessAlloc(
+                hasPendingMaterialization(plan, published_head.manifest));
+        const graph_metric_readiness: GraphMetricReadiness = if (plan.external_materialization) |external| .{
+            .configured = external.graph_metrics_configured,
+            .pending = external.graph_metrics_pending,
+            .rejected = external.graph_metrics_rejected,
+        } else try graphMetricReadinessAlloc(
             self.alloc,
             published_head.manifest,
             plan.table_definition.indexes_json,
@@ -1162,7 +1167,7 @@ pub const CatalogService = struct {
                     null;
                 errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
-                return .{
+                var plan: publication_plan.TablePublicationPlan = .{
                     .targets = targets,
                     .policy = effective_policy,
                     .table_definition = table_definition,
@@ -1175,6 +1180,8 @@ pub const CatalogService = struct {
                     .graph_index_actions = graph_index_actions,
                     .derived_output_actions = derived_output_actions,
                 };
+                if (external_binding != null) try applyExternalReadinessAlloc(self.alloc, &plan, manifest);
+                return plan;
             }
 
             const full_text_index_actions = try planFullTextIndexActionsAlloc(
@@ -1222,7 +1229,7 @@ pub const CatalogService = struct {
                 null;
             errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
-            return .{
+            var plan: publication_plan.TablePublicationPlan = .{
                 .targets = targets,
                 .policy = effective_policy,
                 .table_definition = table_definition,
@@ -1252,6 +1259,8 @@ pub const CatalogService = struct {
                 .sparse_index_actions = sparse_index_actions,
                 .graph_index_actions = graph_index_actions,
             };
+            if (external_binding != null) try applyExternalReadinessAlloc(self.alloc, &plan, null);
+            return plan;
         }
         return .{
             .targets = .{
@@ -1313,6 +1322,72 @@ pub const CatalogService = struct {
         return try self.store.setPolicy(namespace, policy);
     }
 };
+
+/// Status and publication share the same metadata-only external reconciliation.
+/// Managed namespace adjacency aliases never stand in for external projections.
+fn applyExternalReadinessAlloc(alloc: Allocator, plan: *publication_plan.TablePublicationPlan, current: ?manifest_mod.Manifest) !void {
+    var reconciliation = try external_metadata.planAlloc(alloc, current, plan.*);
+    defer reconciliation.deinit(alloc);
+    for (plan.full_text_index_actions) |*entry| {
+        entry.action = reconciliation.action(.text_segment, entry.name);
+    }
+    inline for (.{ .{ "vector_index_actions", manifest_mod.ArtifactKind.vector_segment }, .{ "sparse_index_actions", manifest_mod.ArtifactKind.sparse_segment }, .{ "graph_index_actions", manifest_mod.ArtifactKind.graph_segment } }) |field| {
+        for (@field(plan, field[0])) |*entry| {
+            entry.action = reconciliation.action(field[1], entry.name);
+        }
+    }
+    plan.artifact_actions = .{
+        .document_segment = .reuse,
+        .full_text = reconciliation.familyAction(.text_segment),
+        .dense_vector = reconciliation.familyAction(.vector_segment),
+        .sparse_vector = reconciliation.familyAction(.sparse_segment),
+        .graph = reconciliation.familyAction(.graph_segment),
+    };
+    // External row sources do not run the managed document enrichment queue.
+    // Its policy defaults must not invent chunk/rerank recomputations here;
+    // the external dependency planner owns sidecar readiness instead.
+    plan.derived_output_actions = .{};
+    // Validate metric readiness against the compatible retained graph, not a
+    // same-named old projection which metadata publication would discard.
+    var retained_manifest = current;
+    if (retained_manifest) |*manifest| manifest.artifacts = reconciliation.retained_refs;
+    const metrics_ready = try graphMetricReadinessAlloc(alloc, retained_manifest, plan.table_definition.indexes_json);
+    plan.external_materialization = .{
+        .pending = reconciliation.hasOutstandingWork() or metrics_ready.pending != 0,
+        .graph_metrics_configured = metrics_ready.configured,
+        .graph_metrics_pending = metrics_ready.pending,
+        .graph_metrics_rejected = metrics_ready.rejected,
+    };
+}
+
+/// Actions describe intended publication; a declarative drop is outstanding
+/// work only while there is something to remove. Keep this separate from
+/// ArtifactActions.any(), which is also used as an execution summary.
+fn hasPendingMaterialization(plan: publication_plan.TablePublicationPlan, current: ?manifest_mod.Manifest) bool {
+    if (plan.external_materialization) |external| {
+        if (external.pending) return true;
+    } else {
+        inline for (.{ .{ "document_segment", manifest_mod.ArtifactKind.document_segment }, .{ "full_text", manifest_mod.ArtifactKind.text_segment }, .{ "dense_vector", manifest_mod.ArtifactKind.vector_segment }, .{ "sparse_vector", manifest_mod.ArtifactKind.sparse_segment }, .{ "graph", manifest_mod.ArtifactKind.graph_segment } }) |field| {
+            switch (@field(plan.artifact_actions, field[0])) {
+                .rebuild => return true,
+                .drop => if (current) |manifest| {
+                    if (findManifestArtifactIndex(manifest, field[1]) != null) return true;
+                },
+                .reuse => {},
+            }
+        }
+    }
+    inline for (.{ "chunk_preview", "chunk_embeddings", "rerank_terms" }) |field| {
+        switch (@field(plan.derived_output_actions, field)) {
+            .recompute => return true,
+            .drop => if (current) |manifest| {
+                if (manifest.stats.derived_outputs.containsKind(@field(search_sources.DerivedOutputKind, field))) return true;
+            },
+            .reuse => {},
+        }
+    }
+    return false;
+}
 
 fn cloneFullTextIndexActionsAlloc(
     alloc: Allocator,
@@ -2068,7 +2143,8 @@ fn planFullTextIndexActionsAlloc(
             .document_plus_artifact
         else
             .document;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = action,
             .source_mode = source_mode,
@@ -2080,7 +2156,8 @@ fn planFullTextIndexActionsAlloc(
     while (before_it.next()) |entry| {
         if (!isFullTextIndexValue(entry.value_ptr.*)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = .drop,
             .source_mode = if (hasFullTextSourceArtifact(entry.value_ptr.*)) .artifact_only else .document,
@@ -5378,6 +5455,96 @@ test "serverless catalog service fails closed for current external binding witho
     );
 }
 
+test "serverless external readiness shares exact publication bindings and actual presence" {
+    const a = std.testing.allocator;
+    var current = try external_metadata.testing.fixtureAlloc(a, 16384);
+    defer current.deinit(a);
+    for (current.artifacts) |*ref| {
+        if (ref.kind == .graph_metric_segment) ref.materializer_fingerprint = graph_metric_policy.materializerFingerprint(.{});
+    }
+    const Helpers = struct {
+        fn plan(alloc: Allocator, manifest: manifest_mod.Manifest, indexes: []const u8) !publication_plan.TablePublicationPlan {
+            var out = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
+            errdefer out.deinit(alloc);
+            out.policy = manifest.stats.policy;
+            out.table_definition = try publication_plan.tableDefinitionSnapshotAlloc(alloc, manifest.stats.schema_json, manifest.stats.read_schema_json, indexes);
+            out.full_text_index_actions = try planFullTextIndexActionsAlloc(alloc, manifest.stats.schema_json, manifest.stats.schema_json, manifest.stats.indexes_json, indexes);
+            out.vector_index_actions = try planNamedIndexActionsAlloc(alloc, manifest.stats.indexes_json, indexes, .vector, countManifestArtifactsOfKind(manifest, .vector_segment));
+            out.graph_index_actions = try planNamedIndexActionsAlloc(alloc, manifest.stats.indexes_json, indexes, .graph, countManifestArtifactsOfKind(manifest, .graph_segment));
+            try applyExternalReadinessAlloc(alloc, &out, manifest);
+            return out;
+        }
+    };
+    var ready = try Helpers.plan(a, current, current.stats.indexes_json);
+    defer ready.deinit(a);
+    try std.testing.expect(!hasPendingMaterialization(ready, current));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.full_text_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.vector_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, ready.graph_index_actions[0].action);
+    try std.testing.expectEqual(@as(usize, 0), ready.external_materialization.?.graph_metrics_pending);
+    ready.policy.chunk_preview_enabled = true;
+    ready.policy.chunk_embeddings_enabled = true;
+    ready.policy.rerank_terms_enabled = true;
+    ready.derived_output_actions = .{ .chunk_preview = .recompute, .chunk_embeddings = .recompute, .rerank_terms = .recompute };
+    try applyExternalReadinessAlloc(a, &ready, current);
+    try std.testing.expect(!hasPendingMaterialization(ready, current));
+    try std.testing.expect(!ready.derived_output_actions.any());
+
+    // Metadata can be current while individual physical indexes are missing.
+    // Another graph projection must not satisfy the newly configured graph.
+    const changed = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"other\"},\"vec\":{\"type\":\"embeddings\",\"field\":\"other_vector\",\"dimension\":3},\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\"},\"g2\":{\"type\":\"graph\",\"field\":\"other_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
+    var changing = try Helpers.plan(a, current, changed);
+    defer changing.deinit(a);
+    var metadata_only = try external_metadata.reconcileAlloc(a, current, changing);
+    defer metadata_only.deinit(a);
+    var missing = try Helpers.plan(a, metadata_only, changed);
+    defer missing.deinit(a);
+    try std.testing.expect(hasPendingMaterialization(missing, metadata_only));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.full_text_index_actions[0].action);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.vector_index_actions[0].action);
+    for (missing.graph_index_actions) |entry| {
+        try std.testing.expectEqual(if (std.mem.eql(u8, entry.name, "graph_idx")) publication_plan.ArtifactAction.reuse else .rebuild, entry.action);
+    }
+    try std.testing.expectEqual(publication_plan.ArtifactAction.rebuild, missing.artifact_actions.graph);
+    try std.testing.expectEqual(@as(usize, 1), missing.external_materialization.?.graph_metrics_pending);
+
+    var dropping = try Helpers.plan(a, current, "{}");
+    defer dropping.deinit(a);
+    try std.testing.expect(hasPendingMaterialization(dropping, current));
+    var empty = try external_metadata.reconcileAlloc(a, current, dropping);
+    defer empty.deinit(a);
+    var converged = try Helpers.plan(a, empty, "{}");
+    defer converged.deinit(a);
+    try std.testing.expect(!hasPendingMaterialization(converged, empty));
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, converged.artifact_actions.graph);
+
+    const AllocationExercise = struct {
+        fn run(alloc: Allocator, manifest: manifest_mod.Manifest, indexes: []const u8) !void {
+            var plan = try Helpers.plan(alloc, manifest, indexes);
+            defer plan.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
+    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
+}
+
+test "serverless materialization readiness distinguishes absent drops from real work" {
+    var plan = publication_plan.TablePublicationPlan{
+        .targets = .{ .published_search_sources = .{} },
+        .artifact_actions = .{ .document_segment = .reuse, .full_text = .reuse, .dense_vector = .drop, .sparse_vector = .drop, .graph = .drop },
+        .derived_output_actions = .{ .chunk_preview = .drop, .chunk_embeddings = .drop, .rerank_terms = .drop },
+    };
+    try std.testing.expect(!hasPendingMaterialization(plan, null));
+    var current = try external_metadata.testing.fixtureAlloc(std.testing.allocator, 1);
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expect(hasPendingMaterialization(plan, current));
+    plan.artifact_actions.dense_vector = .reuse;
+    plan.artifact_actions.graph = .reuse;
+    try std.testing.expect(!hasPendingMaterialization(plan, current));
+    plan.derived_output_actions.chunk_preview = .recompute;
+    try std.testing.expect(hasPendingMaterialization(plan, current));
+}
+
 test "serverless catalog status stays local and write admission rejects read-only external tables" {
     const alloc = std.testing.allocator;
     const current_schema =
@@ -5422,7 +5589,9 @@ test "serverless catalog status stays local and write admission rejects read-onl
     defer initial_targets.deinit(alloc);
     try std.testing.expect(initial_targets.targets.published_search_sources.findText() == null);
     try std.testing.expect(!initial_targets.targets.include_graph);
-    try std.testing.expectEqual(publication_plan.ArtifactAction.drop, initial_targets.artifact_actions.full_text);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, initial_targets.artifact_actions.full_text);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, initial_targets.artifact_actions.document_segment);
+    try std.testing.expect(!initial_targets.external_materialization.?.pending);
 
     var status = try catalog.tableBuildStatus("events");
     defer status.deinit(alloc);
@@ -5495,6 +5664,11 @@ test "serverless catalog status stays local and write admission rejects read-onl
     var metadata_unchanged = try catalog.buildTable("events");
     defer metadata_unchanged.deinit(alloc);
     try std.testing.expect(!metadata_unchanged.published);
+    var converged_status = try catalog.tableBuildStatus("events");
+    defer converged_status.deinit(alloc);
+    try std.testing.expect(!converged_status.head_republish_recommended);
+    try std.testing.expect(!converged_status.pending_materialization_rebuild);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, converged_status.artifact_actions.document_segment);
 
     const graph_indexes = "{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\"}}}}";
     try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", graph_indexes));
@@ -5520,7 +5694,8 @@ test "serverless catalog status stays local and write admission rejects read-onl
         defer target_plan.deinit(alloc);
         try std.testing.expect(target_plan.targets.published_search_sources.findText() == null);
         try std.testing.expectEqual(case.graph, target_plan.targets.include_graph);
-        try std.testing.expectEqual(publication_plan.ArtifactAction.drop, target_plan.artifact_actions.full_text);
+        try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, target_plan.artifact_actions.full_text);
+        try std.testing.expectEqual(case.graph, target_plan.external_materialization.?.pending);
     }
 }
 

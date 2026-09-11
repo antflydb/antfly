@@ -25,15 +25,77 @@ const metric_segment = @import("../graph_metric_segment/mod.zig");
 const metric_kernel = @import("lake_graph_metric.zig");
 const artifacts = @import("../artifacts/mod.zig");
 const sources = @import("../search_sources.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
 
-/// The caller has already established that the complete external source
-/// descriptor is unchanged and protected the current HEAD with a read lease.
-/// External inventory refs are deliberately omitted; the caller attaches the
-/// freshly resolved inventory plan after reconciling its logical names.
-pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publication.TablePublicationPlan) !manifests.Manifest {
-    const descriptor = current.base_source orelse return error.InvalidExternalSourceManifestPlan;
+pub const NamedAction = struct {
+    kind: manifests.ArtifactKind,
+    name: []const u8,
+    action: publication.ArtifactAction,
+};
+
+/// Owns planning storage and aliases, but borrows current artifact identities.
+/// The source manifest must outlive this plan. No manifest/payload clone or
+/// remote discovery is required to inspect readiness.
+pub const ReconciliationPlan = struct {
+    retained_refs: []manifests.ArtifactRef,
+    desired_actions: []NamedAction,
+    removed: []NamedAction,
+    desired: lake.DesiredArtifactSet,
+    alias_names: [][]u8,
+
+    pub fn deinit(self: *ReconciliationPlan, alloc: Allocator) void {
+        alloc.free(self.retained_refs);
+        alloc.free(self.desired_actions);
+        alloc.free(self.removed);
+        self.desired.deinit(alloc);
+        for (self.alias_names) |name| alloc.free(name);
+        alloc.free(self.alias_names);
+        self.* = undefined;
+    }
+
+    pub fn action(self: ReconciliationPlan, kind: manifests.ArtifactKind, name: []const u8) publication.ArtifactAction {
+        for (self.desired_actions) |item| if (item.kind == kind and std.mem.eql(u8, item.name, name)) return item.action;
+        for (self.removed) |item| if (item.kind == kind and std.mem.eql(u8, item.name, name)) return .drop;
+        return .reuse;
+    }
+
+    pub fn familyAction(self: ReconciliationPlan, kind: manifests.ArtifactKind) publication.ArtifactAction {
+        for (self.desired_actions) |item| if (item.kind == kind and item.action == .rebuild) return .rebuild;
+        for (self.desired_actions) |item| if (item.kind == kind) return .reuse;
+        for (self.removed) |item| if (item.kind == kind) return .drop;
+        return .reuse;
+    }
+
+    pub fn pendingWork(self: ReconciliationPlan) bool {
+        if (self.removed.len != 0) return true;
+        for (self.desired_actions) |item| if (item.action == .rebuild) return true;
+        return false;
+    }
+
+    pub fn hasOutstandingWork(self: ReconciliationPlan) bool {
+        return self.pendingWork();
+    }
+};
+
+/// Compare explicit desired work with the current immutable snapshot without
+/// discovering a remote source. Changed catalog source bindings invalidate old
+/// sidecars. Publication callers additionally pin and verify resolved source
+/// identity; external inventory refs remain resolver-owned and are omitted.
+pub fn planAlloc(alloc: Allocator, maybe_current: ?manifests.Manifest, plan: publication.TablePublicationPlan) !ReconciliationPlan {
+    const current = maybe_current orelse return bootstrapPlanAlloc(alloc, plan);
+    const descriptor = current.base_source orelse return bootstrapPlanAlloc(alloc, plan);
+    switch (descriptor) {
+        .external_parquet, .external_iceberg, .external_lance => {},
+        else => return bootstrapPlanAlloc(alloc, plan),
+    }
     var binding = try publication.externalBindingFromSchemaJsonAlloc(alloc, current.stats.schema_json);
     defer if (binding) |*value| value.deinit(alloc);
+    var desired_binding = try publication.externalBindingFromSchemaJsonAlloc(alloc, plan.table_definition.schema_json);
+    defer if (desired_binding) |*value| value.deinit(alloc);
+    const compatible_source = bindingsIdentifySameSource(
+        if (binding) |value| value.binding else null,
+        if (desired_binding) |value| value.binding else null,
+    );
     // Real inventory publication persists the external table ID in schema.
     // The namespace fallback is for direct library publications with no schema;
     // it is used only to compare before/after metadata, never to hydrate rows.
@@ -57,10 +119,11 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
         .read_schema_json = plan.table_definition.read_schema_json,
         .indexes_json = plan.table_definition.indexes_json,
     });
-    defer after.deinit(alloc);
+    errdefer after.deinit(alloc);
     var published = std.ArrayListUnmanaged(lake.PublishedArtifact).empty;
     defer published.deinit(alloc);
     for (current.artifacts) |ref| {
+        if (!compatible_source) break;
         const previous = before.find(ref.name) orelse continue;
         if (previous.kind != ref.kind) continue;
         try published.append(alloc, .{ .name = ref.name, .binding = previous.binding, .artifact = ref });
@@ -70,10 +133,12 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
     var retained = std.ArrayListUnmanaged(manifests.ArtifactRef).empty;
     defer retained.deinit(alloc);
     var alias_names = std.ArrayListUnmanaged([]u8).empty;
-    defer {
+    errdefer {
         for (alias_names.items) |name| alloc.free(name);
         alias_names.deinit(alloc);
     }
+    var actions = std.ArrayListUnmanaged(NamedAction).empty;
+    defer actions.deinit(alloc);
     for (current.artifacts) |ref| {
         const keep = switch (ref.kind) {
             .external_base_source, .graph_metric_segment => false,
@@ -93,7 +158,7 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
             // An external generation must not acquire managed source state.
             .document_segment, .document_facts, .mutation_segment => false,
         };
-        if (keep) try retained.append(alloc, ref);
+        if (keep and compatible_source) try retained.append(alloc, ref);
     }
     // A logical graph alias does not change its normalized projection. Reuse
     // the same physical graph under the new name using the lake planner's
@@ -108,12 +173,20 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
             break;
         }
     }
+    for (after.artifacts) |desired| try actions.append(alloc, .{
+        .kind = desired.kind,
+        .name = desired.name,
+        .action = if (find(retained.items, desired.kind, desired.name) != null) .reuse else .rebuild,
+    });
     const configured_metrics = try metrics.parseIndexSpecsAlloc(alloc, plan.table_definition.indexes_json);
     defer metrics.freeIndexSpecs(alloc, configured_metrics);
     const reuse_rejections = try rejectionPlanUnchanged(alloc, configured_metrics, retained.items, current.artifacts);
     for (configured_metrics) |spec| {
-        const graph = find(retained.items, .graph_segment, spec.index_name) orelse continue;
-        const digest = artifacts.sha256DigestFromChecksum(graph.checksum) catch continue;
+        const graph = find(retained.items, .graph_segment, spec.index_name);
+        const digest = if (graph) |ref| digest: {
+            artifacts.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum) catch break :digest null;
+            break :digest artifacts.sha256DigestFromChecksum(ref.checksum) catch null;
+        } else null;
         for (spec.configs) |config| {
             const name = try metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
             alias_names.append(alloc, name) catch |err| {
@@ -124,8 +197,9 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
             // identical graph and normalized metric configuration.
             var selected: ?manifests.ArtifactRef = null;
             for (current.artifacts) |ref| {
+                const source_digest = digest orelse break;
                 if (ref.kind != .graph_metric_segment or ref.metadata_version != metric_segment.wire_version or
-                    !std.mem.eql(u8, &digest, &ref.graph_metric_source_checksum) or
+                    !std.mem.eql(u8, &source_digest, &ref.graph_metric_source_checksum) or
                     ref.graph_metric_config_fingerprint != metric_kernel.configFingerprint(config)) continue;
                 if (ref.graph_metric_materialization_state == .rejected and !reuse_rejections) continue;
                 selected = ref;
@@ -136,13 +210,102 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
                 alias.name = name;
                 try retained.append(alloc, alias);
             }
+            const current_materializer = if (selected) |ref| ref.materializer_fingerprint == metric_kernel.materializerFingerprint(.{}) and
+                ref.graph_metric_control_len != 0 and ref.graph_metric_routing_footer_len != 0 else false;
+            try actions.append(alloc, .{ .kind = .graph_metric_segment, .name = name, .action = if (current_materializer) .reuse else .rebuild });
         }
     }
+
+    var removed = std.ArrayListUnmanaged(NamedAction).empty;
+    defer removed.deinit(alloc);
+    for (current.artifacts) |ref| {
+        if (!isSidecar(ref.kind) or find(retained.items, ref.kind, ref.name) != null) continue;
+        const still_desired = for (actions.items) |item| {
+            if (item.kind == ref.kind and std.mem.eql(u8, item.name, ref.name)) break true;
+        } else false;
+        if (!still_desired) try removed.append(alloc, .{ .kind = ref.kind, .name = ref.name, .action = .drop });
+    }
+    const owned_retained = try retained.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_retained);
+    const owned_actions = try actions.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_actions);
+    const owned_removed = try removed.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_removed);
+    const owned_aliases = try alias_names.toOwnedSlice(alloc);
+    return .{ .retained_refs = owned_retained, .desired_actions = owned_actions, .removed = owned_removed, .desired = after, .alias_names = owned_aliases };
+}
+
+fn bootstrapPlanAlloc(alloc: Allocator, plan: publication.TablePublicationPlan) !ReconciliationPlan {
+    var owned_binding = (try publication.externalBindingFromSchemaJsonAlloc(alloc, plan.table_definition.schema_json)) orelse return error.InvalidExternalSourceManifestPlan;
+    defer owned_binding.deinit(alloc);
+    const binding = owned_binding.binding;
+    // This descriptor only derives declared build dependencies; it never
+    // escapes as a publication or authorizes a remote read. Discovery is the
+    // publication resolver's responsibility, not catalog status's.
+    var desired = try lake.desiredArtifactsFromTableDefinitionAlloc(alloc, .{
+        .source_kind = binding.rowSourceKind(),
+        .source_id = binding.table_id,
+        .snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse "unresolved-status-snapshot",
+        .schema_fingerprint = binding.schema_fingerprint,
+    }, .{
+        .table_name = binding.table_id,
+        .schema_json = plan.table_definition.schema_json,
+        .read_schema_json = plan.table_definition.read_schema_json,
+        .indexes_json = plan.table_definition.indexes_json,
+    });
+    errdefer desired.deinit(alloc);
+    var actions = std.ArrayListUnmanaged(NamedAction).empty;
+    defer actions.deinit(alloc);
+    for (desired.artifacts) |item| try actions.append(alloc, .{ .kind = item.kind, .name = item.name, .action = .rebuild });
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    const specs = try metrics.parseIndexSpecsAlloc(alloc, plan.table_definition.indexes_json);
+    defer metrics.freeIndexSpecs(alloc, specs);
+    for (specs) |spec| for (spec.configs) |config| {
+        try names.ensureUnusedCapacity(alloc, 1);
+        const name = try metric_segment.artifactNameAlloc(alloc, spec.index_name, config.name);
+        names.appendAssumeCapacity(name);
+        try actions.append(alloc, .{ .kind = .graph_metric_segment, .name = name, .action = .rebuild });
+    };
+    const owned_actions = try actions.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_actions);
+    const owned_names = try names.toOwnedSlice(alloc);
+    return .{ .retained_refs = &.{}, .removed = &.{}, .desired_actions = owned_actions, .desired = desired, .alias_names = owned_names };
+}
+
+fn isSidecar(kind: manifests.ArtifactKind) bool {
+    return switch (kind) {
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .algebraic_segment, .graph_metric_segment, .doc_values, .stored_fields => true,
+        else => false,
+    };
+}
+
+fn bindingsIdentifySameSource(before: ?external_binding.Binding, after: ?external_binding.Binding) bool {
+    if (before == null or after == null) return before == null and after == null;
+    const a = before.?;
+    const b = after.?;
+    if (a.format != b.format or a.write_policy != b.write_policy or
+        !std.mem.eql(u8, a.table_id, b.table_id) or !std.mem.eql(u8, a.source_uri, b.source_uri) or
+        !std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint) or
+        std.meta.activeTag(a.snapshot_mode) != std.meta.activeTag(b.snapshot_mode)) return false;
+    return switch (a.snapshot_mode) {
+        .current => true,
+        .snapshot_id => |value| std.mem.eql(u8, value, b.snapshot_mode.snapshot_id),
+        .object_version_digest => |value| std.mem.eql(u8, value, b.snapshot_mode.object_version_digest),
+    };
+}
+
+pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publication.TablePublicationPlan) !manifests.Manifest {
+    var reconciliation = try planAlloc(alloc, current, plan);
+    defer reconciliation.deinit(alloc);
 
     // Clone only retained refs and new metadata, not a complete old manifest
     // followed by a second set of allocations to replace discarded fields.
     var template = current;
-    template.artifacts = retained.items;
+    template.artifacts = reconciliation.retained_refs;
     template.stats.published_search_sources = .{};
     template.stats.policy = plan.policy;
     template.stats.schema_json = plan.table_definition.schema_json;
@@ -150,11 +313,11 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
     template.stats.indexes_json = plan.table_definition.indexes_json;
     var result = try manifests.cloneManifest(alloc, template);
     errdefer result.deinit(alloc);
-    result.stats.published_search_sources = try filterSourcesAlloc(alloc, current.stats.published_search_sources, retained.items);
-    result.stats.text_segment_count = count(retained.items, .text_segment);
-    result.stats.vector_segment_count = count(retained.items, .vector_segment);
-    result.stats.sparse_segment_count = count(retained.items, .sparse_segment);
-    result.stats.graph_segment_count = count(retained.items, .graph_segment);
+    result.stats.published_search_sources = try filterSourcesAlloc(alloc, current.stats.published_search_sources, reconciliation.retained_refs);
+    result.stats.text_segment_count = count(reconciliation.retained_refs, .text_segment);
+    result.stats.vector_segment_count = count(reconciliation.retained_refs, .vector_segment);
+    result.stats.sparse_segment_count = count(reconciliation.retained_refs, .sparse_segment);
+    result.stats.graph_segment_count = count(reconciliation.retained_refs, .graph_segment);
     return result;
 }
 
@@ -258,6 +421,7 @@ pub const testing = struct {
         defer metrics.freeIndexSpecs(alloc, specs);
         for (result.artifacts) |*ref| {
             if (ref.kind != .graph_metric_segment) continue;
+            ref.materializer_fingerprint = metric_kernel.materializerFingerprint(.{});
             const name = try metric_segment.parseArtifactName(ref.name);
             for (specs[0].configs) |config| if (std.mem.eql(u8, config.name, name.metric_name)) {
                 ref.graph_metric_config_fingerprint = metric_kernel.configFingerprint(config);
@@ -424,4 +588,101 @@ test "serverless external metadata removes an explicit default-named full text i
     defer repeated.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), repeated.artifacts.len);
     try std.testing.expect(repeated.stats.published_search_sources.findText() == null);
+}
+
+test "serverless external metadata plan reports exact named work and converges after real removals" {
+    const a = std.testing.allocator;
+    var current = try testing.fixtureAlloc(a, 16384);
+    defer current.deinit(a);
+    var table: publication.TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = .{} },
+        .table_definition = .{ .indexes_json = @constCast(testing.indexes) },
+    };
+    var stable = try planAlloc(a, current, table);
+    defer stable.deinit(a);
+    try std.testing.expect(!stable.pendingWork());
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, stable.familyAction(.document_segment));
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, stable.familyAction(.algebraic_segment));
+    for (stable.desired_actions) |item| try std.testing.expectEqual(publication.ArtifactAction.reuse, item.action);
+
+    table.table_definition.indexes_json = @constCast("{\"graph_alias\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree_alias\":{\"kind\":\"degree\"}}}}");
+    var alias = try planAlloc(a, current, table);
+    defer alias.deinit(a);
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, alias.action(.graph_segment, "graph_alias"));
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, alias.action(.graph_metric_segment, "11:graph_alias12:degree_alias"));
+    try std.testing.expectEqual(publication.ArtifactAction.drop, alias.familyAction(.text_segment));
+    try std.testing.expect(alias.pendingWork()); // Old logical names really disappear.
+    var published_alias = try reconcileAlloc(a, current, table);
+    defer published_alias.deinit(a);
+    var converged = try planAlloc(a, published_alias, table);
+    defer converged.deinit(a);
+    try std.testing.expect(!converged.pendingWork());
+
+    table.table_definition.indexes_json = @constCast("{\"graph_alias\":{\"type\":\"graph\",\"field\":\"other_edges\",\"metrics\":{\"degree_alias\":{\"kind\":\"degree\"}}}}");
+    var changed = try planAlloc(a, published_alias, table);
+    defer changed.deinit(a);
+    try std.testing.expectEqual(publication.ArtifactAction.rebuild, changed.action(.graph_segment, "graph_alias"));
+    try std.testing.expectEqual(publication.ArtifactAction.rebuild, changed.action(.graph_metric_segment, "11:graph_alias12:degree_alias"));
+    try std.testing.expect(changed.pendingWork());
+    try std.testing.expectEqual(@as(usize, 0), changed.removed.len);
+
+    table.table_definition.indexes_json = @constCast("{}");
+    var deleted = try reconcileAlloc(a, current, table);
+    defer deleted.deinit(a);
+    var empty = try planAlloc(a, deleted, table);
+    defer empty.deinit(a);
+    try std.testing.expect(!empty.pendingWork());
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, empty.familyAction(.text_segment));
+    try std.testing.expectEqual(publication.ArtifactAction.reuse, empty.familyAction(.graph_segment));
+}
+
+test "serverless external metadata plan handles bootstrap source changes and terminal rejections without payload IO" {
+    const a = std.testing.allocator;
+    const schema = "{\"base_source\":{\"kind\":\"external\",\"table_id\":\"docs\",\"format\":\"parquet\",\"uri\":\"s3://warehouse/docs\",\"snapshot\":\"current\",\"schema_fingerprint\":\"schema-v3\"}}";
+    var table: publication.TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = .{} },
+        .table_definition = .{ .schema_json = @constCast(schema), .indexes_json = @constCast("{}") },
+    };
+    var empty = try planAlloc(a, null, table);
+    defer empty.deinit(a);
+    try std.testing.expect(!empty.pendingWork());
+    table.table_definition.indexes_json = @constCast("{\"alg\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"count_by_tenant\",\"op\":\"count\",\"group_by\":[\"tenant\"]}]}}");
+    var algebraic = try planAlloc(a, null, table);
+    defer algebraic.deinit(a);
+    try std.testing.expect(algebraic.pendingWork());
+    try std.testing.expectEqual(publication.ArtifactAction.rebuild, algebraic.action(.algebraic_segment, "alg.count_by_tenant"));
+
+    var fixture = try testing.fixtureAlloc(a, 12);
+    defer fixture.deinit(a);
+    var current = fixture;
+    current.stats.schema_json = @constCast(schema);
+    table.table_definition.indexes_json = @constCast(testing.indexes);
+    for (fixture.artifacts) |*ref| if (ref.kind == .graph_metric_segment) {
+        ref.graph_metric_materialization_state = .rejected;
+        ref.graph_metric_rejection_reason = .build_budget_exceeded;
+    };
+    var rejected = try planAlloc(a, current, table);
+    defer rejected.deinit(a);
+    try std.testing.expect(!rejected.pendingWork());
+    for (fixture.artifacts) |*ref| if (ref.kind == .graph_metric_segment) {
+        ref.graph_metric_materialization_state = .ready;
+        ref.graph_metric_rejection_reason = .none;
+        ref.materializer_fingerprint ^= 1;
+    };
+    var stale_policy = try planAlloc(a, current, table);
+    defer stale_policy.deinit(a);
+    try std.testing.expect(stale_policy.pendingWork());
+    try std.testing.expectEqual(publication.ArtifactAction.rebuild, stale_policy.familyAction(.graph_metric_segment));
+    table.table_definition.schema_json = @constCast("{\"base_source\":{\"kind\":\"external\",\"table_id\":\"docs\",\"format\":\"parquet\",\"uri\":\"s3://warehouse/replaced\",\"snapshot\":\"current\",\"schema_fingerprint\":\"schema-v3\"}}");
+    var moved = try planAlloc(a, current, table);
+    defer moved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), moved.retained_refs.len);
+    for (moved.desired_actions) |item| try std.testing.expectEqual(publication.ArtifactAction.rebuild, item.action);
+    const Exercise = struct {
+        fn run(alloc: Allocator, input: publication.TablePublicationPlan) !void {
+            var result = try planAlloc(alloc, null, input);
+            defer result.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{table});
 }
