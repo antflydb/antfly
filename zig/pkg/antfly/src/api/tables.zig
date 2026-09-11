@@ -701,6 +701,40 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
 
 /// Content-addressed immutable definition projections. Runtime coverage and
 /// counters are deliberately excluded and merged from each fresh observation.
+// Clone only the final wire projection into its owning arena. Generated JSON
+// parsers and capability aggregation allocate intermediate trees and indexes;
+// retaining those would make cache capacity depend on parser implementation.
+fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) !T {
+    if (T == std.json.Value) return cloneJsonValueAlloc(alloc, value);
+    return switch (@typeInfo(T)) {
+        .optional => |info| if (value) |item| try cloneSchemaProjection(info.child, alloc, item) else null,
+        .pointer => |info| blk: {
+            if (info.size != .slice) @compileError("schema projection must contain owned slices");
+            const out = try alloc.alloc(info.child, value.len);
+            for (value, out) |item, *dest| dest.* = try cloneSchemaProjection(info.child, alloc, item);
+            break :blk out;
+        },
+        .@"struct" => |info| blk: {
+            if (@hasField(T, "map")) {
+                var out: T = .{};
+                try out.map.ensureTotalCapacity(alloc, value.map.count());
+                var it = value.map.iterator();
+                while (it.next()) |item| {
+                    out.map.putAssumeCapacity(try alloc.dupe(u8, item.key_ptr.*), try cloneSchemaProjection(@TypeOf(item.value_ptr.*), alloc, item.value_ptr.*));
+                }
+                break :blk out;
+            }
+            var out: T = undefined;
+            inline for (info.fields) |field| @field(out, field.name) = try cloneSchemaProjection(field.type, alloc, @field(value, field.name));
+            break :blk out;
+        },
+        .@"union" => switch (value) {
+            inline else => |item, tag| @unionInit(T, @tagName(tag), try cloneSchemaProjection(@TypeOf(item), alloc, item)),
+        },
+        else => value,
+    };
+}
+
 /// Content-addressed schemas only: table-specific index incarnations and runtime
 /// status are read afresh. Compiler scratch never consumes the retained budget.
 pub const DefinitionCache = struct {
@@ -759,10 +793,10 @@ pub const DefinitionCache = struct {
                 .alloc = alloc,
                 .arena = arena,
                 .key = key,
-                .schema = try parseOptionalTableSchema(a, table.schema_json),
-                .read_schema = if (table.read_schema_json.len > 0) try parseTableSchema(a, table.read_schema_json) else null,
+                .schema = try cloneSchemaProjection(?schema_openapi.TableSchema, a, try parseOptionalTableSchema(temporary, table.schema_json)),
+                .read_schema = if (table.read_schema_json.len > 0) try cloneSchemaProjection(schema_openapi.TableSchema, a, try parseTableSchema(temporary, table.read_schema_json)) else null,
                 .declared = declared,
-                .capabilities = if (declared) |caps| try generatedFieldCapabilitiesFromSchema(a, caps, null) else null,
+                .capabilities = if (declared) |caps| try cloneSchemaProjection([]const metadata_openapi.FieldCapability, a, try generatedFieldCapabilitiesFromSchema(temporary, caps, null)) else null,
             };
             // Entry fields above can grow the local arena after its first copy.
             entry.arena = arena;
@@ -6053,4 +6087,22 @@ test "system catalog schema cache releases partial compilation on allocation fai
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "system catalog wide schema cache retained budget" {
+    const alloc = std.testing.allocator;
+    var properties: std.ArrayListUnmanaged(u8) = .empty;
+    defer properties.deinit(alloc);
+    for (0..200) |i| {
+        const field = try std.fmt.allocPrint(alloc, "{s}\"field_{d}\":{{\"type\":\"string\"}}", .{ if (i == 0) "" else ",", i });
+        defer alloc.free(field);
+        try properties.appendSlice(alloc, field);
+    }
+    const schema = try std.fmt.allocPrint(alloc, "{{\"document_schemas\":{{\"doc\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{{s}}}}}}}}}}}", .{properties.items});
+    defer alloc.free(schema);
+    const entry = try DefinitionCache.Entry.create(alloc, @splat(0), &.{ .table_id = 1, .name = "wide", .schema_json = schema });
+    defer entry.release();
+    // Leave room for at least 100 independently evolved 200-field schemas
+    // within the retained budget; parser scratch must not count as cache data.
+    try std.testing.expect(entry.size() <= 512 * 1024);
 }

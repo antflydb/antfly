@@ -161,4 +161,21 @@ pub fn main() !void {
         }
         std.debug.print("tenants={d} listing_scan_ms={d:.3} listing_indexed_ms={d:.3} rename_rebuild_ms={d:.3} rename_indexed_us={d:.3}\n", .{ n, median(&scan_listing) / 1e6, median(&indexed_listing) / 1e6, median(&rebuilt_plan) / 1e6, median(&indexed_plan) / lookups / 1e3 });
     }
+    // Repeated tenant offboarding must retain memory for live parents only.
+    var churn = try catalog.MutableState.clone(alloc, .{});
+    defer churn.deinit();
+    for (0..10000) |i| {
+        for ([_]catalog.Action{ .create, .drop }) |action| {
+            var delta = try catalog.planWithReader(alloc, catalog.MemoryReader{ .index = &churn.index, .tables = &.{} }, churn.value.next_id, .{ .kind = .database, .action = action, .name = "ephemeral" });
+            defer delta.deinit(alloc);
+            var change = try churn.apply(delta);
+            change.finish(&churn, true);
+        }
+        if (i == 9 or i == 999 or i == 9999) {
+            var bytes: usize = 0;
+            var lists = churn.index.children.valueIterator();
+            while (lists.next()) |list| bytes += list.capacity * @sizeOf(catalog.Resource);
+            std.debug.print("churn_cycles={d} live_resources={d} parent_buckets={d} retained_child_array_bytes={d}\n", .{ i + 1, churn.value.resources.len, churn.index.children.count(), bytes });
+        }
+    }
 }
