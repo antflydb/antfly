@@ -15,6 +15,20 @@ on:
         description: Retained trace filename within the artifact
         type: string
         required: true
+  workflow_call:
+    inputs:
+      run_id:
+        description: Soak run containing the original executable and trace
+        type: string
+        required: true
+      shard_artifact:
+        description: Shard artifact name
+        type: string
+        required: true
+      trace_name:
+        description: Retained trace filename within the artifact
+        type: string
+        required: true
 
 permissions:
   contents: read

@@ -10,6 +10,19 @@ on:
         type: number
         default: 0
 
+      diagnostic_run:
+        description: Inspect an earlier soak with its original executable (empty runs a new soak)
+        type: string
+        default: ''
+      diagnostic_shard:
+        description: Artifact name when inspecting an earlier run
+        type: string
+        default: ''
+      diagnostic_trace:
+        description: Trace filename when inspecting an earlier run
+        type: string
+        default: ''
+
 permissions:
   contents: read
 
@@ -18,7 +31,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  diagnose:
+    if: inputs.diagnostic_run != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/zig-vopr-replay-diagnostics.yml
+    with:
+      run_id: ${{ inputs.diagnostic_run }}
+      shard_artifact: ${{ inputs.diagnostic_shard }}
+      trace_name: ${{ inputs.diagnostic_trace }}
+
   build:
+    if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
