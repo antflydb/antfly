@@ -4,6 +4,41 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: combined native Debug acceptance and remaining review gap (#694)
+
+The Debug executable built from `cdc9ffcc8c4d0ed9020564427694173d80185629`
+passed **100/100 quickstart**, **100/100 three-by-three backup/restore**, and
+**100/100 retry-exhaustion/restart**, with zero failures or failed-case retries.
+Four workers each ran 25 repetitions of all three scenarios. The run started
+at 19:23:06 UTC and finished at 20:01:01 UTC on September 11 (37m55s), exit 0.
+The build completed 33/33 steps. Binary SHA-256:
+`b7ee84555588fffaf9aa5c9d6c59b580db2493cc7ab459b3361f07a84c73ce6a`.
+Manifest, revision, counts, and combined worker output are retained under
+`/private/tmp/ci694-coherent-native-soak-cdc9ffcc8`. These results cover the
+prefetch and coherent-publication fixes above the earlier failed soak.
+Issue #705's separate progressive-index heap corruption remains unresolved;
+these scenarios do not reproduce or certify that workload.
+
+Fresh review identified a remaining executor-capacity gap, separate from the
+passed soak: request-forward leases count completed requests, whereas Zig
+0.16 releases `Threaded.busy_count` after group completion and task destruction.
+An allocator pause at that actual retirement edge deterministically leaves six
+completed group tasks occupying all six slots of a supported forwarding lane;
+the next submission returns `ConcurrencyUnavailable`. The production default's
+two spare slots do not establish an ordering guarantee either. The reproduction
+isolates the executor contract; it does not inject this pause into a live HTTP
+forwarder. Source and output are retained at
+`/private/tmp/ci694-forward-retirement-review.zig` and
+`/private/tmp/ci694-forward-retirement-review.log`. Forwarding admission still
+needs a capacity guarantee that includes executor retirement; the passing soak
+must not be presented as resolving this review finding.
+
+The latest Linux x86 job passed all five prefetch tests but failed
+`db dense finalization owner drains requests queued during publication` with
+`TestUnexpectedResult`. Its cause is not established by the passing native
+soak. CI evidence: [job 103392541552](https://github.com/antflydb/antfly/actions/runs/34638056167/job/103392541552)
+and `/private/tmp/ci694-cdc-x86-ci-full.log`.
+
 ## 2026-09-11: partial operational stats erase the published index inventory (#694)
 
 The native Debug soak of `badafbaf9` finished with quickstart **97/100**, while
@@ -85,7 +120,8 @@ The native Debug soak of `badafbaf9` completed separately with quickstart
 **97/100**, backup/restore **100/100**, and retry/restart **100/100**.
 Two quickstart failures lost the existing text index's runtime observation
 after image-index creation; one returned a zero image source cardinality after
-the searchable-artifact wait. These remain unresolved by the prefetch change.
+the searchable-artifact wait. These motivated the coherent-publication
+follow-up recorded above.
 Evidence is retained under `/private/tmp/ci694-reservation-native-soak-badafbaf9`;
 the binary SHA-256 is
 `60d7a097b6924e1821b7aba37d3dd38cffb4e10e3bb693cd3abc94def1ce0491`.
