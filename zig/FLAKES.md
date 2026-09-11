@@ -4,6 +4,51 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: prefetch restart races executor capacity release (#694)
+
+[CI run 34627106321](https://github.com/antflydb/antfly/actions/runs/34627106321/job/103355428154)
+failed `prefetch queue background wake stop and restart preserve lock policy`
+with `ConcurrencyUnavailable` on the second `startWorker`. The Zig 0.16
+threaded executor wakes a future's awaiter before its worker decrements the
+executor's busy count. Awaiting the old task therefore does not guarantee that
+the queue's one-slot executor can admit its replacement. The recorded stack
+lands on the capacity-limit check, not thread creation or allocation failure.
+
+The queue now owns one task from first successful start through deinit.
+Stop withdraws processing admission and waits for an in-flight callback to
+quiesce; restart resumes the parked task. Deinit signals final shutdown,
+awaits the task, and joins its executor before releasing ownership. Pending
+items remain available for a later resume or manual drain. This avoids task
+churn, capacity retries, and polling in production while preserving both
+locked and unlocked callback policies.
+
+The restart regression disables all new executor admission after the first
+start, so the old resubmission design deterministically fails. A second
+regression holds an unlocked callback across stop, verifies stop cannot return
+early, and checks that queued work remains available for manual draining.
+All five focused tests passed 100 consecutive native Debug repetitions
+(500 test executions). The original implementation passed 100 native repeats;
+those passes did not invalidate the failing Linux CI interleaving.
+
+Run from `zig/`:
+
+```sh
+zig test pkg/inference/src/runtime/tier/prefetch.zig
+```
+
+Evidence: `/private/tmp/ci694-badafbaf9-x86-ci-full.log` and
+`/private/tmp/ci694-prefetch-fixed-repeat.log`. The negative control is recorded
+in `/private/tmp/ci694-prefetch-original-regression.log`.
+
+The native Debug soak of `badafbaf9` completed separately with quickstart
+**97/100**, backup/restore **100/100**, and retry/restart **100/100**.
+Two quickstart failures lost the existing text index's runtime observation
+after image-index creation; one returned a zero image source cardinality after
+the searchable-artifact wait. These remain unresolved by the prefetch change.
+Evidence is retained under `/private/tmp/ci694-reservation-native-soak-badafbaf9`;
+the binary SHA-256 is
+`60d7a097b6924e1821b7aba37d3dd38cffb4e10e3bb693cd3abc94def1ce0491`.
+
 ## 2026-09-11: fence stale expiry and reserve uncertain restore capacity (#694)
 
 Review of `8a4d2d83e` added two deterministic failures in the isolated
