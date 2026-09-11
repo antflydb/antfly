@@ -5204,7 +5204,6 @@ pub const AntflyApiHandler = struct {
         defer page.deinit(self.api_server.alloc);
         if (page.cursor) |cursor| {
             try ctx.setHeader("X-Antfly-Next-Cursor", cursor);
-            try ctx.setHeader("Access-Control-Expose-Headers", "X-Antfly-Next-Cursor");
         }
         return jsonResponse(ctx, 200, page.body);
     }

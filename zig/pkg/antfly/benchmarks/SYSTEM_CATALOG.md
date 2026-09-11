@@ -193,7 +193,8 @@ uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
 The first workload crosses the 64 MiB schema cache budget with independently
 evolved wide schemas. It measures complete inventory, first-page latency and a
 validated complete cursor walk separately. It also runs one inventory scanner
-alongside concurrent detail readers, reporting both latency distributions.
+alongside detail readers that remain active until the scan finishes, reporting
+both latency distributions and detail throughput.
 The second models a schema browser opening one table while unrelated tenant
 inventory grows. Both include a one-table prefix control and an empty default
 namespace. Add `--deployment cluster` to exercise durable metadata projections

@@ -354,12 +354,14 @@ Public table lists retain the array response and complete-list behavior when
 `X-Antfly-Next-Cursor` with `cursor`, using the same database, namespace and
 prefix. A continuation without an explicit limit defaults to 100. Pages use
 bytewise logical-name order. Authorization is checked on every page; an empty
-page can still carry a continuation. Cursors contain an opaque table identity,
+page can still carry a continuation. Default CORS configuration exposes the
+continuation header; custom `exposed_headers` must include it for browser clients.
+Cursors contain an opaque table identity,
 not the private name of a filtered row. They confer no authorization.
 
 Each page captures definitions, ranges, placements, store headers and selected
 group reports in one metadata transaction (or the standalone metadata lock).
-Catalog DDL invalidates a continuation with HTTP 409. An order-independent SHA-256
+Logical catalog changes invalidate a continuation with HTTP 409. An order-independent SHA-256
 membership fingerprint also detects unbound legacy table creation, deletion or
 rename and is rebuilt from primary identities after restore. Runtime counters
 can change between pages; pagination is not a retained historical snapshot.

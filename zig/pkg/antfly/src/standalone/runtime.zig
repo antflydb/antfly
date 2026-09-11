@@ -67,6 +67,7 @@ const cors_default_exposed_headers = [_][]const u8{
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
+    "X-Antfly-Next-Cursor",
 };
 const cors_default_max_age: u32 = 3600;
 const antfarm_max_file_bytes: usize = 64 * 1024 * 1024;
@@ -8089,7 +8090,7 @@ test "standalone CORS middleware finalizes independently owned responses" {
     }
 }
 
-test "standalone CORS middleware enforces dynamic configuration" {
+test "standalone CORS middleware enforces dynamic configuration for system catalog clients" {
     const Harness = struct {
         fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
             return ctx.status(209).text("next");
@@ -8124,7 +8125,7 @@ test "standalone CORS middleware enforces dynamic configuration" {
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }

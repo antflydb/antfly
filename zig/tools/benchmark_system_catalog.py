@@ -744,13 +744,16 @@ def paged_inventory(api, path, expected, page_size):
 def inventory_with_readers(api, path, count, args):
     """One inventory scanner alongside concurrent schema-detail readers."""
     barrier = threading.Barrier(args.concurrency + 1, timeout=30)
+    scan_finished = threading.Event()
 
     def worker(scanner):
         client = Api(api.base)
         timings = []
         try:
             barrier.wait()
-            for _ in range(args.samples):
+            while len(timings) < args.samples or (
+                not scanner and not scan_finished.is_set()
+            ):
                 start = time.perf_counter_ns()
                 value = client.request("GET", path if scanner else path + "/needle")
                 if scanner and len(value) != count:
@@ -760,11 +763,18 @@ def inventory_with_readers(api, path, count, args):
                 timings.append((time.perf_counter_ns() - start) / 1e6)
             return timings
         finally:
+            if scanner:
+                scan_finished.set()
             client.session.close()
 
+    started = time.perf_counter_ns()
     with ThreadPoolExecutor(max_workers=args.concurrency + 1) as pool:
         results = list(pool.map(worker, [True] + [False] * args.concurrency))
+    elapsed_seconds = (time.perf_counter_ns() - started) / 1e9
     return {
+        "elapsed_seconds": elapsed_seconds,
+        "detail_requests_per_second": sum(len(row) for row in results[1:])
+        / elapsed_seconds,
         "inventory": summary(results[0]),
         "detail": summary([t for result in results[1:] for t in result]),
         "readers": args.concurrency,
