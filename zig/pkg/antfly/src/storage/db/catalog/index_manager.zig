@@ -7993,11 +7993,10 @@ pub const IndexManager = struct {
                 continue;
             }
             defer entry.apply_mutex.unlock();
-            const build = entry.index.experimental_posting_checkpoint_build orelse continue;
-            if (!build.completed.load(.acquire)) continue;
+            if (!entry.index.experimentalPostingCheckpointBuildCompleted()) continue;
             if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) {
                 result.published += 1;
-            } else if (entry.index.experimental_posting_checkpoint_build != null) {
+            } else if (entry.index.experimentalPostingCheckpointBuildPresent()) {
                 result.deferred = true;
             }
         }
@@ -8256,7 +8255,7 @@ pub const IndexManager = struct {
                 // Backoff means waiting for projection inputs, not ready.
                 // Keep the scheduler/lifecycle obligation alive even when
                 // there is intentionally no worker or publication in flight.
-                if (entry.index.experimental_posting_checkpoint_build != null or
+                if (entry.index.experimentalPostingCheckpointBuildPresent() or
                     entry.index.nativePostingAccelerationPending()) deferred = true;
                 continue;
             }
