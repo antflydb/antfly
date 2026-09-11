@@ -35,6 +35,8 @@ const ActiveMemTable = state_mod.ActiveMemTable;
 pub var test_private_read_versions: bool = false;
 pub var test_current_point_unlocked_hook: ?*const fn (*anyopaque) anyerror!void = null;
 pub var test_current_point_rank_walk: bool = false;
+/// Benchmark control for the former synchronous batch's unconditional copy.
+pub var test_duplicate_owned_point_results: bool = false;
 const namespaceOf = state_mod.namespaceOf;
 const compareNamespace = state_mod.compareNamespace;
 const compareEntryTo = state_mod.compareEntryTo;
@@ -2312,6 +2314,42 @@ fn readManySortedFromCursor(
     return result;
 }
 
+/// Result lifetime is independent of the physical read plan. Snapshot readers
+/// keep sources and cache handles pinned; current-tip writers release their
+/// view at the end of the call and must own every returned value instead.
+const PointResultLifetime = enum {
+    snapshot_pinned,
+    transaction_owned,
+
+    fn forBlockPins(blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle)) PointResultLifetime {
+        return if (blocks != null) .snapshot_pinned else .transaction_owned;
+    }
+
+    /// Reuse allocations produced by this lookup, including interior slices
+    /// of decoded blocks. Never scan the transaction's entire read history.
+    fn retain(
+        self: PointResultLifetime,
+        backend: anytype,
+        allocator: Allocator,
+        held: *std.ArrayListUnmanaged([]u8),
+        first_owned: usize,
+        value: []const u8,
+    ) ![]const u8 {
+        if (self == .snapshot_pinned) return value;
+        const address = @intFromPtr(value.ptr);
+        const candidates = if (builtin.is_test and test_duplicate_owned_point_results) held.items[held.items.len..] else held.items[first_owned..];
+        for (candidates) |owned| {
+            const base = @intFromPtr(owned.ptr);
+            if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
+        }
+        const owned = try allocator.dupe(u8, value);
+        errdefer allocator.free(owned);
+        try held.append(allocator, owned);
+        recordPointValueCopy(backend);
+        return owned;
+    }
+};
+
 fn readManySortedPointFromSnapshot(
     backend: anytype,
     mutable: anytype,
@@ -2341,6 +2379,7 @@ fn readManySortedPointFromSnapshot(
         keys,
         values,
         backend_locked,
+        PointResultLifetime.forBlockPins(held_blocks),
     )) |result| return result;
 
     var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
@@ -2354,6 +2393,7 @@ fn readManySortedPointFromSnapshot(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
             mutable,
@@ -2377,14 +2417,7 @@ fn readManySortedPointFromSnapshot(
             },
             else => return err,
         };
-        if (held_blocks == null) {
-            const owned = try allocator.dupe(u8, value);
-            errdefer allocator.free(owned);
-            try held_values.append(allocator, owned);
-            values[i] = owned;
-        } else {
-            values[i] = value;
-        }
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -2489,6 +2522,7 @@ fn readManySortedByRunFromSnapshot(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
             mutable,
@@ -2512,14 +2546,7 @@ fn readManySortedByRunFromSnapshot(
             },
             else => return err,
         };
-        if (held_blocks == null) {
-            const owned = try allocator.dupe(u8, value);
-            errdefer allocator.free(owned);
-            try held_values.append(allocator, owned);
-            values[i] = owned;
-        } else {
-            values[i] = value;
-        }
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -2697,16 +2724,7 @@ fn getOwnedDirectoryPoint(
     var hint: ?BorrowedReadHint = null;
     const first_owned = held_values.items.len;
     const value = try getFromDirectoryPoint(backend, directory, &.{}, &hint, &blocks, held_values, allocator, namespace, key);
-    const address = @intFromPtr(value.ptr);
-    for (held_values.items[first_owned..]) |owned| {
-        const base = @intFromPtr(owned.ptr);
-        if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
-    }
-    const owned = try allocator.dupe(u8, value);
-    errdefer allocator.free(owned);
-    try held_values.append(allocator, owned);
-    recordPointValueCopy(backend);
-    return owned;
+    return PointResultLifetime.transaction_owned.retain(backend, allocator, held_values, first_owned, value);
 }
 
 fn readManyCurrentSortedPointByRunLocked(
@@ -6037,6 +6055,7 @@ fn readManySortedPointFromSnapshotAsync(
     keys: []const []const u8,
     values: []?[]const u8,
     backend_locked: bool,
+    result_lifetime: PointResultLifetime,
 ) !?BatchCursorReadResult {
     if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
     const async_lease = acquirePointAsyncBatchLease(backend);
@@ -6067,7 +6086,7 @@ fn readManySortedPointFromSnapshotAsync(
             if (entry.tombstone) {
                 result.misses += 1;
             } else {
-                values[key_index] = entry.value;
+                values[key_index] = try result_lifetime.retain(backend, allocator, held_values, held_values.items.len, entry.value);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -6080,7 +6099,7 @@ fn readManySortedPointFromSnapshotAsync(
             if (entry.tombstone) {
                 result.misses += 1;
             } else {
-                values[key_index] = entry.value;
+                values[key_index] = try result_lifetime.retain(backend, allocator, held_values, held_values.items.len, entry.value);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -8295,9 +8314,9 @@ test "lsm async batch reads tree backed mutable and immutable snapshots" {
         }
         @memset(&values, null);
         const result = if (mode == 0)
-            try readManySortedPointFromSnapshotAsync(&backend, &active, &.{}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false)
+            try readManySortedPointFromSnapshotAsync(&backend, &active, &.{}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false, .snapshot_pinned)
         else
-            try readManySortedPointFromSnapshotAsync(&backend, if (mode == 1) &snapshot else &empty, if (mode == 1) &.{} else &.{&snapshot}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false);
+            try readManySortedPointFromSnapshotAsync(&backend, if (mode == 1) &snapshot else &empty, if (mode == 1) &.{} else &.{&snapshot}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false, .snapshot_pinned);
         try std.testing.expect(result != null);
         try std.testing.expectEqual(@as(usize, 1), result.?.hits);
         try std.testing.expectEqual(@as(usize, 2), result.?.misses);
@@ -8305,6 +8324,76 @@ test "lsm async batch reads tree backed mutable and immutable snapshots" {
         try std.testing.expect(values[1] == null and values[2] == null);
     }
     try std.testing.expect(!try bulkStateHasDuplicateKeys(allocator, &snapshot));
+}
+
+test "lsm async batch result lifetimes preserve borrowing and unwind owned allocation failures" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Fixture = struct {
+        fn check(allocator: Allocator, backend: *Backend, snapshot: *const State, immutable: bool, lifetime: PointResultLifetime) !void {
+            var held: std.ArrayListUnmanaged([]u8) = .empty;
+            defer releaseHeldValues(&held, allocator);
+            const keys = [_][]const u8{ "a", "a", "b", "c", "missing" };
+            var values: [keys.len]?[]const u8 = @splat(null);
+            const empty: State = .{};
+            const before = backend.snapshotReadStats().point_value_copies;
+            const result = (try readManySortedPointFromSnapshotAsync(backend, if (immutable) &empty else snapshot, if (immutable) &.{snapshot} else &.{}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false, lifetime)).?;
+            try std.testing.expectEqual(@as(usize, 3), result.hits);
+            try std.testing.expectEqual(@as(usize, 2), result.misses);
+            try std.testing.expectEqualStrings("old", values[0].?);
+            try std.testing.expectEqualStrings("old", values[1].?);
+            try std.testing.expect(values[2] == null and values[4] == null);
+            try std.testing.expectEqualStrings("", values[3].?);
+            const original = snapshot.entryAt(snapshot.findIndex(.{}, "a").?).value;
+            if (lifetime == .snapshot_pinned) {
+                try std.testing.expect(values[0].?.ptr == original.ptr);
+                try std.testing.expectEqual(@as(usize, 0), held.items.len);
+                try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
+            } else {
+                try std.testing.expect(values[0].?.ptr != original.ptr);
+                try std.testing.expectEqual(@as(usize, 3), held.items.len);
+                try std.testing.expectEqual(before + 3, backend.snapshotReadStats().point_value_copies);
+            }
+        }
+    };
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(allocator, "/async-result-lifetimes", .{ .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var active: ActiveMemTable = .{};
+    defer active.deinit(allocator);
+    try active.upsert(allocator, .{}, "a", "old", false);
+    try active.upsert(allocator, .{}, "b", "", true);
+    try active.upsert(allocator, .{}, "c", "", false);
+    var snapshot = try active.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+    for ([_]bool{ false, true }) |immutable| {
+        for ([_]PointResultLifetime{ .snapshot_pinned, .transaction_owned }) |lifetime|
+            try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{ &backend, &snapshot, immutable, lifetime });
+    }
+}
+
+test "lsm point result lifetime adopts decoded interior slices without another allocation" {
+    const Fixture = struct {
+        fn check(allocator: Allocator) !void {
+            var backend = @import("../lsm_backend.zig").Backend.init(allocator, .{});
+            defer backend.close();
+            var held: std.ArrayListUnmanaged([]u8) = .empty;
+            defer releaseHeldValues(&held, allocator);
+            const decoded = try allocator.alloc(u8, 8192);
+            errdefer if (held.items.len == 0) allocator.free(decoded);
+            try held.append(allocator, decoded);
+            @memset(decoded, 'x');
+            const value = decoded[32..8000];
+            const adopted = try PointResultLifetime.transaction_owned.retain(&backend, allocator, &held, 0, value);
+            try std.testing.expect(adopted.ptr == value.ptr);
+            try std.testing.expectEqual(@as(usize, 1), held.items.len);
+            try std.testing.expectEqual(@as(u64, 0), backend.snapshotReadStats().point_value_copies);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
 }
 
 test "lsm async point read cleanup preserves independently retained index pin" {

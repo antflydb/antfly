@@ -92,36 +92,40 @@ test "current writer directory batches keep a coherent tip during concurrent flu
         }
     };
     const alloc = std.testing.allocator;
-    var storage = storage_io.MemoryStorage.init(alloc);
-    defer storage.deinit();
-    var backend = try Backend.open(alloc, "/current-writer-batch", .{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 10000 });
-    defer backend.close();
-    try write(&backend, "old");
-    backend.options.flush_threshold = 1000;
-    {
-        var mutable = try backend.beginWrite();
-        errdefer mutable.abort();
-        try mutable.put(.{ .name = "docs" }, "a", "old");
-        try mutable.commit();
+    for ([_]bool{ false, true }) |cached| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var cache = Cache.init(alloc, 1024 * 1024);
+        defer cache.deinit();
+        var backend = try Backend.open(alloc, "/current-writer-batch", .{ .storage = storage.storage(), .cache = if (cached) &cache else null, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+        defer backend.close();
+        try write(&backend, "old");
+        backend.options.flush_threshold = 1000;
+        {
+            var mutable = try backend.beginWrite();
+            errdefer mutable.abort();
+            try mutable.put(.{ .name = "docs" }, "a", "old");
+            try mutable.commit();
+        }
+        try std.testing.expect(backend.mutable.entryCount() != 0);
+        backend.options.flush_threshold = 1;
+        var txn = try runtime.BoundWriteTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer txn.abort();
+        const keys = [_][]const u8{ "a", "b", "missing" };
+        var values: [3]?[]const u8 = undefined;
+        runtime.test_current_point_unlocked_hook = Hook.publish;
+        defer runtime.test_current_point_unlocked_hook = null;
+        try txn.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("old", values[0].?);
+        try std.testing.expectEqualStrings("old", values[1].?);
+        try std.testing.expect(values[2] == null);
+        try std.testing.expectEqualStrings("new", try txn.get("a"));
+        try std.testing.expectEqualStrings("old", values[0].?);
+        try txn.put("a", "overlay");
+        try txn.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("overlay", values[0].?);
+        try std.testing.expectEqualStrings("new", values[1].?);
     }
-    try std.testing.expect(backend.mutable.entryCount() != 0);
-    backend.options.flush_threshold = 1;
-    var txn = try runtime.BoundWriteTxn(Backend).open(&backend, .{ .name = "docs" });
-    defer txn.abort();
-    const keys = [_][]const u8{ "a", "b", "missing" };
-    var values: [3]?[]const u8 = undefined;
-    runtime.test_current_point_unlocked_hook = Hook.publish;
-    defer runtime.test_current_point_unlocked_hook = null;
-    try txn.getManySorted(&keys, &values);
-    try std.testing.expectEqualStrings("old", values[0].?);
-    try std.testing.expectEqualStrings("old", values[1].?);
-    try std.testing.expect(values[2] == null);
-    try std.testing.expectEqualStrings("new", try txn.get("a"));
-    try std.testing.expectEqualStrings("old", values[0].?);
-    try txn.put("a", "overlay");
-    try txn.getManySorted(&keys, &values);
-    try std.testing.expectEqualStrings("overlay", values[0].?);
-    try std.testing.expectEqualStrings("new", values[1].?);
 }
 
 test "current writer directory reads restore lock and ownership on cancellation" {
@@ -143,6 +147,92 @@ test "current writer directory reads restore lock and ownership on cancellation"
     try std.testing.expectError(error.Canceled, txn.get(.{ .name = "docs" }, "a"));
     runtime.test_current_point_unlocked_hook = null;
     try std.testing.expectEqualStrings("old", try txn.get(.{ .name = "docs" }, "a"));
+    var bound = try runtime.BoundWriteTxn(Backend).open(&backend, .{ .name = "docs" });
+    defer bound.abort();
+    const keys = [_][]const u8{ "a", "b" };
+    var values: [2]?[]const u8 = undefined;
+    runtime.test_current_point_unlocked_hook = Hook.cancel;
+    try std.testing.expectError(error.Canceled, bound.getManySorted(&keys, &values));
+    runtime.test_current_point_unlocked_hook = null;
+    try bound.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("old", values[0].?);
+    try std.testing.expectEqualStrings("old", values[1].?);
+}
+
+test "current writer directory wide batches keep only one owned allocation per result" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 0, 1, 16 }) |concurrency| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var cache = Cache.init(alloc, 1024 * 1024);
+        defer cache.deinit();
+        var backend = try Backend.open(alloc, "/current-writer-wide-batch", .{
+            .storage = storage.storage(),
+            .cache = if (concurrency == 0) null else &cache,
+            .max_concurrent_point_block_reads = concurrency,
+            .flush_threshold = 1,
+        });
+        defer backend.close();
+        const wide: [8192]u8 = @splat('x');
+        try write(&backend, &wide);
+        var txn = try runtime.BoundWriteTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer txn.abort();
+        const keys = [_][]const u8{ "a", "b" };
+        var values: [2]?[]const u8 = undefined;
+        // Check warm-cache and fresh-cache reads; no decoded block should be
+        // retained alongside a redundant second allocation of its row value.
+        for (0..2) |_| {
+            const before = txn.held_values.items.len;
+            try txn.getManySorted(&keys, &values);
+            try std.testing.expectEqual(before + 2, txn.held_values.items.len);
+            try std.testing.expectEqualStrings(&wide, values[0].?);
+            try std.testing.expectEqualStrings(&wide, values[1].?);
+        }
+    }
+}
+
+test "current writer directory owned batch retention benchmark" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/owned-batch-benchmark", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    const count = 32;
+    var raw_keys: [count][8]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var write_txn = try backend.beginWrite();
+    errdefer write_txn.abort();
+    const wide: [8192]u8 = @splat('x');
+    for (&raw_keys, &keys, 0..) |*raw, *key, i| {
+        std.mem.writeInt(u64, raw, i, .big);
+        key.* = raw;
+        try write_txn.put(.{}, key.*, &wide);
+    }
+    try write_txn.commit();
+    defer runtime.test_duplicate_owned_point_results = false;
+    for ([_]bool{ true, false }) |duplicate| {
+        runtime.test_duplicate_owned_point_results = duplicate;
+        var samples: [7]u64 = undefined;
+        var retained_bytes: usize = 0;
+        var retained_allocations: usize = 0;
+        for (0..8) |sample| {
+            const start = clock.monotonicNs();
+            for (0..32) |_| {
+                var txn = try runtime.BoundWriteTxn(Backend).open(&backend, .{});
+                defer txn.abort();
+                var values: [count]?[]const u8 = undefined;
+                try txn.getManySorted(&keys, &values);
+                retained_bytes = 0;
+                retained_allocations = txn.held_values.items.len;
+                for (txn.held_values.items) |value| retained_bytes += value.len;
+                for (values) |value| try std.testing.expectEqualStrings(&wide, value.?);
+            }
+            if (sample != 0) samples[sample - 1] = (clock.monotonicNs() - start) / 32;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        std.debug.print("owned-batch duplicate={} rows={d} value_bytes={d} median_batch_ns={d} retained_allocations={d} retained_bytes={d}\n", .{ duplicate, count, wide.len, samples[3], retained_allocations, retained_bytes });
+    }
 }
 
 test "current writer directory point scaling benchmark" {

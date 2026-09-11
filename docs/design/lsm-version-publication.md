@@ -27,6 +27,36 @@ Regression tests cover overlays, tombstones, namespaces, concurrent flushes,
 coherent batches, cache/no-cache wide values, and allocation failure with more
 than sixteen overlapping candidates.
 
+Point-result lifetime is an explicit contract shared by synchronous and async
+batch plans: `snapshot_pinned` may borrow from the caller's still-pinned sources;
+`transaction_owned` must retain bytes independently of the temporary read view.
+In particular, async mutable and immutable hits must obey that contract just as
+SST hits do. The presence of an async cache pipeline does not extend a memtable
+generation's lifetime. Cursor batches already either retain a source lease or
+copy before advancing. Current probes copy before releasing their scoped view.
+
+The common retention helper adopts newly decoded allocations, including interior
+row slices, instead of keeping both a decoded allocation and a duplicate row.
+Its ownership check is limited to allocations produced by the lookup, not all
+prior reads in the transaction. Snapshot-pinned reads remain zero-copy. Tests
+cover both policies, mutable/immutable sources, duplicate keys, empty values,
+tombstones, allocation-failure cleanup, cancellation, cached concurrent flushes,
+and cached/uncached wide-row batches.
+
+Local arm64 ReleaseFast benchmark of actual bound write batches, 32 rows of
+8 KiB each, uncached memory-backed SSTs: retaining decoded bytes reduced result
+allocations from 64 to 32 and retained payload bytes from 524,288 to 262,144.
+Median batch latency was 99.6 microseconds with the former duplicate-copy policy
+versus 92.7 microseconds with adoption (seven 32-batch samples after warmup).
+This includes batch setup, decoding, value verification and transaction cleanup;
+it excludes filesystem/network latency and is not an end-to-end server benchmark.
+The duplicate-copy switch exists only as a test-build benchmark control.
+
+```sh
+cd zig
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'owned batch retention benchmark'
+```
+
 Local arm64 ReleaseFast metadata-only benchmark, median of seven 100-lookup
 samples after warmup, using actual write-transaction reads into a gap inside a
 lower level: at 1,000 / 10,000 / 100,000 runs, the previous rank walk took
