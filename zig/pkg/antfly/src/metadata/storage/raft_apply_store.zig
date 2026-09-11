@@ -149,7 +149,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "6";
+const derived_catalog_index_version = "7";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -2672,7 +2672,10 @@ pub const RaftApplyStore = struct {
         if (request.revision) |revision| if (revision != view.meta.revision) return error.CatalogGenerationChanged;
         if (request.limit) |limit| if (limit == 0 or limit > 1000) return error.InvalidCatalogName;
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
-        if (request.physical_name) |name| {
+        if (request.target) |target| {
+            const table = (try self.resolveSystemCatalogResultTxn(metadata.TableRecord, a, &txn, group_id, target)) orelse return error.TableNotFound;
+            try entries.append(a, .{ .name = target.table, .table = table });
+        } else if (request.physical_name) |name| {
             const table = (try self.getTableByNameTxn(a, &txn, group_id, name)) orelse return error.TableNotFound;
             try entries.append(a, .{ .name = table.name, .table = table });
         } else {
@@ -2720,7 +2723,7 @@ pub const RaftApplyStore = struct {
         }
         const page = try projection.selectPage(entries.items, request, view.meta.revision);
         for (page.entries) |*entry| {
-            if (request.physical_name != null) continue;
+            if (request.physical_name != null or request.target != null) continue;
             var buf: [160]u8 = undefined;
             const table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group_id, entry.table.table_id)));
             if (table.table_id != entry.table.table_id or !std.mem.eql(u8, table.name, entry.table.name)) return error.InvalidCatalogRecord;
@@ -2741,8 +2744,7 @@ pub const RaftApplyStore = struct {
         const store_rows = try docstore.DocStore.scanPrefixTxn(a, &txn, try listingStorePrefix(a, group_id));
         const stores = try a.alloc(metadata.StoreRecord, store_rows.len);
         for (store_rows, stores) |row, *store| {
-            const compact = try std.json.parseFromSliceLeaky(ListingStore, a, row.value, .{});
-            store.* = compact.store;
+            store.* = try decodeStoreRecord(a, row.value);
             var reports: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
             var group_statuses: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty;
             for (ranges.items) |range| {
@@ -2750,12 +2752,13 @@ pub const RaftApplyStore = struct {
                     error.NotFound => continue,
                     else => return err,
                 };
-                const report = try std.json.parseFromSliceLeaky(ListingReport, a, bytes, .{});
-                if (report.runtime_status) |runtime| {
+                const report = try decodeStoreRecord(a, bytes);
+                if (report.store_id != store.store_id or report.runtime_statuses.len > 1 or report.group_statuses.len > 1) return error.InvalidDerivedCatalogIndex;
+                for (report.runtime_statuses) |runtime| {
                     if (runtime.group_id != range.group_id) return error.InvalidDerivedCatalogIndex;
                     try reports.append(a, runtime);
                 }
-                if (report.group_status) |status| {
+                for (report.group_statuses) |status| {
                     if (status.group_id != range.group_id) return error.InvalidDerivedCatalogIndex;
                     try group_statuses.append(a, status);
                 }
@@ -4166,7 +4169,6 @@ pub const RaftApplyStore = struct {
         try txn.put(try legacyMembershipKey(a, group_id), &fingerprint);
     }
 
-    const ListingStore = struct { store: metadata.StoreRecord };
     const ListingReport = struct {
         group_status: ?metadata.GroupStatusReport = null,
         runtime_status: ?metadata.RuntimeGroupStatusReport = null,
@@ -4205,10 +4207,12 @@ pub const RaftApplyStore = struct {
             }
         }
         if (old_membership) |bytes| {
-            const previous = try std.json.parseFromSliceLeaky([]const u64, a, bytes, .{});
-            for (previous) |id| if (!reports_by_id.contains(id)) {
-                txn.delete(try listingReportKey(a, group_id, store_id, id)) catch |err| if (err != error.NotFound) return err;
-            };
+            if (bytes.len % 8 != 0) return error.InvalidDerivedCatalogIndex;
+            var offset: usize = 0;
+            while (offset < bytes.len) : (offset += 8) {
+                const id = std.mem.readInt(u64, bytes[offset..][0..8], .little);
+                if (!reports_by_id.contains(id)) txn.delete(try listingReportKey(a, group_id, store_id, id)) catch |err| if (err != error.NotFound) return err;
+            }
         }
         if (replacement) |record| {
             var compact = record;
@@ -4221,16 +4225,27 @@ pub const RaftApplyStore = struct {
             std.mem.sort(u64, groups, {}, std.sort.asc(u64));
             for (groups) |id| {
                 const report_key = try listingReportKey(a, group_id, store_id, id);
-                const bytes = try std.json.Stringify.valueAlloc(a, reports_by_id.get(id).?, .{});
+                const report = reports_by_id.get(id).?;
+                var group_status = [_]metadata.GroupStatusReport{report.group_status orelse .{ .group_id = id }};
+                var runtime_status = [_]metadata.RuntimeGroupStatusReport{report.runtime_status orelse .{}};
+                // Reuse the versioned primary codec. JSON expansion here runs
+                // on every heartbeat and can dominate metadata apply latency.
+                const bytes = try encodeStoreRecord(a, .{
+                    .store_id = store_id,
+                    .node_id = record.node_id,
+                    .group_statuses = if (report.group_status != null) &group_status else &.{},
+                    .runtime_statuses = if (report.runtime_status != null) &runtime_status else &.{},
+                });
                 const previous = txn.get(report_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (previous == null or !std.mem.eql(u8, previous.?, bytes)) try txn.put(report_key, bytes);
             }
-            const membership = try std.json.Stringify.valueAlloc(a, groups, .{});
+            const membership = try a.alloc(u8, groups.len * 8);
+            for (groups, 0..) |id, i| std.mem.writeInt(u64, membership[i * 8 ..][0..8], id, .little);
             if (old_membership == null or !std.mem.eql(u8, old_membership.?, membership)) try txn.put(membership_key, membership);
-            const bytes = try std.json.Stringify.valueAlloc(a, ListingStore{ .store = compact }, .{});
+            const bytes = try encodeStoreRecord(a, compact);
             if (old == null or !std.mem.eql(u8, old.?, bytes)) try txn.put(key, bytes);
         } else {
             txn.delete(key) catch |err| if (err != error.NotFound) return err;

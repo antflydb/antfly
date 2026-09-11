@@ -371,12 +371,14 @@ to the requested prefix/keyset boundary. It loads full definitions only after
 merging and truncating those candidate streams. Compact store headers exclude
 both group-summary and detailed-runtime arrays; selected groups are point reads.
 The derived indexes are updated in the same transaction as primary records,
-compare report bytes to avoid rewriting unchanged rows, and rebuild atomically
+reuse the versioned primary binary codec and compare report bytes to avoid
+rewriting unchanged rows, and rebuild atomically
 when their version marker changes. Standalone selects pages from borrowed
 identity/definition references under its lock before projecting runtime state.
 
-Single-table reads and create acknowledgements use this same coherent projection
-and shared immutable schema cache. Labels are applied before encoding. Fresh
+Single-table reads resolve logical identity and capture status together behind
+one Raft read barrier; HTTP and MCP use the same operation. Create acknowledgements
+use its physical-identity form. All share the immutable schema cache. Labels are applied before encoding. Fresh
 runtime evidence is merged on reads; acknowledgements do not wait for runtime
 coverage. Cache admission weighs recent frequency against retained bytes, so
 one-pass inventories cannot replace equally useful residents. Concurrent misses

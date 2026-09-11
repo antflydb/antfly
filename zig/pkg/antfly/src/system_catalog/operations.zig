@@ -99,16 +99,19 @@ pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
     return store.resolveSystemCatalogTable(alloc, svc.metadata_group_id, target);
 }
 
+fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: domain.TableList) ![]u8 {
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const result = try store.listSystemCatalogTables(alloc, svc.metadata_group_id, request);
+    errdefer alloc.free(result);
+    try context.ensureActive();
+    return result;
+}
+
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
-        .list_tables => |request| blk: {
-            try svc.ensureLinearizableReadWithContext(context);
-            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            const result = try store.listSystemCatalogTables(alloc, svc.metadata_group_id, request);
-            errdefer alloc.free(result);
-            try context.ensureActive();
-            break :blk result;
-        },
+        .table_status => |target| listTablesJson(svc, alloc, context, target.listing()),
+        .list_tables => |request| listTablesJson(svc, alloc, context, request),
         .export_snapshot => blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;

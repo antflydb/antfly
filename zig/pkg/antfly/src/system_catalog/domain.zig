@@ -794,8 +794,9 @@ pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: 
 }
 
 pub const TableList = struct {
-    // Internal physical selection is used only after public name authorization.
+    // Internal point selectors are used only after public name authorization.
     physical_name: ?[]const u8 = null,
+    target: ?Target = null,
     after: ?[]const u8 = null,
     after_table_id: ?u64 = null,
     limit: ?u32 = null,
@@ -804,6 +805,18 @@ pub const TableList = struct {
     database: []const u8 = default_database_name,
     namespace: []const u8 = default_namespace_name,
     prefix: ?[]const u8 = null,
+};
+
+pub const TableStatusTarget = union(enum) {
+    physical: []const u8,
+    logical: Target,
+
+    pub fn listing(self: @This()) TableList {
+        return switch (self) {
+            .physical => |name| .{ .physical_name = name },
+            .logical => |target| .{ .target = target },
+        };
+    }
 };
 
 pub const Call = union(enum) {
@@ -815,6 +828,8 @@ pub const Call = union(enum) {
     resolve_many: ResolveMany,
     query_definition: []const u8,
     mutate: Request,
+    // A distinct operation makes older peers reject unsupported point reads.
+    table_status: TableStatusTarget,
 };
 
 pub fn httpStatus(err: anyerror) u16 {

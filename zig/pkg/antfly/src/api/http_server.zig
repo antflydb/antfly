@@ -7387,6 +7387,19 @@ pub const ApiHttpServer = struct {
         return self.encodeProjectedTableStatus(.{}, table_name, label, true);
     }
     pub fn encodeProjectedTableStatus(self: *ApiHttpServer, context: api_operation.RequestContext, table_name: []const u8, label: []const u8, include_runtime: bool) !?[]u8 {
+        return self.encodeTableStatusTarget(context, .{ .physical = table_name }, label, include_runtime);
+    }
+    pub fn encodeScopedTableStatus(self: *ApiHttpServer, context: api_operation.RequestContext, target: system_catalog.Target, label: []const u8, identity: ?AuthenticatedIdentity) !?[]u8 {
+        const key = try target.resourceNameAlloc(self.alloc);
+        defer self.alloc.free(key);
+        if (!try tablePermissionCurrentlyAllowed(identity, key, .read)) return error.Forbidden;
+        return self.encodeTableStatusTarget(context, .{ .logical = target }, label, true);
+    }
+    fn encodeTableStatusTarget(self: *ApiHttpServer, context: api_operation.RequestContext, target: system_catalog.TableStatusTarget, label: []const u8, include_runtime: bool) !?[]u8 {
+        var table_name = switch (target) {
+            .physical => |name| name,
+            .logical => |name| name.table,
+        };
         try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -7394,13 +7407,16 @@ pub const ApiHttpServer = struct {
         defer if (legacy) |*snapshot| self.source.freeAdminSnapshot(snapshot);
         var snapshot: metadata_api.AdminSnapshot = undefined;
         if (self.source.vtable.system_catalog != null) {
-            const bytes = self.source.systemCatalog(arena.allocator(), context, .{ .list_tables = .{ .physical_name = table_name } }) catch |err| switch (err) {
+            const bytes = self.source.systemCatalog(arena.allocator(), context, .{ .table_status = target }) catch |err| switch (err) {
                 error.TableNotFound => return null,
                 else => return err,
             };
             const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena.allocator(), bytes, .{});
+            if (listing.entries.len != 1) return error.InvalidCatalogRecord;
             snapshot = try listing.adminSnapshot(arena.allocator());
+            table_name = snapshot.tables[0].name;
         } else {
+            if (target == .logical and (!std.mem.eql(u8, target.logical.database, "default") or !std.mem.eql(u8, target.logical.namespace, "public"))) return error.UnsupportedOperation;
             legacy = (try self.source.adminSnapshot()) orelse return null;
             snapshot = legacy.?;
         }
@@ -15243,7 +15259,7 @@ pub const ApiHttpServer = struct {
         var physical_name: ?[]u8 = null;
         defer if (physical_name) |name| self.alloc.free(name);
         switch (operation) {
-            .list_tables, .create_table, .query => {},
+            .list_tables, .create_table, .query, .describe_table => {},
             .restore => |*request| {
                 physical_name = try self.resolveCatalogRestoreNameAlloc(self.alloc, .{}, request.table_name, &authenticated_identity, null);
                 request.table_name = physical_name.?;
@@ -15281,10 +15297,12 @@ pub const ApiHttpServer = struct {
             .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body, authenticated_identity),
             .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
             .describe_table => |request| {
-                const body = (try self.maybeEncodeTableStatus(request.table_name)) orelse
+                const target = try system_catalog.Target.parse(request.table_name);
+                const label = try target.displayNameAlloc(self.alloc);
+                defer self.alloc.free(label);
+                const body = (self.encodeScopedTableStatus(.{}, target, label, authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err))) orelse
                     return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-                defer self.alloc.free(body);
-                return contextual_operations.json(try projectCatalogStatusAlloc(self.alloc, body, input.describe_table.table_name), false);
+                return contextual_operations.json(body, false);
             },
             .list_indexes => |request| {
                 var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi(.{}));
@@ -48157,6 +48175,7 @@ test "system catalog authorizes qualified resources before lookup and rename adm
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             self.calls += 1;
+            if (input == .table_status) return error.TableNotFound;
             return a.dupe(u8, if (input == .resolve) "null" else "{}");
         }
     };
@@ -48522,4 +48541,47 @@ test "system catalog table listing never joins stale topology with current bindi
     defer alloc.free(body);
     try std.testing.expectEqualStrings("[]", body);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "system catalog HTTP and MCP detail resolve and project in one observation" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.FullCatalogMustNotBeRead;
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(input == .table_status);
+            try std.testing.expect(input.table_status == .logical);
+            try std.testing.expectEqualStrings("tenant", input.table_status.logical.database);
+            try std.testing.expectEqualStrings("docs", input.table_status.logical.table);
+            self.calls += 1;
+            return std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").TableListing{
+                .revision = 9,
+                .entries = &.{.{ .name = "docs", .table = .{ .table_id = 42, .name = "table:42", .schema_json = "{\"version\":1}" } }},
+            }, .{});
+        }
+    };
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.admin, .system_catalog = Fake.catalog } }, null, null);
+    defer server.deinit();
+    var handler = @import("httpx_handler.zig").AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .GET, "/db/v1/databases/tenant/namespaces/public/tables/docs");
+    defer request.deinit();
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.getTable(&context, "docs");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"name\":\"docs\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const logical = try (system_catalog.Target{ .database = "tenant", .table = "docs" }).resourceNameAlloc(alloc);
+    defer alloc.free(logical);
+    var described = try server.executeMcpApplicationOperation(.{ .describe_table = .{ .table_name = logical } }, null);
+    defer described.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }

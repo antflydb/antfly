@@ -1330,7 +1330,10 @@ const LocalStandaloneMetadata = struct {
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
         var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
         var membership: [32]u8 = @splat(0);
-        if (request.physical_name) |name| {
+        if (request.target) |target| {
+            const table = (try self.resolveSystemCatalogLocked(target)) orelse return error.TableNotFound;
+            try entries.append(a, .{ .name = target.table, .table = table });
+        } else if (request.physical_name) |name| {
             const table = self.findTableByNameLocked(name) orelse return error.TableNotFound;
             try entries.append(a, .{ .name = table.name, .table = table.* });
         } else {
@@ -1389,6 +1392,7 @@ const LocalStandaloneMetadata = struct {
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
         try context.ensureActive();
         switch (call) {
+            .table_status => |target| return self.listCatalogTablesLocked(alloc, context, target.listing()),
             .list_tables => |request| return self.listCatalogTablesLocked(alloc, context, request),
             .export_snapshot => {
                 const tables = try self.manager.listTables(alloc);

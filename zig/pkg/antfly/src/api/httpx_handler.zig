@@ -5213,9 +5213,9 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
-        defer alloc.free(decoded_table_name);
         if (http_server_mod.runtimeSchemaDebugRequested(ctx.request.uri.query orelse "")) {
+            const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid or missing table target");
+            defer alloc.free(decoded_table_name);
             if (!self.api_server.runtimeSchemaDebugAllowed(authenticated_identity)) return jsonErrorResponse(ctx, 403, "forbidden");
             const debug_body = (try self.api_server.encodeTableRuntimeSchemaDebugAlloc(alloc, decoded_table_name)) orelse
                 return jsonErrorResponse(ctx, 404, "not found");
@@ -5224,7 +5224,10 @@ pub const AntflyApiHandler = struct {
         }
         const logical_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
         defer alloc.free(logical_name);
-        const body = (try self.api_server.encodeProjectedTableStatus(operationContext(ctx, authenticated_identity), decoded_table_name, logical_name, true)) orelse return textResponse(ctx, 404, "not found");
+        const route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
+        defer if (route) |value| value.deinit(alloc);
+        const target = if (route) |value| try value.target() else try system_catalog.Target.literal(logical_name);
+        const body = (self.api_server.encodeScopedTableStatus(operationContext(ctx, authenticated_identity), target, logical_name, authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err))) orelse return textResponse(ctx, 404, "not found");
         defer self.api_server.alloc.free(body);
         return jsonResponse(ctx, 200, body);
     }

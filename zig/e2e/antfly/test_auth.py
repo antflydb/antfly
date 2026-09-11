@@ -918,6 +918,8 @@ def test_system_catalog_exact_star_grant_is_not_global(auth_api):
         api.s.get(api.url + "/tables/other/documents/gold", timeout=30).status_code
         == 403
     )
+    assert api.get("/tables/%2A")["name"] == "*"
+    assert api.s.get(api.url + "/tables/other", timeout=30).status_code == 403
     assert [table["name"] for table in api.get("/tables")] == ["*"]
     # A bounded page can contain only denied rows. Its cursor must advance
     # without exposing private names or granting access on the next request.
