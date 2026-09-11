@@ -55,6 +55,29 @@ class RuntimeContainerTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
+            # Use a native probe: setup-python's interpreter may itself need
+            # LD_LIBRARY_PATH to find libpython. Launching that interpreter
+            # under the isolated container paths tests its packaging instead
+            # of our runtime's driver discovery contract.
+            probe = root / "driver-probe"
+            subprocess.run(
+                ["cc", "-x", "c", "-", "-o", str(probe), "-ldl"],
+                input="""#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    void *library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!library) { fprintf(stderr, "%s\\n", dlerror()); return 1; }
+    int (*driver)(void) = (int (*)(void))dlsym(library, "antfly_test_driver");
+    if (!driver) { fprintf(stderr, "%s\\n", dlerror()); dlclose(library); return 2; }
+    int result = driver();
+    dlclose(library);
+    return result == 42 ? 0 : 3;
+}
+""",
+                text=True,
+                check=True,
+                capture_output=True,
+            )
             env = os.environ.copy()
             # Map container absolute paths into an isolated fixture root. Do not
             # modify the host or require an NVIDIA driver/GPU on the CI runner.
@@ -62,11 +85,7 @@ class RuntimeContainerTests(unittest.TestCase):
                 str(root / path.lstrip("/")) for path in runtime_library_paths()
             )
             subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import ctypes; assert ctypes.CDLL('libcuda.so.1').antfly_test_driver() == 42",
-                ],
+                [str(probe)],
                 env=env,
                 check=True,
                 capture_output=True,
