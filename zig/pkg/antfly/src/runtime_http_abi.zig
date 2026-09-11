@@ -73,6 +73,17 @@ pub const HeaderView = extern struct {
     value: Bytes,
 };
 
+/// Borrowed only for the synchronous start callback. The receiver copies
+/// header bytes before returning; no allocator crosses the runtime boundary.
+pub const HeaderList = extern struct {
+    ptr: ?[*]const HeaderView = null,
+    len: usize = 0,
+
+    pub fn slice(self: HeaderList) []const HeaderView {
+        return if (self.ptr) |ptr| ptr[0..self.len] else &.{};
+    }
+};
+
 pub const RouteParamView = extern struct {
     name: Bytes,
     value: Bytes,
@@ -121,7 +132,7 @@ pub const CancellationView = extern struct {
 /// and `close` commits the terminating frame. Callbacks are request-scoped.
 pub const StreamSink = extern struct {
     context: ?*anyopaque = null,
-    start: ?*const fn (?*anyopaque, u16, Bytes) callconv(.c) CallbackStatus = null,
+    start: ?*const fn (?*anyopaque, u16, Bytes, HeaderList) callconv(.c) CallbackStatus = null,
     write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
     close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
 };

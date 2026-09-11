@@ -1401,6 +1401,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
+        "runtime HTTP streaming carries policy headers before commitment across both adapters",
         "linked API route manifest preserves internal scan response streaming",
         "scan stream preserves chunk backpressure without buffered fallback",
     };

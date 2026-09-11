@@ -475,7 +475,7 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
             return self.cancelled;
         }
 
-        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8) !void {
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, _: *const httpx.Headers) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(@as(u16, 200), status);
             try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", content_type);
@@ -9002,7 +9002,7 @@ test "httpx inference connection propagates failures after stream commit" {
     const Target = struct {
         fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
             const stream = context.stream;
-            if (stream.start.?(stream.context, 200, inference_connection_abi.Bytes.init("text/event-stream; charset=utf-8")) != .ok or
+            if (stream.start.?(stream.context, 200, inference_connection_abi.Bytes.init("text/event-stream; charset=utf-8"), .{}) != .ok or
                 stream.write.?(stream.context, inference_connection_abi.Bytes.init("data: partial\n\n")) != .ok)
             {
                 return inference_connection_abi.statusFromError(error.Unavailable);
@@ -9015,7 +9015,7 @@ test "httpx inference connection propagates failures after stream commit" {
         bytes: [32]u8 = undefined,
         len: usize = 0,
 
-        fn start(raw: ?*anyopaque, status: u16, _: []const u8) !void {
+        fn start(raw: ?*anyopaque, status: u16, _: []const u8, _: *const httpx.Headers) !void {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
             self.started = status == 200;
         }

@@ -3859,11 +3859,15 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
-        fn deinitOwned(self: *@This(), allocator: Allocator) void {
+        fn deinitOwned(self: *@This(), backend: *BackendType) void {
             switch (self.*) {
                 .owned => |state| {
-                    state.deinit(allocator);
-                    allocator.destroy(state);
+                    if (@hasDecl(BackendType, "retireOwnedMutableSnapshot")) {
+                        backend.retireOwnedMutableSnapshot(state);
+                    } else {
+                        state.deinit(backend.allocator);
+                        backend.allocator.destroy(state);
+                    }
                 },
                 else => {},
             }
@@ -3903,14 +3907,27 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
-            if (purpose == .general and @hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
-                if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
-                    const owned = try backend.allocator.create(State);
-                    errdefer backend.allocator.destroy(owned);
-                    owned.* = snapshot;
-                    mutable_snapshot = .{ .owned = owned };
-                    mutable_snapshot_is_bulk_current_scan_clone = true;
-                } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+            if (purpose == .general and @hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest") and
+                (!@hasDecl(BackendType, "bulkIngestActive") or backend.bulkIngestActive()))
+            {
+                // Allocate the retirement header before acquiring ownership.
+                // An OOM here must not strand a snapshot/accounting lease.
+                const owned = backend.allocator.create(State) catch null;
+                var adopted = false;
+                defer if (!adopted) {
+                    if (owned) |header| backend.allocator.destroy(header);
+                };
+                if (owned) |header| {
+                    if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
+                        header.* = snapshot;
+                        mutable_snapshot = .{ .owned = header };
+                        adopted = true;
+                        mutable_snapshot_is_bulk_current_scan_clone = true;
+                    }
+                }
+                // A denied optional clone, including its retirement header,
+                // falls back to the existing rotation/admission path.
+                if (!adopted and @hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
                     bulk_current_scan_clone_denied = true;
                 }
             } else if (purpose == .replay and @hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
@@ -3923,7 +3940,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (mutable_snapshot.borrowedPtr()) |snapshot| {
                     releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
                 }
-                mutable_snapshot.deinitOwned(backend.allocator);
+                mutable_snapshot.deinitOwned(backend);
             }
             if (mutable_snapshot.ptr() == null) {
                 if (bulk_current_scan_clone_denied and @hasDecl(BackendType, "prepareCurrentScanSnapshot")) {
@@ -3979,10 +3996,14 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             try retainReadReader(BackendType, backend, .current_scan);
             errdefer releaseReadReader(BackendType, backend, .current_scan);
 
-            const owned = try backend.allocator.create(State);
-            errdefer backend.allocator.destroy(owned);
-            owned.* = try backend.cloneReplayLaneMutableRange(namespace, lower, upper);
-            errdefer owned.deinit(backend.allocator);
+            const owned = blk: {
+                const state = try backend.allocator.create(State);
+                errdefer backend.allocator.destroy(state);
+                state.* = try backend.cloneReplayLaneMutableRange(namespace, lower, upper);
+                break :blk state;
+            };
+            var mutable_snapshot: MutableSnapshot = .{ .owned = owned };
+            errdefer mutable_snapshot.deinitOwned(backend);
 
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
@@ -4016,9 +4037,9 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 if (self.mutable_snapshot.borrowedPtr()) |snapshot| {
                     releaseMutableReadSnapshot(BackendType, backend, snapshot, false);
                 }
+                self.mutable_snapshot.deinitOwned(backend);
                 releaseReadReader(BackendType, backend, .current_scan);
             }
-            self.mutable_snapshot.deinitOwned(self.allocator);
             self.* = undefined;
         }
 

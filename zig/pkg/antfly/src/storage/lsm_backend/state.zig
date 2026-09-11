@@ -271,6 +271,57 @@ pub const State = struct {
         self.* = .{};
     }
 
+    /// Allocation-free, owned retirement continuation. Tree edges, flat rows,
+    /// and arena blocks all consume credits; no recursive whole-generation
+    /// destructor is hidden behind completion of a slice.
+    pub const Reclaimer = struct {
+        owned: State,
+        tree: OrderedIndex.Reclaimer,
+        index: usize = 0,
+        complete: bool = false,
+
+        pub fn init(owned: State) @This() {
+            var out = @This(){ .owned = owned, .tree = .init(.{ .root = owned.ordered_root }) };
+            out.owned.ordered_root = null;
+            return out;
+        }
+
+        pub fn step(self: *@This(), allocator: Allocator, credits: *usize) bool {
+            if (self.complete) return true;
+            if (!self.tree.step(allocator, credits)) return false;
+            while (credits.* != 0 and self.index < self.owned.entries.items.len) {
+                credits.* -= 1;
+                self.owned.entries.items[self.index].deinit(allocator);
+                self.index += 1;
+            }
+            if (self.index != self.owned.entries.items.len) return false;
+            if (self.owned.arena_owner) |arena| {
+                // Use the arena's public state to detach one block, then let
+                // its own destructor preserve alignment/allocator semantics.
+                inline for (.{ "used_list", "free_list" }) |field| {
+                    while (credits.* != 0) {
+                        const node = @field(arena.state, field) orelse break;
+                        credits.* -= 1;
+                        @field(arena.state, field) = node.next;
+                        node.next = null;
+                        var part = std.heap.ArenaAllocator.init(arena.child_allocator);
+                        part.state.used_list = node;
+                        part.deinit();
+                    }
+                    if (@field(arena.state, field) != null) return false;
+                }
+            }
+            if (credits.* == 0) return false;
+            credits.* -= 1;
+            self.owned.entries.deinit(allocator);
+            if (self.owned.arena_owner) |arena| allocator.destroy(arena);
+            if (self.owned.account) |account| account.release();
+            self.owned = .{};
+            self.complete = true;
+            return true;
+        }
+    };
+
     pub fn clone(self: *const State, allocator: Allocator) !State {
         // Flat states may subsequently mix allocations from several accounts.
         // Their shared entries retain those accounts individually.

@@ -428,7 +428,7 @@ pub const Context = struct {
 
     pub const StreamDelegate = struct {
         ptr: ?*anyopaque,
-        start: *const fn (?*anyopaque, u16, []const u8) anyerror!void,
+        start: *const fn (?*anyopaque, u16, []const u8, *const Headers) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
     };
@@ -1128,7 +1128,9 @@ pub const Context = struct {
     pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
         if (self.stream_delegate) |delegate| {
             _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
-            try delegate.start(delegate.ptr, status_code, content_type);
+            self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
+            self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
+            try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
         }
         // Middleware has already established response policy (e.g. CORS).
@@ -1136,8 +1138,8 @@ pub const Context = struct {
         // content type and framing. Never reuse a buffered Content-Length.
         var headers = try self.response.headers.clone(self.allocator);
         defer headers.deinit();
-        _ = headers.remove(HeaderName.CONTENT_LENGTH);
-        _ = headers.remove(HeaderName.TRANSFER_ENCODING);
+        headers.removeAll(HeaderName.CONTENT_LENGTH);
+        headers.removeAll(HeaderName.TRANSFER_ENCODING);
         try headers.set(HeaderName.CONTENT_TYPE, content_type);
         if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {

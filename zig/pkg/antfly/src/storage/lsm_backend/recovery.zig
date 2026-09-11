@@ -299,6 +299,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
     }
     if (@hasDecl(BackendType, "drainRetiredLedgers")) backend.drainRetiredLedgers();
+    if (@hasDecl(BackendType, "drainRetiredMemtables")) backend.drainRetiredMemtables();
     if (@hasField(BackendType, "mutable_read_snapshot")) {
         if (backend.mutable_read_snapshot) |state| {
             state.deinit(backend.allocator);

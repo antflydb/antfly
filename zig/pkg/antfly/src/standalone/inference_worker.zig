@@ -47,7 +47,10 @@ const ForwardControl = struct {
         switch (value.kind) {
             .progress => self.progress.update(value.phase, value.completed, value.total, value.model, value.backend),
             .stream_start => {
-                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status, .init(payload.body)));
+                const headers = try self.alloc.alloc(http.HeaderView, value.headers.len);
+                defer self.alloc.free(headers);
+                for (value.headers, headers) |header, *header_view| header_view.* = .{ .name = .init(header.name), .value = .init(header.value) };
+                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status, .init(payload.body), .{ .ptr = headers.ptr, .len = headers.len }));
                 self.stream_started = true;
             },
             .stream_write => {
@@ -638,11 +641,15 @@ const Child = struct {
         emit(request, .{ .kind = .progress, .phase = phase, .completed = completed, .total = total, .model = model.slice(), .backend = backend.slice() }) catch
             request.cancelled.store(true, .release);
     }
-    fn streamStart(raw: ?*anyopaque, status: u16, content_type: http.Bytes) callconv(.c) http.CallbackStatus {
+    fn streamStart(raw: ?*anyopaque, status: u16, content_type: http.Bytes, headers: http.HeaderList) callconv(.c) http.CallbackStatus {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
+        const alloc = request.endpoint.alloc;
+        const values = alloc.alloc(wire.Header, headers.len) catch return .failed;
+        defer alloc.free(values);
+        for (headers.slice(), values) |header, *value| value.* = .{ .name = header.name.slice(), .value = header.value.slice() };
         // The start event's body carries the content type; subsequent chunks
         // keep their existing envelope without an extra JSON field per event.
-        emitBody(request, .{ .kind = .stream_start, .status = status }, content_type.slice()) catch return .canceled;
+        emitBody(request, .{ .kind = .stream_start, .status = status, .headers = values }, content_type.slice()) catch return .canceled;
         return .ok;
     }
     fn streamWrite(raw: ?*anyopaque, bytes: http.Bytes) callconv(.c) http.CallbackStatus {
@@ -769,8 +776,10 @@ test "inference worker streaming events preserve content type and callback ABI" 
         status: u16 = 0,
         bytes: [128]u8 = undefined,
         len: usize = 0,
-        fn start(raw: ?*anyopaque, status: u16, content_type: http.Bytes) callconv(.c) http.CallbackStatus {
+        saw_headers: bool = false,
+        fn start(raw: ?*anyopaque, status: u16, content_type: http.Bytes, headers: http.HeaderList) callconv(.c) http.CallbackStatus {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.saw_headers = headers.len == 1 and std.mem.eql(u8, headers.slice()[0].name.slice(), "X-Test-Policy") and std.mem.eql(u8, headers.slice()[0].value.slice(), "preserved");
             const value = content_type.slice();
             if (value.len > self.bytes.len) return .failed;
             @memcpy(self.bytes[0..value.len], value);
@@ -785,10 +794,11 @@ test "inference worker streaming events preserve content type and callback ABI" 
     for ([_][]const u8{ "text/event-stream", "application/x-ndjson", "application/octet-stream" }) |content_type| {
         var capture: Capture = .{};
         var control: ForwardControl = .{ .alloc = std.testing.allocator, .cancellation = .{}, .stream = .{ .context = &capture, .start = Capture.start } };
-        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire.Event{ .kind = .stream_start, .status = 202 }, .{});
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire.Event{ .kind = .stream_start, .status = 202, .headers = &.{.{ .name = "X-Test-Policy", .value = "preserved" }} }, .{});
         defer std.testing.allocator.free(encoded);
         try ForwardControl.event(&control, .{ .metadata = encoded, .body = content_type });
         try std.testing.expect(control.stream_started);
+        try std.testing.expect(capture.saw_headers);
         try std.testing.expectEqual(@as(u16, 202), capture.status);
         try std.testing.expectEqualStrings(content_type, capture.bytes[0..capture.len]);
     }

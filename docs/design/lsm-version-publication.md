@@ -1,5 +1,44 @@
 # LSM version publication
 
+## Bounded memtable retirement
+
+Last-reader release, including owned replay-lane and bulk-current scans, hands
+the already-allocated generation header to a FIFO without allocating or walking
+rows. One backend-owned continuation reuses the persistent tree's iterative
+reclaimer. Flat entries and individual arena blocks also consume credits. A
+foreground unlock processes at most 2,048 credits or two milliseconds, checking
+time between 64-credit quanta. New arrivals cannot displace the oldest job.
+
+The backend mutex is released during destruction. A lifecycle pin protects the
+backend while unlocked, and an independent accounting reference remains visible
+until the continuation completes. Tree charges shrink as allocations disappear;
+flat/arena generations conservatively retain their publication-time byte charge
+until completion. Retirement does not rescan entries to calculate that charge.
+Remaining work wakes maintenance even in bulk mode, after a durability fence,
+or on a read-only backend. It needs no I/O or new-memory admission. Close and
+simulated-crash teardown drain the same continuation, yielding through `std.Io`
+between slices without abandoning ownership on cancellation.
+
+Maintenance stats expose `memtable_reclaim_pending`, `memtable_reclaim_slices`,
+`memtable_reclaim_units`, and `memtable_reclaim_max_slice_ns`. A single allocator
+operation and mutex contention can exceed the cooperative time budget; this is
+not a hard real-time deadline or a reduction in total destruction work.
+
+Initial local arm64 ReleaseFast microbenchmark with the production allocator:
+at 1,000 / 10,000 / 100,000 rows, recursive last-reference destruction took
+10 / 112 / 1,010 microseconds. Actual read-transaction release with bounded
+cleanup took 18 / 30 / 21 microseconds. The largest generation drained in 49
+slices (maximum measured slice 26 microseconds), with 1.34 milliseconds of
+remaining drain work. These are in-memory cleanup timings, not SST throughput
+or end-to-end query latency. Debug tests separately cover allocation failures,
+shared roots, tree/flat/arena ownership, FIFO/reentrancy, cancellation, read-only
+maintenance, owned scans, and close/abandon with partially reclaimed trees.
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'memtable reclamation'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'memtable reclamation last-reference latency benchmark'
+```
+
 ## Read-side ownership across storage and runtime boundaries
 
 Publication decisions read the generation's produced/skipped/failed tuple and
@@ -26,6 +65,18 @@ then lends the HTTP response sink to the API kernel; an internal NDJSON scan
 must not fall through the buffered-only default and attempt to use a raw socket
 that belongs to another runtime. A manifest regression covers the real internal
 scan route and its buffered-query neighbor.
+
+Stream start also carries the complete response-header set across the runtime
+boundary, not just status and content type. Otherwise a remote scan loses its
+catalog-fence acknowledgement and retries forever, while a locally routed scan
+appears healthy. The C-layout header view is borrowed for the synchronous start
+callback; the transport copies its values before committing. Repeated fields
+remain repeated, application policy replaces matching outer middleware fields,
+and the transport retains ownership of content length and transfer framing.
+The common path uses sixteen inline header views. Inference-worker start events
+carry the same headers; the affected runtime ABI and worker wire versions have
+advanced together. Regressions cover acknowledgement/CORS fields, repeated
+cookies, inline/overflow header sets, allocation failures, and worker forwarding.
 
 Local arm64 ReleaseFast hot-metadata microbenchmark, 10,000 four-counter reads
 with the production allocator: LSM took 7.52 ms with independent probes versus

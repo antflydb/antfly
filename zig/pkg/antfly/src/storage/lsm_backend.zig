@@ -661,9 +661,7 @@ fn walOperationLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
 
 pub const Backend = struct {
     const ReclaimingMemory = struct {
-        states: ?*State,
         next: ?*ReclaimingMemory,
-        directories: ?*RunDirectory = null,
         versions: ?*runtime_mod.ReadVersion = null,
     };
     pub var test_deep_mutable_snapshots: bool = false;
@@ -913,6 +911,10 @@ pub const Backend = struct {
         ledger_reclaim_slices: u64 = 0,
         ledger_reclaim_units: u64 = 0,
         ledger_reclaim_max_slice_ns: u64 = 0,
+        memtable_reclaim_pending: u64 = 0,
+        memtable_reclaim_slices: u64 = 0,
+        memtable_reclaim_units: u64 = 0,
+        memtable_reclaim_max_slice_ns: u64 = 0,
         active_readers: u64 = 0,
         active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
@@ -1037,6 +1039,10 @@ pub const Backend = struct {
         dst.ledger_reclaim_slices +|= src.ledger_reclaim_slices;
         dst.ledger_reclaim_units +|= src.ledger_reclaim_units;
         dst.ledger_reclaim_max_slice_ns = @max(dst.ledger_reclaim_max_slice_ns, src.ledger_reclaim_max_slice_ns);
+        dst.memtable_reclaim_pending +|= src.memtable_reclaim_pending;
+        dst.memtable_reclaim_slices +|= src.memtable_reclaim_slices;
+        dst.memtable_reclaim_units +|= src.memtable_reclaim_units;
+        dst.memtable_reclaim_max_slice_ns = @max(dst.memtable_reclaim_max_slice_ns, src.memtable_reclaim_max_slice_ns);
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
@@ -1745,6 +1751,13 @@ pub const Backend = struct {
     retired_read_versions: ?*runtime_mod.ReadVersion = null,
     live_read_versions: ?*runtime_mod.ReadVersion = null,
     retired_memory_head: ?*State = null,
+    retired_memory_tail: ?*State = null,
+    memtable_reclaimer: ?@import("lsm_backend/memtable_reclamation.zig").Job = null,
+    memtable_reclaim_in_flight: bool = false,
+    memtable_reclaim_pending: u64 = 0,
+    memtable_reclaim_slices: u64 = 0,
+    memtable_reclaim_units: u64 = 0,
+    memtable_reclaim_max_slice_ns: u64 = 0,
     reclaiming_memory: ?*ReclaimingMemory = null,
     gc_maintenance_turn: u8 = 0,
     tombstone_gc_retry_after_ns: u64 = 0,
@@ -2361,6 +2374,10 @@ pub const Backend = struct {
         stats.ledger_reclaim_slices = self.ledger_reclaim_slices;
         stats.ledger_reclaim_units = self.ledger_reclaim_units;
         stats.ledger_reclaim_max_slice_ns = self.ledger_reclaim_max_slice_ns;
+        stats.memtable_reclaim_pending = self.memtable_reclaim_pending;
+        stats.memtable_reclaim_slices = self.memtable_reclaim_slices;
+        stats.memtable_reclaim_units = self.memtable_reclaim_units;
+        stats.memtable_reclaim_max_slice_ns = self.memtable_reclaim_max_slice_ns;
         stats.tombstone_reconcile_rows = self.tombstone_reconcile_rows;
         stats.tombstone_reconcile_completed = self.tombstone_reconcile_completed;
         stats.tombstone_reconcile_failures = self.tombstone_reconcile_failures;
@@ -2699,6 +2716,7 @@ pub const Backend = struct {
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) score +|= 1;
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) score +|= 1;
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) score +|= 1;
         if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
@@ -2905,14 +2923,11 @@ pub const Backend = struct {
         for (self.retired_mutable_snapshots.items) |snapshot| bytes +|= snapshot.accountedMemoryBytes(pass);
         if (candidate) |prepared| bytes +|= prepared.accountedMemoryBytes(pass);
         var retired = self.retired_memory_head;
-        while (retired) |state| : (retired = state.retired_next) bytes +|= state.accountedMemoryBytes(pass);
+        while (retired) |state| : (retired = state.retired_next) bytes +|= @sizeOf(State) +| state.accountedMemoryBytes(pass);
+        if (self.memtable_reclaimer) |*job| bytes +|= job.memoryBytes(pass);
         var reclaiming = self.reclaiming_memory;
         while (reclaiming) |batch| : (reclaiming = batch.next) {
-            bytes +|= runMetadataMemoryBytes(batch.directories, batch.versions, pass);
-            var state = batch.states;
-            while (state) |pending| : (state = pending.retired_next) {
-                bytes +|= if (pending.account) |account| account.chargeOnce(pass) else pending.frozen_memory_bytes.?;
-            }
+            bytes +|= runMetadataMemoryBytes(null, batch.versions, pass);
         }
         return bytes;
     }
@@ -2953,6 +2968,10 @@ pub const Backend = struct {
         while (self.retired_ledger_snapshots != null) @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
         std.debug.assert(self.ledger_snapshots == null);
         self.mu.unlock();
+    }
+
+    pub fn drainRetiredMemtables(self: *Backend) void {
+        @import("lsm_backend/memtable_reclamation.zig").drain(self);
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
@@ -3010,7 +3029,6 @@ pub const Backend = struct {
     }
 
     pub fn runMaintenanceStepBestEffort(self: *Backend) !bool {
-        if (self.options.backend.read_only) return false;
         if (!self.mu.tryLock()) return false;
         defer self.unlockWithReclamation();
         return try self.runMaintenanceStepLocked();
@@ -3028,6 +3046,7 @@ pub const Backend = struct {
         // Cleanup is safe even after a durability fence or under pressure.
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return true;
         if (self.manifest_recovery_required) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
@@ -3423,6 +3442,7 @@ pub const Backend = struct {
         else
             try self.mutable.snapshot(self.allocator);
         errdefer snapshot.deinit(self.allocator);
+        snapshot.freezeMemoryAccounting();
         self.recordMutableSnapshotClone(&snapshot, reason);
         return snapshot;
     }
@@ -3460,6 +3480,7 @@ pub const Backend = struct {
         if (self.mutable.ordered_enabled) return self.cloneMutableStateWithReason(.current_scan);
         var snapshot = try self.mutable.cloneRangeArena(self.allocator, namespace, lower, upper);
         errdefer snapshot.deinit(self.allocator);
+        snapshot.freezeMemoryAccounting();
         self.recordMutableSnapshotClone(&snapshot, .current_scan);
         return snapshot;
     }
@@ -3473,7 +3494,6 @@ pub const Backend = struct {
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
-        snapshot.freezeMemoryAccounting();
         errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         try self.retired_mutable_snapshot_by_state.ensureUnusedCapacity(self.allocator, 1);
@@ -3530,7 +3550,7 @@ pub const Backend = struct {
     pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
         if (!self.bulkIngestActive()) return null;
         if (self.options.bulk_ingest_current_scan_clone_max_bytes == 0) return null;
-        if (self.mutable.entryCount() == 0) return State{};
+        if (self.mutable.entryCount() == 0) return State{ .frozen_memory_bytes = 0 };
         const mutable_bytes = estimateStateBytes(&self.mutable);
         if (mutable_bytes > self.options.bulk_ingest_current_scan_clone_max_bytes) return null;
         if (!self.canAdmitBulkIngestCurrentScanClone(mutable_bytes)) {
@@ -3598,14 +3618,20 @@ pub const Backend = struct {
     }
 
     fn destroyMutableSnapshot(self: *Backend, state: *State) void {
-        state.retired_next = self.retired_memory_head;
-        self.retired_memory_head = state;
+        @import("lsm_backend/memtable_reclamation.zig").retire(self, state);
+    }
+
+    /// Owned replay/bulk snapshots use the same infallible handoff as shared
+    /// reader epochs. Caller holds Backend.mu and transfers the header.
+    pub fn retireOwnedMutableSnapshot(self: *Backend, state: *State) void {
+        self.destroyMutableSnapshot(state);
     }
 
     /// Detach retired generations while serialized; reclaim their potentially
     /// large subtrees outside the writer lock. A lifecycle pin protects close.
     pub fn unlockWithReclamation(self: *Backend) void {
         @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
+        @import("lsm_backend/memtable_reclamation.zig").reclaimSliceLocked(self);
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
         // Reclamation releases lifecycle pins only. It must not initiate a
         // best-effort manifest write and consume a durability error belonging
@@ -3616,49 +3642,22 @@ pub const Backend = struct {
         self.reclaimStoreSliceLocked();
         self.reclaimDirectorySliceLocked();
         var turns: usize = 0;
-        while ((self.retired_memory_head != null or self.retired_read_versions != null) and turns < 8) : (turns += 1) {
-            var batch = ReclaimingMemory{ .states = self.retired_memory_head, .next = self.reclaiming_memory, .directories = null, .versions = self.retired_read_versions };
-            self.retired_memory_head = null;
+        while (self.retired_read_versions != null and turns < 8) : (turns += 1) {
+            var batch = ReclaimingMemory{ .next = self.reclaiming_memory, .versions = self.retired_read_versions };
             self.retired_read_versions = null;
-            var directory = batch.directories;
-            while (directory) |item| : (directory = item.retired_next) {
-                item.retainAccounting();
-            }
             var version = batch.versions;
             while (version) |item| : (version = item.retired_next) {
                 if (item.directory) |dir| dir.retainAccounting();
             }
-            // Keep accounting handles reachable even if another operation
-            // replaces the live memtable while this batch is being reclaimed.
-            var retired = batch.states;
-            while (retired) |state| : (retired = state.retired_next) {
-                if (state.account) |account| _ = account.retain() else state.freezeMemoryAccounting();
-            }
             self.reclaiming_memory = &batch;
             self.retainReaderKind(.other);
             self.mu.unlock();
-            directory = batch.directories;
-            while (directory) |item| : (directory = item.retired_next) {
-                item.destroyContents(self.allocator);
-            }
             version = batch.versions;
             while (version) |item| : (version = item.retired_next) item.destroyContents(self);
-            retired = batch.states;
-            while (retired) |state| : (retired = state.retired_next) {
-                // Leave the small header immutable for concurrent accounting.
-                var owned = state.*;
-                owned.deinit(self.allocator);
-            }
             _ = runtime_mod.lockBackend(Backend, self);
             var link = &self.reclaiming_memory;
             while (link.*.? != &batch) link = &link.*.?.next;
             link.* = batch.next;
-            directory = batch.directories;
-            while (directory) |item| {
-                directory = item.retired_next;
-                item.releaseAccounting();
-                self.allocator.destroy(item);
-            }
             version = batch.versions;
             while (version) |item| {
                 version = item.retired_next;
@@ -3667,12 +3666,6 @@ pub const Backend = struct {
                     item.allocator.destroy(dir);
                 }
                 item.allocator.destroy(item);
-            }
-            retired = batch.states;
-            while (retired) |state| {
-                retired = state.retired_next;
-                if (state.account) |account| account.release();
-                self.allocator.destroy(state);
             }
             // File pins held by retired metadata have now been released. Run
             // the usual reader-release checkpoint only after reclamation.
@@ -3684,7 +3677,8 @@ pub const Backend = struct {
         // Small snapshot retirements normally finish in this unlock. Only
         // residual debt warrants a worker; pre-unlock scheduling would submit
         // an otherwise empty background job on each ordinary manifest edit.
-        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) self.scheduleMaintenanceJobLocked(true);
+        if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+            @import("lsm_backend/memtable_reclamation.zig").pending(self)) self.scheduleMaintenanceJobLocked(true);
         self.mu.unlock();
     }
 
@@ -4728,11 +4722,12 @@ pub const Backend = struct {
 
     fn scheduleMaintenanceJobLocked(self: *Backend, after_reclamation: bool) void {
         if (self.closing.load(.acquire)) return;
-        if (self.options.backend.read_only) return;
         const pending_ledger = self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight;
-        const ledger_cleanup = after_reclamation and pending_ledger;
+        const pending_memory = @import("lsm_backend/memtable_reclamation.zig").pending(self);
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory);
+        if (self.options.backend.read_only and !ledger_cleanup) return;
         if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
-        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation);
+        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation);
         if (self.options.maintenance_waker != null) {
             if (score != 0) self.wakeMaintenanceWorker();
             return;
@@ -8152,6 +8147,7 @@ pub const Backend = struct {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
         if (self.manifest_recovery_required) return null;
 
         // Keep the advertised deadline consistent with runMaintenanceStepLocked:
