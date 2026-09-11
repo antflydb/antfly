@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
+const openapi_specs = @import("antfly_openapi_specs");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -6126,7 +6127,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         if (std.mem.eql(u8, path, routes.Routes.ard_v1_openapi)) {
-            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, build_options.ard_openapi_ard_yaml));
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, openapi_specs.ard));
         }
         if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_openapi_prefix)) {
             const name = path[routes.Routes.ard_v1_openapi_prefix.len..];
@@ -6368,11 +6369,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
-        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = build_options.ard_openapi_antfly_yaml };
-        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = build_options.ard_openapi_metadata_yaml };
-        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = build_options.ard_openapi_inference_config_yaml };
-        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
-        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
+        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = openapi_specs.antfly };
+        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = openapi_specs.metadata };
+        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = openapi_specs.inference_config };
+        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = openapi_specs.extensions, .admin_only = true };
+        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = openapi_specs.auth, .admin_only = true };
         return null;
     }
 

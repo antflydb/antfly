@@ -124,7 +124,7 @@ for candidate_model_dir in "${model_dirs[@]}"; do
           ;;
       esac
       echo "model_dir=${candidate_model_dir} graph_mode=${graph_mode} qmatmul_variant=${qmatmul_variant}"
-      env "${graph_env[@]}" ANTFLY_CUDA_QMATMUL_VARIANT="$qmatmul_variant" timeout "$timeout_seconds" "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" bench-reranker-e2e -- \
+      env "${graph_env[@]}" ANTFLY_CUDA_QMATMUL_VARIANT="$qmatmul_variant" timeout "$timeout_seconds" "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Doptimize=ReleaseFast -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" bench-reranker-e2e -- \
         --model-dir "$candidate_model_dir" \
         --backend cuda \
         --warmup-iters "$warmup_iters" \
