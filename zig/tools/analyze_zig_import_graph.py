@@ -1247,9 +1247,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if args.check_api_kernel_boundary and not check_api_kernel_boundary(graph):
             return 1
-        if (
-            args.check_compiled_storage_boundary
-            and not check_compiled_storage_boundary(reports, graph.source_root)
+        if args.check_compiled_storage_boundary and not check_compiled_storage_boundary(
+            reports, graph.source_root
         ):
             return 1
         if args.check_ha_seed_failure_registry and not check_ha_seed_failure_registry(

@@ -54,7 +54,9 @@ def audit_manifest(
         (source if source.is_absolute() else root / source).resolve()
         for source in dedicated_sources
     )
-    for source, count in sorted(dedicated_counts.items(), key=lambda item: str(item[0])):
+    for source, count in sorted(
+        dedicated_counts.items(), key=lambda item: str(item[0])
+    ):
         try:
             relative = source.relative_to(root)
         except ValueError:
@@ -66,9 +68,13 @@ def audit_manifest(
         if count != 1:
             failures.append(f"dedicated test source listed {count} times: {relative}")
         if source not in declared:
-            failures.append(f"dedicated test source has no test declarations: {relative}")
+            failures.append(
+                f"dedicated test source has no test declarations: {relative}"
+            )
         if counts.get(source, 0) != 0:
-            failures.append(f"dedicated test source also imported by manifest: {relative}")
+            failures.append(
+                f"dedicated test source also imported by manifest: {relative}"
+            )
 
     for source, count in sorted(counts.items(), key=lambda item: str(item[0])):
         try:

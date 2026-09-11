@@ -90,10 +90,7 @@ class StorageTestShardAuditTest(unittest.TestCase):
             '_ = @import("kernel_owner_test.zig");\n',
         )
         self.assertEqual(
-            [
-                "dedicated test source also imported by manifest: "
-                "kernel_owner_test.zig"
-            ],
+            ["dedicated test source also imported by manifest: kernel_owner_test.zig"],
             self.audit(
                 ["storage.kernel_owner_test."],
                 [Path("kernel_owner_test.zig")],

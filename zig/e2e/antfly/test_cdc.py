@@ -1183,9 +1183,9 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         interval_s=0.25,
     )
     statuses_before_restart = _metadata_replication_status_records(stateful_api)
-    assert (
-        matching_before_restart
-    ), f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+    assert matching_before_restart, (
+        f"unexpected replication statuses before restart: {statuses_before_restart!r}"
+    )
     assert any(
         status.get("phase") == "cutover_prepared" and status.get("prepared_checkpoint")
         for status in matching_before_restart
@@ -1217,12 +1217,12 @@ def test_stateful_postgres_cdc_resumes_after_restart(stateful_api, pg_cdc_source
         ),
         "",
     )
-    assert (
-        prepared_checkpoint_before_restart
-    ), f"missing prepared_checkpoint before restart\n{statuses_before_restart!r}"
-    assert (
-        cutover_mode_before_restart == "exported_snapshot"
-    ), f"unexpected cutover_mode before restart\n{statuses_before_restart!r}"
+    assert prepared_checkpoint_before_restart, (
+        f"missing prepared_checkpoint before restart\n{statuses_before_restart!r}"
+    )
+    assert cutover_mode_before_restart == "exported_snapshot", (
+        f"unexpected cutover_mode before restart\n{statuses_before_restart!r}"
+    )
     assert stream_checkpoint_before_restart, (
         "missing stream_checkpoint before restart after streamed insert\n"
         f"{statuses_before_restart!r}"
