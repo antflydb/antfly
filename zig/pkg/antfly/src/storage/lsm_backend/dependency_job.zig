@@ -238,16 +238,7 @@ pub const Job = struct {
                     return true;
                 };
                 const run = handle.run;
-                if (run.level == 0)
-                    self.oldest_visibility = @min(self.oldest_visibility, if (run.visibility_id == 0) run.id else run.visibility_id);
-                if (self.index == 0 or compare(run.smallest_namespace_name, run.smallest_key, self.lower_ns, self.lower) == .lt) {
-                    self.lower_ns = run.smallest_namespace_name;
-                    self.lower = run.smallest_key;
-                }
-                if (self.index == 0 or compare(run.largest_namespace_name, run.largest_key, self.upper_ns, self.upper) == .gt) {
-                    self.upper_ns = run.largest_namespace_name;
-                    self.upper = run.largest_key;
-                }
+                self.noteInputBounds(run, self.index == 0);
                 try self.members.prepare(allocator);
                 self.members.putPrepared(allocator, .{ .id = run.id });
                 self.index += 1;
@@ -267,6 +258,18 @@ pub const Job = struct {
             }
         }
         return false;
+    }
+    /// Also used while preparing a publication from an already-validated plan.
+    pub fn noteInputBounds(self: *Job, run: *const @import("repository.zig").Run, first: bool) void {
+        if (run.level == 0) self.oldest_visibility = @min(self.oldest_visibility, if (run.visibility_id == 0) run.id else run.visibility_id);
+        if (first or compare(run.smallest_namespace_name, run.smallest_key, self.lower_ns, self.lower) == .lt) {
+            self.lower_ns = run.smallest_namespace_name;
+            self.lower = run.smallest_key;
+        }
+        if (first or compare(run.largest_namespace_name, run.largest_key, self.upper_ns, self.upper) == .gt) {
+            self.upper_ns = run.largest_namespace_name;
+            self.upper = run.largest_key;
+        }
     }
     fn acceptOutside(self: *Job, run: *const @import("repository.zig").Run) bool {
         const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;

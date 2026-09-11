@@ -1707,6 +1707,7 @@ pub const Backend = struct {
     run_directory_generation: u64 = 0,
     retired_run_directories: ?*RunDirectory = null,
     retired_run_stores: ?*RunStore = null,
+    active_compaction_publications: ?*compaction_mod.Publication = null,
     retired_closures: ?*compaction_mod.PendingDirectoryClosure = null,
     closure_reclaim_in_flight: bool = false,
     store_reclaimer: ?RunStore.Reclaimer = null,
@@ -2737,6 +2738,8 @@ pub const Backend = struct {
     fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
         const pass = state_mod.memory_account.nextPass();
         var bytes = self.mutable.accountedMemoryBytes(pass);
+        var publication = self.active_compaction_publications;
+        while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
         bytes +|= self.runs.memoryBytes(pass);
         var retired_store = self.retired_run_stores;
         while (retired_store) |store| : (retired_store = store.retired_next) bytes +|= @sizeOf(RunStore) + store.memoryBytes(pass);
@@ -5334,6 +5337,12 @@ pub const Backend = struct {
         for (0..plan.source_len + plan.target_len) |i| {
             wire +|= 20 +| (if (run_store_mod.planAt(self, plan, i).path) |path| path.len else 0);
         }
+        return self.admitCompactionMetadataBytes(wire);
+    }
+
+    pub fn admitCompactionMetadataBytes(self: *Backend, wire: u64) !MetadataCredit {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.root_dir == null) return .{ .backend = self, .bytes = 0 };
         self.reconcileManifestCredit();
         if (!self.manifestCreditFits(wire)) return error.ResourceBudgetExceeded;
         self.manifest_reserved_mutation_bytes += wire;
@@ -5711,6 +5720,19 @@ pub const Backend = struct {
         }
         self.write_stats.compaction_output_bytes +|= output_bytes;
         self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
+    }
+
+    pub fn recordPreparedCompactionWriteStats(self: *Backend, input_bytes: u64, output_bytes: u64, files: u64, file_bytes: u64, compression: lsm_table_file.CompressionStats, elapsed_ns: u64) void {
+        self.write_stats.compactions +|= 1;
+        self.write_stats.compaction_input_bytes +|= input_bytes;
+        self.write_stats.compaction_output_bytes +|= output_bytes;
+        self.write_stats.compaction_ns +|= elapsed_ns;
+        self.write_stats.compaction_max_input_bytes = @max(self.write_stats.compaction_max_input_bytes, input_bytes);
+        self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
+        self.write_stats.compaction_max_ns = @max(self.write_stats.compaction_max_ns, elapsed_ns);
+        self.write_stats.table_file_writes +|= files;
+        self.write_stats.table_file_bytes +|= file_bytes;
+        self.recordTableCompressionWriteStats(compression);
     }
 
     fn recordSortedIngestWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {

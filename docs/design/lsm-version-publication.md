@@ -2,6 +2,59 @@
 
 ## Logical-generation scheduling and unknown metadata
 
+### Time-sliced compaction publication
+
+Compaction installation now owns a registered publication job. It pins immutable
+writer, directory and obsolete-ledger roots, admits preparation memory, and
+stages removals, outputs, garbage-collection intent and retention metadata outside
+the backend mutex. Preparation uses at most 512 edits or two milliseconds per
+slice, with `std.Io` handoffs between slices. Selected handles remain owned until
+cleanup; candidate headers are never inspected by concurrent accounting passes.
+Shared allocation accounts and a conservative working-set reservation account
+for preparation, including additional names and concurrent-change rebasing.
+
+Before publication, bounded persistent-tree diffs replay unrelated writer and
+obsolete-ledger changes onto the candidate. The dependency certificate rejects
+changed inputs or newly unsafe coverage. Four rebase attempts bound retries under
+continuous churn; a stale attempt discards its unpublished output files. All
+three roots must still match their certified bases at the final fence. Metadata
+journal admission occurs before any live mutation; then root swaps, preaggregated
+statistics and dirty flags publish together without input-count-dependent work.
+
+The post-publication path releases old writer-file references in batches of 64,
+invalidates caches off-lock, and sends retired writer/directory roots through
+bounded reclamation. Detached obsolete ledgers and partial preparation state also
+use explicit cleanup credits, including cancellation and allocation failure.
+Cleanup completes even when the caller has been cancelled. Retention deadlines
+are refreshed off-lock when preparation consumes part of the configured period;
+conservative slack prevents repeatedly chasing the publication clock. They never
+shorten the minimum retention period, and zero retention stays immediately
+eligible. The durable manifest and reader/file pins still govern actual deletion.
+
+Local arm64 ReleaseFast metadata-only benchmark (`std.Io.Clock.awake`):
+
+| Selected inputs | Previous locked writer/directory removals | Atomic publish fence | Off-lock preparation | Maximum preparation slice |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.507 ms | 0.333 µs | 0.708 ms | 0.377 ms |
+| 10,000 | 7.108 ms | 0.459 µs | 10.928 ms | 0.654 ms |
+| 50,000 | 46.935 ms | 0.458 µs | 62.824 ms | 0.784 ms |
+
+The old baseline measures only writer/directory removals; the new preparation
+also stages the obsolete ledger. These are isolated local samples, not sustained
+throughput or request-tail-latency claims. Total preparation still scales with
+selected inputs and has additional ownership/rebase costs. The win is removing
+that work from the shared mutex. Time slicing is cooperative: one allocator,
+cache or storage operation may exceed the target. The fixture has no SST I/O,
+advancing retention clock, active readers or concurrent writes; regression tests
+separately cover rebase, retention, failure cleanup and resource-credit release.
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction publication stages' --test-filter 'obsolete ledger' --test-filter 'obsolete run cleanup fault'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction publication atomic fence scaling benchmark'
+```
+
+### Logical-generation scheduling
+
 The directory maintains a persistent L0 generation index alongside its file
 indexes. Each entry contains the publication sequence, physical file count and
 bytes; subtree summaries expose total files/bytes and the largest generation.

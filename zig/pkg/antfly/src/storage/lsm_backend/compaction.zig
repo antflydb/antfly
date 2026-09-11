@@ -22,6 +22,7 @@ const Directory = @import("run_directory.zig").Directory;
 const run_store = @import("run_store.zig");
 const ClosureJob = @import("closure_job.zig").Job;
 const DependencyValidation = @import("dependency_validation.zig").Validation;
+pub const Publication = @import("compaction_publication.zig").Job;
 pub const BulkPolicy = @import("bulk_selection.zig").Policy;
 const BulkSelection = @import("bulk_selection.zig").Job;
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -5065,59 +5066,36 @@ fn installCompactedRuns(
 }
 
 fn installOwnedTreeRuns(backend: anytype, plan: CompactionPlan, selected_len: usize, input_bytes: u64, start_ns: u64, outputs: *std.ArrayListUnmanaged(Run)) !void {
-    const allocator = backend.allocator;
-    const retired_store = try allocator.create(run_store.Store);
-    errdefer allocator.destroy(retired_store);
-    var metadata_credit = try backend.admitCompactionMetadata(plan, outputs.items);
-    defer metadata_credit.release();
-    var candidate = backend.runs.fork();
-    errdefer candidate.deinit(allocator);
-    var retired: std.ArrayListUnmanaged(Run) = .empty;
-    errdefer {
-        for (retired.items) |*run| run.deinit(allocator);
-        retired.deinit(allocator);
-    }
-    try retired.ensureTotalCapacity(allocator, selected_len);
-    var paths: std.ArrayListUnmanaged([]u8) = .empty;
+    std.debug.assert(selected_len == plan.source_len + plan.target_len);
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    const publication = @import("compaction_publication.zig");
+    errdefer publication.releaseOutputsLocked(backend, outputs, true);
+    var job = try Publication.init(backend, plan, outputs.items.len);
+    job.next = backend.active_compaction_publications;
+    backend.active_compaction_publications = &job;
     defer {
-        for (paths.items) |path| allocator.free(path);
-        paths.deinit(allocator);
+        job.finishLocked(backend, outputs);
+        var link = &backend.active_compaction_publications;
+        while (link.*.? != &job) link = &link.*.?.next;
+        link.* = job.next;
     }
-    try paths.ensureTotalCapacity(allocator, selected_len);
-    for (0..selected_len) |i| {
-        const run = run_store.planAt(backend, plan, i);
-        if (run.path) |path| paths.appendAssumeCapacity(try allocator.dupe(u8, path));
-        retired.appendAssumeCapacity(run.retainOwned());
-        try candidate.remove(allocator, run);
+    while (true) {
+        const ready = job.advanceLocked(backend, outputs.items) catch |err| {
+            if (err != error.CompactionPlanningStale) return err;
+            publication.releaseOutputsLocked(backend, outputs, true);
+            return;
+        };
+        backend.directory_planning_slices +|= 1;
+        if (ready) break;
+        if (backend.manifestCoordinationIo()) |io| {
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            const yielded = io.sleep(.fromNanoseconds(1), .awake);
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            try yielded;
+        }
     }
-    reconcileGcObjective(&backend.runs, plan, outputs.items);
-    for (outputs.items) |run| try candidate.stage(allocator, run);
-    try backend.reserveObsoletePublication(paths.items.len, @intFromBool(selected_len != 0));
-    const directory = try backend.prepareRunDirectoryChange(plan, outputs.items);
-    // Everything below is allocation-free. Untouched runs stay shared; only
-    // removed payloads move to the retirement owner and outputs are adopted.
-    var output_bytes: u64 = 0;
-    for (outputs.items) |run| {
-        candidate.adopt(&run);
-        output_bytes +|= run.size_bytes;
-    }
-    backend.recordCompactionWriteStats(input_bytes, outputs.items, elapsedNs(@TypeOf(backend.*), backend, start_ns));
-    disarmRunList(outputs);
-    outputs.deinit(allocator);
-    outputs.* = .empty;
-    backend.invalidateReadVersion();
-    std.mem.swap(run_store.Store, &backend.runs, &candidate);
-    retired_store.* = candidate;
-    backend.retireRunStore(retired_store);
-    backend.publishRunDirectory(directory);
-    metadata_credit.commit();
-    backend.compaction_stats.compactions += 1;
-    backend.compaction_stats.input_runs += selected_len;
-    backend.compaction_stats.input_bytes +|= input_bytes;
-    backend.compaction_stats.output_bytes +|= output_bytes;
-    for (paths.items) |path| backend.queueObsoleteFilePathAssumeCapacity(path);
-    paths.items.len = 0;
-    backend.queueObsoleteRunsAssumeCapacity(retired);
+    try job.publishLocked(backend, input_bytes, start_ns);
 }
 
 pub fn discardOutputRuns(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {

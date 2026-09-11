@@ -77,6 +77,74 @@ pub const Ledger = struct {
     pub fn fork(self: *const Ledger) Ledger {
         return .{ .tree = self.tree.fork(), .allocator = self.allocator };
     }
+    /// Consumes a detached ledger. Shared subtrees and spare payloads are
+    /// reclaimed with explicit credits, including cancellation/OOM cleanup.
+    pub const Reclaimer = struct {
+        tree: Tree.Reclaimer,
+        spare: std.ArrayListUnmanaged(*Payload),
+        account: ?*Account,
+        pub fn init(ledger: Ledger) Reclaimer {
+            return .{ .tree = .init(ledger.tree), .spare = ledger.spare, .account = ledger.tree.account };
+        }
+        pub fn step(self: *Reclaimer, allocator: std.mem.Allocator, credits: *usize) bool {
+            while (credits.* != 0) {
+                const payload = self.spare.pop() orelse break;
+                credits.* -= 1;
+                self.account.?.discharge(@sizeOf(Payload));
+                allocator.destroy(payload);
+            }
+            if (self.spare.items.len != 0) return false;
+            self.spare.deinit(allocator);
+            self.spare = .empty;
+            return self.tree.step(allocator, credits);
+        }
+    };
+
+    /// Both ledger roots must remain pinned until this bounded diff completes.
+    pub const ChangeCursor = struct {
+        pub const Change = struct { kind: enum { remove, put }, path: Path };
+        previous: ?*Tree.Node,
+        current: ?*Tree.Node,
+        stack: [2 * @bitSizeOf(usize)]*Tree.Node = undefined,
+        len: usize = 0,
+        phase: enum { removed, added, done } = .removed,
+        pub fn init(previous: *const Ledger, current: *const Ledger) ChangeCursor {
+            var out = ChangeCursor{ .previous = previous.tree.root, .current = current.tree.root };
+            out.push(previous.tree.root);
+            return out;
+        }
+        fn push(self: *ChangeCursor, node: ?*Tree.Node) void {
+            if (node) |value| {
+                self.stack[self.len] = value;
+                self.len += 1;
+            }
+        }
+        pub fn done(self: *const ChangeCursor) bool {
+            return self.phase == .done;
+        }
+        pub fn next(self: *ChangeCursor, credits: *usize) ?Change {
+            while (credits.* != 0 and !self.done()) {
+                if (self.len == 0) {
+                    if (self.phase == .removed) {
+                        self.phase = .added;
+                        self.push(self.current);
+                    } else self.phase = .done;
+                    continue;
+                }
+                credits.* -= 1;
+                self.len -= 1;
+                const node = self.stack[self.len];
+                const matched = Tree.find(if (self.phase == .removed) self.current else self.previous, node.entry);
+                if (matched == node) continue;
+                self.push(node.right);
+                self.push(node.left);
+                if (self.phase == .removed) {
+                    if (matched == null) return .{ .kind = .remove, .path = node.entry.value() };
+                } else if (matched == null or !Entry.eql(matched.?.entry, node.entry)) return .{ .kind = .put, .path = node.entry.value() };
+            }
+            return null;
+        }
+    };
     pub fn deinit(self: *Ledger, allocator: std.mem.Allocator) void {
         for (self.spare.items) |payload| {
             self.tree.account.?.discharge(@sizeOf(Payload));
@@ -255,6 +323,20 @@ test "obsolete ledger snapshots retain deadlines and diff only changed paths" {
     try ledger.changesSince(&snapshot, &visitor);
     try std.testing.expectEqual(@as(usize, 1), visitor.puts);
     try std.testing.expectEqual(@as(usize, 1), visitor.removes);
+    var delta = Ledger.ChangeCursor.init(&snapshot, &ledger);
+    var bounded: Visitor = .{};
+    var visits: usize = 0;
+    while (!delta.done()) {
+        var credits: usize = 1;
+        if (delta.next(&credits)) |change| switch (change.kind) {
+            .put => try bounded.put(change.path),
+            .remove => try bounded.remove(change.path),
+        };
+        visits += 1 - credits;
+    }
+    try std.testing.expectEqual(visitor.puts, bounded.puts);
+    try std.testing.expectEqual(visitor.removes, bounded.removes);
+    try std.testing.expect(visits < snapshot.count());
     // Resume from an entry removed from the live root; future-only subtrees
     // and deadline changes do not require retaining an old traversal stack.
     const after = try allocator.dupe(u8, ledger.nextDueAfter(10, null).?.path);
@@ -263,6 +345,30 @@ test "obsolete ledger snapshots retain deadlines and diff only changed paths" {
     ledger.removePrepared(after);
     try std.testing.expectEqualStrings("runs/00003.tbl", ledger.nextDueAfter(10, after).?.path);
     try std.testing.expect(ledger.nextDueAfter(10, "runs/00010.tbl") == null);
+}
+
+test "obsolete ledger reclaimer budgets spare payloads and detached roots" {
+    const allocator = std.testing.allocator;
+    var ledger: Ledger = .empty;
+    errdefer ledger.deinit(allocator);
+    for (0..64) |i| {
+        const path = try std.fmt.allocPrint(allocator, "obsolete-{d}.sst", .{i});
+        errdefer allocator.free(path);
+        try ledger.append(allocator, .{ .path = path, .delete_after_ns = i });
+    }
+    try ledger.ensureUnusedCapacity(allocator, 8);
+    var reclaimer = Ledger.Reclaimer.init(ledger);
+    ledger = .empty;
+    var none: usize = 0;
+    try std.testing.expect(!reclaimer.step(allocator, &none));
+    var slices: usize = 0;
+    while (true) {
+        var credit: usize = 1;
+        slices += 1;
+        if (reclaimer.step(allocator, &credit)) break;
+    }
+    try std.testing.expect(slices >= 72);
+    try std.testing.expect(reclaimer.step(allocator, &none));
 }
 
 test "obsolete ledger churn publication scaling benchmark" {
