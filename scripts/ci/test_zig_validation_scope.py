@@ -24,6 +24,41 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
+    def test_vopr_changes_select_qualification_and_the_base_gate(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        focused = workflow.split("      - name: Detect VOPR qualification changes", 1)[
+            1
+        ]
+        inputs = {
+            "zig/lib/vopr/src/runner.zig",
+            "zig/pkg/antfly/src/vopr/cli.zig",
+            "zig/build.zig",
+            "scripts/ci/zig_vopr_soak.py",
+            "scripts/ci/test_zig_vopr_soak.py",
+            "scripts/ci/zig_vopr_qualification.py",
+            ".github/workflows/zig-vopr-soak.yml",
+        }
+        unrelated = {"scripts/unrelated.py", "docs/guide.md"}
+        for source in (workflow, focused):
+            command = source.split("if git diff --quiet", 1)[1].split(
+                "\n          then", 1
+            )[0]
+            pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                subprocess.run(["git", "init", "-q", temporary], check=True)
+                for name in inputs | unrelated:
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.touch()
+                subprocess.run(["git", "add", "."], cwd=root, check=True)
+                selected = subprocess.check_output(
+                    ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
+                )
+            self.assertEqual(
+                {path.decode() for path in selected.split(b"\0") if path}, inputs
+            )
+
     def test_codegen_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         command = workflow.split("if git diff --quiet", 1)[1].split(

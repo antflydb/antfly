@@ -1,6 +1,12 @@
 name: Zig VOPR soaks
 
 on:
+  workflow_call:
+    inputs:
+      qualification_only:
+        description: Build and qualify the runner without starting full soaks
+        type: boolean
+        default: false
   schedule:
     - cron: '0 10 * * *'
   workflow_dispatch:
@@ -101,6 +107,8 @@ jobs:
           path: |
             ${{ runner.temp }}/vopr-qualification/**/*.json
             ${{ runner.temp }}/vopr-qualification/**/*.log
+            ${{ runner.temp }}/vopr-qualification/**/*.voprtrace
+            ${{ runner.temp }}/vopr-qualification/**/*.voprquarantine
           retention-days: 90
       - name: Package executable
         if: steps.runner_cache.outputs.cache-hit != 'true'
@@ -122,6 +130,7 @@ jobs:
 
   campaign:
     needs: build
+    if: inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 300
     strategy:
@@ -215,7 +224,7 @@ jobs:
 
   corpus:
     needs: [build, campaign]
-    if: always() && needs.build.result == 'success'
+    if: always() && needs.build.result == 'success' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 180
     strategy:
