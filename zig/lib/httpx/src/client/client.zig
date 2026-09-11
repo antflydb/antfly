@@ -268,11 +268,61 @@ pub const CancellationToken = struct {
 
 const cancellation_poll_interval_ms: u64 = 25;
 
+/// Joining a std.Io task does not guarantee that its executor has recycled the
+/// concurrency slot yet. Give that handoff a bounded grace period, shared by
+/// both branches of an operation. Retry admission only: concurrent failure
+/// guarantees the function was not started, so this cannot replay a send.
+const TaskAdmission = struct {
+    io: Io,
+    cancellation: ?CancellationToken,
+    request_deadline_ms: ?i64,
+    expires_ns: i96,
+    attempts: usize = 0,
+
+    fn init(io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken) TaskAdmission {
+        return .{ .io = io, .cancellation = cancellation, .request_deadline_ms = deadline_ms, .expires_ns = Io.Clock.awake.now(io).nanoseconds +| 25 * std.time.ns_per_ms };
+    }
+
+    fn check(self: *TaskAdmission) !i96 {
+        try self.io.checkCancel();
+        if (self.cancellation) |signal| if (signal.isCancelled()) return error.Cancelled;
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        if (self.request_deadline_ms) |deadline| if (now >= @as(i96, deadline) * std.time.ns_per_ms) return error.Timeout;
+        return now;
+    }
+
+    fn concurrent(self: *TaskAdmission, select: anytype, comptime field: @TypeOf(select.*).Field, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) !void {
+        while (true) {
+            _ = try self.check();
+            // Always allow the initial attempt. The budget caps waiting, not
+            // successful admission after an unrelated executor suspension.
+            select.concurrent(field, function, args) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => {
+                    self.attempts += 1;
+                    const now = try self.check();
+                    const deadline = @min(self.expires_ns, if (self.request_deadline_ms) |value| @as(i96, value) * std.time.ns_per_ms else self.expires_ns);
+                    if (self.attempts >= 32 or now >= deadline) return err;
+                    const delay_ns = @min(@as(u64, @intCast(deadline - now)), @as(u64, 100_000) << @as(u6, @intCast(@min(self.attempts - 1, 4))));
+                    try self.io.sleep(.fromNanoseconds(@intCast(delay_ns)), .awake);
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+};
+
 const RequestWatchdogOutcome = enum {
     stopped,
     cancelled,
     timed_out,
 };
+
+/// Admission consumes the same deadline as network work; never restart a full
+/// timeout after waiting for an executor slot.
+fn waitForRequestDeadline(io: Io, stop: *const std.atomic.Value(u32), cancellation: ?CancellationToken, deadline_ms: ?i64) anyerror!RequestWatchdogOutcome {
+    return waitForRequestWatchdog(io, stop, cancellation, if (deadline_ms) |deadline| @as(i128, deadline) * std.time.ns_per_ms else null);
+}
 
 /// Waits for request completion, application cancellation, or the
 /// whole-request deadline.
@@ -291,7 +341,10 @@ fn waitForRequestCancellationOrTimeout(
         null
     else
         Io.Clock.awake.now(io).nanoseconds +| @as(i128, timeout_ms) * std.time.ns_per_ms;
+    return waitForRequestWatchdog(io, stop, cancellation, deadline_ns);
+}
 
+fn waitForRequestWatchdog(io: Io, stop: *const std.atomic.Value(u32), cancellation: ?CancellationToken, deadline_ns: ?i128) anyerror!RequestWatchdogOutcome {
     while (true) {
         if (stop.load(.acquire) != 0) return .stopped;
         if (cancellation) |signal| {
@@ -1189,8 +1242,8 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), deadline: ?i64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestDeadline(io, stop, null, deadline);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1215,8 +1268,9 @@ pub const Client = struct {
         // `select.await` yet, turning a fast request into a full timeout.
         // Admit the watchdog first: failure to reserve the network task must
         // happen before any bytes are sent, not cancel an accepted mutation.
-        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
-        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
+        var admission = TaskAdmission.init(self.io, deadline_ms, null);
+        try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, deadline_ms });
+        admission.concurrent(&select, .request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -1269,8 +1323,8 @@ pub const Client = struct {
                 return client.executeRequestWithRetries(request_value, socket_timeout_ms, request_deadline_ms, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, deadline: ?i64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestDeadline(io, stop, signal, deadline);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1287,8 +1341,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
-        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
+        var admission = TaskAdmission.init(self.io, deadline_ms, cancellation);
+        try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, deadline_ms });
+        admission.concurrent(&select, .request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -1404,8 +1459,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, stop, null, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), deadline: ?i64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestDeadline(io, stop, null, deadline);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1424,8 +1479,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
-        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
+        var admission = TaskAdmission.init(self.io, deadline_ms, null);
+        try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, deadline_ms });
+        admission.concurrent(&select, .request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -1478,8 +1534,8 @@ pub const Client = struct {
                 return client.executeRequestToWriterWithRetries(request_value, socket_timeout_ms, request_deadline_ms, output, callback, callback_context, request_interrupt);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, request_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, stop, signal, request_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), signal: CancellationToken, deadline: ?i64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestDeadline(io, stop, signal, deadline);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1496,8 +1552,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
-        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
+        var admission = TaskAdmission.init(self.io, deadline_ms, cancellation);
+        try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, deadline_ms });
+        admission.concurrent(&select, .request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -1608,8 +1665,8 @@ pub const Client = struct {
                 return client.connectHostDirect(target_host, target_port);
             }
 
-            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), connect_timeout_ms: u64) anyerror!RequestWatchdogOutcome {
-                return waitForRequestCancellationOrTimeout(io, stop, null, connect_timeout_ms);
+            fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), deadline: ?i64) anyerror!RequestWatchdogOutcome {
+                return waitForRequestDeadline(io, stop, null, deadline);
             }
 
             fn drainLateResult(result: SelectResult) void {
@@ -1626,8 +1683,10 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
-        select.concurrent(.connect, Task.connectTask, .{ self, host, port }) catch |err| {
+        const connect_deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        var admission = TaskAdmission.init(self.io, connect_deadline_ms, null);
+        try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, connect_deadline_ms });
+        admission.concurrent(&select, .connect, Task.connectTask, .{ self, host, port }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -4640,7 +4699,7 @@ const python_bounded_response_server_script =
     "listener.bind(('127.0.0.1', port))\n" ++
     "listener.listen(4)\n" ++
     "print(listener.getsockname()[1], flush=True)\n" ++
-    "for _ in range(4):\n" ++
+    "for _ in range(int(sys.argv[2]) if len(sys.argv) > 2 else 4):\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
     "        data = b''\n" ++
@@ -4817,8 +4876,127 @@ test "per-request response limit rejects the body before allocation" {
     try std.testing.expectEqual(@as(usize, 0), streamed.items.len);
 }
 
+test "request task admission bounds handoff retries cancellation and deadlines" {
+    const Fixture = struct {
+        ns: i96 = 0,
+        sleeps: usize = 0,
+        task_canceled: bool = false,
+        external_canceled: std.atomic.Value(bool) = .init(false),
+        cancel_on_sleep: enum { none, task, external } = .none,
+        frozen_clock: bool = false,
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.ns };
+        }
+        fn check(raw: ?*anyopaque) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.task_canceled) return error.Canceled;
+        }
+        fn sleep(raw: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.sleeps += 1;
+            if (!self.frozen_clock) self.ns += timeout.duration.raw.nanoseconds;
+            switch (self.cancel_on_sleep) {
+                .none => {},
+                .task => self.task_canceled = true,
+                .external => self.external_canceled.store(true, .release),
+            }
+            try check(raw);
+        }
+    };
+    const Select = struct {
+        pub const Field = enum { request };
+        failures: usize,
+        attempts: usize = 0,
+        fn concurrent(self: *@This(), comptime _: Field, function: anytype, args: anytype) Io.ConcurrentError!void {
+            self.attempts += 1;
+            if (self.attempts <= self.failures) return error.ConcurrencyUnavailable;
+            @call(.auto, function, args);
+        }
+        fn send(count: *usize) void {
+            count.* += 1;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fixture.now;
+    vtable.checkCancel = Fixture.check;
+    vtable.sleep = Fixture.sleep;
+    var fixture: Fixture = .{};
+    const io: Io = .{ .userdata = &fixture, .vtable = &vtable };
+    var sends: usize = 0;
+    var select: Select = .{ .failures = 3 };
+    var admission = TaskAdmission.init(io, 1000, null);
+    try admission.concurrent(&select, .request, Select.send, .{&sends});
+    try std.testing.expectEqual(@as(usize, 1), sends);
+    try std.testing.expectEqual(@as(usize, 3), fixture.sleeps);
+
+    // Permanent saturation stays bounded, even without a ticking clock.
+    for ([_]bool{ false, true }) |frozen| {
+        fixture = .{ .frozen_clock = frozen };
+        select = .{ .failures = std.math.maxInt(usize) };
+        admission = .init(io, null, null);
+        try std.testing.expectError(error.ConcurrencyUnavailable, admission.concurrent(&select, .request, Select.send, .{&sends}));
+        try std.testing.expect(select.attempts <= 32);
+        try std.testing.expect(fixture.ns <= 25 * std.time.ns_per_ms);
+    }
+    fixture = .{};
+    select = .{ .failures = std.math.maxInt(usize) };
+    admission = .init(io, 1, null);
+    try std.testing.expectError(error.Timeout, admission.concurrent(&select, .request, Select.send, .{&sends}));
+    try std.testing.expect(fixture.ns < 2 * std.time.ns_per_ms);
+    for ([_]@TypeOf(fixture.cancel_on_sleep){ .task, .external }) |cancel| {
+        fixture = .{ .cancel_on_sleep = cancel };
+        select = .{ .failures = std.math.maxInt(usize) };
+        admission = .init(io, null, .fromAtomic(&fixture.external_canceled));
+        const expected = if (cancel == .task) error.Canceled else error.Cancelled;
+        try std.testing.expectError(expected, admission.concurrent(&select, .request, Select.send, .{&sends}));
+        try std.testing.expectEqual(@as(usize, 1), select.attempts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sends);
+    fixture = .{ .ns = 2 * std.time.ns_per_ms };
+    var stop = std.atomic.Value(u32).init(0);
+    try std.testing.expectEqual(RequestWatchdogOutcome.timed_out, try waitForRequestDeadline(io, &stop, null, 1));
+    // Time spent admitting the watchdog cannot restart the expired deadline.
+    try std.testing.expectEqual(@as(usize, 0), fixture.sleeps);
+}
+
+test "request task admission saturation unwinds watchdog without sending" {
+    const allocator = std.testing.allocator;
+    var io_impl = Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .connect_ms = 30_000, .request_ms = 30_000 },
+    });
+    defer client.deinit();
+    var sends = std.atomic.Value(usize).init(0);
+    const observer: Request.DeliveryObserver = .{
+        .context = &sends,
+        .before_send = struct {
+            fn send(raw: *anyopaque) void {
+                const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(raw));
+                _ = count.fetchAdd(1, .monotonic);
+            }
+        }.send,
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    for ([_]?CancellationToken{ null, .fromAtomic(&cancel) }) |signal| {
+        const options: RequestOptions = .{ .cancellation = signal, .delivery_observer = observer };
+        try std.testing.expectError(error.ConcurrencyUnavailable, client.get("http://127.0.0.1:1/", options));
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(allocator);
+        try std.testing.expectError(error.ConcurrencyUnavailable, client.getToWriter("http://127.0.0.1:1/", options, arrayListWriter(&bytes, allocator), null, null));
+        try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, client.connectHost("127.0.0.1", 1, null));
+    try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
+}
+
 test "successful H1 requests do not wait for their timeout deadline" {
     const allocator = std.testing.allocator;
+    const rounds = 8;
     // Reproduce a saturated async pool deterministically. A watchdog submitted
     // with `Io.async` runs eagerly in this configuration and blocks its caller
     // before the completed request result can be observed.
@@ -4830,7 +5008,7 @@ test "successful H1 requests do not wait for their timeout deadline" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(fixture_io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
     var child = std.process.spawn(fixture_io, .{
-        .argv = &.{ "python3", "server.py", "0" },
+        .argv = &.{ "python3", "server.py", "0", std.fmt.comptimePrint("{d}", .{4 * rounds}) },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .pipe,
@@ -4866,38 +5044,42 @@ test "successful H1 requests do not wait for their timeout deadline" {
     };
 
     const started_ms = common.milliTimestamp(io);
-    var ordinary_response = try client.get(url, .{ .delivery_observer = observer });
-    ordinary_response.deinit();
+    // Sequential requests must also tolerate the interval between group
+    // completion and the executor returning its worker to the admission pool.
+    for (0..rounds) |_| {
+        var ordinary_response = try client.get(url, .{ .delivery_observer = observer });
+        ordinary_response.deinit();
 
-    var ordinary_streamed = std.ArrayListUnmanaged(u8).empty;
-    defer ordinary_streamed.deinit(allocator);
-    var ordinary_streamed_response = try client.getToWriter(
-        url,
-        .{ .delivery_observer = observer },
-        arrayListWriter(&ordinary_streamed, allocator),
-        null,
-        null,
-    );
-    ordinary_streamed_response.deinit();
-    try std.testing.expectEqual(@as(usize, 32), ordinary_streamed.items.len);
+        var ordinary_streamed = std.ArrayListUnmanaged(u8).empty;
+        defer ordinary_streamed.deinit(allocator);
+        var ordinary_streamed_response = try client.getToWriter(
+            url,
+            .{ .delivery_observer = observer },
+            arrayListWriter(&ordinary_streamed, allocator),
+            null,
+            null,
+        );
+        ordinary_streamed_response.deinit();
+        try std.testing.expectEqual(@as(usize, 32), ordinary_streamed.items.len);
 
-    var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer });
-    defer response.deinit();
-    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
 
-    var streamed = std.ArrayListUnmanaged(u8).empty;
-    defer streamed.deinit(allocator);
-    var streamed_response = try client.getToWriter(
-        url,
-        .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer },
-        arrayListWriter(&streamed, allocator),
-        null,
-        null,
-    );
-    defer streamed_response.deinit();
-    try std.testing.expectEqual(@as(usize, 32), streamed.items.len);
-    try std.testing.expectEqual(@as(usize, 4), sends.load(.acquire));
-    try std.testing.expect(common.milliTimestamp(io) - started_ms < 2_000);
+        var streamed = std.ArrayListUnmanaged(u8).empty;
+        defer streamed.deinit(allocator);
+        var streamed_response = try client.getToWriter(
+            url,
+            .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer },
+            arrayListWriter(&streamed, allocator),
+            null,
+            null,
+        );
+        defer streamed_response.deinit();
+        try std.testing.expectEqual(@as(usize, 32), streamed.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 4 * rounds), sends.load(.acquire));
+    try std.testing.expect(common.milliTimestamp(io) - started_ms < 2_000 * rounds);
 }
 
 test "H1 transport cancellation interrupts an active response read" {
