@@ -4,6 +4,30 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: release driver-discovery test depends on CI Python loader paths (#694)
+
+SDK CI run `34645983534`, job `103416766382`, passed formatting and SDK
+validation but failed release packaging in
+`test_dlopen_finds_driver_in_injected_mount`. CI tested the merge with main's
+`2bd96e33e` (#707). The test replaced `LD_LIBRARY_PATH` with fixture directories
+and then launched the toolcache Python, which exited 127. CI had supplied its
+Python library directory through that same environment variable; the probe
+therefore also depended on the interpreter's native-library installation.
+
+The test now compiles a minimal native `dlopen`/`dlsym` probe and executes it
+with only the mapped container paths. It checks the fake driver's return value
+and verifies failure when those paths are removed. Loader errors are included
+in assertion diagnostics. No GPU, host driver, inherited Python library path,
+retry, or runtime-image workaround is needed.
+
+Validation: both tests passed in a local Linux x86_64 container, including the
+missing-path negative control. The macOS release suite passed (12 packaging
+tests and 114 release tests, with the Linux-only probe skipped), as did
+`make generate`, `make build-antfarm`, and `make fmt`; generation produced no
+tracked changes. Logs: `/private/tmp/ci694-runtime-container-linux.log` and
+`/private/tmp/ci694-release-mac-fixed.log`. This changes test code only; the
+native Debug runtime soak built from `c11eead5a` continues independently.
+
 ## 2026-09-11: forwarding retirement admission and dense-finalization fixture (#694)
 
 The forwarding review gap below is fixed by checking the native executor's
