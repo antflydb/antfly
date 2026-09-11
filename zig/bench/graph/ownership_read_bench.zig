@@ -17,12 +17,25 @@ const antfly = @import("antfly_zig");
 const G = antfly.graph.GraphIndex;
 
 pub fn run(io: std.Io, out: anytype) !void {
+    return runBackend(io, out, false);
+}
+
+pub fn runDisk(io: std.Io, out: anytype) !void {
+    return runBackend(io, out, true);
+}
+
+fn runBackend(io: std.Io, out: anytype, comptime disk: bool) !void {
     const a = std.heap.smp_allocator;
     for ([_]usize{ 4096, 16384, 65536 }) |count| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const temp = arena.allocator();
-        var g = try G.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .lsm_memory });
+        const root = try std.fmt.allocPrint(temp, "/tmp/antfly-ownership-read-{d}", .{antfly.platform_time.monotonicNs()});
+        if (disk) try std.Io.Dir.cwd().createDirPath(io, root);
+        defer if (disk) std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const forward = try std.fmt.allocPrintSentinel(temp, "{s}/forward", .{root}, 0);
+        const reverse = try std.fmt.allocPrintSentinel(temp, "{s}/reverse", .{root}, 0);
+        var g = try G.openWithPrivateStores(a, forward, reverse, "g", .{ .reverse_backend = if (disk) .lsm else .lsm_memory });
         defer g.close();
         const writes = try temp.alloc(antfly.graph.BatchWrite, count);
         for (writes, 0..) |*w, i| w.* = .{ .source = "z", .target = try std.fmt.allocPrint(temp, "target-{d:0>8}", .{i}), .edge_type = "link" };
@@ -43,7 +56,7 @@ pub fn run(io: std.Io, out: anytype) !void {
                 if (sample > 0) times[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
             }
             std.mem.sort(u64, &times, {}, std.sort.asc(u64));
-            const json = try std.json.Stringify.valueAlloc(temp, .{ .mode = "fenced_incoming_prefix", .edges = count, .key = key, .median_ns = times[2], .note = "LSM memory backend; includes snapshot/cursor setup; no disk/network model" }, .{});
+            const json = try std.json.Stringify.valueAlloc(temp, .{ .mode = "fenced_incoming_prefix", .edges = count, .key = key, .median_ns = times[2], .note = if (disk) "default durable LSM; warm reads; includes snapshot/cursor setup; excludes ingestion and network" else "LSM memory backend; includes snapshot/cursor setup; no disk/network model" }, .{});
             try out.interface.writeAll(json);
             try out.interface.writeByte('\n');
             try out.flush();

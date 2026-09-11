@@ -201,6 +201,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
         if (std.mem.eql(u8, arg, "--ownership-reads-only")) return @import("ownership_read_bench.zig").run(init.io, &output);
+        if (std.mem.eql(u8, arg, "--ownership-disk-reads-only")) return @import("ownership_read_bench.zig").runDisk(init.io, &output);
         if (std.mem.eql(u8, arg, "--filtered-prefix-only")) return @import("paged_read_bench.zig").runFilteredPrefix(init.io, &output);
         if (std.mem.eql(u8, arg, "--native-scans-only")) return benchmarkNativeScans(init.io, &output);
         if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);

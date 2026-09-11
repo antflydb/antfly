@@ -1,5 +1,31 @@
 # Graph metric execution and query benchmarks
 
+## Committed status and immutable memory-run pins (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-disk-reads-only
+```
+
+Apple M4 Max, Zig 0.16.0, median of five samples after one warmup. These
+measure empty incoming adjacency reads behind an ownership fence, including
+snapshot/cursor setup and cleanup. First/last target probes verify the same
+empty result. Fixture ingestion and fence installation are excluded.
+
+| Edges | Memory LSM before (first / last) | Memory LSM pinned (first / last) | Durable LSM warm (first / last) |
+| --- | ---: | ---: | ---: |
+| 4,096 | 300.458 / 264.750 µs | 1.458 / 2.166 µs | 2.125 / 2.167 µs |
+| 16,384 | 1,023.500 / 1,010.333 µs | 1.042 / 1.209 µs | 1.750 / 1.750 µs |
+| 65,536 | 4,337.333 / 4,053.083 µs | 1.125 / 1.042 µs | 1.875 / 1.583 µs |
+
+The memory-backed improvement removes whole-run cloning from snapshot setup.
+The durable column is a separate absolute measurement, **not** a before/after
+disk speedup. These are local warm microbenchmarks, not network latency or
+ingestion throughput. Ten thousand operational-status samples take 22–29 µs
+per batch, with zero extra allocations. Status publication now happens only
+after the counter transaction commits; failure-injection tests verify that
+aborted/staged counts cannot escape through operational status.
+
 ## Ownership fences and lazy type runs (2026-09-10)
 
 ```sh

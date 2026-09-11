@@ -4,6 +4,53 @@ Graph metrics use shared numerical semantics with backend-specific persistence.
 The production boundary is admitted, generation-fenced work—not a synchronous
 full-graph calculation hidden inside a query or maintenance tick.
 
+### Ordinary serverless graph construction admission
+
+WAL/document graph construction shares the lake sidecar allocation limiter:
+10 million input rows, 512 MiB of document bodies, 20 million retained node/edge
+identities, 512 MiB encoded output, and 1 GiB live construction allocations by
+default. Parsing, interning, sorting, routing and output allocations are included;
+upstream materialized document buffers are not. Real allocator exhaustion stays
+distinct from configured-limit rejection. The builder returns owned bytes only
+after complete encoding; no partial graph or replacement HEAD is published.
+
+Explicit build routes report resource rejection with HTTP 422. Background
+publication retains the prior HEAD, counts/logs the affected namespace and
+continues other namespaces. A bounded process-local retry cache backs off from
+10 seconds to at most one minute; explicit build requests bypass that cache.
+This is retry throttling, not durable failure/progress state. Cache eviction or
+restart can retry sooner. Metric computation budget rejection remains its
+separate durable per-metric sidecar contract.
+
+### Remaining storage-layout work: incremental serverless graph roots
+
+**Not implemented:** topology-changing publication still constructs a complete
+graph artifact. Bounded construction prevents uncontrolled allocation but does
+not remove graph-wide rewrite amplification. The next storage-layout change must
+cover the complete lifecycle together:
+
+- A manifest-authenticated graph root addresses bounded outgoing and incoming
+  adjacency partitions. Partition-local dictionaries replace globally sorted
+  ordinals; adding a node must not renumber unrelated partitions.
+- Coalesced old-to-new document edge replacements update only touched source
+  and target partitions, including deletions, qualified endpoints and isolated
+  nodes. High-degree adjacency needs bounded subpartitions, not one unbounded
+  object per node. Immutable replacement pages avoid an ever-growing overlay.
+- Both adjacency readers and metric preparation pin the same root. Queries
+  route directly to selected rows; metric preparation streams selected type
+  ranges and assigns computation-local dense ordinals under existing budgets.
+- The existing fenced HEAD CAS publishes the root and metric provenance
+  together. GC must traverse root reachability for retained/pinned versions;
+  candidate objects remain recoverable after failed publication. Compaction
+  replaces bounded pages without changing canonical connectivity identity.
+
+Serverless is unreleased: this should replace the current graph wire, with no
+legacy fallback. Acceptance requires eager-oracle equivalence, interrupted
+publication/reopen/GC tests, and one-edge-update benchmarks at growing source
+sizes (bytes rewritten, allocations, peak memory, GET/PUT counts and latency).
+Simply splitting uploads while retaining the global dictionary would not meet
+the incremental construction requirement.
+
 ### Stateful split ownership and bounded retirement
 
 Logical ownership is separate from physical graph cleanup. Before committing a
@@ -58,6 +105,13 @@ document count. Explicit diagnostic graph statistics can still request an exact
 scoped edge scan. Adjacency, paged, streaming and presence reads install their
 physical prefix upper bound before seeking, so the ownership wrapper cannot
 walk unrelated incoming targets looking for a visible edge.
+Mutation and repair counters are transaction-local. Their persisted values
+commit with reverse topology accounting before a short ownership-lock-protected
+publication updates the status snapshot. Status reads cannot see provisional
+counts from an aborted transaction; this counter publication acquires the status
+lock only after commit I/O. Immutable in-memory LSM runs share one reference-counted owner for state,
+routing metadata and bloom filters; readers and compaction snapshots pin that
+generation until their last user closes, rather than cloning all its entries.
 This is not a range-aggregate index or a single-store transactional redesign.
 The two private stores and their durability barriers remain intact. Those
 larger storage changes require separate write-amplification and recovery
@@ -399,7 +453,12 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 25 binds the current addressed graph layout and preparation admission.
+  Materializer epoch 26 binds selected-work admission. Indexed preparation is
+  not rejected by unrelated source cardinality or whole-object size. Selected
+  nodes/edges, actual fetched bytes (including authentication), work and live
+  memory remain bounded. The 256 MiB whole-payload decode cap still applies to
+  full-source fallback. Cached projections are re-admitted against each caller's
+  selected cardinality limits.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when

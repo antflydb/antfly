@@ -21,7 +21,11 @@ SPEC.loader.exec_module(launcher)
 
 class BoundedZigBuildTest(unittest.TestCase):
     def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
-        build = (SCRIPT.parents[1] / "build.zig").read_text(encoding="utf-8")
+        # Production runtime construction owns the reservation. The root build
+        # only composes owners; testing it would couple this contract to file
+        # layout instead of the scheduler claim used by the storage artifact.
+        runtime_build = SCRIPT.parents[1] / "pkg/antfly/build/runtime.zig"
+        build = runtime_build.read_text(encoding="utf-8")
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
