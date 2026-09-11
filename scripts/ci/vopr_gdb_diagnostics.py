@@ -109,4 +109,6 @@ if gdb.selected_inferior().pid:
     gdb.execute("thread apply all bt 12")
     gdb.execute("quit 1")
 else:
-    gdb.execute(f"quit {int(gdb.parse_and_eval('$_exitcode')) or int(inspection_failed)}")
+    gdb.execute(
+        f"quit {int(gdb.parse_and_eval('$_exitcode')) or int(inspection_failed)}"
+    )
