@@ -1,5 +1,25 @@
 # Zig E2E flakes
 
+## 2026-09-11: restore admission recovery and range cleanup (#694)
+
+The second retained `0259bab66` metadata backup failure contains two jobs for
+the same restore fingerprint, with distinct generated keys. The first job had
+published the destination; the second failed `TableAlreadyExists`. Evidence:
+`/private/tmp/ci694-main-review-second-failure.tar.gz`, SHA-256
+`3cb2de630eff6dde0c17e3015c9f5f30b08072e063141cbfa3235dfec23e3842`.
+The receipt fix prevents the observed leadership error from being mislabeled
+as safe to replay. Conditional restore admission now additionally preserves a
+recoverable identity across an unresolved timeout; retrying that same key
+cannot overwrite the original job or create another one. Do not blindly retry
+an unknown outcome without the returned key, or treat a missing job as proof
+that the enqueue cannot still commit.
+
+Review also replaced per-completion table-wide progress scans with an atomic
+range/node index and versioned rebuild. See [runtime regressions](../FLAKES.md)
+for the deterministic admission and bounded-work coverage. These changes need
+a new final-revision 100/100 soak; prior acceptance counts are historical.
+The independent #705 heap corruption remains under investigation.
+
 ## 2026-09-11: merged soak exposes a superseded create receipt (#694)
 
 The fresh `0259bab66` Linux batch failed an initial backup-table create with an

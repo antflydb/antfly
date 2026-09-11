@@ -1814,6 +1814,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
             "restore job ownership failures remain retryable",
+            "restore admission unknown response preserves recovery",
             "restore worker authority is fenced across leadership reacquisition",
             "restore ownership backoff is interruptible without polling",
         },

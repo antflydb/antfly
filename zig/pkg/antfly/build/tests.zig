@@ -363,6 +363,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
+            "restore admission recovers generated identity",
+            "restore admission missing row",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
             "retryable restore contention durably requeues progress and honors cancellation",

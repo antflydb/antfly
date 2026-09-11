@@ -747,6 +747,7 @@ const MetadataAdminMux = struct {
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
     return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
+        .create = metadataRestoreJobCreate,
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
@@ -795,6 +796,22 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
         return error.RestoreJobCommitNotApplied;
     defer svc.alloc.free(committed);
     if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
+    // Absence is not an admission proof: an earlier proposal can still apply.
+    // Both proposals use the same key and the Raft transaction claims it once.
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .create_restore_job = .{ .key = key, .value = value } },
+        leadership_term,
+    );
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
 
 fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {

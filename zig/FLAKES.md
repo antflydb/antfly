@@ -4,6 +4,51 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: recoverable restore admission and bounded progress retirement (#694)
+
+Review found a remaining admission gap: a Raft wait can time out before an
+enqueue commits. Losing the generated identity invites a second independent
+job. The `0259bab66` soak retained two jobs for the same request; the later
+receipt fix addressed its leadership classification, but not the timeout path.
+
+Every new restore has a recoverable idempotency key, including requests that
+omit the header. Its principal/resource namespace and key determine the job ID.
+A conditional-create Raft command atomically claims that ID; replays return the
+existing record without overwriting running or terminal progress. Identity and
+request fingerprints are checked before adopting it, including fail-closed
+handling of truncated-ID collisions. Metadata decoder capability 5 gates this
+command across all members; ordinary topology retains its existing minimum
+version. Persistence ABI 3 rejects older adapters rather than emulating a
+conditional create with a racy get/put pair.
+
+Only confirmed admission returns 202. An uncertain response carries the job
+location and recovery key and instructs clients to poll or retry with the same
+key. A missing row does not prove non-admission. Clients must supply a stable
+key before their first request to recover from losing the entire HTTP response.
+Unconfirmed work never enters the local dispatch queue.
+
+Retiring each range previously scanned all remaining progress for its table.
+A derived `(metadata group, table, range, node)` index is now maintained in the
+same transaction as primary progress. Completion visits only that range's node
+entries and removes both namespaces while clearing the restore intent.
+Derived-index version 3 rebuilds older stores once from primary rows. Snapshot
+replacement removes these derived rows and their version marker; rollback and
+upgrade also rebuild rather than trusting rows an older binary did not maintain.
+
+Deterministic regressions cover unknown admission, recovery with an empty local
+index, preservation of a running checkpoint, repeated conditional claims,
+delayed incarnation reports, legacy index migration, and visiting exactly
+three entries with 300 progress rows across 100 ranges. Final-revision soaks
+remain required. This is separate from the progressive-index heap corruption
+in #705.
+
+Native macOS Debug validation passed 24 restore-store tests, 36 restore/API
+integration tests, and 247 metadata tests (one existing opt-in skip), with no
+failures or leaks. The native binary build passed all 41 steps. `make generate`,
+`make build-antfarm`, `make fmt`, and the Go SDK suite passed. Generation used
+an isolated Zig cache after the shared cache was missing `libcompiler_rt.a`;
+socket-based tests ran outside the filesystem/network sandbox.
+
 ## 2026-09-11: admitted topology receipt loses leadership (#694)
 
 The merged Linux soak on `0259bab66` failed its first backup iteration with a

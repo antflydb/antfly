@@ -16294,7 +16294,7 @@ pub const ApiHttpServer = struct {
             table_name,
         );
         defer self.alloc.free(idempotency_namespace);
-        const encoded = self.restore_job_store.start(self.alloc, .{
+        const admission = self.restore_job_store.startRecoverable(self.alloc, .{
             .scope = .table,
             .table_name = table_name,
             .backup_id = parsed.value.backup_id,
@@ -16305,6 +16305,13 @@ pub const ApiHttpServer = struct {
             .destination_authorization_fingerprint = destination_authorization_fingerprint,
             .destination_authorization_principal = storedDestinationPrincipal(authenticated_identity),
         }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        const encoded = switch (admission) {
+            .accepted => |value| value,
+            .unknown => |value| {
+                defer self.alloc.free(value);
+                return restoreJobAdmissionUnknownResponse(self.alloc, value);
+            },
+        };
         defer self.alloc.free(encoded);
         var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer state.deinit();
@@ -16392,7 +16399,7 @@ pub const ApiHttpServer = struct {
             null,
         );
         defer self.alloc.free(idempotency_namespace);
-        const encoded = self.restore_job_store.start(self.alloc, .{
+        const admission = self.restore_job_store.startRecoverable(self.alloc, .{
             .scope = .cluster,
             .backup_id = req.backup_id,
             .location = req.location,
@@ -16403,6 +16410,13 @@ pub const ApiHttpServer = struct {
             .idempotency_key = idempotency_key,
             .destination_authorization_principal = storedDestinationPrincipal(authenticated_identity),
         }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        const encoded = switch (admission) {
+            .accepted => |value| value,
+            .unknown => |value| {
+                defer self.alloc.free(value);
+                return restoreJobAdmissionUnknownResponse(self.alloc, value);
+            },
+        };
         defer self.alloc.free(encoded);
         var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
         defer state.deinit();
@@ -16997,20 +17011,24 @@ pub const ApiHttpServer = struct {
         const arena = arena_impl.allocator();
         const view = try restoreJobViewAlloc(arena, encoded);
         var response = try contextualJsonResponseOmitNullOptionals(self.alloc, status, view);
+        errdefer response.deinit(self.alloc);
         if (status == 202) {
-            response.headers = try self.alloc.alloc(contextual_operations.Header, 2);
+            var state = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
+            defer state.deinit();
+            response.headers = try self.alloc.alloc(contextual_operations.Header, 3);
             var initialized: usize = 0;
             errdefer {
                 for (response.headers[0..initialized]) |*header| header.deinit(self.alloc);
                 self.alloc.free(response.headers);
                 response.headers = &.{};
-                response.deinit(self.alloc);
             }
             const location_value = try std.fmt.allocPrint(self.alloc, "/db/v1/restore/jobs/{s}", .{view.job_id});
             defer self.alloc.free(location_value);
             response.headers[0] = try ownedContextualHeader(self.alloc, "Location", location_value);
             initialized += 1;
             response.headers[1] = try ownedContextualHeader(self.alloc, "Retry-After", "1");
+            initialized += 1;
+            response.headers[2] = try ownedContextualHeader(self.alloc, "Idempotency-Key", state.value.idempotency_key);
         }
         return response;
     }
@@ -17305,6 +17323,52 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
 }
 
+test "restore admission unknown response preserves recovery without claiming acceptance" {
+    const alloc = std.testing.allocator;
+    const encoded = try std.json.Stringify.valueAlloc(alloc, restore_jobs.JobState{
+        .format_version = 4,
+        .job_id = 42,
+        .enqueue_sequence = 1,
+        .dispatch_sequence = 1,
+        .scope = .table,
+        .table_name = "docs",
+        .backup_id = "daily",
+        .location = "file:///backups",
+        .connection = "backups",
+        .idempotency_namespace = "operator:docs",
+        .idempotency_key = "auto:recover-me",
+        .request_fingerprint = "request",
+        .created_at_ms = 0,
+        .updated_at_ms = 0,
+        .expires_at_ms = std.math.maxInt(u64),
+    }, .{});
+    defer alloc.free(encoded);
+    var response = try restoreJobAdmissionUnknownResponse(alloc, encoded);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    var location_seen = false;
+    var key_seen = false;
+    for (response.headers) |header| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Metadata-Not-Leader"));
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_mutation_not_admitted_header));
+        if (std.ascii.eqlIgnoreCase(header.name, metadata_http_routes.Routes.raft_mutation_outcome_header))
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_unknown, header.value);
+        if (std.ascii.eqlIgnoreCase(header.name, "Location")) {
+            try std.testing.expectEqualStrings("/db/v1/restore/jobs/42", header.value);
+            location_seen = true;
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, "Idempotency-Key")) {
+            try std.testing.expectEqualStrings("auto:recover-me", header.value);
+            key_seen = true;
+        }
+    }
+    try std.testing.expect(location_seen and key_seen);
+    var body = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("unknown", body.value.object.get("admission_outcome").?.string);
+    try std.testing.expect(body.value.object.get("phase") == null);
+}
+
 test "native restore validation uncertainty remains an asynchronous retry" {
     try std.testing.expectEqual(
         @as(public_table_http.TableApi.ExecuteRestoreError, error.RestoreValidationPending),
@@ -17357,6 +17421,34 @@ fn restoreJobStartErrorResponse(alloc: std.mem.Allocator, err: anyerror) !contex
         error.DuplicateRestoreTableName => try contextualJsonErrorResponse(alloc, 400, "restore request contains duplicate table names"),
         else => try contextualJsonErrorResponse(alloc, 500, "failed to create restore job"),
     };
+}
+
+fn restoreJobAdmissionUnknownResponse(alloc: std.mem.Allocator, encoded: []const u8) !contextual_operations.OwnedResponse {
+    var state = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
+    defer state.deinit();
+    const job_id = try std.fmt.allocPrint(alloc, "{d}", .{state.value.job_id});
+    defer alloc.free(job_id);
+    const location = try std.fmt.allocPrint(alloc, "/db/v1/restore/jobs/{s}", .{job_id});
+    defer alloc.free(location);
+    var response = try contextualJsonResponseOmitNullOptionals(alloc, 503, .{
+        .@"error" = "restore admission outcome unknown; poll the job or retry the same request with this Idempotency-Key; a missing job does not prove non-admission",
+        .admission_outcome = "unknown",
+        .job_id = job_id,
+        .idempotency_key = state.value.idempotency_key,
+    });
+    errdefer response.deinit(alloc);
+    var headers = std.ArrayListUnmanaged(contextual_operations.Header).empty;
+    errdefer {
+        for (headers.items) |*header| header.deinit(alloc);
+        headers.deinit(alloc);
+    }
+    try headers.ensureUnusedCapacity(alloc, 4);
+    headers.appendAssumeCapacity(try ownedContextualHeader(alloc, "Location", location));
+    headers.appendAssumeCapacity(try ownedContextualHeader(alloc, "Idempotency-Key", state.value.idempotency_key));
+    headers.appendAssumeCapacity(try ownedContextualHeader(alloc, "Retry-After", "1"));
+    headers.appendAssumeCapacity(try ownedContextualHeader(alloc, metadata_http_routes.Routes.raft_mutation_outcome_header, metadata_http_routes.Routes.raft_mutation_outcome_unknown));
+    response.headers = try headers.toOwnedSlice(alloc);
+    return response;
 }
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {

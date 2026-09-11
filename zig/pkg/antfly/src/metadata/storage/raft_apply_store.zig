@@ -147,7 +147,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "2";
+const derived_catalog_index_version = "3";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -172,6 +172,8 @@ pub const TableTopologyMutation = union(enum) {
         },
     },
 };
+
+const RestoreJobWrite = struct { key: []const u8, value: []const u8 };
 
 pub const TransitionCommand = union(enum) {
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
@@ -256,10 +258,8 @@ pub const TransitionCommand = union(enum) {
     remove_shuffle_join_lease: struct {
         job_id: u64,
     },
-    upsert_restore_job: struct {
-        key: []const u8,
-        value: []const u8,
-    },
+    upsert_restore_job: RestoreJobWrite,
+    create_restore_job: RestoreJobWrite,
     remove_restore_job: struct {
         key: []const u8,
     },
@@ -385,7 +385,7 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
             },
-            .upsert_restore_job => |record| {
+            .upsert_restore_job, .create_restore_job => |record| {
                 alloc.free(record.key);
                 alloc.free(record.value);
             },
@@ -584,7 +584,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.receiver_group_id);
         },
         .upsert_shuffle_join_lease => |record| try group_ids.requireDataGroupId(record.owner_group_id),
-        .upsert_restore_job => |record| {
+        .upsert_restore_job, .create_restore_job => |record| {
             try validateRestoreJobLogicalKey(record.key);
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
         },
@@ -2067,6 +2067,9 @@ fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTra
 }
 
 pub const RaftApplyStore = struct {
+    // Counts visited index rows, including rows not ultimately deleted, so
+    // regressions can assert that completion work is bounded by one range.
+    restore_cleanup_rows_visited: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
@@ -3728,6 +3731,19 @@ pub const RaftApplyStore = struct {
             txn,
             try activeRestoreRangeIndexPrefixForGroup(&active_restore_prefix_buf, group_id),
         );
+        var restore_progress_prefix_buf: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try restoreProgressRangeIndexPrefixForGroup(&restore_progress_prefix_buf, group_id));
+        const progress_rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try restoreProgressPrefixForGroup(&restore_progress_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, progress_rows);
+        for (progress_rows) |row| {
+            const record = try decodeRestoreProgressRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeRestoreProgress(self.alloc, record);
+            try putRestoreProgressRangeIndexTxn(txn, group_id, record);
+        }
 
         var table_prefix_buf: [128]u8 = undefined;
         const table_rows = try docstore.DocStore.scanPrefixTxn(
@@ -4003,7 +4019,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
-            .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
@@ -4226,6 +4242,7 @@ pub const RaftApplyStore = struct {
             &rows,
             try derivedCatalogIndexVersionKey(&prefix_buf, group_id),
         );
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreProgressRangeIndexPrefixForGroup(&prefix_buf, group_id));
         return try rows.toOwnedSlice(alloc);
     }
 
@@ -4649,6 +4666,7 @@ pub const RaftApplyStore = struct {
                 const value = try encodeRestoreProgressRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
+                try putRestoreProgressRangeIndexTxn(txn, group_id, record);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_progress,
@@ -4683,6 +4701,8 @@ pub const RaftApplyStore = struct {
                     error.NotFound => {},
                     else => return err,
                 };
+                var index_key_buf: [224]u8 = undefined;
+                try txn.delete(try restoreProgressRangeIndexKey(&index_key_buf, group_id, record.table_id, record.group_id, record.node_id));
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_progress,
@@ -4892,9 +4912,16 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
-            .upsert_restore_job => |record| {
+            .upsert_restore_job, .create_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                if (command == .create_restore_job) {
+                    const existing = txn.get(key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (existing != null) return;
+                }
                 try txn.put(key, record.value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
@@ -5148,24 +5175,25 @@ pub const RaftApplyStore = struct {
         range: metadata.RangeRecord,
         table_name: ?[]const u8,
     ) !void {
-        // The existing durable namespace is table/node/group ordered. Bound
-        // cleanup to this table rather than scanning cluster-wide progress.
-        var prefix_buf: [192]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&prefix_buf, "\x00\x00__metadata__:metadata_restore_progress:{d}:{d}:", .{ metadata_group_id, range.table_id });
+        var prefix_buf: [224]u8 = undefined;
+        const prefix = try restoreProgressRangeIndexPrefix(&prefix_buf, metadata_group_id, range.table_id, range.group_id);
         const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, prefix);
         defer freeMetadataSnapshotRows(self.alloc, rows);
         for (rows) |row| {
-            const record = try decodeRestoreProgressRecord(self.alloc, row.value);
-            defer metadata_table_manager.freeRestoreProgress(self.alloc, record);
-            if (record.group_id != range.group_id) continue;
+            if (builtin.is_test) self.restore_cleanup_rows_visited += 1;
+            if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+            const node_id = std.mem.readInt(u64, row.value[0..8], .little);
+            var key_buf: [224]u8 = undefined;
+            const key = try restoreProgressKeyForGroup(&key_buf, metadata_group_id, range.table_id, node_id, range.group_id);
+            try txn.delete(key);
             try txn.delete(row.key);
-            self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = row.key });
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = key });
             self.notifyProjectionListeners(.{
                 .kind = .restore_progress,
                 .metadata_group_id = metadata_group_id,
                 .table_name = table_name,
                 .table_id = range.table_id,
-                .node_id = record.node_id,
+                .node_id = node_id,
                 .group_id = range.group_id,
             });
         }
@@ -7152,6 +7180,7 @@ const TransitionTag = enum(u8) {
     complete_replication_source_retirement = 49,
     apply_table_topology = 50,
     apply_extension_lifecycle_v2 = 51,
+    create_restore_job = 52,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -7424,8 +7453,8 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle_v2));
             try appendJsonRecord(alloc, &out, delta);
         },
-        .upsert_restore_job => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_job));
+        .upsert_restore_job, .create_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(if (command == .create_restore_job) TransitionTag.create_restore_job else TransitionTag.upsert_restore_job));
             try appendRequiredString(alloc, &out, record.key);
             try appendRequiredString(alloc, &out, record.value);
         },
@@ -7770,6 +7799,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         },
         .apply_extension_lifecycle_v2 => .{
             .apply_extension_lifecycle_v2 = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
+        },
+        .create_restore_job => .{
+            .create_restore_job = .{
+                .key = try readRequiredString(alloc, encoded, &pos),
+                .value = try readRequiredString(alloc, encoded, &pos),
+            },
         },
         .upsert_restore_job => .{
             .upsert_restore_job = .{
@@ -10709,6 +10744,27 @@ pub fn schemaProgressPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
 
 pub fn restoreProgressPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_restore_progress:{d}:", .{group_id});
+}
+
+fn restoreProgressRangeIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_progress_by_range:{d}:", .{group_id});
+}
+
+fn restoreProgressRangeIndexPrefix(buf: []u8, group_id: u64, table_id: u64, range_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_progress_by_range:{d}:{d}:{d}:", .{ group_id, table_id, range_id });
+}
+
+fn restoreProgressRangeIndexKey(buf: []u8, group_id: u64, table_id: u64, range_id: u64, node_id: u64) ![]const u8 {
+    const prefix = try restoreProgressRangeIndexPrefix(buf, group_id, table_id, range_id);
+    const suffix = try std.fmt.bufPrint(buf[prefix.len..], "{d}", .{node_id});
+    return buf[0 .. prefix.len + suffix.len];
+}
+
+fn putRestoreProgressRangeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.RestoreProgressRecord) !void {
+    var key_buf: [224]u8 = undefined;
+    var value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value, record.node_id, .little);
+    try txn.put(try restoreProgressRangeIndexKey(&key_buf, group_id, record.table_id, record.group_id, record.node_id), &value);
 }
 
 pub fn replicationSourceStatusPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
@@ -14445,6 +14501,87 @@ test "metadata raft apply store restore completion retires progress and rejects 
             if (index >= 9 and record.group_id == original.group_id) try std.testing.expectEqualStrings("new", record.backup_id);
         }
     }
+    try std.testing.expectEqual(@as(usize, 2), store.restore_cleanup_rows_visited);
+}
+
+test "metadata raft apply store restore cleanup rebuilds legacy indexes and visits only the completed range" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-range-index", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) txn.abort();
+    // A pre-upgrade store has primary progress and the old index version.
+    for (0..100) |range_id| {
+        for (1..4) |node_id| {
+            const record: metadata.RestoreProgressRecord = .{
+                .table_id = 41,
+                .group_id = range_id,
+                .node_id = node_id,
+                .backup_id = "backup",
+                .artifact_backup_id = "backup",
+                .location = "file:///backups",
+            };
+            var key_buf: [224]u8 = undefined;
+            const value = try encodeRestoreProgressRecord(alloc, record);
+            defer alloc.free(value);
+            try txn.put(try restoreProgressKeyForGroup(&key_buf, 1, 41, node_id, range_id), value);
+        }
+    }
+    var version_buf: [160]u8 = undefined;
+    try txn.put(try derivedCatalogIndexVersionKey(&version_buf, 1), "2");
+    try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    try std.testing.expect(!try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    const range: metadata.RangeRecord = .{ .table_id = 41, .group_id = 42, .start_key = "", .end_key = null };
+    try store.retireRangeRestoreProgressTxn(&txn, 1, range, null);
+    try std.testing.expectEqual(@as(usize, 3), store.restore_cleanup_rows_visited);
+    var prefix_buf: [160]u8 = undefined;
+    const remaining = try docstore.DocStore.scanPrefixTxn(alloc, &txn, try restoreProgressPrefixForGroup(&prefix_buf, 1));
+    defer freeMetadataSnapshotRows(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 297), remaining.len);
+    // Snapshot replacement must remove derived rows and the version marker,
+    // leaving the incoming primary rows as the sole rebuild authority.
+    const derived = try store.collectDerivedCatalogIndexRowsTxn(alloc, &txn, 1);
+    defer freeMetadataSnapshotRows(alloc, derived);
+    try std.testing.expectEqual(@as(usize, 298), derived.len);
+    for (derived) |row| try txn.delete(row.key);
+    try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    try store.retireRangeRestoreProgressTxn(&txn, 1, range, null);
+    try std.testing.expectEqual(@as(usize, 3), store.restore_cleanup_rows_visited);
+    try txn.commit();
+    committed = true;
+}
+
+test "metadata raft apply store restore admission never overwrites a previously claimed job" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-admission", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const commands = [_]TransitionCommand{
+        .{ .create_restore_job = .{ .key = key, .value = "queued-original" } },
+        .{ .upsert_restore_job = .{ .key = key, .value = "running-checkpoint" } },
+        .{ .create_restore_job = .{ .key = key, .value = "queued-retry" } },
+    };
+    for (commands, 1..) |command, index| {
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = encoded },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 1, .commit_index = index, .entries_bytes = entries });
+    }
+    const result = (try store.getRestoreJobValue(alloc, 1, key)).?;
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("running-checkpoint", result);
 }
 
 test "metadata raft apply store projects restore progress records from committed entries" {

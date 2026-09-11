@@ -21,7 +21,10 @@ const std = @import("std");
 /// group identities and stale drop cleanup cannot delete their storage.
 /// Version 4 decodes and enforces the distinct extension-lifecycle-v2 command
 /// carrying table compare-and-set preconditions.
-pub const current_version: u16 = 4;
+/// Version 5 adds conditional restore admission; ordinary job updates retain
+/// their existing wire format.
+pub const current_version: u16 = 5;
+pub const restore_job_admission_version: u16 = 5;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.
