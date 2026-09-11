@@ -2722,12 +2722,19 @@ pub const RaftApplyStore = struct {
             }
         }
         const page = try projection.selectPage(entries.items, request, view.meta.revision);
-        for (page.entries) |*entry| {
-            if (request.physical_name != null or request.target != null) continue;
-            var buf: [160]u8 = undefined;
-            const table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group_id, entry.table.table_id)));
-            if (table.table_id != entry.table.table_id or !std.mem.eql(u8, table.name, entry.table.name)) return error.InvalidCatalogRecord;
-            entry.table = table;
+        if (request.physical_name == null and request.target == null) {
+            const lookups = try a.alloc(ListingLookup, page.entries.len);
+            for (page.entries, lookups, 0..) |entry, *lookup, i| {
+                var buf: [160]u8 = undefined;
+                lookup.* = .{ .key = try a.dupe(u8, try tableKeyForGroup(&buf, group_id, entry.table.table_id)), .index = i };
+            }
+            const values = try readListingKeys(a, &txn, lookups);
+            for (lookups, values) |lookup, bytes| {
+                const entry = &page.entries[lookup.index];
+                const table = try decodeTableRecord(a, bytes orelse return error.InvalidCatalogRecord);
+                if (table.table_id != entry.table.table_id or !std.mem.eql(u8, table.name, entry.table.name)) return error.InvalidCatalogRecord;
+                entry.table = table;
+            }
         }
         var ranges: std.ArrayListUnmanaged(metadata.RangeRecord) = .empty;
         var intents: std.ArrayListUnmanaged(raft_reconciler.PlacementIntent) = .empty;
@@ -2747,11 +2754,15 @@ pub const RaftApplyStore = struct {
             store.* = try decodeStoreRecord(a, row.value);
             var reports: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
             var group_statuses: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty;
-            for (ranges.items) |range| {
-                const bytes = txn.get(try listingReportKey(a, group_id, store.store_id, range.group_id)) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
+            const lookups = try a.alloc(ListingLookup, ranges.items.len);
+            for (ranges.items, lookups, 0..) |range, *lookup, i| lookup.* = .{
+                .key = try listingReportKey(a, group_id, store.store_id, range.group_id),
+                .index = i,
+            };
+            const values = try readListingKeys(a, &txn, lookups);
+            for (lookups, values) |lookup, value| {
+                const bytes = value orelse continue;
+                const range = ranges.items[lookup.index];
                 const report = try decodeStoreRecord(a, bytes);
                 if (report.store_id != store.store_id or report.runtime_statuses.len > 1 or report.group_statuses.len > 1) return error.InvalidDerivedCatalogIndex;
                 for (report.runtime_statuses) |runtime| {
@@ -4167,6 +4178,24 @@ pub const RaftApplyStore = struct {
         var fingerprint = try legacyMembershipTxn(a, txn, group_id);
         for (&fingerprint, @import("../../system_catalog/projection.zig").legacyIdentity(id, name)) |*byte, identity_byte| byte.* ^= identity_byte;
         try txn.put(try legacyMembershipKey(a, group_id), &fingerprint);
+    }
+
+    const ListingLookup = struct {
+        key: []const u8,
+        index: usize,
+        fn less(_: void, left: @This(), right: @This()) bool {
+            return std.mem.lessThan(u8, left.key, right.key);
+        }
+    };
+    fn readListingKeys(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, lookups: []ListingLookup) ![]?[]const u8 {
+        // Share LSM run/block work across selected keys. Never scan or decode
+        // unrelated reports to make a broad inventory cheaper.
+        std.mem.sort(ListingLookup, lookups, {}, ListingLookup.less);
+        const keys = try alloc.alloc([]const u8, lookups.len);
+        for (lookups, keys) |lookup, *key| key.* = lookup.key;
+        const values = try alloc.alloc(?[]const u8, lookups.len);
+        try txn.getManySorted(keys, values);
+        return values;
     }
 
     const ListingReport = struct {
@@ -16898,13 +16927,15 @@ test "system catalog listing indexes bound legacy pages and runtime reports acro
         errdefer txn.abort();
         _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
         for ([_][]const u8{ "a", "b", "z" }, 1..) |name, id| try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = .{ .table_id = id, .name = name, .description = if (id == 3) &huge else "" } });
-        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_range = .{ .table_id = 1, .group_id = 301, .range_id = 301, .start_key = "" } });
+        for ([_]u64{ 301, 40, 41 }) |id| try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_range = .{ .table_id = 1, .group_id = id, .range_id = id, .start_key = "" } });
         var reports = [_]metadata.RuntimeGroupStatusReport{
             .{ .table_id = 1, .table_name = "a", .group_id = 301, .store_id = 20 },
             .{ .table_id = 3, .table_name = &huge, .group_id = 303, .store_id = 20 },
         };
         var group_statuses: [2000]metadata.GroupStatusReport = undefined;
         for (&group_statuses, 301..) |*status, id| status.* = .{ .group_id = id };
+        // Lexical key order differs from numeric range order; group 41 is absent.
+        group_statuses[group_statuses.len - 1] = .{ .group_id = 40 };
         try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = .{ .store_id = 20, .node_id = 30, .runtime_statuses = &reports, .group_statuses = &group_statuses } });
         try txn.commit();
     }
@@ -16927,7 +16958,9 @@ test "system catalog listing indexes bound legacy pages and runtime reports acro
         try std.testing.expectEqualStrings("a", first.entries[0].name);
         try std.testing.expectEqual(@as(?u64, 1), first.next_table_id);
         try std.testing.expectEqual(@as(usize, 1), first.stores[0].runtime_statuses.len);
-        try std.testing.expectEqual(@as(usize, 1), first.stores[0].group_statuses.len);
+        try std.testing.expectEqual(@as(usize, 2), first.stores[0].group_statuses.len);
+        try std.testing.expectEqual(@as(u64, 301), first.stores[0].group_statuses[0].group_id);
+        try std.testing.expectEqual(@as(u64, 40), first.stores[0].group_statuses[1].group_id);
         try std.testing.expectEqual(@as(u64, 301), first.stores[0].runtime_statuses[0].group_id);
         if (round == 0) fingerprint = first.legacy_membership else try std.testing.expectEqualSlices(u8, &fingerprint, &first.legacy_membership);
         bounded.reset();

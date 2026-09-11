@@ -369,7 +369,10 @@ can change between pages; pagination is not a retained historical snapshot.
 Metadata uses ordered logical-child and legacy-identity indexes to seek directly
 to the requested prefix/keyset boundary. It loads full definitions only after
 merging and truncating those candidate streams. Compact store headers exclude
-both group-summary and detailed-runtime arrays; selected groups are point reads.
+both group-summary and detailed-runtime arrays. Selected definitions and group
+reports use sorted batch reads, sharing LSM run/block work without decoding
+unrelated payloads. Logical result order is preserved independently of storage
+key order.
 The derived indexes are updated in the same transaction as primary records,
 reuse the versioned primary binary codec and compare report bytes to avoid
 rewriting unchanged rows, and rebuild atomically
