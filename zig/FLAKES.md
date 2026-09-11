@@ -4,6 +4,28 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: forwarding-retirement native Debug soak passed (#694)
+
+The executable built from `c11eead5aabe7027e4a84498bbd08489b580a89e`
+passed **100/100 quickstart**, **100/100 three-by-three backup/restore**, and
+**100/100 retry-exhaustion/restart**: 300 executions, zero failures, zero
+failed-case retries, exit 0. Four workers each ran 25 repetitions of all three
+scenarios. The native macOS Debug build completed 33/33 steps.
+
+The run started at 20:53:06 UTC and finished at 21:34:31 UTC on September 11
+(41m25s including the review pause). The four loop workers were paused during
+the fresh PR review; their first quickstart executions finished normally, and
+further iterations resumed after the review completed at 20:56:42 UTC.
+Binary SHA-256:
+`1b5262bc4d1246e9a77589d7f4d53984d19f71e065b36121acab2cb38f281386`.
+Manifest, review record, combined worker output, and exit status are retained
+under `/private/tmp/ci694-retirement-native-soak-c11eead5a`.
+
+The subsequent main merge and release-test fix through `c1200f998` changed
+container configuration, test code, and documentation, not the native runtime
+sources exercised here. These results do not certify the container image or
+resolve issue #705's separate progressive-index heap-corruption workload.
+
 ## 2026-09-11: release driver-discovery test depends on CI Python loader paths (#694)
 
 SDK CI run `34645983534`, job `103416766382`, passed formatting and SDK
