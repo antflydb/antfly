@@ -18,7 +18,11 @@ def request_details():
         if frame is None:
             break
         name = frame.name() or ""
-        if "executeRequestCancellable" in name or "waitForRequestCancellation" in name:
+        if name == "vopr_io_task.Entry.call":
+            break  # Synthetic fiber stacks have no caller beyond their entry.
+        if name.startswith("client.client.") and (
+            "executeRequestCancellable" in name or "waitForRequestCancellation" in name
+        ):
             gdb.write(f"  request frame: {name}\n")
             for variable in (
                 "timeout_ms",
@@ -28,7 +32,7 @@ def request_details():
             ):
                 try:
                     gdb.write(f"    {variable}={frame.read_var(variable)}\n")
-                except gdb.error:
+                except (gdb.error, ValueError):
                     pass  # Optimized-out values are not evidence of a timeout.
             try:
                 request = frame.read_var("req").dereference()
