@@ -537,7 +537,7 @@ fn scoreColumnsWithScopeAlloc(
             for (physical_names[start..end], 0..) |metric_name, i| {
                 children[i] = session.forkGraphMetricRead(std.heap.smp_allocator);
                 if (pass == .execute) children[i].graph_metric_transport_credit = transport_credit;
-                cancellations[i] = .{ .parent = session.cancellation, .sibling_failure = &sibling_failure };
+                cancellations[i] = .{ .parent = session.readCancellation(), .sibling_failure = &sibling_failure };
                 children[i].cancellation = cancellations[i].token();
                 if (session.diagnostics != null) children[i].setDiagnostics(&diagnostics[i]);
                 const args = .{ &children[i], graph_index_name, metric_name, node_ids, candidate_order, buffers[start + i].?, &plans[start + i], pass, &failures[i], &sibling_failure };
@@ -899,9 +899,9 @@ fn decodePointScoreBlock(session: *runtime_mod.QuerySession, entry: metric_segme
     if (first_score >= score_count) return error.InvalidGraphMetricSegment;
     const expected = @min(metric_segment.score_block_entries, score_count - first_score);
     try session.chargeGraphMetricDecode(1, expected);
-    const decoded = try metric_segment.decodeScoreBlockWithCancellation(payload, session.cancellation);
+    const decoded = try metric_segment.decodeScoreBlockWithCancellation(payload, session.readCancellation());
     if (decoded.len != expected or !decoded.scores[0].eqlNode(decoded.node_prefix, entry.first_node_id)) return error.InvalidGraphMetricSegment;
-    try decoded.populateSorted(node_ids, candidate_rows, values, session.cancellation);
+    try decoded.populateSorted(node_ids, candidate_rows, values, session.readCancellation());
 }
 
 fn executePointScores(session: *runtime_mod.QuerySession, plan: *const PointScorePlan, node_ids: []const []const u8, values: []?f64) !void {
@@ -956,7 +956,7 @@ fn admitPointPlans(alloc: Allocator, session: *runtime_mod.QuerySession, plans: 
         plan.range_alloc = alloc;
         const routing = plan.point_routing orelse continue;
         try session.checkCancellation();
-        plan.ranges = try planSparseScoreFetchRangesWithBudgetAlloc(alloc, routing.routing.entries, plan.touched_blocks, plan.score_data_offset, std.math.maxInt(usize), .{ .session = session, .cancellation = session.cancellation });
+        plan.ranges = try planSparseScoreFetchRangesWithBudgetAlloc(alloc, routing.routing.entries, plan.touched_blocks, plan.score_data_offset, std.math.maxInt(usize), .{ .session = session, .cancellation = session.readCancellation() });
         requests = std.math.add(usize, requests, plan.ranges.len) catch return error.GraphMetricQueryBudgetExceeded;
     }
     if (requests > allowance) {
@@ -976,7 +976,7 @@ fn admitPointPlans(alloc: Allocator, session: *runtime_mod.QuerySession, plans: 
             for (plan.touched_blocks) |block| counts[block.block_index] = block.pending_count;
             input.* = .{ .entries = entries, .counts = counts, .score_data_offset = plan.score_data_offset };
         }
-        const ranges = try planScoreColumnsWithinBudgetAlloc(alloc, inputs, allowance, remaining.bytes, .{ .cancellation = session.cancellation, .session = session });
+        const ranges = try planScoreColumnsWithinBudgetAlloc(alloc, inputs, allowance, remaining.bytes, .{ .cancellation = session.readCancellation(), .session = session });
         defer alloc.free(ranges);
         for (plans, ranges) |*maybe_plan, planned| {
             const plan = &maybe_plan.*.?;
@@ -1559,7 +1559,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
             const owner = if (session.cache) |cache| cache.alloc else alloc;
             const owned = try owner.dupe(u8, bytes);
             errdefer owner.free(owned);
-            const decoded = try codec.decodePointPageAlloc(owner, owned, page, block_count, root.primary_data_offset, root.primary_data_end, session.cancellation);
+            const decoded = try codec.decodePointPageAlloc(owner, owned, page, block_count, root.primary_data_offset, root.primary_data_end, session.readCancellation());
             errdefer owner.free(decoded);
             if (i + 1 < directory.entries.len and std.mem.order(u8, decoded[decoded.len - 1].first_node_id, directory.entries[i + 1].first_node_id) != .lt) return error.InvalidGraphMetricSegment;
             const entry = try owner.create(routing_cache.Entry);
@@ -1586,7 +1586,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         }
         for (pending[0..pending_count]) |*item| {
             if (item.waiter) |*waiter| {
-                if (try waiter.awaitResult(session.io, session.cancellation)) |shared| {
+                if (try waiter.awaitResult(session.io, session.readCancellation())) |shared| {
                     page_leases[item.view_index] = try OwnedRoutingLease.admit(session, shared);
                     completed += 1;
                     try session.chargeGraphMetricDecode(0, 1);
@@ -1598,7 +1598,7 @@ fn loadPointRouting(alloc: Allocator, session: *runtime_mod.QuerySession, metric
         // With no ownership or registrations, wait for table capacity. Failed
         // leaders are retried by the next pass under the same cancellation.
         if (pending_count == 0) if (saturated) |epoch|
-            try session.cache.?.graph_metric_routing.awaitFill(session.io, session.cancellation, epoch);
+            try session.cache.?.graph_metric_routing.awaitFill(session.io, session.readCancellation(), epoch);
     }
     pages.position = 0;
     for (selected.items, 0..) |i, view_index| {
@@ -1691,7 +1691,7 @@ fn acquireRouting(
     ranked_only: bool,
     directory: ?DirectoryRead,
 ) !OwnedRoutingLease {
-    try session.cancellation.check();
+    try session.readCancellation().check();
     // Include all authentication and interpretation inputs, not merely a
     // logical metric name (which can point at a new immutable publication).
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1716,7 +1716,7 @@ fn acquireRouting(
     defer if (fill) |index| session.cache.?.graph_metric_routing.finish(index, session.io);
     if (session.cache) |cache| {
         while (true) {
-            try session.cancellation.check();
+            try session.readCancellation().check();
             switch (cache.graph_metric_routing.begin(key)) {
                 .hit => |cached| {
                     var lease = try OwnedRoutingLease.admit(session, cached);
@@ -1731,7 +1731,7 @@ fn acquireRouting(
                 .wait => |registered| {
                     var waiter = registered;
                     defer waiter.deinit();
-                    if (try waiter.awaitResult(session.io, session.cancellation)) |shared| {
+                    if (try waiter.awaitResult(session.io, session.readCancellation())) |shared| {
                         var lease = try OwnedRoutingLease.admit(session, shared);
                         errdefer lease.deinit();
                         try session.chargeGraphMetricDecode(0, 1);
@@ -1739,7 +1739,7 @@ fn acquireRouting(
                     }
                 },
                 .saturated => |epoch| {
-                    try cache.graph_metric_routing.awaitFill(session.io, session.cancellation, epoch);
+                    try cache.graph_metric_routing.awaitFill(session.io, session.readCancellation(), epoch);
                 },
             }
         }
@@ -1773,7 +1773,7 @@ fn acquireRouting(
     if (!ranked_only and directory == null and
         (owned.len < 8 or std.mem.readInt(u32, owned[4..8], .little) != decode_work)) return error.InvalidGraphMetricSegment;
     var routing = if (directory) |info| blk: {
-        const entries = try metric_segment.codec.decodePointDirectoryAlloc(owner, owned, offset, info.footer_offset, info.block_count, session.cancellation);
+        const entries = try metric_segment.codec.decodePointDirectoryAlloc(owner, owned, offset, info.footer_offset, info.block_count, session.readCancellation());
         errdefer owner.free(entries);
         break :blk metric_segment.codec.RoutingIndex{
             .entries = entries,
@@ -1783,15 +1783,15 @@ fn acquireRouting(
             .point_index_checksum = artifact.graph_metric_point_index_checksum,
         };
     } else if (ranked_only)
-        try metric_segment.codec.decodeRoutingRootAlloc(owner, owned, artifact.byte_len, version, session.cancellation)
+        try metric_segment.codec.decodeRoutingRootAlloc(owner, owned, artifact.byte_len, version, session.readCancellation())
     else
-        try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(owner, owned, artifact.byte_len, version, session.cancellation);
+        try metric_segment.decodeRoutingIndexForVersionWithCancellationAlloc(owner, owned, artifact.byte_len, version, session.readCancellation());
     errdefer routing.deinit(owner);
     if (!std.mem.eql(u8, &routing.point_index_checksum, &artifact.graph_metric_point_index_checksum)) return error.InvalidGraphMetricSegment;
     const entry = try owner.create(routing_cache.Entry);
     errdefer owner.destroy(entry);
     entry.* = .{ .key = key, .alloc = owner, .footer = owned, .routing = routing };
-    try session.cancellation.check();
+    try session.readCancellation().check();
     // Retain exactly the immutable lease footprint. Admission never drops
     // between the construction owner and the returned query owner.
     decode_memory.absorb(&footer_range.memory);
@@ -1862,7 +1862,7 @@ fn fetchMetricRangeBytesAlloc(
     for (selected, specs) |entry, *spec| {
         spec.* = .{ .key = fills.blockKey(artifact.artifact_id, artifact.checksum, entry.offset, entry.len, &entry.checksum), .len = entry.len };
     }
-    var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, specs, session.io, session.cancellation);
+    var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, specs, session.io, session.readCancellation());
     defer batch.deinit();
     const missing = try alloc.alloc(bool, selected.len);
     defer alloc.free(missing);
@@ -2227,7 +2227,7 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
                 if (relative_offset > ranked_payload.len or entry.len > ranked_payload.len - relative_offset) return error.InvalidGraphMetricSegment;
                 const decoded = try metric_segment.codec.decodeRankedScoreBlockWithCancellation(
                     ranked_payload[relative_offset..][0..entry.len],
-                    session.cancellation,
+                    session.readCancellation(),
                 );
                 const expected_block_count = @min(
                     metric_segment.codec.ranked_score_block_entries,
@@ -2307,7 +2307,7 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     try session.chargeGraphMetricRetained(retained_bytes);
     const payload = try session.fetchArtifactAlloc(metric_index);
     defer session.alloc.free(payload);
-    var segment = try metric_segment.decodeAllocWithCancellation(alloc, payload, session.cancellation);
+    var segment = try metric_segment.decodeAllocWithCancellation(alloc, payload, session.readCancellation());
     errdefer segment.deinit(alloc);
     // The authenticated payload owns its schema version. Manifest provenance
     // is optional and must not override the decoded wire contract.

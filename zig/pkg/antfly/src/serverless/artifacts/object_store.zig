@@ -218,12 +218,19 @@ pub const ObjectStore = struct {
     }
 
     pub fn putWithCancellation(self: *ObjectStore, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        return self.putInScope(alloc, null, contents, cancellation);
+    }
+
+    fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         try cancellation.check();
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
-        const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
+        const artifact_id = if (scope) |value| scoped: {
+            const id = try value.artifactId(checksum);
+            break :scoped try alloc.dupe(u8, &id);
+        } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -274,8 +281,7 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
@@ -298,8 +304,7 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
@@ -349,7 +354,7 @@ pub const ObjectStore = struct {
         };
         defer pin.deinit(alloc);
 
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
@@ -382,7 +387,7 @@ pub const ObjectStore = struct {
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
@@ -418,7 +423,7 @@ pub const ObjectStore = struct {
     ) !void {
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
@@ -495,8 +500,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
-        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const key = try keyForChecksumAlloc(self.alloc, self.prefix, checksum);
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
         lockAtomic(&self.verified_mu);
@@ -563,10 +567,45 @@ pub const ObjectStore = struct {
         return .{ .version_id = version_id, .etag = etag };
     }
 
+    fn visitScopedUploads(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        const prefix = if (self.prefix.len == 0)
+            try std.fmt.allocPrint(self.alloc, "graph/{s}/", .{std.fmt.bytesToHex(&domain, .lower)})
+        else
+            try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
+        defer self.alloc.free(prefix);
+        var token: ?[]u8 = null;
+        defer if (token) |value| self.alloc.free(value);
+        while (true) {
+            try cancellation.check();
+            var page = try self.client.listObjects(self.bucket, .{
+                .prefix = prefix,
+                .recursive = true,
+                .max_keys = 256,
+                .continuation_token = token,
+                .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+            });
+            defer page.deinit(self.client.allocator);
+            var next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
+            errdefer if (next) |value| self.alloc.free(value);
+            if (token != null and next != null and std.mem.eql(u8, token.?, next.?)) return error.InvalidContinuationToken;
+            for (page.entries) |entry| {
+                try cancellation.check();
+                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
+                try artifact_store.visitScopedSuffix(domain, entry.key[prefix.len..], visitor);
+            }
+            if (token) |value| self.alloc.free(value);
+            token = next;
+            next = null;
+            if (token == null) return;
+        }
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
+        .put_scoped = erasedPutScoped,
+        .visit_scoped_uploads = erasedVisitScopedUploads,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
@@ -592,6 +631,16 @@ pub const ObjectStore = struct {
     fn erasedPutWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.putWithCancellation(alloc, contents, cancellation);
+    }
+
+    fn erasedPutScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.putInScope(alloc, scope, contents, cancellation);
+    }
+
+    fn erasedVisitScopedUploads(ptr: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.visitScopedUploads(domain, visitor, cancellation);
     }
 
     fn erasedGetAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -756,8 +805,27 @@ fn keyForChecksumAlloc(alloc: std.mem.Allocator, prefix: []const u8, checksum: [
     return try std.fmt.allocPrint(alloc, "{s}/sha256/{s}/{s}", .{ prefix, checksum[0..2], checksum[2..] });
 }
 
+fn keyForArtifactIdAlloc(alloc: std.mem.Allocator, prefix: []const u8, id: []const u8) ![]u8 {
+    const checksum = try artifact_store.sha256ChecksumFromArtifactId(id);
+    if (id.len == 71) return keyForChecksumAlloc(alloc, prefix, checksum);
+    if (prefix.len == 0) return std.fmt.allocPrint(alloc, "graph/{s}/{s}/{s}", .{ id[78..142], id[143..175], checksum });
+    return std.fmt.allocPrint(alloc, "{s}/graph/{s}/{s}/{s}", .{ prefix, id[78..142], id[143..175], checksum });
+}
+
 fn hexNibble(v: u8) u8 {
     return if (v < 10) '0' + v else 'a' + (v - 10);
+}
+
+test "serverless object artifacts inventory abandoned and late scoped uploads" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "scoped-uploads");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{std.mem.span(path)});
+    defer std.testing.allocator.free(uri);
+    var store = try ObjectStore.initFileUri(std.testing.allocator, uri);
+    defer store.deinit();
+    var capability = store.artifactStore();
+    try @import("scoped_upload_test.zig").exercise(&capability);
 }
 
 test "objectstore-backed artifacts store round-trips over file uri" {

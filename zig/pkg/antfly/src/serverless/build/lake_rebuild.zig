@@ -253,6 +253,7 @@ pub const RowSourceProvider = struct {
 pub const ExecutionOptions = struct {
     limits: lake_build_limits.Limits = .{},
     cancellation: CancellationToken = .none,
+    upload_scope: ?artifact_store.UploadScope = null,
 };
 
 pub const ExecutedOperation = struct {
@@ -470,7 +471,8 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
         defer alloc.free(config_json);
         const graph_column = try configuredColumnOrDefaultAlloc(alloc, index_root, graph_name, "graph_edges");
         defer alloc.free(graph_column);
-        const index_hash = try indexConfigHashAlloc(alloc, "graph", graph_name, config_json, &[_][]const u8{graph_column});
+        // The graph projection is independent of its logical index alias.
+        const index_hash = try indexConfigHashAlloc(alloc, "graph", "", config_json, &[_][]const u8{graph_column});
         defer alloc.free(index_hash);
         try appendDesiredArtifactAlloc(alloc, &artifacts, source, .{
             .name = graph_name,
@@ -524,6 +526,7 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
     table: TableIndexDefinition,
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     provenance: lake_graph_metric.Provenance,
+    upload_scope: ?artifact_store.UploadScope,
 ) !ReconciledManifest {
     return try reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
         alloc,
@@ -535,6 +538,7 @@ pub fn reconcileResolvedExternalSourceSidecarsAlloc(
         published_declarations,
         .none,
         provenance,
+        upload_scope,
     );
 }
 
@@ -548,6 +552,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
     published_declarations: []const sidecar_manifest.DeclaredArtifact,
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
+    upload_scope: ?artifact_store.UploadScope,
 ) !ReconciledManifest {
     return try reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
         alloc,
@@ -560,6 +565,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithCancellationAlloc(
         cancellation,
         provenance,
         .{},
+        upload_scope,
     );
 }
 
@@ -578,6 +584,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
     cancellation: CancellationToken,
     provenance: lake_graph_metric.Provenance,
     runtime: lake_graph_metric.ComputeRuntime,
+    upload_scope: ?artifact_store.UploadScope,
 ) !ReconciledManifest {
     try provenance.validate();
     try cancellation.check();
@@ -589,6 +596,26 @@ pub fn reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
     for (published_declarations) |declaration| {
         if (declaration.binding.sidecar_kind != .graph_metric) try base_declarations.append(alloc, declaration);
     }
+    var aliases = std.ArrayListUnmanaged(sidecar_manifest.DeclaredArtifact).empty;
+    defer {
+        for (aliases.items) |alias| freeOwnedDeclaration(alloc, alias);
+        aliases.deinit(alloc);
+    }
+    // A new name for an existing projection reuses its immutable root, even
+    // though this publication owns a different upload attempt.
+    for (desired.artifacts) |want| {
+        if (want.binding.sidecar_kind != .graph or findDeclaration(base_declarations.items, want.name) != null) continue;
+        for (published_declarations) |old| {
+            if (!bindingsEqual(want.binding, old.binding)) continue;
+            const alias = try cloneGraphAliasAlloc(alloc, old, want.name);
+            aliases.append(alloc, alias) catch |err| {
+                freeOwnedDeclaration(alloc, alias);
+                return err;
+            };
+            try base_declarations.append(alloc, alias);
+            break;
+        }
+    }
     const published = try publishedArtifactsFromDeclarationsAlloc(alloc, base_declarations.items);
     defer alloc.free(published);
 
@@ -597,6 +624,7 @@ pub fn reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(
 
     var executed = try executeOperationsWithOptionsAlloc(alloc, artifacts, source_provider, operation_plan, .{
         .cancellation = cancellation,
+        .upload_scope = upload_scope,
     });
     defer executed.deinit(alloc);
 
@@ -854,10 +882,13 @@ pub fn executeOperationsWithOptionsAlloc(
                 if (group_count == 1) {
                     var source = try source_provider.openWithCancellation(alloc, operation.binding, options.cancellation);
                     defer source.deinit(alloc);
-                    const declaration = try executeRebuildOperationAlloc(alloc, artifacts, source, operation, options.limits, options.cancellation);
-                    errdefer freeOwnedDeclaration(alloc, declaration);
-                    executed[operation_idx] = try makeExecutedOperation(alloc, operation, declaration, declaration.artifact.artifact_id);
+                    const declaration = try executeRebuildOperationAlloc(alloc, artifacts, source, operation, options.limits, options.cancellation, options.upload_scope);
+                    executed[operation_idx] = makeExecutedOperation(alloc, operation, declaration, declaration.artifact.artifact_id) catch |err| {
+                        freeOwnedDeclaration(alloc, declaration);
+                        return err;
+                    };
                     completed[operation_idx] = true;
+                    try completeGraphAliasesAlloc(alloc, plan.operations, executed, completed, operation_idx);
                     continue;
                 }
 
@@ -880,15 +911,19 @@ pub fn executeOperationsWithOptionsAlloc(
                         group_operation,
                         options.limits,
                         options.cancellation,
+                        options.upload_scope,
                     );
-                    errdefer freeOwnedDeclaration(alloc, declaration);
-                    executed[group_idx] = try makeExecutedOperation(
+                    executed[group_idx] = makeExecutedOperation(
                         alloc,
                         group_operation,
                         declaration,
                         declaration.artifact.artifact_id,
-                    );
+                    ) catch |err| {
+                        freeOwnedDeclaration(alloc, declaration);
+                        return err;
+                    };
                     completed[group_idx] = true;
+                    try completeGraphAliasesAlloc(alloc, plan.operations, executed, completed, group_idx);
                 }
             },
         }
@@ -903,10 +938,39 @@ fn countPendingRebuildsForSnapshot(
     binding: source_binding.Binding,
 ) usize {
     var count: usize = 0;
-    for (operations, completed) |operation, done| {
-        if (!done and operation.action == .rebuild and source_binding.sameSourceSnapshot(operation.binding, binding)) count += 1;
+    for (operations, completed, 0..) |operation, done, idx| {
+        if (done or operation.action != .rebuild or !source_binding.sameSourceSnapshot(operation.binding, binding)) continue;
+        // Aliases are one physical projection, not separate replay consumers.
+        var alias = false;
+        for (operations[0..idx], completed[0..idx]) |prior, prior_done| {
+            if (!prior_done and prior.action == .rebuild and sameGraphProjection(prior, operation)) {
+                alias = true;
+                break;
+            }
+        }
+        if (!alias) count += 1;
     }
     return count;
+}
+
+fn sameGraphProjection(a: Operation, b: Operation) bool {
+    if (a.artifact_kind != .graph_segment or b.artifact_kind != .graph_segment or !bindingsEqual(a.binding, b.binding)) return false;
+    const left = a.build_spec orelse return false;
+    const right = b.build_spec orelse return false;
+    return left == .graph and right == .graph and std.mem.eql(u8, left.graph.graph_column, right.graph.graph_column);
+}
+
+fn completeGraphAliasesAlloc(alloc: Allocator, operations: []const Operation, executed: []ExecutedOperation, completed: []bool, representative: usize) !void {
+    const source = executed[representative].declaration orelse return;
+    for (operations, 0..) |operation, idx| {
+        if (completed[idx] or operation.action != .rebuild or !sameGraphProjection(operations[representative], operation)) continue;
+        const alias = try cloneGraphAliasAlloc(alloc, source, operation.name);
+        executed[idx] = makeExecutedOperation(alloc, operation, alias, alias.artifact.artifact_id) catch |err| {
+            freeOwnedDeclaration(alloc, alias);
+            return err;
+        };
+        completed[idx] = true;
+    }
 }
 
 fn mergedRebuildBindingAlloc(
@@ -1760,6 +1824,7 @@ fn executeRebuildOperationAlloc(
     operation: Operation,
     limits: lake_build_limits.Limits,
     cancellation: CancellationToken,
+    upload_scope: ?artifact_store.UploadScope,
 ) !sidecar_manifest.DeclaredArtifact {
     try cancellation.check();
     const build_spec = operation.build_spec orelse return error.MissingLakeRebuildBuildSpec;
@@ -1805,6 +1870,7 @@ fn executeRebuildOperationAlloc(
                 .graph_column = spec.graph_column,
                 .limits = limits,
                 .cancellation = cancellation,
+                .upload_scope = upload_scope,
             });
             const declaration = result.declaration;
             result = undefined;
@@ -2015,6 +2081,13 @@ fn cloneDeclarationAlloc(alloc: Allocator, declaration: sidecar_manifest.Declare
     };
 }
 
+fn cloneGraphAliasAlloc(alloc: Allocator, declaration: sidecar_manifest.DeclaredArtifact, name: []const u8) !sidecar_manifest.DeclaredArtifact {
+    var alias = declaration;
+    alias.name = name;
+    alias.artifact.name = name;
+    return cloneDeclarationAlloc(alloc, alias);
+}
+
 fn declarationFromPublishedAlloc(alloc: Allocator, published: PublishedArtifact) !sidecar_manifest.DeclaredArtifact {
     try published.binding.validate();
     try validatePublishedArtifact(published);
@@ -2136,6 +2209,23 @@ const MemoryArtifactStore = struct {
         return try alloc.dupe(u8, bytes);
     }
 
+    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const self: *MemoryArtifactStore = @ptrCast(@alignCast(ptr));
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+        const hex = std.fmt.bytesToHex(&digest, .lower);
+        const id = try scope.artifactId(&hex);
+        if (!self.entries.contains(&id)) {
+            const key = try self.alloc.dupe(u8, &id);
+            errdefer self.alloc.free(key);
+            const bytes = try self.alloc.dupe(u8, contents);
+            errdefer self.alloc.free(bytes);
+            try self.entries.put(self.alloc, key, bytes);
+        }
+        return self.stat(alloc, &id);
+    }
+
     fn getRangeAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
         const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
         if (offset > bytes.len) return error.InvalidRange;
@@ -2168,6 +2258,7 @@ const MemoryArtifactStore = struct {
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
+        .put_scoped = putScoped,
         .get_alloc = erasedGetAlloc,
         .get_range_alloc = erasedGetRangeAlloc,
         .stat = erasedStat,
@@ -2803,6 +2894,75 @@ test "lake rebuild operation executor opens each source snapshot once" {
     try std.testing.expect(result.find("docs.title_text").?.declaration != null);
 }
 
+test "serverless lake graph aliases bootstrap one projection without replay on initial and changed snapshots" {
+    const a = std.testing.allocator;
+    const binding = source_binding.Binding{
+        .sidecar_kind = .graph,
+        .source_kind = .external_parquet,
+        .row_ref_kind = .external,
+        .source_id = "docs",
+        .snapshot_id = "snapshot-2",
+        .schema_fingerprint = "schema-v1",
+        .column_bindings = &.{"edges"},
+        .index_config_hash = "sha256:graph",
+    };
+    const desired = [_]DesiredArtifact{
+        .{ .name = "first", .binding = binding, .kind = .graph_segment, .build_spec = .{ .graph = .{ .graph_column = "edges" } } },
+        .{ .name = "second", .binding = binding, .kind = .graph_segment, .build_spec = .{ .graph = .{ .graph_column = "edges" } } },
+    };
+    var old_binding = binding;
+    old_binding.snapshot_id = "snapshot-1";
+    const published = [_]PublishedArtifact{
+        .{ .name = "first", .binding = old_binding, .artifact = .{ .kind = .graph_segment, .name = "first", .artifact_id = "old-graph", .byte_len = 32, .checksum = "len:32" } },
+        .{ .name = "second", .binding = old_binding, .artifact = .{ .kind = .graph_segment, .name = "second", .artifact_id = "old-graph", .byte_len = 32, .checksum = "len:32" } },
+    };
+    const row_refs = [_]rowsource.RowRef{.{ .external = .{ .source_id = "docs", .snapshot_id = "snapshot-2", .file_id = "data.parquet", .row_group_ordinal = 0, .row_ordinal = 0 } }};
+    const values = [_][]const u8{"[{\"target\":\"neighbor\",\"edge_type\":\"link\"}]"};
+    const columns = [_]rowsource.ColumnVector{.{ .name = "edges", .values = .{ .json = &values } }};
+    const batches = [_]rowsource.ColumnBatch{.{ .snapshot = .{ .table_id = "docs", .snapshot_id = "snapshot-2" }, .row_refs = &row_refs, .columns = &columns }};
+    for ([_]bool{ false, true }) |changed| {
+        var memory = MemoryArtifactStore.init(a);
+        var artifacts = memory.artifactStore();
+        defer artifacts.deinit();
+        var provider = TestRowSourceProvider{ .source_kind = .external_parquet, .batches = &batches };
+        var plan = try planOperationsAlloc(a, &desired, if (changed) &published else &.{});
+        defer plan.deinit(a);
+        const done = [_]bool{ false, false };
+        try std.testing.expectEqual(@as(usize, 1), countPendingRebuildsForSnapshot(plan.operations, &done, binding));
+        var result = try executeOperationsWithOptionsAlloc(a, &artifacts, provider.provider(), plan, .{
+            // Any replay-buffer capture of this nonempty input must fail.
+            .limits = .{ .max_replay_bytes = 1 },
+            .upload_scope = .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("docs"), .attempt = @splat(1) },
+        });
+        defer result.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), provider.open_count);
+        const first = result.find("first").?.declaration.?;
+        const second = result.find("second").?.declaration.?;
+        try std.testing.expectEqualStrings(first.artifact.artifact_id, second.artifact.artifact_id);
+        try std.testing.expectEqualStrings("first", first.artifact.name);
+        try std.testing.expectEqualStrings("second", second.artifact.name);
+        const Failures = struct {
+            fn run(alloc: Allocator, operations: []const Operation, source: sidecar_manifest.DeclaredArtifact) !void {
+                const executed = try alloc.alloc(ExecutedOperation, operations.len);
+                defer alloc.free(executed);
+                const completed = try alloc.alloc(bool, operations.len);
+                defer alloc.free(completed);
+                @memset(completed, false);
+                defer for (executed, completed) |*entry, complete| if (complete) entry.deinit(alloc);
+                const declaration = try cloneDeclarationAlloc(alloc, source);
+                executed[0] = makeExecutedOperation(alloc, operations[0], declaration, declaration.artifact.artifact_id) catch |err| {
+                    freeOwnedDeclaration(alloc, declaration);
+                    return err;
+                };
+                completed[0] = true;
+                try completeGraphAliasesAlloc(alloc, operations, executed, completed, 0);
+                try std.testing.expect(completed[1]);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Failures.run, .{ plan.operations, first });
+    }
+}
+
 test "serverless lake rebuild reconciles resolved external sidecars end to end" {
     const alloc = std.testing.allocator;
     var memory = MemoryArtifactStore.init(alloc);
@@ -2859,6 +3019,7 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
         },
         &.{},
         .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 },
+        .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("docs"), .attempt = @splat(1) },
     );
     defer reconciled.deinit(alloc);
 
@@ -2908,6 +3069,7 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
         },
         reconciled.artifacts,
         .{ .published_generation = 2, .edge_generation = 2, .computed_at_ms = 2 },
+        .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("docs"), .attempt = @splat(2) },
     );
     defer updated.deinit(alloc);
 
@@ -2974,6 +3136,7 @@ test "serverless lake rebuild reconciles resolved external sidecars end to end" 
         },
         updated.artifacts,
         .{ .published_generation = 3, .edge_generation = 3, .computed_at_ms = 3 },
+        .{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain("docs"), .attempt = @splat(3) },
     );
     defer replaced.deinit(alloc);
 

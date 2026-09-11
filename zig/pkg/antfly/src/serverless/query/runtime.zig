@@ -26,6 +26,7 @@ const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
 const operation = @import("../../api/operation.zig");
 const CancellationToken = operation.CancellationToken;
+const read_lease = @import("../manifest/read_lease.zig");
 
 pub const QueryExecutionMetrics = struct {
     total_queries: u64 = 0,
@@ -259,6 +260,7 @@ pub const QueryRuntime = struct {
     metrics_mu: std.atomic.Mutex = .unlocked,
     metrics: QueryExecutionMetrics = .{},
     namespace_metrics: std.StringHashMapUnmanaged(QueryExecutionMetrics) = .empty,
+    read_leases: read_lease.Cache = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -296,17 +298,38 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSession(self: *QueryRuntime, namespace: []const u8, version: u64) !QuerySession {
+        var manifest = try self.manifests.getAlloc(namespace, version);
+        errdefer manifest.deinit(self.alloc);
+        var lease: ?read_lease.Lease = null;
+        for (manifest.artifacts) |artifact| {
+            if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
+                lease = try self.read_leases.acquire(self.progress, namespace, version);
+                break;
+            }
+        }
         return .{
             .alloc = self.alloc,
             .artifacts = self.artifacts,
             .cache = self.cache,
-            .manifest = try self.manifests.getAlloc(namespace, version),
+            .manifest = manifest,
+            .read_lease = lease,
         };
     }
 
     pub fn openHeadSession(self: *QueryRuntime, namespace: []const u8) !QuerySession {
-        const version = try self.progress.getHead(namespace);
-        return try self.openVersionSession(namespace, version);
+        var version = try self.progress.getHead(namespace);
+        for (0..3) |_| {
+            return self.openVersionSession(namespace, version) catch |err| switch (err) {
+                error.FileNotFound, error.ManifestVersionRetired => {
+                    const next = try self.progress.getHead(namespace);
+                    if (next == version) return err;
+                    version = next;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        return error.ManifestReadLeaseContended;
     }
 
     pub fn recordSearchStats(self: *QueryRuntime, namespace: []const u8, mode: request_mod.QueryMode, stats: anytype) !void {
@@ -370,6 +393,7 @@ pub const QuerySession = struct {
     owns_manifest: bool = true,
     io: ?std.Io = null,
     cancellation: CancellationToken = .none,
+    read_lease: ?read_lease.Lease = null,
     diagnostics: ?*operation.RequestDiagnostics = null,
     graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
     owns_graph_metric_specs: bool = true,
@@ -390,6 +414,21 @@ pub const QuerySession = struct {
         const self: *QuerySession = @ptrCast(@alignCast(ptr));
         const cache = self.cache.?;
         const fills = @import("authenticated_block_fills.zig");
+        // Document bodies can be larger than a shared-cache fill. Cache
+        // admission is an optimization, not a stricter document-size contract.
+        if (len > fills.Cache.max_batch_bytes) {
+            try cancellation.check();
+            if (len > remaining.*) return error.GraphMetricBuildBudgetExceeded;
+            remaining.* -= len;
+            const bytes = try artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, offset, len, cancellation);
+            errdefer alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
+            try cancellation.check();
+            return bytes;
+        }
         const key = fills.blockKey(source.artifact_id, source.checksum, offset, len, &checksum);
         var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, &.{.{ .key = key, .len = len }}, self.io, cancellation);
         defer batch.deinit();
@@ -479,6 +518,7 @@ pub const QuerySession = struct {
             .owns_manifest = false,
             .io = self.io,
             .cancellation = self.cancellation,
+            .read_lease = self.read_lease,
             .diagnostics = null,
             .graph_metric_specs = self.graph_metric_specs,
             .owns_graph_metric_specs = false,
@@ -503,7 +543,19 @@ pub const QuerySession = struct {
     }
 
     pub fn checkCancellation(self: *const QuerySession) !void {
+        if (self.read_lease) |lease| lease.check() catch return error.DeadlineExceeded;
         return self.cancellation.check();
+    }
+
+    /// Borrow only after the session is in its final request-owned location,
+    /// exactly like graphAdjacencyCache. Joined children finish before deinit.
+    pub fn readCancellation(self: *const QuerySession) CancellationToken {
+        return .{ .ptr = self, .check_fn = checkReadCancellation };
+    }
+
+    fn checkReadCancellation(ptr: *const anyopaque) !void {
+        const self: *const QuerySession = @ptrCast(@alignCast(ptr));
+        return self.checkCancellation();
     }
 
     pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
@@ -562,7 +614,7 @@ pub const QuerySession = struct {
                 artifact.artifact_id,
                 artifact.byte_len,
                 artifact.checksum,
-                self.cancellation,
+                self.readCancellation(),
             )
         else
             try self.artifacts.getVerifiedAllocWithCancellationUsingAllocator(
@@ -570,7 +622,7 @@ pub const QuerySession = struct {
                 artifact.artifact_id,
                 artifact.byte_len,
                 artifact.checksum,
-                self.cancellation,
+                self.readCancellation(),
             );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
@@ -589,7 +641,7 @@ pub const QuerySession = struct {
             artifact.artifact_id,
             artifact.byte_len,
             artifact.checksum,
-            self.cancellation,
+            self.readCancellation(),
         );
         try self.checkCancellation();
     }
@@ -607,7 +659,7 @@ pub const QuerySession = struct {
                 artifact.checksum,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             )
         else
             try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
@@ -617,7 +669,7 @@ pub const QuerySession = struct {
                 artifact.checksum,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
@@ -638,7 +690,7 @@ pub const QuerySession = struct {
                 artifact.checksum,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             )
         else
             try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
@@ -648,7 +700,7 @@ pub const QuerySession = struct {
                 artifact.checksum,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
@@ -678,7 +730,7 @@ pub const QuerySession = struct {
                 checksum,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             )
         else blk: {
             const bytes = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
@@ -686,7 +738,7 @@ pub const QuerySession = struct {
                 artifact.artifact_id,
                 offset,
                 len,
-                self.cancellation,
+                self.readCancellation(),
             );
             errdefer self.alloc.free(bytes);
             if (bytes.len != len) return error.ArtifactIntegrityMismatch;
@@ -712,7 +764,7 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const cache = self.cache orelse return null;
-        return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.cancellation) catch |err| switch (err) {
+        return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.readCancellation()) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
             // A damaged/unavailable local cache is a miss, never authority.
             // The origin read still authenticates against the manifest digest.
@@ -766,7 +818,7 @@ pub const QuerySession = struct {
                 offset,
                 len,
                 subranges,
-                self.cancellation,
+                self.readCancellation(),
             );
             errdefer self.alloc.free(result);
             try self.checkCancellation();
@@ -778,7 +830,7 @@ pub const QuerySession = struct {
             artifact.artifact_id,
             offset,
             len,
-            self.cancellation,
+            self.readCancellation(),
         );
         errdefer self.alloc.free(result);
         if (result.len != len) return error.ArtifactIntegrityMismatch;
@@ -828,7 +880,24 @@ fn validateArtifactIdentity(artifact: manifest_mod.ArtifactRef) !void {
         return error.ArtifactIntegrityMismatch;
 }
 
-test "query runtime pins manifest version while head advances" {
+test "serverless query read lease expiry fences transport and joined metric sessions" {
+    var session = QuerySession{
+        .alloc = std.testing.allocator,
+        .artifacts = undefined, // no I/O may escape the expired lease
+        .manifest = .{ .namespace = @constCast("docs"), .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .stats = .{}, .artifacts = @constCast(&.{}) },
+        .owns_manifest = false,
+        .read_lease = .{ .unix_deadline = 1, .authority_deadline = 1 },
+    };
+    defer session.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, session.checkCancellation());
+    try std.testing.expectError(error.DeadlineExceeded, session.readCancellation().check());
+    try std.testing.expectError(error.DeadlineExceeded, session.fetchArtifactAlloc(0));
+    var joined = session.forkGraphMetricRead(std.testing.allocator);
+    defer joined.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, joined.readCancellation().check());
+}
+
+test "serverless query runtime pins manifest version while head advances" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -910,7 +979,7 @@ test "query runtime pins manifest version while head advances" {
     try std.testing.expectEqualStrings("version-two", latest);
 }
 
-test "query session named artifact lookup does not fall back to unnamed artifact" {
+test "serverless query session named artifact lookup does not fall back to unnamed artifact" {
     const alloc = std.testing.allocator;
 
     var session = QuerySession{
@@ -948,7 +1017,7 @@ test "query session named artifact lookup does not fall back to unnamed artifact
     try std.testing.expectEqual(@as(?usize, null), session.findNamedArtifactIndex(.sparse_segment, "missing"));
 }
 
-test "graph reader routes named graph artifacts by index name" {
+test "serverless query runtime routes named graph artifacts by index name" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -970,45 +1039,28 @@ test "graph reader routes named graph artifacts by index name" {
     var progress_store = fs_progress.progressStore();
     defer progress_store.deinit();
 
-    var graph_a = graph_segment_mod.Segment{
-        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = reads;
+    var pages: graph_segment_mod.page_store.PageStore = .{
+        .domain = graph_segment_mod.page_store.PageStore.namespaceDomain("docs"),
+        .attempt = @splat(1),
+        .artifacts = &artifact_store,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
     };
-    defer graph_segment_mod.freeSegment(alloc, &graph_a);
-    graph_a.adjacencies[0] = .{
-        .node_id = try alloc.dupe(u8, "doc-a"),
-        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
-        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
-    };
-    graph_a.adjacencies[0].out_edges[0] = .{
-        .neighbor_id = try alloc.dupe(u8, "doc-b"),
-        .edge_type = try alloc.dupe(u8, "cites"),
-        .weight = 1.0,
-    };
-
-    var graph_b = graph_segment_mod.Segment{
-        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
-    };
-    defer graph_segment_mod.freeSegment(alloc, &graph_b);
-    graph_b.adjacencies[0] = .{
-        .node_id = try alloc.dupe(u8, "doc-a"),
-        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
-        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
-    };
-    graph_b.adjacencies[0].out_edges[0] = .{
-        .neighbor_id = try alloc.dupe(u8, "doc-z"),
-        .edge_type = try alloc.dupe(u8, "rel"),
-        .weight = 2.0,
-    };
-
-    const payload_a = try graph_segment_mod.encodeAlloc(alloc, graph_a);
-    defer alloc.free(payload_a);
-    const payload_b = try graph_segment_mod.encodeAlloc(alloc, graph_b);
-    defer alloc.free(payload_b);
-
-    var artifact_a = try artifact_store.put(payload_a);
-    defer artifact_a.deinit(alloc);
-    var artifact_b = try artifact_store.put(payload_b);
-    defer artifact_b.deinit(alloc);
+    const empty: graph_segment_mod.page_graph.Root = .{ .domain = pages.domain };
+    var plan_a = try graph_segment_mod.page_graph.plan(alloc, pages.store(), empty, &.{.{ .id = "doc-a", .edges = &.{.{ .source = "doc-a", .target = "doc-b", .kind = "cites", .weight = 1 }} }});
+    defer plan_a.deinit();
+    const artifact_a = try pages.publishRoot(alloc, try plan_a.publish(pages.store(), empty), "graph_a");
+    defer alloc.free(artifact_a.name);
+    defer alloc.free(artifact_a.artifact_id);
+    defer alloc.free(artifact_a.checksum);
+    var plan_b = try graph_segment_mod.page_graph.plan(alloc, pages.store(), empty, &.{.{ .id = "doc-a", .edges = &.{.{ .source = "doc-a", .target = "doc-z", .kind = "rel", .weight = 2 }} }});
+    defer plan_b.deinit();
+    const artifact_b = try pages.publishRoot(alloc, try plan_b.publish(pages.store(), empty), "graph_b");
+    defer alloc.free(artifact_b.name);
+    defer alloc.free(artifact_b.artifact_id);
+    defer alloc.free(artifact_b.checksum);
 
     var manifest = manifest_mod.Manifest{
         .namespace = try alloc.dupe(u8, "docs"),
@@ -1026,6 +1078,7 @@ test "graph reader routes named graph artifacts by index name" {
         .artifact_id = try alloc.dupe(u8, artifact_a.artifact_id),
         .byte_len = artifact_a.byte_len,
         .checksum = try alloc.dupe(u8, artifact_a.checksum),
+        .metadata_version = artifact_a.metadata_version,
     };
     manifest.artifacts[1] = .{
         .kind = .graph_segment,
@@ -1033,11 +1086,13 @@ test "graph reader routes named graph artifacts by index name" {
         .artifact_id = try alloc.dupe(u8, artifact_b.artifact_id),
         .byte_len = artifact_b.byte_len,
         .checksum = try alloc.dupe(u8, artifact_b.checksum),
+        .metadata_version = artifact_b.metadata_version,
     };
     try manifest_store.put(manifest);
     try std.testing.expect(try progress_store.compareAndSwapHead("docs", null, 1));
 
     var runtime = QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer runtime.deinit();
     var session = try runtime.openHeadSession("docs");
     defer session.deinit();
 
@@ -1057,7 +1112,53 @@ test "graph reader routes named graph artifacts by index name" {
     try std.testing.expectEqualStrings("rel", neighbors[0].edge_type);
 }
 
-test "query runtime warming keeps artifact available through cache" {
+test "serverless authenticated body reads bypass cache size limits but enforce integrity and admission" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "large-facts-artifacts");
+    const cache_root = tmpPath(&cache_root_buf, "large-facts-cache");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifacts = fs_artifacts.artifactStore();
+    defer artifacts.deinit();
+    var cache = try cache_mod.QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+    const len = @import("authenticated_block_fills.zig").Cache.max_batch_bytes + 1;
+    const payload = try alloc.alloc(u8, len);
+    defer alloc.free(payload);
+    @memset(payload, 'a');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    var metadata = try artifacts.put(payload);
+    defer metadata.deinit(alloc);
+    const source: manifest_mod.ArtifactRef = .{ .kind = .document_facts, .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    var session = QuerySession{ .alloc = alloc, .artifacts = &artifacts, .cache = &cache, .owns_manifest = false, .manifest = .{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &.{},
+    } };
+    defer session.deinit();
+    var remaining: u64 = len - 1;
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining));
+    try std.testing.expectEqual(@as(u64, len - 1), remaining);
+    remaining = len;
+    const loaded = try QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining);
+    defer alloc.free(loaded);
+    try std.testing.expectEqualSlices(u8, payload, loaded);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    try std.testing.expectEqual(@as(usize, 0), cache.graph_metric_blocks.retained);
+    digest[0] ^= 1;
+    remaining = len;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining));
+}
+
+test "serverless query runtime warming keeps artifact available through cache" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1133,7 +1234,7 @@ fn applyModeCount(metrics: *QueryExecutionMetrics, mode: request_mod.QueryMode) 
     }
 }
 
-test "query runtime block range fetch uses cache after artifact deletion" {
+test "serverless query runtime block range fetch uses cache after artifact deletion" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1308,7 +1409,7 @@ test "serverless query session propagates cancellation through full and cached r
     try std.testing.expectEqual(@as(usize, 2), state.range_calls);
 }
 
-test "query runtime tracks namespace-scoped search metrics" {
+test "serverless query runtime tracks namespace-scoped search metrics" {
     const alloc = std.testing.allocator;
 
     var runtime = QueryRuntime.init(alloc, undefined, undefined, undefined);

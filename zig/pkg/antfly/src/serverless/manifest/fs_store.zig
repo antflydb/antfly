@@ -19,10 +19,12 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const FsStore = struct {
     alloc: Allocator,
     root_dir: []u8,
+    durable_dirs: @import("objectstore").durable_directory.Cache = .{},
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FsStore {
@@ -36,6 +38,7 @@ pub const FsStore = struct {
     }
 
     pub fn deinit(self: *FsStore) void {
+        self.durable_dirs.deinit(self.alloc);
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -59,11 +62,25 @@ pub const FsStore = struct {
             const existing = try readFileAlloc(self.alloc, path);
             defer self.alloc.free(existing);
             if (!std.mem.eql(u8, existing, encoded)) return error.ManifestVersionAlreadyExists;
+            var sync_io = threadedIo();
+            defer sync_io.deinit();
+            try self.durable_dirs.ensure(self.alloc, sync_io.io(), std.fs.path.dirname(path) orelse ".");
+            try fs_paths.syncDirPortable(sync_io.io(), std.fs.path.dirname(path) orelse ".");
             return;
         }
 
-        try ensureParentDir(path);
-        try writeFileAtomically(path, encoded);
+        var directory_io = threadedIo();
+        defer directory_io.deinit();
+        try self.durable_dirs.ensure(self.alloc, directory_io.io(), std.fs.path.dirname(path) orelse ".");
+        writeFileAtomically(path, encoded, manifest.publication_fencing_token) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                const winner = try readFileAlloc(self.alloc, path);
+                defer self.alloc.free(winner);
+                if (!std.mem.eql(u8, winner, encoded)) return error.ManifestVersionAlreadyExists;
+                try fs_paths.syncDirPortable(directory_io.io(), std.fs.path.dirname(path) orelse ".");
+            },
+            else => return err,
+        };
     }
 
     pub fn getAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
@@ -81,12 +98,13 @@ pub const FsStore = struct {
     }
 
     fn setHeadUnlocked(self: *FsStore, namespace: []const u8, version: u64) !void {
-        const path = try headPathAlloc(self.alloc, self.root_dir, namespace);
-        defer self.alloc.free(path);
-        try ensureParentDir(path);
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
-        defer self.alloc.free(payload);
-        try writeFileAtomically(path, payload);
+        var progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(self.alloc, self.root_dir);
+        defer progress.deinit();
+        const current = progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (!try progress.compareAndSwapHead(namespace, current, version)) return error.HeadChanged;
     }
 
     pub fn getHead(self: *FsStore, namespace: []const u8) !u64 {
@@ -96,11 +114,9 @@ pub const FsStore = struct {
     }
 
     fn getHeadUnlocked(self: *FsStore, namespace: []const u8) !u64 {
-        const path = try headPathAlloc(self.alloc, self.root_dir, namespace);
-        defer self.alloc.free(path);
-        const raw = try readFileAlloc(self.alloc, path);
-        defer self.alloc.free(raw);
-        return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+        var progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(self.alloc, self.root_dir);
+        defer progress.deinit();
+        return progress.getHead(namespace);
     }
 
     pub fn compareAndSwapHead(self: *FsStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
@@ -111,30 +127,34 @@ pub const FsStore = struct {
         defer self.alloc.free(manifest_path);
         if (!fileExists(manifest_path)) return error.ManifestVersionNotFound;
 
-        const current = self.getHeadUnlocked(namespace) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (current != expected) return false;
-        try self.setHeadUnlocked(namespace, version);
-        return true;
+        var progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(self.alloc, self.root_dir);
+        defer progress.deinit();
+        return progress.compareAndSwapHead(namespace, expected, version);
     }
 
     pub fn listVersionsAlloc(self: *FsStore, alloc: Allocator, namespace: []const u8) ![]u64 {
-        const head = self.getHead(namespace) catch |err| switch (err) {
-            error.FileNotFound => return try alloc.alloc(u64, 0),
+        const path = try std.fs.path.join(alloc, &.{ self.root_dir, namespace, "manifests" });
+        defer alloc.free(path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return alloc.alloc(u64, 0),
             else => return err,
         };
-
+        defer dir.close(io);
         var versions = std.ArrayListUnmanaged(u64).empty;
         errdefer versions.deinit(alloc);
-
-        var version: u64 = 1;
-        while (version <= head) : (version += 1) {
-            const path = try manifestPathAlloc(alloc, self.root_dir, namespace, version);
-            defer alloc.free(path);
-            if (fileExists(path)) try versions.append(alloc, version);
+        var entries = dir.iterate();
+        while (try entries.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
+            const stem = entry.name[0 .. entry.name.len - 4];
+            if (stem.len == 0 or stem[0] == '0') continue;
+            if (std.mem.indexOfNone(u8, stem, "0123456789") != null) continue;
+            const version = std.fmt.parseInt(u64, stem, 10) catch continue;
+            try versions.append(alloc, version);
         }
+        std.mem.sort(u64, versions.items, {}, std.sort.asc(u64));
         return try versions.toOwnedSlice(alloc);
     }
 
@@ -150,6 +170,33 @@ pub const FsStore = struct {
         try deleteFile(path);
     }
 
+    fn cleanupRetiredTemporaries(self: *FsStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "manifests" });
+        defer self.alloc.free(path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var changed = false;
+        var entries = dir.iterate();
+        while (try entries.next(io)) |entry| {
+            try cancellation.check();
+            if (entry.kind != .file) continue;
+            const token = temporaryPublicationToken(entry.name) orelse continue;
+            if (token == 0 or token >= cutoff) continue;
+            dir.deleteFile(io, entry.name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            changed = true;
+        }
+        if (changed) try fs_paths.syncDirPortable(io, path);
+    }
+
     const vtable: manifest_store.ManifestStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
@@ -159,6 +206,7 @@ pub const FsStore = struct {
         .compare_and_swap_head = erasedCompareAndSwapHead,
         .list_versions_alloc = erasedListVersionsAlloc,
         .delete_version = erasedDeleteVersion,
+        .cleanup_retired_temporaries = erasedCleanupRetiredTemporaries,
     };
 
     fn erasedDeinit(_: Allocator, ptr: *anyopaque) void {
@@ -200,6 +248,11 @@ pub const FsStore = struct {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         try self.deleteVersion(namespace, version);
     }
+
+    fn erasedCleanupRetiredTemporaries(ptr: *anyopaque, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        try self.cleanupRetiredTemporaries(namespace, cutoff, cancellation);
+    }
 };
 
 fn threadedIo() std.Io.Threaded {
@@ -227,54 +280,55 @@ fn deleteFile(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), path);
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(path) orelse ".");
 }
 
-fn ensureParentDir(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), parent);
-}
-
-fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
-    defer std.heap.page_allocator.free(tmp_path);
-
+fn writeFileAtomically(path: []const u8, contents: []const u8, publication_token: u64) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{x:0>16}-{s}", .{ path, publication_token, std.fmt.bytesToHex(&nonce, .lower) });
+    defer std.heap.page_allocator.free(tmp_path);
+    var owns_temp = false;
+    defer if (owns_temp) {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    };
 
     {
-        var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
+        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .exclusive = true });
+        owns_temp = true;
         defer file.close(io);
 
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
-    if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.renameAbsolute(tmp_path, path, io) catch |err| {
-            std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-            return err;
-        };
-    } else {
-        std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
-            std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
-            return err;
-        };
-    }
+    try std.Io.Dir.renamePreserve(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    owns_temp = false;
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+}
+
+fn temporaryPublicationToken(name: []const u8) ?u64 {
+    const separator = std.mem.indexOf(u8, name, ".bin.tmp-") orelse return null;
+    const version = name[0..separator];
+    if (version.len == 0 or version[0] == '0' or std.mem.indexOfNone(u8, version, "0123456789") != null) return null;
+    _ = std.fmt.parseInt(u64, version, 10) catch return null;
+    const suffix = name[separator + ".bin.tmp-".len ..];
+    if (suffix.len != 16 + 1 + 32 or suffix[16] != '-') return null;
+    if (std.mem.indexOfNone(u8, suffix[0..16], "0123456789abcdef") != null or
+        std.mem.indexOfNone(u8, suffix[17..], "0123456789abcdef") != null) return null;
+    return std.fmt.parseInt(u64, suffix[0..16], 16) catch return null;
 }
 
 fn manifestPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, version: u64) ![]u8 {
     const file_name = try std.fmt.allocPrint(alloc, "{d}.bin", .{version});
     defer alloc.free(file_name);
     return try std.fs.path.join(alloc, &.{ root_dir, namespace, "manifests", file_name });
-}
-
-fn headPathAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8) ![]u8 {
-    return try std.fs.path.join(alloc, &.{ root_dir, namespace, "HEAD" });
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
@@ -322,7 +376,49 @@ fn sampleManifest(alloc: Allocator, namespace: []const u8, version: u64, artifac
     };
 }
 
-test "fs manifest store put/get/head round-trips" {
+test "serverless retention filesystem manifest cleanup fences temporary ownership" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "retired-temporaries");
+    defer cleanupTmp(path);
+    var store = try FsStore.init(a, std.mem.span(path));
+    defer store.deinit();
+    var manifest = try sampleManifest(a, "docs", 1, "sha256:abc");
+    defer manifest.deinit(a);
+    manifest.publication_fencing_token = 1;
+    try store.put(manifest);
+    const directory = try std.fs.path.join(a, &.{ std.mem.span(path), "docs", "manifests" });
+    defer a.free(directory);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var dir = try std.Io.Dir.cwd().openDir(io, directory, .{});
+    defer dir.close(io);
+    const names = [_][]const u8{
+        "2.bin.tmp-0000000000000001-0123456789abcdef0123456789abcdef",
+        "2.bin.tmp-0000000000000002-0123456789abcdef0123456789abcdef",
+        "2.bin.tmp-0000000000000000-0123456789abcdef0123456789abcdef",
+        "2.bin.tmp-user-owned",
+    };
+    for (names) |name| {
+        var file = try dir.createFile(io, name, .{ .exclusive = true });
+        file.close(io);
+    }
+    var capability = store.manifestStore();
+    try capability.cleanupRetiredTemporaries("docs", 2, .{});
+    try std.testing.expectError(error.FileNotFound, dir.statFile(io, names[0], .{}));
+    for (names[1..]) |name| _ = try dir.statFile(io, name, .{});
+    _ = try dir.statFile(io, "1.bin", .{});
+    // A fenced writer can finish a delayed upload after a sweep. The next
+    // inventory must rediscover it without risking any current attempt.
+    var late = try dir.createFile(io, names[0], .{ .exclusive = true });
+    late.close(io);
+    try capability.cleanupRetiredTemporaries("docs", 2, .{});
+    try std.testing.expectError(error.FileNotFound, dir.statFile(io, names[0], .{}));
+    try std.testing.expectEqual(@as(?u64, null), temporaryPublicationToken("01.bin.tmp-0000000000000001-0123456789abcdef0123456789abcdef"));
+}
+
+test "serverless fs manifest store put/get/head round-trips" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "roundtrip");
     defer cleanupTmp(path);
@@ -345,7 +441,7 @@ test "fs manifest store put/get/head round-trips" {
     try std.testing.expectEqualStrings("sha256:abc", loaded.artifacts[0].artifact_id);
 }
 
-test "fs manifest store rejects mismatched overwrite of immutable version" {
+test "serverless fs manifest store rejects mismatched overwrite of immutable version" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "overwrite");
     defer cleanupTmp(path);
@@ -362,7 +458,7 @@ test "fs manifest store rejects mismatched overwrite of immutable version" {
     try std.testing.expectError(error.ManifestVersionAlreadyExists, store.put(second));
 }
 
-test "fs manifest store compareAndSwapHead enforces expected version" {
+test "serverless fs manifest store compareAndSwapHead enforces expected version" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "cas");
     defer cleanupTmp(path);
@@ -385,7 +481,7 @@ test "fs manifest store compareAndSwapHead enforces expected version" {
     try std.testing.expectEqual(@as(u64, 2), try store.getHead("docs"));
 }
 
-test "fs manifest store lists and prunes non-head versions" {
+test "serverless fs manifest store lists and prunes non-head versions" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "list-delete");
     defer cleanupTmp(path);
@@ -419,7 +515,7 @@ test "fs manifest store lists and prunes non-head versions" {
     try std.testing.expectError(error.CannotDeleteHead, store.deleteVersion("docs", 3));
 }
 
-test "fs manifest store compareAndSwapHead is serialized across threads" {
+test "serverless fs manifest store compareAndSwapHead is serialized across threads" {
     const alloc = std.heap.page_allocator;
 
     var path_buf: [256]u8 = undefined;

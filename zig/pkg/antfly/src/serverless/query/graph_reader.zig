@@ -43,17 +43,12 @@ const GraphSource = struct {
         errdefer self.deinit();
         const admitted = self.allocation.allocator();
         const source = session.artifactRef(artifact_index) orelse return error.GraphSegmentNotFound;
-        self.paged = graph_segment_mod.AdjacencyReader.initCached(admitted, session.artifacts, source, session.cancellation, &self.remaining_bytes, session.graphAdjacencyCache()) catch |err| return self.translate(err);
-        if (self.paged != null) return;
-        // Current-wire sources may omit the optional bounded accelerator.
-        var lease = work_budget_mod.RetainedLease.init(&self.budget, std.math.cast(usize, source.byte_len) orelse return error.GraphTraversalQueryBudgetExceeded) catch |err| return self.translate(err);
-        defer lease.deinit();
-        if (source.byte_len > self.remaining_bytes) return error.GraphTraversalQueryBudgetExceeded;
-        self.remaining_bytes -= source.byte_len;
-        const payload = try session.fetchArtifactAlloc(artifact_index);
-        defer alloc.free(payload);
-        self.segment = graph_segment_mod.decodeAllocWithCancellation(admitted, payload, session.cancellation) catch |err| return self.translate(err);
-        self.index = graph_segment_mod.AdjacencyIndex.initWithCancellation(admitted, self.segment, session.cancellation) catch |err| return self.translate(err);
+        self.paged = graph_segment_mod.AdjacencyReader.initCached(admitted, session.artifacts, source, session.readCancellation(), &self.remaining_bytes, session.graphAdjacencyCache()) catch |err| return self.translate(err);
+        if (self.paged) |reader| if (reader.pages) |pages| {
+            if (!std.mem.eql(u8, &pages.root.domain, &@import("../graph_segment/page_store.zig").PageStore.namespaceDomain(session.namespace())))
+                return error.GraphPageDomainMismatch;
+        };
+        if (self.paged == null) return error.InvalidGraphRoot;
     }
 
     fn translate(self: *GraphSource, err: anyerror) anyerror {
@@ -341,7 +336,7 @@ pub fn traverseWithLimitsAlloc(
     req: request_mod.GraphTraverseRequest,
     limits: GraphTraversalLimits,
 ) ![]TraversalNode {
-    var budget = try GraphTraversalBudget.init(limits, session.cancellation);
+    var budget = try GraphTraversalBudget.init(limits, session.readCancellation());
     try session.checkCancellation();
     if (req.limit > limits.max_limit or req.max_depth > limits.max_depth or
         !edgeTypeFilterWithinLimits(req.edge_types, limits.max_edge_types, limits.max_edge_type_bytes))
@@ -412,7 +407,7 @@ pub fn shortestPathWithLimitsAlloc(
     req: request_mod.GraphShortestPathRequest,
     limits: GraphTraversalLimits,
 ) !?ShortestPath {
-    var budget = try GraphTraversalBudget.init(limits, session.cancellation);
+    var budget = try GraphTraversalBudget.init(limits, session.readCancellation());
     try session.checkCancellation();
     if (req.max_depth > limits.max_depth or
         !edgeTypeFilterWithinLimits(req.edge_types, limits.max_edge_types, limits.max_edge_type_bytes))
@@ -610,7 +605,7 @@ fn numericResultParents(a: Allocator, source: *GraphSource, nodes: []const Ordin
         const name = names.get(nodes[i].node).?;
         if (parents.contains(name)) break;
         if (!kinds.contains(nodes[i].kind)) {
-            const raw = try reader.context.kindAlloc(nodes[i].kind);
+            const raw = try reader.kindNameAlloc(nodes[i].kind);
             defer reader.alloc.free(raw);
             try kinds.put(a, nodes[i].kind, try a.dupe(u8, raw));
         }
@@ -680,10 +675,10 @@ fn selectNeighborsAlloc(
 
     var scanned: usize = 0;
     if (req.direction == .out or req.direction == .both) {
-        try selectEdges(alloc, session.cancellation, &selected, adjacency.out_edges, .out, req, &scanned);
+        try selectEdges(alloc, session.readCancellation(), &selected, adjacency.out_edges, .out, req, &scanned);
     }
     if (req.direction == .in or req.direction == .both) {
-        try selectEdges(alloc, session.cancellation, &selected, adjacency.in_edges, .in, req, &scanned);
+        try selectEdges(alloc, session.readCancellation(), &selected, adjacency.in_edges, .in, req, &scanned);
     }
     try session.checkCancellation();
 
@@ -1045,8 +1040,12 @@ fn lessTraversalNode(_: void, lhs: TraversalNode, rhs: TraversalNode) bool {
 test "serverless graph cursor queries stop early retain top k and share authenticated pages" {
     const alloc = std.testing.allocator;
     const artifacts = @import("../artifacts/mod.zig");
+    const tree = @import("../graph_segment/page_tree.zig");
+    const pages_mod = @import("../graph_segment/page_graph.zig");
+    const page_store = @import("../graph_segment/page_store.zig");
+    const Fixture = struct { root: []u8, pages: *tree.testing.MemoryStore };
     const Memory = struct {
-        payload: []const u8,
+        fixture: *const Fixture,
         calls: usize = 0,
         fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
@@ -1055,10 +1054,13 @@ test "serverless graph cursor queries stop early retain top k and share authenti
         fn get(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.UnexpectedFullRead;
         }
-        fn range(ptr: *anyopaque, a: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
+        fn range(ptr: *anyopaque, a: Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            return a.dupe(u8, self.payload[@intCast(offset)..][0..len]);
+            const checksum = try @import("../artifacts/store.zig").sha256ChecksumFromArtifactId(id);
+            const digest = try @import("../artifacts/store.zig").sha256DigestFromChecksum(checksum);
+            const bytes = self.fixture.pages.pages.get(digest) orelse self.fixture.root;
+            return a.dupe(u8, bytes[@intCast(offset)..][0..len]);
         }
         fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
             return error.Unsupported;
@@ -1069,8 +1071,8 @@ test "serverless graph cursor queries stop early retain top k and share authenti
         const vtable = artifacts.ArtifactStore.VTable{ .deinit = deinit, .put = put, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = delete };
     };
     const Run = struct {
-        fn run(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef, cache: ?*@import("cache.zig").QueryCache) !usize {
-            var memory = Memory{ .payload = payload };
+        fn run(a: Allocator, fixture: *const Fixture, ref: manifest_mod.ArtifactRef, cache: ?*@import("cache.zig").QueryCache) !usize {
+            var memory = Memory{ .fixture = fixture };
             var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &Memory.vtable };
             var refs = [_]manifest_mod.ArtifactRef{ref};
             var session = runtime_mod.QuerySession{ .alloc = a, .artifacts = &store, .cache = cache, .owns_manifest = false, .manifest = .{ .namespace = "n", .version = 1, .built_at_ns = 0, .wal_start_lsn = 0, .wal_end_lsn = 0, .stats = .{}, .artifacts = &refs } };
@@ -1093,47 +1095,69 @@ test "serverless graph cursor queries stop early retain top k and share authenti
             try std.testing.expectEqual(@as(usize, 0), empty.len);
             return memory.calls;
         }
-        fn allocationFailure(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef) !void {
-            _ = try run(a, payload, ref, null);
+        fn allocationFailure(a: Allocator, fixture: *const Fixture, ref: manifest_mod.ArtifactRef) !void {
+            _ = try run(a, fixture, ref, null);
         }
-        fn concurrent(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef, cache: *@import("cache.zig").QueryCache, calls: *usize, failure: *?anyerror) void {
-            calls.* = run(a, payload, ref, cache) catch |err| {
+        fn concurrent(a: Allocator, fixture: *const Fixture, ref: manifest_mod.ArtifactRef, cache: *@import("cache.zig").QueryCache, calls: *usize, failure: *?anyerror) void {
+            calls.* = run(a, fixture, ref, cache) catch |err| {
                 failure.* = err;
                 return;
             };
         }
     };
-    var builder = graph_segment_mod.Builder{ .alloc = alloc };
-    defer builder.deinit();
-    try builder.addEdge("a", "b", "link", 1, null);
-    try builder.addEdge("a", "c", "link", 1, null);
-    try builder.addEdge("d", "a", "link", 1, null);
-    // The foreign b shares a spelling with local b, but not its identity.
-    try builder.addEdge("a", "b", "remote", 1, "foreign");
-    const payload = try builder.encodeAlloc(1024 * 1024, .none);
-    defer alloc.free(payload);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
-    const checksum = std.fmt.bytesToHex(digest, .lower);
-    const id = "sha256:" ++ checksum;
-    var ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
-    try graph_segment_mod.codec.compact.bindTopologyControl(&ref, payload);
-    try std.testing.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ payload, ref });
+    var memory_pages = tree.testing.MemoryStore{ .alloc = alloc };
+    defer memory_pages.deinit();
+    var tree_store = memory_pages.store();
+    tree_store.domain = page_store.PageStore.namespaceDomain("n");
+    tree_store.attempt = @splat(1);
+    const edge = @import("../graph_segment/page_keys.zig").Edge;
+    const a_edges = [_]edge{
+        .{ .source = "a", .target = "b", .kind = "link" },
+        .{ .source = "a", .target = "c", .kind = "link" },
+        .{ .source = "a", .target = "b", .kind = "remote", .table = "foreign" },
+    };
+    const d_edges = [_]edge{.{ .source = "d", .target = "a", .kind = "link" }};
+    var plan = try pages_mod.plan(alloc, tree_store, .{}, &.{
+        .{ .id = "a", .edges = &a_edges },
+        .{ .id = "d", .edges = &d_edges },
+    });
+    defer plan.deinit();
+    const root = try plan.publish(tree_store, .{});
+    var root_bytes = root.encode();
+    var root_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&root_bytes, &root_digest, .{});
+    const checksum = std.fmt.bytesToHex(root_digest, .lower);
+    const id = try (@import("../artifacts/store.zig").UploadScope{ .domain = tree_store.domain, .attempt = tree_store.attempt }).artifactId(&checksum);
+    const ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = &id, .checksum = &checksum, .byte_len = root_bytes.len, .metadata_version = pages_mod.Root.metadata_version };
+    const fixture = Fixture{ .root = &root_bytes, .pages = &memory_pages };
+    try std.testing.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ &fixture, ref });
+    var foreign_root = root;
+    foreign_root.domain = page_store.PageStore.namespaceDomain("other-namespace");
+    var foreign_bytes = foreign_root.encode();
+    var foreign_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&foreign_bytes, &foreign_digest, .{});
+    const foreign_checksum = std.fmt.bytesToHex(foreign_digest, .lower);
+    const foreign_id = try (@import("../artifacts/store.zig").UploadScope{ .domain = foreign_root.domain, .attempt = tree_store.attempt }).artifactId(&foreign_checksum);
+    var foreign_ref = ref;
+    foreign_ref.artifact_id = &foreign_id;
+    foreign_ref.checksum = &foreign_checksum;
+    const foreign_fixture = Fixture{ .root = &foreign_bytes, .pages = &memory_pages };
+    try std.testing.expectError(error.GraphPageDomainMismatch, Run.run(alloc, &foreign_fixture, foreign_ref, null));
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-cursor", .{tmp.sub_path});
     defer alloc.free(cache_root);
     var cache = try @import("cache.zig").QueryCache.init(alloc, cache_root);
     defer cache.deinit();
-    const cold_calls = try Run.run(alloc, payload, ref, &cache);
+    const cold_calls = try Run.run(alloc, &fixture, ref, &cache);
     try std.testing.expect(cold_calls > 0);
-    try std.testing.expectEqual(@as(usize, 0), try Run.run(alloc, payload, ref, &cache));
+    try std.testing.expectEqual(@as(usize, 0), try Run.run(alloc, &fixture, ref, &cache));
     cache.graph_metric_blocks.deinit();
     cache.graph_metric_blocks = .{};
-    payload[0] ^= 1;
-    try std.testing.expectError(error.ArtifactIntegrityMismatch, Run.run(alloc, payload, ref, &cache));
-    payload[0] ^= 1;
-    _ = try Run.run(alloc, payload, ref, &cache);
+    root_bytes[0] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Run.run(alloc, &fixture, ref, &cache));
+    root_bytes[0] ^= 1;
+    _ = try Run.run(alloc, &fixture, ref, &cache);
     cache.graph_metric_blocks.deinit();
     cache.graph_metric_blocks = .{};
     var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -1142,7 +1166,7 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     defer group.cancel(io_impl.io());
     var calls: [4]usize = @splat(0);
     var failures: [4]?anyerror = @splat(null);
-    for (&calls, &failures) |*count, *failure| group.async(io_impl.io(), Run.concurrent, .{ alloc, payload, ref, &cache, count, failure });
+    for (&calls, &failures) |*count, *failure| group.async(io_impl.io(), Run.concurrent, .{ alloc, &fixture, ref, &cache, count, failure });
     try group.await(io_impl.io());
     for (failures) |failure| if (failure) |err| return err;
     var total: usize = 0;

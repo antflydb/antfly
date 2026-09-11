@@ -14,6 +14,26 @@
 
 const std = @import("std");
 
+test "serverless scoped artifact identities validate every routing component" {
+    const a = std.testing.allocator;
+    const scope: UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    const checksum = "a" ** 64;
+    const id = try scope.artifactId(checksum);
+    try std.testing.expectEqualStrings(checksum, try sha256ChecksumFromArtifactId(&id));
+    try std.testing.expectEqual(scope, (try uploadScopeFromArtifactId(&id)).?);
+    const suffix = try storageSuffixAlloc(a, &id);
+    defer a.free(suffix);
+    try std.testing.expectEqualStrings("graph/" ++ "01" ** 32 ++ "/" ++ "02" ** 16 ++ "/" ++ checksum, suffix);
+    for ([_]usize{ 0, 7, 71, 78, 142, 143, 174 }) |offset| {
+        var corrupt = id;
+        corrupt[offset] = '/';
+        try std.testing.expectError(error.InvalidArtifactId, sha256ChecksumFromArtifactId(&corrupt));
+        try std.testing.expectError(error.InvalidArtifactId, storageSuffixAlloc(a, &corrupt));
+    }
+    try std.testing.expectError(error.InvalidArtifactUploadScope, (UploadScope{ .domain = @splat(0), .attempt = scope.attempt }).artifactId(checksum));
+    try std.testing.expectError(error.InvalidArtifactUploadScope, (UploadScope{ .domain = scope.domain, .attempt = @splat(0) }).artifactId(checksum));
+}
+
 pub fn chargeReadBudget(remaining: *u64, amount: u64) !void {
     if (amount > remaining.*) return error.ArtifactReadBudgetExceeded;
     remaining.* -= amount;
@@ -24,17 +44,95 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
 pub const sha256_artifact_id_prefix = "sha256:";
 
+/// A publication attempt owns newly uploaded pages, while immutable references
+/// may reuse pages belonging to older attempts. Attempt identities must never
+/// be reused after loss of publication authority. Scoped object names are also
+/// the durable inventory: late uploads remain discoverable after a failed build.
+pub const UploadScope = struct {
+    domain: [32]u8,
+    attempt: [16]u8,
+
+    pub fn validate(self: UploadScope) !void {
+        if (std.mem.allEqual(u8, &self.domain, 0) or self.fencingToken() == 0 or std.mem.allEqual(u8, self.attempt[8..16], 0))
+            return error.InvalidArtifactUploadScope;
+    }
+
+    pub fn fencingToken(self: UploadScope) u64 {
+        return std.mem.readInt(u64, self.attempt[0..8], .big);
+    }
+
+    pub fn forPublication(domain: [32]u8, token: u64, io: std.Io) !UploadScope {
+        var scope = UploadScope{ .domain = domain, .attempt = undefined };
+        std.mem.writeInt(u64, scope.attempt[0..8], token, .big);
+        while (true) {
+            io.random(scope.attempt[8..16]);
+            if (!std.mem.allEqual(u8, scope.attempt[8..16], 0)) break;
+        }
+        try scope.validate();
+        return scope;
+    }
+
+    pub fn artifactId(self: UploadScope, checksum: []const u8) ![175]u8 {
+        try self.validate();
+        try validateSha256Checksum(checksum);
+        var id: [175]u8 = undefined;
+        @memcpy(id[0..7], "sha256:");
+        @memcpy(id[7..71], checksum);
+        @memcpy(id[71..78], ":graph:");
+        @memcpy(id[78..142], &std.fmt.bytesToHex(&self.domain, .lower));
+        id[142] = ':';
+        @memcpy(id[143..175], &std.fmt.bytesToHex(&self.attempt, .lower));
+        return id;
+    }
+};
+
+pub fn uploadScopeFromArtifactId(id: []const u8) !?UploadScope {
+    if ((id.len != 71 and id.len != 175) or !std.mem.startsWith(u8, id, "sha256:")) return error.InvalidArtifactId;
+    try validateSha256Checksum(id[7..71]);
+    if (id.len == 71) return null;
+    if (id.len != 175 or !std.mem.eql(u8, id[71..78], ":graph:") or id[142] != ':') return error.InvalidArtifactId;
+    try validateSha256Checksum(id[78..142]);
+    for (id[143..175]) |byte| if (!isLowerHex(byte)) return error.InvalidArtifactId;
+    var scope: UploadScope = undefined;
+    _ = std.fmt.hexToBytes(&scope.domain, id[78..142]) catch return error.InvalidArtifactId;
+    _ = std.fmt.hexToBytes(&scope.attempt, id[143..175]) catch return error.InvalidArtifactId;
+    scope.validate() catch return error.InvalidArtifactId;
+    return scope;
+}
+
+/// Validates the complete identity before deriving a filesystem/object key.
+pub fn storageSuffixAlloc(alloc: Allocator, id: []const u8) ![]u8 {
+    const checksum = try sha256ChecksumFromArtifactId(id);
+    if (try uploadScopeFromArtifactId(id)) |_| return std.fmt.allocPrint(alloc, "graph/{s}/{s}/{s}", .{ id[78..142], id[143..175], checksum });
+    return std.fmt.allocPrint(alloc, "sha256/{s}/{s}", .{ checksum[0..2], checksum[2..] });
+}
+
+pub const ScopedUploadVisitor = struct {
+    ptr: *anyopaque,
+    /// ID is borrowed only for this call. Enumeration is namespace-local and
+    /// bounded; visitors must not assume a snapshot of concurrent late uploads.
+    visit: *const fn (*anyopaque, UploadScope, []const u8) anyerror!void,
+};
+
+/// Parse only canonical objects below graph/<domain>/. Temporary local files
+/// are not artifact identities and are deliberately excluded from this API.
+pub fn visitScopedSuffix(domain: [32]u8, suffix: []const u8, visitor: ScopedUploadVisitor) !void {
+    if (suffix.len != 97 or suffix[32] != '/') return;
+    for (suffix[0..32]) |byte| if (!isLowerHex(byte)) return error.InvalidArtifactId;
+    try validateSha256Checksum(suffix[33..97]);
+    var scope: UploadScope = .{ .domain = domain, .attempt = undefined };
+    _ = std.fmt.hexToBytes(&scope.attempt, suffix[0..32]) catch return error.InvalidArtifactId;
+    const id = try scope.artifactId(suffix[33..97]);
+    try visitor.visit(visitor.ptr, scope, &id);
+}
+
 /// Returns the checksum portion of a canonical content-addressed artifact ID.
 /// Artifact stores use this before any filesystem or object-store access so a
 /// malformed ID cannot select an arbitrary cache key or silently weaken
 /// payload verification.
 pub fn sha256ChecksumFromArtifactId(artifact_id: []const u8) ![]const u8 {
-    if (!std.mem.startsWith(u8, artifact_id, sha256_artifact_id_prefix)) {
-        return error.InvalidArtifactId;
-    }
-    const checksum = artifact_id[sha256_artifact_id_prefix.len..];
-    try validateSha256Checksum(checksum);
-    return checksum;
+    _ = try uploadScopeFromArtifactId(artifact_id);
+    return artifact_id[sha256_artifact_id_prefix.len..71];
 }
 
 pub fn validateSha256Checksum(checksum: []const u8) !void {
@@ -92,6 +190,9 @@ pub const ArtifactStore = struct {
         stat_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         verify_content: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, CancellationToken) anyerror!void = null,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
+        put_scoped: ?*const fn (*anyopaque, Allocator, UploadScope, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
+        visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
+        cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, CancellationToken) anyerror!void = null,
     };
 
     pub fn deinit(self: *ArtifactStore) void {
@@ -101,6 +202,33 @@ pub const ArtifactStore = struct {
 
     pub fn put(self: *ArtifactStore, contents: []const u8) !ArtifactMetadata {
         return try self.putWithCancellation(contents, .none);
+    }
+
+    pub fn putScoped(self: *ArtifactStore, scope: UploadScope, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        try scope.validate();
+        try cancellation.check();
+        const put_scoped = self.vtable.put_scoped orelse return error.ArtifactUploadScopesUnsupported;
+        var metadata = try put_scoped(self.ptr, self.allocator, scope, contents, cancellation);
+        errdefer metadata.deinit(self.allocator);
+        const expected = try scope.artifactId(metadata.checksum);
+        if (metadata.byte_len != contents.len or !std.mem.eql(u8, &expected, metadata.artifact_id)) return error.ArtifactIntegrityMismatch;
+        try cancellation.check();
+        return metadata;
+    }
+
+    pub fn visitScopedUploads(self: *ArtifactStore, domain: [32]u8, visitor: ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        if (std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
+        try cancellation.check();
+        const visit = self.vtable.visit_scoped_uploads orelse return error.ArtifactUploadScopesUnsupported;
+        try visit(self.ptr, domain, visitor, cancellation);
+    }
+
+    /// Only a collector that has fenced all older publications may call this.
+    /// Backends without local staging files need no extra cleanup operation.
+    pub fn cleanupRetiredScopedTemporaries(self: *ArtifactStore, domain: [32]u8, cutoff: u64, cancellation: CancellationToken) !void {
+        if (cutoff == 0 or std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
+        try cancellation.check();
+        if (self.vtable.cleanup_retired_scoped_temporaries) |cleanup| try cleanup(self.ptr, domain, cutoff, cancellation);
     }
 
     pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {

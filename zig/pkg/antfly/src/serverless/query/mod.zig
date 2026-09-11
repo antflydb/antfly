@@ -20,6 +20,7 @@ pub const request = @import("request.zig");
 pub const plan = @import("plan.zig");
 pub const cache = @import("cache.zig");
 pub const indexed_reader = @import("indexed_reader.zig");
+pub const document_facts_reader = @import("document_facts_reader.zig");
 pub const graph_reader = @import("graph_reader.zig");
 pub const graph_metric_reader = @import("graph_metric_reader.zig");
 pub const graph_metric_routing_cache = @import("graph_metric_routing_cache.zig");
@@ -525,6 +526,7 @@ test "serverless query module compiles" {
     _ = lakeRowsDesiredSidecarsFromCandidateSetsAlloc;
     _ = scanLakeRowsWithAutomaticSidecarsAlloc;
     _ = searchIndexedPlanAlloc;
+    _ = document_facts_reader;
     _ = searchIndexedPlanWithStatsAlloc;
     _ = searchIndexedAlloc;
     _ = searchIndexedWithStatsAlloc;

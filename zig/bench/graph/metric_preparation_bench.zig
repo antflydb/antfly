@@ -237,6 +237,141 @@ fn benchmarkGraphImpact(io: std.Io, out: anytype) !void {
     }
 }
 
+fn benchmarkPageUpdates(io: std.Io, output: anytype) !void {
+    const a = std.heap.smp_allocator;
+    const paged_graph = antfly.serverless.graph_segment.page_graph;
+    const tree = antfly.serverless.graph_segment.page_tree;
+    const key = antfly.serverless.graph_segment.page_keys;
+    for ([_]usize{ 1024, 16384, 131072 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const input = arena.allocator();
+        const ids = try input.alloc([8]u8, count + 1);
+        for (ids, 0..) |*id, i| std.mem.writeInt(u64, id, i, .big);
+        const edges = try input.alloc(key.Edge, count);
+        const replacements = try input.alloc(paged_graph.Replacement, count);
+        for (edges, replacements, 0..) |*edge, *replacement, i| {
+            edge.* = .{ .source = &ids[i], .target = &ids[i + 1], .kind = "link" };
+            replacement.* = .{ .id = &ids[i], .edges = edges[i..][0..1] };
+        }
+        var backing: tree.testing.MemoryStore = .{ .alloc = a };
+        defer backing.deinit();
+        var initial = try paged_graph.plan(a, backing.store(), .{}, replacements);
+        const root = try initial.publish(backing.store(), .{});
+        initial.deinit();
+        const build_bytes = backing.written_bytes;
+        const changed = [_]key.Edge{.{ .source = &ids[count / 2], .target = &ids[0], .kind = "link" }};
+        var samples: [5]u64 = undefined;
+        var peak: usize = 0;
+        var allocated: usize = 0;
+        var puts: usize = 0;
+        var gets: usize = 0;
+        var rewritten: usize = 0;
+        for (0..6) |sample| {
+            var stats: PhaseAllocStats = .{};
+            var tracker: PhaseTrackingAllocator = .{ .backing = a, .stats = &stats };
+            const alloc = tracker.allocator();
+            const old_reads = backing.reads;
+            const old_writes = backing.writes;
+            const old_bytes = backing.written_bytes;
+            const start = std.Io.Clock.awake.now(io);
+            const updated = block: {
+                var cache: tree.Cache = .{ .alloc = alloc, .underlying = backing.store() };
+                defer cache.deinit();
+                var plan = try paged_graph.plan(alloc, cache.store(), root, &.{.{ .id = &ids[count / 2], .edges = &changed }});
+                defer plan.deinit();
+                break :block try plan.publish(cache.store(), root);
+            };
+            const elapsed: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            if (sample != 0) samples[sample - 1] = elapsed;
+            if (stats.current_bytes != 0) return error.BenchmarkAllocationLeak;
+            peak = @max(peak, stats.peak_bytes);
+            allocated = @max(allocated, stats.total_alloc_bytes);
+            puts = @max(puts, backing.writes - old_writes);
+            gets = @max(gets, backing.reads - old_reads);
+            rewritten = @max(rewritten, backing.written_bytes - old_bytes);
+            if (updated.nodes != root.nodes or updated.edges != root.edges) return error.InvalidBenchmarkResult;
+            var cursor = try paged_graph.Cursor.adjacency(a, backing.store(), updated, changed[0].source, .outgoing, "link");
+            defer cursor.deinit();
+            const edge = try cursor.next() orelse return error.InvalidBenchmarkResult;
+            if (!std.mem.eql(u8, edge.target, changed[0].target) or try cursor.next() != null) return error.InvalidBenchmarkResult;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(a, .{
+            .mode = "paged_graph_one_edge_replacement",
+            .source_edges = count,
+            .source_nodes = root.nodes,
+            .tree_height = root.page.?.height,
+            .initial_written_bytes = build_bytes,
+            .update_written_bytes = rewritten,
+            .update_gets = gets,
+            .update_puts = puts,
+            .update_peak_bytes = peak,
+            .update_allocation_bytes = allocated,
+            .median_ns = samples[2],
+            .note = "in-memory artifact transport; complete normalized plan plus COW publication; excludes document parsing, metric recomputation and manifest CAS; six samples, first discarded",
+        }, .{});
+        defer a.free(json);
+        try output.interface.writeAll(json);
+        try output.interface.writeByte('\n');
+        try output.flush();
+    }
+}
+
+fn benchmarkPageBootstrap(io: std.Io, output: anytype) !void {
+    const a = std.heap.smp_allocator;
+    const tree = antfly.serverless.graph_segment.page_tree;
+    const Source = struct {
+        key: [8]u8 = undefined,
+        value: [64]u8 = @splat(42),
+        index: u64 = 0,
+        limit: u64,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.index == self.limit) return null;
+            std.mem.writeInt(u64, &self.key, self.index, .big);
+            self.index += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    for ([_]u64{ 1024, 131072, 1048576 }) |count| {
+        var samples: [5]u64 = undefined;
+        var last: PhaseAllocStats = .{};
+        var writes: usize = 0;
+        var written_bytes: usize = 0;
+        for (0..6) |sample| {
+            var backing: tree.testing.MemoryStore = .{ .alloc = a };
+            defer backing.deinit();
+            var source: Source = .{ .limit = count };
+            var stats: PhaseAllocStats = .{};
+            var tracker: PhaseTrackingAllocator = .{ .backing = a, .stats = &stats };
+            const start = std.Io.Timestamp.now(io, .awake);
+            const root = (try tree.buildSorted(tracker.allocator(), backing.store(), &source)).?;
+            const elapsed: u64 = @intCast(start.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds);
+            if (root.records != count or stats.current_bytes != 0 or backing.reads != 0) return error.InvalidBenchmark;
+            if (sample > 0) samples[sample - 1] = elapsed;
+            last = stats;
+            writes = backing.writes;
+            written_bytes = backing.written_bytes;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(a, .{
+            .phase = "streamed_graph_page_bootstrap",
+            .records = count,
+            .peak_bytes = last.peak_bytes,
+            .allocation_bytes = last.total_alloc_bytes,
+            .puts = writes,
+            .gets = 0,
+            .written_bytes = written_bytes,
+            .median_ns = samples[2],
+            .note = "generated sorted input; 8-byte keys and 64-byte values; in-memory transport excluded from working set; six samples, first discarded; excludes document sorting and manifest publication",
+        }, .{});
+        defer a.free(json);
+        try output.interface.writeAll(json);
+        try output.interface.writeByte('\n');
+        try output.flush();
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
@@ -252,6 +387,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
         if (std.mem.eql(u8, arg, "--graph-impact-only")) return benchmarkGraphImpact(init.io, &output);
+        if (std.mem.eql(u8, arg, "--page-updates-only")) return benchmarkPageUpdates(init.io, &output);
+        if (std.mem.eql(u8, arg, "--page-bootstrap-only")) return benchmarkPageBootstrap(init.io, &output);
         if (std.mem.eql(u8, arg, "--ownership-reads-only")) return @import("ownership_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--ownership-disk-reads-only")) return @import("ownership_read_bench.zig").runDisk(init.io, &output);
         if (std.mem.eql(u8, arg, "--filtered-prefix-only")) return @import("paged_read_bench.zig").runFilteredPrefix(init.io, &output);

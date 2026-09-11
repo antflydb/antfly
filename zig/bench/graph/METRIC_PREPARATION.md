@@ -1,5 +1,30 @@
 # Graph metric execution and query benchmarks
 
+## Streaming page-tree bootstrap (2026-09-11)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-bootstrap-only
+```
+
+Apple M4 Max, Zig 0.16.0, five measured samples after one warmup, generated
+sorted 8-byte keys and 64-byte values. Memory below includes the builder's
+owned records, routing entries and serialized page buffers, but excludes the
+in-memory storage transport. There is no pre-materialized input array.
+
+| Records | Peak builder bytes | PUTs | GETs | Output bytes | Median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 120,200 | 4 | 0 | 82,375 | 0.089 ms |
+| 131,072 | 158,768 | 323 | 0 | 10,528,642 | 8.356 ms |
+| 1,048,576 | 182,984 | 2,579 | 0 | 84,229,010 | 67.661 ms |
+
+The builder retains one pending page per height rather than graph-wide arrays
+of leaf and routing entries. Each successful build writes only final reachable
+pages. Tests cover borrowed source buffers, page boundaries, failed allocations,
+invalid ordering and interrupted writes. These results exclude document parsing,
+external sorting, metric preparation and manifest publication. The measurements
+include the attempt-scoped v3 page reference format. They are not an end-to-end
+build speedup; the complete publication benchmark below covers that path.
+
 ## Committed status and immutable memory-run pins (2026-09-10)
 
 ```sh
@@ -1011,3 +1036,35 @@ Peak scratch remains 11.0 MB in both modes; sharing removes repeated work and
 allocation traffic, not the peak of one comparison. The companion cardinality
 regression verifies every retry deadline survives three polling passes at 65,
 128 and 4,096 rejected namespaces and that deleted entries are reclaimed.
+
+## Immutable page-tree update prototype
+
+Run the normalized graph-plan and copy-on-write storage benchmark with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-updates-only
+```
+
+The initial fixture is a chain with one outgoing edge per source document.
+One middle source is redirected to the first node. Each sample starts from the
+same pinned root with a cold operation-local cache; the first of six samples is
+discarded. Stored object payloads and fixture inputs are outside operation memory
+accounting. These are in-memory artifact transport measurements, not remote
+storage latency or complete serverless publication timings. Document parsing,
+numerical metric recomputation and manifest HEAD CAS are excluded.
+
+| Source edges | Initial tree bytes written | Update bytes written | GETs / PUTs | Peak operation bytes | Median update |
+|---:|---:|---:|---:|---:|---:|
+| 1,024 | 206,732 | 173,950 | 9 / 7 | 392,370 | 0.613 ms |
+| 16,384 | 3,278,554 | 141,306 | 7 / 6 | 355,665 | 0.386 ms |
+| 131,072 | 25,756,046 | 225,740 | 11 / 9 | 415,355 | 0.489 ms |
+
+The update grows with touched paths rather than total source edges. At the
+largest fixture it writes about 0.88% of initial tree construction bytes. This
+is not a comparison against the packed artifact's size or an end-to-end speedup.
+The small fixture also exposes fixed page-write overhead; page sizing and
+compression still need evaluation before the production cutover. This benchmark
+does not yet include supernode replacement, remote latency, or initial-build
+peak admission. The rerun includes namespace-domain page headers and overlapped
+local builds; latency is not an isolated-host guarantee. See
+`docs/GRAPH_METRICS_EXECUTION.md` for integration status.

@@ -82,20 +82,45 @@ pub const Compactor = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !CompactionResult {
+        var fallback: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        defer if (fallback) |*value| value.deinit();
+        const io = if (cancellation) |token| token.io else fallback.?.io();
+        if (publication_guard == null) {
+            var owner_bytes: [16]u8 = undefined;
+            io.random(&owner_bytes);
+            const owner = std.fmt.bytesToHex(&owner_bytes, .lower);
+            var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
+                return error.WorkLeaseLost;
+            defer _ = held.release() catch false;
+            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+        }
+        var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+        return self.compactHeadPinnedUntil(namespace, publication_guard, protection.token(io)) catch |err| return builder_mod.graphPublicationError(err, false);
+    }
+
+    fn compactHeadPinnedUntil(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !CompactionResult {
         try maintenance_cancellation.check(cancellation);
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
-        const document_index = builder_mod.findArtifactIndex(current, .document_segment) orelse return error.DocumentSegmentNotFound;
-        const mutation_index = builder_mod.findArtifactIndex(current, .mutation_segment);
-
-        const document_payload = try self.artifacts.getAlloc(current.artifacts[document_index].artifact_id);
-        defer self.alloc.free(document_payload);
-        const base_entries = try document_segment_mod.decodeAlloc(self.alloc, document_payload);
-        defer document_segment_mod.freeEntries(self.alloc, base_entries);
-        try maintenance_cancellation.check(cancellation);
-
-        const before_docs = try allocMaterializedDocuments(self.alloc, base_entries);
+        const facts_index = builder_mod.findArtifactIndex(current, .document_facts);
+        const mutation_index = if (facts_index != null) null else builder_mod.findArtifactIndex(current, .mutation_segment);
+        const before_docs = if (facts_index) |idx|
+            try builder_mod.materializeManifestFactsAlloc(self.alloc, self.artifacts, current, current.artifacts[idx], cancellation)
+        else blk: {
+            const document_index = builder_mod.findArtifactIndex(current, .document_segment) orelse return error.DocumentSegmentNotFound;
+            const document_payload = try self.artifacts.getAlloc(current.artifacts[document_index].artifact_id);
+            defer self.alloc.free(document_payload);
+            const base_entries = try document_segment_mod.decodeAlloc(self.alloc, document_payload);
+            defer document_segment_mod.freeEntries(self.alloc, base_entries);
+            try maintenance_cancellation.check(cancellation);
+            break :blk try allocMaterializedDocuments(self.alloc, base_entries);
+        };
         defer query_mod.freeMaterializedDocuments(self.alloc, before_docs);
 
         var overlay_mutations: []query_mod.QueryMaterializerMutation = &.{};
@@ -109,15 +134,12 @@ pub const Compactor = struct {
         defer if (overlay_mutations.len > 0) freeMaterializerMutations(self.alloc, overlay_mutations);
         try maintenance_cancellation.check(cancellation);
 
-        const latest_docs = if (overlay_mutations.len > 0)
-            try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, before_docs, overlay_mutations)
-        else
-            try allocMaterializedDocuments(self.alloc, base_entries);
-        defer query_mod.freeMaterializedDocuments(self.alloc, latest_docs);
+        const latest_docs = if (overlay_mutations.len == 0) before_docs else try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, before_docs, overlay_mutations);
+        defer if (overlay_mutations.len != 0) query_mod.freeMaterializedDocuments(self.alloc, latest_docs);
         try maintenance_cancellation.check(cancellation);
 
-        const document_entries = try allocDocumentEntries(self.alloc, latest_docs);
-        defer document_segment_mod.freeEntries(self.alloc, document_entries);
+        const document_entries = try allocBorrowedDocumentEntries(self.alloc, latest_docs);
+        defer self.alloc.free(document_entries);
         std.mem.sort(document_segment_mod.Entry, document_entries, {}, lessDocumentEntry);
 
         const compacted_documents = try document_segment_mod.encodeAlloc(self.alloc, document_entries);
@@ -192,10 +214,23 @@ pub const Compactor = struct {
             overlay_mutations,
             graph_index_names,
             true,
+            try builder_mod.graphPublicationAttempt(publication_guard, namespace, cancellation.?.io),
             cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, graph_refs);
         try maintenance_cancellation.check(cancellation);
+        const graph_metric_config = @import("graph_metric_config.zig");
+        const graph_metric_specs = try graph_metric_config.parseIndexSpecsAlloc(self.alloc, current.stats.indexes_json);
+        defer graph_metric_config.freeIndexSpecs(self.alloc, graph_metric_specs);
+        const next_version = try std.math.add(u64, current_head, 1);
+        const graph_metric_refs = try builder_mod.buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current, graph_refs, graph_metric_specs, cancellation, .{
+            .published_generation = next_version,
+            .edge_generation = next_version,
+            .computed_at_ms = @divTrunc(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms),
+        }, cancellation.?.io, 1);
+        defer builder_mod.freeArtifactRefs(self.alloc, graph_metric_refs);
+        const published_graph_refs = try builder_mod.concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
+        defer self.alloc.free(published_graph_refs);
         var derived_outputs = try builder_mod.detectMaterializedDerivedOutputsAlloc(
             self.alloc,
             latest_docs,
@@ -205,7 +240,7 @@ pub const Compactor = struct {
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
         try maintenance_cancellation.check(cancellation);
 
-        if (mutation_index == null and artifactsMatchCompactedHead(current, document_artifact, text_refs, sparse_refs, vector_refs, graph_refs, derived_outputs)) {
+        if (mutation_index == null and artifactsMatchCompactedHead(current, document_artifact, text_refs, sparse_refs, vector_refs, published_graph_refs, derived_outputs)) {
             return .{
                 .namespace = try self.alloc.dupe(u8, namespace),
                 .published = false,
@@ -214,7 +249,6 @@ pub const Compactor = struct {
             };
         }
 
-        const next_version = current_head + 1;
         var manifest = try buildCompactedManifestAlloc(
             self.alloc,
             namespace,
@@ -225,7 +259,7 @@ pub const Compactor = struct {
             text_refs,
             sparse_refs,
             vector_refs,
-            graph_refs,
+            published_graph_refs,
             current.stats.policy,
             derived_outputs,
             .{
@@ -235,13 +269,16 @@ pub const Compactor = struct {
             },
         );
         defer manifest.deinit(self.alloc);
+        try builder_mod.publishDocumentFactsForManifest(self.alloc, self.artifacts, &manifest, current, latest_docs, overlay_mutations, publication_guard, cancellation);
 
         try maintenance_cancellation.check(cancellation);
+        try builder_mod.stampPublicationFence(&manifest, publication_guard);
         const published_version = try builder_mod.putManifestForPublication(
             self.manifests,
             &manifest,
             current_head,
         );
+        try maintenance_cancellation.check(cancellation);
         const published = try builder_mod.compareAndSwapHeadGuarded(
             self.progress,
             namespace,
@@ -278,8 +315,8 @@ fn buildCompactedManifestAlloc(
     const text_count: usize = text_refs.len;
     const sparse_count: usize = sparse_refs.len;
     const vector_count: usize = vector_refs.len;
-    const graph_count: usize = graph_refs.len;
-    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_count);
+    const graph_count = builder_mod.countArtifactRefsByKind(graph_refs, .graph_segment);
+    const artifacts = try alloc.alloc(manifest_mod.ArtifactRef, 1 + text_count + sparse_count + vector_count + graph_refs.len);
     errdefer alloc.free(artifacts);
     artifacts[0] = .{
         .kind = .document_segment,
@@ -417,6 +454,47 @@ fn allocMaterializerMutations(
     return mutations;
 }
 
+/// Only the sortable entry array is owned; document IDs and bodies remain
+/// pinned by latest_docs through encoding. Release with allocator.free only.
+fn allocBorrowedDocumentEntries(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument) ![]document_segment_mod.Entry {
+    const entries = try alloc.alloc(document_segment_mod.Entry, docs.len);
+    for (docs, entries) |doc, *entry| entry.* = .{
+        .doc_id = doc.doc_id,
+        .body = doc.body,
+        .last_lsn = doc.last_lsn,
+        .last_timestamp_ns = doc.last_timestamp_ns,
+    };
+    return entries;
+}
+
+test "serverless compactor document entry views borrow payloads and only own the sortable array" {
+    const a = std.testing.allocator;
+    const body = try a.alloc(u8, 1024 * 1024);
+    defer a.free(body);
+    @memset(body, 'x');
+    const docs = [_]query_mod.QueryMaterializedDocument{
+        .{ .doc_id = @constCast("b"), .body = body, .last_lsn = 2, .last_timestamp_ns = 20 },
+        .{ .doc_id = @constCast("a"), .body = @constCast("alpha"), .last_lsn = 1, .last_timestamp_ns = 10 },
+    };
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    const entries = try allocBorrowedDocumentEntries(counted.allocator(), &docs);
+    defer counted.allocator().free(entries);
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    try std.testing.expectEqual(body.ptr, entries[0].body.ptr);
+    try std.testing.expectEqual(docs[0].doc_id.ptr, entries[0].doc_id.ptr);
+    std.mem.sort(document_segment_mod.Entry, entries, {}, lessDocumentEntry);
+    try std.testing.expectEqualStrings("a", entries[0].doc_id);
+    try std.testing.expectEqualStrings("b", docs[0].doc_id);
+    const Run = struct {
+        fn run(alloc: Allocator, source: []const query_mod.QueryMaterializedDocument) !void {
+            const view = try allocBorrowedDocumentEntries(alloc, source);
+            defer alloc.free(view);
+            try std.testing.expectEqual(source[0].body.ptr, view[0].body.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{&docs});
+}
+
 fn allocDocumentEntries(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
@@ -461,7 +539,7 @@ fn artifactsMatchCompactedHead(
     const expected_count: usize = 1 + text_refs.len +
         sparse_refs.len +
         vector_refs.len +
-        graph_refs.len;
+        graph_refs.len + @intFromBool(builder_mod.findArtifactIndex(current, .document_facts) != null);
     if (current.artifacts.len != expected_count) return false;
     if (!artifactMatches(current.artifacts[0], .document_segment, document_artifact.artifact_id)) return false;
     for (text_refs) |text_ref| {
@@ -474,7 +552,7 @@ fn artifactsMatchCompactedHead(
         if (!containsArtifactRef(current.artifacts[1..], .vector_segment, vector_ref.name, vector_ref.artifact_id)) return false;
     }
     for (graph_refs) |graph_ref| {
-        if (!containsArtifactRef(current.artifacts[1..], .graph_segment, graph_ref.name, graph_ref.artifact_id)) return false;
+        if (!containsArtifactRef(current.artifacts[1..], graph_ref.kind, graph_ref.name, graph_ref.artifact_id)) return false;
     }
     return derivedOutputsMatch(current.stats.derived_outputs, derived_outputs);
 }
@@ -572,7 +650,7 @@ fn currentNamedVectorPoliciesAlloc(
     return try items.toOwnedSlice(alloc);
 }
 
-test "compactor rewrites head into compacted searchable artifacts" {
+test "serverless compactor rewrites head into compacted searchable artifacts" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -625,15 +703,17 @@ test "compactor rewrites head into compacted searchable artifacts" {
     defer result.deinit(alloc);
     try std.testing.expect(result.published);
     try std.testing.expectEqual(@as(u64, 2), result.version);
-    try std.testing.expectEqual(@as(usize, 4), result.artifact_count);
+    try std.testing.expectEqual(@as(usize, 6), result.artifact_count);
 
     var manifest = try manifest_store.getAlloc("docs", 2);
     defer manifest.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 4), manifest.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 6), manifest.artifacts.len);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.document_segment, manifest.artifacts[0].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.text_segment, manifest.artifacts[1].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.sparse_segment, manifest.artifacts[2].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.vector_segment, manifest.artifacts[3].kind);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.graph_segment, manifest.artifacts[4].kind);
+    try std.testing.expectEqual(manifest_mod.ArtifactKind.document_facts, manifest.artifacts[5].kind);
 
     const document_payload = try artifact_store.getAlloc(manifest.artifacts[0].artifact_id);
     defer alloc.free(document_payload);
@@ -649,7 +729,7 @@ test "compactor rewrites head into compacted searchable artifacts" {
     try std.testing.expectEqual(shared_vector.DistanceMetric.inner_product, vector_header.metric);
 }
 
-test "artifacts match compacted head ignores named artifact and derived output ordering" {
+test "serverless artifacts match compacted head ignores named artifact and derived output ordering" {
     const alloc = std.testing.allocator;
 
     var current = manifest_mod.Manifest{
@@ -813,7 +893,7 @@ test "artifacts match compacted head ignores named artifact and derived output o
     ));
 }
 
-test "compactor preserves chunk embedding vector segments when top-level embedding is absent" {
+test "serverless compactor preserves chunk embedding vector segments when top-level embedding is absent" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -877,7 +957,7 @@ test "compactor preserves chunk embedding vector segments when top-level embeddi
     try std.testing.expectEqualStrings("doc-v", decoded.entries[1].doc_id);
 }
 
-test "compactor preserves named graph segments for graph indexes" {
+test "serverless compactor preserves named graph roots metrics and no-op provenance" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -914,7 +994,7 @@ test "compactor preserves named graph segments for graph indexes" {
     defer alloc.free(encoded);
     _ = try wal_store.append("docs", 100, encoded);
 
-    const indexes_json = try alloc.dupe(u8, "{\"graph_a\":{\"type\":\"graph\"},\"graph_b\":{\"type\":\"graph\"}}");
+    const indexes_json = try alloc.dupe(u8, "{\"graph_a\":{\"type\":\"graph\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}},\"graph_b\":{\"type\":\"graph\"}}");
     defer alloc.free(indexes_json);
 
     var builder = @import("builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
@@ -930,6 +1010,9 @@ test "compactor preserves named graph segments for graph indexes" {
     defer publish.deinit(alloc);
     try std.testing.expect(publish.published);
 
+    var before = try manifest_store.getAlloc("docs", publish.version);
+    defer before.deinit(alloc);
+
     var compactor = Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store);
     var result = try compactor.compactHead("docs");
     defer result.deinit(alloc);
@@ -940,13 +1023,25 @@ test "compactor preserves named graph segments for graph indexes" {
     try std.testing.expectEqual(@as(u32, 2), manifest.stats.graph_segment_count);
     const graph_a_index = builder_mod.findNamedArtifactIndex(manifest, .graph_segment, "graph_a").?;
     const graph_b_index = builder_mod.findNamedArtifactIndex(manifest, .graph_segment, "graph_b").?;
+    try std.testing.expectEqual(@as(usize, 2), builder_mod.countArtifactRefsByKind(manifest.artifacts, .graph_metric_segment));
+    for (before.artifacts) |prior| {
+        if (prior.kind != .graph_segment and prior.kind != .graph_metric_segment) continue;
+        const retained = manifest.artifacts[builder_mod.findNamedArtifactIndex(manifest, prior.kind, prior.name).?];
+        try std.testing.expectEqualStrings(prior.artifact_id, retained.artifact_id);
+        try std.testing.expectEqual(prior.edge_generation, retained.edge_generation);
+        try std.testing.expectEqual(prior.published_generation, retained.published_generation);
+    }
+    var no_op = try compactor.compactHead("docs");
+    defer no_op.deinit(alloc);
+    try std.testing.expect(!no_op.published);
+    try std.testing.expectEqual(result.version, no_op.version);
     try std.testing.expectEqualStrings(
         manifest.artifacts[graph_a_index].artifact_id,
         manifest.artifacts[graph_b_index].artifact_id,
     );
 }
 
-test "compactor materializes reused document heads before rewriting" {
+test "serverless compactor materializes reused document heads before rewriting" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1020,7 +1115,7 @@ test "compactor materializes reused document heads before rewriting" {
     try std.testing.expectEqualStrings("gamma", compacted_docs[1].body);
 }
 
-test "compactor reuses unaffected sparse vector and graph artifacts" {
+test "serverless compactor reuses unaffected sparse vector and graph artifacts" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1105,7 +1200,7 @@ test "compactor reuses unaffected sparse vector and graph artifacts" {
     try std.testing.expectEqualStrings(graph_before, manifest.artifacts[builder_mod.findNamedArtifactIndex(manifest, .graph_segment, "graph_idx").?].artifact_id);
 }
 
-test "compactor reuses unaffected full text artifacts" {
+test "serverless compactor reuses unaffected full text artifacts" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1167,7 +1262,7 @@ test "compactor reuses unaffected full text artifacts" {
     try std.testing.expectEqualStrings(text_before, manifest.artifacts[builder_mod.findArtifactIndex(manifest, .text_segment).?].artifact_id);
 }
 
-test "compactor no-ops when head is already compacted" {
+test "serverless compactor no-ops when head is already compacted" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1217,7 +1312,7 @@ test "compactor no-ops when head is already compacted" {
     try std.testing.expectEqual(@as(u64, 2), second.version);
 }
 
-test "adaptive vector build policy expands poor cluster layouts" {
+test "serverless adaptive vector build policy expands poor cluster layouts" {
     const policy = builder_mod.adaptiveVectorBuildPolicy(.{
         .metric = .cosine,
         .cluster_count = 4,
@@ -1231,7 +1326,7 @@ test "adaptive vector build policy expands poor cluster layouts" {
     try std.testing.expectEqual(@as(?u32, 3), policy.shortlist_multiplier);
 }
 
-test "adaptive vector build policy can shrink over-fragmented layouts" {
+test "serverless adaptive vector build policy can shrink over-fragmented layouts" {
     const policy = builder_mod.adaptiveVectorBuildPolicy(.{
         .metric = .cosine,
         .cluster_count = 8,
@@ -1245,7 +1340,7 @@ test "adaptive vector build policy can shrink over-fragmented layouts" {
     try std.testing.expectEqual(@as(?u32, 3), policy.shortlist_multiplier);
 }
 
-test "adaptive vector build policy for policy uses namespace thresholds" {
+test "serverless adaptive vector build policy for policy uses namespace thresholds" {
     const policy = builder_mod.adaptiveVectorBuildPolicyForPolicy(.{
         .metric = .cosine,
         .cluster_count = 4,

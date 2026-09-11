@@ -15,6 +15,8 @@
 pub const algebraic_manifest = @import("algebraic_manifest.zig");
 pub const algebraic_publish = @import("algebraic_publish.zig");
 pub const builder = @import("builder.zig");
+pub const document_facts = @import("document_facts.zig");
+pub const document_facts_builder = @import("document_facts_builder.zig");
 pub const compactor = @import("compactor.zig");
 pub const coordinator = @import("coordinator.zig");
 pub const external_source_manifest = @import("external_source_manifest.zig");
@@ -178,6 +180,8 @@ pub const buildRowFragmentStatsFromBatchAlloc = row_fragments.buildFragmentStats
 pub const encodeRowFragmentStatsFromBatchAlloc = row_fragments.encodeFragmentStatsFromBatchAlloc;
 
 test "serverless build module compiles" {
+    _ = document_facts;
+    _ = document_facts_builder;
     _ = algebraic_manifest;
     _ = algebraic_publish;
     _ = builder;

@@ -23,8 +23,11 @@ const topology = @import("topology_reader.zig");
 const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const paged = @import("page_reader.zig");
+const page_graph = @import("page_graph.zig");
 
 pub const Reader = struct {
+    pages: ?*paged.Reader = null,
     alloc: Allocator,
     context: topology.Context,
     tables: []const []const u8,
@@ -39,10 +42,34 @@ pub const Reader = struct {
     }
 
     pub fn initCached(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, cache: ?topology.ReadCache) !?Reader {
+        if (source.metadata_version == page_graph.Root.metadata_version) {
+            const pages = try paged.Reader.create(alloc, store, source, cancellation, remaining, cache);
+            return .{
+                .alloc = alloc,
+                .pages = pages,
+                .tables = &.{},
+                .table_bytes = &.{},
+                .context = .{
+                    .reader = .{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining, .cache = cache },
+                    .paged_root = pages.root,
+                    .trailer = std.mem.zeroes(wire.TopologyTrailer),
+                    .bytes = &.{},
+                    .directory = null,
+                    .block_bytes = &.{},
+                    .cache_slots = 0,
+                },
+            };
+        }
+        return error.InvalidGraphRoot;
+    }
+
+    /// Explicit packed-format oracle for historical codec tests. Production
+    /// queries accept only immutable page roots through init/initCached.
+    pub fn initPackedOracle(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64) !?Reader {
         // Queries alternate dictionary, routing, and adjacency blocks. A small
         // request-local working set avoids thrashing these independent ranges;
         // streaming topology preparation keeps its one-block configuration.
-        var context = try topology.Context.initQuery(alloc, store, source, cancellation, remaining, cache);
+        var context = try topology.Context.initPackedOracle(alloc, store, source, cancellation, remaining, 8, true, null);
         errdefer context.deinit();
         const directory = context.layout orelse {
             context.deinit();
@@ -74,6 +101,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (self.pages) |pages| pages.destroy();
         self.alloc.free(self.page_bytes);
         self.alloc.free(self.tables);
         self.alloc.free(self.table_bytes);
@@ -114,6 +142,7 @@ pub const Reader = struct {
     }
 
     pub fn ordinal(self: *Reader, key: []const u8) !?u32 {
+        if (self.pages) |pages| return pages.ordinal(key);
         const pages = self.context.layout.?.pages;
         if (pages == 0) return null;
         // Authenticated 64-byte fence prefixes usually identify one page with
@@ -164,6 +193,7 @@ pub const Reader = struct {
     const TypeRuns = struct { offset: u64 = 0, count: u32 = 0 };
     const Row = struct { offset: u64, out: u32, in: u32, runs: [2]TypeRuns = .{ .{}, .{} } };
     pub fn containsNode(self: *Reader, key: []const u8) !bool {
+        if (self.pages) |pages| return pages.containsNode(key);
         return try self.row(key) != null;
     }
     fn row(self: *Reader, key: []const u8) !?Row {
@@ -255,15 +285,25 @@ pub const Reader = struct {
     }
 
     pub fn nodeNameAlloc(self: *Reader, node: u32) ![]u8 {
+        if (self.pages) |pages| return pages.nodeNameAlloc(node);
         if (node >= self.context.layout.?.nodes) return error.InvalidGraphSegment;
         try self.loadPage(node / wire.node_page_entries);
         return self.alloc.dupe(u8, self.page_nodes[node % wire.node_page_entries]);
     }
 
     pub fn copyEdge(self: *Reader, edge: wire.Edge) !types.Edge {
+        if (self.pages) |pages| return pages.copyEdge(edge);
         const neighbor = try self.nodeNameAlloc(edge.node);
         errdefer self.alloc.free(neighbor);
         return .{ .neighbor_id = neighbor, .edge_type = try self.context.kindAlloc(edge.edge_type), .weight = edge.weight, .neighbor_table_id = edge.table };
+    }
+
+    pub fn kindNameAlloc(self: *Reader, kind: u32) ![]u8 {
+        if (self.pages) |pages| {
+            if (kind >= pages.kinds.count()) return error.InvalidGraphSegment;
+            return self.alloc.dupe(u8, pages.kinds.keys()[kind]);
+        }
+        return self.context.kindAlloc(kind);
     }
 
     /// A resumable directional scan. Transport is chunked, but edge work and
@@ -271,6 +311,7 @@ pub const Reader = struct {
     /// shortest-path consumer can stop without decoding the rest of a hub.
     pub const Cursor = struct {
         const Range = struct { begin: usize, end: usize };
+        paged: ?paged.Reader.Cursor = null,
         reader: *Reader,
         offset: u64,
         ranges: []Range,
@@ -287,6 +328,7 @@ pub const Reader = struct {
         work: *usize,
 
         pub fn deinit(self: *Cursor) void {
+            if (self.paged) |*active| active.deinit();
             self.reader.alloc.free(self.ranges);
             self.reader.alloc.free(self.bytes);
             self.* = undefined;
@@ -297,6 +339,7 @@ pub const Reader = struct {
         }
 
         pub fn nextWire(self: *Cursor) !?wire.Edge {
+            if (self.paged) |*active| return active.nextWire();
             while (self.range < self.ranges.len) {
                 if (self.selected == null) self.selected = try self.resolveRange(self.range);
                 const selected = self.selected.?;
@@ -352,6 +395,7 @@ pub const Reader = struct {
     };
 
     pub fn cursor(self: *Reader, key: []const u8, requested: []const []const u8, incoming: bool, work: *usize) !Cursor {
+        if (self.pages) |pages| return .{ .reader = self, .offset = 0, .ranges = &.{}, .work = work, .paged = try pages.cursor(key, requested, incoming, work) };
         const found = try self.row(key);
         const offset = if (found) |row_value| row_value.offset + (if (incoming) @as(u64, row_value.out) * wire.edge_len else 0) else 0;
         const count: usize = if (found) |row_value| (if (incoming) row_value.in else row_value.out) else 0;
@@ -363,6 +407,7 @@ pub const Reader = struct {
     /// Resolve the type dictionary once per query, not once per expanded row.
     /// Null means wildcard; an owned empty list means no matching types.
     pub fn resolveTypes(self: *Reader, requested: []const []const u8) !?[]u32 {
+        if (self.pages) |pages| return pages.resolveTypes(requested);
         if (requested.len == 0) return null;
         var ids: std.ArrayListUnmanaged(u32) = .empty;
         errdefer ids.deinit(self.alloc);
@@ -374,6 +419,7 @@ pub const Reader = struct {
     }
 
     pub fn cursorOrdinal(self: *Reader, node: u32, types_filter: ?[]const u32, incoming: bool, work: *usize) !Cursor {
+        if (self.pages) |pages| return .{ .reader = self, .offset = 0, .ranges = &.{}, .work = work, .paged = try pages.cursorOrdinal(node, types_filter, incoming, work) };
         const found = try self.rowOrdinal(node);
         const offset = if (found) |r| r.offset + (if (incoming) @as(u64, r.out) * wire.edge_len else 0) else 0;
         const count: usize = if (found) |r| (if (incoming) r.in else r.out) else 0;
@@ -420,6 +466,7 @@ pub const Reader = struct {
     /// Work is a shared remaining physical-edge allowance, consumed before I/O.
     /// Returned edges own their strings using this reader's admitted allocator.
     pub fn probe(self: *Reader, source: []const u8, kind: []const u8, target: []const u8, work: *usize) !?types.Edge {
+        if (self.pages) |pages| return pages.probe(source, kind, target, work);
         const kind_id = try self.context.kindId(kind) orelse return null;
         const target_id = try self.ordinal(target) orelse return null;
         const found = try self.row(source) orelse return null;
@@ -463,6 +510,7 @@ pub const Reader = struct {
     }
 
     pub fn adjacencyFiltered(self: *Reader, key: []const u8, requested: []const []const u8, direction: anytype, limit: usize, work: *usize, include_qualified: bool, deduplicate_self_loops: bool) !?types.Adjacency {
+        if (self.pages) |pages| return pages.adjacencyFiltered(key, requested, direction, limit, work, include_qualified, deduplicate_self_loops);
         const found = try self.row(key) orelse return null;
         const node = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(node);
@@ -473,6 +521,10 @@ pub const Reader = struct {
         }
         const incoming = try self.readEdges(found.offset + @as(u64, found.out) * wire.edge_len, if (direction == .in or direction == .both) found.in else 0, found.runs[1], requested, limit - out.len, work, false, if (deduplicate_self_loops and direction == .both) key else null);
         return .{ .node_id = node, .out_edges = out, .in_edges = incoming };
+    }
+
+    pub fn dynamicTableMetadata(self: *Reader, table: u32) ?[]const u8 {
+        return if (self.pages) |pages| pages.tableMetadata(table) else null;
     }
 };
 
@@ -524,7 +576,8 @@ test "serverless graph filtered cursors lazily coalesce canonical type runs" {
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
     var bytes: u64 = 16 * 1024 * 1024;
-    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    try std.testing.expectError(error.InvalidGraphRoot, Reader.init(a, &store, source, .none, &bytes));
+    var reader = (try Reader.initPackedOracle(a, &store, source, .none, &bytes)).?;
     defer reader.deinit();
     for ([_]bool{ false, true }) |incoming| {
         const key = if (incoming) "incoming" else "hub";
@@ -576,7 +629,7 @@ fn exerciseIndexedCursor(a: Allocator, payload: []const u8, source: refs.Artifac
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
     var bytes: u64 = 16 * 1024 * 1024;
-    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    var reader = (try Reader.initPackedOracle(a, &store, source, .none, &bytes)).?;
     defer reader.deinit();
     var work: usize = 1;
     var cursor = try reader.cursor("hub", &.{"c"}, false, &work);
@@ -613,7 +666,7 @@ test "serverless graph sparse type directory bounds overhead and independently a
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
     var bytes: u64 = 16 * 1024 * 1024;
-    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    var reader = (try Reader.initPackedOracle(a, &store, source, .none, &bytes)).?;
     defer reader.deinit();
     for ([_][]const u8{ "hub", "reverse" }, 0..) |key, direction| {
         const row_value = (try reader.row(key)).?;
@@ -637,7 +690,7 @@ fn exerciseReader(alloc: Allocator, payload: []const u8, source: refs.ArtifactRe
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };
     var remaining: u64 = 1024 * 1024;
-    var reader = (try Reader.init(alloc, &store, source, .none, &remaining)).?;
+    var reader = (try Reader.initPackedOracle(alloc, &store, source, .none, &remaining)).?;
     defer reader.deinit();
     var work: usize = 1000;
     const Direction = enum { out, in, both };
@@ -710,10 +763,10 @@ test "serverless graph paged adjacency preserves lookup semantics budgets and al
     // hashes as dictionary and adjacency data.
     const trailer = try wire.decodeTopologyTrailer(payload[payload.len - wire.topology_trailer_len ..], payload.len);
     payload[@intCast(trailer.body_len + trailer.topology_len)] ^= 1;
-    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.init(alloc, &store, source, .none, &remaining));
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.initPackedOracle(alloc, &store, source, .none, &remaining));
     payload[@intCast(trailer.body_len + trailer.topology_len)] ^= 1;
     remaining = wire.topology_trailer_len - 1;
-    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, Reader.init(alloc, &store, source, .none, &remaining));
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, Reader.initPackedOracle(alloc, &store, source, .none, &remaining));
 }
 
 test "serverless graph paged preparation coalesces thousands of small type runs" {
@@ -734,7 +787,7 @@ test "serverless graph paged preparation coalesces thousands of small type runs"
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };
     var remaining: u64 = 2 * 1024 * 1024;
     const Config = struct { edge_filter: struct { mode: enum { all, types } = .all, types: []const []const u8 = &.{} } = .{} };
-    var prepared = (try topology.readAlloc(alloc, &store, source, &[_]Config{.{}}, .{ .max_nodes = 2, .max_edges = 10000 }, .none, &remaining)).?;
+    var prepared = (try topology.readOracleAlloc(alloc, &store, source, &[_]Config{.{}}, .{ .max_nodes = 2, .max_edges = 10000 }, .none, &remaining)).?;
     defer prepared.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 10000), prepared.edges.len);
     try std.testing.expectEqual(@as(usize, 10000), prepared.edge_types.len);
@@ -762,7 +815,7 @@ test "serverless graph paged routing survives large type directories and authent
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };
     var remaining: u64 = 4 * 1024 * 1024;
     {
-        var reader = (try Reader.init(alloc, &store, source, .none, &remaining)).?;
+        var reader = (try Reader.initPackedOracle(alloc, &store, source, .none, &remaining)).?;
         defer reader.deinit();
         var work: usize = 100;
         var edge = (try reader.probe("a", "kind00001", "b", &work)).?;
@@ -781,10 +834,10 @@ test "serverless graph paged routing survives large type directories and authent
         try std.testing.expectEqual(@as(usize, 0), work);
     }
     payload[@intCast(trailer.rootOffset())] ^= 1;
-    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.init(alloc, &store, source, .none, &remaining));
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.initPackedOracle(alloc, &store, source, .none, &remaining));
     payload[@intCast(trailer.rootOffset())] ^= 1;
     payload[@intCast(trailer.directoryOffset())] ^= 1;
-    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.init(alloc, &store, source, .none, &remaining));
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.initPackedOracle(alloc, &store, source, .none, &remaining));
 }
 
 test "serverless graph paged dictionary fences handle long shared prefixes and page boundaries" {
@@ -807,7 +860,7 @@ test "serverless graph paged dictionary fences handle long shared prefixes and p
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };
     var remaining: u64 = 8 * 1024 * 1024;
-    var reader = (try Reader.init(alloc, &store, source, .none, &remaining)).?;
+    var reader = (try Reader.initPackedOracle(alloc, &store, source, .none, &remaining)).?;
     defer reader.deinit();
     var work: usize = 100;
     for ([_]usize{ 0, 255, 256, 511, 512, 1023, 1024 }) |i| {

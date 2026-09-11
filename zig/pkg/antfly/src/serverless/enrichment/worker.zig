@@ -1356,7 +1356,7 @@ fn appendChunkEmbeddingsJSON(
     try appendJSONString(alloc, out, "]");
 }
 
-test "sparse enricher appends derived sparse mutation when published docs lack sparse features" {
+test "serverless sparse enricher appends derived sparse mutation when published docs lack sparse features" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1584,7 +1584,7 @@ test "serverless object enrichment writes a stable idempotent WAL identity" {
     try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
 }
 
-test "sparse enricher can append derived chunk preview mutation" {
+test "serverless sparse enricher can append derived chunk preview mutation" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1643,7 +1643,7 @@ test "sparse enricher can append derived chunk preview mutation" {
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"chunk_preview_version\":1") != null);
 }
 
-test "sparse enricher can append derived rerank terms mutation" {
+test "serverless sparse enricher can append derived rerank terms mutation" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1702,7 +1702,7 @@ test "sparse enricher can append derived rerank terms mutation" {
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"rerank_terms_version\":1") != null);
 }
 
-test "sparse enricher can append derived chunk embeddings mutation" {
+test "serverless sparse enricher can append derived chunk embeddings mutation" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1761,7 +1761,7 @@ test "sparse enricher can append derived chunk embeddings mutation" {
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"chunk_embeddings_version\":1") != null);
 }
 
-test "sparse enricher idles when unpublished tail already exists" {
+test "serverless sparse enricher idles when unpublished tail already exists" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1812,7 +1812,7 @@ test "sparse enricher idles when unpublished tail already exists" {
     try std.testing.expectEqual(@as(usize, 1), stats.idle_namespaces);
 }
 
-test "sparse enricher skips docs already enriched at current version" {
+test "serverless sparse enricher skips docs already enriched at current version" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -1971,7 +1971,7 @@ test "serverless sparse enricher can use model-backed dense and sparse embedders
     try std.testing.expectEqual(before_cancel_lsn, try wal_store.latestLsn("docs"));
 }
 
-test "sparse enricher prefers model but falls back deterministically when sparse model fails" {
+test "serverless sparse enricher prefers model but falls back deterministically when sparse model fails" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2027,7 +2027,7 @@ test "sparse enricher prefers model but falls back deterministically when sparse
     try std.testing.expectEqual(@as(usize, 0), stats.failed_documents);
 }
 
-test "sparse enricher can require chunk embedding model and fail stage" {
+test "serverless sparse enricher can require chunk embedding model and fail stage" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2083,7 +2083,7 @@ test "sparse enricher can require chunk embedding model and fail stage" {
     );
 }
 
-test "sparse enricher advances progress in batches" {
+test "serverless sparse enricher advances progress in batches" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2131,7 +2131,15 @@ test "sparse enricher advances progress in batches" {
         .pipeline_version = lexical_sparse_enrichment_version,
     });
     try std.testing.expectEqual(@as(usize, 2), first.enriched_documents);
-    try std.testing.expectEqual(@as(?u64, 2), try progress_store.getEnrichmentDocOffset("docs"));
+    const stage_progress = (try progress_store.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    try std.testing.expectEqual(build.version, stage_progress.head_version);
+    try std.testing.expectEqual(@as(u64, 2), stage_progress.doc_offset);
+    // The atomic source-bound tuple is authoritative, including after reopen;
+    // the old independent unscoped offset is no longer a producer output.
+    var reopened_fs = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var reopened = reopened_fs.progressStore();
+    defer reopened.deinit();
+    try std.testing.expectEqual(stage_progress, (try reopened.getEnrichmentStageProgress("docs", .lexical_sparse)).?);
 
     const second = try enricher.runNamespaceWithConfig("docs", .{
         .batch_size = 2,

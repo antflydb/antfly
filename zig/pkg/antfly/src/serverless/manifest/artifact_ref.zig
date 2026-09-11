@@ -19,7 +19,7 @@
 /// The only manifest wire that may publish graph-metric artifacts. Serverless
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
-pub const graph_metric_manifest_wire_version: u16 = 24;
+pub const graph_metric_manifest_wire_version: u16 = 25;
 pub const graph_metric_segment_wire_version: u16 = 10;
 
 pub const GraphMetricMaterializationState = enum(u8) {
@@ -46,6 +46,9 @@ pub const ArtifactKind = enum(u8) {
     algebraic_segment = 11,
     external_base_source = 12,
     graph_metric_segment = 13,
+    /// Source-fenced point directory for immutable document bodies and exact
+    /// projection/enrichment facts. Root aggregates serve bounded status reads.
+    document_facts = 14,
 };
 
 pub const ArtifactRef = struct {

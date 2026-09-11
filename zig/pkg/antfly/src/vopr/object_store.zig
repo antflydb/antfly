@@ -540,6 +540,16 @@ test "serverless object store VOPR enrichment conflict preserves pruning progres
     ));
     defer runtime.deinit();
 
+    // Completed builds leave shared source pins alive for bounded reader
+    // protection. This case exercises eventual collection after those rights
+    // have expired, not unsafe immediate deletion of their source versions.
+    const lease = @import("../serverless/manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn read(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.read };
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 1), stats.enrichment_conflicts);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_namespaces);

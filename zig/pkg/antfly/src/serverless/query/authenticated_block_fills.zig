@@ -33,6 +33,7 @@ pub fn blockKey(artifact_id: []const u8, artifact_checksum: []const u8, offset: 
 /// Shared authenticated blocks, independent of transport grouping. Batches
 /// claim all missing keys atomically and never wait while owning new fills.
 pub const Cache = struct {
+    pub const max_batch_bytes = 8 * 1024 * 1024;
     const max_entries = 4096;
     const max_bytes = 64 * 1024 * 1024;
     const Entry = struct {
@@ -145,7 +146,7 @@ pub const Cache = struct {
             if (spec.len == 0) return error.InvalidCacheBatch;
             bytes = std.math.add(usize, bytes, spec.len) catch return error.InvalidCacheBatch;
         }
-        if (specs.len > max_entries or bytes > 8 * 1024 * 1024) return error.InvalidCacheBatch;
+        if (specs.len > max_entries or bytes > max_batch_bytes) return error.InvalidCacheBatch;
         const items = try result_alloc.alloc(Item, specs.len);
         var transferred = false;
         defer if (!transferred) result_alloc.free(items);

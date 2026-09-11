@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! End-to-end serverless workflow campaign over production stores and
 //! orchestration. VOPR selects one immediate fault history; the real WAL,
@@ -34,12 +45,12 @@ const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
-    pub const version: u32 = 5;
+    pub const version: u32 = 6;
 
     const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
     const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
     const stale_fenced_id = vopr.id.stable(name, "stale-owner-fenced-at-publication");
-    const legacy_epoch_id = vopr.id.stable(name, "legacy-head-rewrite-preserves-fencing-epoch");
+    const fenced_epoch_id = vopr.id.stable(name, "unfenced-head-rewrite-preserves-fencing-epoch");
     const duplicate_serialized_id = vopr.id.stable(name, "duplicate-workers-serialized");
     const recovery_id = vopr.id.stable(name, "interrupted-workflow-recovers");
     const compacted_id = vopr.id.stable(name, "compaction-publishes-complete-head");
@@ -50,7 +61,7 @@ pub const Scenario = struct {
         .{ .id = no_lost_documents_id, .name = name ++ ".no-lost-documents", .kind = .always },
         .{ .id = catalog_visible_id, .name = name ++ ".catalog-visible-after-cutover", .kind = .always },
         .{ .id = stale_fenced_id, .name = name ++ ".stale-owner-fenced-at-publication", .kind = .always },
-        .{ .id = legacy_epoch_id, .name = name ++ ".legacy-head-rewrite-preserves-fencing-epoch", .kind = .always },
+        .{ .id = fenced_epoch_id, .name = name ++ ".unfenced-head-rewrite-preserves-fencing-epoch", .kind = .always },
         .{ .id = duplicate_serialized_id, .name = name ++ ".duplicate-workers-serialized", .kind = .always },
         .{ .id = recovery_id, .name = name ++ ".interrupted-workflow-recovers", .kind = .reachable },
         .{ .id = compacted_id, .name = name ++ ".compaction-publishes-complete-head", .kind = .reachable },
@@ -62,7 +73,7 @@ pub const Scenario = struct {
         clean,
         duplicate_workers,
         lease_takeover,
-        legacy_head_rewrite,
+        unfenced_head_rewrite,
         ambiguous_publish,
         cancellation,
         retry,
@@ -75,7 +86,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "clean"),
         vopr.id.stable(name, "duplicate-workers"),
         vopr.id.stable(name, "lease-takeover"),
-        vopr.id.stable(name, "legacy-head-rewrite"),
+        vopr.id.stable(name, "unfenced-head-rewrite"),
         vopr.id.stable(name, "ambiguous-publish"),
         vopr.id.stable(name, "cancellation"),
         vopr.id.stable(name, "retry"),
@@ -87,7 +98,7 @@ pub const Scenario = struct {
         name ++ ".clean",
         name ++ ".duplicate_workers",
         name ++ ".lease_takeover",
-        name ++ ".legacy_head_rewrite",
+        name ++ ".unfenced_head_rewrite",
         name ++ ".ambiguous_publish",
         name ++ ".cancellation",
         name ++ ".retry",
@@ -140,9 +151,11 @@ pub const Scenario = struct {
         first_attempt_interrupted: bool = false,
         duplicate_blocked: bool = false,
         stale_fenced: bool = false,
-        legacy_epoch_preserved: bool = false,
+        fenced_epoch_preserved: bool = false,
         recovered: bool = false,
         final_head: u64 = 0,
+        initial_head: u64 = 0,
+        fault_head_version: u64 = 0,
         visible_document_mask: u8 = 0,
         compacted: bool = false,
         generation_fenced: bool = true,
@@ -272,9 +285,11 @@ pub const Scenario = struct {
             self.first_attempt_interrupted = false;
             self.duplicate_blocked = false;
             self.stale_fenced = false;
-            self.legacy_epoch_preserved = false;
+            self.fenced_epoch_preserved = false;
             self.recovered = false;
             self.final_head = 0;
+            self.initial_head = 0;
+            self.fault_head_version = 0;
             self.visible_document_mask = 0;
             self.compacted = false;
             self.generation_fenced = true;
@@ -397,7 +412,7 @@ pub const Scenario = struct {
                 "docs",
             );
             defer query_result.deinit();
-            const expected_version: u64 = if (mode == .stale_enrichment_progress_conflict) 4 else 3;
+            const expected_version: u64 = if (mode == .stale_enrichment_progress_conflict) 4 else self.initial_head + 2;
             if (query_result.value.version != expected_version or query_result.value.view != .published) return false;
             var mask: u8 = 0;
             for (query_result.value.documents) |document| {
@@ -496,17 +511,18 @@ pub const Scenario = struct {
                     const contender = try self.runtime.runOnce();
                     self.duplicate_blocked = contender.work_lease_conflicts == 1 and
                         (self.progress.getHead("docs") catch 0) == 0;
-                    var published = try self.catalog.buildNamespace("docs");
+                    var published = try self.catalog.buildNamespaceGuarded("docs", incumbent.guard());
                     published.deinit(self.alloc);
                     _ = try incumbent.release();
                 },
-                .lease_takeover, .legacy_head_rewrite => {
-                    // First publication is protected by the absent-to-present
-                    // HEAD CAS; bootstrap coordination never materializes HEAD.
+                .lease_takeover, .unfenced_head_rewrite => {
+                    // Bootstrap and visible HEAD share one fenced record.
                     _ = try self.runtime.runOnce();
                 },
                 .ambiguous_publish => {
+                    self.fault_head_version = 1;
                     self.progress_faults.commitNextPutThenFail(error.Timeout);
+                    self.progress_faults.put_filter = .{ .ptr = self, .matches = matchesHeadPublication };
                     try self.expectInterrupted(error.Timeout);
                     try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
                     try self.restartRuntime();
@@ -533,7 +549,23 @@ pub const Scenario = struct {
                     _ = try self.runtime.runOnce();
                 },
             }
-            try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
+            self.initial_head = try self.progress.getHead("docs");
+            // A crashed immutable candidate consumes its version. A retry's
+            // fresh upload scope must never overwrite that candidate in place.
+            // Cancellation of the HEAD write also leaves a durable candidate:
+            // work leases use their own client, before the progress fault.
+            const expected_initial: u64 = switch (self.mode) {
+                .crash_recovery, .cancellation => 2,
+                else => 1,
+            };
+            try std.testing.expectEqual(expected_initial, self.initial_head);
+        }
+
+        fn matchesHeadPublication(ptr: *anyopaque, _: []const u8, key: []const u8, body: []const u8) bool {
+            const self: *Fixture = @ptrCast(@alignCast(ptr));
+            if (!std.mem.endsWith(u8, key, "/HEAD")) return false;
+            const head = std.fmt.parseInt(u64, std.mem.trim(u8, body, " \t\r\n"), 10) catch return false;
+            return head == self.fault_head_version;
         }
 
         fn expectInterrupted(self: *Fixture, expected: anyerror) !void {
@@ -609,7 +641,7 @@ pub const Scenario = struct {
                 }
                 _ = try replacement.release();
                 _ = try self.runtime.runOnce();
-            } else if (self.mode == .legacy_head_rewrite) {
+            } else if (self.mode == .unfenced_head_rewrite) {
                 var stale = (try build_mod.work_lease.acquireHeld(
                     self.lease_impl.provider(),
                     self.sim.io(),
@@ -617,16 +649,8 @@ pub const Scenario = struct {
                     "stable-owner",
                     100,
                 )).?;
-                var legacy_client = self.memory.client();
-                var current = try legacy_client.getObject("workflow-progress", "tenant/docs/HEAD", .{});
-                const current_etag = try self.alloc.dupe(u8, current.metadata.etag.?);
-                current.deinit(self.alloc);
-                defer self.alloc.free(current_etag);
-                var legacy_write = try legacy_client.putObject("workflow-progress", "tenant/docs/HEAD", "1", .{
-                    .content_type = "text/plain",
-                    .if_match_etag = current_etag,
-                });
-                legacy_write.deinit(self.alloc);
+                try std.testing.expectError(error.PublicationFenceRequired, self.progress.compareAndSwapHead("docs", 1, 2));
+                try self.sim.jumpRealtime(101);
                 var replacement = (try build_mod.work_lease.acquireHeld(
                     self.lease_impl.provider(),
                     self.sim.io(),
@@ -634,11 +658,11 @@ pub const Scenario = struct {
                     "stable-owner",
                     100,
                 )).?;
-                self.legacy_epoch_preserved = replacement.acquisition.fencing_token > stale.acquisition.fencing_token;
+                self.fenced_epoch_preserved = replacement.acquisition.fencing_token > stale.acquisition.fencing_token;
                 if (self.catalog.buildNamespaceGuarded("docs", stale.guard())) |*result| {
                     var owned = result.*;
                     owned.deinit(self.alloc);
-                    return error.StaleWorkerPublishedAfterLegacyRewrite;
+                    return error.StaleWorkerPublishedAfterUnfencedAttempt;
                 } else |err| {
                     if (err != error.WorkLeaseLost) return err;
                 }
@@ -655,7 +679,9 @@ pub const Scenario = struct {
                 var build = try self.catalog.buildNamespaceGuarded("docs", builder_lease.guard());
                 build.deinit(self.alloc);
                 _ = try builder_lease.release();
+                self.fault_head_version = 3;
                 self.progress_faults.commitNextPutThenFail(error.Timeout);
+                self.progress_faults.put_filter = .{ .ptr = self, .matches = matchesHeadPublication };
                 try self.expectInterrupted(error.Timeout);
                 try std.testing.expectEqual(@as(u64, 3), try self.progress.getHead("docs"));
                 try self.restartRuntime();
@@ -665,7 +691,7 @@ pub const Scenario = struct {
                 self.compacted = stats.compacted_namespaces == 1;
             }
             self.final_head = try self.progress.getHead("docs");
-            if (self.final_head == 3) self.compacted = true;
+            if (self.final_head == self.initial_head + 2) self.compacted = true;
         }
 
         fn observeVisibility(self: *Fixture) !void {
@@ -714,9 +740,20 @@ pub const Scenario = struct {
         }
 
         fn advanceGenerationDuringPublication(self: *Fixture) !void {
+            // Retire the parked writer and publish through the replacement's
+            // own token. An unfenced metadata write is no longer a valid actor.
+            var raw = self.memory.client();
+            var head = try raw.getObject("workflow-progress", "tenant/docs/HEAD", .{});
+            defer head.deinit(self.alloc);
+            var record = (try head_coordination.parseContentTypeAlloc(self.alloc, head.metadata.content_type)).?;
+            defer record.deinit();
+            if (!try self.lease_impl.provider().release("docs", record.value.owner_id.?, record.value.fencing_token)) return error.WorkLeaseLost;
+            var replacement = (try build_mod.work_lease.acquireHeld(self.lease_impl.provider(), self.sim.io(), "docs", "metadata-replacement", 100)).?;
+            defer _ = replacement.release() catch false;
             var generation = try self.manifests.getAlloc("docs", 1);
             defer generation.deinit(self.alloc);
             generation.version = self.conflicting_candidate_version;
+            generation.publication_fencing_token = replacement.acquisition.fencing_token;
             self.generation_cutover_version = try build_mod.builder.putManifestForPublication(
                 &self.manifests,
                 &generation,
@@ -724,10 +761,11 @@ pub const Scenario = struct {
             );
             if (self.generation_cutover_version != 3)
                 return error.GenerationCutoverVersionMismatch;
-            if (!try self.progress.compareAndSwapHead(
+            if (!try self.progress.compareAndSwapHeadFenced(
                 "docs",
                 1,
                 self.generation_cutover_version,
+                (try replacement.guard().preparePublication("docs")).?,
             )) return error.GenerationCutoverConflict;
         }
 
@@ -766,7 +804,7 @@ pub const Scenario = struct {
             var orphan = try self.manifests.getAlloc("docs", self.conflicting_candidate_version);
             defer orphan.deinit(self.alloc);
             if (first_publish_error) |err| {
-                if (err != error.HeadChanged) return err;
+                if (err != error.HeadChanged and err != error.WorkLeaseLost) return err;
             } else return error.ConflictingPublicationUnexpectedlyWon;
             if (self.publication_hook_calls != 1)
                 return error.PublicationLifecycleHookCountMismatch;
@@ -845,7 +883,7 @@ pub const Scenario = struct {
         pub fn workflowVisibleForMode(self: *const Fixture, mode: Mode) bool {
             const fencing_mode = mode == .stale_enrichment_progress_conflict;
             const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
-            const expected_head: u64 = if (fencing_mode) 4 else 3;
+            const expected_head: u64 = if (fencing_mode) 4 else self.initial_head + 2;
             return self.complete and self.recovered and self.final_head == expected_head and
                 self.visible_document_mask == expected_document_mask and
                 (fencing_mode or self.compacted) and
@@ -908,7 +946,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".documents", @intCast(world.state.visible_document_mask));
         try builder.addNamed(allocator, name ++ ".interrupted", @intFromBool(world.state.first_attempt_interrupted));
         try builder.addNamed(allocator, name ++ ".compacted", @intFromBool(world.state.compacted));
-        try builder.addNamed(allocator, name ++ ".legacy-epoch-preserved", @intFromBool(world.state.legacy_epoch_preserved));
+        try builder.addNamed(allocator, name ++ ".fenced-epoch-preserved", @intFromBool(world.state.fenced_epoch_preserved));
         try builder.addNamed(allocator, name ++ ".publication-hook-calls", @intCast(world.state.publication_hook_calls));
         try builder.addNamed(allocator, name ++ ".conflicting-candidate-version", @intCast(world.state.conflicting_candidate_version));
         try builder.addNamed(allocator, name ++ ".generation-cutover-version", @intCast(world.state.generation_cutover_version));
@@ -923,7 +961,7 @@ pub const Scenario = struct {
         const state = world.state;
         const fencing_mode = state.mode == .stale_enrichment_progress_conflict;
         const expected_document_mask: u8 = if (fencing_mode) 1 else 3;
-        const expected_head: u64 = if (fencing_mode) 4 else 3;
+        const expected_head: u64 = if (fencing_mode) 4 else state.initial_head + 2;
         try sink.check(
             allocator,
             no_lost_documents_id,
@@ -941,8 +979,8 @@ pub const Scenario = struct {
         );
         try sink.check(
             allocator,
-            legacy_epoch_id,
-            state.mode != .legacy_head_rewrite or state.legacy_epoch_preserved,
+            fenced_epoch_id,
+            state.mode != .unfenced_head_rewrite or state.fenced_epoch_preserved,
         );
         try sink.check(
             allocator,
@@ -1127,7 +1165,7 @@ test "complete serverless workflow VOPR exact replays claim build compact publis
                 .system = "antfly",
                 .transition_budget = 1,
                 .backend_ids = &backend_ids,
-                .source_revision = "serverless-workflow-vopr-v5-generation-progress-conflict",
+                .source_revision = "serverless-workflow-vopr-v6-fenced-bootstrap-and-recovery",
                 .target = "native",
                 .optimize = @tagName(@import("builtin").mode),
             },

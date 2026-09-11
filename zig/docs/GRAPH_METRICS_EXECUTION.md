@@ -44,48 +44,124 @@ Graph neighbors, traversal and shortest-path HTTP responses fetch only the WAL
 tip for freshness, not build status. An inadmissible pending publication cannot
 prevent those reads from serving their pinned graph.
 
-Remaining control-plane work: prediction still materializes the namespace and
-is repeated between status and publication. The long-term incremental root
-transition below must provide a source-fenced, reusable touched-document change
-plan plus persisted scheduling facts; a memory cap alone is not that transition.
+Prediction reads the pinned document-facts root and only WAL-touched bodies.
+Persisted aggregate counters supply scheduling coverage without a corpus scan.
+Publication independently derives an exact-source-fenced touched-document plan;
+status requests do not leave mutable plans cached across HEAD changes.
+Policy changes and affected flat text/vector projections explicitly take the
+admitted full-rebuild path. Graph-only updates do not hydrate unrelated bodies.
 
-### Remaining storage-layout work: incremental serverless graph roots
+### Incremental serverless graph roots
 
-**Not implemented:** topology-changing publication still constructs a complete
-graph artifact. Bounded construction prevents uncontrolled allocation but does
-not remove graph-wide rewrite amplification. The next storage-layout change must
-cover the complete lifecycle together:
+WAL publication, compaction and lake sidecars publish immutable graph page roots.
+Adjacency queries and metric preparation read the same manifest-pinned roots.
+Production graph readers accept only the current format; packed graph codecs
+remain explicit numerical/test oracles, not a legacy serving fallback.
 
-- A manifest-authenticated graph root addresses bounded outgoing and incoming
-  adjacency partitions. Partition-local dictionaries replace globally sorted
-  ordinals; adding a node must not renumber unrelated partitions.
-- Coalesced old-to-new document edge replacements update only touched source
-  and target partitions, including deletions, qualified endpoints and isolated
-  nodes. High-degree adjacency needs bounded subpartitions, not one unbounded
-  object per node. Immutable replacement pages avoid an ever-growing overlay.
-- Both adjacency readers and metric preparation pin the same root. Queries
-  route directly to selected rows; metric preparation streams selected type
-  ranges and assigns computation-local dense ordinals under existing budgets.
-- The existing fenced HEAD CAS publishes the root and metric provenance
-  together. GC must traverse root reachability for retained/pinned versions;
-  candidate objects remain recoverable after failed publication. Compaction
-  replaces bounded pages without changing canonical connectivity identity.
+The implementation is in `serverless/graph_segment/page_tree.zig`,
+`page_keys.zig`, `page_graph.zig`, `page_store.zig`, `page_reader.zig` and
+`page_topology.zig`:
 
-Serverless is unreleased: this should replace the current graph wire, with no
-legacy fallback. Acceptance requires eager-oracle equivalence, interrupted
-publication/reopen/GC tests, and one-edge-update benchmarks at growing source
-sizes (bytes rewritten, allocations, peak memory, GET/PUT counts and latency).
-Simply splitting uploads while retaining the global dictionary would not meet
-the incremental construction requirement.
+- Content-addressed ordered pages target 32 KiB. An indivisible large identity
+  can use a larger page, bounded at 1 MiB; encoded keys are capped at 256 KiB.
+  Branches always pack at least two entries, including long-key cases.
+  Sorted batched edits replace touched paths, merge underfull siblings and
+  collapse single-child roots. There are no tombstones or unbounded overlays.
+  Initial sorted construction retains only one pending page per height, owns
+  borrowed source records before advancing, and writes each final page once.
+  It performs no reads or intermediate root rewrites. Unsorted document sources
+  use `page_bootstrap.zig`: admitted 4 MiB sorted runs and eight-way external
+  merges, with at most 32 merge levels. Scratch pages belong to the publication
+  attempt and are recoverable by GC. Memory scales with the run allowance,
+  largest admitted document and merge fan-in, not the full graph dictionary.
+- Node-first outgoing/incoming keys and type-first local topology keys use
+  stable string identities. Canonical duplicate occurrence ordinals preserve
+  multiplicity without depending on document-array ordering. Explicit document
+  membership and implicit local endpoints have separate lifetimes.
+- `page_graph.Plan` owns normalized replacements and fences publication against
+  the exact prior root. It reads replaced source adjacency and touched node
+  membership, not the complete namespace. Its caller must still supply coalesced,
+  normalized document replacements under an admitted operation allocator.
+  Ordered old/new edge merging emits only actual differences: unchanged hub
+  edges do not create, sort or validate replacement mutations.
+- Root metadata authenticates page digests, height, record count and size.
+  Every page and the 128-byte root include a namespace reclamation domain;
+  identical graphs in different namespaces cannot share reclaimable objects.
+  Versions and index aliases within one namespace still reuse unchanged pages.
+  Streaming range cursors have height-bounded residency. An operation-local
+  512 KiB cache shares immutable routing pages without mutating store owners.
+  Subtree cardinalities support selected-type admission before edge scans.
+- Metric topology preparation reads selected type ranges and constructs dense
+  computation-local ordinals. Tests compare node ordering, physical edge
+  multiplicity and canonical per-type checksums with the packed implementation.
+  All-type discovery advances ordered prefixes without rescanning prior kinds;
+  requested kinds are sorted/deduplicated once. Edge-count admission stops at
+  the first over-budget kind, before endpoint scanning or further discovery.
+  The shared preparation context recognizes page roots and separates admission
+  groups by filter. Single, batch and prepared artifact entry points support
+  roots; tests compare all five metric kinds and filtered/unfiltered scores
+  against the packed numerical oracle, including duplicates and qualified edges.
+- Public adjacency readers dispatch to stable-key page ranges, intern only
+  query-visited identities and lazily encode qualified-table metadata. Exact
+  edge probes seek the source/type/target prefix. Ordinal filters are sorted and
+  deduplicated before traversal; allocation-failure tests cover reader ownership.
+- Retention follows page reachability for retained publications and above-HEAD
+  candidates. Reclamation deletes children before their parent and graph root,
+  preserving recovery inventories after interruption. Shared retained pages are
+  never reclaimed. Unit and object-store retention tests cover replay and CAS
+  publication/candidate boundaries.
+- Query sessions over page roots acquire durable, shared per-version read
+  deadlines in filesystem/object progress storage. A 64-slot local cache avoids
+  per-query remote pin traffic. Deadlines last ten minutes and are reused only
+  with at least five minutes remaining; a query cannot extend its captured
+  authority. Readers check both wall time and suspend-inclusive local time,
+  propagating expiry through transport and traversal as `DeadlineExceeded`.
+  GC commits its retirement floor before observing pins, retains live pinned
+  versions even below that floor, and allows 30 seconds of inter-host clock skew.
+  Acquirers publish/observe a pin before their final floor check; independent
+  owners cannot reopen retired history. Clock failure retains content and denies
+  new read authority. Expired pins, including failed-acquisition orphans without
+  manifests, are swept with bounded listing pages. This assumes clocks remain
+  within the documented skew allowance, as with distributed publication leases.
+  Filesystem pin/floor acknowledgements sync file contents and parent entries.
+
+The current page wire is v3 and manifest wire is v25. Each page reference binds
+its producing attempt, allowing unchanged pages to survive later publications.
+Scoped artifact identities include namespace, fencing token and random attempt
+nonce. A short GC work-lease barrier fences old attempts before inventory;
+uploads abandoned before a candidate manifest are discoverable, while later
+attempts cannot be swept. Candidate manifests carry their own publication token,
+independent of the age of reused roots. Builders pin their source manifest and
+recheck publication authority after candidate durability and before HEAD CAS.
+
+Document facts use a separately typed root, leaves and `AFDBODY1` body envelopes;
+arbitrary JSON bytes cannot masquerade as internal tree objects. Query filters
+and hit hydration point-read facts/bodies. Enumerating document IDs does not
+hydrate the corpus. Read caches and temporary body ownership are charged to
+query admission. Composite graph keys, including escaped node/type/table IDs,
+must fit 256 KiB; oversized identities produce a specific admission failure.
 
 ### Stateful split ownership and bounded retirement
 
-Ownership allocation and fsync run outside the reader visibility mutex. Durable
-metadata commit and adoption of the in-memory fence remain one locked handoff,
-so a reader cannot capture a new epoch with an old ownership scope. Sync failure
-does not undo committed visibility; idempotent retries sync without holding the
-reader mutex. Moving backend commit itself off this mutex requires a versioned
-snapshot handoff and is not implemented by this change.
+Ownership preparation, backend commit, snapshot retirement and fsync run outside
+the reader visibility mutex. A separate writer gate serializes range transitions.
+Before commit, outgoing and reverse snapshots capture the old scope and epoch;
+readers arriving during commit fork those pinned snapshots. A short locked
+adoption replaces the visible scope and retires the handoff atomically. Forks
+and their cursors can outlive the handoff and retain their original visibility.
+Each logical adjacency call acquires outgoing and incoming snapshots together,
+including calls spanning multiple relationship types. Repeated forks retain a
+flat immutable owner anchor, not a recursively growing parent chain.
+LSM forks share immutable snapshot metadata but own read hints, held blocks and
+scratch; memory forks retain the immutable state; optional LMDB forks serialize
+native transaction calls and require `MDB_NOTLS`. Unsupported backends fail
+before any ownership commit. Metric admission reports a pending transition
+throughout the commit window. Sync failure does not undo committed visibility;
+idempotent retries sync without holding the reader mutex.
+Commit-window tests open readers after the physical commit but before scope
+adoption, retain them through cleanup, and verify independent cursor lifetimes.
+Injected commit failures cover both fence creation and final retirement: neither
+adopts an uncommitted scope nor retains a leaked handoff or write gate.
 
 Logical ownership is separate from physical graph cleanup. Before committing a
 narrower primary range and its Raft receipt, each private graph store durably
@@ -398,45 +474,33 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
 
 ## Serverless
 
-- Normal and lake ingestion share one ordinal graph builder. Distinct node IDs,
-  relationship types, and target tables are interned once; retained edges carry
-  numeric ordinals. Encoding counts adjacency sizes and scatters directly into
-  the final wire allocation, then sorts each node/direction in place. It does not
-  retain separate forward and reverse edge arrays. Scratch is 24 bytes per
-  dictionary node instead of up to 40 bytes per edge; sparse graphs can have a
-  different tradeoff than dense graphs. Canonical ordering, qualified endpoints
-  and isolated local nodes are preserved.
-  Both JSON adapters propagate allocator exhaustion and unwind partial edge
-  ownership; allocation failure cannot silently produce an empty graph.
-- Graph wire v9 and manifest v24 bind a 112-byte topology trailer to the
-  manifest. Its SHA-256-authenticated directory contains canonical per-type
-  semantic digests, dictionary page offsets, bounded first-key fence prefixes,
-  and SHA-256 checksums for 64 KiB
-  data blocks. A small authenticated root binds independently addressable
-  64 KiB directory leaves; a fixed-width type-offset array supports lazy type
-  lookup. Cold query readers fetch only the trailer, root, directory leaves and blocks covering
-  selected ranges. They verify every fetched block before decoding; actual
-  aligned/overfetched origin bytes count against the shared read allowance.
-  Crossing 1 MiB of directory metadata no longer removes the accelerator.
-  Preparation may read the complete directory under its existing peak budget;
-  queries retain up to four directory leaves and eight data blocks. An explicitly unavailable directory retains the
-  current-wire full-preparation path, not a legacy decoder. Low-level callers
-  without a manifest control binding must authenticate the complete artifact
-  before trusting its directory.
-- Query sessions share authenticated root, directory, and data blocks through
-  the same bounded single-flight cache as metric reads. Keys bind artifact
-  identity, extent, and trusted digest; canceled or failed producers cannot
-  publish partial data. Cache hits consume no origin-read bytes.
-- Dedicated packed graph traversal and shortest-path queries retain numeric
-  node/type IDs during BFS and decode only returned paths. Table-qualified
-  targets cannot alias local identities. Ordered neighbor queries stop after
-  the requested prefix; all inspected records still consume the work budget.
-- Public traversal, path, and MATCH consumers use request-local edge streams
-  on both native graph indexes and packed serverless artifacts. Native streams
-  use the caller-pinned generation; packed streams bind immutable artifacts.
-  Batches hold at most 64 edges, preserve vectorized admission/filtering, and
-  stop when the consumer has its answer. Adapters without a streaming source
-  retain the existing bounded materialized fallback.
+- Normal and lake ingestion publish stable-key, copy-on-write adjacency and
+  type-topology pages. Initial construction uses bounded external sorted runs;
+  incremental WAL updates merge only touched documents and changed edges.
+  Document facts provide authoritative point lookup and maintained scheduling
+  counters, independently of flat search-projection rebuilds.
+- Queries share authenticated graph pages through a bounded single-flight cache.
+  Keys bind namespace, artifact identity and trusted digest; canceled or failed
+  producers cannot publish partial data. Cache hits consume no origin-read bytes.
+  Root, routing, selected-row and decoded identity allocations remain admitted.
+  Document bodies larger than the shared fill limit bypass the cache, retain
+  checksum verification, and consume the caller's read and allocation budgets.
+- Equivalent lake graph aliases build one projection per source binding and
+  clone only owned declarations. Initial and changed-source alias-only groups
+  stream once without corpus replay. Distinct projections may share an admitted
+  replay; equivalent graph projections within that group still build once.
+- Compaction uses the same graph-metric reuse/publication path as WAL builds,
+  preserving configured metrics and their source provenance. Facts-backed
+  compaction borrows the authoritative document view and sortable entry payloads
+  instead of copying the corpus twice. Unchanged compacted heads are no-ops.
+- Public traversal, path and MATCH consumers use request-local edge streams on
+  native graph indexes and immutable serverless roots. Native reads pin outgoing
+  and incoming snapshots in one visibility epoch across all requested types.
+  Batches hold at most 64 edges and stop when the consumer has its answer.
+  Exact relationship probes seek stable source/type/target prefixes.
+- Packed ordinal dictionaries and their v9 trailer/directory/block codec remain
+  explicit test and numerical-reference oracles. Production graph queries and
+  metric preparation do not fall back to packed whole-artifact decoding.
 - Stateful tree ingestion validates final identities once per `(source, type)`;
   deletes precede writes, including reinsertion of a deleted identity. Reverse
   rebuild and outgoing split-copy scans borrow cursor entries from a stable
@@ -452,20 +516,6 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
   and 4 MiB of identity bytes (one oversized identity is indivisible). A new
   dependency epoch marks published scores stale; operator pause/disable settings
   survive repair. Reopening finishes an interrupted repair before serving reads.
-- An authenticated eight-byte-per-dictionary-node routing array addresses
-  adjacency rows. Public MATCH, traversal, path, and dedicated graph-query
-  readers resolve dictionary pages through the small fence directory, then read
-  only the requested row/type intervals. Exact relationship probes binary-search
-  canonical `(type, neighbor)` ordinals and preserve the minimum-weight match.
-  Fence prefixes are capped at 64 bytes per page; long common prefixes widen a
-  bounded binary search rather than making the control object unbounded.
-  Query allocators admit directory, cache, page, and decoded-row memory before
-  allocation. Traversal parent identities borrow only visited retained rows.
-  All reads share one byte allowance and authenticate every fetched block.
-  Adjacent metric type runs share one authenticated boundary block, preventing
-  thousands of small runs from repeatedly downloading the same 64 KiB range.
-  Point/traversal readers retain up to eight blocks (512 KiB) per source so
-  dictionary, routing, and row reads do not evict each other on every hop.
 - Filesystem object GET pins one file handle for metadata and body reads.
   Concurrent atomic HEAD replacement cannot turn an unconditional read into a
   failed precondition; explicit ETag conditions still bind that pinned object.
@@ -474,10 +524,10 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
   separately, smallest selected edge count first; one oversized filter cannot
   make a small filter retain its topology. Equivalent filters still share
   preparation, and compatible metric requirements share their projection.
-  An unavailable directory falls back to one shared full-source preparation.
-  Returned topology carries verified type digests, avoiding a second graph-wide
-  hashing pass and per-node digest array. Fallback preparation computes the same
-  digests under the separate identity-work allowance.
+  Page roots admit selected types using subtree cardinalities, then stream their
+  local endpoints and compute canonical type digests. Returned topology carries
+  those digests, avoiding a second graph-wide hashing pass and per-node digest
+  array. Packed full-source preparation is an explicit reference-oracle API.
   Compatible projection requirements share preparation when the combined work
   and memory fit. Otherwise, cheaper exact requirements are admitted first.
   Admission bounds active nodes by `min(source_nodes, 2 * selected_edges)` and
@@ -491,7 +541,7 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
   not rejected by unrelated source cardinality or whole-object size. Selected
   nodes/edges, actual fetched bytes (including authentication), work and live
   memory remain bounded. The 256 MiB whole-payload decode cap still applies to
-  full-source fallback. Cached projections are re-admitted against each caller's
+  packed reference-oracle calls. Cached projections are re-admitted against each caller's
   selected cardinality limits.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
@@ -528,10 +578,10 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
   Readers validate both semantic binding and current source integrity. Original
   source strings in the immutable payload need not equal the new publication's
   strings; authenticated control lengths come from the artifact manifest.
-  Changed indexed graphs authenticate their directory and only the selected
-  topology blocks. Reuse can read semantic digests directly from that verified
-  directory; full-content authentication is unnecessary when the manifest
-  already binds the control root.
+  Changed page graphs authenticate their root and selected topology ranges.
+  Semantic digests are calculated from those ranges; unrelated adjacency and
+  relationship types need not be fetched. Unchanged roots can reuse their
+  already-bound computation identity.
   Optional hashing has a separate 1 GiB byte-work allowance and live-allocation
   admission including any retained projection. Per-type digest scratch is freed
   before numerical work. If admission is exhausted, a zero identity disables
@@ -632,10 +682,28 @@ intact. Retained-byte accounting remains conservative and request-cumulative.
 
 ## Validation and measurements
 
+Serverless retention uses an exact, admitted mark set rather than unbounded
+heap growth. `Pruner.limits.max_working_set_bytes` defaults to 256 MiB and covers
+manifest inventories and decoding, retained/pinned version sets, owned artifact
+identities, and graph/document-facts page traversal buffers. Store-owned fixed
+transport and coordination state is outside that operation allocator. A denied
+allocation reports `GarbageCollectionBudgetExceeded`; callers can raise the
+limit for larger retained namespaces. Marking must finish before sweeping, so a
+mark denial never makes a live publication partially collectible. Later cleanup
+interruptions remain replayable through immutable manifests and the physical
+namespace/attempt inventory. This is a bounded exact-mark contract, not an
+external-memory collector or a claim of constant-memory GC for arbitrary graphs.
+
 Regression coverage includes planning reopen/mutation fencing, metadata range
 skipping, missing ordinal rows, exact integer degrees, standalone/incompatible
 HITS definitions, admission caps, pre-allocation rejection, cold/warm artifact
 authentication budgets, and point-only query metadata. See
-[the benchmark report](../bench/graph/METRIC_PREPARATION.md) for measured scope,
-fixtures, and limitations. Kernel or mock-storage microbenchmarks are not claims
+[the preparation benchmark report](../bench/graph/METRIC_PREPARATION.md) and
+[end-to-end publication qualification](GRAPH_METRICS_PUBLICATION_BENCHMARK.md)
+for measured scope, fixtures, and limitations. Kernel or mock-storage microbenchmarks are not claims
 about whole-query, whole-build, or cloud-network latency.
+
+Focused validation targets are `graph-metric-core-test`,
+`antfly-graph-page-test`, `antfly-document-facts-test`, `lake-test` and
+`antfly-serverless-test`. The graph-page target supports `ReleaseSafe` for
+checked page/key invariants; allocation-failure tests also validate ownership.

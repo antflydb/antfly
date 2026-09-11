@@ -307,7 +307,8 @@ pub const ManagedRuntime = struct {
                 };
                 defer result.deinit(self.alloc);
                 if (result.gc_watermark_conflict) stats.prune_gc_conflicts += 1;
-                if (result.deleted_versions == 0 and result.wal_records_removed == 0) continue;
+                if (result.work_lease_conflict) stats.work_lease_conflicts += 1;
+                if (result.deleted_versions == 0 and result.wal_records_removed == 0 and result.deleted_artifacts == 0) continue;
                 stats.pruned_namespaces += 1;
                 stats.deleted_versions += result.deleted_versions;
                 stats.deleted_artifacts += result.deleted_artifacts;
@@ -625,7 +626,7 @@ fn firstSparseIndexNameFromIndexesJson(root: std.json.Value) ?[]const u8 {
     return null;
 }
 
-test "managed runtime publishes and prunes based on namespace policy" {
+test "serverless managed runtime publishes and prunes based on namespace policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -698,9 +699,22 @@ test "managed runtime publishes and prunes based on namespace policy" {
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 1), stats.published_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_namespaces);
-    try std.testing.expectEqual(@as(usize, 2), stats.deleted_versions);
-    try std.testing.expectEqual(@as(usize, 6), stats.deleted_artifacts);
+    // The publishing pass pins its source; GC must not reclaim that source
+    // until the shared read right expires, even after the writer returns.
+    try std.testing.expectEqual(@as(usize, 0), stats.deleted_versions);
     try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("docs"));
+
+    const lease = @import("../manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn now(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.now };
+    const collected = try runtime.runOnce();
+    try std.testing.expectEqual(@as(usize, 0), collected.published_namespaces);
+    try std.testing.expectEqual(@as(usize, 2), collected.deleted_versions);
+    try std.testing.expect(collected.deleted_artifacts >= 6);
 
     const versions = try manifest_store.listVersionsAlloc("docs");
     defer alloc.free(versions);
@@ -708,7 +722,7 @@ test "managed runtime publishes and prunes based on namespace policy" {
 
     const cumulative = runtime.metricsSnapshot();
     try std.testing.expectEqual(stats.published_namespaces, cumulative.published_namespaces);
-    try std.testing.expectEqual(stats.pruned_namespaces, cumulative.pruned_namespaces);
+    try std.testing.expectEqual(stats.pruned_namespaces + collected.pruned_namespaces, cumulative.pruned_namespaces);
 
     // An already-expired shutdown budget cancels and joins the background
     // task without converting expected teardown into a runtime failure.
@@ -735,7 +749,7 @@ test "managed runtime publishes and prunes based on namespace policy" {
     }
 }
 
-test "managed runtime query-only role skips maintenance work" {
+test "serverless managed runtime query-only role skips maintenance work" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -794,7 +808,7 @@ test "managed runtime query-only role skips maintenance work" {
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime api-only role skips maintenance work" {
+test "serverless managed runtime api-only role skips maintenance work" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -857,7 +871,7 @@ test "managed runtime api-only role skips maintenance work" {
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime honors maintenance feature flags" {
+test "serverless managed runtime honors maintenance feature flags" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -922,7 +936,7 @@ test "managed runtime honors maintenance feature flags" {
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime compacts head when namespace exceeds compaction threshold" {
+test "serverless managed runtime compacts head when namespace exceeds compaction threshold" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -993,9 +1007,11 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
 
     var compacted = try manifest_store.getAlloc("docs", 3);
     defer compacted.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), compacted.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 4), compacted.artifacts.len);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.document_segment, compacted.artifacts[0].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.text_segment, compacted.artifacts[1].kind);
+    try std.testing.expect(@import("../build/builder.zig").findArtifactIndex(compacted, .document_facts) != null);
+    try std.testing.expect(@import("../build/builder.zig").findArtifactIndex(compacted, .graph_segment) != null);
 }
 
 test "serverless managed runtime targets request-driven enrichment without global maintenance" {

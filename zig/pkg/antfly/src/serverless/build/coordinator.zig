@@ -177,10 +177,8 @@ pub const BackgroundPublisher = struct {
 
             var held_lease: ?work_lease.HeldLease = null;
             var held_bootstrap_lease: ?work_lease.HeldBootstrapLease = null;
-            // The absent-to-first-HEAD CAS is already the atomic publication
-            // fence. Avoid materializing a HEAD=0 lease placeholder, which
-            // older publishers interpret as an existing head and cannot
-            // replace during a rolling rollback.
+            // Bootstrap and established publications use the same durable
+            // HEAD coordination record and monotonically increasing fence.
             if (self.lease_provider) |provider| {
                 if (status.head_version == 0) {
                     held_bootstrap_lease = try work_lease.acquireBootstrapHeld(
@@ -492,7 +490,7 @@ test "serverless background publisher publishes once and stop wakes a long idle 
     try std.testing.expect(publisher.future == null);
 }
 
-test "background publisher loop publishes asynchronously and latest reads remain valid" {
+test "serverless background publisher loop publishes asynchronously and latest reads remain valid" {
     const alloc = std.heap.page_allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -598,7 +596,7 @@ test "background publisher loop publishes asynchronously and latest reads remain
     try std.testing.expect(publisher.future == null);
 }
 
-test "concurrent background publishers yield a single publish winner" {
+test "serverless concurrent background publishers yield a single publish winner" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -658,13 +656,21 @@ test "concurrent background publishers yield a single publish winner" {
         pub_b: BackgroundPublisher,
         stats_a: PublishRunStats = .{},
         stats_b: PublishRunStats = .{},
+        error_a: ?anyerror = null,
+        error_b: ?anyerror = null,
 
         fn runA(self: *@This()) void {
-            self.stats_a = self.pub_a.runOnce() catch PublishRunStats{};
+            self.stats_a = self.pub_a.runOnce() catch |err| {
+                self.error_a = err;
+                return;
+            };
         }
 
         fn runB(self: *@This()) void {
-            self.stats_b = self.pub_b.runOnce() catch PublishRunStats{};
+            self.stats_b = self.pub_b.runOnce() catch |err| {
+                self.error_b = err;
+                return;
+            };
         }
     };
 
@@ -672,14 +678,18 @@ test "concurrent background publishers yield a single publish winner" {
         .pub_a = BackgroundPublisher.init(alloc, std.testing.io, &catalog_a, 1),
         .pub_b = BackgroundPublisher.init(alloc, std.testing.io, &catalog_b, 1),
     };
+    defer state.pub_a.deinit();
+    defer state.pub_b.deinit();
     var thread_a = try std.testing.io.concurrent(RaceState.runA, .{&state});
     defer thread_a.await(std.testing.io);
     var thread_b = try std.testing.io.concurrent(RaceState.runB, .{&state});
     thread_a.await(std.testing.io);
     thread_b.await(std.testing.io);
 
+    try std.testing.expectEqual(@as(?anyerror, null), state.error_a);
+    try std.testing.expectEqual(@as(?anyerror, null), state.error_b);
     try std.testing.expectEqual(@as(usize, 1), state.stats_a.published_namespaces + state.stats_b.published_namespaces);
-    try std.testing.expectEqual(@as(usize, 1), state.stats_a.head_conflicts + state.stats_b.head_conflicts + state.stats_a.idle_namespaces + state.stats_b.idle_namespaces);
+    try std.testing.expectEqual(@as(usize, 1), state.stats_a.head_conflicts + state.stats_b.head_conflicts + state.stats_a.idle_namespaces + state.stats_b.idle_namespaces + state.stats_a.lease_conflicts + state.stats_b.lease_conflicts);
     try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
 }
 

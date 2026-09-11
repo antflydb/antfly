@@ -32,6 +32,9 @@ pub const GraphSidecarBuildOptions = struct {
     artifact_id: []const u8 = &.{},
     limits: lake_build_limits.Limits = .{},
     cancellation: CancellationToken = .none,
+    /// Authority belongs to the enclosing fenced manifest publication. This
+    /// builder never creates publication rights itself.
+    upload_scope: ?artifact_store.UploadScope = null,
 };
 
 pub const GraphSidecarBuildResult = struct {
@@ -133,24 +136,94 @@ pub fn publishGraphSidecarFromRowSourceAlloc(
     binding: source_binding.Binding,
     options: GraphSidecarBuildOptions,
 ) !GraphSidecarPublishResult {
-    var built = try buildGraphSidecarFromRowSourceAlloc(alloc, source, binding, options);
-    defer alloc.free(built.payload);
-    errdefer freeOwnedDeclaration(alloc, built.declaration);
-
-    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
-    var metadata_owned = true;
-    errdefer if (metadata_owned) metadata.deinit(alloc);
-
-    alloc.free(built.declaration.artifact.artifact_id);
-    alloc.free(built.declaration.artifact.checksum);
-    built.declaration.artifact.artifact_id = metadata.artifact_id;
-    built.declaration.artifact.byte_len = metadata.byte_len;
-    built.declaration.artifact.checksum = metadata.checksum;
-    metadata_owned = false;
-
-    try built.declaration.validate();
-    return .{ .declaration = built.declaration };
+    try validateOptions(binding, source.kind, options);
+    const scope = options.upload_scope orelse return error.GraphPublicationFenceRequired;
+    try scope.validate();
+    var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, options.limits);
+    return publishPagedGraph(working_set.allocator(), artifacts, source, binding, options, scope) catch |err| {
+        if ((err == error.OutOfMemory and working_set.limit_exceeded) or err == error.GraphPageWriteBudgetExceeded or err == error.ArtifactReadBudgetExceeded)
+            return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
 }
+
+fn publishPagedGraph(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: rowsource.Source, binding: source_binding.Binding, options: GraphSidecarBuildOptions, scope: artifact_store.UploadScope) !GraphSidecarPublishResult {
+    var input: ReplacementSource = .{ .alloc = alloc, .source = source, .binding = binding, .options = options, .budget = try lake_build_limits.Budget.init(options.limits) };
+    defer input.clearRow();
+    var reads: u64 = options.limits.max_output_bytes;
+    var writes: u64 = options.limits.max_output_bytes;
+    var pages: graph_segment.page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = artifacts, .cancellation = options.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = try @import("../graph_segment/page_bootstrap.zig").buildFromSource(alloc, pages.store(), &input, .{});
+    if (root.edges == 0) return error.EmptyLakeSidecarGraphSegment;
+    try input.budget.checkRetainedItems(std.math.cast(usize, std.math.add(u64, root.nodes, root.edges) catch return error.LakeSidecarBuildBudgetExceeded) orelse return error.LakeSidecarBuildBudgetExceeded);
+    const ref = try pages.publishRoot(alloc, root, options.name);
+    errdefer {
+        alloc.free(ref.name);
+        alloc.free(ref.artifact_id);
+        alloc.free(ref.checksum);
+    }
+    const name = try alloc.dupe(u8, options.name);
+    errdefer alloc.free(name);
+    const owned_binding = try cloneBindingAlloc(alloc, binding);
+    errdefer freeOwnedBinding(alloc, owned_binding);
+    const declaration: sidecar_manifest.DeclaredArtifact = .{ .name = name, .binding = owned_binding, .artifact = ref };
+    try declaration.validate();
+    return .{ .declaration = declaration };
+}
+
+const ReplacementSource = struct {
+    alloc: Allocator,
+    source: rowsource.Source,
+    binding: source_binding.Binding,
+    options: GraphSidecarBuildOptions,
+    budget: lake_build_limits.Budget,
+    batch: ?rowsource.ColumnBatch = null,
+    row: usize = 0,
+    node: ?[]u8 = null,
+    parsed: []ParsedGraphEdge = &.{},
+    edges: []graph_segment.page_keys.Edge = &.{},
+
+    fn clearRow(self: *@This()) void {
+        if (self.node) |node| self.alloc.free(node);
+        self.node = null;
+        freeParsedGraphEdges(self.alloc, self.parsed);
+        self.parsed = &.{};
+        self.alloc.free(self.edges);
+        self.edges = &.{};
+    }
+
+    pub fn next(self: *@This()) !?graph_segment.page_graph.Replacement {
+        self.clearRow();
+        while (true) {
+            try self.options.cancellation.check();
+            if (self.batch == null or self.row == self.batch.?.rowCount()) {
+                self.batch = try self.source.next(self.alloc) orelse return null;
+                self.row = 0;
+                try self.budget.admitBatch(self.batch.?);
+                try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
+                    .name = self.options.name,
+                    .binding = self.binding,
+                    .artifact = .{ .kind = .graph_segment, .name = self.options.name, .artifact_id = "pending", .byte_len = 1, .checksum = "pending" },
+                }, self.batch.?);
+                if (self.batch.?.rowCount() == 0) continue;
+            }
+            const batch = self.batch.?;
+            const row = self.row;
+            self.row += 1;
+            const column = batch.findColumn(self.options.graph_column).?;
+            if (column.nulls.isNull(row)) continue;
+            const value = switch (column.values) {
+                .bytes, .json => |values| values[row],
+                else => return error.UnsupportedLakeSidecarGraphColumn,
+            };
+            self.node = try source_binding.rowRefKeyAlloc(self.alloc, batch.row_refs[row]);
+            self.parsed = try parseGraphEdgesAlloc(self.alloc, value);
+            self.edges = try self.alloc.alloc(graph_segment.page_keys.Edge, self.parsed.len);
+            for (self.edges, self.parsed) |*out, edge| out.* = .{ .source = self.node.?, .target = edge.target, .kind = edge.edge_type, .weight = edge.weight, .table = edge.target_table };
+            return .{ .id = self.node.?, .edges = self.edges };
+        }
+    }
+};
 
 fn validateOptions(
     binding: source_binding.Binding,
@@ -610,8 +683,10 @@ test "lake graph sidecar builder consumes direct graph edge arrays" {
 
 test "lake graph sidecar publisher writes artifact store metadata into declaration" {
     const alloc = std.testing.allocator;
-    var memory = MemoryArtifactStore.init(alloc);
-    var artifacts = memory.artifactStore();
+    var memory = @import("objectstore").MemoryClient.init(alloc);
+    defer memory.deinit();
+    var store = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "tenant");
+    var artifacts = store.artifactStore();
     defer artifacts.deinit();
 
     const external_binding = external_rowsource.Binding{
@@ -656,20 +731,24 @@ test "lake graph sidecar publisher writes artifact store metadata into declarati
         .{
             .name = "events.links.graph",
             .graph_column = "graph_edges",
+            .upload_scope = .{ .domain = graph_segment.page_store.PageStore.namespaceDomain("events"), .attempt = @splat(1) },
         },
     );
     defer result.deinit(alloc);
 
     try result.declaration.validate();
-    try std.testing.expectEqualStrings("mem:graph-sidecar", result.declaration.artifact.artifact_id);
+    try std.testing.expect((try artifact_store.uploadScopeFromArtifactId(result.declaration.artifact.artifact_id)) != null);
 
     const stored = try artifacts.getAlloc(result.declaration.artifact.artifact_id);
     defer alloc.free(stored);
     try std.testing.expectEqual(@as(usize, @intCast(result.declaration.artifact.byte_len)), stored.len);
 
-    var segment = try graph_segment.decodeAlloc(alloc, stored);
-    defer graph_segment.freeSegment(alloc, &segment);
-    try std.testing.expectEqual(@as(usize, 2), segment.adjacencies.len);
+    const root = try graph_segment.page_graph.Root.decode(stored);
+    try std.testing.expectEqual(@as(u64, 2), root.nodes);
+    var reads: u64 = 1024 * 1024;
+    const reader = try @import("../graph_segment/page_reader.zig").Reader.create(alloc, &artifacts, result.declaration.artifact, .none, &reads, null);
+    defer reader.destroy();
+    try std.testing.expect(try reader.containsNode("node-b"));
 }
 
 test "lake graph sidecar builder rejects stale source batches" {

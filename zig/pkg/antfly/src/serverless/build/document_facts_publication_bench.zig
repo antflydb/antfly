@@ -1,0 +1,238 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Opt-in end-to-end publication qualification. Artifact counters count calls
+//! at the store boundary, not provider-internal requests. Filesystem manifest,
+//! WAL, lease renewal and fenced HEAD latency are included in wall time.
+const std = @import("std");
+const a = std.heap.page_allocator;
+const artifacts_mod = @import("../artifacts/mod.zig");
+const store_mod = @import("../artifacts/store.zig");
+const manifest_mod = @import("../manifest/mod.zig");
+const catalog_mod = @import("../catalog/mod.zig");
+const wal_mod = @import("../wal/mod.zig");
+const builder_mod = @import("builder.zig");
+const publication_plan = @import("publication_plan.zig");
+const api_codec = @import("../api/codec.zig");
+const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
+
+const Counts = struct { gets: u64 = 0, read_bytes: u64 = 0, puts: u64 = 0, write_bytes: u64 = 0, stats: u64 = 0, verifies: u64 = 0 };
+const CountingStore = struct {
+    inner: *store_mod.ArtifactStore,
+    counts: Counts = .{},
+
+    fn capability(self: *@This()) store_mod.ArtifactStore {
+        return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &.{
+            .deinit = deinit,
+            .put = put,
+            .put_with_cancellation = putUntil,
+            .put_scoped = putScoped,
+            .get_alloc = get,
+            .get_alloc_with_cancellation = getUntil,
+            .get_range_alloc = range,
+            .get_range_alloc_with_cancellation = rangeUntil,
+            .get_verified_range_alloc_with_cancellation = verifiedRange,
+            .get_verified_range_alloc_with_budget = verifiedRangeBudget,
+            .stat = stat,
+            .stat_with_cancellation = statUntil,
+            .verify_content = verify,
+            .delete = delete,
+        } };
+    }
+    fn selfFrom(ptr: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    fn put(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8) !store_mod.ArtifactMetadata {
+        return putUntil(ptr, alloc, bytes, .none);
+    }
+    fn putUntil(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, cancel: Cancellation) !store_mod.ArtifactMetadata {
+        const self = selfFrom(ptr);
+        self.counts.puts += 1;
+        self.counts.write_bytes += bytes.len;
+        var inner = self.inner.*;
+        inner.allocator = alloc;
+        return inner.putWithCancellation(bytes, cancel);
+    }
+    fn putScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: store_mod.UploadScope, bytes: []const u8, cancel: Cancellation) !store_mod.ArtifactMetadata {
+        const self = selfFrom(ptr);
+        self.counts.puts += 1;
+        self.counts.write_bytes += bytes.len;
+        var inner = self.inner.*;
+        inner.allocator = alloc;
+        return inner.putScoped(scope, bytes, cancel);
+    }
+    fn get(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8) ![]u8 {
+        return getUntil(ptr, alloc, id, .none);
+    }
+    fn getUntil(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, cancel: Cancellation) ![]u8 {
+        const self = selfFrom(ptr);
+        const bytes = try self.inner.getAllocWithCancellationUsingAllocator(alloc, id, cancel);
+        self.counts.gets += 1;
+        self.counts.read_bytes += bytes.len;
+        return bytes;
+    }
+    fn range(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
+        return rangeUntil(ptr, alloc, id, offset, len, .none);
+    }
+    fn rangeUntil(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, offset: u64, len: usize, cancel: Cancellation) ![]u8 {
+        const self = selfFrom(ptr);
+        const bytes = try self.inner.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancel);
+        self.counts.gets += 1;
+        self.counts.read_bytes += bytes.len;
+        return bytes;
+    }
+    fn verifiedRange(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, size: u64, checksum: []const u8, offset: u64, len: usize, cancel: Cancellation) ![]u8 {
+        const self = selfFrom(ptr);
+        const bytes = try self.inner.getVerifiedRangeAllocWithCancellationUsingAllocator(alloc, id, size, checksum, offset, len, cancel);
+        self.counts.gets += 1;
+        self.counts.read_bytes += bytes.len;
+        return bytes;
+    }
+    fn verifiedRangeBudget(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, size: u64, checksum: []const u8, offset: u64, len: usize, cancel: Cancellation, remaining: *u64) ![]u8 {
+        const self = selfFrom(ptr);
+        const bytes = try self.inner.getVerifiedRangeAllocWithBudget(alloc, id, size, checksum, offset, len, cancel, remaining);
+        self.counts.gets += 1;
+        self.counts.read_bytes += bytes.len;
+        return bytes;
+    }
+    fn stat(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8) !store_mod.ArtifactMetadata {
+        return statUntil(ptr, alloc, id, .none);
+    }
+    fn statUntil(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, cancel: Cancellation) !store_mod.ArtifactMetadata {
+        const self = selfFrom(ptr);
+        self.counts.stats += 1;
+        return self.inner.statWithCancellationUsingAllocator(alloc, id, cancel);
+    }
+    fn verify(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, size: u64, checksum: []const u8, cancel: Cancellation) !void {
+        const self = selfFrom(ptr);
+        self.counts.verifies += 1;
+        return self.inner.verifyContentWithCancellationUsingAllocator(alloc, id, size, checksum, cancel);
+    }
+    fn delete(ptr: *anyopaque, id: []const u8) !void {
+        return selfFrom(ptr).inner.delete(id);
+    }
+};
+
+test "serverless publication qualification benchmark" {
+    if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
+    var runtime = std.Io.Threaded.init(a, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    const selected_count = if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH_DOCS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 0;
+    const selected_degree = if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH_DEGREE")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 0;
+    for ([_]usize{ 1024, 16384 }) |count| {
+        if (selected_count != 0 and selected_count != count) continue;
+        for ([_]usize{ 1, 1023 }) |degree| {
+            if (selected_degree != 0 and selected_degree != degree) continue;
+            try run(io, count, degree);
+        }
+    }
+}
+
+fn run(io: std.Io, count: usize, degree: usize) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/publication", .{tmp.sub_path});
+    defer a.free(root);
+    const artifact_path = try std.fs.path.join(a, &.{ root, "artifacts" });
+    defer a.free(artifact_path);
+    const manifest_path = try std.fs.path.join(a, &.{ root, "manifests" });
+    defer a.free(manifest_path);
+    const wal_path = try std.fs.path.join(a, &.{ root, "wal" });
+    defer a.free(wal_path);
+    var fs_artifacts = try artifacts_mod.FsStore.init(a, artifact_path);
+    var underlying = fs_artifacts.artifactStore();
+    defer underlying.deinit();
+    var counting = CountingStore{ .inner = &underlying };
+    var artifacts = counting.capability();
+    var fs_manifests = try manifest_mod.FsStore.init(a, manifest_path);
+    var manifests = fs_manifests.manifestStore();
+    defer manifests.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(a, manifest_path);
+    var progress = fs_progress.progressStore();
+    defer progress.deinit();
+    var fs_wal = try wal_mod.FsStore.init(a, wal_path);
+    var wal = fs_wal.walStore();
+    defer wal.deinit();
+    var builder = builder_mod.Builder.init(a, &artifacts, &manifests, &progress, &wal);
+    builder.setIo(io);
+    const plan = publication_plan.TablePublicationPlan{
+        .targets = .{ .published_search_sources = .{ .items = &.{} }, .include_graph = true },
+        .table_definition = .{ .indexes_json = @constCast("{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}") },
+        .artifact_actions = .{ .full_text = .drop, .dense_vector = .drop, .sparse_vector = .drop },
+        .derived_output_actions = .{ .chunk_preview = .drop, .chunk_embeddings = .drop, .rerank_terms = .drop },
+    };
+    for (0..count) |i| {
+        const id = try std.fmt.allocPrint(a, "doc-{d:0>8}", .{i});
+        defer a.free(id);
+        const body = if (i == 0) try hubBody(degree, 0) else try a.dupe(u8, "{}");
+        defer a.free(body);
+        const payload = try api_codec.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = id, .body = body });
+        defer a.free(payload);
+        _ = try wal.append("docs", i + 1, payload);
+    }
+    var bootstrap = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+    bootstrap.deinit(a);
+    const Sample = struct { ns: u64, predict_ns: u64, counts: Counts };
+    var samples: [5]Sample = undefined;
+    for (0..6) |round| {
+        const body = try hubBody(degree, round + 1);
+        defer a.free(body);
+        counting.counts = .{};
+        const start = std.Io.Timestamp.now(io, .awake);
+        const payload = try api_codec.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = "doc-00000000", .body = body });
+        defer a.free(payload);
+        _ = try wal.append("docs", count + round + 1, payload);
+        const prediction_start = std.Io.Timestamp.now(io, .awake);
+        if (try builder.predictPendingWalPublicationActionsAlloc("docs", .cosine, plan)) |value| {
+            var prediction = value;
+            prediction.deinit(a);
+        }
+        const prediction_end = std.Io.Timestamp.now(io, .awake);
+        var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
+        defer result.deinit(a);
+        try std.testing.expect(result.published);
+        try std.testing.expectEqual(result.version, try progress.getHead("docs"));
+        const end = std.Io.Timestamp.now(io, .awake);
+        if (round != 0) samples[round - 1] = .{
+            .ns = @intCast(end.toNanoseconds() - start.toNanoseconds()),
+            .predict_ns = @intCast(prediction_end.toNanoseconds() - prediction_start.toNanoseconds()),
+            .counts = counting.counts,
+        };
+    }
+    std.mem.sort(Sample, &samples, {}, struct {
+        fn less(_: void, lhs: Sample, rhs: Sample) bool {
+            return lhs.ns < rhs.ns;
+        }
+    }.less);
+    const median = samples[2];
+    std.debug.print("publication_qualification docs={} degree={} median_ns={} prediction_ns={} artifact_gets={} read_bytes={} artifact_puts={} write_bytes={} stats={} verifies={} samples=5\n", .{
+        count,              degree,                    median.ns,           median.predict_ns,      median.counts.gets, median.counts.read_bytes,
+        median.counts.puts, median.counts.write_bytes, median.counts.stats, median.counts.verifies,
+    });
+}
+
+fn hubBody(degree: usize, round: usize) ![]u8 {
+    const Edge = struct { target: []const u8, edge_type: []const u8 = "links", weight: f32 };
+    const edges = try a.alloc(Edge, degree);
+    defer a.free(edges);
+    var initialized: usize = 0;
+    defer for (edges[0..initialized]) |edge| a.free(edge.target);
+    for (edges, 0..) |*edge, i| {
+        edge.* = .{ .target = try std.fmt.allocPrint(a, "doc-{d:0>8}", .{i + 1}), .weight = if (i == 0) @as(f32, @floatFromInt(1 + round % 2)) else 1 };
+        initialized += 1;
+    }
+    return std.json.Stringify.valueAlloc(a, .{ .text = "", .graph_edges = edges }, .{});
+}

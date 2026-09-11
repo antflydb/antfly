@@ -133,59 +133,44 @@ pub const ObjectStore = struct {
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
         const key = try manifestKeyAlloc(alloc, self.opened.prefix, namespace, version);
         defer alloc.free(key);
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
+        var client = self.opened.client;
+        client.allocator = alloc;
+        var result = try client.getObject(self.opened.bucket, key, .{});
         defer result.deinit(alloc);
         return try manifest_codec.decodeAlloc(alloc, result.body);
     }
 
+    fn borrowedProgress(self: *ObjectStore) @import("../catalog/object_progress_store.zig").ObjectProgressStore {
+        return .{ .alloc = self.alloc, .client = self.opened.client, .bucket = self.opened.bucket, .prefix = self.opened.prefix, .owns_client = false };
+    }
+
     pub fn setHead(self: *ObjectStore, namespace: []const u8, version: u64) !void {
-        const key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(key);
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
-        defer self.alloc.free(payload);
-        var result = try self.opened.client.putObject(self.opened.bucket, key, payload, .{ .content_type = "text/plain" });
-        defer result.deinit(self.alloc);
+        var progress = self.borrowedProgress();
+        const current = progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (!try progress.compareAndSwapHead(namespace, current, version)) return error.HeadChanged;
     }
 
     pub fn getHead(self: *ObjectStore, namespace: []const u8) !u64 {
-        const key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(key);
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
-        defer result.deinit(self.alloc);
-        return try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10);
+        var progress = self.borrowedProgress();
+        return progress.getHead(namespace);
     }
 
     pub fn compareAndSwapHead(self: *ObjectStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
         const manifest_key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(manifest_key);
-        var meta = self.opened.client.statObject(self.opened.bucket, manifest_key) catch return error.ManifestVersionNotFound;
+        var meta = self.opened.client.statObject(self.opened.bucket, manifest_key) catch |err| switch (err) {
+            error.FileNotFound => return error.ManifestVersionNotFound,
+            else => return err,
+        };
         defer meta.deinit(self.alloc);
-
-        const head_key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(head_key);
-
-        const current = self.tryReadHead(self.alloc, head_key) catch |err| switch (err) {
-            error.FileNotFound => null,
-            error.PreconditionFailed => return false,
+        var progress = self.borrowedProgress();
+        return progress.compareAndSwapHead(namespace, expected, version) catch |err| switch (err) {
+            error.PreconditionFailed => false,
             else => return err,
         };
-        defer if (current) |*value| self.alloc.free(value.etag);
-
-        if ((if (current) |value| value.version else null) != expected) return false;
-
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
-        defer self.alloc.free(payload);
-
-        var result = self.opened.client.putObject(self.opened.bucket, head_key, payload, .{
-            .content_type = "text/plain",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
-        }) catch |err| switch (err) {
-            error.PreconditionFailed => return false,
-            else => return err,
-        };
-        defer result.deinit(self.alloc);
-        return true;
     }
 
     pub fn listVersionsAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8) ![]u64 {
@@ -194,6 +179,8 @@ pub const ObjectStore = struct {
 
     fn listVersionsAllocWithPageSize(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, page_size: u32) ![]u64 {
         if (page_size == 0) return error.InvalidPageSize;
+        var client = self.opened.client;
+        client.allocator = alloc;
         const prefix = try manifestsPrefixAlloc(alloc, self.opened.prefix, namespace);
         defer alloc.free(prefix);
 
@@ -202,7 +189,7 @@ pub const ObjectStore = struct {
         var continuation_token: ?[]u8 = null;
         defer if (continuation_token) |token| alloc.free(token);
         while (true) {
-            var listed = try self.opened.client.listObjects(self.opened.bucket, .{
+            var listed = try client.listObjects(self.opened.bucket, .{
                 .prefix = prefix,
                 .recursive = true,
                 .max_keys = page_size,
@@ -238,32 +225,6 @@ pub const ObjectStore = struct {
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(key);
         try self.opened.client.deleteObject(self.opened.bucket, key, .{});
-    }
-
-    const HeadValue = struct {
-        version: u64,
-        etag: []u8,
-    };
-
-    fn tryReadHead(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !HeadValue {
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
-        defer result.deinit(alloc);
-        if (result.metadata.etag) |etag| {
-            return .{
-                .version = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
-                .etag = try alloc.dupe(u8, etag),
-            };
-        }
-
-        var metadata = try self.opened.client.statObject(self.opened.bucket, key);
-        defer metadata.deinit(alloc);
-        const stat_etag = metadata.etag orelse return error.MissingObjectEtag;
-        var verified = try self.opened.client.getObject(self.opened.bucket, key, .{ .if_match_etag = stat_etag });
-        defer verified.deinit(alloc);
-        return .{
-            .version = try std.fmt.parseInt(u64, std.mem.trim(u8, verified.body, " \t\r\n"), 10),
-            .etag = try alloc.dupe(u8, stat_etag),
-        };
     }
 
     fn tryGetEncoded(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -349,11 +310,6 @@ fn manifestsPrefixAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace:
 fn manifestKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8, version: u64) ![]u8 {
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/manifests/{d}.bin", .{ namespace, version });
     return try std.fmt.allocPrint(alloc, "{s}/{s}/manifests/{d}.bin", .{ prefix, namespace, version });
-}
-
-fn headKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
-    if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/HEAD", .{namespace});
-    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD", .{ prefix, namespace });
 }
 
 fn parseVersionFromManifestKey(key: []const u8) !u64 {

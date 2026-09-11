@@ -1052,12 +1052,10 @@ pub const CatalogService = struct {
                         ),
                     .graph = if (!targets.include_graph)
                         .drop
+                    else if (findManifestArtifactIndex(manifest, .graph_segment) != null)
+                        .reuse
                     else
-                        publication_plan.collapseNamedArtifactAction(
-                            graph_index_actions,
-                            findManifestArtifactIndex(manifest, .graph_segment) != null,
-                            if (impact.rebuild_graph) .rebuild else .reuse,
-                        ),
+                        .rebuild,
                 };
                 const derived_output_actions: publication_plan.DerivedOutputActions = .{
                     .chunk_preview = if (!effective_policy.chunk_preview_enabled)
@@ -1740,6 +1738,11 @@ fn planNamedIndexActionsAlloc(
     while (after_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         const action: publication_plan.ArtifactAction = blk: {
+            // Graph aliases select the same canonical namespace adjacency.
+            // Index definitions/metric policy still require a manifest update,
+            // but cannot invalidate its document-derived physical root. WAL
+            // prediction separately promotes this action for changed facts.
+            if (kind == .graph) break :blk if (current_artifact_count != 0) .reuse else .rebuild;
             if (before_object.get(entry.key_ptr.*)) |before_value| {
                 if (isNamedIndexKindValue(before_value, kind) and namedIndexConfigEql(entry.value_ptr.*, before_value, kind)) {
                     break :blk .reuse;
@@ -1751,7 +1754,8 @@ fn planNamedIndexActionsAlloc(
             }
             break :blk .rebuild;
         };
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = action,
         });
@@ -1761,7 +1765,8 @@ fn planNamedIndexActionsAlloc(
     while (before_it.next()) |entry| {
         if (!isNamedIndexKindValue(entry.value_ptr.*, kind)) continue;
         if (after_object.get(entry.key_ptr.*) != null) continue;
-        try actions.append(alloc, .{
+        try actions.ensureUnusedCapacity(alloc, 1);
+        actions.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
             .action = .drop,
         });
@@ -2141,6 +2146,42 @@ test "serverless named graph planning reuses topology for metric-only changes" {
     try std.testing.expectEqual(publication_plan.ArtifactAction.reuse, actions[0].action);
 }
 
+test "serverless named graph planning unwinds every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: Allocator) !void {
+            const actions = try planNamedIndexActionsAlloc(a, "{\"old\":{\"type\":\"graph\"}}", "{\"a\":{\"type\":\"graph\"},\"b\":{\"type\":\"graph\"},\"c\":{\"type\":\"graph\"},\"d\":{\"type\":\"graph\"},\"e\":{\"type\":\"graph\"},\"f\":{\"type\":\"graph\"},\"g\":{\"type\":\"graph\"},\"h\":{\"type\":\"graph\"}}", .graph, 1);
+            defer freeNamedArtifactActions(a, actions);
+        }
+    }.run, .{});
+}
+
+test "serverless named graph planning treats aliases separately from canonical storage" {
+    const a = std.testing.allocator;
+    const graph = "{\"g\":{\"type\":\"graph\"}}";
+    const two = "{\"g\":{\"type\":\"graph\"},\"alias\":{\"type\":\"graph\",\"edge_types\":[\"links\"]}}";
+    for ([_]struct { before: []const u8, after: []const u8, roots: usize, expected: publication_plan.ArtifactAction }{
+        .{ .before = "{}", .after = graph, .roots = 1, .expected = .reuse },
+        .{ .before = graph, .after = two, .roots = 1, .expected = .reuse },
+        .{ .before = graph, .after = "{\"renamed\":{\"type\":\"graph\",\"edge_types\":[\"other\"]}}", .roots = 2, .expected = .reuse },
+        .{ .before = graph, .after = graph, .roots = 0, .expected = .rebuild },
+        .{ .before = "{}", .after = graph, .roots = 0, .expected = .rebuild },
+    }) |case| {
+        const actions = try planNamedIndexActionsAlloc(a, case.before, case.after, .graph, case.roots);
+        defer freeNamedArtifactActions(a, actions);
+        var live: usize = 0;
+        for (actions) |action| {
+            if (action.action == .drop) continue;
+            live += 1;
+            try std.testing.expectEqual(case.expected, action.action);
+        }
+        try std.testing.expect(live != 0);
+    }
+    const removed = try planNamedIndexActionsAlloc(a, graph, "{}", .graph, 1);
+    defer freeNamedArtifactActions(a, removed);
+    try std.testing.expectEqual(@as(usize, 1), removed.len);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.drop, removed[0].action);
+}
+
 fn publishedSearchSourcesMatch(
     lhs: search_sources.PublishedSearchSources,
     rhs: search_sources.PublishedSearchSources,
@@ -2418,7 +2459,7 @@ fn vectorCompactionSignalAlloc(
     return if (found) signal else .{};
 }
 
-test "vector compaction signal aggregates named vector artifacts" {
+test "serverless vector compaction signal aggregates named vector artifacts" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2508,7 +2549,7 @@ test "vector compaction signal aggregates named vector artifacts" {
     try std.testing.expectEqualStrings("semantic_b", signal.driver_index_name.?);
 }
 
-test "vector compaction signal uses driver artifact metrics" {
+test "serverless vector compaction signal uses driver artifact metrics" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2632,7 +2673,7 @@ test "vector compaction signal uses driver artifact metrics" {
     try std.testing.expectEqual(@as(u32, 9), signal.shortlist_multiplier);
 }
 
-test "vector compaction signal ignores artifacts whose adaptive policy is a no-op" {
+test "serverless vector compaction signal ignores artifacts whose adaptive policy is a no-op" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2752,7 +2793,7 @@ fn findArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mod.Artifac
     return null;
 }
 
-test "catalog service tracks namespaces and reports build status" {
+test "serverless catalog service tracks namespaces and reports build status" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2845,12 +2886,16 @@ test "catalog service tracks namespaces and reports build status" {
     try std.testing.expect(!after.publish_recommended);
     try std.testing.expectEqual(catalog_types.MutationTailResolution.none, after.mutation_tail_resolution);
     try std.testing.expectEqual(@as(usize, 1), after.retained_versions);
-    try std.testing.expectEqual(@as(usize, 3), after.retained_artifacts);
+    var published = try manifest_store.getAlloc("docs", after.head_version);
+    defer published.deinit(alloc);
+    try std.testing.expect(findManifestArtifactIndex(published, .document_facts) != null);
+    try std.testing.expect(findManifestArtifactIndex(published, .graph_segment) != null);
+    try std.testing.expectEqual(published.artifacts.len, after.retained_artifacts);
     try std.testing.expect(!after.compaction_recommended);
     try std.testing.expect(after.enrichment_complete);
 }
 
-test "catalog service stores per-namespace policy" {
+test "serverless catalog service stores per-namespace policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -2918,7 +2963,7 @@ test "catalog service stores per-namespace policy" {
     try std.testing.expectEqual(@as(u32, 2), updated.enrichment_pipeline_version);
 }
 
-test "catalog service exposes table records over serving namespaces" {
+test "serverless catalog service exposes table records over serving namespaces" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3002,7 +3047,7 @@ test "catalog service exposes table records over serving namespaces" {
     try std.testing.expectEqualStrings("sparse_idx", after_build.materialized_search_sources.findSparse().?.index_name);
 }
 
-test "catalog service republishes head when table index metadata changes without new wal" {
+test "serverless catalog service republishes head when table index metadata changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3102,7 +3147,7 @@ test "catalog service republishes head when table index metadata changes without
     try std.testing.expect(!after.publish_recommended);
 }
 
-test "catalog service republishes head when derived output policy changes without new wal" {
+test "serverless catalog service republishes head when derived output policy changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3148,7 +3193,7 @@ test "catalog service republishes head when derived output policy changes withou
         .{ .chunk_preview_enabled = true },
         "{\"default_type\":\"doc\"}",
         "",
-        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"}}",
     ));
 
     var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
@@ -3200,7 +3245,7 @@ test "catalog service republishes head when derived output policy changes withou
     try std.testing.expect(!after.publish_recommended);
 }
 
-test "catalog service republishes head when graph index metadata changes without new wal" {
+test "serverless catalog service republishes head when graph index metadata changes without new wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3276,7 +3321,7 @@ test "catalog service republishes head when graph index metadata changes without
         "docs",
         "{\"default_type\":\"doc\"}",
         "",
-        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3},\"graph_idx\":{\"type\":\"graph\"}}",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"},\"graph_idx\":{\"type\":\"graph\"}}",
     ));
 
     var status = try catalog.buildStatus("docs");
@@ -3285,8 +3330,8 @@ test "catalog service republishes head when graph index metadata changes without
     try std.testing.expectEqual(catalog_types.NextPublishReason.head_republish, status.next_publish_reason.?);
     try std.testing.expect(status.head_republish_recommended);
     try std.testing.expect(!status.pending_materialization_rebuild);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, status.artifact_actions.graph);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, status.artifact_actions.graph);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -3299,10 +3344,37 @@ test "catalog service republishes head when graph index metadata changes without
     try std.testing.expectEqual(@as(u64, 2), after.head_version);
     try std.testing.expectEqual(@as(u64, 1), after.published_wal_end_lsn);
     try std.testing.expect(!after.publish_recommended);
-    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(after.head_graph_index_actions, "graph_idx").?);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(after.head_graph_index_actions, "graph_idx").?);
+
+    var aliased = try manifest_store.getAlloc("docs", 2);
+    defer aliased.deinit(alloc);
+    const canonical_id = first_manifest.artifacts[findManifestArtifactIndex(first_manifest, .graph_segment).?].artifact_id;
+    try std.testing.expectEqualStrings(canonical_id, findManifestNamedArtifact(aliased, .graph_segment, "graph_idx").?.artifact_id);
+
+    // Removing the final public alias does not remove the namespace's default
+    // graph: aliases and canonical physical storage have separate lifetimes.
+    try std.testing.expect(try catalog.setTableDefinition(
+        "docs",
+        "{\"default_type\":\"doc\"}",
+        "",
+        "{\"semantic_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"distance_metric\":\"cosine\"}}",
+    ));
+    var dropping = try catalog.buildStatus("docs");
+    defer dropping.deinit(alloc);
+    try std.testing.expect(dropping.head_republish_recommended);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, dropping.artifact_actions.graph);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.drop, findNamedArtifactAction(dropping.graph_index_actions, "graph_idx").?);
+    var dropped = try catalog.buildTable("docs");
+    defer dropped.deinit(alloc);
+    try std.testing.expect(dropped.published);
+    var unnamed = try manifest_store.getAlloc("docs", dropped.version);
+    defer unnamed.deinit(alloc);
+    const retained_graph = unnamed.artifacts[findManifestArtifactIndex(unnamed, .graph_segment).?];
+    try std.testing.expectEqualStrings(canonical_id, retained_graph.artifact_id);
+    try std.testing.expectEqualStrings("", retained_graph.name);
 }
 
-test "catalog service republishes head when dense index config changes without renaming source" {
+test "serverless catalog service republishes head when dense index config changes without renaming source" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3414,7 +3486,7 @@ test "catalog service republishes head when dense index config changes without r
     try std.testing.expect(!std.mem.eql(u8, first_vector.artifact_id, second_vector.artifact_id));
 }
 
-test "catalog service reports chunk embeddings changes as pending materialization rebuilds" {
+test "serverless catalog service reports chunk embeddings changes as pending materialization rebuilds" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3488,7 +3560,7 @@ test "catalog service reports chunk embeddings changes as pending materializatio
     try std.testing.expect(!status.pending_materialization_families.dense_vector);
 }
 
-test "catalog service republishes head when chunk embeddings are already materialized" {
+test "serverless catalog service republishes head when chunk embeddings are already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3566,7 +3638,7 @@ test "catalog service republishes head when chunk embeddings are already materia
     try std.testing.expect(!status.pending_materialization_families.chunk_embeddings);
 }
 
-test "catalog service republishes head when chunk preview is already materialized" {
+test "serverless catalog service republishes head when chunk preview is already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3644,7 +3716,7 @@ test "catalog service republishes head when chunk preview is already materialize
     try std.testing.expect(!status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service republishes head when rerank terms are already materialized" {
+test "serverless catalog service republishes head when rerank terms are already materialized" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3722,7 +3794,7 @@ test "catalog service republishes head when rerank terms are already materialize
     try std.testing.expect(!status.pending_materialization_families.rerank_terms);
 }
 
-test "catalog service reports named vector and sparse publication actions" {
+test "serverless catalog service reports named vector and sparse publication actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3799,7 +3871,7 @@ test "catalog service reports named vector and sparse publication actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.sparse_index_actions, "sparse_b").?);
 }
 
-test "catalog service defers small publish tails while enrichment is still in progress" {
+test "serverless catalog service defers small publish tails while enrichment is still in progress" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3882,7 +3954,7 @@ test "catalog service defers small publish tails while enrichment is still in pr
     try std.testing.expectEqual(@as(u64, 0), status.enrichment_doc_offset);
 }
 
-test "catalog service advances active enrichment stage to rerank terms" {
+test "serverless catalog service advances active enrichment stage to rerank terms" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -3950,7 +4022,7 @@ test "catalog service advances active enrichment stage to rerank terms" {
     try std.testing.expectEqual(catalog_types.EnrichmentStage.rerank_terms, status.enrichment_active_stage.?);
 }
 
-test "catalog service uses stage-specific publish thresholds for later enrichment stages" {
+test "serverless catalog service uses stage-specific publish thresholds for later enrichment stages" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4025,7 +4097,7 @@ test "catalog service uses stage-specific publish thresholds for later enrichmen
     try std.testing.expect(!status.materialized_derived_outputs.containsKind(.rerank_terms));
 }
 
-test "catalog service recommends compaction only while head still contains mutation segments" {
+test "serverless catalog service recommends compaction only while head still contains mutation segments" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4100,7 +4172,7 @@ test "catalog service recommends compaction only while head still contains mutat
     try std.testing.expect(!after.compaction_recommended);
 }
 
-test "catalog service recommends compaction based on document base lineage after pruning" {
+test "serverless catalog service recommends compaction based on document base lineage after pruning" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4162,6 +4234,15 @@ test "catalog service recommends compaction based on document base lineage after
     }
 
     var pruner = @import("../build/retention.zig").Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    // Publication pins are shared read rights and remain valid after the
+    // writer returns. Test eventual pruning once those rights have expired.
+    const lease = @import("../manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn now(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.now };
     var result = try pruner.pruneNamespace("docs", 2);
     defer result.deinit(alloc);
 
@@ -4179,7 +4260,7 @@ test "catalog service recommends compaction based on document base lineage after
     try std.testing.expect(status.next_document_publish_mode == null);
 }
 
-test "catalog service reports mutation tail resolved by next inline rebase publish" {
+test "serverless catalog service reports mutation tail resolved by next inline rebase publish" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4260,7 +4341,7 @@ test "catalog service reports mutation tail resolved by next inline rebase publi
     try std.testing.expectEqual(catalog_types.MutationTailResolution.next_publish_inline_rebase, status.mutation_tail_resolution);
 }
 
-test "catalog service reports versioned full text migration actions" {
+test "serverless catalog service reports versioned full text migration actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4332,7 +4413,7 @@ test "catalog service reports versioned full text migration actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findFullTextIndexAction(status.full_text_index_actions, "full_text_index_v1").?);
 }
 
-test "catalog service reports versioned full text cutover drop actions" {
+test "serverless catalog service reports versioned full text cutover drop actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4404,7 +4485,7 @@ test "catalog service reports versioned full text cutover drop actions" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findFullTextIndexAction(status.full_text_index_actions, "full_text_index_v1").?);
 }
 
-test "catalog service reports head publication actions for wal partial reuse" {
+test "serverless catalog service reports head publication actions for wal partial reuse" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4482,7 +4563,7 @@ test "catalog service reports head publication actions for wal partial reuse" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.head_sparse_index_actions, "sparse_idx").?);
 }
 
-test "catalog service predicts wal partial reuse before publish" {
+test "serverless catalog service predicts wal partial reuse before publish" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4560,7 +4641,7 @@ test "catalog service predicts wal partial reuse before publish" {
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.sparse_index_actions, "sparse_idx").?);
 }
 
-test "catalog service predicts graph index reuse before publish when graph projection is unchanged" {
+test "serverless catalog service predicts graph index reuse before publish when graph projection is unchanged" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4632,7 +4713,7 @@ test "catalog service predicts graph index reuse before publish when graph proje
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.reuse, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 }
 
-test "catalog service predicts graph index rebuild before publish when graph projection changes" {
+test "serverless catalog service predicts graph index rebuild before publish when graph projection changes" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4704,7 +4785,7 @@ test "catalog service predicts graph index rebuild before publish when graph pro
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, findNamedArtifactAction(status.graph_index_actions, "graph_idx").?);
 }
 
-test "catalog service predicts derived output recomputes from pending wal when enrichment is enabled" {
+test "serverless catalog service predicts derived output recomputes from pending wal when enrichment is enabled" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4784,7 +4865,7 @@ test "catalog service predicts derived output recomputes from pending wal when e
     try std.testing.expect(!status.pending_materialization_families.sparse_vector);
 }
 
-test "catalog service predicts lexical sparse enrichment stage from pending wal" {
+test "serverless catalog service predicts lexical sparse enrichment stage from pending wal" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4865,7 +4946,7 @@ test "catalog service predicts lexical sparse enrichment stage from pending wal"
     try std.testing.expect(!status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service marks pending wal enrichment as ready to publish when threshold is met" {
+test "serverless catalog service marks pending wal enrichment as ready to publish when threshold is met" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4942,7 +5023,7 @@ test "catalog service marks pending wal enrichment as ready to publish when thre
     try std.testing.expect(status.pending_materialization_families.chunk_preview);
 }
 
-test "catalog service reports chunk-augmented full text status without chunk preview policy" {
+test "serverless catalog service reports chunk-augmented full text status without chunk preview policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -4999,7 +5080,7 @@ test "catalog service reports chunk-augmented full text status without chunk pre
     try std.testing.expectEqual(false, status.chunk_preview_enabled);
 }
 
-test "catalog service marks chunk-backed full text as waiting on chunk preview materialization" {
+test "serverless catalog service marks chunk-backed full text as waiting on chunk preview materialization" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -5074,7 +5155,7 @@ test "catalog service marks chunk-backed full text as waiting on chunk preview m
     try std.testing.expect(status.pending_materialization_families.full_text);
 }
 
-test "catalog service auto-enables chunk embeddings for chunked embedding indexes" {
+test "serverless catalog service auto-enables chunk embeddings for chunked embedding indexes" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;

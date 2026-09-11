@@ -42,12 +42,22 @@ fn ParentBox(comptime T: type) type {
         child_count: usize = 0,
         owner_closed: bool = false,
         finalizing: bool = false,
+        parent_release: ?ParentRelease = null,
 
         fn retainChild(self: *@This()) !void {
             platform.sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             if (self.owner_closed or self.finalizing) return error.TransactionClosed;
             self.child_count += 1;
+        }
+
+        // A live fork can extend the immutable snapshot's lifetime after its
+        // original owner closes. Its own reference proves the anchor is live.
+        fn retainSnapshot(self: *@This()) !void {
+            platform.sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.finalizing or (self.owner_closed and self.child_count == 0)) return error.TransactionClosed;
+            self.child_count = try std.math.add(usize, self.child_count, 1);
         }
 
         fn requestAbort(self: *@This()) void {
@@ -95,8 +105,10 @@ fn ParentBox(comptime T: type) type {
 
         fn finalizeAbort(self: *@This()) void {
             const allocator = self.allocator;
+            const parent_release = self.parent_release;
             self.handle.abort();
             allocator.destroy(self);
+            if (parent_release) |parent| parent.release(parent.ptr);
         }
     };
 }
@@ -104,6 +116,7 @@ fn ParentBox(comptime T: type) type {
 const ParentRelease = struct {
     ptr: *anyopaque,
     release: *const fn (*anyopaque) void,
+    retain_snapshot: *const fn (*anyopaque) anyerror!void,
 };
 
 fn parentReleaseFor(parent: anytype) ParentRelease {
@@ -114,7 +127,13 @@ fn parentReleaseFor(parent: anytype) ParentRelease {
             typed.releaseChild();
         }
     }.run;
-    return .{ .ptr = parent, .release = release };
+    const retain_snapshot = struct {
+        fn run(ptr: *anyopaque) !void {
+            const typed: *Parent = @ptrCast(@alignCast(ptr));
+            try typed.retainSnapshot();
+        }
+    }.run;
+    return .{ .ptr = parent, .release = release, .retain_snapshot = retain_snapshot };
 }
 
 fn allocBox(allocator: Allocator, value: anytype) !*Box(@TypeOf(value)) {
@@ -217,6 +236,7 @@ pub const ReadTxn = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
     };
 
     pub fn abort(self: *ReadTxn) void {
@@ -244,6 +264,17 @@ pub const ReadTxn = struct {
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
         return try self.vtable.open_cursor(self.allocator, self.ptr);
+    }
+
+    /// Owns the same immutable snapshot, with independent read/cursor scratch.
+    /// The original handle may be aborted before this handle or its cursors.
+    pub fn forkRead(self: *ReadTxn) !ReadTxn {
+        const fork = self.vtable.fork_read orelse return error.ReadSnapshotForkUnsupported;
+        return fork(self.allocator, self.ptr);
+    }
+
+    pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
+        return self.forkRead();
     }
 };
 
@@ -1045,9 +1076,14 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
 }
 
 pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
+    return readTxnFromWithParent(allocator, handle, null);
+}
+
+fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: ?ParentRelease) anyerror!ReadTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
     const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
+    box_ptr.parent_release = parent_release;
 
     const vt = struct {
         fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
@@ -1083,6 +1119,21 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        fn forkRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            defer parent.releaseChild();
+            // Forks pin the original immutable owner, never their immediate
+            // scratch handle. Repeated fork/close therefore retains constant
+            // ownership depth and cannot recurse through an unbounded chain.
+            const anchor = parent.parent_release orelse parentReleaseFor(parent);
+            try anchor.retain_snapshot(anchor.ptr);
+            errdefer anchor.release(anchor.ptr);
+            var forked = try parent.handle.forkBorrowedRead();
+            errdefer forked.abort();
+            return readTxnFromWithParent(alloc, forked, anchor);
+        }
     };
 
     return .{
@@ -1093,6 +1144,7 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .open_cursor = vt.openCursor,
+            .fork_read = if (@hasDecl(Handle, "forkBorrowedRead")) vt.forkRead else null,
         },
     };
 }
@@ -2330,6 +2382,80 @@ test "runtime namespace store forwards batch options" {
     try batch.commit();
     try std.testing.expect(shared.saw_batch_options);
     try std.testing.expectEqual(backend_types.BatchMode.bulk_ingest, shared.last_mode);
+}
+
+test "graph maintenance erased read forks flatten snapshot ownership and retain cursors" {
+    const Shared = struct { live: usize = 1, owner_aborts: usize = 0 };
+    const MockCursor = struct {
+        shared: *Shared,
+        pub fn close(_: *@This()) void {}
+        pub fn first(self: *@This()) !?Entry {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            return .{ .key = "key", .value = "snapshot" };
+        }
+        pub fn last(self: *@This()) !?Entry {
+            return self.first();
+        }
+        pub fn next(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn prev(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrAfter(self: *@This(), _: []const u8) !?Entry {
+            return self.first();
+        }
+        pub fn seekAtOrBefore(self: *@This(), _: []const u8) !?Entry {
+            return self.first();
+        }
+    };
+    const MockRead = struct {
+        shared: *Shared,
+        owner: bool = true,
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            self.shared.live += 1;
+            return .{ .shared = self.shared, .owner = false };
+        }
+        pub fn abort(self: *@This()) void {
+            self.shared.live -= 1;
+            if (self.owner) self.shared.owner_aborts += 1;
+        }
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            return "snapshot";
+        }
+        pub fn openCursor(self: *@This()) !MockCursor {
+            return .{ .shared = self.shared };
+        }
+    };
+    const Run = struct {
+        fn run(a: Allocator, iterations: usize) !void {
+            var shared: Shared = .{};
+            var read = try readTxnFrom(a, MockRead{ .shared = &shared });
+            var read_open = true;
+            defer if (read_open) read.abort();
+            var retained: ?Cursor = null;
+            defer if (retained) |*cursor| cursor.close();
+            for (0..iterations) |i| {
+                const next = try read.forkRead();
+                read.abort();
+                read = next;
+                if (i == 1) retained = try read.openCursor();
+                try std.testing.expect(shared.live <= 3);
+                try std.testing.expectEqualStrings("snapshot", try read.get("key"));
+            }
+            read.abort();
+            read_open = false;
+            try std.testing.expectEqualStrings("snapshot", (try retained.?.first()).?.value);
+            retained.?.close();
+            retained = null;
+            try std.testing.expectEqual(@as(usize, 0), shared.live);
+            try std.testing.expectEqual(@as(usize, 1), shared.owner_aborts);
+        }
+    };
+    try Run.run(std.testing.allocator, 100_000);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{@as(usize, 8)});
 }
 
 test "erased cursor retains read transaction until cursor close" {

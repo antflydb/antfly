@@ -2,7 +2,15 @@
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -84,6 +92,35 @@ pub fn loadOrCount(
     byte_range: types.ByteRange,
 ) !u64 {
     return (try load(alloc, store)) orelse try countPrimaryDocuments(alloc, store, byte_range);
+}
+
+/// Read the cardinality from the same immutable view as the caller's coverage
+/// proof. A fresh store or legacy snapshot may need the scan fallback, but it
+/// must not open a second transaction and mix primary commit epochs.
+pub fn loadOrCountFromReadTxn(
+    alloc: Allocator,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
+    const raw = txn.get(&internal_keys.range_document_count_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (raw) |value| return try decode(value);
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
+    defer alloc.free(lower);
+    const upper = if (byte_range.end.len == 0) null else try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end);
+    defer if (upper) |key| alloc.free(key);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(lower);
+    var count: u64 = 0;
+    while (entry) |current| : (entry = try cursor.next()) {
+        if (upper) |key| if (std.mem.order(u8, current.key, key) != .lt) break;
+        if (internal_keys.isPrimaryDocumentKey(current.key)) count = std.math.add(u64, count, 1) catch
+            return error.RangeDocumentCountOverflow;
+    }
+    return count;
 }
 
 /// Appends the range-local cardinality transition to the caller's atomic

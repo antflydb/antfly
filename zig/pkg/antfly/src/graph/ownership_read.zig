@@ -26,10 +26,18 @@ pub fn begin(a: A, inner: backend.ReadTxn, raw: []const u8, incoming: bool, comp
         raw: []u8,
         scope: maintenance.RangeProgress,
         incoming: bool,
+        owns_raw: bool = true,
+
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            var fork = self.*;
+            fork.inner = try self.inner.forkRead();
+            fork.owns_raw = false;
+            return fork;
+        }
 
         pub fn abort(self: *@This()) void {
             self.inner.abort();
-            self.alloc.free(self.raw);
+            if (self.owns_raw) self.alloc.free(self.raw);
         }
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (!accepts(self.scope, key, self.incoming)) return error.NotFound;

@@ -2744,6 +2744,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable_snapshot: *const State,
         owns_mutable_snapshot: bool = false,
+        owns_snapshot: bool = true,
         immutable_memtables: []const *const State = &.{},
         runs: []Run = &.{},
         l0_groups: []RunGroup = &.{},
@@ -2795,8 +2796,34 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             };
         }
 
+        /// The erased read handle retains the parent snapshot until all forks
+        /// and their cursors close. Only immutable metadata is shared here.
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            // Do not copy mutable read scratch even transiently: the source
+            // handle may be serving a read while another worker forks it.
+            return .{
+                .allocator = self.allocator,
+                .metadata_allocator = self.metadata_allocator,
+                .backend = self.backend,
+                .namespace = self.namespace,
+                .mutable_snapshot = self.mutable_snapshot,
+                .owns_mutable_snapshot = self.owns_mutable_snapshot,
+                .owns_snapshot = false,
+                .immutable_memtables = self.immutable_memtables,
+                .runs = self.runs,
+                .l0_groups = self.l0_groups,
+                .levels = self.levels,
+            };
+        }
+
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            if (!self.owns_snapshot) {
+                releaseHeldBlocks(&self.held_blocks, backend.allocator);
+                releaseHeldValues(&self.held_values, self.allocator);
+                self.* = undefined;
+                return;
+            }
             if (self.owns_mutable_snapshot) {
                 var owned = @constCast(self.mutable_snapshot);
                 owned.deinit(self.allocator);

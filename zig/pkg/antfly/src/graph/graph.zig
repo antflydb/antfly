@@ -811,6 +811,8 @@ pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
 pub var test_abort_prune_after_forward_commit = false;
 threadlocal var test_counter_publication_hook: ?*const fn (*GraphIndex, GraphIndex.Stats) anyerror!void = null;
 threadlocal var test_ownership_sync_hook: ?*const fn (*GraphIndex) anyerror!void = null;
+threadlocal var test_ownership_commit_hook: ?*const fn (*GraphIndex) void = null;
+threadlocal var test_ownership_read_pair_hook: ?*const fn (*GraphIndex) void = null;
 pub var test_abort_ownership_before_range_commit = false;
 pub var test_abort_counter_rebuild_after_pages: ?usize = null;
 const graph_meta_prefix = "meta:";
@@ -888,6 +890,8 @@ pub const GraphIndex = struct {
     prune_pending: bool = false,
     ownership_fence: ?[]u8 = null,
     ownership_mutex: std.atomic.Mutex = .unlocked,
+    ownership_write_mutex: std.atomic.Mutex = .unlocked,
+    ownership_handoff: ?*OwnershipHandoff = null,
     managed_ownership_range: bool = false,
     ownership_active: bool = true,
     alloc: Allocator,
@@ -1037,9 +1041,16 @@ pub const GraphIndex = struct {
         if (self.borrowed_owner) |owner| return owner.beginReadOutgoingTxn();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
-        var read = try self.outgoing_store.beginRead();
+        if (self.ownership_handoff) |handoff| return handoff.outgoing.forkRead();
+        return self.beginOwnershipRead(false);
+    }
+
+    // Caller holds ownership_mutex, so scope and backend snapshot belong to
+    // the same visible generation. No storage writes occur under that mutex.
+    fn beginOwnershipRead(self: *GraphIndex, incoming: bool) !backend_erased.ReadTxn {
+        var read = if (incoming) try self.reverse_store.beginRead() else try self.outgoing_store.beginRead();
         errdefer read.abort();
-        if (self.ownership_active) if (self.ownership_fence) |scope| return @import("ownership_read.zig").begin(self.alloc, read, scope, false, ownsPhysicalEdge, ownershipSeekAlloc);
+        if (self.ownership_active) if (self.ownership_fence) |scope| return @import("ownership_read.zig").begin(self.alloc, read, scope, incoming, ownsPhysicalEdge, ownershipSeekAlloc);
         return read;
     }
 
@@ -1047,10 +1058,63 @@ pub const GraphIndex = struct {
         if (self.borrowed_owner) |owner| return owner.beginReadReverseTxn();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
-        var read = try self.reverse_store.beginRead();
-        errdefer read.abort();
-        if (self.ownership_active) if (self.ownership_fence) |scope| return @import("ownership_read.zig").begin(self.alloc, read, scope, true, ownsPhysicalEdge, ownershipSeekAlloc);
-        return read;
+        if (self.ownership_handoff) |handoff| return handoff.reverse.forkRead();
+        return self.beginOwnershipRead(true);
+    }
+
+    const OwnershipHandoff = struct {
+        outgoing: backend_erased.ReadTxn,
+        reverse: backend_erased.ReadTxn,
+    };
+
+    const OwnershipReads = struct {
+        outgoing: ?backend_erased.ReadTxn = null,
+        incoming: ?backend_erased.ReadTxn = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.outgoing) |*txn| txn.abort();
+            if (self.incoming) |*txn| txn.abort();
+            self.* = .{};
+        }
+    };
+
+    fn beginReadEdgeTxns(self: *GraphIndex, direction: EdgeDirection) !OwnershipReads {
+        if (self.borrowed_owner) |owner| return owner.beginReadEdgeTxns(direction);
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        var reads: OwnershipReads = .{};
+        errdefer if (reads.outgoing) |*txn| txn.abort();
+        if (direction != .in) reads.outgoing = if (self.ownership_handoff) |handoff| try handoff.outgoing.forkRead() else try self.beginOwnershipRead(false);
+        if (builtin.is_test) if (test_ownership_read_pair_hook) |hook| hook(self);
+        if (direction != .out) reads.incoming = if (self.ownership_handoff) |handoff| try handoff.reverse.forkRead() else try self.beginOwnershipRead(true);
+        return reads;
+    }
+
+    fn startOwnershipHandoff(self: *GraphIndex, handoff: *OwnershipHandoff) !void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        std.debug.assert(self.ownership_handoff == null);
+        var outgoing = try self.beginOwnershipRead(false);
+        errdefer outgoing.abort();
+        var reverse = try self.beginOwnershipRead(true);
+        errdefer reverse.abort();
+        // Fail closed before committing on a backend lacking snapshot forks.
+        var outgoing_probe = try outgoing.forkRead();
+        outgoing_probe.abort();
+        var reverse_probe = try reverse.forkRead();
+        reverse_probe.abort();
+        handoff.* = .{ .outgoing = outgoing, .reverse = reverse };
+        self.ownership_handoff = handoff;
+    }
+
+    fn finishOwnershipHandoff(self: *GraphIndex, handoff: *OwnershipHandoff) void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        std.debug.assert(self.ownership_handoff == null or self.ownership_handoff == handoff);
+        self.ownership_handoff = null;
+        self.ownership_mutex.unlock();
+        // Backend release may do work; keep it off the visibility mutex too.
+        handoff.outgoing.abort();
+        handoff.reverse.abort();
     }
 
     fn ownsPhysicalEdge(scope: maintenance.RangeProgress, key: []const u8, incoming: bool) bool {
@@ -1065,14 +1129,14 @@ pub const GraphIndex = struct {
         if (self.borrowed_owner) |owner| return owner.ownershipCleanupPending();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
-        return self.ownership_active and self.ownership_fence != null;
+        return self.ownership_handoff == null and self.ownership_active and self.ownership_fence != null;
     }
 
     pub fn ownershipTransitionPending(self: *GraphIndex) bool {
         if (self.borrowed_owner) |owner| return owner.ownershipTransitionPending();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
-        return self.ownership_fence != null;
+        return self.ownership_handoff != null or self.ownership_fence != null;
     }
 
     fn compareEncodedBoundary(encoded: []const u8, plain: []const u8) std.math.Order {
@@ -1090,6 +1154,8 @@ pub const GraphIndex = struct {
     /// reopen before publication of the catalog. A prepared transition whose
     /// primary commit failed remains invisible to readers and to cleanup.
     pub fn reconcileOwnershipRange(self: *GraphIndex, start: []const u8, end: []const u8) void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        defer self.ownership_write_mutex.unlock();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         const raw = self.ownership_fence orelse return;
@@ -1104,6 +1170,7 @@ pub const GraphIndex = struct {
     pub fn validateOwnershipRange(self: *GraphIndex, start: []const u8, end: []const u8) !void {
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
+        if (self.ownership_handoff != null) return error.GraphMaintenanceInProgress;
         const raw = self.ownership_fence orelse return;
         const scope = try maintenance.RangeProgress.decode(raw);
         const before = end.len > 0 and scope.lower.len > 0 and compareEncodedBoundary(scope.lower[1..], end) != .lt;
@@ -7055,6 +7122,8 @@ pub const GraphIndex = struct {
 
     /// Get edges connected to a key. Caller owns the returned slice and edge data.
     pub fn getEdges(self: *GraphIndex, alloc: Allocator, key: []const u8, edge_type: []const u8, direction: EdgeDirection) ![]Edge {
+        var reads = try self.beginReadEdgeTxns(direction);
+        defer reads.deinit();
         var results = std.ArrayListUnmanaged(Edge).empty;
         errdefer {
             for (results.items) |e| freeEdge(alloc, e);
@@ -7062,10 +7131,10 @@ pub const GraphIndex = struct {
         }
 
         if (direction == .out or direction == .both) {
-            try self.scanOutgoingEdges(alloc, &results, key, edge_type);
+            try self.scanOutgoingEdges(alloc, &reads.outgoing.?, &results, key, edge_type);
         }
         if (direction == .in or direction == .both) {
-            try self.scanIncomingEdges(alloc, &results, key, edge_type, direction == .both);
+            try self.scanIncomingEdges(alloc, &reads.incoming.?, &results, key, edge_type, direction == .both);
         }
 
         return try results.toOwnedSlice(alloc);
@@ -7075,6 +7144,8 @@ pub const GraphIndex = struct {
     /// relationship types. An empty type list retains the unfiltered behavior.
     pub fn getEdgesByTypes(self: *GraphIndex, alloc: Allocator, key: []const u8, edge_types: []const []const u8, direction: EdgeDirection) ![]Edge {
         if (edge_types.len == 0) return try self.getEdges(alloc, key, "", direction);
+        var reads = try self.beginReadEdgeTxns(direction);
+        defer reads.deinit();
 
         var results = std.ArrayListUnmanaged(Edge).empty;
         errdefer {
@@ -7091,10 +7162,10 @@ pub const GraphIndex = struct {
             }
             if (duplicate) continue;
             if (direction == .out or direction == .both) {
-                try self.scanOutgoingEdges(alloc, &results, key, edge_type);
+                try self.scanOutgoingEdges(alloc, &reads.outgoing.?, &results, key, edge_type);
             }
             if (direction == .in or direction == .both) {
-                try self.scanIncomingEdges(alloc, &results, key, edge_type, direction == .both);
+                try self.scanIncomingEdges(alloc, &reads.incoming.?, &results, key, edge_type, direction == .both);
             }
         }
         return try results.toOwnedSlice(alloc);
@@ -7138,6 +7209,8 @@ pub const GraphIndex = struct {
             }
         }
 
+        var reads = try self.beginReadEdgeTxns(direction);
+        defer reads.deinit();
         while (type_index < type_count) : (type_index += 1) {
             if (edge_types.len > 0) {
                 var duplicate = false;
@@ -7176,6 +7249,7 @@ pub const GraphIndex = struct {
                     false;
                 const capped = try self.scanEdgePagePhase(
                     alloc,
+                    if (phase == .out) &reads.outgoing.? else &reads.incoming.?,
                     &results,
                     &owned_bytes,
                     key,
@@ -7318,8 +7392,9 @@ pub const GraphIndex = struct {
             if (count == 0) return error.GraphExploredEdgesBudgetExceeded;
             if (bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
             if (!self.started) {
-                if (self.direction != .in) self.outgoing = try self.index.beginReadOutgoingTxn();
-                if (self.direction != .out) self.incoming = try self.index.beginReadReverseTxn();
+                const reads = try self.index.beginReadEdgeTxns(self.direction);
+                self.outgoing = reads.outgoing;
+                self.incoming = reads.incoming;
                 self.started = true;
             }
             var results = std.ArrayListUnmanaged(Edge).empty;
@@ -7385,6 +7460,7 @@ pub const GraphIndex = struct {
     fn scanEdgePagePhase(
         self: *GraphIndex,
         alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
         results: *std.ArrayListUnmanaged(Edge),
         owned_bytes: *usize,
         key: []const u8,
@@ -7416,8 +7492,6 @@ pub const GraphIndex = struct {
             null;
         defer if (resume_key) |value| alloc.free(value);
 
-        var txn = if (phase == .out) try self.beginReadOutgoingTxn() else try self.beginReadReverseTxn();
-        defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
         cursor.setUpperBound(upper);
@@ -7612,14 +7686,12 @@ pub const GraphIndex = struct {
         return result;
     }
 
-    fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
+    fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, txn: *backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
         const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
         const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
         defer alloc.free(upper);
 
-        var txn = try self.beginReadOutgoingTxn();
-        defer txn.abort();
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(upper);
@@ -7636,6 +7708,7 @@ pub const GraphIndex = struct {
     fn scanIncomingEdges(
         self: *GraphIndex,
         alloc: Allocator,
+        txn: *backend_erased.ReadTxn,
         results: *std.ArrayListUnmanaged(Edge),
         key: []const u8,
         edge_type: []const u8,
@@ -7645,9 +7718,6 @@ pub const GraphIndex = struct {
         defer alloc.free(prefix);
         const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
         defer alloc.free(upper);
-
-        var txn = try self.beginReadReverseTxn();
-        defer txn.abort();
 
         var cur = try txn.openCursor();
         defer cur.close();
@@ -7978,6 +8048,8 @@ pub const GraphIndex = struct {
     }
 
     fn startPruneRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8, fence: bool) !void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        defer self.ownership_write_mutex.unlock();
         const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (range_lower_owned) |key| alloc.free(key);
         const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
@@ -7993,11 +8065,9 @@ pub const GraphIndex = struct {
             if (owned) |value| self.alloc.free(value);
         };
         publish: {
-            // Allocation and durability do not need the reader visibility lock.
-            // Commit and in-memory adoption remain one snapshot handoff: readers
-            // must not combine a new reverse epoch with an old ownership scope.
-            @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
-            defer self.ownership_mutex.unlock();
+            var handoff: OwnershipHandoff = undefined;
+            try self.startOwnershipHandoff(&handoff);
+            defer self.finishOwnershipHandoff(&handoff);
             var batch = try self.beginWriteReverseBatch();
             errdefer batch.abort();
             if (batch.get(maintenance.range_key)) |raw| {
@@ -8026,14 +8096,18 @@ pub const GraphIndex = struct {
                 }
             }
             try batch.commit();
+            if (builtin.is_test) if (test_ownership_commit_hook) |hook| hook(self);
             // Adopt immediately after commit, even if the durability barrier
             // fails. Retry must never serve a broader view than persisted state.
+            @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+            defer self.ownership_mutex.unlock();
             if (fence) {
                 self.ownership_fence = owned;
                 self.ownership_active = !self.managed_ownership_range;
                 transferred = true;
                 self.edge_generation = generation;
             }
+            self.ownership_handoff = null;
         }
         // Ownership has moved to self; a failed sync must not free its scope.
         try self.syncOwnership();
@@ -8047,6 +8121,8 @@ pub const GraphIndex = struct {
     /// One bounded, replayable unit. Null means there is no remaining task.
     /// Callers may release graph/apply ownership between invocations.
     pub fn pruneOwnedRangePage(self: *GraphIndex) !?usize {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        defer self.ownership_write_mutex.unlock();
         if (self.ownershipTransitionPending() and !self.ownershipCleanupPending()) return null;
         const recovered = try self.resumePrunePage();
         if (recovered > 0) return recovered;
@@ -8089,15 +8165,20 @@ pub const GraphIndex = struct {
             }
             if (keys.items.len == 0) {
                 {
-                    @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
-                    defer self.ownership_mutex.unlock();
+                    var handoff: OwnershipHandoff = undefined;
+                    try self.startOwnershipHandoff(&handoff);
+                    defer self.finishOwnershipHandoff(&handoff);
                     var batch = try self.beginWriteReverseBatch();
                     errdefer batch.abort();
                     try batch.delete(maintenance.range_key);
                     batch.delete(maintenance.ownership_key) catch |err| if (err != error.NotFound) return err;
                     try batch.commit();
+                    if (builtin.is_test) if (test_ownership_commit_hook) |hook| hook(self);
+                    @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+                    defer self.ownership_mutex.unlock();
                     if (self.ownership_fence) |scope| self.alloc.free(scope);
                     self.ownership_fence = null;
+                    self.ownership_handoff = null;
                 }
                 try self.syncOwnership();
                 return null;
@@ -35007,6 +35088,168 @@ test "graph maintenance ownership fences pin snapshots and retire bounded pages"
     try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
     const first_visible = (try retained.first()).?;
     try std.testing.expectEqualStrings("a", BorrowedEdgeKey.parse(first_visible.key, .in).?.source);
+}
+
+test "graph maintenance commit handoff forks the old epoch without holding the visibility lock" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        var retained: ?backend_erased.ReadTxn = null;
+        var retained_cursor: ?backend_erased.Cursor = null;
+        var calls: usize = 0;
+        fn check(index: *GraphIndex) void {
+            std.testing.expect(index.ownership_mutex.tryLock()) catch @panic("commit holds visibility mutex");
+            index.ownership_mutex.unlock();
+            std.testing.expect(index.ownershipTransitionPending()) catch unreachable;
+            std.testing.expect(!index.ownershipCleanupPending()) catch unreachable;
+            var read = index.beginReadReverseTxn() catch @panic("handoff snapshot failed");
+            if (calls == 0) {
+                // The physical commit has happened, but readers must still see
+                // the old metadata and edges until in-memory scope adoption.
+                std.testing.expectError(error.NotFound, read.get(maintenance.ownership_key)) catch @panic("mixed ownership epoch");
+                retained = read;
+                var outgoing = index.beginReadOutgoingTxn() catch unreachable;
+                retained_cursor = outgoing.openCursor() catch unreachable;
+                outgoing.abort();
+            } else {
+                _ = read.get(maintenance.ownership_key) catch @panic("old scope missing during retirement");
+                read.abort();
+            }
+            calls += 1;
+        }
+    };
+    inline for (.{ ReverseBackend.mem, ReverseBackend.lsm_memory }) |kind| {
+        var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = kind });
+        defer g.close();
+        Hook.calls = 0;
+        Hook.retained = null;
+        Hook.retained_cursor = null;
+        defer if (Hook.retained) |*read| read.abort();
+        defer if (Hook.retained_cursor) |*cursor| cursor.close();
+        try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+        test_ownership_commit_hook = Hook.check;
+        defer test_ownership_commit_hook = null;
+        try g.fenceOwnedRange(a, "m", "");
+        try std.testing.expectEqual(@as(u64, 0), (try g.stats(a)).edge_count);
+        while (try g.pruneOwnedRangePage()) |_| {}
+        try std.testing.expectEqual(@as(usize, 2), Hook.calls);
+        // Handoff owners and physical edges have been retired; both the fork
+        // and a cursor whose fork was already aborted still own their snapshot.
+        const key = try reverseEdgeKeyAlloc(a, "a", "g", "link", "z");
+        defer a.free(key);
+        _ = try Hook.retained.?.get(key);
+        var nested = try Hook.retained.?.forkRead();
+        Hook.retained.?.abort();
+        Hook.retained = null;
+        defer nested.abort();
+        _ = try nested.get(key);
+        const entry = (try Hook.retained_cursor.?.first()).?;
+        try std.testing.expectEqualStrings("z", BorrowedEdgeKey.parse(entry.key, .out).?.source);
+    }
+}
+
+test "graph maintenance both direction snapshots exclude an interleaved ownership epoch" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Hook = struct {
+        var runtime: std.Io = undefined;
+        var start: std.Io.Event = .unset;
+        var observed: std.Io.Event = .unset;
+        fn between(index: *GraphIndex) void {
+            std.testing.expect(!index.ownership_mutex.tryLock()) catch @panic("read pair released visibility lock");
+            start.set(runtime);
+            observed.wait(runtime) catch @panic("ownership worker cancelled");
+        }
+        fn adopt(worker_io: std.Io, index: *GraphIndex) !void {
+            try start.wait(worker_io);
+            // The writer reaches the transition while the outgoing snapshot
+            // exists but the incoming snapshot has not yet been acquired.
+            const unlocked = index.ownership_mutex.tryLock();
+            if (unlocked) index.ownership_mutex.unlock();
+            observed.set(worker_io);
+            try std.testing.expect(!unlocked);
+            try index.fenceOwnedRange(index.alloc, "m", "");
+        }
+    };
+    inline for (.{ ReverseBackend.mem, ReverseBackend.lsm_memory }) |kind| {
+        var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = kind });
+        defer g.close();
+        try g.addEdge("a", "z", "link", 1, 0, 0, "{}");
+        try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+        Hook.runtime = io;
+        Hook.start = .unset;
+        Hook.observed = .unset;
+        var worker = try io.concurrent(Hook.adopt, .{ io, &g });
+        defer worker.cancel(io) catch {};
+        var scan = g.nativeEdgeScan("a", &.{"link"}, .both);
+        defer scan.deinit(a);
+        test_ownership_read_pair_hook = Hook.between;
+        defer test_ownership_read_pair_hook = null;
+        const first = (try scan.nextPage(a, 1, 4096)).?;
+        defer GraphIndex.freeEdges(a, first);
+        test_ownership_read_pair_hook = null;
+        try worker.await(io);
+        try std.testing.expectEqualStrings("a", first[0].source);
+        // A cursor already admitted before adoption retains the entire old
+        // epoch, not old outgoing combined with newly fenced incoming edges.
+        const second = (try scan.nextPage(a, 1, 4096)).?;
+        defer GraphIndex.freeEdges(a, second);
+        try std.testing.expectEqualStrings("z", second[0].source);
+        const fresh = try g.getEdges(a, "a", "link", .both);
+        defer GraphIndex.freeEdges(a, fresh);
+        try std.testing.expectEqual(@as(usize, 1), fresh.len);
+        try std.testing.expectEqualStrings("a", fresh[0].source);
+    }
+}
+
+test "graph maintenance failed metadata commits retire handoff snapshots without adopting a scope" {
+    const a = std.testing.allocator;
+    var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .lsm_memory });
+    defer g.close();
+    try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+    const Fault = struct {
+        var begin: *const fn (Allocator, *anyopaque) anyerror!backend_erased.Batch = undefined;
+        var batch_vtable: backend_erased.Batch.VTable = undefined;
+        fn beginFailing(alloc: Allocator, ptr: *anyopaque) !backend_erased.Batch {
+            var batch = try begin(alloc, ptr);
+            batch_vtable = batch.vtable.*;
+            batch_vtable.commit = failCommit;
+            batch.vtable = &batch_vtable;
+            return batch;
+        }
+        fn failCommit(_: Allocator, _: *anyopaque) !void {
+            return error.TestMetadataCommitFailed;
+        }
+    };
+    const original_vtable = g.reverse_store.vtable;
+    var failing_vtable = original_vtable.*;
+    Fault.begin = original_vtable.begin_batch;
+    failing_vtable.begin_batch = Fault.beginFailing;
+    defer g.reverse_store.vtable = original_vtable;
+    const epoch = g.edge_generation;
+    g.reverse_store.vtable = &failing_vtable;
+    try std.testing.expectError(error.TestMetadataCommitFailed, g.fenceOwnedRange(a, "m", ""));
+    try std.testing.expect(g.ownership_handoff == null);
+    try std.testing.expect(!g.ownershipTransitionPending());
+    try std.testing.expectEqual(epoch, g.edge_generation);
+    var read = try g.beginReadReverseTxn();
+    try std.testing.expectError(error.NotFound, read.get(maintenance.range_key));
+    read.abort();
+    try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
+
+    g.reverse_store.vtable = original_vtable;
+    try g.fenceOwnedRange(a, "m", "");
+    try std.testing.expectEqual(@as(?usize, 1), try g.pruneOwnedRangePage());
+    // Retirement failure keeps the persisted scope, while releasing both
+    // pinned handoff owners. Retrying can finish without leaked write gates.
+    g.reverse_store.vtable = &failing_vtable;
+    try std.testing.expectError(error.TestMetadataCommitFailed, g.pruneOwnedRangePage());
+    try std.testing.expect(g.ownership_handoff == null);
+    try std.testing.expect(g.ownershipCleanupPending());
+    g.reverse_store.vtable = original_vtable;
+    try std.testing.expectEqual(@as(?usize, null), try g.pruneOwnedRangePage());
+    try std.testing.expect(!g.ownershipTransitionPending());
 }
 
 test "graph maintenance topology execution views never copy held locks or stale ownership" {

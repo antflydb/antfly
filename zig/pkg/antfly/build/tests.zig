@@ -1844,15 +1844,46 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // compiler headroom for aggregate scheduling; Linux CI stays bounded.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .root_module = antfly_test_mod,
+        // Keep module-discovery anchors reachable even for narrow runtime
+        // selections; otherwise filtered-out module tests hide their imports.
         .filters = &serverless_default_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_serverless_tests = addFilteredTestRunArtifact(b, serverless_tests);
+    const run_serverless_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, serverless_tests, selectTestFilters(b, &serverless_default_filters));
     const serverless_test_step = b.step("antfly-serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
+
+    const document_facts_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_facts_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, document_facts_test_mod, true, true);
+    document_facts_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const document_facts_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{"document facts"}),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_document_facts_tests = addFilteredTestRunArtifact(b, document_facts_tests);
+    b.step("antfly-document-facts-test", "Run focused immutable document facts and scheduling tests").dependOn(&run_document_facts_tests.step);
+
+    const graph_page_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_page_tree_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, graph_page_test_mod, true, true);
+    graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const graph_page_tests = b.addTest(.{
+        .root_module = graph_page_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_graph_page_tests = addFilteredTestRunArtifact(b, graph_page_tests);
+    b.step("antfly-graph-page-test", "Run immutable graph page construction, query and recovery tests").dependOn(&run_graph_page_tests.step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -1867,6 +1898,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "objectstore-backed manifest store supports publish and list",
             "serverless retention",
             "serverless manifest GC floor",
+            "serverless fs manifest store",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
             "host object storage delegates through callbacks",
@@ -1876,6 +1908,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_serverless_manifest_tests = addFilteredTestRunArtifact(b, serverless_manifest_tests);
     const serverless_manifest_test_step = b.step("antfly-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
+
+    const serverless_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, serverless_runtime_test_mod, true, true);
+    serverless_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const serverless_runtime_tests = b.addTest(.{
+        .root_module = serverless_runtime_test_mod,
+        .filters = selectTestFilters(b, &.{ "managed runtime", "background publisher" }),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_serverless_runtime_tests = addFilteredTestRunArtifact(b, serverless_runtime_tests);
+    b.step("antfly-serverless-runtime-test", "Run focused serverless maintenance ownership and lifecycle tests").dependOn(&run_serverless_runtime_tests.step);
 
     const lake_scaffold_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
@@ -4327,6 +4374,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const graph_metric_unit_filters = [_][]const u8{
         "graph maintenance",
+        "lmdb backend read forks",
         "graph metric tree batch validation",
         "graph rebuildReverseFromOwnedOutgoingEdges",
         "db graph reverse rebuild resumes after interrupted reopen",

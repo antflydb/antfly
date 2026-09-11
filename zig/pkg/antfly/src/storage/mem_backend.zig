@@ -259,6 +259,15 @@ pub const Backend = struct {
         read_only: bool,
         rc: ?*RcState,
 
+        pub fn forkBorrowedRead(self: *@This()) !BoundTxn {
+            if (!self.read_only) return error.ReadOnly;
+            const rc = self.rc orelse return error.TransactionClosed;
+            lockBackend(self.backend);
+            defer self.backend.mutex.unlock();
+            retainState(rc);
+            return self.*;
+        }
+
         fn open(backend: *Backend, namespace: backend_types.Namespace, read_only: bool) !BoundTxn {
             lockBackend(backend);
             defer backend.mutex.unlock();

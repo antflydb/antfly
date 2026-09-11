@@ -255,7 +255,7 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
     var built = try buildFromGraphPayloadAlloc(alloc, graph_payload, options);
     defer built.deinit(alloc);
     var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
-    defer metadata.deinit(alloc);
+    defer metadata.deinit(artifacts.allocator);
     const name = try alloc.dupe(u8, built.artifact.name);
     errdefer alloc.free(name);
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
@@ -294,6 +294,30 @@ pub fn publishFromGraphArtifactAlloc(
     artifacts: *artifact_store.ArtifactStore,
     options: BuildOptions,
 ) !artifact_ref.ArtifactRef {
+    if (options.source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return publishFromGraphArtifactOracleAlloc(alloc, artifacts, options);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn publishFromGraphArtifactOracleAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    options: BuildOptions,
+) !artifact_ref.ArtifactRef {
+    if (options.source_graph.metadata_version == graph_segment.page_graph.Root.metadata_version) {
+        try options.provenance.validate();
+        try (ComputeRuntime{ .io = options.io, .max_parallelism = options.max_parallelism }).validate();
+        var local_budget = graph_metric_policy.Budget{ .limits = options.limits };
+        const budget = options.batch_budget orelse &local_budget;
+        try validatePublicationOptions(options.graph_index_name, options.source_graph, &.{options.config}, options.cancellation, options.limits, budget);
+        var prepared = (try prepareSelectedGraphArtifactOracleAlloc(alloc, artifacts, options.source_graph, &.{options.config}, options.cancellation, options.limits, budget)) orelse return error.InvalidGraphRoot;
+        defer prepared.deinit(alloc);
+        var admitted = options;
+        admitted.batch_budget = budget;
+        var built = try buildFromTopologyAlloc(alloc, prepared.topology, admitted);
+        defer built.deinit(alloc);
+        return putBuildResultAlloc(alloc, artifacts, &built, options.cancellation);
+    }
     if (options.source_graph.byte_len > options.limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     const graph_payload = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(
         alloc,
@@ -320,8 +344,23 @@ pub fn publishManyFromGraphArtifactAlloc(
     limits: Limits,
     provenance: Provenance,
 ) ![]artifact_ref.ArtifactRef {
+    if (source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return publishManyFromGraphArtifactOracleAlloc(alloc, artifacts, graph_index_name, source_graph, configs, cancellation, limits, provenance);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn publishManyFromGraphArtifactOracleAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    limits: Limits,
+    provenance: Provenance,
+) ![]artifact_ref.ArtifactRef {
     var batch_budget = graph_metric_policy.Budget{ .limits = limits };
-    return publishManyFromGraphArtifactWithBudgetAlloc(
+    return publishManyFromGraphArtifactWithBudgetOracleAlloc(
         alloc,
         artifacts,
         graph_index_name,
@@ -350,10 +389,38 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
     provenance: Provenance,
     runtime: ComputeRuntime,
 ) ![]artifact_ref.ArtifactRef {
+    if (source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return publishManyFromGraphArtifactWithBudgetOracleAlloc(alloc, artifacts, graph_index_name, source_graph, configs, cancellation, limits, batch_budget, provenance, runtime);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn publishManyFromGraphArtifactWithBudgetOracleAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    graph_index_name: []const u8,
+    source_graph: artifact_ref.ArtifactRef,
+    configs: []const graph_mod.GraphMetricConfig,
+    cancellation: CancellationToken,
+    limits: Limits,
+    batch_budget: *graph_metric_policy.Budget,
+    provenance: Provenance,
+    runtime: ComputeRuntime,
+) ![]artifact_ref.ArtifactRef {
     if (configs.len == 0) return try alloc.alloc(artifact_ref.ArtifactRef, 0);
+    if (source_graph.metadata_version == graph_segment.page_graph.Root.metadata_version) {
+        const requests = try alloc.alloc(PublicationRequest, configs.len);
+        defer alloc.free(requests);
+        for (configs, requests) |config, *request| request.* = .{
+            .graph_index_name = graph_index_name,
+            .source_graph = source_graph,
+            .config = config,
+            .provenance = provenance,
+        };
+        return publishRequestsOracleAlloc(alloc, artifacts, requests, cancellation, limits, batch_budget, runtime);
+    }
     try validatePublicationOptions(graph_index_name, source_graph, configs, cancellation, limits, batch_budget);
     try batch_budget.chargeGraphPayload(source_graph.artifact_id, source_graph.checksum, source_graph.byte_len);
-    var prepared = prepareGraphArtifactAlloc(alloc, artifacts, source_graph, cancellation, limits) catch |err| switch (err) {
+    var prepared = prepareGraphArtifactOracleAlloc(alloc, artifacts, source_graph, cancellation, limits) catch |err| switch (err) {
         error.GraphMetricBuildBudgetExceeded => return publishRejectedManyAlloc(alloc, artifacts, graph_index_name, source_graph, configs, cancellation, .build_budget_exceeded, limits, provenance),
         else => return err,
     };
@@ -374,11 +441,17 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
 }
 
 fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
+    if (source.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return prepareSelectedGraphArtifactOracleAlloc(alloc, artifacts, source, configs, cancellation, limits, budget);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+fn prepareSelectedGraphArtifactOracleAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
     var remaining: u64 = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
     const before = remaining;
     defer budget.graph_payload_bytes += @intCast(before - remaining);
-    var topology = (indexed_topology.readAlloc(limiter.allocator(), artifacts, source, configs, limits, cancellation, &remaining) catch |err| {
+    var topology = (indexed_topology.readOracleAlloc(limiter.allocator(), artifacts, source, configs, limits, cancellation, &remaining) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
         return err;
     }) orelse return null;
@@ -392,6 +465,9 @@ fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_stor
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
         return err;
     };
+    // The provenance strings remain resident with the prepared topology during
+    // kernel execution, so they must survive into its peak-memory accounting.
+    topology.retained_bytes += id.len + checksum.len;
     return .{ .source_artifact_id = id, .source_checksum = checksum, .source_byte_len = source.byte_len, .topology = topology };
 }
 
@@ -423,9 +499,26 @@ pub fn prepareGraphArtifactAlloc(
     cancellation: CancellationToken,
     limits: Limits,
 ) !PreparedGraphArtifact {
+    if (source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return prepareGraphArtifactOracleAlloc(alloc, artifacts, source_graph, cancellation, limits);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn prepareGraphArtifactOracleAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    source_graph: artifact_ref.ArtifactRef,
+    cancellation: CancellationToken,
+    limits: Limits,
+) !PreparedGraphArtifact {
     try cancellation.check();
     try graph_metric_policy.validateLimits(limits);
     if (source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
+    if (source_graph.metadata_version == graph_segment.page_graph.Root.metadata_version) {
+        var budget = graph_metric_policy.Budget{ .limits = limits };
+        const all = graph_mod.GraphMetricConfig{ .name = "prepare", .kind = .degree };
+        return (try prepareSelectedGraphArtifactOracleAlloc(alloc, artifacts, source_graph, &.{all}, cancellation, limits, &budget)) orelse error.InvalidGraphRoot;
+    }
     // Payload residency is part of the peak, not merely an independent wire
     // limit. Reject impossible builds before any object-store read/allocation.
     if (source_graph.byte_len > limits.max_graph_payload_bytes or
@@ -816,7 +909,21 @@ pub fn publishRequestsAlloc(
     budget: *graph_metric_policy.Budget,
     runtime: ComputeRuntime,
 ) ![]artifact_ref.ArtifactRef {
-    return publishRequestsWithPriorAlloc(alloc, artifacts, requests, &.{}, cancellation, limits, budget, runtime);
+    for (requests) |request| if (request.source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return publishRequestsOracleAlloc(alloc, artifacts, requests, cancellation, limits, budget, runtime);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn publishRequestsOracleAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    requests: []const PublicationRequest,
+    cancellation: CancellationToken,
+    limits: Limits,
+    budget: *graph_metric_policy.Budget,
+    runtime: ComputeRuntime,
+) ![]artifact_ref.ArtifactRef {
+    return publishRequestsWithPriorOracleAlloc(alloc, artifacts, requests, &.{}, cancellation, limits, budget, runtime);
 }
 
 /// The previous manifest is the durable admission-plan witness. Compare the
@@ -955,7 +1062,7 @@ fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.Artif
     const before = remaining;
     defer budget.reuse_read_bytes += before - remaining;
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, budget.limits.max_peak_memory_bytes);
-    var context = indexed_topology.Context.init(limiter.allocator(), artifacts, source, cancellation, &remaining) catch |err| switch (err) {
+    var context = indexed_topology.Context.initOracle(limiter.allocator(), artifacts, source, cancellation, &remaining) catch |err| switch (err) {
         error.GraphMetricBuildBudgetExceeded, error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.InvalidGraphSegment, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return null,
         error.OutOfMemory => if (limiter.limit_exceeded) return null else return err,
         else => return err,
@@ -969,6 +1076,21 @@ fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.Artif
 }
 
 pub fn publishRequestsWithPriorAlloc(
+    alloc: Allocator,
+    artifacts: *artifact_store.ArtifactStore,
+    requests: []const PublicationRequest,
+    previous: []const artifact_ref.ArtifactRef,
+    cancellation: CancellationToken,
+    limits: Limits,
+    budget: *graph_metric_policy.Budget,
+    runtime: ComputeRuntime,
+) ![]artifact_ref.ArtifactRef {
+    for (requests) |request| if (request.source_graph.metadata_version != graph_segment.page_graph.Root.metadata_version) return error.InvalidGraphRoot;
+    return publishRequestsWithPriorOracleAlloc(alloc, artifacts, requests, previous, cancellation, limits, budget, runtime);
+}
+
+/// Explicit packed-format reference path for codec tests and benchmarks.
+pub fn publishRequestsWithPriorOracleAlloc(
     alloc: Allocator,
     artifacts: *artifact_store.ArtifactStore,
     requests: []const PublicationRequest,
@@ -1066,18 +1188,28 @@ pub fn publishRequestsWithPriorAlloc(
             const before = source_remaining;
             defer budget.graph_payload_bytes += @intCast(before - source_remaining);
             var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
-            source_context = indexed_topology.Context.init(limiter.allocator(), artifacts, first.source_graph, cancellation, &source_remaining) catch |err| switch (err) {
+            source_context = indexed_topology.Context.initOracle(limiter.allocator(), artifacts, first.source_graph, cancellation, &source_remaining) catch |err| switch (err) {
                 error.GraphMetricBuildBudgetExceeded => null,
                 error.OutOfMemory => if (limiter.limit_exceeded) null else return err,
                 else => return err,
             };
             if (source_context) |*context| context.reader.alloc = alloc;
         }
-        const split_filters = source_context != null and source_context.?.directory != null;
+        const split_filters = source_context != null and (source_context.?.directory != null or source_context.?.paged_root != null);
         var cheapest: u64 = std.math.maxInt(u64);
         for (requests, ready) |request, initialized| {
             if (initialized or !sameSource(first.source_graph, request.source_graph)) continue;
             var cost: u64 = 0;
+            if (source_context) |*context| if (context.paged_root != null) {
+                const before = source_remaining;
+                defer budget.graph_payload_bytes += @intCast(before - source_remaining);
+                var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
+                cost = context.selectedPageEdgeCount(limiter.allocator(), request.config.edge_filter) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded, error.ArtifactReadBudgetExceeded => std.math.maxInt(u64),
+                    error.OutOfMemory => if (limiter.limit_exceeded) std.math.maxInt(u64) else return err,
+                    else => return err,
+                };
+            };
             if (source_context) |context| if (context.directory) |directory| {
                 var entries = directory.iterator();
                 while (try entries.next()) |entry| {
@@ -1125,7 +1257,7 @@ pub fn publishRequestsWithPriorAlloc(
                 budget.chargeGraphPayload(first.source_graph.artifact_id, first.source_graph.checksum, first.source_graph.byte_len) catch break :prepare null;
                 var fallback_limits = limits;
                 fallback_limits.max_peak_memory_bytes -= context.retainedBytes();
-                var fallback: ?PreparedGraphArtifact = prepareGraphArtifactAlloc(alloc, artifacts, first.source_graph, cancellation, fallback_limits) catch |err| switch (err) {
+                var fallback: ?PreparedGraphArtifact = prepareGraphArtifactOracleAlloc(alloc, artifacts, first.source_graph, cancellation, fallback_limits) catch |err| switch (err) {
                     error.GraphMetricBuildBudgetExceeded => null,
                     else => return err,
                 };
@@ -1179,7 +1311,7 @@ fn validatePublicationOptions(
 
 fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, built: *const BuildResult, cancellation: CancellationToken) !artifact_ref.ArtifactRef {
     var metadata = try artifacts.putWithCancellation(built.payload, cancellation);
-    defer metadata.deinit(alloc);
+    defer metadata.deinit(artifacts.allocator);
     const name = try alloc.dupe(u8, built.artifact.name);
     errdefer alloc.free(name);
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
@@ -1267,7 +1399,7 @@ fn publishRejectedAlloc(
     const payload = try metric_segment.encodeAllocWithCancellation(alloc, segment, cancellation);
     defer alloc.free(payload);
     var metadata = try artifacts.putWithCancellation(payload, cancellation);
-    defer metadata.deinit(alloc);
+    defer metadata.deinit(artifacts.allocator);
     const name = try metric_segment.artifactNameAlloc(alloc, graph_index_name, config.name);
     errdefer alloc.free(name);
     const artifact_id = try alloc.dupe(u8, metadata.artifact_id);
@@ -1498,8 +1630,8 @@ pub fn benchmarkSelectedArtifactPreparation(alloc: Allocator, artifacts: *artifa
     var budget = graph_metric_policy.Budget{ .limits = .{} };
     var prepared = if (reference) blk: {
         try budget.chargeGraphPayload(source.artifact_id, source.checksum, source.byte_len);
-        break :blk try prepareGraphArtifactAlloc(alloc, artifacts, source, .none, budget.limits);
-    } else (try prepareSelectedGraphArtifactAlloc(alloc, artifacts, source, &.{config}, .none, budget.limits, &budget)) orelse return error.InvalidBenchmarkResult;
+        break :blk try prepareGraphArtifactOracleAlloc(alloc, artifacts, source, .none, budget.limits);
+    } else (try prepareSelectedGraphArtifactOracleAlloc(alloc, artifacts, source, &.{config}, .none, budget.limits, &budget)) orelse return error.InvalidBenchmarkResult;
     defer prepared.deinit(alloc);
     const checksums = if (!reference and prepared.topology.type_checksums.len == prepared.topology.edge_types.len)
         try alloc.dupe([32]u8, prepared.topology.type_checksums)
@@ -2490,7 +2622,9 @@ fn buildFromTopologyAlloc(
     options: BuildOptions,
 ) !BuildResult {
     var identified = options;
-    if (typeChecksumsAlloc(alloc, topology, options.limits, options.cancellation)) |checksums| {
+    if (topology.type_checksums.len == topology.edge_types.len) {
+        identified.topology_checksum = selectedTopologyChecksum(topology, topology.type_checksums, options.config.edge_filter);
+    } else if (typeChecksumsAlloc(alloc, topology, options.limits, options.cancellation)) |checksums| {
         defer alloc.free(checksums);
         identified.topology_checksum = selectedTopologyChecksum(topology, checksums, options.config.edge_filter);
     } else |err| if (err != error.GraphMetricBuildBudgetExceeded) return err;
@@ -2954,6 +3088,86 @@ pub fn freeArtifactRef(alloc: Allocator, artifact: artifact_ref.ArtifactRef) voi
     alloc.free(artifact.checksum);
 }
 
+test "serverless immutable graph root metric entry points agree with packed numerical oracle" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/page-metrics", .{tmp.sub_path});
+    defer alloc.free(path);
+    var fs = try fs_artifact_store.FsStore.init(alloc, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const pg = graph_segment.page_graph;
+    const edges = [_]graph_segment.page_keys.Edge{
+        .{ .source = "a", .target = "b", .kind = "cites" },
+        .{ .source = "a", .target = "b", .kind = "cites" },
+        .{ .source = "a", .target = "foreign", .kind = "cites", .table = "other" },
+        .{ .source = "b", .target = "c", .kind = "cites" },
+        .{ .source = "c", .target = "a", .kind = "links" },
+    };
+    var remaining: u64 = 10 * 1024 * 1024;
+    var writes: u64 = 10 * 1024 * 1024;
+    var pages: graph_segment.page_store.PageStore = .{ .attempt = @splat(1), .domain = graph_segment.page_store.PageStore.namespaceDomain("docs"), .artifacts = &artifacts, .remaining_read_bytes = &remaining, .remaining_write_bytes = &writes };
+    var plan = try pg.plan(alloc, pages.store(), .{}, &.{
+        .{ .id = "a", .edges = edges[0..3] },
+        .{ .id = "b", .edges = edges[3..4] },
+        .{ .id = "c", .edges = edges[4..5] },
+        .{ .id = "isolated", .edges = &.{} },
+    });
+    defer plan.deinit();
+    const root = try plan.publish(pages.store(), .{});
+    const source = try pages.publishRoot(alloc, root, "graph");
+    defer freeArtifactRef(alloc, source);
+    var packed_builder = graph_segment.Builder{ .alloc = alloc };
+    defer packed_builder.deinit();
+    for (edges) |edge| try packed_builder.addEdge(edge.source, edge.target, edge.kind, edge.weight, edge.table);
+    try packed_builder.addNode("isolated");
+    const packed_bytes = try packed_builder.encodeAlloc(10 * 1024 * 1024, .none);
+    defer alloc.free(packed_bytes);
+    var metadata = try artifacts.put(packed_bytes);
+    defer metadata.deinit(alloc);
+    const packed_ref = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    const provenance = Provenance{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 };
+    var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, .{});
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(4, prepared.topology.edges.len);
+    try std.testing.expectEqual(3, prepared.topology.node_ids.len);
+    for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank, .eigenvector, .hits_authority, .hits_hub }) |kind| {
+        for ([_]graph_mod.GraphMetricEdgeFilter{ .{}, .{ .mode = .types, .types = &.{"cites"} } }) |filter| {
+            const config = graph_mod.GraphMetricConfig{ .name = "metric", .kind = kind, .edge_filter = filter };
+            const options = BuildOptions{ .graph_index_name = "graph", .source_graph = source, .config = config, .provenance = provenance };
+            const single = try publishFromGraphArtifactAlloc(alloc, &artifacts, options);
+            defer freeArtifactRef(alloc, single);
+            const many = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &.{config}, .none, .{}, provenance);
+            defer {
+                for (many) |ref| freeArtifactRef(alloc, ref);
+                alloc.free(many);
+            }
+            var oracle_options = options;
+            oracle_options.source_graph = packed_ref;
+            try std.testing.expectError(error.InvalidGraphRoot, publishFromGraphArtifactAlloc(alloc, &artifacts, oracle_options));
+            const oracle = try publishFromGraphArtifactOracleAlloc(alloc, &artifacts, oracle_options);
+            defer freeArtifactRef(alloc, oracle);
+            const expected_bytes = try artifacts.getAlloc(oracle.artifact_id);
+            defer alloc.free(expected_bytes);
+            var expected = try metric_segment.decodeAlloc(alloc, expected_bytes);
+            defer expected.deinit(alloc);
+            for ([_]artifact_ref.ArtifactRef{ single, many[0] }) |actual_ref| {
+                const bytes = try artifacts.getAlloc(actual_ref.artifact_id);
+                defer alloc.free(bytes);
+                var actual = try metric_segment.decodeAlloc(alloc, bytes);
+                defer actual.deinit(alloc);
+                try std.testing.expectEqual(expected.scores.len, actual.scores.len);
+                try std.testing.expectEqualSlices(u8, &expected.topology_checksum, &actual.topology_checksum);
+                for (expected.scores, actual.scores) |a, b| {
+                    try std.testing.expectEqualStrings(a.node_id, b.node_id);
+                    try std.testing.expectApproxEqAbs(a.value, b.value, 1e-12);
+                }
+            }
+        }
+    }
+}
+
 test "serverless graph metric decode admission includes the live source payload" {
     try admitGraphDecodePeak(10, 20, 30);
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, admitGraphDecodePeak(10, 20, 29));
@@ -2999,7 +3213,7 @@ test "serverless graph metric impossible payload is rejected before artifact IO"
     } };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     for ([_]u64{ 1024, 1025 }) |bytes| {
-        try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactAlloc(failing.allocator(), &store, .{
+        try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactOracleAlloc(failing.allocator(), &store, .{
             .kind = .graph_segment,
             .artifact_id = "sha256:" ++ "0" ** 64,
             .checksum = "0" ** 64,
@@ -3108,25 +3322,25 @@ test "serverless graph metric indexed preparation selects topology and cleans up
     var cold_artifacts = cold_fs.artifactStore();
     defer cold_artifacts.deinit();
     var cold_budget = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = indexed.read_bytes } };
-    var cold = (try prepareSelectedGraphArtifactAlloc(alloc, &cold_artifacts, source, &.{config}, .none, cold_budget.limits, &cold_budget)).?;
+    var cold = (try prepareSelectedGraphArtifactOracleAlloc(alloc, &cold_artifacts, source, &.{config}, .none, cold_budget.limits, &cold_budget)).?;
     defer cold.deinit(alloc);
     try std.testing.expectEqual(indexed.read_bytes, cold_budget.graph_payload_bytes);
     // Indexed admission is about selected work, not the unrelated source.
     // A full decode under the same policy must still reject the payload.
     const selected_limits = Limits{ .max_graph_payload_bytes = 1, .max_nodes = 2, .max_edges = 2 };
     var selected_budget = graph_metric_policy.Budget{ .limits = selected_limits };
-    var selected = (try prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, selected_limits, &selected_budget)).?;
+    var selected = (try prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{config}, .none, selected_limits, &selected_budget)).?;
     defer selected.deinit(alloc);
-    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, selected_limits));
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactOracleAlloc(alloc, &artifacts, source, .none, selected_limits));
     var all_budget = graph_metric_policy.Budget{ .limits = selected_limits };
     const all_config = graph_mod.GraphMetricConfig{ .name = "all", .kind = .degree };
-    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{all_config}, .none, selected_limits, &all_budget));
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{all_config}, .none, selected_limits, &all_budget));
     var corrupted = source;
     corrupted.graph_topology_control_checksum[0] ^= 1;
     var bad_budget = graph_metric_policy.Budget{ .limits = .{} };
-    try std.testing.expectError(error.ArtifactIntegrityMismatch, prepareSelectedGraphArtifactAlloc(alloc, &cold_artifacts, corrupted, &.{config}, .none, bad_budget.limits, &bad_budget));
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, prepareSelectedGraphArtifactOracleAlloc(alloc, &cold_artifacts, corrupted, &.{config}, .none, bad_budget.limits, &bad_budget));
     var remaining: u64 = 1024 * 1024;
-    var context = try indexed_topology.Context.init(alloc, &cold_artifacts, source, .none, &remaining);
+    var context = try indexed_topology.Context.initOracle(alloc, &cold_artifacts, source, .none, &remaining);
     defer context.deinit();
     // A response that disagrees with the authenticated block table is rejected
     // even when footer/directory verification already succeeded.
@@ -3135,15 +3349,15 @@ test "serverless graph metric indexed preparation selects topology and cleans up
     const Runner = struct {
         fn run(failing: Allocator, store: *artifact_store.ArtifactStore, ref: artifact_ref.ArtifactRef, cfg: graph_mod.GraphMetricConfig) !void {
             var budget = graph_metric_policy.Budget{ .limits = .{} };
-            var prepared = (try prepareSelectedGraphArtifactAlloc(failing, store, ref, &.{cfg}, .none, budget.limits, &budget)).?;
+            var prepared = (try prepareSelectedGraphArtifactOracleAlloc(failing, store, ref, &.{cfg}, .none, budget.limits, &budget)).?;
             prepared.deinit(failing);
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
     var tiny = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 128 } };
-    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, tiny.limits, &tiny));
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{config}, .none, tiny.limits, &tiny));
     var no_reads = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = 0 } };
-    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, no_reads.limits, &no_reads));
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{config}, .none, no_reads.limits, &no_reads));
 }
 
 test "serverless graph metric semantic reuse authenticates current provenance and skips numerical work" {
@@ -3178,7 +3392,7 @@ test "serverless graph metric semantic reuse authenticates current provenance an
         const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
         const request = PublicationRequest{ .graph_index_name = "graph", .source_graph = source, .config = config, .prior_artifact = prior, .provenance = .{ .published_generation = round + 1, .edge_generation = round + 1, .computed_at_ms = (round + 1) * 10 } };
         var budget = graph_metric_policy.Budget{ .limits = .{} };
-        const refs = try publishRequestsWithPriorAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, .{}, &budget, .{});
+        const refs = try publishRequestsWithPriorOracleAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, .{}, &budget, .{});
         defer alloc.free(refs);
         if (prior) |ref| freeArtifactRef(alloc, ref);
         prior = refs[0];
@@ -3231,7 +3445,7 @@ test "serverless graph metric directory reuse admits selected work and rejects s
         const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
         const request = PublicationRequest{ .graph_index_name = "graph", .source_graph = source, .config = config, .prior_artifact = prior, .provenance = .{ .published_generation = round + 1, .edge_generation = round + 1, .computed_at_ms = round + 1 } };
         var budget = graph_metric_policy.Budget{ .limits = limits };
-        const refs = try publishRequestsWithPriorAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, limits, &budget, .{});
+        const refs = try publishRequestsWithPriorOracleAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, limits, &budget, .{});
         defer alloc.free(refs);
         if (prior) |ref| freeArtifactRef(alloc, ref);
         prior = refs[0];
@@ -3393,7 +3607,7 @@ test "serverless graph metric filter groups isolate preparation admission and re
     broad.config = .{ .name = "broad", .kind = .degree };
     for ([_][2]PublicationRequest{ .{ broad, small }, .{ small, broad } }) |requests| {
         var budget = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 2 * 1024 * 1024, .max_total_identity_work_bytes = 1 } };
-        const results = try publishRequestsAlloc(alloc, &artifacts, &requests, .none, budget.limits, &budget, .{});
+        const results = try publishRequestsOracleAlloc(alloc, &artifacts, &requests, .none, budget.limits, &budget, .{});
         defer {
             for (results) |ref| freeArtifactRef(alloc, ref);
             alloc.free(results);
@@ -3434,7 +3648,7 @@ test "serverless lake graph metrics persist a budget rejection with exact proven
         .checksum = source_metadata.checksum,
     };
     const configs = [_]graph_mod.GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_nodes = 1 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const published = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_nodes = 1 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -3548,7 +3762,7 @@ test "serverless graph metric warm start maps an authenticated prior vector onto
         .checksum = source_metadata.checksum,
     };
     const config = graph_mod.GraphMetricConfig{ .name = "rank", .kind = .pagerank };
-    const prior = try publishFromGraphArtifactAlloc(alloc, &artifacts, .{
+    const prior = try publishFromGraphArtifactOracleAlloc(alloc, &artifacts, .{
         .graph_index_name = "graph",
         .config = config,
         .source_graph = source,
@@ -3835,7 +4049,7 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
     };
     // 604 HITS kernel work items plus sixteen projection/filter work items.
     const limits = Limits{ .max_work_items = 620, .max_total_work_items = 620 };
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const published = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "graph", source, &configs, .none, limits, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -3858,7 +4072,7 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
     // scope; each degree kernel then consumes two more. Rebuilding the
     // projection per metric would exceed this exact 19-item budget.
     const shared_projection_limits = Limits{ .max_work_items = 19, .max_total_work_items = 19 };
-    const degree_published = try publishManyFromGraphArtifactAlloc(
+    const degree_published = try publishManyFromGraphArtifactOracleAlloc(
         alloc,
         &artifacts,
         "graph",
@@ -3908,7 +4122,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     };
     // One PageRank consumes 254 kernel work items plus sixteen projection
     // items; the table-wide budget admits the first and rejects the second.
-    const published = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 270, .max_total_work_items = 270 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
+    const published = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "graph", source, &configs, .none, .{ .max_work_items = 270, .max_total_work_items = 270 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
     defer {
         for (published) |ref| freeArtifactRef(alloc, ref);
         alloc.free(published);
@@ -3923,7 +4137,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
 
     // An unaffordable PageRank must not force its larger CSR projection on a
     // degree metric. Degree fits exactly: source 3 + filter 1 + projection 9 + kernel 2.
-    const pressure = try publishManyFromGraphArtifactAlloc(alloc, &artifacts, "pressure", source, &.{
+    const pressure = try publishManyFromGraphArtifactOracleAlloc(alloc, &artifacts, "pressure", source, &.{
         .{ .name = "rank", .kind = .pagerank },
         .{ .name = "degree", .kind = .degree },
     }, .none, .{ .max_work_items = 15, .max_total_work_items = 15 }, .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 });
@@ -3936,7 +4150,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
 
     var shared_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 270, .max_total_work_items = 270 } };
     const one_config = [_]graph_mod.GraphMetricConfig{.{ .name = "shared_rank", .kind = .pagerank }};
-    var prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
+    var prepared = try prepareGraphArtifactOracleAlloc(alloc, &artifacts, source, .none, shared_budget.limits);
     defer prepared.deinit(alloc);
     try std.testing.expect(prepared.identifies(source));
     // Exercise the real publication entry point: failures in either scratch
@@ -4013,7 +4227,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     // projection would force the alias publication into terminal rejection.
     const alias_limits = Limits{ .max_work_items = 524, .max_total_work_items = 524 };
     var alias_budget = graph_metric_policy.Budget{ .limits = alias_limits };
-    var alias_prepared = try prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, alias_limits);
+    var alias_prepared = try prepareGraphArtifactOracleAlloc(alloc, &artifacts, source, .none, alias_limits);
     defer alias_prepared.deinit(alloc);
     const alias_a = try publishManyFromPreparedGraphWithBudgetAlloc(
         alloc,
@@ -4124,7 +4338,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     var request_hub = request_alias;
     request_hub.config = .{ .name = "hub", .kind = .hits_hub };
     var baseline_budget = graph_metric_policy.Budget{ .limits = .{} };
-    const baseline = try publishRequestsAlloc(alloc, &counted, &.{ request_a, request_typed, request_b, request_authority, request_hub }, .none, baseline_budget.limits, &baseline_budget, .{});
+    const baseline = try publishRequestsOracleAlloc(alloc, &counted, &.{ request_a, request_typed, request_b, request_authority, request_hub }, .none, baseline_budget.limits, &baseline_budget, .{});
     defer {
         for (baseline) |ref| freeArtifactRef(alloc, ref);
         alloc.free(baseline);
@@ -4144,7 +4358,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         .max_total_graph_payload_bytes = baseline_budget.graph_payload_bytes,
         .max_total_metric_payload_bytes = baseline_budget.metric_payload_bytes,
     } };
-    const planned = try publishRequestsAlloc(alloc, &counted, &.{ request_a, request_b, request_typed, request_alias, request_hub, request_typed, request_authority, request_authority }, .none, planned_budget.limits, &planned_budget, .{});
+    const planned = try publishRequestsOracleAlloc(alloc, &counted, &.{ request_a, request_b, request_typed, request_alias, request_hub, request_typed, request_authority, request_authority }, .none, planned_budget.limits, &planned_budget, .{});
     defer {
         for (planned) |ref| freeArtifactRef(alloc, ref);
         alloc.free(planned);
@@ -4167,7 +4381,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     var reuse_budget = graph_metric_policy.Budget{ .limits = baseline_budget.limits };
     var renamed = request_alias;
     renamed.config.name = "renamed_rank";
-    const reused = try publishRequestsWithPriorAlloc(alloc, &counted, &.{ request_alias, request_a, renamed }, baseline, .none, reuse_budget.limits, &reuse_budget, .{});
+    const reused = try publishRequestsWithPriorOracleAlloc(alloc, &counted, &.{ request_alias, request_a, renamed }, baseline, .none, reuse_budget.limits, &reuse_budget, .{});
     defer {
         for (reused) |ref| freeArtifactRef(alloc, ref);
         alloc.free(reused);
@@ -4188,7 +4402,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     // Its unchanged plan stays terminal, but removing the expensive sibling
     // must make the remaining metric eligible again, with fresh provenance.
     var rejected_budget = graph_metric_policy.Budget{ .limits = .{ .max_work_items = 270, .max_total_work_items = 270 } };
-    const rejected = try publishRequestsAlloc(alloc, &artifacts, &.{ request_a, request_b }, .none, rejected_budget.limits, &rejected_budget, .{});
+    const rejected = try publishRequestsOracleAlloc(alloc, &artifacts, &.{ request_a, request_b }, .none, rejected_budget.limits, &rejected_budget, .{});
     defer {
         for (rejected) |ref| freeArtifactRef(alloc, ref);
         alloc.free(rejected);
@@ -4196,7 +4410,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.rejected, rejected[1].graph_metric_materialization_state);
     counting = .{ .inner = &artifacts };
     rejected_budget = .{ .limits = rejected_budget.limits };
-    const stable = try publishRequestsWithPriorAlloc(alloc, &counted, &.{ request_a, request_b }, rejected, .none, rejected_budget.limits, &rejected_budget, .{});
+    const stable = try publishRequestsWithPriorOracleAlloc(alloc, &counted, &.{ request_a, request_b }, rejected, .none, rejected_budget.limits, &rejected_budget, .{});
     defer {
         for (stable) |ref| freeArtifactRef(alloc, ref);
         alloc.free(stable);
@@ -4207,7 +4421,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     var retried_request = request_b;
     retried_request.provenance = .{ .published_generation = 5, .edge_generation = 1, .computed_at_ms = 5 };
     rejected_budget = .{ .limits = rejected_budget.limits };
-    const retried = try publishRequestsWithPriorAlloc(alloc, &counted, &.{retried_request}, stable, .none, rejected_budget.limits, &rejected_budget, .{});
+    const retried = try publishRequestsWithPriorOracleAlloc(alloc, &counted, &.{retried_request}, stable, .none, rejected_budget.limits, &rejected_budget, .{});
     defer {
         for (retried) |ref| freeArtifactRef(alloc, ref);
         alloc.free(retried);
@@ -4223,7 +4437,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     const AllocationRunner = struct {
         fn run(failing: Allocator, store: *artifact_store.ArtifactStore, prior: []const artifact_ref.ArtifactRef, requests: []const PublicationRequest) !void {
             var budget = graph_metric_policy.Budget{ .limits = .{} };
-            const result = try publishRequestsWithPriorAlloc(failing, store, requests, prior, .none, budget.limits, &budget, .{});
+            const result = try publishRequestsWithPriorOracleAlloc(failing, store, requests, prior, .none, budget.limits, &budget, .{});
             defer {
                 for (result) |ref| freeArtifactRef(failing, ref);
                 failing.free(result);

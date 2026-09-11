@@ -54,6 +54,10 @@ pub const PublishedGeneration = struct {
     /// manifests written before publication lineage was encoded.
     publication_lineage_tracked: bool = false,
     publication_parent_version: ?u64 = null,
+    /// Exact HEAD ownership epoch that created this immutable candidate.
+    /// GC uses it to retire unpublished candidates after a fencing barrier,
+    /// even when their graph roots were reused from older publications.
+    publication_fencing_token: u64 = 0,
     base_source: ?BaseSourceDescriptor = null,
     stats: PublishedGenerationStats,
     artifacts: []ArtifactRef,
@@ -168,6 +172,7 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
         .wal_end_lsn = src.wal_end_lsn,
         .publication_lineage_tracked = src.publication_lineage_tracked,
         .publication_parent_version = src.publication_parent_version,
+        .publication_fencing_token = src.publication_fencing_token,
         .base_source = base_source_copy,
         .stats = .{
             .document_count = src.stats.document_count,

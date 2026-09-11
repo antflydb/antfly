@@ -21,35 +21,16 @@ const wire = @import("packed.zig");
 const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const page_graph = @import("page_graph.zig");
+const page_store = @import("page_store.zig");
+const page_tree = @import("page_tree.zig");
+const page_topology = @import("page_topology.zig");
 
-pub const Edge = struct { source: u32, target: u32 };
+pub const Edge = @import("topology_data.zig").Edge;
 /// Query-owned adapter to a shared authenticated cache. Preparation remains
 /// independent of serving/runtime ownership and can use uncached coalesced I/O.
-pub const ReadCache = struct {
-    ptr: *anyopaque,
-    read: *const fn (*anyopaque, Allocator, *artifacts.ArtifactStore, refs.ArtifactRef, u64, usize, [32]u8, CancellationToken, *u64) anyerror![]u8,
-};
-pub const Topology = struct {
-    node_ids: []const []const u8,
-    edge_types: []const []const u8,
-    string_bytes: []u8,
-    edge_type_offsets: []const u32,
-    edges: []const Edge,
-    source_node_count: usize,
-    source_edge_count: usize,
-    retained_bytes: usize,
-    type_checksums: []const [32]u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        alloc.free(self.node_ids);
-        alloc.free(self.edge_types);
-        alloc.free(self.string_bytes);
-        alloc.free(self.edge_type_offsets);
-        alloc.free(self.edges);
-        alloc.free(self.type_checksums);
-        self.* = undefined;
-    }
-};
+pub const ReadCache = page_store.ReadCache;
+pub const Topology = @import("topology_data.zig").Topology;
 
 const Reader = struct {
     alloc: Allocator,
@@ -90,6 +71,7 @@ const Reader = struct {
 /// manifest-bound footer authenticates the directory; the directory binds all
 /// data blocks and semantic type identities. No data-range response is trusted.
 pub const Context = struct {
+    paged_root: ?page_graph.Root = null,
     reader: Reader,
     trailer: wire.TopologyTrailer,
     bytes: []u8,
@@ -136,6 +118,11 @@ pub const Context = struct {
         return initWithCache(alloc, store, source, cancellation, remaining, 1);
     }
 
+    pub fn initOracle(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64) !Context {
+        if (source.metadata_version == page_graph.Root.metadata_version) return init(alloc, store, source, cancellation, remaining);
+        return initPackedOracle(alloc, store, source, cancellation, remaining, 1, false, null);
+    }
+
     pub fn initWithCache(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, requested_slots: usize) !Context {
         return initInternal(alloc, store, source, cancellation, remaining, requested_slots, false, null);
     }
@@ -145,6 +132,30 @@ pub const Context = struct {
     }
 
     fn initInternal(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, requested_slots: usize, lazy: bool, cache: ?ReadCache) !Context {
+        _ = lazy;
+        if (requested_slots == 0 or requested_slots > 8) return error.InvalidGraphSegment;
+        if (source.metadata_version == page_graph.Root.metadata_version) {
+            var writes: u64 = 0;
+            var pages: page_store.PageStore = .{ .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = remaining, .remaining_write_bytes = &writes };
+            return .{
+                .reader = .{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining, .cache = cache },
+                .paged_root = pages.loadRoot(alloc, source) catch |err| switch (err) {
+                    error.ArtifactReadBudgetExceeded => return error.GraphMetricBuildBudgetExceeded,
+                    else => return err,
+                },
+                .trailer = std.mem.zeroes(wire.TopologyTrailer),
+                .bytes = &.{},
+                .directory = null,
+                .block_bytes = &.{},
+                .cache_slots = 0,
+            };
+        }
+        return error.InvalidGraphRoot;
+    }
+
+    /// Packed topology is retained solely as an explicitly selected numerical
+    /// and codec oracle; production initialization is latest page-root only.
+    pub fn initPackedOracle(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, requested_slots: usize, lazy: bool, cache: ?ReadCache) !Context {
         if (requested_slots == 0 or requested_slots > 8) return error.InvalidGraphSegment;
         if (source.byte_len < wire.topology_trailer_len) return error.InvalidGraphSegment;
         try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
@@ -177,6 +188,24 @@ pub const Context = struct {
         self.reader.alloc.free(self.block_bytes);
         for (self.leaf_bytes) |bytes| self.reader.alloc.free(bytes);
         self.* = undefined;
+    }
+
+    pub fn selectedPageEdgeCount(self: *Context, alloc: Allocator, filter: anytype) !u64 {
+        const root = self.paged_root orelse return error.InvalidGraphRoot;
+        var writes: u64 = 0;
+        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = self.reader.store, .cancellation = self.reader.cancellation, .remaining_read_bytes = self.reader.remaining, .remaining_write_bytes = &writes };
+        var cache: page_tree.Cache = .{ .alloc = alloc, .underlying = pages.store() };
+        defer cache.deinit();
+        if (filter.mode == .all) return page_graph.topologyEdgeCount(alloc, cache.store(), root, null);
+        var count: u64 = 0;
+        for (filter.types, 0..) |kind, i| {
+            for (filter.types[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, kind)) break;
+            } else {
+                count = try std.math.add(u64, count, try page_graph.topologyEdgeCount(alloc, cache.store(), root, kind));
+            }
+        }
+        return count;
     }
 
     fn verify(bytes: []const u8, checksum: [32]u8) !void {
@@ -390,7 +419,33 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
     return readPreparedAlloc(alloc, &context, configs, limits, cancellation);
 }
 
+pub fn readOracleAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, configs: anytype, limits: anytype, cancellation: CancellationToken, remaining: *u64) !?Topology {
+    var context = try Context.initOracle(alloc, store, source, cancellation, remaining);
+    defer context.deinit();
+    return readPreparedAlloc(alloc, &context, configs, limits, cancellation);
+}
+
 pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
+    if (context.paged_root) |root| {
+        var requested: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer requested.deinit(alloc);
+        var all = false;
+        for (configs) |config| {
+            if (config.edge_filter.mode == .all) {
+                all = true;
+                break;
+            }
+            try requested.appendSlice(alloc, config.edge_filter.types);
+        }
+        var writes: u64 = 0;
+        var pages: page_store.PageStore = .{ .domain = root.domain, .artifacts = context.reader.store, .cancellation = cancellation, .remaining_read_bytes = context.reader.remaining, .remaining_write_bytes = &writes };
+        var cache: page_tree.Cache = .{ .alloc = alloc, .underlying = pages.store() };
+        defer cache.deinit();
+        return page_topology.readAlloc(alloc, cache.store(), root, if (all) null else requested.items, limits.max_nodes, limits.max_edges) catch |err| switch (err) {
+            error.ArtifactReadBudgetExceeded => return error.GraphMetricBuildBudgetExceeded,
+            else => return err,
+        };
+    }
     const reader = context;
     const trailer = reader.trailer;
     const directory = reader.directory orelse return null;

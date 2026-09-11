@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_types = @import("types.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const PublishResult = struct {
     published: bool,
@@ -35,6 +36,7 @@ pub const ManifestStore = struct {
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         list_versions_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u64,
         delete_version: *const fn (*anyopaque, []const u8, u64) anyerror!void,
+        cleanup_retired_temporaries: ?*const fn (*anyopaque, []const u8, u64, CancellationToken) anyerror!void = null,
     };
 
     pub fn deinit(self: *ManifestStore) void {
@@ -68,6 +70,14 @@ pub const ManifestStore = struct {
 
     pub fn deleteVersion(self: *ManifestStore, namespace: []const u8, version: u64) !void {
         try self.vtable.delete_version(self.ptr, namespace, version);
+    }
+
+    /// Filesystem implementations retire staging files only after the namespace
+    /// publication barrier has fenced their owning token out of HEAD.
+    pub fn cleanupRetiredTemporaries(self: *ManifestStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
+        try cancellation.check();
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        if (self.vtable.cleanup_retired_temporaries) |cleanup| try cleanup(self.ptr, namespace, cutoff, cancellation);
     }
 
     pub fn publish(self: *ManifestStore, manifest: manifest_types.Manifest, expected_head: ?u64) !PublishResult {

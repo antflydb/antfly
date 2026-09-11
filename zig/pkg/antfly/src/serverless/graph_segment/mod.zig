@@ -15,6 +15,12 @@
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 pub const Builder = @import("builder.zig").Builder;
+pub const page_tree = @import("page_tree.zig");
+pub const page_graph = @import("page_graph.zig");
+pub const page_bootstrap = @import("page_bootstrap.zig");
+pub const page_keys = @import("page_keys.zig");
+pub const page_store = @import("page_store.zig");
+pub const page_topology = @import("page_topology.zig");
 pub const AdjacencyReader = @import("adjacency_reader.zig").Reader;
 
 pub const Edge = types.Edge;
@@ -38,6 +44,12 @@ test "serverless graph segment module compiles" {
     _ = types;
     _ = codec;
     _ = Builder;
+    _ = page_tree;
+    _ = page_graph;
+    _ = page_bootstrap;
+    _ = page_keys;
+    _ = page_store;
+    _ = page_topology;
     _ = AdjacencyReader;
     _ = Edge;
     _ = Adjacency;

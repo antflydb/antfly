@@ -16,6 +16,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 const head_coordination = @import("../head_coordination.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const work_lease = @import("../build/work_lease.zig");
 
 pub const PublicationFence = head_coordination.Fence;
 
@@ -30,6 +32,7 @@ pub const ProgressStore = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        work_lease_provider: ?*const fn (*anyopaque) work_lease.Provider = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
@@ -38,6 +41,9 @@ pub const ProgressStore = struct {
         compare_and_swap_gc_watermark: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         get_manifest_gc_floor: *const fn (*anyopaque, []const u8) anyerror!?u64,
         compare_and_swap_manifest_gc_floor: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
+        get_manifest_read_deadline: ?*const fn (*anyopaque, []const u8, u64) anyerror!?u64 = null,
+        compare_and_swap_manifest_read_deadline: ?*const fn (*anyopaque, []const u8, u64, ?u64, u64) anyerror!bool = null,
+        prune_manifest_read_deadlines: ?*const fn (*anyopaque, []const u8, u64, u64, CancellationToken) anyerror!void = null,
         get_enrichment_head_version: *const fn (*anyopaque, []const u8) anyerror!?u64,
         compare_and_swap_enrichment_head_version: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         get_enrichment_stage: *const fn (*anyopaque, []const u8) anyerror!?u64,
@@ -62,6 +68,11 @@ pub const ProgressStore = struct {
 
     pub fn getHead(self: *ProgressStore, namespace: []const u8) !u64 {
         return try self.vtable.get_head(self.ptr, namespace);
+    }
+
+    /// The provider and HEAD CAS must share the same atomic coordination record.
+    pub fn workLeaseProvider(self: *ProgressStore) !work_lease.Provider {
+        return (self.vtable.work_lease_provider orelse return error.WorkLeaseUnsupported)(self.ptr);
     }
 
     pub fn compareAndSwapHead(self: *ProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
@@ -100,6 +111,28 @@ pub const ProgressStore = struct {
 
     pub fn compareAndSwapManifestGcFloor(self: *ProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
         return try self.vtable.compare_and_swap_manifest_gc_floor(self.ptr, namespace, expected, floor);
+    }
+
+    /// Shared, monotonic wall-clock deadline for readers of an immutable
+    /// version. Publish before checking MANIFEST_GC_FLOOR; collectors advance
+    /// that floor before reading deadlines. An unsupported backend fails closed.
+    pub fn getManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64) !?u64 {
+        const get = self.vtable.get_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
+        return get(self.ptr, namespace, version);
+    }
+
+    pub fn compareAndSwapManifestReadDeadline(self: *ProgressStore, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+        if (expected) |prior| if (deadline < prior) return false;
+        const cas = self.vtable.compare_and_swap_manifest_read_deadline orelse return error.ManifestReadLeasesUnsupported;
+        return cas(self.ptr, namespace, version, expected, deadline);
+    }
+
+    /// Includes pins left by failed acquisitions after their manifest vanished.
+    /// The committed floor prevents cleanup from removing renewable authority.
+    pub fn pruneManifestReadDeadlines(self: *ProgressStore, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
+        const prune = self.vtable.prune_manifest_read_deadlines orelse return;
+        if (floor > (try self.getManifestGcFloor(namespace) orelse 0)) return error.ManifestGcFloorNotCommitted;
+        return prune(self.ptr, namespace, floor, expired_before, cancellation);
     }
 
     pub fn compareAndSwapGcWatermark(self: *ProgressStore, namespace: []const u8, expected: ?u64, watermark: u64) !bool {

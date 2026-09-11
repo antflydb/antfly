@@ -56243,18 +56243,51 @@ fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
+    // Enrichment publishes its complete coverage tuple atomically, but it does
+    // not hold apply_mutex. Independent point reads (including live probes)
+    // can straddle that commit and mistake a torn tuple for corruption. The
+    // range cardinality and fallback counter belong to this same read epoch.
+    var snapshot = try ctx.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer snapshot.abort();
+    return denseTargetCountForIndexSnapshot(ctx, index_name, &snapshot);
+}
+
+fn denseTargetCountForIndexSnapshot(ctx: *AsyncContext, index_name: []const u8, snapshot: *docstore_mod.DocStore.Txn) !?u64 {
+    const Read = struct {
+        fn counter(txn: *docstore_mod.DocStore.Txn, key: []const u8) !?u64 {
+            const raw = txn.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+        }
+        fn artifact(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, name: []const u8) !?u64 {
+            const key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, name);
+            defer alloc.free(key);
+            return counter(txn, key) catch |err| switch (err) {
+                error.InvalidDerivedCoverageOutcomeCount => error.InvalidDenseArtifactTargetCounter,
+                else => err,
+            };
+        }
+    };
     // Inline external vectors have no generated-enrichment incarnation, while
     // one source document can produce multiple chunk-backed or multi-source
     // vectors. Their durable artifact counter remains authoritative.
     if (ctx.index_manager.denseIndex(index_name)) |entry| {
         if (densePublicationTargetUsesArtifactCounter(entry)) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            return try Read.artifact(ctx.alloc, snapshot, index_name);
         }
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
-    const produced = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "produced");
-    const skipped = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "skipped");
-    const terminal_failed = try loadDerivedCoverageOutcomeCounterFromStore(ctx.alloc, ctx.store, index_name, generation, "terminal_failed");
+    var counts: [3]?u64 = undefined;
+    inline for (.{ "produced", "skipped", "terminal_failed" }, 0..) |outcome, i| {
+        const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, index_name, generation, outcome);
+        defer ctx.alloc.free(key);
+        counts[i] = try Read.counter(snapshot, key);
+    }
+    const produced = counts[0];
+    const skipped = counts[1];
+    const terminal_failed = counts[2];
     const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
         @as(u2, @intFromBool(skipped != null)) +
         @as(u2, @intFromBool(terminal_failed != null));
@@ -56270,14 +56303,14 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         else
             false;
         if (requires_artifact_coverage) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            return try Read.artifact(ctx.alloc, snapshot, index_name);
         }
         // A fresh generation on an empty table has no outcome rows to create
         // the counter tuple. The range-local primary cardinality distinguishes
         // that valid zero target from missing accounting on a non-empty range.
-        const source_count = try range_cardinality.loadOrCount(
+        const source_count = try range_cardinality.loadOrCountFromReadTxn(
             ctx.alloc,
-            ctx.store,
+            snapshot,
             ctx.index_manager.byte_range,
         );
         return if (source_count == 0) 0 else null;
@@ -56295,9 +56328,9 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         return error.InvalidDerivedCoverageCounter;
     const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
         return error.InvalidDerivedCoverageCounter;
-    const source_count = try range_cardinality.loadOrCount(
+    const source_count = try range_cardinality.loadOrCountFromReadTxn(
         ctx.alloc,
-        ctx.store,
+        snapshot,
         ctx.index_manager.byte_range,
     );
     if (accounted != source_count) return null;
@@ -97822,6 +97855,58 @@ test "db empty inline dense generation finalizes without scanning primary docume
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 4), checkpoint.generation);
+}
+
+test "db dense target coverage reads one immutable primary commit epoch" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    const generation = db.core.index_manager.coverageGenerationForIndex("dense_idx").?;
+    var keys: [3][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    inline for (.{ "produced", "skipped", "terminal_failed" }, 0..) |outcome, i| {
+        keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, "dense_idx", generation, outcome);
+        initialized += 1;
+    }
+    var empty = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer empty.abort();
+    var values: [4][8]u8 = undefined;
+    var writes: [4]docstore_mod.KVPair = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{
+        .key = if (i == 3) &internal_keys.range_document_count_key else keys[i],
+        .value = internal_keys.encodeDerivedCoverageOutcomeCount(&values[i], if (i == 0 or i == 3) 1 else 0),
+    };
+    // Deterministically publish the first complete tuple after the target
+    // reader has acquired its view. Three independent gets could see a
+    // missing produced counter followed by newly present skipped/failed.
+    try db.core.store.putBatch(&writes, &.{});
+    try std.testing.expectEqual(@as(?u64, 0), try denseTargetCountForIndexSnapshot(db.async_context, "dense_idx", &empty));
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(db.async_context, "dense_idx"));
+
+    var one = try db.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer one.abort();
+    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[0], 2);
+    _ = internal_keys.encodeDerivedCoverageOutcomeCount(&values[3], 2);
+    try db.core.store.putBatch(&writes, &.{});
+    // Source cardinality is part of the same proof, not a second live read.
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexSnapshot(db.async_context, "dense_idx", &one));
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContext(db.async_context, "dense_idx"));
+    try db.core.store.putBatch(&.{}, &.{keys[1]});
+    try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, "dense_idx"));
 }
 
 test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {

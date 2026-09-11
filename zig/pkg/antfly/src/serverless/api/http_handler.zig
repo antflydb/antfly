@@ -65,6 +65,7 @@ const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const query_mod = @import("../query/mod.zig");
 const query_materializer = @import("../query/materializer.zig");
+const document_facts_reader = @import("../query/document_facts_reader.zig");
 const runtime_bootstrap = @import("../runtime/bootstrap.zig");
 const runtime_manager = @import("../runtime/manager.zig");
 const document_segment_mod = @import("../document_segment/mod.zig");
@@ -1121,12 +1122,24 @@ pub const HttpHandler = struct {
         };
     }
 
+    fn publicationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !?HttpResponse {
+        return switch (err) {
+            error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged => blk: {
+                var response = try textResponse(alloc, 503, "publication authority changed or another builder is active; retry");
+                response.retry_after_seconds = 1;
+                break :blk response;
+            },
+            error.GraphPageRecordTooLarge => try textResponse(alloc, 422, "encoded graph identity exceeds the 256 KiB composite key limit; shorten node, edge-type, or table identifiers"),
+            else => null,
+        };
+    }
+
     fn handleBuildNamespace(self: *HttpHandler, namespace: []const u8) !HttpResponse {
         if (try self.requirePublishRoute()) |resp| return resp;
         var result = self.catalog.buildNamespace(namespace) catch |err| switch (err) {
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
-            else => return try textResponse(self.alloc, 500, "build failed"),
+            else => return (try publicationFailureResponse(self.alloc, err)) orelse try textResponse(self.alloc, 500, "build failed"),
         };
         defer result.deinit(self.alloc);
         return try jsonResponse(self.alloc, 202, result);
@@ -1138,7 +1151,7 @@ pub const HttpHandler = struct {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
-            else => return try textResponse(self.alloc, 500, "build failed"),
+            else => return (try publicationFailureResponse(self.alloc, err)) orelse try textResponse(self.alloc, 500, "build failed"),
         };
         defer result.deinit(self.alloc);
         var table_result = api_types.TableBuildResult{
@@ -1156,7 +1169,7 @@ pub const HttpHandler = struct {
     fn handleBuildStatus(self: *HttpHandler, namespace: []const u8) !HttpResponse {
         var status = self.catalog.buildStatus(namespace) catch |err| switch (err) {
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "publication prediction exceeds resource limits; published head is unchanged"),
-            else => return try textResponse(self.alloc, 500, "status failed"),
+            else => return (try publicationFailureResponse(self.alloc, err)) orelse try textResponse(self.alloc, 500, "status failed"),
         };
         defer status.deinit(self.alloc);
         return try jsonResponse(self.alloc, 200, status);
@@ -1167,6 +1180,7 @@ pub const HttpHandler = struct {
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "publication prediction exceeds resource limits; published head is unchanged"),
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => {
+                if (try publicationFailureResponse(self.alloc, err)) |response| return response;
                 std.log.warn("table build status failed table={s} err={s}", .{ table_name, @errorName(err) });
                 return try textResponse(self.alloc, 500, "status failed");
             },
@@ -2403,6 +2417,11 @@ pub const HttpHandler = struct {
         alloc: Allocator,
         session: *query_mod.QuerySession,
     ) ![]query_materializer.Document {
+        var remaining: u64 = 512 * 1024 * 1024;
+        if (try document_facts_reader.Reader.create(alloc, session, &remaining)) |reader| {
+            defer reader.destroy();
+            return reader.materializeAlloc();
+        }
         const doc_index = session.findArtifactIndex(.document_segment) orelse return error.DocumentSegmentNotFound;
         const doc_payload = try session.fetchArtifactAlloc(doc_index);
         defer alloc.free(doc_payload);
@@ -3698,7 +3717,7 @@ pub const HttpHandler = struct {
             try stripServerlessGraphMetricStatus(self.alloc, result);
         }
         if (result.paths.len > 0) try self.rebuildPublicGraphPathsFromNodes(result);
-        try self.rebuildPublicGraphHitsFromNodes(session.cancellation, result);
+        try self.rebuildPublicGraphHitsFromNodes(session.readCancellation(), result);
     }
 
     fn rebuildPublicGraphPathsFromNodes(self: *HttpHandler, result: *db_types.GraphSearchResult) !void {
@@ -4206,7 +4225,7 @@ pub const HttpHandler = struct {
             self.graph_execution_limits.max_distinct_state_bytes,
         );
         var request_graph_read_budget = ServerlessGraphReadBudget{
-            .cancellation = session.cancellation,
+            .cancellation = session.readCancellation(),
             .work_budget = &request_work_budget,
         };
         var request_cache = PublicGraphRequestCache.init(self, session, &request_work_budget);
@@ -4603,10 +4622,11 @@ pub const HttpHandler = struct {
         defer self.alloc.free(target_nodes);
         for (target_key_refs, 0..) |key, i| target_nodes[i] = .{ .table = null, .key = key };
 
-        // Canonical MATCH needs the complete published document relation both
-        // to enumerate its selected anchor and to evaluate alias filters.
+        // Anchor enumeration needs the document relation. Point predicates and
+        // returned bodies use the facts index without enumerating other IDs.
         const need_docs = conjunctive_pattern != null or named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
-        const docs: []const PublicDocumentRef = if (need_docs) try request_cache.documents() else &.{};
+        const enumerate_docs = conjunctive_pattern != null or (need_docs and request_cache.session.findArtifactIndex(.document_facts) == null);
+        const docs: []const PublicDocumentRef = if (enumerate_docs) try request_cache.documents() else &.{};
 
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
@@ -5004,6 +5024,7 @@ pub const HttpHandler = struct {
         const neighbors = query_mod.graphNeighborsAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphNeighborQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph neighbor query exceeds configured limits"),
+            error.DeadlineExceeded => return try textResponse(self.alloc, 504, "graph snapshot deadline exceeded; retry the query"),
             error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5124,6 +5145,7 @@ pub const HttpHandler = struct {
         const nodes = query_mod.graphTraverseAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph traversal query exceeds configured limits"),
+            error.DeadlineExceeded => return try textResponse(self.alloc, 504, "graph snapshot deadline exceeded; retry the query"),
             error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5186,6 +5208,7 @@ pub const HttpHandler = struct {
         const maybe_path = query_mod.graphShortestPathAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph shortest-path query exceeds configured limits"),
+            error.DeadlineExceeded => return try textResponse(self.alloc, 504, "graph snapshot deadline exceeded; retry the query"),
             error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5542,6 +5565,11 @@ pub const HttpHandler = struct {
     }
 
     fn allocPublishedDocumentsAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Document {
+        var remaining: u64 = 512 * 1024 * 1024;
+        if (try document_facts_reader.Reader.create(self.alloc, session, &remaining)) |reader| {
+            defer reader.destroy();
+            return reader.materializeAlloc();
+        }
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
             if (artifact_ref.kind != .document_segment) continue;
@@ -5996,6 +6024,8 @@ pub const HttpHandler = struct {
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -6038,6 +6068,8 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.Canceled => return error.Canceled,
@@ -6350,6 +6382,7 @@ const CachedPublicGraphSegment = struct {
 
     fn edgeMetadata(self: @This(), edge: graph_segment_mod.Edge) ?[]const u8 {
         const table_id = edge.neighbor_table_id orelse return null;
+        if (self.paged) |paged| if (paged.reader.dynamicTableMetadata(table_id)) |metadata| return metadata;
         if (table_id >= self.neighbor_table_metadata.len) return null;
         return self.neighbor_table_metadata[table_id];
     }
@@ -6405,6 +6438,7 @@ const BudgetedMutationOverlay = struct {
 
 const PublicDocumentBody = union(enum) {
     artifact: PublicDocumentArtifactBody,
+    fact: document_facts_reader.Fact,
     owned: []u8,
     cached: []const u8,
     deleted,
@@ -6425,7 +6459,7 @@ const PublicDocumentRef = struct {
                 alloc.free(self.doc_id);
                 alloc.free(body);
             },
-            .artifact, .cached, .deleted => alloc.free(self.doc_id),
+            .artifact, .fact, .cached, .deleted => alloc.free(self.doc_id),
             .moved => {},
         }
         self.* = undefined;
@@ -6455,6 +6489,9 @@ const PublicGraphRequestCache = struct {
     segments: std.ArrayListUnmanaged(CachedPublicGraphSegment) = .empty,
     filter_cache: db_query_graph.PreparedPatternFilterCache,
     graph_read_remaining: u64 = 512 * 1024 * 1024,
+    facts_reader: ?*document_facts_reader.Reader = null,
+    facts_allocation: graph_work_budget_mod.RetainedAllocator = undefined,
+    facts_bodies: std.StringHashMapUnmanaged([]u8) = .empty,
 
     fn init(
         handler: *HttpHandler,
@@ -6471,6 +6508,17 @@ const PublicGraphRequestCache = struct {
     }
 
     fn deinit(self: *PublicGraphRequestCache) void {
+        if (self.facts_reader) |reader| {
+            const alloc = self.facts_allocation.allocator();
+            var bodies = self.facts_bodies.iterator();
+            while (bodies.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
+            }
+            self.facts_bodies.deinit(alloc);
+            reader.destroy();
+            std.debug.assert(self.facts_allocation.live_bytes == 0);
+        }
         self.filter_cache.deinit();
         self.published_document_index.deinit(self.handler.alloc);
         if (self.published_documents) |docs| freePublicDocumentRefs(self.handler.alloc, docs);
@@ -6518,6 +6566,13 @@ const PublicGraphRequestCache = struct {
     }
 
     fn documents(self: *PublicGraphRequestCache) ![]const PublicDocumentRef {
+        return self.documentsImpl() catch |err| {
+            if (err == error.OutOfMemory and self.facts_reader != null and self.facts_allocation.denied) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn documentsImpl(self: *PublicGraphRequestCache) ![]const PublicDocumentRef {
         if (self.published_documents == null) {
             self.published_documents = try self.allocPublishedDocumentRefs();
             const docs = self.published_documents.?;
@@ -6540,7 +6595,59 @@ const PublicGraphRequestCache = struct {
         return self.published_documents.?;
     }
 
+    fn factsReader(self: *PublicGraphRequestCache) !?*document_facts_reader.Reader {
+        if (self.facts_reader) |reader| return reader;
+        if (self.session.findArtifactIndex(.document_facts) == null) return null;
+        self.facts_allocation = .{ .backing = self.handler.alloc, .budget = self.work_budget };
+        self.facts_reader = document_facts_reader.Reader.create(self.facts_allocation.allocator(), self.session, &self.graph_read_remaining) catch |err| {
+            if (err == error.OutOfMemory and self.facts_allocation.denied) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+        return self.facts_reader;
+    }
+
+    fn allocFactsDocumentRefs(self: *PublicGraphRequestCache, reader: *document_facts_reader.Reader) ![]PublicDocumentRef {
+        const alloc = self.handler.alloc;
+        const count = std.math.cast(usize, reader.root.document_count) orelse return error.QueryCandidateBudgetExceeded;
+        const prior = self.retained_lease.bytes;
+        try self.reserveRetained(try std.math.mul(usize, count, @sizeOf(PublicDocumentRef)));
+        errdefer self.retained_lease.resize(prior) catch unreachable;
+        const out = try alloc.alloc(PublicDocumentRef, count);
+        errdefer alloc.free(out);
+        var initialized: usize = 0;
+        errdefer for (out[0..initialized]) |*doc| doc.deinit(alloc);
+        var cursor = try @import("../graph_segment/page_tree.zig").Cursor.init(reader.alloc, reader.cache.store(), reader.root.page, "", null);
+        defer cursor.deinit();
+        while (try cursor.next()) |record| {
+            if (initialized == count) return error.InvalidDocumentFactsRoot;
+            const fact = try document_facts_reader.Fact.decode(record.value);
+            try self.reserveRetained(record.key.len);
+            out[initialized] = .{ .doc_id = try alloc.dupe(u8, record.key), .body = .{ .fact = fact }, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
+            initialized += 1;
+        }
+        if (initialized != count) return error.InvalidDocumentFactsRoot;
+        return out;
+    }
+
     fn documentBody(self: *PublicGraphRequestCache, doc_id: []const u8) !?[]const u8 {
+        return self.documentBodyImpl(doc_id) catch |err| {
+            if (err == error.OutOfMemory and self.facts_reader != null and self.facts_allocation.denied) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn documentBodyImpl(self: *PublicGraphRequestCache, doc_id: []const u8) !?[]const u8 {
+        if (try self.factsReader()) |reader| {
+            if (self.facts_bodies.get(doc_id)) |body| return body;
+            const fact = try reader.lookup(doc_id) orelse return null;
+            const alloc = self.facts_allocation.allocator();
+            const body = try reader.readBodyAlloc(fact);
+            errdefer alloc.free(body);
+            const id = try alloc.dupe(u8, doc_id);
+            errdefer alloc.free(id);
+            try self.facts_bodies.put(alloc, id, body);
+            return body;
+        }
         _ = try self.documents();
         const idx = self.published_document_index.get(doc_id) orelse return null;
         const doc = &self.published_documents.?[idx];
@@ -6548,6 +6655,7 @@ const PublicGraphRequestCache = struct {
             .owned => |body| return body,
             .cached => |body| return body,
             .deleted, .moved => return null,
+            .fact => unreachable, // facts are routed through the point reader above
             .artifact => |locator| {
                 try self.reserveRetained(locator.len);
                 const body = self.session.fetchArtifactRangeAlloc(
@@ -6639,7 +6747,7 @@ const PublicGraphRequestCache = struct {
                 const doc = &self.published_documents.?[candidate.document_index];
                 const locator = switch (doc.body) {
                     .artifact => |value| value,
-                    .owned, .cached, .deleted, .moved => continue,
+                    .owned, .fact, .cached, .deleted, .moved => continue,
                 };
                 if (locator.artifact_index != first_locator.artifact_index or locator.offset < first_locator.offset)
                     continue;
@@ -6663,12 +6771,13 @@ const PublicGraphRequestCache = struct {
         const document_index = self.published_document_index.get(candidate.doc_id) orelse return null;
         const locator = switch (self.published_documents.?[document_index].body) {
             .artifact => |value| value,
-            .owned, .cached, .deleted, .moved => return null,
+            .owned, .fact, .cached, .deleted, .moved => return null,
         };
         return .{ .document_index = document_index, .locator = locator };
     }
 
     fn allocPublishedDocumentRefs(self: *PublicGraphRequestCache) ![]PublicDocumentRef {
+        if (try self.factsReader()) |reader| return self.allocFactsDocumentRefs(reader);
         const base_allocation = blk: {
             for (0..self.session.artifactCount()) |artifact_index| {
                 const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
@@ -6736,7 +6845,7 @@ const PublicGraphRequestCache = struct {
                 (mutation.lsn == slot.last_lsn and mutation.timestamp_ns < slot.last_timestamp_ns)) continue;
             switch (slot.body) {
                 .owned => |body| self.handler.alloc.free(body),
-                .artifact, .cached, .deleted, .moved => {},
+                .artifact, .fact, .cached, .deleted, .moved => {},
             }
             slot.body = switch (mutation.kind) {
                 .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
@@ -6749,13 +6858,13 @@ const PublicGraphRequestCache = struct {
         var live_count: usize = 0;
         for (slots.items) |slot| switch (slot.body) {
             .deleted, .moved => {},
-            .artifact, .owned, .cached => live_count += 1,
+            .artifact, .fact, .owned, .cached => live_count += 1,
         };
         var out_bytes = std.math.mul(usize, live_count, @sizeOf(PublicDocumentRef)) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         for (slots.items) |slot| switch (slot.body) {
             .deleted, .moved => {},
-            .artifact, .cached => out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
+            .artifact, .fact, .cached => out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
                 return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
             .owned => |body| {
                 out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
@@ -6776,7 +6885,7 @@ const PublicGraphRequestCache = struct {
         for (slots.items) |*slot| {
             switch (slot.body) {
                 .deleted, .moved => continue,
-                .artifact, .owned, .cached => {},
+                .artifact, .fact, .owned, .cached => {},
             }
             out[out_idx] = slot.*;
             slot.body = .moved;
@@ -6990,12 +7099,15 @@ const PublicGraphRequestCache = struct {
         const paged = try self.handler.alloc.create(AdmittedAdjacencyReader);
         errdefer self.handler.alloc.destroy(paged);
         paged.allocation = .{ .backing = self.handler.alloc, .budget = self.work_budget };
-        paged.reader = (graph_segment_mod.AdjacencyReader.initCached(paged.allocation.allocator(), self.session.artifacts, artifact_ref, self.session.cancellation, &self.graph_read_remaining, self.session.graphAdjacencyCache()) catch |err| return paged.translate(err)) orelse {
+        paged.reader = (graph_segment_mod.AdjacencyReader.initCached(paged.allocation.allocator(), self.session.artifacts, artifact_ref, self.session.readCancellation(), &self.graph_read_remaining, self.session.graphAdjacencyCache()) catch |err| return paged.translate(err)) orelse {
             self.handler.alloc.destroy(paged);
             try self.retained_lease.resize(prior);
             return null;
         };
         errdefer paged.reader.deinit();
+        if (paged.reader.pages) |reader| {
+            if (!std.mem.eql(u8, &reader.root.domain, &@import("../graph_segment/page_store.zig").PageStore.namespaceDomain(self.session.namespace()))) return error.GraphPageDomainMismatch;
+        }
         try self.reserveRetained(try std.math.mul(usize, paged.reader.tables.len, @sizeOf([]u8)));
         const metadata = try self.handler.alloc.alloc([]u8, paged.reader.tables.len);
         errdefer self.handler.alloc.free(metadata);
@@ -7035,7 +7147,7 @@ const PublicGraphRequestCache = struct {
 
         var view_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, try graph_segment_mod.codec.compact.viewRetainedBytes(payload));
         defer view_lease.deinit();
-        var view = graph_segment_mod.codec.compact.viewAlloc(self.handler.alloc, payload, .{}, self.session.cancellation) catch |err| switch (err) {
+        var view = graph_segment_mod.codec.compact.viewAlloc(self.handler.alloc, payload, .{}, self.session.readCancellation()) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled, error.UnsupportedGraphSegmentVersion => return err,
             else => return error.InvalidGraphSegment,
         };
@@ -7080,12 +7192,12 @@ const PublicGraphRequestCache = struct {
         try self.reserveRetained(persistent_bytes);
         errdefer self.retained_lease.resize(prior_retained) catch unreachable;
 
-        var segment = try graph_segment_mod.codec.compact.decodeViewAlloc(self.handler.alloc, view, self.session.cancellation);
+        var segment = try graph_segment_mod.codec.compact.decodeViewAlloc(self.handler.alloc, view, self.session.readCancellation());
         errdefer graph_segment_mod.freeSegment(self.handler.alloc, &segment);
         var adjacency_index = try graph_segment_mod.AdjacencyIndex.initWithCancellation(
             self.handler.alloc,
             segment,
-            self.session.cancellation,
+            self.session.readCancellation(),
         );
         errdefer adjacency_index.deinit(self.handler.alloc);
         const neighbor_table_metadata = try self.handler.alloc.alloc([]u8, segment.neighbor_tables.len);
@@ -7681,6 +7793,61 @@ fn conjunctivePatternHasExternalDocumentFilter(source_table: []const u8, pattern
     return false;
 }
 
+test "serverless graph document predicates use admitted facts points without corpus hydration" {
+    const a = std.testing.allocator;
+    const facts = @import("../build/document_facts.zig");
+    const PageStore = @import("../graph_segment/page_store.zig").PageStore;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var impl = try @import("../artifacts/object_store.zig").ObjectStore.initWithClient(a, memory.client(), "artifacts", "tenant");
+    var artifacts = impl.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = reads;
+    var pages: PageStore = .{ .domain = PageStore.namespaceDomain("docs"), .attempt = @splat(1), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const first_body = try facts.putBody(a, &pages, "{\"name\":\"a\"}");
+    const second_body = try facts.putBody(a, &pages, "{\"name\":\"b\"}");
+    const empty: facts.Root = .{ .domain = pages.domain, .policy_fingerprint = @splat(1) };
+    var plan = try facts.planAlloc(a, pages.store(), empty, &.{
+        .{ .id = "a", .value = .{ .body = first_body, .last_lsn = 1, .last_timestamp_ns = 10 } },
+        .{ .id = "b", .value = .{ .body = second_body, .last_lsn = 1, .last_timestamp_ns = 10 } },
+    }, 1);
+    defer plan.deinit();
+    const root = try plan.publish(pages.store(), empty);
+    const ref = try facts.publishRoot(a, &pages, root);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    var refs = [_]manifest_mod.ArtifactRef{ref};
+    var session: query_mod.QuerySession = .{ .alloc = a, .artifacts = &artifacts, .owns_manifest = false, .manifest = .{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 1,
+        .stats = .{ .document_count = 2, .document_base_version = 1 },
+        .artifacts = &refs,
+    } };
+    defer session.deinit();
+    // Missing unrelated content must not be touched by an exact node lookup.
+    try artifacts.delete(&try second_body.identity(pages.domain));
+    var handler: HttpHandler = undefined;
+    handler.alloc = a;
+    var budget = graph_work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 1024 * 1024 });
+    var cache = PublicGraphRequestCache.init(&handler, &session, &budget);
+    defer cache.deinit();
+    const body = (try cache.documentBody("a")).?;
+    try std.testing.expectEqualStrings("{\"name\":\"a\"}", body);
+    try std.testing.expect(cache.published_documents == null);
+    const remaining = cache.graph_read_remaining;
+    try std.testing.expectEqual(body.ptr, (try cache.documentBody("a")).?.ptr);
+    try std.testing.expectEqual(remaining, cache.graph_read_remaining);
+    const docs = try cache.documents();
+    try std.testing.expectEqual(@as(usize, 2), docs.len);
+    try std.testing.expect(docs[1].body == .fact);
+    // Anchor enumeration retains identities and body refs, not every body.
+    try std.testing.expectEqual(@as(usize, 1), cache.facts_bodies.count());
+}
+
 test "serverless document body prefetch order is artifact monotonic" {
     var locators = [_]PublicDocumentBodyPrefetch{
         .{ .document_index = 0, .locator = .{ .artifact_index = 1, .offset = 90, .len = 5 } },
@@ -7761,7 +7928,7 @@ fn publishedPatternNodeFilterBatchEvaluator(
     filter: graph_pattern_mod.NodeFilter,
 ) anyerror![]bool {
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    if (filter.filter_query_json != null) {
+    if (filter.filter_query_json != null and active.documents.session.findArtifactIndex(.document_facts) == null) {
         const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
         defer alloc.free(refs);
         var refs_len: usize = 0;
@@ -7791,7 +7958,7 @@ fn serverlessGraphNodeAdmission(
     nodes: []const graph_node_admission.NodeRef,
 ) anyerror![]bool {
     const active: *ServerlessGraphAdmissionContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    if (active.filter.filter_query_json != null) {
+    if (active.filter.filter_query_json != null and active.filter_ctx.documents.session.findArtifactIndex(.document_facts) == null) {
         const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
         defer alloc.free(refs);
         var refs_len: usize = 0;
@@ -10363,7 +10530,7 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(@as(u64, 1), parsed_build.value.version);
     try std.testing.expectEqual(@as(u64, 1), parsed_build.value.wal_start_lsn);
     try std.testing.expectEqual(@as(u64, 2), parsed_build.value.wal_end_lsn);
-    try std.testing.expectEqual(@as(usize, 3), parsed_build.value.artifact_count);
+    try std.testing.expectEqual(@as(usize, 5), parsed_build.value.artifact_count);
 
     var head = try handler.handle(.{
         .method = .get,
@@ -10395,8 +10562,8 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(query_types.QueryView.published, parsed_query_head.value.view);
     try std.testing.expectEqual(@as(u64, 2), parsed_query_head.value.latest_wal_lsn);
     try std.testing.expectEqual(@as(u64, 0), parsed_query_head.value.freshness_lag_records);
-    try std.testing.expectEqual(@as(usize, 3), parsed_query_head.value.artifact_count);
-    try std.testing.expectEqual(@as(usize, 3), parsed_query_head.value.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 5), parsed_query_head.value.artifact_count);
+    try std.testing.expectEqual(@as(usize, 5), parsed_query_head.value.artifacts.len);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.mutation_segment, parsed_query_head.value.artifacts[0].kind);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_head.value.document_count);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_head.value.documents.len);
@@ -11752,7 +11919,9 @@ test "serverless http handler index status exposes graph publication actions" {
     try std.testing.expectEqual(@as(u16, 200), planned.status);
     var parsed_planned = try parseServerlessIndexStatusTestResponse(alloc, planned.body, "graph_idx");
     defer parsed_planned.deinit();
-    try std.testing.expectEqualStrings("rebuild", parsed_planned.value.status.planned_publication_action.?);
+    // The new name binds the already published default graph root; declaring
+    // an alias requires publication, but no adjacency reconstruction.
+    try std.testing.expectEqualStrings("reuse", parsed_planned.value.status.planned_publication_action.?);
     try std.testing.expectEqualStrings("pending", parsed_planned.value.status.readiness.?.state);
     try std.testing.expect(parsed_planned.value.status.readiness.?.pending_reasons.len > 0);
     // Graph indexes do not yet persist a private incarnation. Omitting the
@@ -11773,7 +11942,7 @@ test "serverless http handler index status exposes graph publication actions" {
     try std.testing.expectEqual(@as(u16, 200), head.status);
     var parsed_head = try parseServerlessIndexStatusTestResponse(alloc, head.body, "graph_idx");
     defer parsed_head.deinit();
-    try std.testing.expectEqualStrings("rebuild", parsed_head.value.status.head_publication_action.?);
+    try std.testing.expectEqualStrings("reuse", parsed_head.value.status.head_publication_action.?);
     try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
     try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_head.value.status.readiness.?.incarnation);
@@ -11781,7 +11950,7 @@ test "serverless http handler index status exposes graph publication actions" {
     try std.testing.expect(std.mem.indexOf(u8, head.body, "published_revision") == null);
 }
 
-test "http handler index status predicts graph reuse and rebuild before publish" {
+test "serverless http handler index status predicts graph reuse and rebuild before publish" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -12187,7 +12356,7 @@ test "serverless index catalog rejects artifact-backed sources before publicatio
     );
 }
 
-test "http handler serves the table public lifecycle and consistency routes" {
+test "serverless http handler serves the table public lifecycle and consistency routes" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -12509,7 +12678,11 @@ test "http handler serves the table public lifecycle and consistency routes" {
         .body = "{\"full_text_search\":{\"query\":\"body:alpha\"},\"fields\":[\"_chunks.*\"]}",
     });
     defer unsupported_fields_search.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), unsupported_fields_search.status);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_fields_search.status);
+    try std.testing.expectEqualStrings("application/json", unsupported_fields_search.content_type);
+    var unsupported_fields_error = try parseJsonTestBody(public_table_http.UnsupportedQueryError, alloc, unsupported_fields_search.body);
+    defer unsupported_fields_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", unsupported_fields_error.value.@"error");
 
     var text_only_update = try handler.handle(.{
         .method = .put,
@@ -14162,7 +14335,7 @@ test "serverless public packed graph streams bound hub prefixes and resume acros
     var paged: AdmittedAdjacencyReader = undefined;
     paged.allocation = .{ .backing = a, .budget = null };
     var remaining: u64 = 1024 * 1024;
-    paged.reader = (try graph_segment_mod.AdjacencyReader.init(paged.allocation.allocator(), &store, ref, .none, &remaining)).?;
+    paged.reader = (try graph_segment_mod.AdjacencyReader.initPackedOracle(paged.allocation.allocator(), &store, ref, .none, &remaining)).?;
     defer paged.reader.deinit();
     const cached = CachedPublicGraphSegment{ .index_name = @constCast("g"), .paged = &paged };
     for ([_]usize{ 1, 130 }) |limit| {
@@ -14509,6 +14682,21 @@ test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
         graph_pattern_mod.default_max_scanned_anchors - docs.len,
         work_budget.remaining_anchors,
     );
+}
+
+test "serverless publication errors distinguish retryable authority from identity admission" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.WorkLeaseLost, error.ManifestVersionRetired, error.ManifestReadLeaseExpired, error.ManifestReadLeaseContended, error.DocumentFactsSourceChanged }) |err| {
+        var response = (try HttpHandler.publicationFailureResponse(alloc, err)).?;
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+    }
+    var oversized = (try HttpHandler.publicationFailureResponse(alloc, error.GraphPageRecordTooLarge)).?;
+    defer oversized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized.status);
+    try std.testing.expectEqual(@as(?u32, null), oversized.retry_after_seconds);
+    try std.testing.expect((try HttpHandler.publicationFailureResponse(alloc, error.InvalidDocumentFactsRoot)) == null);
 }
 
 test "serverless ordinary search planning strips every graph metric control" {
