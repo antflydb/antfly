@@ -5032,6 +5032,11 @@ pub const DB = struct {
         try source.setAnnScopes(scopes);
     }
 
+    /// Advance source-payload collection without waiting for retained readers.
+    /// Returns true on completion, false if source storage is disabled or work
+    /// is deferred/incomplete, and an error on failure. Immediate completion
+    /// requires quiescent readers and sufficient per-call work/memory budgets;
+    /// disabling index workers alone does not drain startup cleanup readers.
     pub fn collectSourceVectorGarbage(self: *DB) !bool {
         const source = self.source_vectors orelse return false;
         try source.advanceMarkingSnapshot();
@@ -115878,8 +115883,60 @@ test "source vector table persists references without an ANN index and reopens" 
     const other = try reopened.core.store.get(alloc, other_key);
     defer alloc.free(other);
     try std.testing.expectEqualSlices(u8, second, other);
+    // Open schedules artifact cleanup even with index workers disabled. Its
+    // metadata scans retain payload sessions, so join this owner's startup
+    // jobs before requiring a quiescent collection to complete in one call.
+    reopened.backend_runtime.durable_jobs.drainOwner(reopened.repair_cleanup_owner_id);
     try std.testing.expect(try reopened.collectSourceVectorGarbage());
     try std.testing.expectEqual(@as(u64, 2), reopened.sourceVectorStats().?.live_payloads_at_collection);
+}
+
+test "source vector table collection defers until an old read transaction releases its payload session" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .table_storage = .{ .dense_embeddings = .vector_store },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const first = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 11, &.{ 1, 2, 3 });
+    defer alloc.free(first);
+    const replacement = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, 12, &.{ 4, 5, 6 });
+    defer alloc.free(replacement);
+    try db.core.store.put(key, first);
+    try db.sync(true);
+
+    {
+        var reader = try db.core.store.beginReadTxn();
+        defer reader.abort();
+        try db.core.store.put(key, replacement);
+        try std.testing.expectEqual(@as(u64, 2), db.sourceVectorStats().?.retained_payloads);
+        const before = db.sourceVectorStats().?;
+        try std.testing.expect(!try db.collectSourceVectorGarbage());
+        const deferred = db.sourceVectorStats().?;
+        try std.testing.expectEqual(before.collections, deferred.collections);
+        try std.testing.expectEqual(before.collection_deferrals + 1, deferred.collection_deferrals);
+        try std.testing.expectEqual(@as(u64, 2), deferred.retained_payloads);
+        // Resolve only after the attempted collection: the old transaction's
+        // primary reference must still have a live source payload to read.
+        try std.testing.expectEqualSlices(u8, first, try reader.get(key));
+    }
+
+    try std.testing.expect(try db.collectSourceVectorGarbage());
+    try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.live_payloads_at_collection);
+    try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.retained_payloads);
+    const current = try db.core.store.get(alloc, key);
+    defer alloc.free(current);
+    try std.testing.expectEqualSlices(u8, replacement, current);
 }
 
 test "source vector table retains artifacts after dropping last consumer and rebuilds" {
