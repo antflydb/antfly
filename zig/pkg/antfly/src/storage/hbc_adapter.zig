@@ -95,6 +95,16 @@ const TestBeforeDurableSnapshotCaptureHook = *const fn (?*anyopaque, *HBCIndex) 
 var test_before_durable_snapshot_capture_ctx: ?*anyopaque = null;
 var test_before_durable_snapshot_capture_hook: ?TestBeforeDurableSnapshotCaptureHook = null;
 
+const TestCheckpointBuildClaimHook = *const fn (?*anyopaque, *HBCIndex) void;
+var test_checkpoint_build_claim_ctx: ?*anyopaque = null;
+var test_checkpoint_build_claim_hook: ?TestCheckpointBuildClaimHook = null;
+
+pub fn setTestCheckpointBuildClaimHook(ctx: ?*anyopaque, hook: ?TestCheckpointBuildClaimHook) void {
+    if (!builtin.is_test) return;
+    test_checkpoint_build_claim_ctx = ctx;
+    test_checkpoint_build_claim_hook = hook;
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -9424,7 +9434,7 @@ pub const HBCIndex = struct {
         build.deinit();
     }
 
-    fn experimentalPostingCheckpointBuildPresent(self: *HBCIndex) bool {
+    pub fn experimentalPostingCheckpointBuildPresent(self: *HBCIndex) bool {
         lockAtomic(&self.experimental_posting_checkpoint_build_mu);
         defer self.experimental_posting_checkpoint_build_mu.unlock();
         return self.experimental_posting_checkpoint_build != null;
@@ -9439,7 +9449,7 @@ pub const HBCIndex = struct {
         return true;
     }
 
-    fn experimentalPostingCheckpointBuildCompleted(self: *HBCIndex) bool {
+    pub fn experimentalPostingCheckpointBuildCompleted(self: *HBCIndex) bool {
         lockAtomic(&self.experimental_posting_checkpoint_build_mu);
         defer self.experimental_posting_checkpoint_build_mu.unlock();
         const build = self.experimental_posting_checkpoint_build orelse return false;
@@ -9583,6 +9593,9 @@ pub const HBCIndex = struct {
         defer self.experimental_posting_checkpoint_build_mu.unlock();
         const build = self.experimental_posting_checkpoint_build orelse return false;
         if (!build.completed.load(.acquire)) return false;
+        // Test-only synchronization point used to prove that teardown cannot
+        // reclaim a build after a publisher has acquired its pointer.
+        self.notifyCheckpointBuildClaimedForTest();
         build.awaitCompletion();
         if (build.build_error == null and build.staged_readers != null and build.rebase_source == null and
             !build.force_progress.load(.acquire) and
@@ -13533,6 +13546,13 @@ pub const HBCIndex = struct {
         if (!builtin.is_test) return;
         if (test_before_durable_snapshot_capture_hook) |hook| {
             hook(test_before_durable_snapshot_capture_ctx, self);
+        }
+    }
+
+    fn notifyCheckpointBuildClaimedForTest(self: *HBCIndex) void {
+        if (!builtin.is_test) return;
+        if (test_checkpoint_build_claim_hook) |hook| {
+            hook(test_checkpoint_build_claim_ctx, self);
         }
     }
 
@@ -29224,33 +29244,65 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             try Fixture.checkpoint(&idx, .full);
             try Fixture.check(&idx, deleted[0..4]);
 
-            // Two independent recovery notifications can publish the same
-            // completed build. Only one caller may detach and destroy it;
-            // the other must observe an already-consumed slot safely.
+            // Hold a publisher after it has acquired the build pointer, then
+            // race teardown against that held pointer. The old implementation
+            // frees the build here; the publisher resumes with a dangling
+            // pointer. The ownership lock makes teardown wait until handoff
+            // completes.
             try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, .full));
             const concurrent_build = idx.experimental_posting_checkpoint_build.?;
             concurrent_build.awaitCompletion();
             try concurrent_build.stageReaders();
-            const PublishWorker = struct {
-                fn run(index: *HBCIndex, start: *std.atomic.Value(bool), published: *std.atomic.Value(u32), failed: *std.atomic.Value(bool)) void {
-                    while (!start.load(.acquire)) std.atomic.spinLoopHint();
-                    const did_publish = index.publishReadyExperimentalPostingCheckpointForRecovery() catch {
-                        failed.store(true, .release);
+            const PublishRace = struct {
+                index: *HBCIndex,
+                claimed: std.atomic.Value(bool) = .init(false),
+                allow_resume: std.atomic.Value(bool) = .init(false),
+                discard_started: std.atomic.Value(bool) = .init(false),
+                discard_finished: std.atomic.Value(bool) = .init(false),
+                publish_failed: std.atomic.Value(bool) = .init(false),
+
+                fn onClaim(raw_ctx: ?*anyopaque, _: *HBCIndex) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+                    self.claimed.store(true, .release);
+                    while (!self.allow_resume.load(.acquire)) std.atomic.spinLoopHint();
+                }
+
+                fn publish(self: *@This()) void {
+                    _ = self.index.publishReadyExperimentalPostingCheckpointForRecovery() catch {
+                        self.publish_failed.store(true, .release);
                         return;
                     };
-                    if (did_publish) _ = published.fetchAdd(1, .monotonic);
+                }
+
+                fn discard(self: *@This()) void {
+                    self.discard_started.store(true, .release);
+                    self.index.discardExperimentalPostingCheckpointBuild();
+                    self.discard_finished.store(true, .release);
                 }
             };
-            var start_publishers = std.atomic.Value(bool).init(false);
-            var published_count = std.atomic.Value(u32).init(0);
-            var publish_failed = std.atomic.Value(bool).init(false);
-            var publisher_a = try runtime.io().concurrent(PublishWorker.run, .{ &idx, &start_publishers, &published_count, &publish_failed });
-            var publisher_b = try runtime.io().concurrent(PublishWorker.run, .{ &idx, &start_publishers, &published_count, &publish_failed });
-            start_publishers.store(true, .release);
-            publisher_a.await(runtime.io());
-            publisher_b.await(runtime.io());
-            try std.testing.expect(!publish_failed.load(.acquire));
-            try std.testing.expectEqual(@as(u32, 1), published_count.load(.acquire));
+            var race = PublishRace{ .index = &idx };
+            setTestCheckpointBuildClaimHook(&race, PublishRace.onClaim);
+            defer setTestCheckpointBuildClaimHook(null, null);
+            var publisher: ?std.Io.Future(void) = null;
+            var discarder: ?std.Io.Future(void) = null;
+            defer {
+                race.allow_resume.store(true, .release);
+                if (publisher) |*task| task.await(runtime.io());
+                if (discarder) |*task| task.await(runtime.io());
+            }
+            publisher = try runtime.io().concurrent(PublishRace.publish, .{&race});
+            while (!race.claimed.load(.acquire)) {
+                try runtime.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+            discarder = try runtime.io().concurrent(PublishRace.discard, .{&race});
+            while (!race.discard_started.load(.acquire)) {
+                try runtime.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+            race.allow_resume.store(true, .release);
+            publisher.?.await(runtime.io());
+            discarder.?.await(runtime.io());
+            try std.testing.expect(!race.publish_failed.load(.acquire));
+            try std.testing.expect(race.discard_finished.load(.acquire));
             try std.testing.expect(!idx.experimentalPostingCheckpointBuildPresent());
 
             const pinned = idx.retainCurrentExperimentalPostingReadGeneration().?;
