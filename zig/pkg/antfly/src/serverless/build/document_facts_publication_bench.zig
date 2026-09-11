@@ -31,6 +31,7 @@ const Counts = struct { gets: u64 = 0, read_bytes: u64 = 0, puts: u64 = 0, write
 const CountingStore = struct {
     inner: *store_mod.ArtifactStore,
     counts: Counts = .{},
+    reject_document_bodies: bool = false,
 
     fn capability(self: *@This()) store_mod.ArtifactStore {
         return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &.{
@@ -79,6 +80,8 @@ const CountingStore = struct {
     fn getUntil(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, cancel: Cancellation) ![]u8 {
         const self = selfFrom(ptr);
         const bytes = try self.inner.getAllocWithCancellationUsingAllocator(alloc, id, cancel);
+        errdefer alloc.free(bytes);
+        if (self.reject_document_bodies and std.mem.startsWith(u8, bytes, "AFDBODY1")) return error.UnexpectedDocumentBodyRead;
         self.counts.gets += 1;
         self.counts.read_bytes += bytes.len;
         return bytes;
@@ -89,6 +92,8 @@ const CountingStore = struct {
     fn rangeUntil(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, offset: u64, len: usize, cancel: Cancellation) ![]u8 {
         const self = selfFrom(ptr);
         const bytes = try self.inner.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancel);
+        errdefer alloc.free(bytes);
+        if (self.reject_document_bodies and std.mem.startsWith(u8, bytes, "AFDBODY1")) return error.UnexpectedDocumentBodyRead;
         self.counts.gets += 1;
         self.counts.read_bytes += bytes.len;
         return bytes;
@@ -96,6 +101,8 @@ const CountingStore = struct {
     fn verifiedRange(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, size: u64, checksum: []const u8, offset: u64, len: usize, cancel: Cancellation) ![]u8 {
         const self = selfFrom(ptr);
         const bytes = try self.inner.getVerifiedRangeAllocWithCancellationUsingAllocator(alloc, id, size, checksum, offset, len, cancel);
+        errdefer alloc.free(bytes);
+        if (self.reject_document_bodies and std.mem.startsWith(u8, bytes, "AFDBODY1")) return error.UnexpectedDocumentBodyRead;
         self.counts.gets += 1;
         self.counts.read_bytes += bytes.len;
         return bytes;
@@ -103,6 +110,8 @@ const CountingStore = struct {
     fn verifiedRangeBudget(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, size: u64, checksum: []const u8, offset: u64, len: usize, cancel: Cancellation, remaining: *u64) ![]u8 {
         const self = selfFrom(ptr);
         const bytes = try self.inner.getVerifiedRangeAllocWithBudget(alloc, id, size, checksum, offset, len, cancel, remaining);
+        errdefer alloc.free(bytes);
+        if (self.reject_document_bodies and std.mem.startsWith(u8, bytes, "AFDBODY1")) return error.UnexpectedDocumentBodyRead;
         self.counts.gets += 1;
         self.counts.read_bytes += bytes.len;
         return bytes;
@@ -136,12 +145,18 @@ test "serverless publication qualification benchmark" {
         if (selected_count != 0 and selected_count != count) continue;
         for ([_]usize{ 1, 1023 }) |degree| {
             if (selected_degree != 0 and selected_degree != degree) continue;
-            try run(io, count, degree);
+            try run(io, count, degree, false);
         }
     }
 }
 
-fn run(io: std.Io, count: usize, degree: usize) !void {
+pub fn metadataRepublishRegression() !void {
+    var runtime = std.Io.Threaded.init(a, .{});
+    defer runtime.deinit();
+    try run(runtime.io(), 16, 1, true);
+}
+
+fn run(io: std.Io, count: usize, degree: usize, metadata_only: bool) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/publication", .{tmp.sub_path});
@@ -168,16 +183,23 @@ fn run(io: std.Io, count: usize, degree: usize) !void {
     defer wal.deinit();
     var builder = builder_mod.Builder.init(a, &artifacts, &manifests, &progress, &wal);
     builder.setIo(io);
-    const plan = publication_plan.TablePublicationPlan{
+    var plan = publication_plan.TablePublicationPlan{
         .targets = .{ .published_search_sources = .{ .items = &.{} }, .include_graph = true },
         .table_definition = .{ .indexes_json = @constCast("{\"graph_idx\":{\"type\":\"graph\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}") },
         .artifact_actions = .{ .full_text = .drop, .dense_vector = .drop, .sparse_vector = .drop },
         .derived_output_actions = .{ .chunk_preview = .drop, .chunk_embeddings = .drop, .rerank_terms = .drop },
     };
+    if (metadata_only) {
+        plan.targets.published_search_sources = @import("../search_sources.zig").defaultPublishedSearchSources();
+        plan.artifact_actions = .{};
+    }
     for (0..count) |i| {
         const id = try std.fmt.allocPrint(a, "doc-{d:0>8}", .{i});
         defer a.free(id);
-        const body = if (i == 0) try hubBody(degree, 0) else try a.dupe(u8, "{}");
+        const body = if (i == 0) try hubBody(degree, 0) else try a.dupe(u8, if (metadata_only)
+            "{\"text\":\"alpha\",\"embedding\":[1,0],\"sparse_embedding\":{\"alpha\":1.0}}"
+        else
+            "{}");
         defer a.free(body);
         const payload = try api_codec.encodeMutationAlloc(a, .{ .kind = .upsert, .doc_id = id, .body = body });
         defer a.free(payload);
@@ -185,6 +207,8 @@ fn run(io: std.Io, count: usize, degree: usize) !void {
     }
     var bootstrap = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, plan);
     bootstrap.deinit(a);
+    try metadataRounds(io, &builder, &counting, &manifests, &progress, plan, count, degree, !metadata_only);
+    if (metadata_only) return;
     const Sample = struct { ns: u64, predict_ns: u64, counts: Counts };
     var samples: [5]Sample = undefined;
     for (0..6) |round| {
@@ -222,6 +246,71 @@ fn run(io: std.Io, count: usize, degree: usize) !void {
         count,              degree,                    median.ns,           median.predict_ns,      median.counts.gets, median.counts.read_bytes,
         median.counts.puts, median.counts.write_bytes, median.counts.stats, median.counts.verifies,
     });
+}
+
+fn metadataRounds(io: std.Io, builder: *builder_mod.Builder, counting: *CountingStore, manifests: *manifest_mod.ManifestStore, progress: *catalog_mod.ProgressStore, plan: publication_plan.TablePublicationPlan, count: usize, degree: usize, report: bool) !void {
+    var source = try manifests.getAlloc("docs", try progress.getHead("docs"));
+    defer source.deinit(a);
+    const source_facts = factsRef(source);
+    const Sample = struct { ns: u64, counts: Counts };
+    var samples: [5]Sample = undefined;
+    counting.reject_document_bodies = true;
+    defer counting.reject_document_bodies = false;
+    for (0..6) |round| {
+        var metadata_plan = plan;
+        metadata_plan.metadata_republish.index_definitions_changed = true;
+        metadata_plan.artifact_actions = .{
+            .document_segment = .reuse,
+            .full_text = .reuse,
+            .dense_vector = if (plan.artifact_actions.dense_vector == .drop) .drop else .reuse,
+            .sparse_vector = if (plan.artifact_actions.sparse_vector == .drop) .drop else .reuse,
+            .graph = .reuse,
+        };
+        metadata_plan.derived_output_actions = .{ .chunk_preview = .recompute, .chunk_embeddings = .recompute, .rerank_terms = .recompute };
+        const indexes = try std.fmt.allocPrint(
+            a,
+            "{{\"alias_{d}\":{{\"type\":\"graph\",\"metrics\":{{\"degree\":{{\"kind\":\"degree\"}},\"rank\":{{\"kind\":\"pagerank\",\"max_iterations\":20}}}}}}}}",
+            .{round},
+        );
+        defer a.free(indexes);
+        metadata_plan.table_definition.indexes_json = indexes;
+        counting.counts = .{};
+        const start = std.Io.Timestamp.now(io, .awake);
+        var result = try builder.publishNamespaceWithMetricAndPlan("docs", .cosine, metadata_plan);
+        defer result.deinit(a);
+        const elapsed: u64 = @intCast(std.Io.Timestamp.now(io, .awake).toNanoseconds() - start.toNanoseconds());
+        try std.testing.expect(result.published);
+        var published = try manifests.getAlloc("docs", result.version);
+        defer published.deinit(a);
+        try std.testing.expectEqualStrings(source_facts.artifact_id, factsRef(published).artifact_id);
+        try std.testing.expectEqual(source.stats.document_count, published.stats.document_count);
+        for (published.artifacts) |ref| {
+            if (ref.kind != .graph_segment) continue;
+            for (source.artifacts) |prior| {
+                if (prior.kind != .graph_segment) continue;
+                try std.testing.expectEqualStrings(prior.artifact_id, ref.artifact_id);
+                try std.testing.expectEqual(prior.edge_generation, ref.edge_generation);
+                break;
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 0), counting.counts.puts);
+        try std.testing.expect(counting.counts.read_bytes < 16 * 1024);
+        if (round != 0) samples[round - 1] = .{ .ns = elapsed, .counts = counting.counts };
+    }
+    std.mem.sort(Sample, &samples, {}, struct {
+        fn less(_: void, lhs: Sample, rhs: Sample) bool {
+            return lhs.ns < rhs.ns;
+        }
+    }.less);
+    const median = samples[2];
+    if (report) std.debug.print("metadata_publication_qualification docs={} degree={} median_ns={} artifact_gets={} read_bytes={} artifact_puts={} write_bytes={} stats={} verifies={} samples=5\n", .{
+        count, degree, median.ns, median.counts.gets, median.counts.read_bytes, median.counts.puts, median.counts.write_bytes, median.counts.stats, median.counts.verifies,
+    });
+}
+
+fn factsRef(manifest: manifest_mod.Manifest) manifest_mod.ArtifactRef {
+    for (manifest.artifacts) |ref| if (ref.kind == .document_facts) return ref;
+    unreachable;
 }
 
 fn hubBody(degree: usize, round: usize) ![]u8 {

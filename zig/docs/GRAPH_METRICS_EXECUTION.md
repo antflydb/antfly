@@ -48,8 +48,32 @@ Prediction reads the pinned document-facts root and only WAL-touched bodies.
 Persisted aggregate counters supply scheduling coverage without a corpus scan.
 Publication independently derives an exact-source-fenced touched-document plan;
 status requests do not leave mutable plans cached across HEAD changes.
-Policy changes and affected flat text/vector projections explicitly take the
-admitted full-rebuild path. Graph-only updates do not hydrate unrelated bodies.
+Only changes to facts semantics or affected flat text/vector projections take
+the admitted rebuild path. Graph aliases, metric configuration and unrelated
+index settings do not invalidate the facts fingerprint. Metadata-only publication
+reuses the facts tree and unchanged root, without fetching document bodies.
+Graph-only updates do not hydrate unrelated bodies.
+
+Catalog enrichment completion reads exact pending counters from a pinned facts
+root. When the requested enrichment semantics differ, it streams authoritative
+bodies under a read budget to calculate the new counts; an unreadable source is
+an error, never an indication that enrichment is complete. Workers likewise
+read facts, not the flat compaction base plus its latest-only mutation segment.
+Each worker batch resumes by authenticated subtree rank in O(tree height),
+holds at most one body at a time, and bounds both scans and source bytes. Source
+read pins and publication/WAL fences protect every emitted full-body upsert.
+
+All newly written publication artifacts, including flat search/document
+segments, use namespace- and attempt-scoped identities. Existing immutable
+references retain their identities when reused. GC fences old attempts before
+sweeping their inventory, rechecks candidate authority before collecting its
+references, and conditionally removes only a retired manifest identity. Object
+stores use the ETag from that exact manifest read; filesystem creation and
+candidate deletion share a cross-process mutation lock. A delayed collector
+cannot delete a newer candidate that reused the same numeric version. Stores
+without conditional removal fail closed. Unscoped synthetic/old candidate
+references are conservatively retained; current production writers do not
+create such uploads.
 
 ### Incremental serverless graph roots
 

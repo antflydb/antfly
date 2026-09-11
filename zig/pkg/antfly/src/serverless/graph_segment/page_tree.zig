@@ -597,6 +597,40 @@ pub const Cursor = struct {
         return self;
     }
 
+    /// Resume an ordered stream by its stable record offset without reading
+    /// preceding leaves. Authenticated subtree counts bound this to one path.
+    pub fn initAtRank(alloc: Allocator, store: Store, root: ?Ref, rank: u64) !Cursor {
+        var self: Cursor = .{ .alloc = alloc, .store = store, .upper = null };
+        errdefer self.deinit();
+        var ref = root orelse return self;
+        if (rank >= ref.records) return self;
+        var remaining = rank;
+        var first: ?[]const u8 = null;
+        var end: ?[]const u8 = null;
+        while (true) {
+            if (self.depth == self.frames.len) return error.InvalidGraphPage;
+            var page = try load(alloc, store, ref);
+            errdefer page.deinit(alloc);
+            if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+            if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+            if (ref.height == 0) {
+                if (remaining >= page.entries.len) return error.InvalidGraphPage;
+                self.frames[self.depth] = .{ .page = page, .next = @intCast(remaining), .end = end };
+                self.depth += 1;
+                return self;
+            }
+            var index: usize = 0;
+            while (index < page.entries.len and remaining >= page.entries[index].child.?.records) : (index += 1)
+                remaining -= page.entries[index].child.?.records;
+            if (index == page.entries.len) return error.InvalidGraphPage;
+            self.frames[self.depth] = .{ .page = page, .next = index + 1, .end = end };
+            self.depth += 1;
+            ref = page.entries[index].child.?;
+            first = page.entries[index].key;
+            if (index + 1 < page.entries.len) end = page.entries[index + 1].key;
+        }
+    }
+
     pub fn deinit(self: *Cursor) void {
         for (self.frames[0..self.depth]) |*frame| frame.page.deinit(self.alloc);
         self.depth = 0;
@@ -760,6 +794,33 @@ const TestStore = struct {
         try self.pages.put(self.alloc, ref.digest, owned);
     }
 };
+
+test "serverless graph page tree rank cursors resume without reading earlier leaves" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const value = [_]u8{42} ** 128;
+    for (names, changes, 0..) |*name, *change, i| {
+        std.mem.writeInt(u64, name, i, .big);
+        change.* = .{ .key = name, .value = &value };
+    }
+    const root = (try apply(a, backing.store(), null, changes)).?;
+    for ([_]u64{ 0, 1, 233, 1024, count - 2, count - 1, count, count + 1 }) |rank| {
+        const reads = backing.reads;
+        var cursor = try Cursor.initAtRank(a, backing.store(), root, rank);
+        defer cursor.deinit();
+        try std.testing.expect(backing.reads - reads <= @as(usize, root.height) + 1);
+        var expected = rank;
+        while (try cursor.next()) |record| : (expected += 1)
+            try std.testing.expectEqual(expected, std.mem.readInt(u64, record.key[0..8], .big));
+        try std.testing.expectEqual(@max(rank, count), expected);
+    }
+}
 
 test "serverless graph page tree ordered batches preserve snapshots and bound one-record rewrite" {
     const alloc = std.testing.allocator;
@@ -958,6 +1019,9 @@ fn allocationExercise(alloc: Allocator) !void {
     var cursor = try Cursor.init(alloc, backing.store(), next, "c", "i");
     defer cursor.deinit();
     while (try cursor.next()) |_| {}
+    var ranked = try Cursor.initAtRank(alloc, backing.store(), next, 3);
+    defer ranked.deinit();
+    while (try ranked.next()) |_| {}
 }
 
 test "serverless graph page tree releases every allocation on failed build update and scan" {

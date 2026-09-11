@@ -20,11 +20,12 @@ const api_types = @import("../api/types.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const document_projection = @import("../document_projection.zig");
-const document_segment_mod = @import("../document_segment/mod.zig");
+const document_facts = @import("../build/document_facts.zig");
+const page_tree = @import("../graph_segment/page_tree.zig");
+const PageStore = @import("../graph_segment/page_store.zig").PageStore;
+const read_lease = @import("../manifest/read_lease.zig");
 const manifest_mod = @import("../manifest/mod.zig");
-const query_mod = @import("../query/mod.zig");
 const query_reader = @import("../query/indexed_reader.zig");
-const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const embedder_mod = @import("../../storage/db/enrichment/embedder.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
@@ -53,11 +54,45 @@ pub const rerank_terms_enrichment_version: u32 = 1;
 
 pub const SparseEnricherConfig = struct {
     batch_size: usize = 32,
+    /// Bound scans even when most documents already contain this output.
+    scan_batch_size: usize = 1024,
+    max_source_read_bytes: u64 = 64 * 1024 * 1024,
     pipeline_version: u32 = lexical_sparse_enrichment_version,
     stage: catalog_mod.EnrichmentStage = .lexical_sparse,
     model_preference: catalog_mod.EnrichmentModelPreference = .prefer_model,
     failure_policy: catalog_mod.EnrichmentFailurePolicy = .skip_document,
     cancellation: CancellationToken = .none,
+};
+
+const SourcePin = struct {
+    progress: *catalog_mod.ProgressStore,
+    namespace: []const u8,
+    version: u64,
+    parent: ?maintenance_cancellation.Token,
+    cancellation: CancellationToken,
+    lease: read_lease.Lease,
+    cache: read_lease.Cache = .{},
+
+    fn check(self: *SourcePin) !void {
+        try maintenance_cancellation.check(self.parent);
+        try self.cancellation.check();
+        try self.lease.check();
+        if (self.lease.unix_deadline -| @import("antfly_platform").time.realtimeNs() < read_lease.reuse_min_ns)
+            self.lease = try self.cache.acquire(self.progress, self.namespace, self.version);
+    }
+
+    fn token(self: *SourcePin) CancellationToken {
+        const Callbacks = struct {
+            fn run(ptr: *const anyopaque) !void {
+                try @as(*SourcePin, @ptrCast(@alignCast(@constCast(ptr)))).check();
+            }
+            fn canceled(ptr: *const anyopaque) bool {
+                run(ptr) catch return true;
+                return false;
+            }
+        };
+        return .{ .ptr = self, .check_fn = Callbacks.run, .is_cancelled_fn = Callbacks.canceled };
+    }
 };
 
 const DerivedBodyResult = struct {
@@ -159,12 +194,16 @@ pub const SparseEnricher = struct {
         cfg: SparseEnricherConfig,
         cancellation: ?maintenance_cancellation.Token,
     ) !EnrichmentRunStats {
+        if (cfg.batch_size == 0 or cfg.scan_batch_size == 0 or cfg.max_source_read_bytes == 0) return error.InvalidEnrichmentLimits;
         try maintenance_cancellation.check(cancellation);
         try cfg.cancellation.check();
         const head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => return .{ .idle_namespaces = 1 },
             else => return err,
         };
+        var lease_cache: read_lease.Cache = .{};
+        var pin: SourcePin = .{ .progress = self.progress, .namespace = namespace, .version = head, .parent = cancellation, .cancellation = cfg.cancellation, .lease = try lease_cache.acquire(self.progress, namespace, head) };
+        try pin.check();
         var manifest = try self.manifests.getAlloc(namespace, head);
         defer manifest.deinit(self.alloc);
         const latest_lsn = try self.wal.latestLsn(namespace);
@@ -178,12 +217,18 @@ pub const SparseEnricher = struct {
         if (!self.wal.supportsConditionalIdempotentAppend())
             return error.IdempotentAppendUnsupported;
 
-        const docs = try self.loadPublishedDocsAlloc(manifest);
-        defer query_mod.freeMaterializedDocuments(self.alloc, docs);
-        try maintenance_cancellation.check(cancellation);
-        try cfg.cancellation.check();
+        // Facts are the authoritative snapshot. The document segment is only
+        // a compaction base; its latest-only mutation sidecar is not a history.
+        const facts_index = findArtifactIndex(manifest, .document_facts) orelse return error.DocumentFactsNotFound;
+        for (manifest.artifacts[facts_index + 1 ..]) |artifact| if (artifact.kind == .document_facts) return error.InvalidDocumentFactsRoot;
+        var remaining = cfg.max_source_read_bytes;
+        var no_writes: u64 = 0;
+        var pages: PageStore = .{ .domain = PageStore.namespaceDomain(namespace), .artifacts = self.artifacts, .cancellation = pin.token(), .remaining_read_bytes = &remaining, .remaining_write_bytes = &no_writes };
+        const facts = try document_facts.loadRoot(self.alloc, &pages, manifest.artifacts[facts_index]);
+        if (facts.wal_end_lsn != manifest.wal_end_lsn or facts.document_count != manifest.stats.document_count) return error.DocumentFactsSourceChanged;
+        try pin.check();
 
-        // Loading and materializing the immutable manifest can be expensive.
+        // Loading the immutable manifest can overlap another publication.
         // Do not initialize progress or emit work if publication moved while
         // it was in flight. The atomic stage state below prevents a stale
         // worker from regressing progress after a newer worker takes over.
@@ -222,19 +267,32 @@ pub const SparseEnricher = struct {
                 return error.EnrichmentProgressChanged;
             stage_progress = next;
         }
-        const start_offset: usize = @intCast(stage_progress.?.doc_offset);
-        if (start_offset >= docs.len) {
+        const start_offset = stage_progress.?.doc_offset;
+        if (start_offset >= facts.document_count) {
             return .{ .idle_namespaces = 1 };
         }
 
         var stats = EnrichmentRunStats{};
-        var next_offset: usize = start_offset;
+        var next_offset: u64 = start_offset;
         var expected_latest_lsn = latest_lsn;
-        for (docs[start_offset..], start_offset..) |doc, doc_index| {
-            try maintenance_cancellation.check(cancellation);
-            try cfg.cancellation.check();
-            next_offset = doc_index + 1;
-            const derived = buildDerivedBodyAlloc(self, cfg.stage, doc.body, cfg.pipeline_version, cfg.model_preference) catch |err| {
+        var cursor = try page_tree.Cursor.initAtRank(self.alloc, pages.store(), facts.page, start_offset);
+        defer cursor.deinit();
+        var scanned: usize = 0;
+        while (scanned < cfg.scan_batch_size) : (scanned += 1) {
+            const record = (cursor.next() catch |err| {
+                if (err == error.ArtifactReadBudgetExceeded and next_offset > start_offset) break;
+                return err;
+            }) orelse break;
+            try pin.check();
+            const fact = try document_facts.Fact.decode(record.value);
+            const doc_index = std.math.cast(usize, next_offset) orelse return error.InvalidEnrichmentProgress;
+            // A transport allowance ends this batch, not the namespace's
+            // worker. Leave the next record's offset untouched for resumption.
+            if (fact.body.bytes > remaining and next_offset > start_offset) break;
+            const source_body = try document_facts.readBodyAlloc(self.alloc, &pages, fact.body);
+            defer self.alloc.free(source_body);
+            next_offset += 1;
+            const derived = buildDerivedBodyAlloc(self, cfg.stage, source_body, cfg.pipeline_version, cfg.model_preference) catch |err| {
                 if (isRecoverableEnrichmentError(err)) {
                     stats.failed_documents += 1;
                     if (cfg.failure_policy == .fail_stage) {
@@ -246,17 +304,17 @@ pub const SparseEnricher = struct {
                 return err;
             };
             defer if (derived.body) |body| self.alloc.free(body);
-            try maintenance_cancellation.check(cancellation);
+            try pin.check();
             const body = derived.body orelse continue;
             const mutation = api_types.DocumentMutation{
                 .kind = .upsert,
-                .doc_id = doc.doc_id,
+                .doc_id = record.key,
                 .body = body,
             };
             const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
             defer self.alloc.free(encoded);
-            try cfg.cancellation.check();
-            const timestamp_ns = std.math.add(u64, doc.last_timestamp_ns, 1) catch
+            try pin.check();
+            const timestamp_ns = std.math.add(u64, fact.last_timestamp_ns, 1) catch
                 return error.EnrichmentTimestampOverflow;
             var operation_id_buf: [128]u8 = undefined;
             const operation_id = try enrichmentOperationId(
@@ -281,7 +339,7 @@ pub const SparseEnricher = struct {
             if (stats.wal_appends >= cfg.batch_size) break;
         }
 
-        try maintenance_cancellation.check(cancellation);
+        try pin.check();
         const previous = (try self.progress.getEnrichmentStageProgress(namespace, cfg.stage)) orelse
             return error.EnrichmentProgressChanged;
         if (previous.head_version != head) return error.EnrichmentProgressChanged;
@@ -304,72 +362,6 @@ pub const SparseEnricher = struct {
             stats.enriched_namespaces = 1;
         }
         return stats;
-    }
-
-    fn loadPublishedDocsAlloc(self: *SparseEnricher, manifest: manifest_mod.Manifest) ![]query_mod.QueryMaterializedDocument {
-        const document_index = findArtifactIndex(manifest, .document_segment) orelse return error.DocumentSegmentNotFound;
-        const payload = try self.artifacts.getAlloc(manifest.artifacts[document_index].artifact_id);
-        defer self.alloc.free(payload);
-        const entries = try document_segment_mod.decodeAlloc(self.alloc, payload);
-        defer document_segment_mod.freeEntries(self.alloc, entries);
-        const base_docs = try allocMaterializedDocuments(self.alloc, entries);
-        errdefer query_mod.freeMaterializedDocuments(self.alloc, base_docs);
-
-        const mutation_index = findArtifactIndex(manifest, .mutation_segment) orelse return base_docs;
-        const mutation_payload = try self.artifacts.getAlloc(manifest.artifacts[mutation_index].artifact_id);
-        defer self.alloc.free(mutation_payload);
-        const mutation_entries = try segment_mod.decodeAlloc(self.alloc, mutation_payload);
-        defer segment_mod.freeEntries(self.alloc, mutation_entries);
-        const overlay = try allocMaterializerMutations(self.alloc, mutation_entries);
-        defer freeMaterializerMutations(self.alloc, overlay);
-        const docs = try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, base_docs, overlay);
-        query_mod.freeMaterializedDocuments(self.alloc, base_docs);
-        return docs;
-    }
-
-    fn allocMaterializedDocuments(alloc: Allocator, entries: []const document_segment_mod.Entry) ![]query_mod.QueryMaterializedDocument {
-        const docs = try alloc.alloc(query_mod.QueryMaterializedDocument, entries.len);
-        errdefer alloc.free(docs);
-        var initialized: usize = 0;
-        errdefer {
-            for (docs[0..initialized]) |*doc| doc.deinit(alloc);
-        }
-        for (entries, 0..) |entry, idx| {
-            docs[idx] = .{
-                .doc_id = try alloc.dupe(u8, entry.doc_id),
-                .body = try alloc.dupe(u8, entry.body),
-                .last_lsn = entry.last_lsn,
-                .last_timestamp_ns = entry.last_timestamp_ns,
-            };
-            initialized += 1;
-        }
-        return docs;
-    }
-
-    fn allocMaterializerMutations(alloc: Allocator, entries: []const segment_mod.Entry) ![]query_mod.QueryMaterializerMutation {
-        const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, entries.len);
-        errdefer alloc.free(mutations);
-        var initialized: usize = 0;
-        errdefer freeMaterializerMutations(alloc, mutations[0..initialized]);
-        for (entries, 0..) |entry, idx| {
-            mutations[idx] = .{
-                .lsn = entry.lsn,
-                .timestamp_ns = entry.timestamp_ns,
-                .kind = entry.kind,
-                .doc_id = try alloc.dupe(u8, entry.doc_id),
-                .body = if (entry.body) |body| try alloc.dupe(u8, body) else null,
-            };
-            initialized += 1;
-        }
-        return mutations;
-    }
-
-    fn freeMaterializerMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializerMutation) void {
-        for (mutations) |mutation| {
-            alloc.free(mutation.doc_id);
-            if (mutation.body) |body| alloc.free(body);
-        }
-        alloc.free(mutations);
     }
 };
 
@@ -1466,6 +1458,83 @@ test "serverless enrichment fails closed before a non-idempotent append" {
     );
     try std.testing.expectEqual(@as(?u64, null), try progress_store.getEnrichmentDocOffset("docs"));
     try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn("docs"));
+}
+
+test "serverless enrichment preserves successive partial facts publications and graph edges" {
+    const a = std.testing.allocator;
+    var artifact_buf: [256]u8 = undefined;
+    var manifest_buf: [256]u8 = undefined;
+    var wal_buf: [256]u8 = undefined;
+    const artifact_path = tmpPath(&artifact_buf, "facts-artifacts");
+    const manifest_path = tmpPath(&manifest_buf, "facts-manifests");
+    const wal_path = tmpPath(&wal_buf, "facts-wal");
+    defer cleanupTmp(artifact_path);
+    defer cleanupTmp(manifest_path);
+    defer cleanupTmp(wal_path);
+    var artifact_impl = try artifacts_mod.FsStore.init(a, std.mem.span(artifact_path));
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_mod.FsStore.init(a, std.mem.span(manifest_path));
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try catalog_mod.FsProgressStore.init(a, std.mem.span(manifest_path));
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_mod.FsStore.init(a, std.mem.span(wal_path));
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+    var builder = @import("../build/builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
+    var api = @import("../api/service.zig").Service.init(a, &wal, &builder);
+    const batches = [_][]const api_types.DocumentMutation{
+        &.{ .{ .kind = .upsert, .doc_id = "a", .body = "{\"text\":\"original\"}" }, .{ .kind = .upsert, .doc_id = "b", .body = "{\"text\":\"before\"}" } },
+        &.{.{ .kind = .upsert, .doc_id = "a", .body = "{\"text\":\"updated alpha\",\"graph_edges\":[{\"target\":\"c\",\"edge_type\":\"link\",\"weight\":2}]}" }},
+        &.{.{ .kind = .upsert, .doc_id = "b", .body = "{\"text\":\"updated bravo\"}" }},
+    };
+    for (batches, 0..) |batch, i| {
+        var ingested = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = i + 100, .mutations = batch });
+        defer ingested.deinit(a);
+        var built = try builder.publishNamespace("docs");
+        built.deinit(a);
+    }
+    const previous_lsn = try wal.latestLsn("docs");
+    var enricher = SparseEnricher.init(a, &artifacts, &manifests, &progress, &wal);
+    defer enricher.deinit();
+    const stats = try enricher.runNamespaceWithConfig("docs", .{ .scan_batch_size = 8 });
+    try std.testing.expectEqual(@as(usize, 2), stats.enriched_documents);
+    try std.testing.expect((try progress.getManifestReadDeadline("docs", 3)) != null);
+    const tail = try wal.readFromAlloc("docs", previous_lsn + 1);
+    defer wal_mod.freeRecords(a, tail);
+    try std.testing.expectEqual(@as(usize, 2), tail.len);
+    var first = try api_codec.decodeMutationAlloc(a, tail[0].payload);
+    defer first.deinit(a);
+    var parsed = try @import("antfly-json").parseFromSlice(std.json.Value, a, first.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a", first.doc_id);
+    try std.testing.expectEqualStrings("updated alpha", parsed.value.object.get("text").?.string);
+    try std.testing.expectEqualStrings("c", parsed.value.object.get("graph_edges").?.array.items[0].object.get("target").?.string);
+    var published = try builder.publishNamespace("docs");
+    published.deinit(a);
+    var current = try manifests.getAlloc("docs", try progress.getHead("docs"));
+    defer current.deinit(a);
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 0;
+    var pages: PageStore = .{ .domain = PageStore.namespaceDomain("docs"), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const graph_root = try pages.loadRoot(a, current.artifacts[findArtifactIndex(current, .graph_segment).?]);
+    var edges = try @import("../graph_segment/page_graph.zig").Cursor.adjacency(a, pages.store(), graph_root, "a", .outgoing, "link");
+    defer edges.deinit();
+    try std.testing.expectEqualStrings("c", (try edges.next()).?.target);
+    try std.testing.expect(try edges.next() == null);
+
+    // An already-enriched corpus must still advance in bounded scans. The
+    // next pass resumes by rank rather than decoding all earlier documents.
+    const stable_lsn = try wal.latestLsn("docs");
+    const first_scan = try enricher.runNamespaceWithConfig("docs", .{ .scan_batch_size = 1 });
+    try std.testing.expectEqual(@as(usize, 0), first_scan.wal_appends);
+    try std.testing.expectEqual(@as(u64, 1), (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?.doc_offset);
+    const second_scan = try enricher.runNamespaceWithConfig("docs", .{ .scan_batch_size = 1 });
+    try std.testing.expectEqual(@as(usize, 0), second_scan.wal_appends);
+    try std.testing.expectEqual(@as(u64, 2), (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?.doc_offset);
+    try std.testing.expectEqual(stable_lsn, try wal.latestLsn("docs"));
 }
 
 test "serverless enrichment WAL fence rejects a user mutation that lands during model work" {

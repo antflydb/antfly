@@ -92,4 +92,22 @@ pub fn exercise(store: *artifacts.ArtifactStore) !void {
     try std.testing.expect(visitor.seen.contains(late.artifact_id));
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, store.visitScopedUploads(scope.domain, visitor.capability(), CancellationToken.fromAtomic(&canceled)));
+    // A publication-local capability scopes plain and cancellable writes too;
+    // an explicit root nonce may differ, but authority must not escape.
+    var publication = store.*;
+    publication.upload_scope = scope;
+    var implicit = try publication.put("same content");
+    defer implicit.deinit(store.allocator);
+    try std.testing.expectEqualStrings(first.artifact_id, implicit.artifact_id);
+    var cancellable = try publication.putWithCancellation("same content", .none);
+    defer cancellable.deinit(store.allocator);
+    try std.testing.expectEqualStrings(first.artifact_id, cancellable.artifact_id);
+    try std.testing.expectError(error.InvalidArtifactUploadScope, publication.putScoped(other_attempt, "rejected", .none));
+    try std.testing.expectError(error.InvalidArtifactUploadScope, publication.putScoped(other_domain, "rejected", .none));
+    var sibling = scope;
+    sibling.attempt[15] ^= 1;
+    var explicit = try publication.putScoped(sibling, "same content", .none);
+    defer explicit.deinit(store.allocator);
+    try std.testing.expectEqual(sibling, (try artifacts.uploadScopeFromArtifactId(explicit.artifact_id)).?);
+    try std.testing.expect(store.upload_scope == null);
 }

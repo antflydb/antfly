@@ -149,8 +149,7 @@ pub const Pruner = struct {
                     defer candidate.deinit(self.alloc);
                     if (candidate.publication_fencing_token == 0 or candidate.publication_fencing_token >= retired_before) continue;
                     try validateScopedRoots(namespace, candidate.artifacts);
-                    try self.manifests.deleteVersion(namespace, version);
-                    result.deleted_versions += 1;
+                    if (try self.manifests.deleteRetiredCandidate(namespace, version, retired_before)) result.deleted_versions += 1;
                 }
                 return result;
             },
@@ -258,6 +257,14 @@ pub const Pruner = struct {
             try validateScopedRoots(namespace, manifest.artifacts);
             if (version > published_head and manifest.publication_fencing_token != 0 and manifest.publication_fencing_token < retired_before) {
                 try retired_candidates.put(self.alloc, version, {});
+                // Global content IDs cannot prove publication ownership. They
+                // may be reused by a concurrent writer and are not eligible
+                // for candidate cleanup. Production uploads use scoped IDs;
+                // retain old/custom unscoped references conservatively.
+                for (manifest.artifacts) |artifact| {
+                    if (try scoped_artifacts.uploadScopeFromArtifactId(artifact.artifact_id) == null)
+                        try collectArtifactIds(self.alloc, &retained_artifacts, &.{artifact});
+                }
                 continue;
             }
             for (manifest.artifacts) |artifact| {
@@ -281,8 +288,16 @@ pub const Pruner = struct {
         for (versions) |version| {
             if ((version > published_head and !retired_candidates.contains(version)) or kept_versions.contains(version)) continue;
             try maintenance_cancellation.check(cancellation);
-            var manifest = try self.manifests.getAlloc(namespace, version);
+            var manifest = self.manifests.getAlloc(namespace, version) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
             defer manifest.deinit(self.alloc);
+            // Another collector may have removed this orphan and a newer
+            // publication may reuse its version. Never collect the replacement
+            // graph/facts roots using an earlier candidate classification.
+            if (version > published_head and
+                (manifest.publication_fencing_token == 0 or manifest.publication_fencing_token >= retired_before)) continue;
             try validateScopedRoots(namespace, manifest.artifacts);
             try collectUnretainedArtifactIds(self.alloc, &pruned_artifacts, retained_artifacts, manifest.artifacts);
             for (manifest.artifacts) |artifact| {
@@ -331,8 +346,15 @@ pub const Pruner = struct {
         for (versions) |version| {
             if ((version > published_head and !retired_candidates.contains(version)) or kept_versions.contains(version)) continue;
             try maintenance_cancellation.check(cancellation);
-            try self.manifests.deleteVersion(namespace, version);
-            deleted_versions += 1;
+            if (version > published_head) {
+                if (try self.manifests.deleteRetiredCandidate(namespace, version, retired_before)) deleted_versions += 1;
+            } else {
+                self.manifests.deleteVersion(namespace, version) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                deleted_versions += 1;
+            }
         }
 
         try maintenance_cancellation.check(cancellation);
@@ -482,7 +504,13 @@ test "serverless retention fences upload attempts and rediscovers late orphan up
     const failed_scope = try scoped_artifacts.UploadScope.forPublication(domain, failed.acquisition.fencing_token, io);
     var orphan = try artifacts.putScoped(failed_scope, "orphan", .none);
     defer orphan.deinit(alloc);
-    var candidate_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = published.artifact_id, .checksum = published.checksum, .byte_len = published.byte_len }};
+    var unscoped = try artifacts.put("custom global content ID");
+    defer unscoped.deinit(alloc);
+    var candidate_refs = [_]manifest_mod.ArtifactRef{
+        .{ .kind = .document_segment, .artifact_id = published.artifact_id, .checksum = published.checksum, .byte_len = published.byte_len },
+        .{ .kind = .mutation_segment, .artifact_id = orphan.artifact_id, .checksum = orphan.checksum, .byte_len = orphan.byte_len },
+        .{ .kind = .text_segment, .artifact_id = unscoped.artifact_id, .checksum = unscoped.checksum, .byte_len = unscoped.byte_len },
+    };
     // The candidate's own fencing token matters, not the older scope of its
     // reused content. Retirement removes only the candidate, not shared bytes.
     try manifests.put(.{ .namespace = "docs", .version = 2, .built_at_ns = 2, .wal_start_lsn = 0, .wal_end_lsn = 0, .publication_fencing_token = failed.acquisition.fencing_token, .publication_lineage_tracked = true, .publication_parent_version = 1, .stats = .{ .document_count = 1, .document_base_version = 1 }, .artifacts = &candidate_refs });
@@ -503,6 +531,10 @@ test "serverless retention fences upload attempts and rediscovers late orphan up
     defer kept.deinit(alloc);
     var future_kept = try artifacts.stat(future.artifact_id);
     defer future_kept.deinit(alloc);
+    // Custom unscoped IDs have no retirement authority; scoped flat segments
+    // are reclaimed, but never infer ownership of a global content ID.
+    var unscoped_kept = try artifacts.stat(unscoped.artifact_id);
+    defer unscoped_kept.deinit(alloc);
     try std.testing.expectError(error.WorkLeaseLost, progress.compareAndSwapHeadFenced("docs", 1, 2, .{ .owner_id = "failed", .fencing_token = failed.acquisition.fencing_token }));
     var late = try artifacts.putScoped(failed_scope, "orphan", .none);
     defer late.deinit(alloc);
@@ -832,6 +864,131 @@ test "serverless retention snapshots HEAD before concurrent publication and fail
         try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
         if (!remove_old) try manifests.deleteVersion("docs", 1);
         try std.testing.expectError(error.PublishedHeadManifestMissing, pruner.pruneNamespace("docs", 1));
+    }
+}
+
+test "serverless retention never sweeps recreated candidate artifacts or deletes replacement manifests" {
+    const Race = struct {
+        manifests: *manifest_mod.ManifestStore,
+        replacement: manifest_mod.Manifest,
+        replace_before_collection: bool,
+        candidate_reads: usize = 0,
+        fired: bool = false,
+
+        fn state(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn replace(self: *@This()) !void {
+            if (self.fired) return;
+            self.fired = true;
+            try std.testing.expect(try self.manifests.deleteRetiredCandidate("docs", self.replacement.version, 2));
+            try self.manifests.put(self.replacement);
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, ns: []const u8, version: u64) !manifest_mod.Manifest {
+            const self = state(ptr);
+            if (version == self.replacement.version) {
+                self.candidate_reads += 1;
+                if (self.replace_before_collection and self.candidate_reads == 2) try self.replace();
+            }
+            return self.manifests.vtable.get_alloc(self.manifests.ptr, alloc, ns, version);
+        }
+        fn removeCandidate(ptr: *anyopaque, ns: []const u8, version: u64, cutoff: u64) !bool {
+            const self = state(ptr);
+            try self.replace();
+            return self.manifests.deleteRetiredCandidate(ns, version, cutoff);
+        }
+        fn put(ptr: *anyopaque, manifest: manifest_mod.Manifest) !void {
+            return state(ptr).manifests.put(manifest);
+        }
+        fn setHead(ptr: *anyopaque, ns: []const u8, version: u64) !void {
+            return state(ptr).manifests.setHead(ns, version);
+        }
+        fn getHead(ptr: *anyopaque, ns: []const u8) !u64 {
+            return state(ptr).manifests.getHead(ns);
+        }
+        fn cas(ptr: *anyopaque, ns: []const u8, expected: ?u64, version: u64) !bool {
+            return state(ptr).manifests.compareAndSwapHead(ns, expected, version);
+        }
+        fn list(ptr: *anyopaque, alloc: Allocator, ns: []const u8) ![]u64 {
+            const self = state(ptr);
+            return self.manifests.vtable.list_versions_alloc(self.manifests.ptr, alloc, ns);
+        }
+        fn remove(ptr: *anyopaque, ns: []const u8, version: u64) !void {
+            return state(ptr).manifests.deleteVersion(ns, version);
+        }
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        const vtable: manifest_mod.ManifestStore.VTable = .{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = get,
+            .set_head = setHead,
+            .get_head = getHead,
+            .compare_and_swap_head = cas,
+            .list_versions_alloc = list,
+            .delete_version = remove,
+            .delete_retired_candidate = removeCandidate,
+        };
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |has_head| {
+        for ([_]bool{ false, true }) |replace_before_collection| {
+            if (!has_head and replace_before_collection) continue;
+            var memory = objectstore.MemoryClient.init(alloc);
+            defer memory.deinit();
+            var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "artifacts", "");
+            var artifacts = artifact_impl.artifactStore();
+            defer artifacts.deinit();
+            var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "manifests", "");
+            var manifests = manifest_impl.manifestStore();
+            defer manifests.deinit();
+            var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "progress", "");
+            var progress = progress_impl.progressStore();
+            defer progress.deinit();
+            var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "wal", "");
+            var wal = wal_impl.walStore();
+            defer wal.deinit();
+            var old_artifact = try artifacts.put("old");
+            defer old_artifact.deinit(alloc);
+            var replacement_artifact = try artifacts.put("new publication body");
+            defer replacement_artifact.deinit(alloc);
+            if (has_head) {
+                try putTestManifest(&manifests, 1, 0, old_artifact);
+                try std.testing.expect(try progress.compareAndSwapHead("docs", null, 1));
+            }
+            const candidate_version: u64 = if (has_head) 2 else 1;
+            var old_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = old_artifact.artifact_id, .checksum = old_artifact.checksum, .byte_len = old_artifact.byte_len }};
+            var candidate: manifest_mod.Manifest = .{
+                .namespace = "docs",
+                .version = candidate_version,
+                .built_at_ns = 1,
+                .wal_start_lsn = 0,
+                .wal_end_lsn = 0,
+                .stats = .{},
+                .artifacts = &old_refs,
+                .publication_fencing_token = 1,
+            };
+            try manifests.put(candidate);
+            // Reserve the old worker's token; the collector obtains token 2.
+            var old_lease = (try work_lease.acquireHeld(try progress.workLeaseProvider(), std.testing.io, "docs", "old", std.time.ns_per_s)).?;
+            try std.testing.expect(try old_lease.release());
+            var new_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = replacement_artifact.artifact_id, .checksum = replacement_artifact.checksum, .byte_len = replacement_artifact.byte_len }};
+            candidate.publication_fencing_token = 3;
+            candidate.artifacts = &new_refs;
+            var race: Race = .{ .manifests = &manifests, .replacement = candidate, .replace_before_collection = replace_before_collection };
+            var wrapped: manifest_mod.ManifestStore = .{ .allocator = alloc, .ptr = &race, .vtable = &Race.vtable };
+            var pruner = Pruner.init(alloc, &artifacts, &wrapped, &progress, &wal);
+            var result = try pruner.pruneNamespace("docs", 1);
+            defer result.deinit(alloc);
+            try std.testing.expect(race.fired);
+            try std.testing.expectEqual(@as(usize, 0), result.deleted_versions);
+            var preserved = try manifests.getAlloc("docs", candidate_version);
+            defer preserved.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 3), preserved.publication_fencing_token);
+            const body = try artifacts.getAlloc(replacement_artifact.artifact_id);
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("new publication body", body);
+            try std.testing.expect(try progress.compareAndSwapHead("docs", if (has_head) 1 else null, candidate_version));
+        }
     }
 }
 

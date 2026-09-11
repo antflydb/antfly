@@ -18,6 +18,7 @@ const object_storage = @import("storage/object_storage.zig");
 test {
     _ = manifest_object_store;
     _ = @import("serverless/manifest/fs_store.zig");
+    _ = @import("serverless/manifest/remote_store.zig");
     _ = object_storage;
     _ = @import("serverless/build/retention.zig");
     _ = @import("serverless/catalog/fs_progress_store.zig");

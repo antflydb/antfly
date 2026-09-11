@@ -379,7 +379,14 @@ pub const Builder = struct {
             return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try GraphSourceProtection.init(self.progress, namespace, cancellation);
-        return self.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
+        var scoped_artifacts = self.artifacts.*;
+        scoped_artifacts.upload_scope = .{
+            .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+            .attempt = try graphPublicationAttempt(publication_guard, namespace, io),
+        };
+        var publisher = self.*;
+        publisher.artifacts = &scoped_artifacts;
+        return publisher.publishNamespaceWithMetricAndPlanPinnedUntil(namespace, vector_metric, plan, publication_guard, protection.token(io)) catch |err| return graphPublicationError(err, false);
     }
 
     fn publishNamespaceWithMetricAndPlanPinnedUntil(
@@ -841,6 +848,7 @@ pub const Builder = struct {
 
         var docs_cache: ?[]query_mod.QueryMaterializedDocument = null;
         defer if (docs_cache) |docs| query_mod.freeMaterializedDocuments(self.alloc, docs);
+        const reusable_facts = try reusableDocumentFactsAlloc(self.alloc, self.artifacts, current, plan.policy, plan.table_definition.indexes_json, cancellation);
 
         const document_ref = if (plan.artifact_actions.document_segment == .reuse) blk: {
             if (findArtifactIndex(current, .document_segment)) |artifact_index| {
@@ -900,10 +908,25 @@ pub const Builder = struct {
         defer freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
 
-        const republish_docs = if (plan.artifact_actions.sparse_vector == .drop and plan.artifact_actions.dense_vector == .drop)
-            &.{}
+        const sparse_sources = try search_sources.listSparseSourcesAlloc(self.alloc, targets.published_search_sources);
+        defer search_sources.freeSparseSourceDescriptors(self.alloc, sparse_sources);
+        const vector_sources = try search_sources.listVectorSourcesAlloc(self.alloc, targets.published_search_sources);
+        defer search_sources.freeVectorSourceDescriptors(self.alloc, vector_sources);
+        const needs_flat_docs = needs: {
+            for (sparse_sources) |source| {
+                const action = namedArtifactActionForName(plan.sparse_index_actions, source.index_name, plan.artifact_actions.sparse_vector);
+                if (action != .drop and (action != .reuse or !artifactAvailableForName(current, .sparse_segment, source.index_name))) break :needs true;
+            }
+            for (vector_sources) |source| {
+                const action = namedArtifactActionForName(plan.vector_index_actions, source.index_name, plan.artifact_actions.dense_vector);
+                if (action != .drop and (action != .reuse or !artifactAvailableForName(current, .vector_segment, source.index_name))) break :needs true;
+            }
+            break :needs false;
+        };
+        const republish_docs = if (needs_flat_docs)
+            try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation)
         else
-            try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation);
+            &.{};
         const sparse_refs = try buildSparseArtifactRefsForRepublishAlloc(
             self.alloc,
             self.artifacts,
@@ -933,7 +956,8 @@ pub const Builder = struct {
 
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_docs = if (plan.artifact_actions.graph == .drop or !targets.include_graph)
+        const graph_docs = if (plan.artifact_actions.graph == .drop or !targets.include_graph or
+            (plan.artifact_actions.graph == .reuse and findArtifactIndex(current, .graph_segment) != null))
             &.{}
         else
             try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation);
@@ -972,17 +996,15 @@ pub const Builder = struct {
             plan.derived_output_actions.chunk_embeddings == .recompute or
             plan.derived_output_actions.rerank_terms == .recompute)
         {
-            const docs = try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation);
-            scanned_derived_outputs = try detectMaterializedDerivedOutputsAlloc(
-                self.alloc,
-                docs,
-                current.stats.indexes_json,
-                .{
-                    .chunk_preview = plan.derived_output_actions.chunk_preview == .recompute,
-                    .chunk_embeddings = plan.derived_output_actions.chunk_embeddings == .recompute,
-                    .rerank_terms = plan.derived_output_actions.rerank_terms == .recompute,
-                },
-            );
+            const selection: DerivedOutputDetectionSelection = .{
+                .chunk_preview = plan.derived_output_actions.chunk_preview == .recompute,
+                .chunk_embeddings = plan.derived_output_actions.chunk_embeddings == .recompute,
+                .rerank_terms = plan.derived_output_actions.rerank_terms == .recompute,
+            };
+            scanned_derived_outputs = if (reusable_facts) |root|
+                try document_facts_builder.outputsFromCountsAlloc(self.alloc, root.counts, selection)
+            else
+                try detectMaterializedDerivedOutputsAlloc(self.alloc, try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation), plan.table_definition.indexes_json, selection);
         }
 
         var derived_outputs = try mergeDerivedOutputsAlloc(
@@ -1017,8 +1039,12 @@ pub const Builder = struct {
         );
         defer manifest.deinit(self.alloc);
         if (consumed_record) |record| manifest.built_at_ns = record.timestamp_ns;
-        const fact_docs = try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation);
-        try publishDocumentFactsForManifest(self.alloc, self.artifacts, &manifest, current, fact_docs, null, publication_guard, cancellation);
+        if (reusable_facts != null) {
+            try publishDocumentFactsForManifest(self.alloc, self.artifacts, &manifest, current, &.{}, &.{}, publication_guard, cancellation);
+        } else {
+            const fact_docs = try ensurePublishedDocumentsAlloc(self, namespace, current_head, &docs_cache, cancellation);
+            try publishDocumentFactsForManifest(self.alloc, self.artifacts, &manifest, current, fact_docs, null, publication_guard, cancellation);
+        }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
@@ -1396,6 +1422,21 @@ test "serverless graph publication resource limits retain actionable error categ
     try std.testing.expectEqual(error.LakeSidecarBuildBudgetExceeded, graphPublicationError(error.OutOfMemory, true));
     try std.testing.expectEqual(error.OutOfMemory, graphPublicationError(error.OutOfMemory, false));
     try std.testing.expectEqual(error.GraphPageRecordTooLarge, graphPublicationError(error.GraphPageRecordTooLarge, false));
+}
+
+/// A metadata-only operation can authenticate the fixed-size facts root and
+/// retain its immutable tree when neither documents nor counter semantics
+/// changed. The surrounding publication already owns source protection.
+fn reusableDocumentFactsAlloc(alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, current: manifest_mod.Manifest, policy: catalog_mod.NamespacePolicy, indexes_json: []const u8, cancellation: ?maintenance_cancellation.Token) !?document_facts.Root {
+    const idx = findArtifactIndex(current, .document_facts) orelse return null;
+    var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+    var reads: u64 = document_facts.Root.encoded_bytes;
+    var writes: u64 = 0;
+    var pages: graph_page_store.PageStore = .{ .domain = graph_page_store.PageStore.namespaceDomain(current.namespace), .artifacts = artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = try document_facts.loadRoot(alloc, &pages, current.artifacts[idx]);
+    if (root.wal_end_lsn != current.wal_end_lsn or root.document_count != current.stats.document_count) return error.DocumentFactsSourceChanged;
+    if (try document_facts_builder.needsRebuild(alloc, root, policy, indexes_json)) return null;
+    return root;
 }
 
 pub fn publishDocumentFactsForManifest(
@@ -4631,8 +4672,15 @@ fn stampGraphTopologyGenerations(
     for (graph_refs) |*graph_ref| {
         graph_ref.edge_generation = next_generation;
         const manifest = current orelse continue;
-        const previous_graph = findArtifactRefByName(manifest.artifacts, .graph_segment, graph_ref.name) orelse continue;
-        if (!artifactRefsIdentifySamePayload(previous_graph, graph_ref.*)) continue;
+        // Aliases name a shared immutable topology, not a new edge generation.
+        // A rename may have no same-name prior ref while its source is exactly
+        // the authenticated root already published under another graph alias.
+        const previous_graph = previous: {
+            for (manifest.artifacts) |candidate| {
+                if (candidate.kind == .graph_segment and artifactRefsIdentifySamePayload(candidate, graph_ref.*)) break :previous candidate;
+            }
+            continue;
+        };
 
         if (previous_graph.edge_generation != 0) {
             graph_ref.edge_generation = previous_graph.edge_generation;
@@ -5419,6 +5467,12 @@ test "serverless builder publishes first manifest from WAL and query sees mutati
     var session = try runtime.openHeadSession("docs");
     defer session.deinit();
 
+    for (session.manifest.artifacts) |artifact| {
+        const scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(artifact.artifact_id)).?;
+        try std.testing.expectEqual(graph_page_store.PageStore.namespaceDomain("docs"), scope.domain);
+        try std.testing.expectEqual(session.manifest.publication_fencing_token, scope.fencingToken());
+    }
+    try std.testing.expect(artifact_store.upload_scope == null);
     const built = try session.fetchArtifactAlloc(0);
     defer alloc.free(built);
     const decoded = try segment_mod.decodeAlloc(alloc, built);
@@ -7006,7 +7060,12 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const second_metric = second.artifacts[findNamedArtifactIndex(second, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqualStrings(first_graph.artifact_id, second_graph.artifact_id);
     try std.testing.expectEqual(first_graph.edge_generation, second_graph.edge_generation);
-    try std.testing.expectEqualStrings(first_metric.artifact_id, second_metric.artifact_id);
+    // Recomputing a missing payload must not resurrect a retired attempt's
+    // physical identity, even when the numerical bytes are identical.
+    try std.testing.expectEqualStrings(first_metric.checksum, second_metric.checksum);
+    try std.testing.expect(!std.mem.eql(u8, first_metric.artifact_id, second_metric.artifact_id));
+    const repaired_scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(second_metric.artifact_id)).?;
+    try std.testing.expectEqual(second.publication_fencing_token, repaired_scope.fencingToken());
     try std.testing.expectEqual(first_metric.metadata_version, second_metric.metadata_version);
     // The missing payload was recomputed; only unchanged, reusable artifacts
     // retain their previous publication/computation provenance.
@@ -7604,6 +7663,10 @@ fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
         nonce,
     }) catch unreachable;
     return @ptrCast(slice.ptr);
+}
+
+test "serverless metadata graph alias publication reuses facts without reading document bodies" {
+    try @import("document_facts_publication_bench.zig").metadataRepublishRegression();
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {

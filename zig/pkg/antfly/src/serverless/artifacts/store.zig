@@ -175,6 +175,10 @@ pub const ArtifactStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// A borrowed publication-local capability. All newly created artifacts,
+    /// including flat/search segments, belong to this fenced attempt. Reused
+    /// immutable references keep their original identities.
+    upload_scope: ?UploadScope = null,
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
@@ -206,6 +210,10 @@ pub const ArtifactStore = struct {
 
     pub fn putScoped(self: *ArtifactStore, scope: UploadScope, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
         try scope.validate();
+        if (self.upload_scope) |authority| {
+            if (!std.mem.eql(u8, &scope.domain, &authority.domain) or scope.fencingToken() != authority.fencingToken())
+                return error.InvalidArtifactUploadScope;
+        }
         try cancellation.check();
         const put_scoped = self.vtable.put_scoped orelse return error.ArtifactUploadScopesUnsupported;
         var metadata = try put_scoped(self.ptr, self.allocator, scope, contents, cancellation);
@@ -232,6 +240,7 @@ pub const ArtifactStore = struct {
     }
 
     pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
+        if (self.upload_scope) |scope| return self.putScoped(scope, contents, cancellation);
         try cancellation.check();
         var metadata = if (self.vtable.put_with_cancellation) |put_with_cancellation|
             try put_with_cancellation(self.ptr, self.allocator, contents, cancellation)

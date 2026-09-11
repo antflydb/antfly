@@ -4,7 +4,7 @@ The opt-in fixture exercises a complete small-WAL serverless publication, not
 only an in-memory graph/tree operation. Run from `zig/`:
 
 ```sh
-ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- 'publication qualification benchmark'
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'publication qualification benchmark'
 ```
 
 Set `ANTFLY_DOCUMENT_FACTS_BENCH_DOCS=1024` or `16384`, and optionally
@@ -70,10 +70,43 @@ sorted runs with bounded merge fan-in; its sorting memory is bounded by the run
 budget plus one document's edge list and cursor paths. Unreachable scratch runs
 remain governed by publication-attempt inventory and garbage collection.
 
+## Metadata-only publication qualification
+
+The same fixture now also measures graph-alias metadata publication before the
+WAL samples. Each sample renames the graph alias while retaining the same degree
+and PageRank computation settings. The timer covers the builder publication,
+including source protection, manifest persistence and fenced HEAD update;
+catalog planning is outside this measurement. It uses one warmup and five
+samples on the same filesystem-backed namespace.
+
+The facts fingerprint now represents counter semantics rather than raw index
+JSON: enabled pipeline versions and canonical, deduplicated chunked full-text
+source configurations. Graph aliases, graph metric settings, unrelated dense
+settings, JSON ordering and disabled pipeline versions do not invalidate it.
+An unchanged source fence retains the exact immutable facts root. Reused
+text/vector/sparse indexes and graph aliases do not hydrate document bodies;
+derived-presence checks use the authenticated root's exact counters. Changing a
+metric computation can still require graph work, but not a document-facts scan.
+
+| Documents | Hub degree | Metadata median (ms) | Artifact GETs | Read bytes | Artifact PUTs | Write bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 1 | 3.596 | 6 | 1,546 | 0 | 0 |
+| 16,384 | 1 | 3.863 | 6 | 1,546 | 0 | 0 |
+
+These are logical artifact-store counters; they do not count provider-internal
+authentication reads. Namespace bootstrap is excluded. No before/after latency
+speedup is claimed for this new measurement. A normal CI regression also enables
+text, vector and sparse artifacts, rejects document-body reads at every artifact
+read callback, and checks zero artifact writes, unchanged facts/topology roots
+and unchanged topology generation across repeated alias publications.
+The same run's degree-one WAL medians were 6.913 ms and 8.750 ms respectively;
+their artifact counts/bytes matched the earlier qualification table. The new
+metadata path's artifact work was constant across the 16x namespace increase.
+
 ## Focused correctness checks
 
 ```sh
-zig build antfly-document-facts-test -Doptimize=ReleaseFast -- 'document facts' 'external graph bootstrap' 'paged graph' 'visits borrowed body records'
+zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'document facts' --test-filter 'external graph bootstrap' --test-filter 'paged graph' --test-filter 'visits borrowed body records' --test-filter 'metadata graph alias'
 zig build antfly-storage-db-test -Doptimize=ReleaseFast -- --test-filter 'db dense target coverage reads one immutable primary commit epoch' --test-filter 'db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend' --test-filter 'db inline dense generation remains rebuilding until outcomes cover the live corpus'
 ```
 

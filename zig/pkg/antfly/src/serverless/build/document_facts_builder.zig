@@ -33,22 +33,55 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     // a fixed struct, giving deterministic field ordering and explicit values.
     const encoded = try std.json.Stringify.valueAlloc(alloc, .{
         .enrichment_enabled = policy.enrichment_enabled,
-        .enrichment_pipeline_version = policy.enrichment_pipeline_version,
+        .enrichment_pipeline_version = if (policy.enrichment_enabled) policy.enrichment_pipeline_version else 0,
         .chunk_preview_enabled = policy.chunk_preview_enabled,
-        .chunk_preview_pipeline_version = policy.chunk_preview_pipeline_version,
+        .chunk_preview_pipeline_version = if (policy.chunk_preview_enabled) policy.chunk_preview_pipeline_version else 0,
         .chunk_embeddings_enabled = policy.chunk_embeddings_enabled,
-        .chunk_embeddings_pipeline_version = policy.chunk_embeddings_pipeline_version,
+        .chunk_embeddings_pipeline_version = if (policy.chunk_embeddings_enabled) policy.chunk_embeddings_pipeline_version else 0,
         .rerank_terms_enabled = policy.rerank_terms_enabled,
-        .rerank_terms_pipeline_version = policy.rerank_terms_pipeline_version,
+        .rerank_terms_pipeline_version = if (policy.rerank_terms_enabled) policy.rerank_terms_pipeline_version else 0,
     }, .{});
     defer alloc.free(encoded);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:document-facts:v1:");
+    hash.update("antfly:document-facts:semantics:v2:");
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, encoded.len, .little);
     hash.update(&len);
     hash.update(encoded);
-    hash.update(indexes_json);
+    // Presence uses only chunked full-text source extraction. Graph aliases,
+    // metric policies, dense index options and JSON presentation cannot change
+    // any fact. Names/order/duplicates of equivalent chunk sources cannot
+    // change their any-source-present result either.
+    const chunked = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json);
+    defer full_text_indexes.freeChunkedFullTextSources(alloc, chunked);
+    const digests = try alloc.alloc([32]u8, chunked.len);
+    defer alloc.free(digests);
+    for (chunked, digests) |source, *digest| {
+        var cfg = try @import("../../chunking/types.zig").parseConfigFromSlice(alloc, source.chunker_json);
+        defer cfg.deinit(alloc);
+        const semantic = try std.json.Stringify.valueAlloc(alloc, .{
+            .field = if (source.source_template.len == 0) source.source_field else "",
+            .template = source.source_template,
+            .provider = cfg.provider,
+            .api_url = cfg.api_url,
+            .model = cfg.model,
+            .max_chunks = cfg.max_chunks,
+            .threshold = cfg.threshold,
+            .text = cfg.text,
+            .audio = cfg.audio,
+        }, .{});
+        defer alloc.free(semantic);
+        std.crypto.hash.sha2.Sha256.hash(semantic, digest, .{});
+    }
+    std.mem.sort([32]u8, digests, {}, struct {
+        fn less(_: void, lhs: [32]u8, rhs: [32]u8) bool {
+            return std.mem.lessThan(u8, &lhs, &rhs);
+        }
+    }.less);
+    for (digests, 0..) |digest, i| {
+        if (i != 0 and std.mem.eql(u8, &digests[i - 1], &digest)) continue;
+        hash.update(&digest);
+    }
     return hash.finalResult();
 }
 
@@ -141,6 +174,8 @@ pub fn publishAlloc(
     defer context.deinit();
     const previous: ?facts.Root = if (source_ref) |ref| try facts.loadRoot(alloc, pages, ref) else null;
     const rebuild = previous == null or mutations == null or !std.mem.eql(u8, &previous.?.policy_fingerprint, &policy_hash);
+    if (!rebuild and mutations.?.len == 0 and previous.?.wal_end_lsn == wal_end_lsn)
+        return builder.cloneArtifactRefAlloc(alloc, source_ref.?);
     const source = if (rebuild) facts.Root{ .domain = pages.domain, .policy_fingerprint = policy_hash } else previous.?;
     var cache = tree.Cache{ .alloc = alloc, .underlying = pages.store() };
     defer cache.deinit();
@@ -389,6 +424,37 @@ fn freeRef(alloc: Allocator, ref: refs.ArtifactRef) void {
     if (ref.name.len != 0) alloc.free(ref.name);
     alloc.free(ref.artifact_id);
     alloc.free(ref.checksum);
+}
+
+test "serverless document facts fingerprint ignores unrelated metadata but fences projection semantics" {
+    const a = std.testing.allocator;
+    const empty = try fingerprint(a, .{}, "{}");
+    try std.testing.expectEqual(empty, try fingerprint(a, .{},
+        \\{"graph_alias":{"metrics":{"rank":{"kind":"pagerank","max_iterations":20}},"type":"graph"},"dense":{"type":"embeddings","field":"body"}}
+    ));
+    var disabled = catalog.NamespacePolicy{};
+    disabled.enrichment_pipeline_version = 19;
+    try std.testing.expectEqual(empty, try fingerprint(a, disabled, "{}"));
+    disabled.enrichment_enabled = true;
+    try std.testing.expect(!std.mem.eql(u8, &empty, &try fingerprint(a, disabled, "{}")));
+    const enabled = try fingerprint(a, disabled, "{}");
+    disabled.enrichment_pipeline_version += 1;
+    try std.testing.expect(!std.mem.eql(u8, &enabled, &try fingerprint(a, disabled, "{}")));
+    const source =
+        \\{"dense":{"type":"embeddings","field":"body","chunker":{"provider":"mock","full_text_index":{}}}}
+    ;
+    const renamed =
+        \\{"alias":{"chunker":{"full_text_index":{},"store_chunks":true,"provider":"mock"},"field":"body","type":"embeddings"},"duplicate":{"type":"embeddings","field":"body","chunker":{"provider":"mock","full_text_index":{}}}}
+    ;
+    const source_hash = try fingerprint(a, .{}, source);
+    try std.testing.expect(!std.mem.eql(u8, &empty, &source_hash));
+    try std.testing.expectEqual(source_hash, try fingerprint(a, .{}, renamed));
+    try std.testing.expect(!std.mem.eql(u8, &source_hash, &try fingerprint(a, .{},
+        \\{"dense":{"type":"embeddings","field":"title","chunker":{"provider":"mock","full_text_index":{}}}}
+    )));
+    try std.testing.expect(!std.mem.eql(u8, &source_hash, &try fingerprint(a, .{},
+        \\{"dense":{"type":"embeddings","field":"body","chunker":{"provider":"mock","full_text_index":{},"text":{"target_tokens":8}}}}
+    )));
 }
 
 test "serverless document facts compiled normalization agrees with existing status semantics" {

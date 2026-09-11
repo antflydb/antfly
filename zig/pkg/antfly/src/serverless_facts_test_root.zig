@@ -21,4 +21,5 @@ test {
     _ = @import("serverless/query/document_facts_reader.zig");
     _ = @import("serverless/build/builder.zig");
     _ = @import("serverless/build/compactor.zig");
+    _ = @import("serverless/catalog/service.zig");
 }

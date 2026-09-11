@@ -227,6 +227,33 @@ pub const ObjectStore = struct {
         try self.opened.client.deleteObject(self.opened.bucket, key, .{});
     }
 
+    pub fn deleteRetiredCandidate(self: *ObjectStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
+        defer self.alloc.free(key);
+        var object = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer object.deinit(self.opened.client.allocator);
+        var current = try manifest_codec.decodeAlloc(self.alloc, object.body);
+        defer current.deinit(self.alloc);
+        if (current.publication_fencing_token == 0 or current.publication_fencing_token >= cutoff) return false;
+        // Do not substitute a separate HEAD/STAT identity: recreation between
+        // GET and STAT could pair old authority with the new object's ETag.
+        const etag = object.metadata.etag orelse return error.ConditionalManifestDeletionUnsupported;
+        const head = self.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (head == version) return error.CannotDeleteHead;
+        self.opened.client.deleteObject(self.opened.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     fn tryGetEncoded(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
         var result = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -259,6 +286,7 @@ pub const ObjectStore = struct {
         .compare_and_swap_head = erasedCompareAndSwapHead,
         .list_versions_alloc = erasedListVersionsAlloc,
         .delete_version = erasedDeleteVersion,
+        .delete_retired_candidate = erasedDeleteRetiredCandidate,
     };
 
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
@@ -300,6 +328,11 @@ pub const ObjectStore = struct {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         try self.deleteVersion(namespace, version);
     }
+
+    fn erasedDeleteRetiredCandidate(ptr: *anyopaque, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.deleteRetiredCandidate(namespace, version, cutoff);
+    }
 };
 
 fn manifestsPrefixAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
@@ -326,6 +359,7 @@ const ConditionalCreateRaceClient = struct {
     hidden_reads_after_publish: usize = 0,
     omit_get_etag: bool = false,
     omit_stat_etag: bool = false,
+    replacement_on_delete: ?[]const u8 = null,
 
     fn client(self: *@This()) object_storage.ObjectStorage {
         return .{
@@ -415,6 +449,12 @@ const ConditionalCreateRaceClient = struct {
     fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: object_storage.DeleteOptions) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var client_impl = self.backingClient(std.testing.allocator);
+        if (self.replacement_on_delete) |body| {
+            self.replacement_on_delete = null;
+            try client_impl.deleteObject(bucket, key, .{});
+            var replacement = try client_impl.putObject(bucket, key, body, .{ .if_none_match = true });
+            replacement.deinit(std.testing.allocator);
+        }
         try client_impl.deleteObject(bucket, key, opts);
     }
 
@@ -473,6 +513,46 @@ test "objectstore-backed manifest store supports publish and list" {
     const versions = try impl.listVersionsAllocWithPageSize(std.testing.allocator, "docs", 2);
     defer std.testing.allocator.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, versions);
+}
+
+test "serverless object manifest candidate deletion protects recreated bootstrap and normal versions" {
+    var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+    defer backing.deinit();
+    var impl = try ObjectStore.initWithClient(std.testing.allocator, backing.client(), "manifests", "");
+    defer impl.deinit();
+    var store = impl.manifestStore();
+    try manifest_store.testRetiredCandidateRecreation(&store);
+}
+
+test "serverless object manifest candidate recreation between GET and DELETE is identity fenced" {
+    const alloc = std.testing.allocator;
+    var backing = object_storage.MemoryObjectStorage.init(alloc);
+    defer backing.deinit();
+    var adapter: ConditionalCreateRaceClient = .{ .backing = &backing, .winner_body = "", .injected = true };
+    var store = try ObjectStore.initWithClient(alloc, adapter.client(), "manifests", "");
+    defer store.deinit();
+    var candidate: manifest_types.Manifest = .{
+        .namespace = @constCast("docs"),
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = @constCast(&.{}),
+        .publication_fencing_token = 1,
+    };
+    try store.put(candidate);
+    candidate.publication_fencing_token = 3;
+    const replacement = try manifest_codec.encodeAlloc(alloc, candidate);
+    defer alloc.free(replacement);
+    adapter.replacement_on_delete = replacement;
+    try std.testing.expect(!try store.deleteRetiredCandidate("docs", 1, 2));
+    try std.testing.expect(adapter.replacement_on_delete == null);
+    var current = try store.getAlloc(alloc, "docs", 1);
+    defer current.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), current.publication_fencing_token);
+    adapter.omit_get_etag = true;
+    try std.testing.expectError(error.ConditionalManifestDeletionUnsupported, store.deleteRetiredCandidate("docs", 1, 4));
 }
 
 test "manifest head CAS verifies a stat ETag when GET omits it" {

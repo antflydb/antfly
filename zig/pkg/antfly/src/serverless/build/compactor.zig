@@ -95,7 +95,14 @@ pub const Compactor = struct {
             return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
-        return self.compactHeadPinnedUntil(namespace, publication_guard, protection.token(io)) catch |err| return builder_mod.graphPublicationError(err, false);
+        var scoped_artifacts = self.artifacts.*;
+        scoped_artifacts.upload_scope = .{
+            .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace),
+            .attempt = try builder_mod.graphPublicationAttempt(publication_guard, namespace, io),
+        };
+        var compactor = self.*;
+        compactor.artifacts = &scoped_artifacts;
+        return compactor.compactHeadPinnedUntil(namespace, publication_guard, protection.token(io)) catch |err| return builder_mod.graphPublicationError(err, false);
     }
 
     fn compactHeadPinnedUntil(
@@ -144,7 +151,7 @@ pub const Compactor = struct {
 
         const compacted_documents = try document_segment_mod.encodeAlloc(self.alloc, document_entries);
         defer self.alloc.free(compacted_documents);
-        var document_artifact = try self.artifacts.put(compacted_documents);
+        var document_artifact = try putOrReuseCompactedDocuments(self.alloc, self.artifacts, current, compacted_documents, cancellation);
         defer document_artifact.deinit(self.alloc);
         try maintenance_cancellation.check(cancellation);
 
@@ -527,6 +534,38 @@ fn freeMaterializerMutations(alloc: Allocator, mutations: []query_mod.QueryMater
     alloc.free(mutations);
 }
 
+fn putOrReuseCompactedDocuments(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: manifest_mod.Manifest,
+    contents: []const u8,
+    cancellation: ?maintenance_cancellation.Token,
+) !artifacts_mod.ArtifactMetadata {
+    const store = @import("../artifacts/store.zig");
+    var bridge: maintenance_cancellation.GraphBridge = .{ .maintenance = cancellation };
+    const token = bridge.token();
+    try token.check();
+    if (builder_mod.findArtifactIndex(current, .document_segment)) |index| {
+        const prior = current.artifacts[index];
+        try store.validateSha256ArtifactIdentity(prior.artifact_id, prior.checksum);
+        const same_content = if (prior.byte_len != contents.len) false else matches: {
+            store.validatePayloadSha256WithCancellation(contents, prior.checksum, token) catch |err| switch (err) {
+                error.ArtifactIntegrityMismatch => break :matches false,
+                else => return err,
+            };
+            break :matches true;
+        };
+        if (same_content) {
+            // Content equality, not the new upload attempt's physical ID,
+            // decides reuse. Keep the pinned source reference without a PUT.
+            const id = try alloc.dupe(u8, prior.artifact_id);
+            errdefer alloc.free(id);
+            return .{ .artifact_id = id, .checksum = try alloc.dupe(u8, prior.checksum), .byte_len = prior.byte_len };
+        }
+    }
+    return artifacts.putWithCancellation(contents, token);
+}
+
 fn artifactsMatchCompactedHead(
     current: manifest_mod.Manifest,
     document_artifact: artifacts_mod.ArtifactMetadata,
@@ -697,6 +736,8 @@ test "serverless compactor rewrites head into compacted searchable artifacts" {
     defer ingest.deinit(alloc);
     var build = try builder.publishNamespaceWithMetric("docs", .inner_product);
     defer build.deinit(alloc);
+    var before = try manifest_store.getAlloc("docs", build.version);
+    defer before.deinit(alloc);
 
     var compactor = Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store);
     var result = try compactor.compactHead("docs");
@@ -707,6 +748,15 @@ test "serverless compactor rewrites head into compacted searchable artifacts" {
 
     var manifest = try manifest_store.getAlloc("docs", 2);
     defer manifest.deinit(alloc);
+    for (manifest.artifacts) |artifact| {
+        const scope = (try @import("../artifacts/store.zig").uploadScopeFromArtifactId(artifact.artifact_id)).?;
+        try std.testing.expectEqual(@import("../graph_segment/page_store.zig").PageStore.namespaceDomain("docs"), scope.domain);
+        const reused = for (before.artifacts) |prior| {
+            if (std.mem.eql(u8, prior.artifact_id, artifact.artifact_id)) break true;
+        } else false;
+        if (!reused) try std.testing.expectEqual(manifest.publication_fencing_token, scope.fencingToken());
+    }
+    try std.testing.expect(artifact_store.upload_scope == null);
     try std.testing.expectEqual(@as(usize, 6), manifest.artifacts.len);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.document_segment, manifest.artifacts[0].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.text_segment, manifest.artifacts[1].kind);
@@ -1306,6 +1356,16 @@ test "serverless compactor no-ops when head is already compacted" {
     defer first.deinit(alloc);
     try std.testing.expect(first.published);
 
+    const RejectUploads = struct {
+        fn put(_: *anyopaque, _: Allocator, _: @import("../artifacts/store.zig").UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedCompactionUpload;
+        }
+    };
+    var read_only_vtable = artifact_store.vtable.*;
+    read_only_vtable.put_scoped = RejectUploads.put;
+    var read_only = artifact_store;
+    read_only.vtable = &read_only_vtable;
+    compactor.artifacts = &read_only;
     var second = try compactor.compactHead("docs");
     defer second.deinit(alloc);
     try std.testing.expect(!second.published);

@@ -19,11 +19,13 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 const progress_store_mod = @import("progress_store.zig");
-const document_projection = @import("../document_projection.zig");
-const document_segment_mod = @import("../document_segment/mod.zig");
+const document_facts = @import("../build/document_facts.zig");
+const document_facts_builder = @import("../build/document_facts_builder.zig");
+const graph_page_store = @import("../graph_segment/page_store.zig");
+const graph_page_tree = @import("../graph_segment/page_tree.zig");
+const read_lease = @import("../manifest/read_lease.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const query_mod = @import("../query/mod.zig");
-const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
@@ -160,6 +162,7 @@ pub const CatalogService = struct {
     builder: *builder_mod.Builder,
     store: *catalog_store.CatalogStore,
     external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
+    facts_read_leases: read_lease.Cache = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -442,7 +445,7 @@ pub const CatalogService = struct {
                 .background_compaction
             else
                 .none;
-        const enrichment_completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
+        const enrichment_completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, plan.table_definition.indexes_json, cancellation);
         const pipeline = enrichment_pipeline.builtinPipelineForPolicy(effective_policy);
         const enrichment_active_stage = chooseActiveEnrichmentStage(pipeline, enrichment_completion);
         const atomic_enrichment_progress = if (enrichment_active_stage) |stage|
@@ -970,7 +973,7 @@ pub const CatalogService = struct {
                     .before_policy = manifest.stats.policy,
                     .after_policy = effective_policy,
                 });
-                const completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
+                const completion = try enrichmentCompletionAlloc(self, namespace, head_version, effective_policy, table.indexes_json, null);
                 const can_republish_chunk_preview = impact.rebuild_chunk_preview and
                     (!effective_policy.chunk_preview_enabled or completion.chunk_preview_complete);
                 const can_republish_chunk_embeddings = impact.rebuild_chunk_embeddings and
@@ -2267,128 +2270,160 @@ fn isStageComplete(completion: EnrichmentCompletion, stage: catalog_types.Enrich
 }
 
 fn enrichmentCompletionAlloc(
-    alloc: Allocator,
-    artifacts: *artifacts_mod.ArtifactStore,
-    manifests: *manifest_mod.ManifestStore,
+    self: *CatalogService,
     namespace: []const u8,
     head_version: u64,
     policy: catalog_types.NamespacePolicy,
+    indexes_json: []const u8,
+    cancellation: ?maintenance_cancellation.Token,
 ) !EnrichmentCompletion {
     if (head_version == 0) return .{};
-    var manifest = try manifests.getAlloc(namespace, head_version);
-    defer manifest.deinit(alloc);
-    const docs = loadPublishedDocumentsForEnrichmentAlloc(alloc, artifacts, manifest) catch return .{};
-    defer query_mod.freeMaterializedDocuments(alloc, docs);
+    // Pin before resolving the manifest; a concurrent retirement must either
+    // observe this reader or reject it. Never turn an unreadable source into
+    // "enrichment complete".
+    const pin = try self.facts_read_leases.acquire(self.progress, namespace, head_version);
+    const ReadCheck = struct {
+        pin: read_lease.Lease,
+        cancellation: ?maintenance_cancellation.Token,
+        fn check(ptr: *const anyopaque) !void {
+            const state: *const @This() = @ptrCast(@alignCast(ptr));
+            try state.pin.check();
+            try maintenance_cancellation.check(state.cancellation);
+        }
+        fn cancelled(ptr: *const anyopaque) bool {
+            check(ptr) catch return true;
+            return false;
+        }
+    };
+    const check = ReadCheck{ .pin = pin, .cancellation = cancellation };
+    const token = CancellationToken{ .ptr = &check, .check_fn = ReadCheck.check, .is_cancelled_fn = ReadCheck.cancelled };
+    try token.check();
+    var manifest = try self.manifests.getAlloc(namespace, head_version);
+    defer manifest.deinit(self.alloc);
+    const idx = findArtifactIndex(manifest, .document_facts) orelse return error.DocumentFactsNotFound;
+    for (manifest.artifacts[idx + 1 ..]) |artifact| if (artifact.kind == .document_facts) return error.InvalidDocumentFactsRoot;
+    var reads: u64 = (builder_mod.GraphBuildLimits{}).max_input_bytes;
+    var writes: u64 = 0;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain(namespace),
+        .artifacts = self.artifacts,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+        .cancellation = token,
+    };
+    const root = try document_facts.loadRoot(self.alloc, &pages, manifest.artifacts[idx]);
+    if (root.wal_end_lsn != manifest.wal_end_lsn or root.document_count != manifest.stats.document_count) return error.DocumentFactsSourceChanged;
+    const result = try enrichmentCompletionFromFactsAlloc(self.alloc, &pages, root, policy, indexes_json);
+    try token.check();
+    return result;
+}
 
-    var lexical_pending: u64 = 0;
-    var chunk_pending: u64 = 0;
-    var chunk_embeddings_pending: u64 = 0;
-    var rerank_pending: u64 = 0;
-    for (docs) |doc| {
-        var projection = document_projection.parseAlloc(alloc, doc.body) catch continue;
-        defer projection.deinit(alloc);
-        if (policy.enrichment_enabled and (projection.lexical_sparse_version == null or projection.lexical_sparse_version.? < policy.enrichment_pipeline_version)) {
-            lexical_pending += 1;
+fn enrichmentCompletionFromFactsAlloc(
+    alloc: Allocator,
+    pages: *graph_page_store.PageStore,
+    root: document_facts.Root,
+    policy: catalog_types.NamespacePolicy,
+    indexes_json: []const u8,
+) !EnrichmentCompletion {
+    if (!policy.enrichment_enabled and !policy.chunk_preview_enabled and
+        !policy.chunk_embeddings_enabled and !policy.rerank_terms_enabled) return .{};
+    var pending: [4]u64 = root.counts[3..7].*;
+    if (try document_facts_builder.needsRebuild(alloc, root, policy, indexes_json)) {
+        // Only a real change to facts semantics needs bodies. Stream that
+        // exceptional read with bounded memory and the same admission budget
+        // as publication, rather than rebuilding a second document array.
+        pending = @splat(0);
+        var context = try document_facts_builder.Context.init(alloc, policy, indexes_json);
+        defer context.deinit();
+        var cursor = try graph_page_tree.Cursor.init(alloc, pages.store(), root.page, "", null);
+        defer cursor.deinit();
+        var count: u64 = 0;
+        while (try cursor.next()) |record| {
+            try pages.cancellation.check();
+            const fact = try document_facts.Fact.decode(record.value);
+            const body = try document_facts.readBodyAlloc(alloc, pages, fact.body);
+            defer alloc.free(body);
+            const flags = try context.flags(.{
+                .doc_id = @constCast(record.key),
+                .body = body,
+                .last_lsn = fact.last_lsn,
+                .last_timestamp_ns = fact.last_timestamp_ns,
+            });
+            for (&pending, 0..) |*value, bit| {
+                if (flags.pending & (@as(u4, 1) << @intCast(bit)) != 0) value.* += 1;
+            }
+            count += 1;
         }
-        if (policy.chunk_preview_enabled and (projection.chunk_preview_version == null or projection.chunk_preview_version.? < policy.chunk_preview_pipeline_version)) {
-            chunk_pending += 1;
-        }
-        if (policy.chunk_embeddings_enabled and (projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version)) {
-            chunk_embeddings_pending += 1;
-        }
-        if (policy.rerank_terms_enabled and (projection.rerank_terms_version == null or projection.rerank_terms_version.? < policy.rerank_terms_pipeline_version)) {
-            rerank_pending += 1;
-        }
+        if (count != root.document_count) return error.InvalidDocumentFactsRoot;
     }
     return .{
-        .lexical_sparse_complete = !policy.enrichment_enabled or lexical_pending == 0,
-        .lexical_sparse_pending_documents = lexical_pending,
-        .chunk_preview_complete = !policy.chunk_preview_enabled or chunk_pending == 0,
-        .chunk_preview_pending_documents = chunk_pending,
-        .chunk_embeddings_complete = !policy.chunk_embeddings_enabled or chunk_embeddings_pending == 0,
-        .chunk_embeddings_pending_documents = chunk_embeddings_pending,
-        .rerank_terms_complete = !policy.rerank_terms_enabled or rerank_pending == 0,
-        .rerank_terms_pending_documents = rerank_pending,
+        .lexical_sparse_complete = pending[0] == 0,
+        .lexical_sparse_pending_documents = pending[0],
+        .chunk_preview_complete = pending[1] == 0,
+        .chunk_preview_pending_documents = pending[1],
+        .chunk_embeddings_complete = pending[2] == 0,
+        .chunk_embeddings_pending_documents = pending[2],
+        .rerank_terms_complete = pending[3] == 0,
+        .rerank_terms_pending_documents = pending[3],
     };
 }
 
-fn loadPublishedDocumentsForEnrichmentAlloc(
-    alloc: Allocator,
-    artifacts: *artifacts_mod.ArtifactStore,
-    manifest: manifest_mod.Manifest,
-) ![]query_mod.QueryMaterializedDocument {
-    const document_index = findArtifactIndex(manifest, .document_segment) orelse return error.DocumentSegmentNotFound;
-    const payload = try artifacts.getAlloc(manifest.artifacts[document_index].artifact_id);
-    defer alloc.free(payload);
-    const entries = try document_segment_mod.decodeAlloc(alloc, payload);
-    defer document_segment_mod.freeEntries(alloc, entries);
-    const base_docs = try allocMaterializedDocumentsForEnrichment(alloc, entries);
-    errdefer query_mod.freeMaterializedDocuments(alloc, base_docs);
+test "serverless catalog facts completion uses exact counters and authoritative policy refresh" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/facts-completion", .{tmp.sub_path});
+    defer alloc.free(path);
+    var fs = try artifacts_mod.FsStore.init(alloc, path);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages = graph_page_store.PageStore{
+        .domain = graph_page_store.PageStore.namespaceDomain("docs"),
+        .attempt = @splat(1),
+        .artifacts = &artifacts,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    const policy = catalog_types.NamespacePolicy{ .enrichment_enabled = true };
+    const initial = [_]query_mod.QueryMaterializedDocument{
+        .{ .doc_id = @constCast("a"), .body = @constCast("{\"text\":\"alpha\"}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = @constCast("{\"text\":\"bravo\"}"), .last_lsn = 2, .last_timestamp_ns = 2 },
+    };
+    const first = try document_facts_builder.publishAlloc(alloc, &pages, null, &initial, null, policy, "{}", 2);
+    defer alloc.free(first.artifact_id);
+    defer alloc.free(first.checksum);
+    const a_body = "{\"text\":\"alpha\",\"_enrichment\":{\"lexical_sparse_version\":1}}";
+    const a_docs = [_]query_mod.QueryMaterializedDocument{.{ .doc_id = @constCast("a"), .body = @constCast(a_body), .last_lsn = 3, .last_timestamp_ns = 3 }};
+    const a_mutations = [_]query_mod.QueryMaterializerMutation{.{ .doc_id = @constCast("a"), .body = @constCast(a_body), .kind = .upsert, .lsn = 3, .timestamp_ns = 3 }};
+    const second = try document_facts_builder.publishAlloc(alloc, &pages, first, &a_docs, &a_mutations, policy, "{}", 3);
+    defer alloc.free(second.artifact_id);
+    defer alloc.free(second.checksum);
+    const b_body = "{\"text\":\"bravo\",\"other\":\"new\"}";
+    const b_docs = [_]query_mod.QueryMaterializedDocument{.{ .doc_id = @constCast("b"), .body = @constCast(b_body), .last_lsn = 4, .last_timestamp_ns = 4 }};
+    const b_mutations = [_]query_mod.QueryMaterializerMutation{.{ .doc_id = @constCast("b"), .body = @constCast(b_body), .kind = .upsert, .lsn = 4, .timestamp_ns = 4 }};
+    const third = try document_facts_builder.publishAlloc(alloc, &pages, second, &b_docs, &b_mutations, policy, "{}", 4);
+    defer alloc.free(third.artifact_id);
+    defer alloc.free(third.checksum);
+    const root = try document_facts.loadRoot(alloc, &pages, third);
 
-    const mutation_index = findArtifactIndex(manifest, .mutation_segment) orelse return base_docs;
-    const mutation_payload = try artifacts.getAlloc(manifest.artifacts[mutation_index].artifact_id);
-    defer alloc.free(mutation_payload);
-    const mutation_entries = try segment_mod.decodeAlloc(alloc, mutation_payload);
-    defer segment_mod.freeEntries(alloc, mutation_entries);
-    const overlay = try allocMaterializerMutationsForEnrichment(alloc, mutation_entries);
-    defer freeMaterializerMutationsForEnrichment(alloc, overlay);
-    const docs = try query_mod.materializeDocumentsOverBaseAlloc(alloc, base_docs, overlay);
-    query_mod.freeMaterializedDocuments(alloc, base_docs);
-    return docs;
-}
-
-fn allocMaterializedDocumentsForEnrichment(
-    alloc: Allocator,
-    entries: []const document_segment_mod.Entry,
-) ![]query_mod.QueryMaterializedDocument {
-    const docs = try alloc.alloc(query_mod.QueryMaterializedDocument, entries.len);
-    errdefer alloc.free(docs);
-    var initialized: usize = 0;
-    errdefer {
-        for (docs[0..initialized]) |*doc| doc.deinit(alloc);
-    }
-    for (entries, 0..) |entry, idx| {
-        docs[idx] = .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = try alloc.dupe(u8, entry.body),
-            .last_lsn = entry.last_lsn,
-            .last_timestamp_ns = entry.last_timestamp_ns,
-        };
-        initialized += 1;
-    }
-    return docs;
-}
-
-fn allocMaterializerMutationsForEnrichment(
-    alloc: Allocator,
-    entries: []const segment_mod.Entry,
-) ![]query_mod.QueryMaterializerMutation {
-    const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, entries.len);
-    errdefer alloc.free(mutations);
-    var initialized: usize = 0;
-    errdefer freeMaterializerMutationsForEnrichment(alloc, mutations[0..initialized]);
-    for (entries, 0..) |entry, idx| {
-        mutations[idx] = .{
-            .lsn = entry.lsn,
-            .timestamp_ns = entry.timestamp_ns,
-            .kind = entry.kind,
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
-            .body = if (entry.body) |body| try alloc.dupe(u8, body) else null,
-        };
-        initialized += 1;
-    }
-    return mutations;
-}
-
-fn freeMaterializerMutationsForEnrichment(
-    alloc: Allocator,
-    mutations: []query_mod.QueryMaterializerMutation,
-) void {
-    for (mutations) |mutation| {
-        alloc.free(mutation.doc_id);
-        if (mutation.body) |body| alloc.free(body);
-    }
-    alloc.free(mutations);
+    // No flat document segment or mutation segment exists, and no page/body
+    // reads are admitted: unchanged semantics must use the exact root tuple.
+    reads = 0;
+    const current = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, policy, "{}");
+    try std.testing.expectEqual(@as(u64, 1), current.lexical_sparse_pending_documents);
+    try std.testing.expect(!current.lexical_sparse_complete);
+    var upgraded = policy;
+    upgraded.enrichment_pipeline_version = 2;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, enrichmentCompletionFromFactsAlloc(alloc, &pages, root, upgraded, "{}"));
+    reads = 1024 * 1024;
+    const refreshed = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, upgraded, "{}");
+    try std.testing.expectEqual(@as(u64, 2), refreshed.lexical_sparse_pending_documents);
+    var disabled = policy;
+    disabled.enrichment_enabled = false;
+    const complete = try enrichmentCompletionFromFactsAlloc(alloc, &pages, root, disabled, "{}");
+    try std.testing.expect(complete.lexical_sparse_complete);
 }
 
 const VectorCompactionSignal = struct {

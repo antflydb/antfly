@@ -52,6 +52,11 @@ pub const FsStore = struct {
     }
 
     pub fn put(self: *FsStore, manifest: manifest_types.Manifest) !void {
+        var lock_io = threadedIo();
+        defer lock_io.deinit();
+        var mutation_lock = try self.lockManifestMutations(lock_io.io(), manifest.namespace);
+        defer mutation_lock.close(lock_io.io());
+        defer mutation_lock.unlock(lock_io.io());
         const path = try manifestPathAlloc(self.alloc, self.root_dir, manifest.namespace, manifest.version);
         defer self.alloc.free(path);
 
@@ -170,6 +175,34 @@ pub const FsStore = struct {
         try deleteFile(path);
     }
 
+    fn lockManifestMutations(self: *FsStore, io: std.Io, namespace: []const u8) !std.Io.File {
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "MANIFEST_MUTATIONS.lock" });
+        defer self.alloc.free(path);
+        try self.durable_dirs.ensure(self.alloc, io, std.fs.path.dirname(path).?);
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
+        errdefer file.close(io);
+        try file.lock(io, .exclusive);
+        return file;
+    }
+
+    pub fn deleteRetiredCandidate(self: *FsStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var mutation_lock = try self.lockManifestMutations(io, namespace);
+        defer mutation_lock.close(io);
+        defer mutation_lock.unlock(io);
+        var current = self.getAlloc(self.alloc, namespace, version) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer current.deinit(self.alloc);
+        if (current.publication_fencing_token == 0 or current.publication_fencing_token >= cutoff) return false;
+        try self.deleteVersion(namespace, version);
+        return true;
+    }
+
     fn cleanupRetiredTemporaries(self: *FsStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "manifests" });
         defer self.alloc.free(path);
@@ -206,6 +239,7 @@ pub const FsStore = struct {
         .compare_and_swap_head = erasedCompareAndSwapHead,
         .list_versions_alloc = erasedListVersionsAlloc,
         .delete_version = erasedDeleteVersion,
+        .delete_retired_candidate = erasedDeleteRetiredCandidate,
         .cleanup_retired_temporaries = erasedCleanupRetiredTemporaries,
     };
 
@@ -247,6 +281,11 @@ pub const FsStore = struct {
     fn erasedDeleteVersion(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         try self.deleteVersion(namespace, version);
+    }
+
+    fn erasedDeleteRetiredCandidate(ptr: *anyopaque, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.deleteRetiredCandidate(namespace, version, cutoff);
     }
 
     fn erasedCleanupRetiredTemporaries(ptr: *anyopaque, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
@@ -479,6 +518,16 @@ test "serverless fs manifest store compareAndSwapHead enforces expected version"
     try std.testing.expect(!(try store.compareAndSwapHead("docs", 7, 2)));
     try std.testing.expect(try store.compareAndSwapHead("docs", 1, 2));
     try std.testing.expectEqual(@as(u64, 2), try store.getHead("docs"));
+}
+
+test "serverless fs manifest store candidate deletion protects recreated bootstrap and normal versions" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "candidate-recreation");
+    defer cleanupTmp(path);
+    var impl = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer impl.deinit();
+    var store = impl.manifestStore();
+    try manifest_store.testRetiredCandidateRecreation(&store);
 }
 
 test "serverless fs manifest store lists and prunes non-head versions" {

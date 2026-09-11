@@ -15,4 +15,5 @@
 test {
     _ = @import("serverless/runtime/manager.zig");
     _ = @import("serverless/build/coordinator.zig");
+    _ = @import("serverless/enrichment/worker.zig");
 }

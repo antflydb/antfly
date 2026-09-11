@@ -1899,6 +1899,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "serverless retention",
             "serverless manifest GC floor",
             "serverless fs manifest store",
+            "serverless object manifest candidate",
+            "scoped uploads",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
             "host object storage delegates through callbacks",
