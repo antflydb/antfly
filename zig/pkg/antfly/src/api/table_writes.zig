@@ -22294,11 +22294,16 @@ pub const ProvisionedTableWriteSource = struct {
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
         }
+        var preserve_writer_on_error = false;
         errdefer {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             self.invalidateReadCache(table_name);
-            self.invalidateWriteCache(table_name);
+            // Graph ownership cleanup runs on the resident writer. A retry
+            // before mutation must leave that owner alive to clear its fence;
+            // retiring it on every retry cancels the work Raft is waiting for.
+            if (!preserve_writer_on_error)
+                self.invalidateWriteCache(table_name);
         }
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
@@ -22342,10 +22347,12 @@ pub const ProvisionedTableWriteSource = struct {
                         try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
                     else
                         try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-                } else if (raft_entry) |entry|
-                    try cached.db.batchRaftReplicatedApply(apply_req, entry)
-                else
-                    try cached.db.batchReplicatedApply(apply_req);
+                } else if (raft_entry) |entry| {
+                    cached.db.batchRaftReplicatedApply(apply_req, entry) catch |err| {
+                        preserve_writer_on_error = err == error.RaftApplyWriterUnavailable;
+                        return err;
+                    };
+                } else try cached.db.batchReplicatedApply(apply_req);
             }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
@@ -34634,6 +34641,69 @@ test "provisioned table write source seeds doc identity namespace from table ran
         .shard_id = 7001,
         .range_id = 7101,
     }));
+}
+
+test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-graph-owner", .{tmp.sub_path});
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogAccess;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn source() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+            } };
+        }
+    };
+    var cache = ProvisionedTableWriteCache.init(alloc);
+    defer cache.deinit();
+    var source = ProvisionedTableWriteSource.init(root, Catalog.source());
+    defer source.deinit();
+    source.write_cache = &cache;
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var writer = (try source.leaseCachedGroupWriterWithMetadata(alloc, 1, "docs", .{
+        .indexes_json = "{}",
+        .schema_json = tables_api.default_schema_json,
+        .identity_namespace = namespace,
+    })) orelse return error.TestUnexpectedResult;
+    defer writer.deinit(alloc);
+    try writer.db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try writer.db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+    try writer.db.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+    const merge = db_mod.types.BatchRequest{ .merge_checkpoint = .{
+        .kind = .accept,
+        .transition_id = 10,
+        .donor_group_id = 2,
+        .receiver_group_id = 1,
+        .receiver_base_start = "",
+        .receiver_base_end = "m",
+        .merged_start = "",
+        .merged_end = "",
+    }, .merge_replication = .{
+        .transition_id = 10,
+        .donor_group_id = 2,
+        .receiver_group_id = 1,
+        .identity_namespace = namespace,
+    } };
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), (try writer.db.raftAppliedEntry()).?.index);
+    // Unit tests explicitly drive the same maintenance pass; the borrowed-I/O
+    // regression separately proves its production scheduler advances it.
+    try writer.db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    _ = try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", merge, .{ .term = 1, .index = 2 });
+    try std.testing.expectEqual(@as(u64, 2), (try writer.db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqualStrings("", writer.db.getRange().end);
 }
 
 test "replicated split destination seeds inherited doc identity before range publication" {

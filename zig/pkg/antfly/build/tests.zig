@@ -3628,7 +3628,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "transaction recovery executes production pass on borrowed VoprIo",
         "background maintenance services lifecycle runs on borrowed VoprIo",
         "generation publication replays durable identities on borrowed VoprIo",
+        "graph ownership cleanup runs on borrowed VoprIo before replicated merge",
         "replicated split destination seeds inherited doc identity before range publication",
+        "replicated merge retains its resident writer while graph ownership cleanup is pending",
         "table provisioner materializes metadata indexes into hosted group dbs",
     };
     const vopr_runtime_adapter_tests = b.addTest(.{
