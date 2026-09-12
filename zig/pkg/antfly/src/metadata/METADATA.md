@@ -57,6 +57,19 @@ The projected raft apply store is still part of the implementation, but the
 control plane is no longer just transition-focused scaffolding. Desired topology,
 placement, store observation, and reconcile status are first-class surfaces.
 
+## Listener Topology
+
+Raft peer traffic keeps its own dedicated listener, separate from the metadata
+HTTP/admin surface. The public API and the internal (`/internal/v1`) API,
+however, share one HTTP listener rather than each getting a dedicated port.
+Internal routes are protected by request-level authentication rather than by
+being reachable only from a private port, so there is exactly one port to
+expose and firewall for API traffic, plus the raft-only listener for peer
+communication. Gating internal routes by auth instead of by port keeps the
+deployment surface small without weakening the internal endpoints, since a
+request has to pass the same authentication check regardless of which network
+path reached the listener.
+
 ## Module Map
 
 - [service.zig](service.zig)
@@ -121,6 +134,31 @@ Current tests and simulations cover:
 - multi-range placement spread
 - placement role constraints under churn
 - automatic split/merge planning from runtime status
+
+## Automatic Split And Merge Policy
+
+Automatic range transitions are governed by a size band rather than a single
+threshold: shards are split once they exceed a configured maximum size, and
+merged back together only once they fall under a configured minimum size,
+which defaults to one quarter of the maximum when not set explicitly. That gap
+between the two thresholds keeps a shard sitting near either boundary from
+being split and then immediately re-merged (or the reverse) as its size
+fluctuates slightly.
+
+Planning also throttles how much transition work can be in flight at once:
+each table has its own cap on the number of concurrent automatic split/merge
+transitions it can have running, and the whole cluster shares a further cap
+across all tables, so one table's growth cannot monopolize the reconciler or
+trigger a burst of simultaneous transitions. Each shard that finishes a split
+or merge (or has one rolled back) also enters a cooldown window before it can
+be selected for another automatic transition, which keeps a shard from being
+repeatedly re-split or re-merged while its size stabilizes.
+
+An automatic merge only fires between shards that are healthy, adjacent, and
+not already mid-transition. Because a merge folds one shard's data into its
+neighbor rather than just widening a byte range, the donor's data has to be
+moved into the receiver before the donor range is retired from the table's
+topology, not the other way around.
 
 ## Active Follow-Up
 

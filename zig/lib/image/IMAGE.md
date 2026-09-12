@@ -11,12 +11,12 @@ Use it to answer:
 
 Sibling repo references:
 
-- [`lib/image/src/mod.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/lib/image/src/mod.zig)
-- [`lib/pdf/src/reader.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/lib/pdf/src/reader.zig)
-- [`build.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-zig/build.zig)
-- [`../antfly-inference-zig/src/pipelines/image.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/src/pipelines/image.zig)
-- [`../antfly-inference-zig/lib/chunker/src/fixed_multimodal.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/lib/chunker/src/fixed_multimodal.zig)
-- [`../antfly-inference-zig/build.zig`](/Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/build.zig)
+- [`lib/image/src/mod.zig`](src/mod.zig)
+- [`lib/pdf/src/reader.zig`](../pdf/src/reader.zig)
+- [`build.zig`](../../build.zig)
+- [`pkg/inference/src/pipelines/image.zig`](../../pkg/inference/src/pipelines/image.zig)
+- [`lib/chunker/src/fixed_multimodal.zig`](../chunker/src/fixed_multimodal.zig)
+- [`pkg/inference/build.zig`](../../pkg/inference/build.zig)
 
 ## Public Surface
 

@@ -65,7 +65,7 @@ expert IDs, not as a bundle of independently contiguous 2D tensors.
 Implementation implications:
 
 - `expert_axis == 2` is valid for ggml-compatible Gemma4/Unsloth GGUF files.
-- Native, MLX, and Metal paths must not compute selected expert bytes as
+- Native and Metal paths must not compute selected expert bytes as
   `total_bytes / expert_count` unless the layout proves that slice is
   contiguous.
 - Fused gate/up tensors should project once over the packed expert tensor, then
@@ -355,7 +355,7 @@ Antfly inference already recognizes the `Q4_1` tensor type and block sizing in
 
 - GGUF codec materialization and row dequantization.
 - Native CPU direct quantized matmul.
-- MLX and pure-Metal device kernels, including grouped packed-expert MoE
+- Pure-Metal device kernels, including grouped packed-expert MoE
   kernels where the backend supports them.
 - WASM/WebGPU quantized matmul if browser inference needs the same model.
 
@@ -372,12 +372,12 @@ concerns:
 1. File compatibility: GGUF can parse the tensor type and compute byte length.
 2. Correctness fallback: codec and native CPU paths can produce correct f32
    results without full model-specific fast kernels.
-3. Fast execution: MLX, pure Metal, and WebGPU can execute common linear and
+3. Fast execution: pure Metal and WebGPU can execute common linear and
    MoE paths without materializing whole tensors.
 
 Current practical priority:
 
-- Complete `Q4_1` across codec, native, MLX, pure Metal, and WebGPU.
+- Complete `Q4_1` across codec, native, pure Metal, and WebGPU.
 - Add the sibling legacy formats `Q5_1` and `Q8_1` next, because the parser
   already recognizes them and their layouts are close to existing `Q5_0` and
   `Q8_0` support.
@@ -385,7 +385,7 @@ Current practical priority:
   shapes permit 256-value blocks.
 
 Validation should include synthetic block tests, row dequant tests, native
-matmul-vs-dense tests, MLX and pure-Metal kernel tests, and at least one real
+matmul-vs-dense tests, pure-Metal kernel tests, and at least one real
 GGUF smoke test that verifies quantized execution counters are hit.
 
 ## Quantization Task List
@@ -393,22 +393,19 @@ GGUF smoke test that verifies quantized execution counters are hit.
 Antfly inference should prioritize formats by how much real GGUF compatibility they
 unlock and how close they are to already-covered paths.
 
-- [x] Finish `Q4_1` across GGUF codec, native CPU, MLX/Metal, Antfly inference WebGPU,
+- [x] Finish `Q4_1` across GGUF codec, native CPU, Metal, Antfly inference WebGPU,
   and the embedded WebGPU mirror.
 - [x] Add WebGPU `Q4_K` support in Antfly inference and the embedded mirror. `Q4_K` is a
-  common K-quant format and already has codec/native/MLX coverage.
+  common K-quant format and already has codec/native coverage.
 - [x] Add fast-path parity for legacy `Q5_0`, `Q5_1`, and `Q8_1`, starting with
-  WebGPU where missing and then filling any MLX grouped-path gaps.
+  WebGPU where missing.
   - [x] Antfly inference WebGPU `Q5_0` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q5_1` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q8_1` direct linear shader and WASM dispatch.
   - [x] Embedded WebGPU mirror and install packaging for `Q5_0`, `Q5_1`, and
     `Q8_1`.
-  - [x] MLX grouped coverage checked: `Q5_0` already has direct and grouped
-    kernels.
-  - [x] Add MLX direct and grouped kernels for `Q5_1` and `Q8_1`.
 - [x] Add WebGPU parity for `Q2_K`, `Q3_K`, and `Q8_K` so browser execution
-  covers the same K-quant family as codec/native/MLX paths.
+  covers the same K-quant family as codec/native paths.
   - [x] Antfly inference WebGPU `Q2_K` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q3_K` direct linear shader and WASM dispatch.
   - [x] Antfly inference WebGPU `Q8_K` direct linear shader and WASM dispatch.
@@ -418,7 +415,6 @@ unlock and how close they are to already-covered paths.
   `IQ4_XS`.
 - [x] Add fast kernels for the `IQ4_*` formats that show up in real target
   GGUFs.
-  - [x] MLX direct and grouped kernels for `IQ4_NL` and `IQ4_XS`.
   - [x] Antfly inference WebGPU direct linear shaders and WASM dispatch for `IQ4_NL` and
     `IQ4_XS`.
   - [x] Embedded WebGPU mirror and install packaging for `IQ4_NL` and

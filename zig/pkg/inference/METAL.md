@@ -128,8 +128,8 @@ Local ggml inspection on 2026-05-01 confirmed the production shape:
 
 ## Current Status
 
-- `--backend metal` builds without MLX when configured with `-Dmetal=true
-  -Dmlx=false`.
+- `--backend metal` builds with `-Dmetal=true` (there is no `-Dmlx` flag now
+  that the MLX backend has been removed).
 - The Gemma4 4-token anchor is correct on the current safe path:
   `Hi! How can`, token ids `10979 236888 2088 740`.
 - `gelu_new` now lowers as a backend activation kind instead of decomposing
@@ -1375,7 +1375,7 @@ experiment.
 - [ ] Collapse per-layer command boundaries into a runtime-owned prefill graph
   or block submission.
 - [x] Add prompt benchmark buckets for `pp10`, `pp128`, and `pp512`.
-  `zig build bench-metal-prefill-buckets -Dmetal=true -Dmlx=false` runs the
+  `zig build bench-metal-prefill-buckets -Dmetal=true` runs the
   real Metal CLI against fixed prompt buckets plus a short-prompt decode bucket
   so future kernel work is measured against pp/tg buckets instead of noisy
     4-token smoke runs. Current local sample on Gemma4 Q8_0 after the Q8_0
@@ -1481,8 +1481,8 @@ Local ggml reference:
 Use these checks after changing Metal runtime behavior:
 
 ```sh
-zig build test-metal-gemma4-prefill-block-parity -Dmetal=true -Dmlx=false --summary failures
-zig build -Dmetal=true -Dmlx=false -Donnx=false --summary failures
+zig build test-metal-gemma4-prefill-block-parity -Dmetal=true --summary failures
+zig build -Dmetal=true -Donnx=false --summary failures
 LIST_ONLY=1 bash pkg/inference/scripts/debug_metal_command.sh unit 'metal|Metal'
 RUN_MODE=isolated USE_PREBUILT_UNIT=1 bash pkg/inference/scripts/debug_metal_command.sh unit --api-validate 'metal|Metal'
 ./zig-out/bin/antfly inference generate ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi --backend metal --max-tokens 4 --print-token-ids --print-timing
@@ -1493,27 +1493,27 @@ Run Gemma4 Metal timing through the crash-debug wrapper:
 ```sh
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-mapped-quant-default \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
-  --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
+  --cwd "$ANTFLY_REPO/zig" \
   -- ./pkg/inference/zig-out/bin/antfly inference generate \
-  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-private-quant-baseline \
   ANTFLY_INFERENCE_METAL_DISABLE_MAPPED_QUANT_WEIGHTS=1 \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
-  --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
+  --cwd "$ANTFLY_REPO/zig" \
   -- ./pkg/inference/zig-out/bin/antfly inference generate \
-  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 
 env TIMEOUT_SECS=180 LABEL=metal-gemma4-force-mapped-quant \
   ANTFLY_INFERENCE_METAL_FORCE_MAPPED_QUANT_WEIGHTS=1 \
   bash pkg/inference/scripts/debug_metal_command.sh command --api-validate \
-  --cwd /Users/ajroetker/go/src/github.com/antflydb/antfly-zig \
+  --cwd "$ANTFLY_REPO/zig" \
   -- ./pkg/inference/zig-out/bin/antfly inference generate \
-  /Users/ajroetker/.antfly/models/ggml-org/gemma-4-e2b-it-gguf hi \
+  ~/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf hi \
   --backend metal --mode compiled --compiled-target whole-model \
   --max-tokens 4 --print-token-ids --print-timing
 ```
@@ -1780,7 +1780,7 @@ Target outcome for the Gemma4 `hi --max-tokens 1` Metal smoke:
   - Keep fallback tests proving unsupported frames still run through current per-layer helpers.
 
 - Runtime smoke:
-  - Build `pkg/inference` with `-Dmetal=true -Dmlx=false -Doptimize=ReleaseFast`.
+  - Build `pkg/inference` with `-Dmetal=true -Doptimize=ReleaseFast`.
   - Run Gemma4 unsandboxed through `debug_metal_command.sh`.
   - Acceptance for this slice: token `10979`, no fallbacks/host outputs, no diagnostic reports, and reduced command/encoder counts versus `commands=924`, `total_compute_encoders=942`.
   - Record both cold and warm runs; use warm run for performance comparison.

@@ -2,7 +2,7 @@
 
 ## Context
 
-antfly-inference-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (BLAS, MLX, WASM) implements these ops immediately.
+antfly-inference-zig currently uses **eager execution** with a `ComputeBackend` VTable of ~45 fused ops (`src/ops/ops.zig:118-345`). Model architectures (`gpt.zig`, `bert.zig`, etc.) call `cb.linear(...)`, `cb.rmsNorm(...)` directly, and each backend (BLAS, Metal, WASM) implements these ops immediately.
 
 This works well for inference but prevents:
 - **Graph optimizations** (op fusion, memory planning, dead code elimination)
@@ -296,7 +296,6 @@ src/graph/                      -- Antfly inference-specific bridge (imports lib
 | `src/ops/ops.zig:110-345` | ComputeBackend VTable — the tracing target |
 | `src/architectures/gpt.zig:92-114` | GPT forward pass — primary test subject |
 | `src/ops/blas_compute.zig` | BLAS backend — reference interpreter target |
-| `src/ops/mlx_compute.zig` | MLX backend — fused kernel targets for optimization |
 | `src/pipelines/generation.zig` | Generation pipeline — integration point for graph mode |
 | `src/backends/backends.zig:17-21` | BackendKind enum — needs `graph` variant |
 | `build.zig` | Build system — add `lib/ml` and `src/graph` to module resolution |

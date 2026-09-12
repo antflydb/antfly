@@ -592,119 +592,25 @@ parsing.
 - Keep scheduled maintenance distinct from explicit force compaction, as
   defined in `FULL_TEXT.md`.
 
-## Implementation Milestones
+## Status
 
-### Milestone 0: Freeze the benchmark specification
-
-- [x] Define the typed query grammar and version.
-- [x] Define corpus normalization and stable ordinal assignment.
-- [x] Define score tolerance and cutoff-tie rules.
-- [x] Define single and production segment modes.
-- [x] Define the machine-readable run manifest and result schema.
-- [x] Check in a small deterministic correctness corpus and query suite.
-
-Exit gate: two independent engine adapters can consume the same artifacts and
-the verifier can deliberately detect injected count, ID, and score mismatches.
-
-### Milestone 1: Correct embedded adapter
-
-Likely files:
-
-- `bench/full_text/search_benchmark_common.zig`
-- `bench/full_text/search_benchmark_index.zig`
-- `bench/full_text/search_benchmark_query.zig`
-- `search-benchmark-game/engines/antfly-zig/Makefile`
-- `search-benchmark-game/engines/antfly-zig/details.json`
-- `build.zig`
-
-Tasks:
-
-- [x] Add verification output containing IDs, scores, count, and relation.
-- [x] Replace ambiguous query parsing with the benchmark grammar.
-- [x] Make analyzer and BM25 configuration explicit.
-- [x] Add stable corpus ordinals.
-- [x] Add segment-mode selection and post-index assertions.
-- [x] Emit index, segment, corpus, build, and environment manifests.
-- [x] Add adapter protocol and golden tests.
-
-Exit gate: no timed sample is recorded when correctness preflight fails.
-
-### Milestone 2: Add the production-backed kernel API
-
-Likely files:
-
-- `pkg/antfly/src/index.zig`
-- `pkg/antfly/src/search/search.zig`
-- `pkg/antfly/src/embedded/db.zig`, only for snapshot/access plumbing
-- segment ordinal/doc-value sections if native identity needs format work
-
-Tasks:
-
-- [x] Return corpus ordinals and scores without body loading.
-- [x] Bypass MVCC/public projection in kernel mode.
-- [x] Prove equivalence with a static fully visible DB search.
-- [x] Add phase and work counters without affecting default production cost.
-
-Exit gate: profiles show the timed kernel path is limited to declared kernel
-work, and the server path remains unchanged.
-
-### Milestone 3: Reproducible runner and baseline
-
-- [x] Integrate Tantivy correctness output.
-- [x] Add analyzer-token-stream comparison.
-- [x] Run the full corpus in both segment modes.
-- [x] Run at least five warm repetitions per class.
-- [x] Record index time/size, RSS, reopen time, latency, and raw samples.
-- [x] Publish an internal baseline report with commit hashes and manifests.
-
-Exit gate: replace the historical latency table with a reproducible current
-baseline, including failed/unsupported query counts.
-
-### Milestone 4: Boolean iterator tree
-
-- [x] Route simple fast-path seeks through postings `advanceTo`.
-- [x] Implement conjunction, disjunction, required/optional, exclusion, and
-      minimum-should-match scorers.
-- [x] Separate exact-count and competitive top-k plans.
-- [x] Remove benchmark query shapes from the all-hit/hash-map fallback.
-- [x] Add randomized differential tests against the old executor.
-
-Exit gate: correctness is unchanged, top-k memory does not scale with match
-count, and union/intersection latency is reported independently.
-
-### Milestone 5: Scored two-phase phrases
-
-- [x] Add approximation and positional verification interfaces.
-- [x] Define and test phrase scoring semantics.
-- [x] Add exact count without scored-hit materialization.
-- [x] Feed phrase top-k into the global competitive collector.
-- [x] Add phrase work counters and randomized differential tests.
-
-Exit gate: phrase correctness passes against the comparator and top-k no longer
-allocates one hit per phrase match.
-
-### Milestone 6: Segment, codec, and allocation optimization
-
-- [x] Add conservative segment upper bounds and search ordering.
-- [x] Evaluate persisted postings/block-max layouts.
-- [x] Reduce query-local allocations and repeated sorting.
-- [x] Tune production merge policy with read/write tradeoff measurements.
-
-Exit gate: accepted improvements pass format, reopen, corruption, merge,
-correctness, index-size, RSS, and query-class regression gates.
-
-### Milestone 7: Product/server benchmark
-
-- [x] Add persistent-client concurrency sweeps.
-- [x] Add read-only and mixed read/write workloads.
-- [x] Add searchable-freshness markers.
-- [x] Define and implement durability-profile manifests.
-- [x] Add graceful/crash restart and recovery measurements.
-- [x] Compare Antfly with a normal server comparator such as Quickwit.
-
-Exit gate: the public report clearly separates kernel results from product
-results and includes throughput, tail latency, freshness, durability, memory,
-disk, indexing, and recovery.
+The eight-milestone implementation plan above is complete: the benchmark
+specification (grammar, corpus normalization, score/cutoff-tie rules, segment
+modes, manifest schema) is frozen and checked in; the embedded adapter
+(`bench/full_text/search_benchmark_*.zig`, `search-benchmark-game/engines/antfly-zig/`)
+is correct and correctness-gated; the production-backed kernel API
+(`pkg/antfly/src/index.zig`, `pkg/antfly/src/search/search.zig`) returns
+native ordinals/scores without MVCC or body-loading overhead; the runner
+(`tools/run_search_kernel_benchmark.py`, `tools/run_search_server_benchmark.py`)
+is reproducible with an archived baseline; the boolean iterator tree, scored
+two-phase phrase executor, and segment/codec/allocation optimizations
+described in the Engine Optimization Roadmap above are implemented in
+`pkg/antfly/src/search/scorer.zig` and `pkg/antfly/src/section/inverted.zig`;
+and the product/server benchmark (persistent-client concurrency sweeps, mixed
+read/write, freshness, durability-profile, and restart/recovery measurements)
+is implemented and compared against Quickwit. The dated log below records the
+ongoing measurement history against that completed harness; it is not a list
+of outstanding milestone work.
 
 ## Implementation Progress
 

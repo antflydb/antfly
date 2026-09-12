@@ -212,20 +212,7 @@ Shader requirements:
 - `MAX_KV` limits and workgroup memory use must be re-evaluated because encoded
   K reduces storage bandwidth but may add estimator math.
 
-### 6. MLX/Metal Path
-
-Once native and WebGPU have a stable ABI, add MLX support:
-
-- `src/backends/mlx_quant.zig`
-- `src/backends/mlx_quant_metal.m`
-- `src/ops/mlx_compute.zig`
-
-MLX should initially be allowed to fall back to f16/f32 cache dtype for
-unsupported model families. Do not route Gemma through `turbo3` by default until
-model-level quality is measured, since Gemma currently has special KV dtype
-selection behavior.
-
-### 7. Compaction Composition
+### 6. Compaction Composition
 
 After the base compressed cache works:
 
@@ -330,15 +317,15 @@ Exit criteria:
 - WebGPU compressed path runs without falling back for `polar4`.
 - Shader output matches native reference within tolerance.
 
-### Phase 6: MLX/Metal Kernel
+### Phase 6: Metal Kernel
 
 - Add a Metal compressed-key scoring kernel.
-- Wire MLX dispatch behind dtype and shape checks.
+- Wire dispatch behind dtype and shape checks.
 - Keep unsupported shapes on current f16/f32 behavior.
 
 Exit criteria:
 
-- MLX path can run a real decode loop with `polar4`.
+- The Metal path can run a real decode loop with `polar4`.
 - Per-token decode latency and memory are reported against f16 and int8.
 
 ### Phase 7: End-To-End Quality Gates
@@ -377,12 +364,11 @@ Exit criteria:
 | Attention | Direct compressed scoring versus fallback decode, masks, GQA grouping, page boundaries |
 | Benchmark | Native dtype sweep, long-context decode, compaction composition |
 | WebGPU | Shader reference comparison, dtype dispatch, unsupported fallback |
-| MLX | Real decode loop, dtype dispatch, unsupported fallback |
 | E2E | Numeric kernel gates, short deterministic token checks, long-context retrieval, model-family tolerance table |
 
 ## Risks
 
-- The paper's H100 speedup numbers may not transfer to CPU, WebGPU, or MLX
+- The paper's H100 speedup numbers may not transfer to CPU or WebGPU
   without specialized kernels.
 - A metadata-free quantizer is only useful if direct scoring avoids f32
   materialization in the hot loop.

@@ -66,7 +66,7 @@ docs/                          # User-facing documentation
 - EKS: Spot node selectors, tolerations, IRSA annotations — triggered by `spec.eks.enabled: true`
 - Cannot enable both GKE Autopilot and EKS simultaneously (webhook-enforced)
 
-**Webhook validation** (`api/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection, and managed `spec.inference` validation. Controller has fallback validation with exponential backoff if webhook disabled.
+**Webhook validation** (`api/antfly/v1/antflycluster_webhook.go`): Enforces immutability, enum validation, conflict detection, and managed `spec.inference` validation. Controller has fallback validation with exponential backoff if webhook disabled.
 
 ## Autoscaling
 

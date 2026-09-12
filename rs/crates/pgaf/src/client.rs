@@ -6,7 +6,7 @@ use url::Url;
 /// HTTP client for communicating with an Antfly server.
 ///
 /// The base URL should include the API version prefix with a trailing slash,
-/// e.g. `http://localhost:8080/api/v1/`.
+/// e.g. `http://localhost:8080/db/v1/`.
 pub struct AntflyClient {
     base_url: Url,
     http: Client,

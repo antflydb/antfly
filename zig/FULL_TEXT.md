@@ -139,14 +139,17 @@ Internally this should lower to the existing boolean, term, and prefix query
 machinery. Completed terms match the root and shingle fields, and the final
 partial phrase is satisfied through `._index_prefix`.
 
-## Task List
+## Status
 
-- [x] Stop draining scheduled text merges inside normal sync-level waits.
-- [x] Add an explicit `drainScheduledTextMerges()` API.
-- [x] Route `runUntilIdle()` through the scheduled-merge drain path.
-- [x] Keep `forceCompactTextIndexes()` as a separate explicit admin/test path.
-- [x] Move broad callers off forced compaction where the goal is just stable
-      maintenance rather than minimal segments.
+The sync/merge split described above is implemented: `SyncLevel.full_text`
+waits for search visibility only, scheduled text merges run as background
+maintenance drained via `drainScheduledTextMerges()`, `runUntilIdle()` routes
+through that drain path, and `forceCompactTextIndexes()` remains a separate
+explicit admin/test path. Callers that only need stable maintenance have been
+moved off forced compaction. See the segment-builder and format work recorded
+below under "Segment Build Profiling" for the current implementation
+locations (primarily the text segment builder, `IndexWriter`, and the
+file-backed segment writer/publisher).
 
 ## Follow-Through
 

@@ -1,17 +1,17 @@
 # antfly-inference-zig Roadmap
 
-antfly-inference-zig is a Zig reimplementation of the Go Antfly inference ML inference service targeting full API parity with all 10 endpoints, plus native MLX/SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
+antfly-inference-zig is a Zig reimplementation of the Go Antfly inference ML inference service targeting full API parity with all 10 endpoints, plus native SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
 
 ## Architecture
 
 ```
 .onnx files ──────► ONNX Runtime (CPU, CUDA, TensorRT, ROCm)
                          │
-SafeTensors/GGUF ──► Hand-written forward pass ──► MLX (Metal, macOS only)
+SafeTensors/GGUF ──► Hand-written forward pass ──► Metal (macOS only)
                          │                    └──► BLAS (CPU everywhere)
 ```
 
-ONNX Runtime is the universal backend (loads `.onnx` directly). MLX and BLAS need SafeTensors weight loading + hand-written model architectures per model family.
+ONNX Runtime is the universal backend (loads `.onnx` directly). Metal and BLAS need SafeTensors weight loading + hand-written model architectures per model family.
 
 ---
 
@@ -38,13 +38,13 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 - Model registry (local discovery, ModelRef parsing)
 - HTTP server (httpx.zig, route stubs)
 - CLI (run, list, pull, version)
-- Build system (conditional `-Donnx`, `-Dmlx`, `-Dblas`)
+- Build system (conditional `-Donnx`, `-Dmetal`, `-Dblas`)
 - Working `/api/embed` via ONNX
 - Reranking pipeline and `/api/rerank`
-- Native BERT/RoBERTa cross-encoder path with MLX TP
+- Native BERT/RoBERTa cross-encoder path
 - ColBERT late-interaction text reranker
 - ColQwen multimodal reranker and `/rerank_multimodal`
-- GLiNER2 native DeBERTa + span-head path with distributed MLX TP
+- GLiNER2 native DeBERTa + span-head path
 - Document classification runtime (`/api/classify/document`, `/api/classify/document_tokens`)
 - LayoutLMv3 PEFT surface (LoRA bootstrap, train, inspect, materialize)
 - Autodiff and training loop (reverse-mode AD, VJP rules, FlatTrainingState, LoRA injection)
@@ -62,25 +62,16 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 ## Active Work
 
-### MLX Gemma Follow-Up
-
-- [ ] **Budget accounting for native MLX Gemma**: large native Gemma 3 MLX runs exceed the intended runtime budget because resident MLX tensors and other backend allocations are not fully accounted for by the current host/backend/KV/scratch reservation system.
-- [ ] **NVMe spill for native MLX Gemma**: current `disk`/`host`/`backend` budgeting is still tensor-store reload semantics, not a true NVMe-managed residency path. Cold dense weights should stay on disk/NVMe by default rather than being pulled resident too eagerly.
-- [ ] **Clean up MLX Gemma debug scaffolding**: remove the temporary scheduler/KV/paged-attention debug env toggles and noisy MLX tied-logits logging added during the Gemma 3 decode investigation, while keeping the actual correctness fixes.
-
 ### Reranker and Multimodal Verification
 
-- [ ] **Bounded BLAS-vs-MLX TP verification on a real local ColQwen2 bundle**
 - [ ] **`/rerank_multimodal` smoke/regression surface** (request-level)
-- [ ] **Verify native Qwen2-VL vision behavior under distributed MLX** on the larger machine
 - [ ] **Unify text and multimodal late-interaction reporting semantics**
 - [ ] **Broader multimodal server-path regression coverage**
-- [ ] **Rank-aware MLX device/stream selection polish** for distributed reranker
 - [ ] **Request orchestration semantics** for server-side distributed rerank execution
 
 ### Native GLiNER Parity
 
-- [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across MLX/BLAS, add backend-specific tests, tighten performance gaps in the native head.
+- [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across backends, add backend-specific tests, tighten performance gaps in the native head.
 - [ ] **Bounded BLAS-vs-TP parity run** on a real local GLiNER2 bundle
 - [ ] **Server-path orchestration** for distributed multi-rank GLiNER2 execution
 - [ ] **Thread server/reporting semantics** through native `/classify` and `/extract`
@@ -170,13 +161,12 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 | `test_rerank.sh` | ms-marco-MiniLM-L-6-v2 | Score ordering, relevant > irrelevant |
 | `test_chunk.sh` | (no model) | Chunk boundaries, overlap |
 | `test_blas.sh` | bge-small-en-v1.5 (SafeTensors) | Output matches ONNX within tolerance |
-| `test_mlx.sh` | bge-small-en-v1.5 (SafeTensors) | Output matches ONNX within tolerance |
 | `test_generate.sh` | small T5/GPT model | Generates coherent text |
 | `test_ner.sh` | NER model | Correct entity spans |
 
 **CI matrix:**
 ```
-macOS arm64:  ONNX + BLAS + MLX
+macOS arm64:  ONNX + BLAS + Metal
 Linux x86_64: ONNX + BLAS
 Linux arm64:  ONNX + BLAS
 ```

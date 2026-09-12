@@ -209,21 +209,17 @@ only appropriate for explicitly local, non-HTTP test/service paths.
 - integration tests for snapshot + streaming + restart/resume
 - parity/e2e tests against a real Postgres instance
 
-## Near-Term Tasks
+## Status
 
-- [x] Persist `replication_sources` in canonical table metadata
-- [x] Round-trip that metadata through raft/apply storage
-- [x] Expose raw `replication_sources` in table metadata/status routes
-- [x] Expose configured-source counts in metadata status
-- [x] Add explicit replication-source status/progress records to metadata
-- [x] Add admin snapshot visibility for source status/progress
-- [x] Add a first passthrough Postgres snapshot/backfill runner
-- [x] Add a first metadata-owned snapshot backfill coordinator
-- [x] Wire snapshot/backfill orchestration into metadata runtime/server execution
-- [x] Add a first metadata-owned streaming/apply coordinator
-- [x] Add transform-aware snapshot import and routed CDC fan-out on the
-  stateful metadata-owned path
-- [x] Build the first real Postgres logical replication tail transport
-- [x] Add richer durable CDC checkpointing
-- [x] Add end-to-end CDC tests
-- [x] Add restart/resume CDC E2E coverage on the unified stateful `standalone` path
+The near-term task list is implemented: `replication_sources` metadata
+round-trips through raft/apply storage and is exposed on status/admin routes;
+metadata owns a snapshot/backfill coordinator and a streaming/apply
+coordinator, both wired into the metadata leader's `runRound()`; the Postgres
+snapshot runner supports transform-aware import and routed fan-out; a real
+Postgres logical-replication tail transport backs the streaming phase with
+durable checkpointing; and `e2e/test_cdc.py` covers snapshot import,
+streaming insert/update/delete, and restart/resume on the unified
+`standalone` entrypoint. The "What does not exist yet" section above still
+applies: exact exported-snapshot cutover only covers fresh-slot sync, and
+existing-slot/resume flows remain on the non-exact path with explicit
+operator reseeding as the escape hatch.

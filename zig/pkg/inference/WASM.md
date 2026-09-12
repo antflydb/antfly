@@ -2,7 +2,7 @@
 
 ## Context
 
-Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), MLX (Metal/Apple Silicon), ONNX (runtime).
+Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently four backends exist: native (CPU), Metal (Apple Silicon), ONNX (runtime), and ORT GenAI.
 
 Goal: enable antfly inference to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
 
@@ -1175,7 +1175,7 @@ Current status:
 - streamed GGUF loading now parses tokenizer-related header metadata in `web/runtime/gguf-stream.js` and surfaces `{ tokenizerJson, chatTemplate }` through `streamLoadGgufModel(..., { onMetadata })`; `streamLoadGgufModel(..., { autoLoadTokenizer: true, onTokenizerLoaded })` can now also install that tokenizer automatically without a second whole-file fetch
 - the web runtime now exposes `gguf_chat_template` and `render_chat_prompt`, so direct mode and worker mode can extract a GGUF chat template and render a single-turn system/user prompt through Zig's existing Jinja chat-template engine instead of relying on raw prompt text
 - GPU-resident weights have now started as an explicit runtime feature: `WasmCompute` now owns a `GpuWeightStore`, WebGPU-enabled registration eagerly uploads those weights during model load, and the WebGPU matmul / LayerNorm / RMSNorm paths now reuse those resident GPU buffers instead of re-uploading long-lived `B`, `gamma`, and `beta` tensors on every dispatch
-- local build verification now passes for both `wasm32` and `wasm64`, but this currently depends on a local Zig freestanding `std.Io.Threaded` workaround tracked in the repo root `ZIG.md`
+- local build verification now passes for both `wasm32` and `wasm64`, but this currently depends on a local Zig freestanding `std.Io.Threaded` workaround that was tracked in a since-removed repo-root `ZIG.md` note
 - large-model browser bring-up remains follow-on work
 
 ### Initial Refactor Slice

@@ -104,8 +104,7 @@ Near-term goals:
 Primary references:
 - [TODO.md](TODO.md)
 - [pkg/antfly/src/api/PLAN.md](pkg/antfly/src/api/PLAN.md)
-- [../antfly/openapi.yaml](../antfly/openapi.yaml)
-- [../antfly2/openapi.yaml](../antfly2/openapi.yaml)
+- [../openapi.yaml](../openapi.yaml) (joined public spec at the repo root)
 
 Near-term goals:
 - fix status/readiness gaps before broadening API behavior
