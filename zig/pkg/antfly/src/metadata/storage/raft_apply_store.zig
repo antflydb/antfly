@@ -1896,6 +1896,8 @@ pub const ProjectionSignal = struct {
     node_id: u64 = 0,
     /// False only when existing report payloads and observation clocks are unchanged.
     store_reports_changed: bool = true,
+    /// Runtime references change group facts/clocks but retain runtime pages.
+    store_runtime_changed: bool = true,
 };
 
 pub const ProjectionListener = struct {
@@ -2608,6 +2610,21 @@ pub const RaftApplyStore = struct {
         return if (reports) try self.readStoredStoreTxn(alloc, &txn, group_id, bytes) else try decodeStoredHeader(alloc, bytes);
     }
 
+    pub fn readStoreGroupFacts(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, store_id: u64) !?metadata.StoreRecord {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        const bytes = txn.get(try storeKeyForGroup(&key_buf, group_id, store_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var record = try self.readStoredStoreArenaTxn(arena.allocator(), &txn, group_id, bytes, false);
+        record.runtime_statuses = &.{};
+        return try metadata_table_manager.cloneStore(alloc, record);
+    }
+
     pub fn freeStores(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.StoreRecord) void {
         for (records) |record| metadata_table_manager.freeStore(alloc, record);
         alloc.free(records);
@@ -2824,7 +2841,7 @@ pub const RaftApplyStore = struct {
         }
         // Visit actual reporters instead of the stores x selected-groups product.
         const ReportPageAddress = struct { store_id: u64, page_id: u64 };
-        const ReportPageValues = struct { payload: []const u8, clocks: []const u8 };
+        const ReportPageValues = [4][]const u8;
         var report_pages: std.AutoHashMapUnmanaged(ReportPageAddress, ReportPageValues) = .empty;
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -2839,20 +2856,21 @@ pub const RaftApplyStore = struct {
                 const i = store_positions.get(store_id) orelse return error.InvalidCatalogRecord;
                 if (!std.mem.eql(u8, kv.key, try listingReportKey(a, group_id, store_id, range.group_id))) return error.InvalidCatalogRecord;
                 const cached_report_page = try report_pages.getOrPut(a, .{ .store_id = store_id, .page_id = slot / report_page_slots });
-                if (!cached_report_page.found_existing) cached_report_page.value_ptr.* = .{
-                    .payload = try txn.get(try reportPageKey(a, group_id, store_id, slot / report_page_slots, false)),
-                    .clocks = try txn.get(try reportPageKey(a, group_id, store_id, slot / report_page_slots, true)),
+                if (!cached_report_page.found_existing) for (0..4) |component| {
+                    cached_report_page.value_ptr[component] = try txn.get(try reportComponentKey(a, group_id, store_id, slot / report_page_slots, component));
                 };
-                var report = try decodeStoreRecord(a, try reportPageEntry(cached_report_page.value_ptr.payload, slot));
-                if (report.store_id != store_id or report.node_id != stores[i].node_id) return error.InvalidCatalogRecord;
-                try applyReportClocks(&report, try reportPageEntry(cached_report_page.value_ptr.clocks, slot));
-                for (report.group_statuses) |item| {
-                    if (item.group_id != range.group_id) return error.InvalidCatalogRecord;
-                    try group_reports[i].append(a, item);
-                }
-                for (report.runtime_statuses) |item| {
-                    if (item.group_id != range.group_id) return error.InvalidCatalogRecord;
-                    try runtime_reports[i].append(a, item);
+                for ([_]usize{ 0, 2 }) |component| {
+                    var report = try decodeStoreRecord(a, try reportPageEntry(cached_report_page.value_ptr[component], slot));
+                    if (report.store_id != store_id or report.node_id != stores[i].node_id) return error.InvalidCatalogRecord;
+                    try applyReportClocks(&report, try reportPageEntry(cached_report_page.value_ptr[component + 1], slot));
+                    for (report.group_statuses) |item| {
+                        if (item.group_id != range.group_id) return error.InvalidCatalogRecord;
+                        try group_reports[i].append(a, item);
+                    }
+                    for (report.runtime_statuses) |item| {
+                        if (item.group_id != range.group_id) return error.InvalidCatalogRecord;
+                        try runtime_reports[i].append(a, item);
+                    }
                 }
             }
         }
@@ -4315,18 +4333,16 @@ pub const RaftApplyStore = struct {
     // Store reports are primary rows. Full StoreRecord remains the wire/snapshot
     // codec; local storage keeps one header and one payload per reporting group.
     const store_header_magic = "ASTORE1\x00";
-    const report_member_bytes = 48; // group ID + stable slot + payload SHA-256
+    const report_member_bytes = 64; // group ID + slot + runtime digest + group/runtime counts
     const report_members_magic = "AMEMBER1";
     const report_page_slots = 64;
     const report_page_directory_bytes = report_page_slots * 8;
     const ListingReport = struct {
-        payload_dirty: bool = false,
-        clocks_dirty: bool = false,
+        dirty: [4]bool = @splat(false),
         member: [report_member_bytes]u8 = undefined,
-        encoded_clocks: []const u8 = &.{},
+        encoded: [4][]const u8 = @splat(&.{}),
         groups: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty,
         runtimes: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty,
-        clocks: std.ArrayListUnmanaged(u64) = .empty,
     };
     fn listingStorePrefix(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:metadata_store:{d}:", .{group_id});
@@ -4338,14 +4354,19 @@ pub const RaftApplyStore = struct {
         return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:store_report_v1:{d}:{d}:{d}", .{ group_id, range_id, store_id });
     }
     fn reportPageKey(alloc: std.mem.Allocator, group_id: u64, store_id: u64, page_id: u64, clocks: bool) ![]u8 {
-        return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:store_report_{s}_page_v1:{d}:{d}:{d}", .{ if (clocks) "clock" else "payload", group_id, store_id, page_id });
+        return reportComponentKey(alloc, group_id, store_id, page_id, if (clocks) 1 else 0);
+    }
+    // Runtime observations and live Raft facts have independent payload/clock pages.
+    fn reportComponentKey(alloc: std.mem.Allocator, group_id: u64, store_id: u64, page_id: u64, component: usize) ![]u8 {
+        const names = [_][]const u8{ "payload", "clock", "group", "group_clock" };
+        return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:store_report_{s}_page_v1:{d}:{d}:{d}", .{ names[component], group_id, store_id, page_id });
     }
     fn reportPageEntry(bytes: []const u8, slot: u64) ![]const u8 {
         if (bytes.len < report_page_directory_bytes) return error.InvalidCatalogRecord;
         const position: usize = @intCast((slot % report_page_slots) * 8);
         const start = std.mem.readInt(u32, bytes[position..][0..4], .little);
         const len = std.mem.readInt(u32, bytes[position + 4 ..][0..4], .little);
-        if (start < report_page_directory_bytes or start > bytes.len or len == 0 or len > bytes.len - start) return error.InvalidCatalogRecord;
+        if (start < report_page_directory_bytes or start > bytes.len or len > bytes.len - start) return error.InvalidCatalogRecord;
         return bytes[start..][0..len];
     }
     fn reportMembershipKey(alloc: std.mem.Allocator, group_id: u64, store_id: u64) ![]u8 {
@@ -4449,12 +4470,12 @@ pub const RaftApplyStore = struct {
         if (!std.mem.startsWith(u8, bytes, store_header_magic)) return decodeStoreRecord(alloc, bytes);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        return metadata_table_manager.cloneStore(alloc, try self.readStoredStoreArenaTxn(arena.allocator(), txn, group_id, bytes));
+        return metadata_table_manager.cloneStore(alloc, try self.readStoredStoreArenaTxn(arena.allocator(), txn, group_id, bytes, true));
     }
 
     // Internal apply consumers borrow decoded observations until their arena is
     // released. Avoid cloning an entire store only to free it after one update.
-    fn readStoredStoreArenaTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !metadata.StoreRecord {
+    fn readStoredStoreArenaTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8, include_runtime: bool) !metadata.StoreRecord {
         if (!std.mem.startsWith(u8, bytes, store_header_magic)) return decodeStoreRecord(a, bytes);
         var header = try decodeStoredHeader(a, bytes);
         const members = try readReportMembersTxn(a, txn, group_id, header.store_id);
@@ -4468,12 +4489,12 @@ pub const RaftApplyStore = struct {
             const entry = try pages.getOrPut(a, slot / report_page_slots);
             if (!entry.found_existing) entry.value_ptr.* = pages.count() - 1;
         }
-        const lookups = try a.alloc(ListingLookup, pages.count() * 2);
+        const width: usize = if (include_runtime) 4 else 2;
+        const lookups = try a.alloc(ListingLookup, pages.count() * width);
         var iterator = pages.iterator();
         while (iterator.next()) |page| {
             const i = page.value_ptr.*;
-            lookups[i * 2] = .{ .key = try reportPageKey(a, group_id, header.store_id, page.key_ptr.*, false), .index = i * 2 };
-            lookups[i * 2 + 1] = .{ .key = try reportPageKey(a, group_id, header.store_id, page.key_ptr.*, true), .index = i * 2 + 1 };
+            for (0..width) |j| lookups[i * width + j] = .{ .key = try reportComponentKey(a, group_id, header.store_id, page.key_ptr.*, if (include_runtime) j else j + 2), .index = i * width + j };
         }
         const sorted = if (self.block_cache != null) try readListingKeys(a, txn, lookups) else try readReportKeys(a, txn, lookups);
         const values = try a.alloc([]const u8, lookups.len);
@@ -4482,19 +4503,25 @@ pub const RaftApplyStore = struct {
             const id = std.mem.readInt(u64, members[i * report_member_bytes ..][0..8], .little);
             const slot = std.mem.readInt(u64, members[i * report_member_bytes + 8 ..][0..8], .little);
             const page = pages.get(slot / report_page_slots).?;
-            var report = try decodeStoreRecord(a, try reportPageEntry(values[page * 2], slot));
-            if (report.store_id != header.store_id or report.node_id != header.node_id) return error.InvalidCatalogRecord;
-            for (report.group_statuses) |item| if (item.group_id != id) return error.InvalidCatalogRecord;
-            for (report.runtime_statuses) |item| if (item.group_id != id) return error.InvalidCatalogRecord;
-            try applyReportClocks(&report, try reportPageEntry(values[page * 2 + 1], slot));
-            try groups.appendSlice(a, report.group_statuses);
-            try runtimes.appendSlice(a, report.runtime_statuses);
+            var j: usize = 0;
+            while (j < width) : (j += 2) {
+                var report = try decodeStoreRecord(a, try reportPageEntry(values[page * width + j], slot));
+                if (report.store_id != header.store_id or report.node_id != header.node_id) return error.InvalidCatalogRecord;
+                for (report.group_statuses) |item| if (item.group_id != id) return error.InvalidCatalogRecord;
+                for (report.runtime_statuses) |item| if (item.group_id != id) return error.InvalidCatalogRecord;
+                try applyReportClocks(&report, try reportPageEntry(values[page * width + j + 1], slot));
+                try groups.appendSlice(a, report.group_statuses);
+                try runtimes.appendSlice(a, report.runtime_statuses);
+            }
         }
         header.group_statuses = groups.items;
         header.runtime_statuses = runtimes.items;
         return header;
     }
     fn updateListingStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord) !bool {
+        return self.updateStoreComponentsTxn(txn, group_id, store_id, replacement, false);
+    }
+    fn updateStoreComponentsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord, retain_runtime: bool) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -4509,19 +4536,12 @@ pub const RaftApplyStore = struct {
             error.NotFound => &.{},
             else => return err,
         };
-        if (old_membership.len % report_member_bytes != 0) return error.InvalidCatalogRecord;
         var old: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
         var used_slots: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        const Page = struct {
-            groups: [report_page_slots]?u64 = @splat(null),
-            payload_dirty: bool = false,
-            clocks_dirty: bool = false,
-            members_dirty: bool = false,
-        };
+        const Page = struct { groups: [report_page_slots]?u64 = @splat(null), dirty: [4]bool = @splat(false), members_dirty: bool = false };
         var pages: std.AutoHashMapUnmanaged(u64, Page) = .empty;
         var reports: std.AutoHashMapUnmanaged(u64, ListingReport) = .empty;
         if (replacement) |record| {
-            // Duplicates remain distinct: reconciliation fails closed on ambiguity.
             for (record.group_statuses) |report| {
                 const entry = try reports.getOrPut(a, report.group_id);
                 if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -4538,18 +4558,20 @@ pub const RaftApplyStore = struct {
             const row = old_membership[offset..][0..report_member_bytes];
             const id = std.mem.readInt(u64, row[0..8], .little);
             const slot = std.mem.readInt(u64, row[8..16], .little);
-            const member = try old.getOrPut(a, id);
-            if (member.found_existing) return error.InvalidCatalogRecord;
-            member.value_ptr.* = row;
+            try old.put(a, id, row);
+            if (retain_runtime) {
+                const entry = try reports.getOrPut(a, id);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                // Inventory changes, including duplicate multiplicity, need a full report.
+                if (entry.value_ptr.groups.items.len != std.mem.readInt(u64, row[48..56], .little)) return error.StoreReportBaseMismatch;
+            }
             const page = try pages.getOrPut(a, slot / report_page_slots);
             if (!page.found_existing) page.value_ptr.* = .{};
             if (reports.contains(id)) {
-                const used = try used_slots.getOrPut(a, slot);
-                if (used.found_existing) return error.InvalidCatalogRecord;
+                try used_slots.put(a, slot, {});
             } else {
                 try txn.delete(try listingReportKey(a, group_id, store_id, id));
-                page.value_ptr.payload_dirty = true;
-                page.value_ptr.clocks_dirty = true;
+                page.value_ptr.dirty = @splat(true);
                 page.value_ptr.members_dirty = true;
             }
         }
@@ -4558,56 +4580,69 @@ pub const RaftApplyStore = struct {
         var n: usize = 0;
         while (iterator.next()) |id| : (n += 1) ids[n] = id.*;
         std.mem.sort(u64, ids, {}, std.sort.asc(u64));
-        var old_clock_pages: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
+        var old_pages: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
         var next_slot: u64 = 0;
         for (ids) |id| {
             const record = replacement.?;
             const prior = old.get(id);
+            if (retain_runtime and prior == null) return error.StoreReportBaseMismatch;
             const slot = if (prior) |row| std.mem.readInt(u64, row[8..16], .little) else blk: {
                 while (used_slots.contains(next_slot)) next_slot = std.math.add(u64, next_slot, 1) catch return error.InvalidCatalogRecord;
                 try used_slots.put(a, next_slot, {});
                 break :blk next_slot;
             };
-            const page = try pages.getOrPut(a, slot / report_page_slots);
+            const page_id = slot / report_page_slots;
+            const page = try pages.getOrPut(a, page_id);
             if (!page.found_existing) page.value_ptr.* = .{};
             page.value_ptr.groups[slot % report_page_slots] = id;
             const report = reports.getPtr(id).?;
-            for (report.groups.items) |*item| {
-                try report.clocks.append(a, item.updated_at_millis);
+            const group_clocks = try a.alloc(u8, report.groups.items.len * 8);
+            for (report.groups.items, 0..) |*item, j| {
+                std.mem.writeInt(u64, group_clocks[j * 8 ..][0..8], item.updated_at_millis, .little);
                 item.updated_at_millis = 0;
             }
-            for (report.runtimes.items) |*item| {
-                try report.clocks.append(a, item.updated_at_ns);
-                item.updated_at_ns = 0;
+            report.encoded[2] = try encodeStoreRecord(a, .{ .store_id = store_id, .node_id = record.node_id, .group_statuses = report.groups.items });
+            report.encoded[3] = group_clocks;
+            const member = &report.member;
+            std.mem.writeInt(u64, member[0..8], id, .little);
+            std.mem.writeInt(u64, member[8..16], slot, .little);
+            std.mem.writeInt(u64, member[48..56], report.groups.items.len, .little);
+            if (retain_runtime) {
+                @memcpy(member[16..48], prior.?[16..48]);
+                @memcpy(member[56..64], prior.?[56..64]);
+            } else {
+                const clocks = try a.alloc(u8, report.runtimes.items.len * 8);
+                for (report.runtimes.items, 0..) |*item, j| {
+                    std.mem.writeInt(u64, clocks[j * 8 ..][0..8], item.updated_at_ns, .little);
+                    item.updated_at_ns = 0;
+                }
+                report.encoded[1] = clocks;
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hashReportValue(&hash, record.reporter_incarnation);
+                hashReportValue(&hash, record.node_id);
+                hashReportValue(&hash, report.runtimes.items);
+                const digest = hash.finalResult();
+                @memcpy(member[16..48], &digest);
+                std.mem.writeInt(u64, member[56..64], report.runtimes.items.len, .little);
+                report.dirty[0] = prior == null or !std.mem.eql(u8, prior.?[16..48], &digest);
+                if (report.dirty[0]) report.encoded[0] = try encodeStoreRecord(a, .{ .store_id = store_id, .node_id = record.node_id, .runtime_statuses = report.runtimes.items });
             }
-            var hash = std.crypto.hash.sha2.Sha256.init(.{});
-            hashReportValue(&hash, record.reporter_incarnation);
-            hashReportValue(&hash, record.node_id);
-            hashReportValue(&hash, report.groups.items);
-            hashReportValue(&hash, report.runtimes.items);
-            const payload_hash = hash.finalResult();
-            const clock_bytes = try a.alloc(u8, report.clocks.items.len * 8);
-            for (report.clocks.items, 0..) |clock, j| std.mem.writeInt(u64, clock_bytes[j * 8 ..][0..8], clock, .little);
-            report.encoded_clocks = clock_bytes;
-            report.payload_dirty = prior == null or !std.mem.eql(u8, prior.?[16..48], &payload_hash);
-            report.clocks_dirty = if (prior == null) true else blk: {
-                const old_page = try old_clock_pages.getOrPut(a, slot / report_page_slots);
-                if (!old_page.found_existing) old_page.value_ptr.* = try txn.get(try reportPageKey(a, group_id, store_id, slot / report_page_slots, true));
-                break :blk !std.mem.eql(u8, try reportPageEntry(old_page.value_ptr.*, slot), clock_bytes);
-            };
-            page.value_ptr.members_dirty = page.value_ptr.members_dirty or report.payload_dirty;
-            page.value_ptr.payload_dirty = page.value_ptr.payload_dirty or report.payload_dirty;
-            page.value_ptr.clocks_dirty = page.value_ptr.clocks_dirty or report.clocks_dirty;
+            for (1..4) |component| {
+                if (retain_runtime and component == 1) continue;
+                report.dirty[component] = if (prior == null) true else blk: {
+                    const previous = try old_pages.getOrPut(a, page_id * 4 + component);
+                    if (!previous.found_existing) previous.value_ptr.* = try txn.get(try reportComponentKey(a, group_id, store_id, page_id, component));
+                    break :blk !std.mem.eql(u8, try reportPageEntry(previous.value_ptr.*, slot), report.encoded[component]);
+                };
+            }
+            page.value_ptr.members_dirty = page.value_ptr.members_dirty or prior == null or !std.mem.eql(u8, prior.?, member);
+            for (0..4) |component| page.value_ptr.dirty[component] = page.value_ptr.dirty[component] or report.dirty[component];
             if (prior == null) {
                 var reference: [16]u8 = undefined;
                 std.mem.writeInt(u64, reference[0..8], store_id, .little);
                 std.mem.writeInt(u64, reference[8..16], slot, .little);
                 try txn.put(try listingReportKey(a, group_id, store_id, id), &reference);
             }
-            const member = &report.member;
-            std.mem.writeInt(u64, member[0..8], id, .little);
-            std.mem.writeInt(u64, member[8..16], slot, .little);
-            @memcpy(member[16..48], &payload_hash);
         }
         var reports_changed = false;
         var live_page_ids: std.ArrayListUnmanaged(u64) = .empty;
@@ -4615,7 +4650,8 @@ pub const RaftApplyStore = struct {
         while (page_iterator.next()) |entry| {
             const page_id = entry.key_ptr.*;
             const page = entry.value_ptr;
-            reports_changed = reports_changed or page.payload_dirty or page.clocks_dirty or page.members_dirty;
+            for (page.dirty) |dirty| reports_changed = reports_changed or dirty;
+            reports_changed = reports_changed or page.members_dirty;
             var live = false;
             for (page.groups) |id| if (id != null) {
                 live = true;
@@ -4632,9 +4668,9 @@ pub const RaftApplyStore = struct {
                     try txn.put(member_key, member_bytes.items);
                 }
             }
-            for ([_]bool{ false, true }) |clocks| {
-                if (if (clocks) !page.clocks_dirty else !page.payload_dirty) continue;
-                const page_key = try reportPageKey(a, group_id, store_id, page_id, clocks);
+            for (0..4) |component| {
+                if (!page.dirty[component]) continue;
+                const page_key = try reportComponentKey(a, group_id, store_id, page_id, component);
                 if (!live) {
                     try txn.delete(page_key);
                     continue;
@@ -4648,8 +4684,7 @@ pub const RaftApplyStore = struct {
                 for (page.groups, 0..) |maybe_id, local_slot| {
                     const id = maybe_id orelse continue;
                     const report = reports.getPtr(id).?;
-                    const dirty = if (clocks) report.clocks_dirty else report.payload_dirty;
-                    const payload = if (!dirty) try reportPageEntry(prior_page orelse return error.InvalidCatalogRecord, local_slot) else if (clocks) report.encoded_clocks else try encodeStoreRecord(a, .{ .store_id = store_id, .node_id = replacement.?.node_id, .group_statuses = report.groups.items, .runtime_statuses = report.runtimes.items });
+                    const payload = if (report.dirty[component]) report.encoded[component] else try reportPageEntry(prior_page orelse return error.InvalidCatalogRecord, local_slot);
                     const start = std.math.cast(u32, bytes.items.len) orelse return error.InvalidCatalogRecord;
                     const len = std.math.cast(u32, payload.len) orelse return error.InvalidCatalogRecord;
                     try bytes.appendSlice(a, payload);
@@ -4674,9 +4709,7 @@ pub const RaftApplyStore = struct {
             compact.runtime_statuses = &.{};
             const bytes = try std.mem.concat(a, u8, &.{ store_header_magic, try encodeStoreRecord(a, compact) });
             if (old_header == null or !std.mem.eql(u8, old_header.?, bytes)) try txn.put(key, bytes);
-        } else {
-            txn.delete(membership_key) catch |err| if (err != error.NotFound) return err;
-        }
+        } else txn.delete(membership_key) catch |err| if (err != error.NotFound) return err;
         return reports_changed;
     }
 
@@ -5325,7 +5358,7 @@ pub const RaftApplyStore = struct {
         // These primary local rows are represented by full StoreRecords in
         // wire snapshots. Remove them atomically with the replaced headers;
         // legacy snapshot rows will normalize on the next index rebuild/apply.
-        for ([_][]const u8{ "store_report_v1", "store_report_clock_page_v1", "store_report_payload_page_v1", "store_report_members_v1", "store_report_member_page_v1" }) |kind| {
+        for ([_][]const u8{ "store_report_v1", "store_report_clock_page_v1", "store_report_payload_page_v1", "store_report_members_v1", "store_report_member_page_v1", "store_report_group_page_v1", "store_report_group_clock_page_v1" }) |kind| {
             var report_buf: [160]u8 = undefined;
             const prefix = try std.fmt.bufPrint(&report_buf, "\x00\x00__metadata__:{s}:{d}:", .{ kind, group_id });
             try appendMetadataPrefixRowsTxn(alloc, txn, &rows, prefix);
@@ -5585,12 +5618,16 @@ pub const RaftApplyStore = struct {
                 if (record.runtime_statuses.len != 0) return error.InvalidStoreReporterFence;
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena.deinit();
-                const previous = try self.readStoredStoreArenaTxn(arena.allocator(), txn, group_id, try txn.get(key));
-                var replacement = record;
-                replacement.runtime_statuses = previous.runtime_statuses;
-                try self.applyTransitionCommandTxn(txn, group_id, .{ .upsert_store = replacement });
+                const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
+                if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
+                const reports_changed = self.updateStoreComponentsTxn(txn, group_id, record.store_id, applied, true) catch |err| switch (err) {
+                    // A full report can supersede the inventory after admission.
+                    error.StoreReportBaseMismatch => return,
+                    else => return err,
+                };
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{ .kind = .store, .metadata_group_id = group_id, .store_id = record.store_id, .node_id = record.node_id, .store_reports_changed = reports_changed, .store_runtime_changed = false });
+                try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, record.node_id);
             },
             .upsert_store => |record| {
                 var key_buf: [160]u8 = undefined;
@@ -17769,6 +17806,8 @@ test "system catalog manifest pages bound sparse writes and preserve pinned read
     const untouched_key = try RaftApplyStore.reportMemberPageKey(a, 21, 20, 1);
     const directory = try a.dupe(u8, try pinned.get(directory_key));
     const original_member = try a.dupe(u8, try pinned.get(member_key));
+    const group_key = try RaftApplyStore.reportComponentKey(a, 21, 20, 0, 2);
+    const original_group = try a.dupe(u8, try pinned.get(group_key));
     const untouched = try a.dupe(u8, try pinned.get(untouched_key));
     try std.testing.expectEqual(RaftApplyStore.report_members_magic.len + 3 * 8, directory.len);
     reports[0].updated_at_millis += 1;
@@ -17786,12 +17825,14 @@ test "system catalog manifest pages bound sparse writes and preserve pinned read
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
         _ = try store.updateListingStoreTxn(&txn, 21, 20, record);
-        try std.testing.expect(!std.mem.eql(u8, original_member, try txn.get(member_key)));
+        try std.testing.expectEqualSlices(u8, original_member, try txn.get(member_key));
+        try std.testing.expect(!std.mem.eql(u8, original_group, try txn.get(group_key)));
         try std.testing.expectEqualSlices(u8, untouched, try txn.get(untouched_key));
         try std.testing.expectEqualSlices(u8, directory, try txn.get(directory_key));
         try txn.commit();
     }
     try std.testing.expectEqualSlices(u8, original_member, try pinned.get(member_key));
+    try std.testing.expectEqualSlices(u8, original_group, try pinned.get(group_key));
     // Losing every member of one page retires its manifest and data pages,
     // while surviving stable slots remain in their existing pages.
     {
@@ -17827,6 +17868,10 @@ test "system catalog runtime references preserve observations and reject stale g
         try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = record });
         try txn.commit();
     }
+    const runtime_page_key = try RaftApplyStore.reportComponentKey(a, 21, 20, 0, 0);
+    const runtime_page_before = try store.store.get(a, runtime_page_key);
+    const runtime_clocks_key = try RaftApplyStore.reportComponentKey(a, 21, 20, 0, 1);
+    const runtime_clocks_before = try store.store.get(a, runtime_clocks_key);
     record.runtime_statuses = &.{};
     record.available_bytes = 999;
     group[0].raft_term = 2;
@@ -17837,9 +17882,18 @@ test "system catalog runtime references preserve observations and reject stale g
     try std.testing.expectEqual(@as(u64, 999), current.available_bytes);
     try std.testing.expectEqual(@as(u64, 2), current.group_statuses[0].raft_term);
     try std.testing.expectEqual(@as(u64, 123), current.runtime_statuses[0].updated_at_ns);
-    for (0..2) |i| {
+    try std.testing.expectEqualSlices(u8, runtime_page_before, try store.store.get(a, runtime_page_key));
+    try std.testing.expectEqualSlices(u8, runtime_clocks_before, try store.store.get(a, runtime_clocks_key));
+    const group_only = (try store.readStoreGroupFacts(a, 21, 20)).?;
+    try std.testing.expectEqual(@as(usize, 0), group_only.runtime_statuses.len);
+    try std.testing.expectEqual(@as(u64, 2), group_only.group_statuses[0].raft_term);
+    for (0..4) |i| {
         var stale = record;
-        if (i == 0) stale.reporter_incarnation += 1 else stale.status_generation += 1;
+        if (i == 0) stale.reporter_incarnation += 1;
+        if (i == 1) stale.status_generation += 1;
+        var invalid_groups = [_]metadata.GroupStatusReport{ group[0], group[0] };
+        if (i == 2) stale.group_statuses = &invalid_groups;
+        if (i == 3) stale.group_statuses = &.{};
         stale.available_bytes = 5;
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -17857,4 +17911,31 @@ test "system catalog runtime references preserve observations and reject stale g
     try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 2, .entries_bytes = restored_entries });
     current = (try store.listStores(a, 21))[0];
     try std.testing.expectEqual(@as(u64, 123), current.runtime_statuses[0].updated_at_ns);
+}
+
+test "system catalog store report workload benchmark repair admission" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const observer = @import("../store_observer.zig");
+    const alloc = std.heap.c_allocator;
+    for ([_]usize{ 1000, 10000 }) |count| {
+        const runtimes = try alloc.alloc(metadata.RuntimeGroupStatusReport, count);
+        defer alloc.free(runtimes);
+        for ([_]bool{ false, true }) |repair| {
+            var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .coverage_generation = 1, .coverage_config_hash = 2, .coverage_identity_ready = true, .repair_status = if (repair) .waiting else null }};
+            for (runtimes, 0..) |*runtime, i| runtime.* = .{ .table_id = 1, .table_name = "docs", .group_id = i + 1, .store_id = 20, .node_id = 30, .indexes = &indexes };
+            const record: metadata.StoreRecord = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .status_generation = 1, .runtime_statuses = runtimes };
+            const next_runtimes = try alloc.dupe(metadata.RuntimeGroupStatusReport, runtimes);
+            defer alloc.free(next_runtimes);
+            const report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .runtime_statuses = next_runtimes, .available_bytes = 1 };
+            var elapsed: [7]u64 = undefined;
+            for (&elapsed) |*sample| {
+                const start = platform_time.monotonicNs();
+                const changed = try @call(.never_inline, observer.observationChangesRecord, .{ alloc, record, report });
+                sample.* = platform_time.monotonicNs() - start;
+                try std.testing.expect(changed);
+            }
+            std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+            std.debug.print("REPAIR_ADMISSION_BENCH groups={d} repair={} p50_ms={d:.3}\n", .{ count, repair, @as(f64, @floatFromInt(elapsed[3])) / 1e6 });
+        }
+    }
 }

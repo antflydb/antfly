@@ -26,10 +26,9 @@ pub const HttpDriverConfig = struct {
     max_batch_bytes: usize = common_http.default_max_request_bytes,
     async_send_queue_max: usize = 4096,
     async_send_queue_max_per_peer: usize = 256,
-    async_send_immediate_retry_attempts: u32 = 1,
-    async_send_max_attempts: u32 = 32,
-    async_send_retry_base_ms: u64 = 50,
-    async_send_retry_max_ms: u64 = 1_000,
+    /// Four maximum-size requests plus bounded routing metadata.
+    async_send_retained_bytes_max: usize = 4 * (common_http.default_max_request_bytes + 64 * 1024),
+    async_send_retained_bytes_max_per_peer: usize = common_http.default_max_request_bytes + 64 * 1024,
     async_send_worker_count: u32 = 4,
     isolated_worker_executors: bool = false,
     isolated_worker_executor_config: common_http.StdHttpExecutorConfig = .{},
@@ -43,6 +42,8 @@ pub const AsyncSendMetricsSnapshot = struct {
     queue_full: u64 = 0,
     peer_queue_full: u64 = 0,
     pending: usize = 0,
+    retained_bytes: usize = 0,
+    retained_frames: usize = 0,
 };
 
 const AsyncSendMetrics = struct {
@@ -63,19 +64,21 @@ pub const SendBatch = struct {
 };
 
 pub const HttpFrameDriver = struct {
+    const Retention = struct { bytes: usize = 0, frames: usize = 0 };
     const QueuedFrame = struct {
         source_id: ?u64 = null,
         peer_id: u64,
         base_uri: []u8,
         body: []u8,
         content_type: []u8,
-        attempts: u32 = 0,
-        not_before_ms: u64 = 0,
+        attempt: u32 = 1,
+        group_ids: []u64,
 
         fn deinit(self: *QueuedFrame, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
             alloc.free(self.body);
             alloc.free(self.content_type);
+            alloc.free(self.group_ids);
             self.* = undefined;
         }
     };
@@ -93,6 +96,10 @@ pub const HttpFrameDriver = struct {
     closing: bool = false,
     queue: std.ArrayListUnmanaged(QueuedFrame) = .empty,
     queue_head: usize = 0,
+    failed: std.ArrayListUnmanaged(QueuedFrame) = .empty,
+    failed_head: usize = 0,
+    retained: Retention = .{},
+    peer_retention: std.AutoHashMapUnmanaged(u64, Retention) = .empty,
     in_flight_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
     metrics: AsyncSendMetrics = .{},
 
@@ -116,6 +123,8 @@ pub const HttpFrameDriver = struct {
         self.mutex.lockUncancelable(self.io);
         self.clearQueueLocked();
         self.queue.deinit(self.alloc);
+        self.failed.deinit(self.alloc);
+        self.peer_retention.deinit(self.alloc);
         self.in_flight_peers.deinit(self.alloc);
         self.mutex.unlock(self.io);
         self.* = undefined;
@@ -137,6 +146,8 @@ pub const HttpFrameDriver = struct {
             .ptr = self,
             .vtable = &.{
                 .send_frame = sendFrame,
+                .poll_failed_frame = pollFailedFrame,
+                .invalidate_route = invalidateRoute,
             },
         };
     }
@@ -144,6 +155,7 @@ pub const HttpFrameDriver = struct {
     pub fn metricsSnapshot(self: *HttpFrameDriver) AsyncSendMetricsSnapshot {
         self.mutex.lockUncancelable(self.io);
         const pending = self.pendingQueueCountLocked();
+        const retained = self.retained;
         self.mutex.unlock(self.io);
         return .{
             .enqueued = self.metrics.enqueued.load(.monotonic),
@@ -153,6 +165,8 @@ pub const HttpFrameDriver = struct {
             .queue_full = self.metrics.queue_full.load(.monotonic),
             .peer_queue_full = self.metrics.peer_queue_full.load(.monotonic),
             .pending = pending,
+            .retained_bytes = retained.bytes,
+            .retained_frames = retained.frames,
         };
     }
 
@@ -262,74 +276,82 @@ pub const HttpFrameDriver = struct {
                 .body = owned.body,
                 .content_type = owned.content_type,
             }, executor) catch |err| {
-                const retrying = self.retryQueuedFrame(&owned, err);
-                self.finishInFlightPeer(frame.peer_id);
-                if (retrying) continue;
-                owned.deinit(self.alloc);
+                _ = self.metrics.failed.fetchAdd(1, .monotonic);
+                self.mutex.lockUncancelable(self.io);
+                std.debug.assert(self.in_flight_peers.remove(frame.peer_id));
+                if (err == error.BatchTooLarge or self.closing) {
+                    _ = self.metrics.dropped.fetchAdd(1, .monotonic);
+                    self.releaseRetentionLocked(owned);
+                    owned.deinit(self.alloc);
+                } else self.publishFailureLocked(owned);
+                self.cond.broadcast(self.io);
+                self.mutex.unlock(self.io);
                 continue;
             };
-            self.finishInFlightPeer(frame.peer_id);
+            self.mutex.lockUncancelable(self.io);
+            std.debug.assert(self.in_flight_peers.remove(frame.peer_id));
+            self.releaseRetentionLocked(owned);
+            self.cond.broadcast(self.io);
+            self.mutex.unlock(self.io);
             owned.deinit(self.alloc);
         }
     }
 
-    fn finishInFlightPeer(self: *HttpFrameDriver, peer_id: u64) void {
-        self.mutex.lockUncancelable(self.io);
-        std.debug.assert(self.in_flight_peers.remove(peer_id));
-        self.cond.broadcast(self.io);
-        self.mutex.unlock(self.io);
+    fn releaseRetentionLocked(self: *HttpFrameDriver, frame: QueuedFrame) void {
+        const size = frame.body.len + frame.base_uri.len + frame.content_type.len + frame.group_ids.len * @sizeOf(u64);
+        self.retained.bytes -= size;
+        self.retained.frames -= 1;
+        const peer = self.peer_retention.getPtr(frame.peer_id).?;
+        peer.bytes -= size;
+        peer.frames -= 1;
+        if (peer.frames == 0) _ = self.peer_retention.remove(frame.peer_id);
     }
 
-    fn retryQueuedFrame(self: *HttpFrameDriver, frame: *QueuedFrame, err: anyerror) bool {
-        _ = self.metrics.failed.fetchAdd(1, .monotonic);
-        if (err == error.BatchTooLarge) {
+    fn publishFailureLocked(self: *HttpFrameDriver, frame: QueuedFrame) void {
+        if (self.failed_head > 0 and self.failed_head * 2 >= self.failed.items.len) {
+            const remaining = self.failed.items.len - self.failed_head;
+            std.mem.copyForwards(QueuedFrame, self.failed.items[0..remaining], self.failed.items[self.failed_head..]);
+            self.failed.items.len = remaining;
+            self.failed_head = 0;
+        }
+        self.failed.append(self.alloc, frame) catch {
+            var owned = frame;
+            self.releaseRetentionLocked(owned);
+            owned.deinit(self.alloc);
             _ = self.metrics.dropped.fetchAdd(1, .monotonic);
-            std.log.warn("raft http async send dropping oversized frame peer_id={d} bytes={d} max_bytes={d}", .{
-                frame.peer_id,
-                frame.body.len,
-                self.cfg.max_batch_bytes,
-            });
-            return false;
-        }
-        frame.attempts +|= 1;
-        if (frame.attempts >= self.cfg.async_send_max_attempts) {
-            _ = self.metrics.dropped.fetchAdd(1, .monotonic);
-            std.log.warn("raft http async send dropping frame peer_id={d} attempts={d} err={}", .{
-                frame.peer_id,
-                frame.attempts,
-                err,
-            });
-            return false;
-        }
-        const delay_ms = self.retryDelayMs(frame.*);
-        frame.not_before_ms = nowMs() + delay_ms;
-        if (frame.attempts == 1 or frame.attempts % 16 == 0) {
-            std.log.debug("raft http async send failed peer_id={d} attempts={d} retry_delay_ms={d} err={}", .{
-                frame.peer_id,
-                frame.attempts,
-                delay_ms,
-                err,
-            });
-        }
+        };
+    }
 
+    fn pollFailedFrame(ptr: *anyopaque) ?raft_engine.runtime.frame_driver_iface.FailedFrame {
+        const self: *HttpFrameDriver = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.closing) return false;
-        if (self.pendingQueueCountLocked() >= self.cfg.async_send_queue_max) {
-            _ = self.metrics.queue_full.fetchAdd(1, .monotonic);
-            _ = self.metrics.dropped.fetchAdd(1, .monotonic);
-            return false;
+        if (self.failed_head == self.failed.items.len) return null;
+        const frame = self.failed.items[self.failed_head];
+        self.failed_head += 1;
+        self.releaseRetentionLocked(frame);
+        self.alloc.free(frame.base_uri);
+        self.alloc.free(frame.group_ids);
+        return .{ .alloc = self.alloc, .source_id = frame.source_id, .peer_id = frame.peer_id, .frame = .{ .bytes = frame.body, .media_type = frame.content_type }, .attempt = frame.attempt };
+    }
+
+    fn invalidateRoute(ptr: *anyopaque, group_id: u64, peer_id: u64) void {
+        const self: *HttpFrameDriver = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var i = self.queue_head;
+        while (i < self.queue.items.len) {
+            const frame = self.queue.items[i];
+            if (frame.peer_id != peer_id or std.mem.indexOfScalar(u64, frame.group_ids, group_id) == null) {
+                i += 1;
+                continue;
+            }
+            _ = self.queue.orderedRemove(i);
+            self.publishFailureLocked(frame);
         }
-        if (self.pendingQueueCountForPeerLocked(frame.peer_id) >= self.cfg.async_send_queue_max_per_peer) {
-            _ = self.metrics.peer_queue_full.fetchAdd(1, .monotonic);
-            _ = self.metrics.dropped.fetchAdd(1, .monotonic);
-            return false;
-        }
-        self.queue.append(self.alloc, frame.*) catch return false;
-        _ = self.metrics.retried.fetchAdd(1, .monotonic);
-        frame.* = undefined;
-        self.cond.signal(self.io);
-        return true;
+        // In-flight requests were admitted under the previous route. Their
+        // eventual failure returns here through the normal completion path.
+        self.cond.broadcast(self.io);
     }
 
     fn enqueueFrame(self: *HttpFrameDriver, req: raft_engine.runtime.frame_driver_iface.SendFrameRequest) !void {
@@ -343,29 +365,48 @@ pub const HttpFrameDriver = struct {
             });
         }
 
-        var frame: QueuedFrame = .{
-            .source_id = req.source_id,
-            .peer_id = req.peer_id,
-            .base_uri = try self.alloc.dupe(u8, req.endpoint.address),
-            .body = try self.alloc.dupe(u8, req.frame.bytes),
-            .content_type = try self.alloc.dupe(u8, req.frame.media_type),
-        };
-        errdefer frame.deinit(self.alloc);
-
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
         if (self.closing) return error.AsyncSenderClosed;
-        if (self.pendingQueueCountLocked() >= self.cfg.async_send_queue_max) {
+        if (req.frame.bytes.len > self.cfg.max_batch_bytes) return error.BatchTooLarge;
+        const size = std.math.add(usize, req.frame.bytes.len, req.endpoint.address.len) catch return error.BatchTooLarge;
+        const metadata_size = std.math.add(usize, req.frame.media_type.len, std.math.mul(usize, req.group_ids.len, @sizeOf(u64)) catch return error.BatchTooLarge) catch return error.BatchTooLarge;
+        const bytes = std.math.add(usize, size, metadata_size) catch return error.BatchTooLarge;
+        const peer = self.peer_retention.get(req.peer_id) orelse Retention{};
+        if (self.retained.frames >= self.cfg.async_send_queue_max or bytes > self.cfg.async_send_retained_bytes_max -| self.retained.bytes) {
             _ = self.metrics.queue_full.fetchAdd(1, .monotonic);
             return error.AsyncSendQueueFull;
         }
-        if (self.pendingQueueCountForPeerLocked(frame.peer_id) >= self.cfg.async_send_queue_max_per_peer) {
+        if (peer.frames >= self.cfg.async_send_queue_max_per_peer or bytes > self.cfg.async_send_retained_bytes_max_per_peer -| peer.bytes) {
             _ = self.metrics.peer_queue_full.fetchAdd(1, .monotonic);
             return error.AsyncSendQueueFull;
         }
-        try self.queue.append(self.alloc, frame);
+        // Reserve before copying bytes. Queued, in-flight and failed completions
+        // all retain the same reservation until delivery or ownership transfer.
+        const entry = try self.peer_retention.getOrPut(self.alloc, req.peer_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        entry.value_ptr.bytes += bytes;
+        entry.value_ptr.frames += 1;
+        self.retained.bytes += bytes;
+        self.retained.frames += 1;
+        errdefer {
+            self.retained.bytes -= bytes;
+            self.retained.frames -= 1;
+            entry.value_ptr.bytes -= bytes;
+            entry.value_ptr.frames -= 1;
+            if (entry.value_ptr.frames == 0) _ = self.peer_retention.remove(req.peer_id);
+        }
+        const address = try self.alloc.dupe(u8, req.endpoint.address);
+        errdefer self.alloc.free(address);
+        const body = try self.alloc.dupe(u8, req.frame.bytes);
+        errdefer self.alloc.free(body);
+        const content_type = try self.alloc.dupe(u8, req.frame.media_type);
+        errdefer self.alloc.free(content_type);
+        const group_ids = try self.alloc.dupe(u64, req.group_ids);
+        errdefer self.alloc.free(group_ids);
+        try self.queue.append(self.alloc, .{ .source_id = req.source_id, .peer_id = req.peer_id, .base_uri = address, .body = body, .content_type = content_type, .group_ids = group_ids, .attempt = req.attempt });
         _ = self.metrics.enqueued.fetchAdd(1, .monotonic);
+        if (req.attempt > 1) _ = self.metrics.retried.fetchAdd(1, .monotonic);
         self.cond.signal(self.io);
     }
 
@@ -376,7 +417,7 @@ pub const HttpFrameDriver = struct {
                 self.mutex.unlock(self.io);
                 return null;
             }
-            if (self.popReadyFrameLocked(nowMs())) |frame| {
+            if (self.popReadyFrameLocked()) |frame| {
                 self.mutex.unlock(self.io);
                 return frame;
             }
@@ -390,15 +431,14 @@ pub const HttpFrameDriver = struct {
                 }
                 self.mutex.unlock(self.io);
             } else {
-                self.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(self.nextSleepMs())), .awake) catch {};
+                self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
         }
     }
 
-    fn popReadyFrameLocked(self: *HttpFrameDriver, now_ms: u64) ?QueuedFrame {
+    fn popReadyFrameLocked(self: *HttpFrameDriver) ?QueuedFrame {
         self.compactQueueIfNeededLocked();
         for (self.queue.items, 0..) |frame, index| {
-            if (frame.not_before_ms > now_ms) continue;
             if (self.in_flight_peers.contains(frame.peer_id)) continue;
             const out = frame;
             if (index + 1 < self.queue.items.len) {
@@ -427,32 +467,6 @@ pub const HttpFrameDriver = struct {
         return count;
     }
 
-    fn nextSleepMs(self: *HttpFrameDriver) u64 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const now_ms = nowMs();
-        var next_ready_ms: ?u64 = null;
-        for (self.queue.items[self.queue_head..]) |frame| {
-            if (frame.not_before_ms <= now_ms) return 1;
-            if (next_ready_ms == null or frame.not_before_ms < next_ready_ms.?) {
-                next_ready_ms = frame.not_before_ms;
-            }
-        }
-        const delay = if (next_ready_ms) |ready_ms| ready_ms -| now_ms else 25;
-        return @max(@as(u64, 1), @min(@as(u64, 25), delay));
-    }
-
-    fn retryDelayMs(self: *const HttpFrameDriver, frame: QueuedFrame) u64 {
-        if (frame.attempts <= self.cfg.async_send_immediate_retry_attempts) return 0;
-        const retry_index = frame.attempts - self.cfg.async_send_immediate_retry_attempts;
-        const shift: u6 = @intCast(@min(retry_index - 1, 6));
-        const capped = @min(self.cfg.async_send_retry_max_ms, self.cfg.async_send_retry_base_ms << shift);
-        if (capped <= 1) return capped;
-        const low = capped - capped / 4;
-        const span = capped - low + 1;
-        return low + pseudoJitter(frame.peer_id, frame.attempts, nowMs()) % span;
-    }
-
     fn compactQueueIfNeededLocked(self: *HttpFrameDriver) void {
         if (self.queue_head == 0) return;
         if (self.queue_head < 64 and self.queue_head * 2 < self.queue.items.len) return;
@@ -463,7 +477,16 @@ pub const HttpFrameDriver = struct {
     }
 
     fn clearQueueLocked(self: *HttpFrameDriver) void {
-        for (self.queue.items[self.queue_head..]) |*frame| frame.deinit(self.alloc);
+        for (self.queue.items[self.queue_head..]) |*frame| {
+            self.releaseRetentionLocked(frame.*);
+            frame.deinit(self.alloc);
+        }
+        for (self.failed.items[self.failed_head..]) |*frame| {
+            self.releaseRetentionLocked(frame.*);
+            frame.deinit(self.alloc);
+        }
+        self.failed.clearRetainingCapacity();
+        self.failed_head = 0;
         self.queue.clearRetainingCapacity();
         self.queue_head = 0;
     }
@@ -476,16 +499,6 @@ pub const HttpFrameDriver = struct {
 
 fn nowMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-}
-
-fn pseudoJitter(peer_id: u64, attempts: u32, now_ms: u64) u64 {
-    var x = peer_id ^ (@as(u64, attempts) << 32) ^ now_ms;
-    x ^= x >> 33;
-    x *%= 0xff51afd7ed558ccd;
-    x ^= x >> 33;
-    x *%= 0xc4ceb9fe1a85ec53;
-    x ^= x >> 33;
-    return x;
 }
 
 test "http driver module compiles" {
@@ -782,4 +795,72 @@ test "http frame sender borrows capacity and drains a refused partial startup" {
     try std.testing.expect(driver.sender_io == null);
     var probe = try lane.io().concurrent(Unused.done, .{});
     probe.await(lane.io());
+}
+
+test "http frame driver budgets in flight and failed frames and invalidates queued routes" {
+    const BlockingFailure = struct {
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        allow: bool = false,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn release(self: *@This()) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.allow = true;
+            self.cond.broadcast(self.io);
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            _ = self.calls.fetchAdd(1, .release);
+            while (!self.allow) self.cond.waitUncancelable(self.io, &self.mutex);
+            return error.ConnectionRefused;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var executor = BlockingFailure{ .io = io };
+    var driver: HttpFrameDriver = undefined;
+    try driver.initAsyncInPlace(alloc, .{ .async_send_worker_count = 1, .async_send_retained_bytes_max = 256, .async_send_retained_bytes_max_per_peer = 100 }, .{ .ptr = &executor, .vtable = &.{ .execute = BlockingFailure.execute } }, io);
+    defer driver.deinit();
+    defer executor.release();
+    var bytes = "payload".*;
+    const req: raft_engine.runtime.frame_driver_iface.SendFrameRequest = .{ .peer_id = 2, .source_id = 1, .endpoint = .{ .protocol = .http1, .address = "http://old" }, .frame = .{ .bytes = &bytes, .media_type = "raft" }, .group_ids = &.{41} };
+    const size = bytes.len + req.endpoint.address.len + req.frame.media_type.len + 8;
+    try driver.frameDriver().sendFrame(req);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (executor.calls.load(.acquire) == 0 and platform_time.monotonicNs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.acquire));
+    try driver.frameDriver().sendFrame(req);
+    try driver.frameDriver().sendFrame(req);
+    try std.testing.expectError(error.AsyncSendQueueFull, driver.frameDriver().sendFrame(req));
+    driver.frameDriver().invalidateRoute(41, 2);
+    try std.testing.expectEqual(@as(usize, 0), driver.metricsSnapshot().pending);
+    try std.testing.expectEqual(3 * size, driver.metricsSnapshot().retained_bytes);
+    // Invalidation transfers unsent frames back without releasing their budget.
+    try std.testing.expectError(error.AsyncSendQueueFull, driver.frameDriver().sendFrame(req));
+    for (0..2) |_| {
+        var failed = driver.frameDriver().pollFailedFrame().?;
+        defer failed.deinit();
+        try std.testing.expectEqualStrings("payload", failed.frame.bytes);
+        try std.testing.expectEqual(@as(?u64, 1), failed.source_id);
+        try std.testing.expectEqual(@as(u32, 1), failed.attempt);
+    }
+    try std.testing.expectEqual(size, driver.metricsSnapshot().retained_bytes);
+    executor.release();
+    var completion: ?raft_engine.runtime.frame_driver_iface.FailedFrame = null;
+    while (completion == null and platform_time.monotonicNs() < deadline) {
+        completion = driver.frameDriver().pollFailedFrame();
+        if (completion == null) try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(completion != null);
+    completion.?.deinit();
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), driver.metricsSnapshot().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), driver.metricsSnapshot().retained_frames);
+    driver.cfg.async_send_retained_bytes_max = size - 1;
+    try std.testing.expectError(error.AsyncSendQueueFull, driver.frameDriver().sendFrame(req));
+    try std.testing.expectEqual(@as(u64, 1), driver.metricsSnapshot().queue_full);
 }

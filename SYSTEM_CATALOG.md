@@ -381,15 +381,16 @@ avoiding a probe for every store/group combination. Logical result order is
 preserved independently of storage key order.
 
 Store reports have a normalized local primary representation: one compact
-header and stable per-group slots in bounded 64-group payload, clock and membership
-pages. A compact sorted directory lists live pages; each membership entry stores
-the group, slot and structural digest in 48 bytes. Changing one group rewrites
-only its membership page, and clock-only changes leave membership untouched.
+header and stable per-group slots in bounded 64-group pages. Runtime payloads,
+runtime clocks, group facts and group clocks occupy independent pages. A compact
+sorted directory lists live pages; each 64-byte membership entry stores the
+group, slot, runtime digest and group/runtime observation counts. Group fact and
+clock changes leave runtime payloads and their membership digest untouched.
 Reporter indexes map selected groups
 to actual stores and slots; fixed page directories locate only the selected
 binary record without decoding adjacent reports. Deleted slots are reused, so
-ordinary group churn does not renumber or rewrite unrelated pages. Structural SHA-256 digests exclude
-observation clocks from payload identity and include the reporter incarnation.
+ordinary group churn does not renumber or rewrite unrelated pages. Structural
+SHA-256 runtime digests exclude observation clocks and include the reporter incarnation.
 Cached reports update only changed headers; fresh observations update clock pages
 without re-encoding unchanged payloads. Sparse changes rebuild only affected
 pages, copying the unchanged encoded members. Full status changes still require work
@@ -428,22 +429,45 @@ must pass the catalog protocol readiness fence before proposing the new command.
 Missing support or a mismatched base triggers a full report. Apply checks the fence
 again in its write transaction and preserves existing observation clocks. Current
 per-group Raft facts still travel with every heartbeat. Changed observations use
-full reports; this is not an arbitrary sparse-update protocol. Reconstruction and
-validation remain proportional to the referenced store's groups.
+full reports. The reference must preserve group IDs and duplicate multiplicity;
+inventory changes require a full report. Admission reads only group facts and
+the header. Apply retains runtime pages without decoding, hashing or rewriting
+them. Reference work remains proportional to that store's groups, independent
+of the size of its unchanged runtime/index payloads.
 
-Committed projection notifications coalesce changed store IDs and report flags in
-a bounded, allocation-free queue. Header-only updates retain owned report arrays;
-report changes reload only the affected store. Other projection collections refresh
-only when their own kind changes. Overflow, snapshot replacement and failed refresh
-force a full rebuild. Consumers still receive owned snapshots; this does not remove
-all reconciliation cloning.
+Committed projection notifications coalesce changed store IDs and separate group
+and runtime change flags in a bounded, allocation-free queue. Refcounted immutable
+store snapshots own separate group and runtime leaves. Header updates share both;
+reference heartbeats replace group facts and share runtime observations. Retained
+admission leases survive publication, deletion and snapshot replacement. A store-ID
+index selects reporting stores under the runtime lock; only those records are
+cloned for mutable full-report admission after releasing the lock. Capability
+counts update when a store is replaced or removed; unchanged runtime capabilities
+are retained with the runtime leaf. Protocol admission therefore retains global
+requirements without scanning every store's indexes. Repair identity comparisons
+use temporary hash indexes over borrowed reports, preserving first-match and
+causal fencing semantics in linear expected time. Allocation failure leaves the
+owned observation unchanged.
+
+Other projection collections refresh only when their own kind changes. Overflow,
+snapshot replacement and failed refresh force a full rebuild. General reconciliation
+consumers still receive owned snapshots; their full-inventory cloning remains.
 
 Raft transport batches ready heartbeat and heartbeat-response messages only when
 destination, source identity, protocol, address and endpoint metadata match. Frames
 cap at 256 groups, 1,024 messages and 1 MiB (a single group's existing size contract
-still applies). No timer or deduplication changes consensus evidence. Failed frames
-retain per-group retries so each route is resolved again, bounded by 4,096 retained
-frames and 8 MiB. Append, vote and snapshot scheduling retain their existing path.
+still applies). No timer or deduplication changes consensus evidence. The codec
+transport owns retries, including asynchronous HTTP failures, and resolves each
+group's current route. Route changes invalidate unsent HTTP bundles. In-flight
+requests finish their admitted attempt; failures return to the transport. Codec
+retry retention is bounded by 4,096 frames and 8 MiB. The HTTP driver independently
+budgets queued, in-flight and failed-completion bytes before copying, with a default
+of four maximum-size requests globally and one per peer, each including 64 KiB of
+routing overhead (128.25 MiB globally and 32.0625 MiB per peer). Frame caps also
+include in-flight and failed completions. Failed completion ownership transfers
+back to the codec; its budget releases on delivery or transfer. Retained byte/frame
+gauges expose HTTP pressure. Raft retransmits work dropped on budget/attempt
+exhaustion. Append, vote and snapshot scheduling retain their existing path.
 
 Metadata apply commits a versioned 26-byte checkpoint in the same transaction
 as projected records. It contains the applied index, input kind (committed entries
@@ -481,3 +505,8 @@ for the same definition share one compilation. Retention remains limited to
 frequencies decay to allow the working set to change. Inventories wider than the
 cache still pay for nonresident schemas and response serialization; bounded pages
 control individual response work, not total inventory cost.
+
+The Rust SDK generator adapts operations with heterogeneous JSON success bodies
+to private typed unions. A completed resource and `committed_visibility_pending`
+remain distinct variants, and `ResponseValue` retains the HTTP status. This is a
+Progenitor input adapter; the public per-status OpenAPI contract is unchanged.

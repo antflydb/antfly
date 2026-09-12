@@ -969,3 +969,88 @@ with `--binary` pointing to each separately built revision, using otherwise
 identical arguments. Keep setup and warmup outside measured intervals and run
 builds, tests, and other benchmark scenarios separately. Raw JSON output retains
 all settings, binary hash, percentiles, startup time, and readiness poll counts.
+
+## Report admission and asynchronous delivery follow-up
+
+The matched baseline is `23335d336`; the updated source includes `origin/main`
+at `5460d0490` via merge `72794f05a`. [Raw results and source hashes](system_catalog_admission_workloads_2026_09_11.json)
+record both component runs and the live discovery workload. Both component
+revisions were compiled before measurement; task-owned builds/tests did not
+overlap the sequential benchmark runs. Unrelated host activity was uncontrolled.
+Zig 0.16.0 ReleaseFast and `c_allocator` were used for components. Each apply and
+repair comparison uses seven samples; selected-store capture uses nine.
+
+| 10,000 groups per store | Before | After |
+| --- | --- | --- |
+| Repair-fact admission comparison p50 | 180.733 ms | 5.651 ms |
+| Repair-free admission comparison p50 | 0.045 ms | 0.012 ms |
+| Referenced-runtime committed apply p50 | 20.896 ms | 8.726 ms |
+| Cached full-report committed apply p50 | 13.048 ms | 16.484 ms |
+| Fresh-clock committed apply p50 | 16.056 ms | 20.889 ms |
+| One-group-change committed apply p50 | 12.854 ms | 16.420 ms |
+| All-group-change committed apply p50 | 33.347 ms | 22.304 ms |
+| Full-store hydration p50 | 3.693 ms | 5.326 ms |
+| One-group-change WAL bytes/apply | 61,841 | 14,591 |
+| All-group-change WAL bytes/apply | 9,616,373 | 2,233,295 |
+| Fresh-clock WAL bytes/apply | 253,295 | 347,228 |
+
+Repair comparison builds temporary identity indexes over borrowed observations;
+its fixture uses separate equal runtime slices and one full-text index per group.
+It excludes cloning, service callbacks and proposal/replication. At 1,000 groups,
+repair admission measured 0.633 → 0.582 ms; at 10,000 groups the quadratic prior
+scan dominates. References also avoid the comparison entirely for the retained
+runtime inventory: only group facts and the header are read and compared.
+
+Runtime and group payloads now occupy separate primary pages, with independent
+clock pages. Reference apply never decodes/hashes runtime payloads. The benefit
+comes with additional page reads, directories and per-group encoding on full
+reports: cached full apply increased about 26%, full hydration 44%, and fresh-clock
+WAL bytes 37% in this run. These are material tradeoffs, not universal speedups.
+The preferred unchanged-runtime heartbeat path improved 2.4×, while changing
+all group facts no longer rewrites runtime payloads. Wire size is unchanged from
+the previous iteration: 1,230,124 bytes for the 10,000-group reference command
+versus 8,210,124 for a full command. Apply includes command decode, projection,
+checkpoint persistence and commit, but excludes network, Raft replication and
+service callback fanout.
+
+A second component models one reporting store beside unrelated tenant inventory,
+with 100 runtime groups per store. Both paths run in the updated binary. The
+baseline reproduces the previous whole-inventory clone and capability scan;
+selection retains one immutable store lease, reads aggregate capability counts,
+and clones only that store. The interval includes clone destruction.
+
+| Stores | Whole-inventory p50 | Selected-store p50 |
+| --- | --- | --- |
+| 1 | 0.019 ms | 0.016 ms |
+| 10 | 0.167 ms | 0.015 ms |
+| 100 | 1.514 ms | 0.016 ms |
+
+This measures admission preparation, not HTTP end-to-end reporting or all
+reconciliation consumers. The full-inventory reconciliation clone remains.
+
+The disposable three-metadata/three-data-node discovery workload provisioned
+30 tables with 200-field schemas. Ten samples followed three warmups: inventory
+p50/p95 was 77.698/86.696 ms, first-page 75.243/476.368 ms, complete cursor walk
+99.858/323.133 ms, and selected-table status 25.921/30.909 ms. These are unpaired
+application observations, not evidence of capacity at 10,000 live ranges or
+resolution of earlier 100-table/empty-graph failures. Server SHA-256:
+`a1c4b965e60d10f9a1f6872b028cf38fbe35948a96ecbde92447d50d52e43420`.
+
+Asynchronous HTTP now returns failed frame ownership to the codec transport for
+route-aware retries. HTTP reservations include queued, in-flight and failed
+completions, with counters for retained bytes/frames. Defaults admit the existing
+32 MiB maximum request; the separate codec retry queue retains its 8 MiB cap.
+Deterministic regressions verify blocked peers, invalidated unsent routes,
+failed-completion accounting, current-route retry, removed groups, source/read
+contexts and attempt exhaustion. These correctness checks do not measure
+network throughput or queue-tail latency.
+
+Validation: server build and focused suites passed (69 storage, 58 API,
+117 metadata/observer, 46 HTTP transport tests), plus all 396 Raft library tests.
+The 22 catalog/schema/sort/authorization E2E tests passed in 80.57 s. A distributed
+status E2E also passed: with the data owner paused, an authenticated reference
+heartbeat preserves runtime/index observations, updates group clocks, and rejects
+stale generations and changed group inventory. Rust SDK generation and all
+14 tests passed with the locked dependencies; heterogeneous catalog 202 responses
+retain typed pending-visibility variants. These are focused checks, not a full
+repository-suite pass.

@@ -189,7 +189,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{"store report workload benchmark"},
     });
-    b.step("antfly-system-catalog-report-bench", "Run opt-in report apply and hydration workloads").dependOn(&b.addRunArtifact(report_bench_tests).step);
+    const admission_bench_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"store report workload benchmark selected admission"},
+    });
+    const run_report_bench = b.addRunArtifact(report_bench_tests);
+    const run_admission_bench = b.addRunArtifact(admission_bench_tests);
+    // Compile both before either timed workload, and serialize measurements.
+    run_report_bench.step.dependOn(&admission_bench_tests.step);
+    run_admission_bench.step.dependOn(&run_report_bench.step);
+    b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "system catalog", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder" },
@@ -1945,6 +1954,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_metadata_service_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "store observer ",
             "metadata service ",
             "cdc work permit ",
             "metadata proposal receipt ",

@@ -25,19 +25,19 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
     _metadata_command,
     _read_log_tail,
-    antfly_public_api_url,
     annotate_metadata_table_names,
+    antfly_public_api_url,
+    internal_service_headers,
     maybe_preserve_tempdir,
     wait_for_server,
 )
-from port_reservations import LoopbackPortReservations
 from helpers import wait_until
+from port_reservations import LoopbackPortReservations
 
 
 def _data_command(
@@ -386,3 +386,78 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     assert status["reported_groups"] == 1
     assert status["missing_groups"] == 0
     assert status["index_type"] == "full_text"
+
+    # Hold the real owner so a reference update can be observed without a newer
+    # full report racing it. Always resume it before fixture teardown.
+    owner = split_status_cluster.data_proc
+    assert owner is not None
+    owner.send_signal(signal.SIGSTOP)
+    try:
+
+        def raw_store() -> dict[str, Any]:
+            snapshot = _check_response(
+                session.get(
+                    f"{split_status_cluster.metadata_admin_url}/metadata/v1/admin/snapshot",
+                    timeout=10,
+                )
+            )
+            return next(
+                store for store in snapshot["stores"] if int(store["store_id"]) == 2
+            )
+
+        heartbeat_url = f"{split_status_cluster.metadata_admin_url}/internal/v1/nodes/2/status/heartbeat"
+
+        def admit_reference() -> dict[str, Any] | None:
+            baseline = raw_store()
+            assert baseline["reporter_incarnation"] != 0
+            assert baseline["runtime_statuses"]
+            report = dict(baseline)
+            report["runtime_statuses"] = []
+            report["available_bytes"] = max(0, int(baseline["available_bytes"]) - 123)
+            report["group_statuses"] = [
+                dict(group) for group in baseline["group_statuses"]
+            ]
+            for group in report["group_statuses"]:
+                group["updated_at_millis"] = int(group.get("updated_at_millis", 0)) + 1
+            response = session.post(
+                heartbeat_url,
+                json=report,
+                headers=internal_service_headers(),
+                timeout=10,
+            )
+            if response.status_code == 409:
+                return None  # A full report admitted just before SIGSTOP won.
+            assert response.status_code == 202, response.text
+            return {"baseline": baseline, "report": report}
+
+        admitted = wait_until(admit_reference, timeout_s=15, interval_s=0.1)
+        assert admitted is not None
+        report = admitted["report"]
+        baseline = admitted["baseline"]
+
+        def committed_reference() -> dict[str, Any] | None:
+            current = raw_store()
+            return (
+                current
+                if current["available_bytes"] == report["available_bytes"]
+                else None
+            )
+
+        current = wait_until(committed_reference, timeout_s=15, interval_s=0.1)
+        assert current is not None
+        assert current["runtime_statuses"] == baseline["runtime_statuses"]
+        assert current["group_statuses"] == report["group_statuses"]
+        for invalid in (
+            {**report, "status_generation": int(report["status_generation"]) + 1},
+            {**report, "group_statuses": []},
+        ):
+            response = session.post(
+                heartbeat_url,
+                json=invalid,
+                headers=internal_service_headers(),
+                timeout=10,
+            )
+            assert response.status_code == 409, response.text
+        assert raw_store()["runtime_statuses"] == baseline["runtime_statuses"]
+    finally:
+        owner.send_signal(signal.SIGCONT)

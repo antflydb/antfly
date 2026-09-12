@@ -402,3 +402,51 @@ test "codec transport bounds encoded heartbeat bundles and preserves read contex
     }
     try std.testing.expectEqual(@as(usize, 4), total);
 }
+
+test "codec transport asynchronous failures re-resolve routes and exhaust actual attempts" {
+    const AsyncDriver = struct {
+        alloc: std.mem.Allocator,
+        failed: std.ArrayListUnmanaged(runtime.frame_driver_iface.FailedFrame) = .empty,
+        calls: usize = 0,
+        fn send(ptr: *anyopaque, req: runtime.frame_driver_iface.SendFrameRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (req.attempt == 1) try std.testing.expectEqualStrings("http://old", req.endpoint.address) else {
+                try std.testing.expectEqualStrings("http://new", req.endpoint.address);
+                try std.testing.expectEqualSlices(u64, &.{42}, req.group_ids);
+            }
+            try std.testing.expectEqual(@as(?u64, 1), req.source_id);
+            const decoded = try runtime.BinaryCodec.codec().decodeFrame(self.alloc, req.frame);
+            defer runtime.BinaryCodec.codec().freeDecoded(self.alloc, decoded);
+            for (decoded.raft_peer_batch.groups) |group| try std.testing.expectEqualStrings("read-token", group.messages[0].context);
+            const bytes = try self.alloc.dupe(u8, req.frame.bytes);
+            errdefer self.alloc.free(bytes);
+            const media_type = try self.alloc.dupe(u8, req.frame.media_type);
+            errdefer self.alloc.free(media_type);
+            try self.failed.append(self.alloc, .{ .alloc = self.alloc, .source_id = req.source_id, .peer_id = req.peer_id, .frame = .{ .bytes = bytes, .media_type = media_type }, .attempt = req.attempt });
+        }
+        fn poll(ptr: *anyopaque) ?runtime.frame_driver_iface.FailedFrame {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.failed.items.len == 0) null else self.failed.orderedRemove(0);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var driver: AsyncDriver = .{ .alloc = alloc };
+    defer {
+        for (driver.failed.items) |*failed| failed.deinit();
+        driver.failed.deinit(alloc);
+    }
+    var host = runtime.CodecTransportHost.init(alloc, runtime.BinaryCodec.codec(), .{ .ptr = &driver, .vtable = &.{ .send_frame = AsyncDriver.send, .poll_failed_frame = AsyncDriver.poll } }, .{ .max_attempts = 3 });
+    defer host.deinit();
+    for ([_]u64{ 41, 42 }) |id| try host.transport().addPeer(id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://old" }} });
+    var context = "read-token".*;
+    const messages = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .context = &context }};
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &.{ .{ .group_id = 41, .messages = &messages }, .{ .group_id = 42, .messages = &messages } } }});
+    try host.transport().removePeer(41, 2);
+    try host.transport().upsertPeer(42, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://new" }} });
+    for (0..16) |_| try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 3), driver.calls);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_retry_bytes);
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().retries_exhausted);
+}

@@ -40,8 +40,22 @@ frames split recursively. A single group's existing driver size contract remains
 Route builders are hash indexed. Mixed-message duplicate-group ordering checks
 may scan the bounded pending builders; the normal heartbeat grouping path is linear.
 
-Retry retention caps at 4,096 frames and 8 MiB per host, in addition to existing
-attempt/backoff limits. Exhaustion discards transport work and increments the
+The codec transport owns all retries, including failed asynchronous HTTP attempts.
+The driver performs one HTTP attempt and returns failed frame ownership on the
+next transport round. Unsent bundles are invalidated on endpoint changes/removal;
+in-flight attempts may finish on the previously admitted endpoint. The transport
+splits failed bundles by group and resolves current routes before retrying.
+
+Codec retry retention caps at 4,096 frames and 8 MiB per host, in addition to
+attempt/backoff limits. HTTP queue admission reserves bytes before allocation;
+queued, in-flight and failed completions all retain the reservation. Defaults
+allow four maximum 32 MiB requests globally and one per peer, plus 64 KiB routing
+metadata per request: 128.25 MiB globally, 32.0625 MiB per peer. Existing 4,096/256
+global/per-peer frame caps count all retained states too. These HTTP limits are
+independent of the codec's 8 MiB retry budget; they are not one combined 8 MiB cap.
+`antfly_raft_async_send_retained_bytes` and `antfly_raft_async_send_retained_frames`
+include failed completions awaiting transfer. The cap excludes bounded queue/map
+metadata and transient encoding/decoding buffers. Exhaustion discards transport work and increments the
 exhaustion metric; Raft remains responsible for retransmission. Context-bearing
 heartbeats are never deduplicated. New traffic and old retries retain the existing
 lossy, potentially reordered delivery contract.

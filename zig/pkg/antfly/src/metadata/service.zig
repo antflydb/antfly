@@ -3143,7 +3143,93 @@ const LocalProjectionInputs = struct {
     restore_progresses: []metadata_table_manager.RestoreProgressRecord,
 };
 
+// Immutable report leaves let header and group-only publications retain the
+// runtime inventory. Admission leases remain valid across replacement/removal.
+fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
+    return struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        items: []T,
+        fn retain(self: *@This()) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+        fn release(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                free(alloc, self.items);
+                alloc.destroy(self);
+            }
+        }
+    };
+}
+const StoreCapabilities = struct {
+    const Kind = enum { repair, vector_projection, native_storage, artifact_source, reporter_fence, inference, native_restore };
+    flags: std.EnumSet(Kind) = .initEmpty(),
+    fn fromStores(stores: []const metadata_table_manager.StoreRecord) StoreCapabilities {
+        var out: StoreCapabilities = .{};
+        if (storesHaveRuntimeRepairStatus(stores)) out.flags.insert(.repair);
+        if (storesHaveDenseVectorProjectionPending(stores)) out.flags.insert(.vector_projection);
+        if (storesHaveDenseNativeStorageStatus(stores)) out.flags.insert(.native_storage);
+        if (storesHaveRuntimeArtifactSourceStatus(stores)) out.flags.insert(.artifact_source);
+        if (storesHaveRuntimeReporterFence(stores)) out.flags.insert(.reporter_fence);
+        if (storesHaveRuntimeInferenceDiagnostics(stores)) out.flags.insert(.inference);
+        if (storesHaveNativeGenerationRestoreCapability(stores)) out.flags.insert(.native_restore);
+        return out;
+    }
+};
+const StoreProjectionLease = struct {
+    const Groups = SharedStoreReports(metadata_table_manager.GroupStatusReport, metadata_table_manager.freeGroupStatuses);
+    const Runtime = SharedStoreReports(metadata_table_manager.RuntimeGroupStatusReport, metadata_table_manager.freeRuntimeGroupStatusReports);
+    refs: std.atomic.Value(usize) = .init(1),
+    record: metadata_table_manager.StoreRecord,
+    groups: *Groups,
+    runtime: *Runtime,
+    runtime_capabilities: StoreCapabilities,
+    capabilities: StoreCapabilities,
+
+    // Takes ownership of record only on success. Shared components must be
+    // absent from the incoming record; no report arrays are copied here.
+    fn create(alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord, prior: ?*StoreProjectionLease, share_groups: bool, share_runtime: bool) !*StoreProjectionLease {
+        const self = try alloc.create(StoreProjectionLease);
+        errdefer alloc.destroy(self);
+        const groups = if (share_groups) prior.?.groups else try alloc.create(Groups);
+        errdefer if (!share_groups) alloc.destroy(groups);
+        const runtime = if (share_runtime) prior.?.runtime else try alloc.create(Runtime);
+        if (share_groups) {
+            std.debug.assert(record.group_statuses.len == 0);
+            groups.retain();
+        } else groups.* = .{ .items = record.group_statuses };
+        if (share_runtime) {
+            std.debug.assert(record.runtime_statuses.len == 0);
+            runtime.retain();
+        } else runtime.* = .{ .items = record.runtime_statuses };
+        const runtime_capabilities = if (share_runtime) prior.?.runtime_capabilities else StoreCapabilities.fromStores(&.{.{ .store_id = record.store_id, .node_id = record.node_id, .runtime_statuses = runtime.items }});
+        var capabilities = runtime_capabilities;
+        if (record.artifact_sources_protocol_version != 0) capabilities.flags.insert(.artifact_source);
+        if (record.reporter_incarnation != 0) capabilities.flags.insert(.reporter_fence);
+        if (record.native_generation_restore_version != 0) capabilities.flags.insert(.native_restore);
+        self.* = .{ .record = record, .groups = groups, .runtime = runtime, .runtime_capabilities = runtime_capabilities, .capabilities = capabilities };
+        self.record.group_statuses = groups.items;
+        self.record.runtime_statuses = runtime.items;
+        return self;
+    }
+    fn retain(self: *@This()) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    fn release(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.record.group_statuses = &.{};
+        self.record.runtime_statuses = &.{};
+        metadata_table_manager.freeStore(alloc, self.record);
+        self.groups.release(alloc);
+        self.runtime.release(alloc);
+        alloc.destroy(self);
+    }
+};
+
 const ProjectedCoreSnapshot = struct {
+    store_leases: std.ArrayListUnmanaged(*StoreProjectionLease) = .empty,
+    store_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    capability_counts: [7]usize = @splat(0),
+
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
     placement_version_fences: []metadata_reconciler.PlacementVersionFence = &.{},
@@ -3154,9 +3240,45 @@ const ProjectedCoreSnapshot = struct {
     split_transitions: []transition_state.SplitTransitionRecord = &.{},
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
+    fn adjustCapabilities(self: *@This(), facts: StoreCapabilities, add: bool) void {
+        var it = facts.flags.iterator();
+        while (it.next()) |kind| {
+            const count = &self.capability_counts[@intFromEnum(kind)];
+            if (add) count.* += 1 else count.* -= 1;
+        }
+    }
+    fn capabilities(self: *const @This()) StoreCapabilities {
+        var out: StoreCapabilities = .{};
+        for (self.capability_counts, 0..) |count, i| if (count != 0) {
+            out.flags.insert(@enumFromInt(i));
+        };
+        return out;
+    }
+    fn initializeStoreLeases(self: *@This(), alloc: std.mem.Allocator) !void {
+        try self.store_leases.ensureTotalCapacity(alloc, self.stores.len);
+        try self.store_positions.ensureTotalCapacity(alloc, @intCast(self.stores.len));
+        for (self.stores, 0..) |record, i| {
+            const lease = try StoreProjectionLease.create(alloc, record, null, false, false);
+            self.store_leases.appendAssumeCapacity(lease);
+            self.store_positions.putAssumeCapacity(record.store_id, i);
+            self.adjustCapabilities(lease.capabilities, true);
+        }
+    }
+    fn deinitStores(self: *@This(), alloc: std.mem.Allocator) void {
+        // During initialization, only the prefix has transferred ownership.
+        for (self.stores[self.store_leases.items.len..]) |record| metadata_table_manager.freeStore(alloc, record);
+        for (self.store_leases.items) |lease| lease.release(alloc);
+        self.store_leases.deinit(alloc);
+        self.store_positions.deinit(alloc);
         if (self.stores.len > 0) alloc.free(self.stores);
+        self.stores = &.{};
+        self.store_leases = .empty;
+        self.store_positions = .empty;
+        self.capability_counts = @splat(0);
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.deinitStores(alloc);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
         if (self.placement_version_fences.len > 0) alloc.free(self.placement_version_fences);
@@ -3243,7 +3365,7 @@ const ProjectedCoreSnapshot = struct {
 // Notifications must not allocate or fail after a durable commit. Bound the
 // per-store change set and fall back to a complete store refresh on overflow.
 const CoreProjectionChanges = struct {
-    const StoreChange = struct { id: u64, reports: bool };
+    const StoreChange = struct { id: u64, reports: bool, runtime: bool = true };
     const Pending = struct {
         all: bool = true,
         kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initEmpty(),
@@ -3267,13 +3389,14 @@ const CoreProjectionChanges = struct {
         for (self.pending.stores[0..self.pending.store_count]) |*store| {
             if (store.id != signal.store_id) continue;
             store.reports = store.reports or signal.store_reports_changed;
+            store.runtime = store.runtime or (signal.store_reports_changed and signal.store_runtime_changed);
             return;
         }
         if (self.pending.store_count == self.pending.stores.len) {
             self.pending.all_stores = true;
             return;
         }
-        self.pending.stores[self.pending.store_count] = .{ .id = signal.store_id, .reports = signal.store_reports_changed };
+        self.pending.stores[self.pending.store_count] = .{ .id = signal.store_id, .reports = signal.store_reports_changed, .runtime = signal.store_reports_changed and signal.store_runtime_changed };
         self.pending.store_count += 1;
     }
     fn take(self: *@This()) Pending {
@@ -7572,12 +7695,37 @@ pub const MetadataHttpService = struct {
         var runtime_locked = true;
         errdefer if (runtime_locked) self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
-        const projected = try cloneProjectedStoresOwned(self.alloc, snapshot.stores);
+        const capabilities = snapshot.capabilities();
+        var leases: std.ArrayListUnmanaged(*StoreProjectionLease) = .empty;
+        defer {
+            for (leases.items) |lease| lease.release(self.alloc);
+            leases.deinit(self.alloc);
+        }
+        var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer selected.deinit(self.alloc);
+        for (reports) |report| {
+            const index = snapshot.store_positions.get(report.store_id) orelse return error.UnknownStore;
+            const entry = try selected.getOrPut(self.alloc, report.store_id);
+            if (entry.found_existing) continue;
+            const lease = snapshot.store_leases.items[index];
+            try leases.append(self.alloc, lease);
+            lease.retain();
+        }
         self.unlockRuntime();
         runtime_locked = false;
-        defer self.freeProjectedStores(self.alloc, projected);
-
-        return try reportStoreStatusesWithProjected(self, projected, reports);
+        // Only reporting stores need mutable observations. Retained immutable
+        // leaves keep the captured records alive while the lock is released.
+        const projected = try self.alloc.alloc(metadata_table_manager.StoreRecord, leases.items.len);
+        var initialized: usize = 0;
+        defer {
+            for (projected[0..initialized]) |record| metadata_table_manager.freeStore(self.alloc, record);
+            self.alloc.free(projected);
+        }
+        for (leases.items, 0..) |lease, i| {
+            projected[i] = try metadata_table_manager.cloneStore(self.alloc, lease.record);
+            initialized += 1;
+        }
+        return try reportStoreStatusesWithCapabilities(self, projected, reports, capabilities);
     }
 
     pub fn removeStore(self: *MetadataHttpService, store_id: u64) !void {
@@ -9524,6 +9672,7 @@ pub const MetadataHttpService = struct {
         var snapshot: ProjectedCoreSnapshot = .{};
         errdefer snapshot.deinit(self.alloc);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
+        try snapshot.initializeStoreLeases(self.alloc);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.placement_version_fences = try store.listPlacementVersionFences(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -9537,38 +9686,51 @@ pub const MetadataHttpService = struct {
 
     fn refreshProjectedStoreLocked(self: *MetadataHttpService, snapshot: *ProjectedCoreSnapshot, change: CoreProjectionChanges.StoreChange) !void {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        var position: ?usize = null;
-        for (snapshot.stores, 0..) |record, i| if (record.store_id == change.id) {
-            position = i;
-            break;
-        };
+        const position = snapshot.store_positions.get(change.id);
         const reports = change.reports or position == null;
-        var replacement = try store.readStore(self.alloc, self.metadata_group_id, change.id, reports);
-        errdefer if (replacement) |record| metadata_table_manager.freeStore(self.alloc, record);
+        const runtime = change.runtime or position == null;
+        const replacement = if (reports and !runtime)
+            try store.readStoreGroupFacts(self.alloc, self.metadata_group_id, change.id)
+        else
+            try store.readStore(self.alloc, self.metadata_group_id, change.id, reports);
+        var record_owned = true;
+        errdefer if (record_owned) {
+            if (replacement) |record| metadata_table_manager.freeStore(self.alloc, record);
+        };
         if (position) |i| {
-            if (replacement) |*record| {
-                if (!reports) {
-                    metadata_table_manager.freeGroupStatuses(self.alloc, record.group_statuses);
-                    metadata_table_manager.freeRuntimeGroupStatusReports(self.alloc, record.runtime_statuses);
-                    record.group_statuses = snapshot.stores[i].group_statuses;
-                    record.runtime_statuses = snapshot.stores[i].runtime_statuses;
-                    snapshot.stores[i].group_statuses = &.{};
-                    snapshot.stores[i].runtime_statuses = &.{};
-                }
-                metadata_table_manager.freeStore(self.alloc, snapshot.stores[i]);
-                snapshot.stores[i] = record.*;
+            const prior = snapshot.store_leases.items[i];
+            if (replacement) |record| {
+                const lease = try StoreProjectionLease.create(self.alloc, record, prior, !reports, !reports or !runtime);
+                record_owned = false;
+                snapshot.adjustCapabilities(prior.capabilities, false);
+                snapshot.adjustCapabilities(lease.capabilities, true);
+                snapshot.store_leases.items[i] = lease;
+                snapshot.stores[i] = lease.record;
+                prior.release(self.alloc);
             } else {
                 const next = try self.alloc.alloc(metadata_table_manager.StoreRecord, snapshot.stores.len - 1);
                 @memcpy(next[0..i], snapshot.stores[0..i]);
                 @memcpy(next[i..], snapshot.stores[i + 1 ..]);
-                metadata_table_manager.freeStore(self.alloc, snapshot.stores[i]);
+                _ = snapshot.store_positions.remove(change.id);
+                _ = snapshot.store_leases.orderedRemove(i);
+                for (next[i..], i..) |record, j| snapshot.store_positions.getPtr(record.store_id).?.* = j;
+                snapshot.adjustCapabilities(prior.capabilities, false);
+                prior.release(self.alloc);
                 self.alloc.free(snapshot.stores);
                 snapshot.stores = next;
             }
         } else if (replacement) |record| {
+            try snapshot.store_leases.ensureUnusedCapacity(self.alloc, 1);
+            try snapshot.store_positions.ensureUnusedCapacity(self.alloc, 1);
             const next = try self.alloc.alloc(metadata_table_manager.StoreRecord, snapshot.stores.len + 1);
+            errdefer self.alloc.free(next);
+            const lease = try StoreProjectionLease.create(self.alloc, record, null, false, false);
+            record_owned = false;
             @memcpy(next[0..snapshot.stores.len], snapshot.stores);
-            next[snapshot.stores.len] = record;
+            next[snapshot.stores.len] = lease.record;
+            snapshot.store_positions.putAssumeCapacity(record.store_id, snapshot.stores.len);
+            snapshot.store_leases.appendAssumeCapacity(lease);
+            snapshot.adjustCapabilities(lease.capabilities, true);
             self.alloc.free(snapshot.stores);
             snapshot.stores = next;
         }
@@ -9594,9 +9756,15 @@ pub const MetadataHttpService = struct {
             const store = self.projectedStore() orelse return error.MissingMetadataStore;
             if (changes.kinds.contains(.store)) {
                 if (changes.all_stores) {
-                    const fresh = try store.listStores(self.alloc, self.metadata_group_id);
-                    store.freeStores(self.alloc, snapshot.stores);
-                    snapshot.stores = fresh;
+                    var fresh: ProjectedCoreSnapshot = .{};
+                    errdefer fresh.deinit(self.alloc);
+                    fresh.stores = try store.listStores(self.alloc, self.metadata_group_id);
+                    try fresh.initializeStoreLeases(self.alloc);
+                    snapshot.deinitStores(self.alloc);
+                    snapshot.stores = fresh.stores;
+                    snapshot.store_leases = fresh.store_leases;
+                    snapshot.store_positions = fresh.store_positions;
+                    snapshot.capability_counts = fresh.capability_counts;
                 } else for (changes.stores[0..changes.store_count]) |change| try self.refreshProjectedStoreLocked(snapshot, change);
             }
             if (changes.kinds.contains(.placement_intent)) {
@@ -12384,13 +12552,14 @@ fn reportReferencedStoreStatus(service: anytype, report: metadata_table_manager.
     service.lockCatalogMutation();
     defer service.unlockCatalogMutation();
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
-    const header = (try store.readStore(service.alloc, service.metadata_group_id, report.store_id, true)) orelse return error.UnknownStore;
+    const header = (try store.readStoreGroupFacts(service.alloc, service.metadata_group_id, report.store_id)) orelse return error.UnknownStore;
     defer metadata_table_manager.freeStore(service.alloc, header);
     if (header.reporter_incarnation != report.reporter_incarnation or header.status_generation != report.status_generation) return error.StoreReportBaseMismatch;
+    try metadata_store_observer.validateHeartbeatInventory(service.alloc, header.group_statuses, report.group_statuses);
     try service.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
     var observation = report;
-    observation.runtime_statuses = header.runtime_statuses;
-    if (!metadata_store_observer.observationChangesRecord(header, observation)) return;
+    observation.runtime_statuses = &.{};
+    if (!try metadata_store_observer.observationChangesRecord(service.alloc, header, observation)) return;
     var replacement = metadata_store_observer.applyObservation(header, report);
     replacement.runtime_statuses = &.{};
     try service.proposeTransitionCommand(.{ .upsert_store_heartbeat = replacement });
@@ -12401,24 +12570,33 @@ fn reportStoreStatusesWithProjected(
     projected: []metadata_table_manager.StoreRecord,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) !usize {
+    return reportStoreStatusesWithCapabilities(service, projected, reports, StoreCapabilities.fromStores(projected));
+}
+
+fn reportStoreStatusesWithCapabilities(
+    service: anytype,
+    projected: []metadata_table_manager.StoreRecord,
+    reports: []const metadata_table_manager.StoreStatusReport,
+    capabilities: StoreCapabilities,
+) !usize {
     // Durable admission facts use the positional V15 profile; native vector
     // projection and authority use framed V17 and may never be stripped.
     // Runtime embedding activity remains a volatile heartbeat overlay.
     const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
-        storesHaveRuntimeRepairStatus(projected);
+        capabilities.flags.contains(.repair);
     const vector_projection_transition_possible = reportsHaveDenseVectorProjectionPending(reports) or
-        storesHaveDenseVectorProjectionPending(projected);
+        capabilities.flags.contains(.vector_projection);
     const native_storage_transition_possible = reportsHaveDenseNativeStorageStatus(reports) or
-        storesHaveDenseNativeStorageStatus(projected);
+        capabilities.flags.contains(.native_storage);
     const artifact_source_transition_possible = reportsHaveRuntimeArtifactSourceStatus(reports) or
-        storesHaveRuntimeArtifactSourceStatus(projected);
+        capabilities.flags.contains(.artifact_source);
     const reporter_fence_transition_possible = reportsHaveRuntimeReporterFence(reports) or
-        storesHaveRuntimeReporterFence(projected);
+        capabilities.flags.contains(.reporter_fence);
     const inference_diagnostics_transition_possible = reportsHaveRuntimeInferenceDiagnostics(reports) or
-        storesHaveRuntimeInferenceDiagnostics(projected);
+        capabilities.flags.contains(.inference);
     const required_version = if (inference_diagnostics_transition_possible)
         metadata_runtime_status_protocol.inference_diagnostics_record_version
-    else if (storesHaveNativeGenerationRestoreCapability(projected) or
+    else if (capabilities.flags.contains(.native_restore) or
         repair_status_transition_possible or artifact_source_transition_possible or
         reporter_fence_transition_possible)
         metadata_runtime_status_protocol.positional_record_version
@@ -12456,7 +12634,8 @@ fn reportStoreStatusesWithProjected(
             report.runtime_statuses,
         )) return error.InvalidStoreReporterFence;
         const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
-        if (!metadata_store_observer.observationChangesRecordWithRepairStatus(
+        if (!try metadata_store_observer.observationChangesRecordWithRepairStatus(
+            service.alloc,
             projected[index],
             report,
             include_repair_status,
@@ -18804,7 +18983,11 @@ test "metadata http service catalog cache is independent from volatile projectio
     // Header-only commits retain report ownership, and updating one store
     // does not rehydrate another store's potentially large report collection.
     var observed = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 123, .raft_term = 1 }};
-    var store_record: metadata_table_manager.StoreRecord = .{ .store_id = 41, .node_id = 41, .group_statuses = &observed };
+    var activation_rounds: usize = 0;
+    while (try svc.metadataIncarnation() == null and activation_rounds < 32) : (activation_rounds += 1) try svc.runRound();
+    try std.testing.expect(try svc.metadataIncarnation() != null);
+    var runtime_observed = [_]metadata_table_manager.RuntimeGroupStatusReport{.{ .table_id = 1, .table_name = "docs", .group_id = 123, .store_id = 41, .node_id = 41 }};
+    var store_record: metadata_table_manager.StoreRecord = .{ .store_id = 41, .node_id = 41, .reporter_incarnation = 77, .status_generation = 1, .group_statuses = &observed, .runtime_statuses = &runtime_observed };
     for ([_]u64{ 41, 42 }) |id| {
         var seeded = store_record;
         seeded.store_id = id;
@@ -18842,6 +19025,25 @@ test "metadata http service catalog cache is independent from volatile projectio
         try std.testing.expectEqual(@as(u64, 2), values[metadata_store_observer.findStoreIndex(values, 41).?].group_statuses[0].raft_term);
         const cached = &svc.projected_core_snapshot_cache.snapshot.?;
         try std.testing.expectEqual(second_reports, cached.stores[metadata_store_observer.findStoreIndex(cached.stores, 42).?].group_statuses.ptr);
+    }
+    // A reference publication replaces group facts while a retained admission
+    // lease keeps the previous group view and shares the same runtime leaf.
+    const pinned_lease = svc.projected_core_snapshot_cache.snapshot.?.store_leases.items[first_index];
+    pinned_lease.retain();
+    defer pinned_lease.release(std.testing.allocator);
+    observed[0].raft_term = 3;
+    var heartbeat = store_record;
+    heartbeat.runtime_statuses = &.{};
+    const reference_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_store_heartbeat = heartbeat });
+    try svc.waitForTransitionApplied(reference_receipt);
+    {
+        const values = try svc.listProjectedStores(std.testing.allocator);
+        defer svc.freeProjectedStores(std.testing.allocator, values);
+        const next_lease = svc.projected_core_snapshot_cache.snapshot.?.store_leases.items[first_index];
+        try std.testing.expectEqual(@as(u64, 2), pinned_lease.record.group_statuses[0].raft_term);
+        try std.testing.expectEqual(@as(u64, 3), next_lease.record.group_statuses[0].raft_term);
+        try std.testing.expectEqual(pinned_lease.runtime, next_lease.runtime);
+        try std.testing.expectEqual(second_reports, svc.projected_core_snapshot_cache.snapshot.?.stores[second_index].group_statuses.ptr);
     }
     const updated_core_epoch = svc.projected_core_epoch.load(.acquire);
 
@@ -19312,4 +19514,81 @@ test "metadata service projection notifications coalesce and bound store invalid
     try std.testing.expect(changes.take().all);
     changes.invalidate();
     try std.testing.expect(changes.take().all);
+}
+
+test "metadata service store leases retain runtime across group and header publications" {
+    const alloc = std.testing.allocator;
+    var groups = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 7, .raft_term = 1 }};
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .repair_status = .waiting }};
+    var runtimes = [_]metadata_table_manager.RuntimeGroupStatusReport{.{ .table_id = 1, .table_name = "docs", .group_id = 7, .store_id = 20, .node_id = 30, .indexes = &indexes }};
+    const record: metadata_table_manager.StoreRecord = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .native_generation_restore_version = 1, .group_statuses = &groups, .runtime_statuses = &runtimes };
+    const old = try StoreProjectionLease.create(alloc, try metadata_table_manager.cloneStore(alloc, record), null, false, false);
+    defer old.release(alloc);
+    var changed = record;
+    changed.native_generation_restore_version = 0;
+    changed.group_statuses = &.{};
+    changed.runtime_statuses = &.{};
+    const header = try StoreProjectionLease.create(alloc, try metadata_table_manager.cloneStore(alloc, changed), old, true, true);
+    try std.testing.expectEqual(old.groups, header.groups);
+    try std.testing.expectEqual(old.runtime, header.runtime);
+    try std.testing.expect(header.capabilities.flags.contains(.repair));
+    try std.testing.expect(!header.capabilities.flags.contains(.native_restore));
+    groups[0].raft_term = 2;
+    changed.group_statuses = &groups;
+    const next = try StoreProjectionLease.create(alloc, try metadata_table_manager.cloneStore(alloc, changed), header, false, true);
+    defer next.release(alloc);
+    header.release(alloc);
+    try std.testing.expectEqual(old.runtime, next.runtime);
+    try std.testing.expectEqual(@as(u64, 1), old.record.group_statuses[0].raft_term);
+    try std.testing.expectEqual(@as(u64, 2), next.record.group_statuses[0].raft_term);
+    var snapshot: ProjectedCoreSnapshot = .{};
+    snapshot.adjustCapabilities(old.capabilities, true);
+    snapshot.adjustCapabilities(next.capabilities, true);
+    snapshot.adjustCapabilities(old.capabilities, false);
+    try std.testing.expect(snapshot.capabilities().flags.contains(.repair));
+    try std.testing.expect(!snapshot.capabilities().flags.contains(.native_restore));
+    snapshot.adjustCapabilities(next.capabilities, false);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
+}
+
+test "metadata service store report workload benchmark selected admission" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const alloc = std.heap.c_allocator;
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .repair_status = .waiting }};
+    var runtimes: [100]metadata_table_manager.RuntimeGroupStatusReport = undefined;
+    for (&runtimes, 0..) |*runtime, i| runtime.* = .{ .table_id = 1, .table_name = "tenant_events", .group_id = i + 1, .store_id = 20, .node_id = 30, .indexes = &indexes };
+    for ([_]usize{ 1, 10, 100 }) |count| {
+        var snapshot: ProjectedCoreSnapshot = .{};
+        defer snapshot.deinit(alloc);
+        snapshot.stores = try alloc.alloc(metadata_table_manager.StoreRecord, count);
+        // Initialize ownership before any fallible clone.
+        for (snapshot.stores, 0..) |*record, i| record.* = .{ .store_id = i + 1, .node_id = i + 1 };
+        for (snapshot.stores) |*record| record.* = try metadata_table_manager.cloneStore(alloc, .{ .store_id = record.store_id, .node_id = record.node_id, .runtime_statuses = &runtimes });
+        try snapshot.initializeStoreLeases(alloc);
+        for ([_]bool{ false, true }) |selected| {
+            var elapsed: [9]u64 = undefined;
+            for (&elapsed) |*sample| {
+                const start = platform_time.monotonicNs();
+                if (selected) {
+                    const lease = snapshot.store_leases.items[snapshot.store_positions.get(1).?];
+                    lease.retain();
+                    defer lease.release(alloc);
+                    const capabilities = snapshot.capabilities();
+                    const record = try metadata_table_manager.cloneStore(alloc, lease.record);
+                    defer metadata_table_manager.freeStore(alloc, record);
+                    try std.testing.expect(capabilities.flags.contains(.repair));
+                } else {
+                    const records = try cloneProjectedStoresOwned(alloc, snapshot.stores);
+                    defer {
+                        for (records) |record| metadata_table_manager.freeStore(alloc, record);
+                        alloc.free(records);
+                    }
+                    try std.testing.expect(StoreCapabilities.fromStores(records).flags.contains(.repair));
+                }
+                sample.* = platform_time.monotonicNs() - start;
+            }
+            std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+            std.debug.print("ADMISSION_CACHE_BENCH stores={d} groups_per_store=100 selected={} p50_ms={d:.6}\n", .{ count, selected, @as(f64, @floatFromInt(elapsed[4])) / 1e6 });
+        }
+    }
 }

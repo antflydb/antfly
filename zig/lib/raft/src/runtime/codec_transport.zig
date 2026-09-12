@@ -288,7 +288,11 @@ pub const CodecTransportHost = struct {
             return;
         }
 
+        var group_ids: [256]u64 = undefined;
+        std.debug.assert(batch.groups.len <= group_ids.len);
+        for (batch.groups, 0..) |group, i| group_ids[i] = group.group_id;
         self.driver.sendFrame(.{
+            .group_ids = group_ids[0..batch.groups.len],
             .source_id = firstSourceNodeId(batch),
             .peer_id = batch.peer_id,
             .endpoint = endpoint,
@@ -317,7 +321,7 @@ pub const CodecTransportHost = struct {
         frame: codec_iface.EncodedFrame,
         attempt: u32,
     ) !void {
-        if (self.pending_retries.items.len >= self.retry_policy.max_pending_frames or frame.bytes.len > self.retry_policy.max_pending_bytes -| self.pending_retry_bytes) {
+        if (attempt >= self.retry_policy.max_attempts or self.pending_retries.items.len >= self.retry_policy.max_pending_frames or frame.bytes.len > self.retry_policy.max_pending_bytes -| self.pending_retry_bytes) {
             // Raft transport is lossy; bounded retry retention never prevents
             // the consensus layer from retransmitting current work later.
             self.metrics.retries_exhausted += 1;
@@ -381,6 +385,7 @@ pub const CodecTransportHost = struct {
             self.metrics.peer_refreshes += 1;
         }
         entry.value_ptr.* = replacement;
+        self.driver.invalidateRoute(group_id, peer.node_id);
     }
 
     fn removePeer(ptr: *anyopaque, group_id: core.types.GroupId, node_id: core.types.NodeId) !void {
@@ -388,6 +393,7 @@ pub const CodecTransportHost = struct {
         const removed = self.peer_routes.fetchRemove(.{ .group_id = group_id, .node_id = node_id }) orelse return;
         var endpoint = removed.value;
         endpoint.deinit(self.alloc);
+        self.driver.invalidateRoute(group_id, node_id);
     }
 
     fn advanceRound(ptr: *anyopaque) !void {
@@ -404,6 +410,26 @@ pub const CodecTransportHost = struct {
     }
 
     fn drainRetries(self: *CodecTransportHost) !void {
+        while (self.driver.pollFailedFrame()) |failed| {
+            var completion = failed;
+            defer completion.deinit();
+            self.metrics.send_failures += 1;
+            if (completion.attempt >= self.retry_policy.max_attempts) {
+                self.metrics.retries_exhausted += 1;
+                continue;
+            }
+            const decoded = try self.codec.decodeFrame(self.alloc, completion.frame);
+            defer self.codec.freeDecoded(self.alloc, decoded);
+            switch (decoded) {
+                .raft_peer_batch => |batch| for (batch.groups) |group| {
+                    if (!self.peer_routes.contains(.{ .group_id = group.group_id, .node_id = completion.peer_id })) continue;
+                    const frame = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = completion.peer_id, .groups = &.{group} });
+                    defer self.codec.freeFrame(self.alloc, frame);
+                    try self.scheduleRetry(group.group_id, completion.source_id, completion.peer_id, frame, completion.attempt);
+                },
+                else => {},
+            }
+        }
         var i: usize = 0;
         while (i < self.pending_retries.items.len) {
             var pending = &self.pending_retries.items[i];
@@ -423,13 +449,15 @@ pub const CodecTransportHost = struct {
                 continue;
             };
             const req: frame_driver_iface.SendFrameRequest = .{
+                .group_ids = &.{pending.group_id},
+                .attempt = pending.attempts + 1,
                 .source_id = pending.source_id,
                 .peer_id = pending.peer_id,
                 .endpoint = endpoint.endpoint(),
                 .frame = pending.frame,
             };
             self.driver.sendFrame(req) catch {
-                if (pending.attempts >= self.retry_policy.max_attempts) {
+                if (pending.attempts + 1 >= self.retry_policy.max_attempts) {
                     self.metrics.retries_exhausted += 1;
                     self.pending_retry_bytes -= pending.frame.bytes.len;
                     pending.deinit(self.alloc);

@@ -237,3 +237,12 @@ heartbeat latency.
 [Heartbeat bundling](HEARTBEAT_BUNDLING.md) documents production route-aware
 batching, retry ownership, isolated codec and transport-host benchmarks, and
 larger live-cluster capacity workloads.
+
+The report target also exercises repair-heavy admission at 1,000/10,000 groups
+with separately allocated equal report slices, and selected-store admission at
+1/10/100 stores with 100 runtime groups each. The latter compares the former
+whole-inventory clone/capability scan with retained single-store selection in the
+same binary, including clone destruction. These component scenarios model a
+repair backlog and steady reporting beside growing unrelated tenant inventory;
+they exclude protocol negotiation, proposals and network I/O. Compile once with
+the environment flag unset, then run with it set after other builds finish.
