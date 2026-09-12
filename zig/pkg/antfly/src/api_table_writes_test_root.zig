@@ -21,6 +21,7 @@ const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 
 test {
     _ = batch;
+    _ = @import("api/table_router.zig");
     _ = http_client;
     _ = internal_transition_wire;
     _ = provisioned_storage;
@@ -29,4 +30,8 @@ test {
 }
 
 /// Implementation source choices for this compilation root.
-pub const antfly_sources = @import("source_owner_physical.zig");
+pub const antfly_sources = @import("source_owner_control.zig");
+
+pub const consumer_tests_only = true;
+
+pub const linked_owner_fixture = @import("api/linked_owner_test_fixture.zig");

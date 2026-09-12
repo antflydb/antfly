@@ -18,11 +18,18 @@ pub const PhysicalStorageResources = struct {
     hbc_cache: hbc_mod.Cache,
 
     pub fn init(alloc: std.mem.Allocator) PhysicalStorageResources {
-        const budgets = memory_budget.smartResourceBudgets(0);
+        return initFallible(alloc) catch @panic("OOM");
+    }
+
+    pub fn initFallible(alloc: std.mem.Allocator) std.mem.Allocator.Error!PhysicalStorageResources {
+        return initWithBudgets(alloc, memory_budget.smartResourceBudgets(0));
+    }
+
+    pub fn initWithBudgets(alloc: std.mem.Allocator, budgets: memory_budget.SmartResourceBudgets) std.mem.Allocator.Error!PhysicalStorageResources {
         return .{
             .alloc = alloc,
             .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
-            .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
+            .lsm_cache = try lsm_backend.Cache.initFallible(alloc, budgets.lsm_cache_budget_bytes),
             .hbc_cache = hbc_mod.Cache.init(alloc),
         };
     }

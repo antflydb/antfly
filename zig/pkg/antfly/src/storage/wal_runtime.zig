@@ -21,12 +21,12 @@ const native = @import("wal.zig");
 const client = @import("kernel_wal_client.zig");
 
 pub const WAL = if (storage_source_options.control_only) client.WAL else native.WAL;
-pub const WalOptions = native.WalOptions;
+pub const WalOptions = if (storage_source_options.control_only) client.WalOptions else native.WalOptions;
 pub const WalEntry = if (storage_source_options.control_only) client.WalEntry else native.WalEntry;
 pub const WalStats = if (storage_source_options.control_only) client.WalStats else native.WalStats;
 pub const BatchAppendResult = native.BatchAppendResult;
-pub const CommitBackend = native.CommitBackend;
-pub const StorageBackend = native.StorageBackend;
+pub const CommitBackend = if (storage_source_options.control_only) client.CommitBackend else native.CommitBackend;
+pub const StorageBackend = if (storage_source_options.control_only) client.StorageBackend else native.StorageBackend;
 
 pub fn appendAt(wal: *WAL, expected_lsn: u64, data: []const u8) !u64 {
     if (storage_source_options.control_only) return wal.appendAt(expected_lsn, data);

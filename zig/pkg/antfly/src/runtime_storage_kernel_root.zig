@@ -49,6 +49,7 @@ comptime {
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
     exportInternal(&@import("storage/db/enrichment/enrichment_types.zig").interactiveActivity, "antfly_storage_interactive_activity");
     exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
+    exportInternal(&storage_kernel_exports.storageOwnerContextCreateWithRuntime, "antfly_storage_context_create_with_runtime");
     exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
     exportInternal(&storage_kernel_exports.storageContextAttachInferenceProvider, "antfly_storage_context_attach_inference_provider");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSecurity, "antfly_storage_context_configure_remote_content_security");
@@ -160,6 +161,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageWalOpen, "antfly_storage_wal_open");
     exportInternal(&storage_kernel_exports.storageWalClose, "antfly_storage_wal_close");
     exportInternal(&storage_kernel_exports.storageWalAppend, "antfly_storage_wal_append");
+    exportInternal(&storage_kernel_exports.storageWalAppendIdempotent, "antfly_storage_wal_append_idempotent");
     exportInternal(&storage_kernel_exports.storageWalSync, "antfly_storage_wal_sync");
     exportInternal(&storage_kernel_exports.storageWalTruncatePrefix, "antfly_storage_wal_truncate_prefix");
     exportInternal(&storage_kernel_exports.storageWalTruncateSuffix, "antfly_storage_wal_truncate_suffix");

@@ -31,6 +31,7 @@ const kernel_wal_owner = antfly.kernel_wal_owner;
 pub const storageWalOpen = kernel_wal_owner.open;
 pub const storageWalClose = kernel_wal_owner.close;
 pub const storageWalAppend = kernel_wal_owner.append;
+pub const storageWalAppendIdempotent = kernel_wal_owner.appendIdempotent;
 pub const storageWalSync = kernel_wal_owner.sync;
 pub const storageWalTruncatePrefix = kernel_wal_owner.truncatePrefix;
 pub const storageWalTruncateSuffix = kernel_wal_owner.truncateSuffix;
@@ -82,7 +83,11 @@ const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
 
+const kernel_runtime_services = @import("../storage/kernel_runtime_services.zig");
+
 const StorageOwnerContext = struct {
+    allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
+    io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
     resources: antfly.physical_resources.PhysicalStorageResources,
     backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
@@ -95,16 +100,6 @@ const StorageOwnerContext = struct {
     auth_casbin_store: ?antfly.storage_backend_erased.Store = null,
     mutex: std.atomic.Mutex = .unlocked,
     active_owners: usize = 0,
-
-    fn init(alloc: Allocator) !StorageOwnerContext {
-        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
-        errdefer backend_runtime.deinit();
-        return .{
-            .alloc = alloc,
-            .resources = .init(alloc),
-            .backend_runtime = backend_runtime,
-        };
-    }
 
     fn lock(self: *StorageOwnerContext) void {
         antfly.platform_sync.lockYielding(&self.mutex);
@@ -147,7 +142,10 @@ const StorageOwnerContext = struct {
         if (self.remote_content_security) |*parsed| parsed.deinit();
         self.backend_runtime.deinit();
         self.resources.deinit();
-        const alloc = self.alloc;
+        // The standard allocator adapter points into this context. Copy its
+        // table before poisoning/freeing the object that contains the adapter.
+        const bridge = self.allocator_bridge;
+        const alloc = if (bridge) |*value| value.asStd() else self.alloc;
         self.* = undefined;
         alloc.destroy(self);
         return true;
@@ -2274,42 +2272,81 @@ pub fn storageOwnerContextCreate(
 ) callconv(.c) kernel_owner_abi.Status {
     out_context.* = null;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    const alloc = std.heap.c_allocator;
-    const context = alloc.create(StorageOwnerContext) catch return .out_of_memory;
-    errdefer alloc.destroy(context);
-    context.* = StorageOwnerContext.init(alloc) catch |err| return storageOwnerStatusFromError(err);
-    errdefer context.backend_runtime.deinit();
+    out_context.* = createStorageOwnerContext(.{ .context = request.* }) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn storageOwnerContextCreateWithRuntime(
+    request: *const kernel_runtime_services.Request,
+    out_context: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_context.* = null;
+    if (request.version != kernel_runtime_services.abi_version or request._reserved != 0 or request.context.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    out_context.* = createStorageOwnerContext(request.*) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+/// Keep fallible construction in an error union: errdefer does not run when
+/// an ABI function returns a scalar failure status.
+fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
+    const request = services.context;
+    const bridge = if (services.allocator) |value| blk: {
+        if (!value.valid()) return error.InvalidArgument;
+        break :blk value.*;
+    } else null;
+    const receiver = if (services.io) |io| try io.receive() else null;
+    const bootstrap_alloc = if (bridge) |*value| value.asStd() else std.heap.c_allocator;
+    const context = try bootstrap_alloc.create(StorageOwnerContext);
+    errdefer bootstrap_alloc.destroy(context);
+    context.* = .{
+        .allocator_bridge = bridge,
+        .io_receiver = receiver,
+        .alloc = undefined,
+        .resources = undefined,
+        .backend_runtime = undefined,
+    };
+    const alloc = if (context.allocator_bridge) |*value| value.asStd() else std.heap.c_allocator;
+    context.alloc = alloc;
+    const memory_budget = @import("../storage/memory_budget.zig");
+    const memory_limit = std.math.cast(usize, services.memory_limit_bytes) orelse return error.InvalidArgument;
+    const budgets = if (services.io != null)
+        memory_budget.smartResourceBudgetsResolved(memory_limit, if (memory_limit == 0) .unavailable else .explicit)
+    else
+        memory_budget.smartResourceBudgets(memory_limit);
+    context.resources = try .initWithBudgets(alloc, budgets);
     errdefer context.resources.deinit();
+    var runtime_config = db_mod.background_runtime.Config{};
+    if (context.io_receiver) |*io| runtime_config = .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io.io() },
+    };
+    context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
+    errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();
     switch (request.storage_kind) {
-        .directory => if (request.storage_path.len != 0) return .invalid_argument,
+        .directory => if (request.storage_path.len != 0) return error.InvalidArgument,
         .lite => {
             const path = request.storage_path.slice();
-            if (path.len == 0) return .invalid_argument;
-            context.lite_backend = lite_backend.Handle.openOrCreate(alloc, path, .{
+            if (path.len == 0) return error.InvalidArgument;
+            context.lite_backend = try lite_backend.Handle.openOrCreate(alloc, path, .{
                 .no_sync = request.no_sync != 0,
                 .resource_manager = &context.resources.resource_manager,
-            }) catch |err| return storageOwnerStatusFromError(err);
+                .io = if (context.io_receiver) |*io| io.io() else null,
+            });
         },
     }
     errdefer if (context.lite_backend) |*backend| backend.deinit();
     const auth_storage_path = request.auth_storage_path.slice();
     if (auth_storage_path.len != 0) {
-        context.auth_backend = antfly.lsm_backend.BackendHandle.open(alloc, auth_storage_path, .{}) catch |err|
-            return storageOwnerStatusFromError(err);
+        context.auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, auth_storage_path, .{
+            .storage = context.backend_runtime.ptr().storage(),
+        });
         errdefer context.auth_backend.?.close();
-        context.auth_users_store = context.auth_backend.?.backend.runtimeStore(
-            alloc,
-            .{ .name = "usermgr_users" },
-        ) catch |err| return storageOwnerStatusFromError(err);
+        context.auth_users_store = try context.auth_backend.?.backend.runtimeStore(alloc, .{ .name = "usermgr_users" });
         errdefer context.auth_users_store.?.deinit();
-        context.auth_casbin_store = context.auth_backend.?.backend.runtimeStore(
-            alloc,
-            .{ .name = "usermgr_casbin" },
-        ) catch |err| return storageOwnerStatusFromError(err);
+        context.auth_casbin_store = try context.auth_backend.?.backend.runtimeStore(alloc, .{ .name = "usermgr_casbin" });
     }
-    out_context.* = context;
-    return .ok;
+    return context;
 }
 
 pub fn storageOwnerContextDestroy(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
@@ -4194,7 +4231,8 @@ pub fn storageOwnerOpen(
         }
     else
         null;
-    const alloc = std.heap.c_allocator;
+    const owner_context = asStorageOwnerContext(request.context);
+    const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
     const recovery_config = request.transaction_recovery;
     if (recovery_config.enabled != 0) {
         if (recovery_config.callback_ctx == null or recovery_config.resolve_participant_fn == null)
@@ -4243,7 +4281,6 @@ pub fn storageOwnerOpen(
         runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
     }
     defer if (!success) if (runtime_hooks) |value| alloc.destroy(value);
-    const owner_context = asStorageOwnerContext(request.context);
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
     defer if (context_borrowed) owner_context.?.release();

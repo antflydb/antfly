@@ -1425,46 +1425,6 @@ const GraphPayloadAdmission = struct {
     }
 };
 
-test "distributed graph result admission is cumulative across shard payloads" {
-    var nodes = [_]graph_query_mod.GraphResultNode{.{
-        .key = @constCast("node"),
-        .depth = 0,
-        .distance = 0,
-    }};
-    var graph_results = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("walk"),
-        .nodes = &nodes,
-        .hits = &.{},
-        .total_hits = 1,
-    }};
-    const queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "walk",
-        .query = .{
-            .query_type = .neighbors,
-            .index_name = "graph",
-            .start_nodes = .{ .keys = &.{} },
-        },
-    }};
-    const usage = graphResultsRetainedUsage(&graph_results);
-    var limits = graph_work_budget.Limits{};
-    limits.max_retained_state_bytes = usage.state_bytes * 2 - 1;
-    var admission = GraphPayloadAdmission.init(&queries, limits);
-    try admission.admit(&graph_results);
-
-    var diagnostic: graph_work_budget_diagnostic.Storage = .{};
-    const binding = graph_work_budget_diagnostic.bind(&diagnostic);
-    defer binding.deinit();
-    try std.testing.expectError(
-        error.GraphWorkBudgetExceeded,
-        admission.admit(&graph_results),
-    );
-    try std.testing.expectEqualStrings("walk", diagnostic.diagnostic.?.operation);
-    try std.testing.expectEqual(
-        graph_work_budget.Dimension.retained_state_bytes,
-        diagnostic.diagnostic.?.dimension,
-    );
-}
-
 fn mergeGraphSearchResults(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
@@ -2169,970 +2129,6 @@ fn freePathEdge(alloc: std.mem.Allocator, edge: anytype) void {
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
-test "query parser accepts full text request subset" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match":{"field":"body","text":"alpha"}},"fields":["title"],"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
-    try std.testing.expectEqual(@as(usize, 1), owned.req.fields.len);
-    try std.testing.expectEqual(false, owned.req.include_all_fields);
-}
-
-test "query parser accepts generated query request shape" {
-    const metadata_openapi = @import("antfly_metadata_openapi");
-    const full_text = try ant_json.RawValue.init(
-        \\{"match":{"field":"body","text":"alpha"}}
-    );
-
-    const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
-        .full_text_search = full_text,
-        .fields = &.{"title"},
-        .limit = 5,
-        .profile = false,
-    });
-    defer std.testing.allocator.free(body);
-
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs", body);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
-    try std.testing.expectEqual(@as(usize, 1), owned.req.fields.len);
-    try std.testing.expectEqualStrings("title", owned.req.fields[0]);
-}
-
-test "query parser defers ordinary stored projection to response encoding" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"fields":["id","title"],"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), owned.req.fields.len);
-    try std.testing.expect(owned.req.defer_stored_projection);
-}
-
-test "query parser defaults to stored documents when fields are omitted" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.req.fields.len);
-    try std.testing.expectEqual(true, owned.req.include_all_fields);
-    try std.testing.expectEqual(true, owned.req.include_stored);
-    try std.testing.expectEqual(false, owned.req.defer_stored_projection);
-}
-
-test "query parser keeps special stored projection in db layer" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"fields":["title","_chunks.*"],"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), owned.req.fields.len);
-    try std.testing.expect(!owned.req.defer_stored_projection);
-}
-
-test "query parser accepts generated count and profile flags" {
-    const metadata_openapi = @import("antfly_metadata_openapi");
-    const full_text = try ant_json.RawValue.init(
-        \\{"match":{"field":"body","text":"alpha"}}
-    );
-
-    const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
-        .full_text_search = full_text,
-        .count = true,
-        .profile = true,
-    });
-    defer std.testing.allocator.free(body);
-
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs", body);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expect(owned.req.count_only);
-    try std.testing.expect(owned.req.profile);
-}
-
-test "query parser accepts aggregations" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match":{"field":"body","text":"alpha"}},"aggregations":{"price_stats":{"type":"stats","field":"price"},"categories":{"type":"terms","field":"category","size":5}}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.aggregations_json.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.aggregations_json, "\"price_stats\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owned.req.aggregations_json, "\"categories\"") != null);
-}
-
-test "query parser accepts bleve match query shape" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match":"alpha","field":"body"},"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .match);
-    try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
-    try std.testing.expectEqualStrings("alpha", owned.req.full_text.?.match.text);
-}
-
-test "query parser accepts bleve match_all query shape" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match_all":{}},"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .match_all);
-}
-
-test "query parser accepts bleve boolean filter shape" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"filter":{"match_all":{}}}}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .bool_query);
-}
-
-test "query parser preserves filter and exclusion request JSON" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":"published","field":"status"},"exclusion_query":{"term":"draft","field":"status"}}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .match);
-    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
-        \\{"term":{"path":"status","term":"published"}}
-    , owned.req.filter_query_json);
-    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
-        \\{"term":{"path":"status","term":"draft"}}
-    , owned.req.exclusion_query_json);
-}
-
-test "query parser does not use dense fast path when public filters are present" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"dense_idx":[0.1,0.2]},"indexes":["dense_idx"],"filter_query":{"term":{"status":"published"}},"exclusion_query":{"term":{"status":"draft"}},"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
-        \\{"term":{"path":"status","term":"published"}}
-    , owned.req.filter_query_json);
-    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
-        \\{"term":{"path":"status","term":"draft"}}
-    , owned.req.exclusion_query_json);
-}
-
-test "query parser accepts typed bleve leaf queries through db full_text" {
-    var fuzzy = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"term":"alph","field":"body","fuzziness":1}}
-    );
-    defer fuzzy.deinit(std.testing.allocator);
-    try std.testing.expect(fuzzy.req.full_text != null);
-    try std.testing.expect(fuzzy.req.full_text.? == .fuzzy or fuzzy.req.full_text.? == .term);
-    switch (fuzzy.req.full_text.?) {
-        .fuzzy => |q| try std.testing.expectEqualStrings("alph", q.term),
-        .term => |q| try std.testing.expectEqualStrings("alph", q.term),
-        else => return error.TestUnexpectedResult,
-    }
-
-    var numeric = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"field":"score","min":10,"max":20,"inclusive_max":true}}
-    );
-    defer numeric.deinit(std.testing.allocator);
-    try std.testing.expect(numeric.req.full_text != null);
-    try std.testing.expect(numeric.req.full_text.? == .numeric_range);
-    try std.testing.expectEqual(@as(f64, 10), numeric.req.full_text.?.numeric_range.min.?);
-    try std.testing.expectEqual(@as(f64, 20), numeric.req.full_text.?.numeric_range.max.?);
-    try std.testing.expectEqual(true, numeric.req.full_text.?.numeric_range.inclusive_max);
-
-    var date_range = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"field":"created_at","start":"2026-03-01T00:00:00Z","end":"2026-03-31","inclusive_end":true}}
-    );
-    defer date_range.deinit(std.testing.allocator);
-    try std.testing.expect(date_range.req.full_text != null);
-    try std.testing.expect(date_range.req.full_text.? == .date_range);
-    try std.testing.expect(date_range.req.full_text.?.date_range.start_ns != null);
-    try std.testing.expect(date_range.req.full_text.?.date_range.end_ns != null);
-    try std.testing.expectEqual(true, date_range.req.full_text.?.date_range.inclusive_end);
-}
-
-test "query parser accepts bleve query string queries" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"body:alpha AND title:\"beta gamma\""},"limit":5}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .bool_query);
-    const root = owned.req.full_text.?.bool_query;
-    try std.testing.expectEqual(@as(usize, 2), root.must.len);
-    try std.testing.expect(root.must[0] == .match);
-    try std.testing.expectEqualStrings("body", root.must[0].match.field);
-    try std.testing.expectEqualStrings("alpha", root.must[0].match.text);
-    try std.testing.expect(root.must[1] == .match_phrase);
-    try std.testing.expectEqualStrings("title", root.must[1].match_phrase.field);
-    try std.testing.expectEqualStrings("beta gamma", root.must[1].match_phrase.text);
-}
-
-test "query parser accepts bleve query string boosts" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"body:alpha^2 AND title:\"beta gamma\"~3^4"}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .bool_query);
-    const root = owned.req.full_text.?.bool_query;
-    try std.testing.expectEqual(@as(usize, 2), root.must.len);
-    try std.testing.expect(root.must[0] == .match);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), root.must[0].match.boost, 0.0001);
-    try std.testing.expect(root.must[1] == .match_phrase);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), root.must[1].match_phrase.boost, 0.0001);
-}
-
-test "query parser accepts bleve query string field groups" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"title:(alpha beta)"}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .bool_query);
-    const root = owned.req.full_text.?.bool_query;
-    try std.testing.expectEqual(@as(usize, 2), root.must.len);
-    try std.testing.expect(root.must[0] == .match);
-    try std.testing.expect(root.must[1] == .match);
-    try std.testing.expectEqualStrings("title", root.must[0].match.field);
-    try std.testing.expectEqualStrings("alpha", root.must[0].match.text);
-    try std.testing.expectEqualStrings("title", root.must[1].match.field);
-    try std.testing.expectEqualStrings("beta", root.must[1].match.text);
-}
-
-test "query parser accepts bleve query string inline ranges" {
-    var numeric = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"score:[10 TO 20}"}}
-    );
-    defer numeric.deinit(std.testing.allocator);
-
-    try std.testing.expect(numeric.req.full_text != null);
-    try std.testing.expect(numeric.req.full_text.? == .numeric_range);
-    try std.testing.expectEqual(@as(f64, 10), numeric.req.full_text.?.numeric_range.min.?);
-    try std.testing.expectEqual(@as(f64, 20), numeric.req.full_text.?.numeric_range.max.?);
-    try std.testing.expect(numeric.req.full_text.?.numeric_range.inclusive_min);
-    try std.testing.expect(!numeric.req.full_text.?.numeric_range.inclusive_max);
-
-    var date = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"created:[2024-01-01T00:00:00Z TO 2024-12-31T00:00:00Z]"}}
-    );
-    defer date.deinit(std.testing.allocator);
-
-    try std.testing.expect(date.req.full_text != null);
-    try std.testing.expect(date.req.full_text.? == .date_range);
-    try std.testing.expect(date.req.full_text.?.date_range.start_ns != null);
-    try std.testing.expect(date.req.full_text.?.date_range.end_ns != null);
-
-    var term = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"title:[alpha TO omega]"}}
-    );
-    defer term.deinit(std.testing.allocator);
-
-    try std.testing.expect(term.req.full_text != null);
-    try std.testing.expect(term.req.full_text.? == .term_range);
-    try std.testing.expectEqualStrings("alpha", term.req.full_text.?.term_range.min.?);
-    try std.testing.expectEqualStrings("omega", term.req.full_text.?.term_range.max.?);
-}
-
-test "query parser accepts bleve query string filters" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"query":"alpha"},"filter_query":{"query":"status:published OR status:review"}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.full_text != null);
-    try std.testing.expect(owned.req.full_text.? == .match);
-    try ant_json.testing.expectEqualJsonText(std.testing.allocator,
-        \\{"bool":{"should":[{"match":{"path":"status","text":"published"}},{"match":{"path":"status","text":"review"}}],"minimum_should_match":1}}
-    , owned.req.filter_query_json);
-}
-
-test "query parser rejects invalid bleve date ranges" {
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"full_text_search":{"field":"created_at","start":"not-a-date"}}
-    ));
-}
-
-test "query parser resolves semantic search into dense query" {
-    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
-    try std.testing.expectEqual(@as(u32, 4), owned.req.dense_queries[0].query.k);
-    try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
-}
-
-test "query parser preserves search effort for semantic search" {
-    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"search_effort":0.3}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.search_effort != null);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), owned.req.search_effort.?, 0.0001);
-}
-
-test "query parser accepts semantic embedding template" {
-    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","embedding_template":"{{remotePDF url=this}}","indexes":["semantic_idx"],"limit":4}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
-}
-
-test "query parser accepts precomputed embedding payload" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"semantic_idx":[0.5,1.5,2.5]},"limit":6}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
-    try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
-    try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
-    try std.testing.expectEqual(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1]);
-}
-
-test "query parser accepts packed dense embedding payload" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"semantic_idx":"AAAAPwAAwD8AACBA"},"indexes":["semantic_idx"],"fields":["title"],"search_effort":0.3,"limit":6}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
-    try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
-    try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
-    try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), owned.req.dense_queries[0].query.vector[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.5), owned.req.dense_queries[0].query.vector[2], 0.0001);
-    try std.testing.expectEqual(@as(?f32, 0.3), owned.req.search_effort);
-    try std.testing.expect(owned.req.defer_stored_projection);
-}
-
-test "query parser rejects packed dense indexes that reference a missing embedding" {
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"semantic_idx":"AAAAPwAAwD8AACBA"},"indexes":["missing_idx"],"limit":6}
-    ));
-}
-
-test "query parser rejects invalid packed dense embedding payload" {
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"semantic_idx":"not-base64"},"indexes":["semantic_idx"],"limit":6}
-    ));
-}
-
-test "query parser accepts sparse embedding payload" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"sparse_idx":{"indices":[1,7],"values":[0.4,0.9]}},"limit":6}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.sparse_queries.len);
-    try std.testing.expectEqualStrings("sparse_idx", owned.req.sparse_queries[0].index_name);
-    try std.testing.expectEqual(@as(u32, 6), owned.req.sparse_queries[0].query.k);
-    try std.testing.expectEqual(@as(usize, 2), owned.req.sparse_queries[0].query.indices.len);
-    try std.testing.expectEqual(@as(u32, 7), owned.req.sparse_queries[0].query.indices[1]);
-}
-
-test "query parser accepts merge config reranker and pruner" {
-    var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"full_text_search":{"match":{"field":"body","text":"alpha concept"}},"merge_config":{"strategy":"rsf","window_size":25,"rank_constant":42.0,"weights":{"full_text":0.5,"semantic_idx":1.5}},"reranker":{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","field":"body","top_n":3},"pruner":{"min_score_ratio":0.5,"require_multi_index":true},"limit":6}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expect(owned.req.merge_config != null);
-    try std.testing.expectEqual(.rsf, owned.req.merge_config.?.strategy);
-    try std.testing.expectEqual(@as(u32, 25), owned.req.merge_config.?.window_size);
-    try std.testing.expectEqual(@as(usize, 2), owned.req.merge_config.?.weights.len);
-    try std.testing.expect(owned.req.reranker != null);
-    try std.testing.expectEqual(.antfly, owned.req.reranker.?.provider);
-    try std.testing.expectEqualStrings("body", owned.req.reranker.?.field);
-    try std.testing.expectEqual(@as(?u32, 3), owned.req.reranker.?.top_n);
-    try std.testing.expectEqualStrings("alpha concept", owned.req.reranker_query_text);
-    try std.testing.expect(owned.req.include_stored);
-    try std.testing.expect(owned.req.pruner != null);
-    try std.testing.expectEqual(@as(f64, 0.5), owned.req.pruner.?.min_score_ratio);
-    try std.testing.expect(owned.req.pruner.?.require_multi_index);
-}
-
-test "query parser rejects dense reranking without query text" {
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"reranker":{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","field":"body","top_n":2},"limit":6}
-    ));
-}
-
-test "query parser accepts graph queries" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["links"],"max_depth":1}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
-    try std.testing.expectEqualStrings("graph_idx", owned.req.graph_queries[0].query.index_name);
-    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .traverse);
-    switch (owned.req.graph_queries[0].query.start_nodes) {
-        .identities => |identities| {
-            try std.testing.expectEqualStrings("doc:a", identities[0].key);
-            try std.testing.expect(identities[0].table == null);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "query parser preserves exact graph path endpoint identities" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"path":{"index":"graph_idx","shortest_path":{"from":{"key":"shared"},"to":{"key":"shared","table":"companies"}}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    const graph_query = owned.req.graph_queries[0].query;
-    switch (graph_query.start_nodes) {
-        .identities => |identities| {
-            try std.testing.expectEqual(@as(usize, 1), identities.len);
-            try std.testing.expectEqualStrings("shared", identities[0].key);
-            try std.testing.expect(identities[0].table == null);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    switch (graph_query.target_nodes.?) {
-        .identities => |identities| {
-            try std.testing.expectEqual(@as(usize, 1), identities.len);
-            try std.testing.expectEqualStrings("shared", identities[0].key);
-            try std.testing.expectEqualStrings("companies", identities[0].table.?);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "query parser adapts deprecated graph searches" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"],"max_depth":1}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
-    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
-    const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.legacy, transport.dialect);
-    try std.testing.expect(std.mem.startsWith(u8, transport.operations_json, "{\"neighbors\":"));
-}
-
-test "query parser rejects graph queries and graph searches together" {
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"new":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_searches":{"old":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}}}
-    ));
-}
-
-test "query parser accepts graph pattern searches" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{"table":"entities"}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    try std.testing.expect(owned.req.graph_queries[0].query.query_type == .pattern);
-    try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.match_pattern.?.nodes.len);
-    try std.testing.expectEqualStrings("entities", owned.req.graph_queries[0].query.match_pattern.?.nodes[1].table.?);
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
-    try std.testing.expectEqual(@as(u32, 10), owned.req.graph_queries[0].query.params.max_results);
-}
-
-test "query parser owns graph match anchor through its required node alias" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"escaped":{"index":"graph_idx","match":{"anchor":"a\u0062","nodes":{"a\u0062":{}},"edges":[]},"return":{"bindings":["a\u0062"]}}}}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    const pattern = owned.req.graph_queries[0].query.match_pattern.?;
-    try std.testing.expect(pattern.anchor_alias != null);
-    const anchor_alias = pattern.anchor_alias.?;
-    try std.testing.expectEqualStrings("ab", anchor_alias);
-    try std.testing.expectEqual(@intFromPtr(pattern.nodes[0].alias.ptr), @intFromPtr(anchor_alias.ptr));
-}
-
-test "query parser treats explicit graph document fields as a projection" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"include_documents":true,"fields":["title"]}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    const graph_query = owned.req.graph_queries[0].query;
-    try std.testing.expect(graph_query.include_documents);
-    try std.testing.expect(!graph_query.include_all_fields);
-    try std.testing.expectEqual(@as(usize, 1), graph_query.fields.len);
-    try std.testing.expectEqualStrings("title", graph_query.fields[0]);
-}
-
-test "query parser accepts exact graph count aggregates" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-
-    const graph_query = owned.req.graph_queries[0].query;
-    try std.testing.expectEqual(@as(usize, 1), graph_query.aggregates.len);
-    try std.testing.expectEqualStrings("count", graph_query.aggregates[0].name);
-    try std.testing.expectEqualStrings("*", graph_query.aggregates[0].of);
-}
-
-test "query parser accepts duplicate graph count expressions under different names" {
-    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"first":{"count":"a","distinct":true},"second":{"count":"a","distinct":true}}}}},"limit":10}
-    );
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.aggregates.len);
-}
-
-test "query parser rejects semantic search offsets" {
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"offset":1}
-    ));
-}
-
-test "query parser records approximate source diagnostic for semantic exact sort" {
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"created_at","desc":true}],"limit":4}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "query parser rejects semantic cursor-only pagination as approximate source" {
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_after":["doc:a"],"limit":4}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "query parser rejects semantic search_before pagination as approximate source" {
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_before":["doc:a"],"limit":4}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "query parser rejects semantic score sort as approximate source" {
-    const alloc = std.testing.allocator;
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, FakeSemanticResolver.iface(), "docs",
-        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"_score","desc":true}],"limit":4}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "query encoder emits antfly-style response envelope" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.25,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
-    defer encoded.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"responses\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"table\":\"docs\"") != null);
-}
-
-test "query encoder does not expose internal doc ordinals" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .doc_ordinal = 42,
-        .native_text_doc_id = 7,
-        .score = 1.25,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
-    defer encoded.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "doc_ordinal") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "native_text_doc_id") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "ordinal") == null);
-}
-
-test "query encoder emits aggregations" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.25,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\",\"price\":10,\"category\":\"books\"}"),
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    const aggregation_results = try alloc.alloc(db_mod.aggregations.SearchAggregationResult, 2);
-    aggregation_results[0] = .{
-        .name = "price_stats",
-        .field = "price",
-        .type = "stats",
-        .value_json = try alloc.dupe(u8, "{\"count\":1,\"sum\":10,\"avg\":10,\"min\":10,\"max\":10,\"sum_squares\":100,\"variance\":0,\"std_dev\":0}"),
-    };
-    const buckets = try alloc.alloc(db_mod.aggregations.SearchAggregationBucket, 1);
-    buckets[0] = .{
-        .key_json = try alloc.dupe(u8, "\"books\""),
-        .count = 1,
-    };
-    aggregation_results[1] = .{
-        .name = "categories",
-        .field = "category",
-        .type = "terms",
-        .buckets = buckets,
-    };
-
-    var meta: QueryResponseMeta = .{
-        .aggregation_results = aggregation_results,
-    };
-    defer meta.deinit(alloc);
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{
-        .aggregations_json =
-        \\{"price_stats":{"type":"stats","field":"price"},"categories":{"type":"terms","field":"category","size":5}}
-        ,
-    }, meta, result);
-    defer encoded.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"aggregations\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"price_stats\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"sum\":10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"categories\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"key\":\"books\"") != null);
-}
-
-test "query encoder supports count-only and profile responses" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.25,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{ .count_only = true, .profile = true }, .{
-        .took_ms = 7,
-        .shard_count = 3,
-        .merged = true,
-        .dense_search = .{
-            .resolved_search_width = 128,
-            .resolved_epsilon = 0.15,
-            .hbc_reranked_vectors = 42,
-            .hbc_search_ns = 123456,
-        },
-    }, result);
-    defer encoded.deinit(alloc);
-    try ant_json.testing.expectSubsetJsonText(alloc,
-        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[]}}]}
-    , encoded.json);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"took\":7") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"shards\":{\"total\":3,\"successful\":3,\"failed\":0}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"merge\":{\"strategy\":\"rrf\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"dense_search\":{\"total_ns\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_search_width\":128") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_epsilon\":0.15") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"hbc_reranked_vectors\":42") != null);
-}
-
-test "query encoder projects deferred stored fields without round-tripping bytes" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.25,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\",\"id\":\"stored-id\",\"body\":\"hello\"}"),
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{
-        .fields = &.{ "id", "title" },
-        .include_all_fields = false,
-        .defer_stored_projection = true,
-    }, .{}, result);
-    defer encoded.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_source\":{\"id\":\"stored-id\",\"title\":\"alpha\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"body\"") == null);
-}
-
-test "query encoder omits _source for key-only hits" {
-    const alloc = std.testing.allocator;
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:key-only"),
-        .score = 0.75,
-        .stored_data = null,
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    var encoded = try encodeQueryResponses(alloc, "docs", .{
-        .include_all_fields = false,
-    }, .{}, result);
-    defer encoded.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:key-only\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_source\"") == null);
-}
-
-test "query encoder emits graph results" {
-    const alloc = std.testing.allocator;
-    const graph_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
-    graph_nodes[0] = .{
-        .key = try alloc.dupe(u8, "doc:b"),
-        .depth = 1,
-        .distance = 1,
-        .path = null,
-        .path_edges = null,
-    };
-    const graph_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    graph_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .score = 1,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
-    };
-    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
-    graph_results[0] = .{
-        .name = try alloc.dupe(u8, "neighbors"),
-        .nodes = graph_nodes,
-        .paths = &.{},
-        .hits = graph_hits,
-        .total_hits = 1,
-    };
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = graph_results,
-    };
-    defer result.deinit();
-
-    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "neighbors",
-        .query = .{
-            .query_type = .traverse,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-            .include_documents = true,
-        },
-    }};
-    var encoded = try encodeQueryResponses(alloc, "docs", .{
-        .graph_queries = &graph_queries,
-        .graph_query_transport = .{
-            .dialect = .canonical,
-            .operations_json =
-            \\{"neighbors":{"traverse":{"index":"graph_idx","start":{"keys":["doc:a"]},"include_documents":true}}}
-            ,
-            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
-            .admitted_operations_len = graph_queries.len,
-        },
-    }, .{ .took_ms = 4 }, result);
-    defer encoded.deinit(alloc);
-    var parsed = try ant_json.parseFromSlice(metadata_test_openapi.QueryResponses, alloc, encoded.json, .{});
-    defer parsed.deinit();
-    const responses = parsed.value.responses orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 1), responses.len);
-    const decoded_graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
-    const result_value = decoded_graph_results.map.get("neighbors") orelse return error.TestUnexpectedResult;
-    const neighbors = switch (result_value) {
-        .graph_nodes_result => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    const nodes = neighbors.nodes;
-    try std.testing.expectEqual(@as(usize, 1), nodes.len);
-    try std.testing.expectEqualStrings("doc:b", nodes[0].key);
-    const document = nodes[0].document orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("beta", document.map.get("title").?.string);
-}
-
-test "query merge applies global score ordering and offset" {
-    const alloc = std.testing.allocator;
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    left_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .doc_ordinal = 2,
-        .score = 2.0,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
-    };
-    left_hits[1] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .doc_ordinal = 1,
-        .score = 3.0,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
-    };
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:c"),
-        .score = 1.0,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"gamma\"}"),
-    };
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "alpha" } } }, &.{ left, right }, 1, 1);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(u32, 3), merged.total_hits);
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
-    try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
-}
-
-test "query merge allocation scales with the selected page" {
-    const large_stored = "x" ** 1024;
-    var input_hits: [2048]db_mod.types.SearchHit = undefined;
-    for (&input_hits) |*hit| {
-        hit.* = .{
-            .id = @constCast("doc:a"),
-            .stored_data = @constCast(large_stored),
-        };
-    }
-    const input = db_mod.types.SearchResult{
-        .alloc = std.testing.allocator,
-        .hits = &input_hits,
-        .total_hits = input_hits.len,
-    };
-
-    // Enough for a bounded top-one heap plus one cloned page hit, but not for
-    // an O(candidate count) pointer array or cloned stored candidates.
-    var backing: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&backing);
-    var merged = try mergeSearchResults(fba.allocator(), .{}, &.{input}, 0, 1);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
-    try std.testing.expectEqual(@as(usize, large_stored.len), merged.hits[0].stored_data.?.len);
-}
-
-test "query merge rejects score ordered hits without finite scores" {
-    const alloc = std.testing.allocator;
-
-    var missing_score_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    missing_score_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:missing"),
-    };
-    var missing_score = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = missing_score_hits,
-        .total_hits = 1,
-    };
-    defer missing_score.deinit();
-
-    const scoring_req = db_mod.types.SearchRequest{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, scoring_req, &.{missing_score}, 0, 10));
-
-    var non_finite_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    non_finite_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:nan"),
-        .score = std.math.nan(f32),
-    };
-    var non_finite = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = non_finite_hits,
-        .total_hits = 1,
-    };
-    defer non_finite.deinit();
-
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, scoring_req, &.{non_finite}, 0, 10));
-}
-
-test "query merge orders non score bearing hits by id without requiring scores" {
-    const alloc = std.testing.allocator;
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .score = 100.0,
-    };
-    hits[1] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-    };
-
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
-    defer result.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{ .full_text = .{ .match_all = {} } }, &.{result}, 0, 10);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), merged.hits.len);
-    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
-    try std.testing.expectEqualStrings("doc:b", merged.hits[1].id);
-}
-
 fn testSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) !db_mod.types.SearchHit {
     const sort_values = try alloc.alloc(std.json.Value, 2);
     errdefer alloc.free(sort_values);
@@ -3265,390 +2261,6 @@ fn testHierarchyUnitShardResultAlloc(
     };
 }
 
-test "query merge treats hierarchy navigation positions as opaque cursor values" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "_hierarchy.position" },
-        .{ .field = "_id" },
-    };
-    const cursor = [_]std.json.Value{
-        .{ .string = "document_units_v1/00000000000000000007/00000000000000000000" },
-        .{ .string = "artifact:page:1" },
-    };
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyNavigationHitAlloc(
-        alloc,
-        "artifact:page:1",
-        "document_units_v1/00000000000000000007/00000000000000000000",
-    );
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyNavigationHitAlloc(
-        alloc,
-        "artifact:page:2",
-        "document_units_v1/00000000000000000007/00000000000000000001",
-    );
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2 };
-    defer right.deinit();
-
-    var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
-        .hierarchy_children = .{ .parent_id = "doc:a" },
-        .order_by = &order_by,
-        .search_after = &cursor,
-        .limit = 20,
-    }, &.{ left, right }, 0, 20, .{});
-    defer merged.deinit();
-
-    // Duplicate parent plans use a logical maximum rather than inflating the
-    // unit count, and the coordinator applies the opaque tuple cursor.
-    try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqualStrings("artifact:page:2", merged.hits[0].id);
-}
-
-test "query merge treats conflicting hierarchy navigation plans as retryable" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "_hierarchy.position" },
-        .{ .field = "_id" },
-    };
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-b/page/1");
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
-        alloc,
-        .{
-            .hierarchy_children = .{ .parent_id = "doc:a" },
-            .order_by = &order_by,
-            .limit = 20,
-        },
-        &.{ left, right },
-        0,
-        20,
-        .{},
-    ));
-}
-
-test "query merge treats malformed hierarchy navigation shard tuples as retryable" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "_hierarchy.position" },
-        .{ .field = "_id" },
-    };
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
-    alloc.free(hits[0].sort_values[1].string);
-    hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "artifact:wrong-tiebreaker") };
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
-        alloc,
-        .{
-            .hierarchy_children = .{ .parent_id = "doc:a" },
-            .order_by = &order_by,
-            .limit = 20,
-        },
-        &.{result},
-        0,
-        20,
-        .{},
-    ));
-}
-
-test "query merge releases hierarchy navigation candidates once at the global budget" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "_hierarchy.position" },
-        .{ .field = "_id" },
-    };
-    const hit_count = db_mod.types.max_canonical_hierarchy_total_matches + 1;
-    const hits = try alloc.alloc(db_mod.types.SearchHit, hit_count);
-    var initialized: usize = 0;
-    errdefer {
-        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-        alloc.free(hits);
-    }
-    for (hits, 0..) |*hit, i| {
-        const id = try std.fmt.allocPrint(alloc, "unit:{d}", .{i});
-        defer alloc.free(id);
-        const position = try std.fmt.allocPrint(alloc, "position/{d:0>8}", .{i});
-        defer alloc.free(position);
-        hit.* = try testHierarchyNavigationHitAlloc(alloc, id, position);
-        initialized += 1;
-    }
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = hit_count,
-    };
-    defer result.deinit();
-
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeSearchResultsWithRuntimeSchema(
-        alloc,
-        .{
-            .hierarchy_children = .{ .parent_id = "doc:a" },
-            .order_by = &order_by,
-            .limit = 20,
-        },
-        &.{result},
-        0,
-        20,
-        .{},
-    ));
-}
-
-test "query merge globally coalesces hierarchy unit groups and bounded chunks" {
-    const alloc = std.testing.allocator;
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{
-        .{ .id = "chunk:a", .score = 0.8 },
-        .{ .id = "chunk:shared", .score = 0.4 },
-    });
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{
-        .{ .id = "chunk:b", .score = 0.9 },
-        .{ .id = "chunk:shared", .score = 0.5 },
-    });
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .unit_with_chunks,
-        .hierarchy_group_level = .unit,
-        .hierarchy_grouped_matches = true,
-        .max_chunks_per_parent = 2,
-        .limit = 10,
-    }, &.{ left, right }, 0, 10);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(u32, 1), merged.total_hits);
-    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, merged.total_hits_relation);
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqual(@as(?f32, 0.9), merged.hits[0].score);
-    try std.testing.expectEqual(@as(usize, 2), merged.hits[0].chunk_hits.len);
-    try std.testing.expectEqualStrings("chunk:b", merged.hits[0].chunk_hits[0].id);
-    try std.testing.expectEqualStrings("chunk:a", merged.hits[0].chunk_hits[1].id);
-}
-
-test "query merge composes hierarchy unit groups with canonical graph results" {
-    const alloc = std.testing.allocator;
-    const cloneOneGraphResult = struct {
-        fn run(
-            allocator: std.mem.Allocator,
-            source: db_mod.types.GraphSearchResult,
-        ) ![]db_mod.types.GraphSearchResult {
-            const out = try allocator.alloc(db_mod.types.GraphSearchResult, 1);
-            errdefer allocator.free(out);
-            out[0] = try cloneGraphSearchResult(allocator, source);
-            return out;
-        }
-    }.run;
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
-
-    var left_node = [_]graph_query_mod.GraphResultNode{.{
-        .key = "left",
-        .depth = 1,
-        .distance = 1,
-    }};
-    var right_node = [_]graph_query_mod.GraphResultNode{.{
-        .key = "right",
-        .depth = 1,
-        .distance = 1,
-    }};
-    const left_graph = db_mod.types.GraphSearchResult{
-        .name = @constCast("walk"),
-        .nodes = &left_node,
-        .hits = &.{},
-        .total_hits = 1,
-    };
-    const right_graph = db_mod.types.GraphSearchResult{
-        .name = @constCast("walk"),
-        .nodes = &right_node,
-        .hits = &.{},
-        .total_hits = 1,
-    };
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    left.graph_results = try cloneOneGraphResult(alloc, left_graph);
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-    right.graph_results = try cloneOneGraphResult(alloc, right_graph);
-
-    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "walk",
-        .query = .{
-            .query_type = .neighbors,
-            .index_name = "graph",
-            .start_nodes = .{ .keys = &.{} },
-        },
-    }};
-    var merged = try mergeSearchResults(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .graph_queries = &graph_queries,
-        .return_mode = .unit,
-        .hierarchy_group_level = .unit,
-        .limit = 10,
-    }, &.{ left, right }, 0, 10);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
-    try std.testing.expectEqualStrings("walk", merged.graph_results[0].name);
-    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
-    try std.testing.expectEqualStrings("left", merged.graph_results[0].nodes[0].key);
-    try std.testing.expectEqualStrings("right", merged.graph_results[0].nodes[1].key);
-}
-
-test "query merge treats conflicting hierarchy unit identities as retryable" {
-    const alloc = std.testing.allocator;
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
-    const right_ref = &right_hits[0].artifact_ref.?;
-    alloc.free(right_ref.name);
-    right_ref.name = try alloc.dupe(u8, "document_units_v2");
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
-        alloc,
-        .{
-            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-            .return_mode = .unit,
-            .hierarchy_group_level = .unit,
-            .limit = 10,
-        },
-        &.{ left, right },
-        0,
-        10,
-    ));
-}
-
-test "query merge treats malformed hierarchy unit shard ranking as retryable" {
-    const alloc = std.testing.allocator;
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:0", 0.8, &.{});
-    left_hits[0].score = null;
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:1", 0.7, &.{});
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
-        alloc,
-        .{
-            .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-            .return_mode = .unit,
-            .hierarchy_group_level = .unit,
-            .limit = 10,
-        },
-        &.{ left, right },
-        0,
-        10,
-    ));
-}
-
-test "query merge reports an honest lower bound for a partial hierarchy unit union" {
-    const alloc = std.testing.allocator;
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 10 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 12 };
-    defer right.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .unit,
-        .hierarchy_group_level = .unit,
-        .limit = 10,
-    }, &.{ left, right }, 0, 10);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(u32, 12), merged.total_hits);
-    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-}
-
-test "query merge rejects exact sorting for hierarchy unit groups" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "_score", .desc = true },
-        .{ .field = "_id" },
-    };
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .unit,
-        .hierarchy_group_level = .unit,
-        .order_by = &order_by,
-        .limit = 10,
-    }, &.{result}, 0, 10));
-}
-
-test "query merge bounds hierarchy unit selection by page instead of shard fanout" {
-    const alloc = std.testing.allocator;
-    const shard_count = 11;
-    const hits_per_shard = 100;
-    const results = try alloc.alloc(db_mod.types.SearchResult, shard_count);
-    var initialized: usize = 0;
-    defer {
-        for (results[0..initialized]) |*result| result.deinit();
-        alloc.free(results);
-    }
-    for (results, 0..) |*result, shard_index| {
-        result.* = try testHierarchyUnitShardResultAlloc(alloc, shard_index, hits_per_shard);
-        initialized += 1;
-    }
-
-    var merged = try mergeSearchResults(alloc, .{
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .unit,
-        .hierarchy_group_level = .unit,
-        .limit = hits_per_shard,
-    }, results, 0, hits_per_shard);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, hits_per_shard), merged.hits.len);
-    try std.testing.expectEqual(@as(u32, hits_per_shard), merged.total_hits);
-    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
-    for (merged.hits, 0..) |hit, i| {
-        if (i > 0) try std.testing.expect(merged.hits[i - 1].score.? >= hit.score.?);
-        for (merged.hits[0..i]) |previous| {
-            try std.testing.expect(!std.mem.eql(u8, previous.id, hit.id));
-        }
-    }
-}
-
 fn testDateSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, created_at_ns: u64) !db_mod.types.SearchHit {
     const sort_values = try alloc.alloc(std.json.Value, 2);
     errdefer alloc.free(sort_values);
@@ -3676,369 +2288,6 @@ fn testRankRuntimeSchema() runtime_schema_mod.TableSchema {
         }};
     }.values;
     return .{ .dynamic_templates = &templates };
-}
-
-test "query merge rejects explicit score sort without score-bearing source" {
-    const alloc = std.testing.allocator;
-    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    hits[0] = try testScoreSortedQueryHitAlloc(alloc, "doc:b", 2.0);
-    hits[1] = try testScoreSortedQueryHitAlloc(alloc, "doc:a", 1.0);
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
-        .order_by = &score_order,
-        .full_text = .{ .match_all = {} },
-    }, &.{result}, 0, 2));
-
-    var page = try mergeSearchResults(alloc, .{
-        .order_by = &score_order,
-        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-    }, &.{result}, 0, 2);
-    defer page.deinit();
-    try std.testing.expectEqual(@as(usize, 2), page.hits.len);
-    try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:a", page.hits[1].id);
-}
-
-test "query merge applies distributed typed sort ordering and cursor paging" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-    const schema = testRankRuntimeSchema();
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
-    left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
-    left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
-    left_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 4);
-    right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
-    right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
-    right_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
-    right_hits[3] = try testSortedQueryHitAlloc(alloc, "doc:h", 8);
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 4, .total_hits_relation = .gte };
-    defer right.deinit();
-
-    var first_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3, schema);
-    defer first_page.deinit();
-    try std.testing.expectEqual(@as(u32, 7), first_page.total_hits);
-    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, first_page.total_hits_relation);
-    try std.testing.expectEqual(@as(usize, 3), first_page.hits.len);
-    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
-    try std.testing.expectEqualStrings("doc:d", first_page.hits[2].id);
-    try std.testing.expectEqual(@as(?u32, null), first_page.hits[0].doc_ordinal);
-
-    const after_cursor = [_]std.json.Value{
-        .{ .integer = 2 },
-        .{ .string = "doc:b" },
-    };
-    var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    after_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
-    after_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
-    var after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    after_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
-    after_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
-    var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 2 };
-    defer after_left.deinit();
-    var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 2 };
-    defer after_right.deinit();
-    var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
-        .order_by = &order_by,
-        .search_after = &after_cursor,
-        .profile = true,
-    }, &.{ after_left, after_right }, 0, 2, schema);
-    defer after_page.deinit();
-    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
-    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
-    const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
-    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
-    try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
-    try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
-    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
-    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_window);
-
-    const before_cursor = [_]std.json.Value{
-        .{ .integer = 5 },
-        .{ .string = "doc:e" },
-    };
-    var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    before_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
-    before_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
-    var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    before_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
-    before_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
-    var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
-    defer before_left.deinit();
-    var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 2 };
-    defer before_right.deinit();
-    var before_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
-        .order_by = &order_by,
-        .search_before = &before_cursor,
-    }, &.{ before_left, before_right }, 0, 2, schema);
-    defer before_page.deinit();
-    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
-    try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:d", before_page.hits[1].id);
-}
-
-test "query merge applies default id cursor ordering without explicit order_by" {
-    const alloc = std.testing.allocator;
-
-    // Distributed cursor shards must already have sought the cursor. The
-    // coordinator validates this invariant rather than silently filtering an
-    // incomplete per-shard window.
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:d");
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
-    var after_page = try mergeSearchResults(alloc, .{
-        .search_after = &after_cursor,
-        .limit = 2,
-        .profile = true,
-    }, &.{ left, right }, 0, 2);
-    defer after_page.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
-    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
-    const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("distributed_k_way_merge", after_profile.plan);
-    try std.testing.expectEqualStrings("bounded_exact", after_profile.exactness);
-    try std.testing.expectEqualStrings("distributed_merge", after_profile.source);
-
-    const before_cursor = [_]std.json.Value{.{ .string = "doc:d" }};
-    var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    before_left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:a");
-    before_left_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
-    var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    before_right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:b");
-    var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
-    defer before_left.deinit();
-    var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 1 };
-    defer before_right.deinit();
-    var before_page = try mergeSearchResults(alloc, .{
-        .search_before = &before_cursor,
-        .limit = 2,
-    }, &.{ before_left, before_right }, 0, 2);
-    defer before_page.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
-    try std.testing.expectEqualStrings("doc:b", before_page.hits[0].id);
-    try std.testing.expectEqualStrings("doc:c", before_page.hits[1].id);
-}
-
-test "query merge sort profile does not inherit stale rejection diagnostic" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-    const schema = testRankRuntimeSchema();
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    db_mod.recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
-    var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
-        .order_by = &order_by,
-        .profile = true,
-    }, &.{ left, right }, 0, 2, schema);
-    defer merged.deinit();
-
-    const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
-    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
-    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_reason);
-    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_detail);
-    try std.testing.expectEqualStrings("", sort_profile.sort_rejection_field.slice());
-}
-
-test "query merge rejects distributed field sort without runtime schema" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
-        .order_by = &order_by,
-    }, &.{result}, 0, 1));
-}
-
-test "query merge applies runtime schema to distributed date cursors" {
-    const alloc = std.testing.allocator;
-    const mapping = runtime_schema_mod.DynamicTemplate{
-        .name = "created_at",
-        .path_match = "created_at",
-        .mapping = .{
-            .field_type = .datetime,
-            .doc_values = true,
-            .sortable = true,
-            .analyzer = "keyword",
-        },
-    };
-    const templates = [_]runtime_schema_mod.DynamicTemplate{mapping};
-    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
-    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at" }};
-
-    const ts_a = runtime_schema_mod.parseDateTimeToNs("2026-01-01T00:00:00Z") orelse return error.TestUnexpectedResult;
-    const ts_b = runtime_schema_mod.parseDateTimeToNs("2026-01-02T00:00:00Z") orelse return error.TestUnexpectedResult;
-    const ts_c = runtime_schema_mod.parseDateTimeToNs("2026-01-03T00:00:00Z") orelse return error.TestUnexpectedResult;
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    left_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:a", ts_a);
-    left_hits[1] = try testDateSortedQueryHitAlloc(alloc, "doc:c", ts_c);
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:b", ts_b);
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    const after_cursor = [_]std.json.Value{
-        .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{ts_b}) },
-        .{ .string = "doc:b" },
-    };
-    defer alloc.free(after_cursor[0].number_string);
-
-    var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    after_left_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:c", ts_c);
-    const after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 0);
-    var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 1 };
-    defer after_left.deinit();
-    var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 0 };
-    defer after_right.deinit();
-    var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
-        .order_by = &order_by,
-        .search_after = &after_cursor,
-        .profile = true,
-    }, &.{ after_left, after_right }, 0, 1, schema);
-    defer after_page.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), after_page.hits.len);
-    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
-    const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
-    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
-    try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
-}
-
-test "query merge rejects sorted shards without complete sort tuples" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-    const schema = testRankRuntimeSchema();
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .sort_values = try alloc.alloc(std.json.Value, 1),
-    };
-    hits[0].sort_values[0] = .{ .integer = 1 };
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
-}
-
-test "query merge rejects sorted shards whose id tiebreaker mismatches hit id" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-    const schema = testRankRuntimeSchema();
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .sort_values = try alloc.alloc(std.json.Value, 2),
-    };
-    hits[0].sort_values[0] = .{ .integer = 1 };
-    hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
-    var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer result.deinit();
-
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
-}
-
-test "query merge rejects sorted shards with mixed sort value domains" {
-    const alloc = std.testing.allocator;
-    const order_by = [_]db_mod.types.SortField{
-        .{ .field = "rank" },
-        .{ .field = "_id" },
-    };
-    const schema = testRankRuntimeSchema();
-
-    var numeric_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    numeric_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
-    var string_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    string_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .sort_values = try alloc.alloc(std.json.Value, 2),
-    };
-    string_hits[0].sort_values[0] = .{ .string = try alloc.dupe(u8, "two") };
-    string_hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
-
-    var numeric = db_mod.types.SearchResult{ .alloc = alloc, .hits = numeric_hits, .total_hits = 1 };
-    defer numeric.deinit();
-    var string = db_mod.types.SearchResult{ .alloc = alloc, .hits = string_hits, .total_hits = 1 };
-    defer string.deinit();
-
-    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ numeric, string }, 0, 10, schema));
-}
-
-test "query merge preserves single-result doc ordinals" {
-    const alloc = std.testing.allocator;
-
-    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .doc_ordinal = 9,
-        .score = 1.0,
-    };
-
-    var single = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
-    defer single.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{}, &.{single}, 0, 1);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
-    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
-    try std.testing.expectEqual(@as(?u32, 9), merged.hits[0].doc_ordinal);
 }
 
 fn expectGraphTableProvenanceMerge(alloc: std.mem.Allocator) !void {
@@ -4135,14 +2384,6 @@ fn expectGraphTableProvenanceMerge(alloc: std.mem.Allocator) !void {
     );
 }
 
-test "query merge preserves graph table provenance under allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        expectGraphTableProvenanceMerge,
-        .{},
-    );
-}
-
 fn expectGraphMergeRowLimitAndDistinctIdentity(alloc: std.mem.Allocator) !void {
     var binding_a = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("shared"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
     var binding_b = [_]db_mod.types.GraphPatternBinding{.{ .alias = @constCast("n"), .node = .{ .key = @constCast("other"), .table = @constCast("people"), .depth = 0, .distance = 0, .path = &.{}, .path_edges = &.{} } }};
@@ -4192,584 +2433,2355 @@ fn expectGraphMergeRowLimitAndDistinctIdentity(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 2), merged[1].aggregates[0].distinct_values.len);
 }
 
-test "graph merge enforces query-wide row limit and exact distinct identity" {
-    try expectGraphMergeRowLimitAndDistinctIdentity(std.testing.allocator);
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "distributed graph result admission is cumulative across shard payloads" {
+            var nodes = [_]graph_query_mod.GraphResultNode{.{
+                .key = @constCast("node"),
+                .depth = 0,
+                .distance = 0,
+            }};
+            var graph_results = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("walk"),
+                .nodes = &nodes,
+                .hits = &.{},
+                .total_hits = 1,
+            }};
+            const queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{} },
+                },
+            }};
+            const usage = graphResultsRetainedUsage(&graph_results);
+            var limits = graph_work_budget.Limits{};
+            limits.max_retained_state_bytes = usage.state_bytes * 2 - 1;
+            var admission = GraphPayloadAdmission.init(&queries, limits);
+            try admission.admit(&graph_results);
+
+            var diagnostic: graph_work_budget_diagnostic.Storage = .{};
+            const binding = graph_work_budget_diagnostic.bind(&diagnostic);
+            defer binding.deinit();
+            try std.testing.expectError(
+                error.GraphWorkBudgetExceeded,
+                admission.admit(&graph_results),
+            );
+            try std.testing.expectEqualStrings("walk", diagnostic.diagnostic.?.operation);
+            try std.testing.expectEqual(
+                graph_work_budget.Dimension.retained_state_bytes,
+                diagnostic.diagnostic.?.dimension,
+            );
+        }
+
+        test "query parser accepts full text request subset" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"match":{"field":"body","text":"alpha"}},"fields":["title"],"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.fields.len);
+            try std.testing.expectEqual(false, owned.req.include_all_fields);
+        }
+
+        test "query parser accepts generated query request shape" {
+            const metadata_openapi = @import("antfly_metadata_openapi");
+            const full_text = try ant_json.RawValue.init(
+                \\{"match":{"field":"body","text":"alpha"}}
+            );
+
+            const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
+                .full_text_search = full_text,
+                .fields = &.{"title"},
+                .limit = 5,
+                .profile = false,
+            });
+            defer std.testing.allocator.free(body);
+
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs", body);
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.fields.len);
+            try std.testing.expectEqualStrings("title", owned.req.fields[0]);
+        }
+
+        test "query parser defers ordinary stored projection to response encoding" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"fields":["id","title"],"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 2), owned.req.fields.len);
+            try std.testing.expect(owned.req.defer_stored_projection);
+        }
+
+        test "query parser defaults to stored documents when fields are omitted" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 0), owned.req.fields.len);
+            try std.testing.expectEqual(true, owned.req.include_all_fields);
+            try std.testing.expectEqual(true, owned.req.include_stored);
+            try std.testing.expectEqual(false, owned.req.defer_stored_projection);
+        }
+
+        test "query parser keeps special stored projection in db layer" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"fields":["title","_chunks.*"],"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 2), owned.req.fields.len);
+            try std.testing.expect(!owned.req.defer_stored_projection);
+        }
+
+        test "query parser accepts generated count and profile flags" {
+            const metadata_openapi = @import("antfly_metadata_openapi");
+            const full_text = try ant_json.RawValue.init(
+                \\{"match":{"field":"body","text":"alpha"}}
+            );
+
+            const body = try jsonStringifyAlloc(std.testing.allocator, metadata_openapi.QueryRequest{
+                .full_text_search = full_text,
+                .count = true,
+                .profile = true,
+            });
+            defer std.testing.allocator.free(body);
+
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs", body);
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expect(owned.req.count_only);
+            try std.testing.expect(owned.req.profile);
+        }
+
+        test "query parser accepts aggregations" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"match":{"field":"body","text":"alpha"}},"aggregations":{"price_stats":{"type":"stats","field":"price"},"categories":{"type":"terms","field":"category","size":5}}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.aggregations_json.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, owned.req.aggregations_json, "\"price_stats\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, owned.req.aggregations_json, "\"categories\"") != null);
+        }
+
+        test "query parser accepts bleve match query shape" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"match":"alpha","field":"body"},"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .match);
+            try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
+            try std.testing.expectEqualStrings("alpha", owned.req.full_text.?.match.text);
+        }
+
+        test "query parser accepts bleve match_all query shape" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"match_all":{}},"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .match_all);
+        }
+
+        test "query parser accepts bleve boolean filter shape" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"filter":{"match_all":{}}}}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .bool_query);
+        }
+
+        test "query parser preserves filter and exclusion request JSON" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":"published","field":"status"},"exclusion_query":{"term":"draft","field":"status"}}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .match);
+            try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+                \\{"term":{"path":"status","term":"published"}}
+            , owned.req.filter_query_json);
+            try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+                \\{"term":{"path":"status","term":"draft"}}
+            , owned.req.exclusion_query_json);
+        }
+
+        test "query parser does not use dense fast path when public filters are present" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"dense_idx":[0.1,0.2]},"indexes":["dense_idx"],"filter_query":{"term":{"status":"published"}},"exclusion_query":{"term":{"status":"draft"}},"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+            try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+                \\{"term":{"path":"status","term":"published"}}
+            , owned.req.filter_query_json);
+            try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+                \\{"term":{"path":"status","term":"draft"}}
+            , owned.req.exclusion_query_json);
+        }
+
+        test "query parser accepts typed bleve leaf queries through db full_text" {
+            var fuzzy = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"term":"alph","field":"body","fuzziness":1}}
+            );
+            defer fuzzy.deinit(std.testing.allocator);
+            try std.testing.expect(fuzzy.req.full_text != null);
+            try std.testing.expect(fuzzy.req.full_text.? == .fuzzy or fuzzy.req.full_text.? == .term);
+            switch (fuzzy.req.full_text.?) {
+                .fuzzy => |q| try std.testing.expectEqualStrings("alph", q.term),
+                .term => |q| try std.testing.expectEqualStrings("alph", q.term),
+                else => return error.TestUnexpectedResult,
+            }
+
+            var numeric = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"field":"score","min":10,"max":20,"inclusive_max":true}}
+            );
+            defer numeric.deinit(std.testing.allocator);
+            try std.testing.expect(numeric.req.full_text != null);
+            try std.testing.expect(numeric.req.full_text.? == .numeric_range);
+            try std.testing.expectEqual(@as(f64, 10), numeric.req.full_text.?.numeric_range.min.?);
+            try std.testing.expectEqual(@as(f64, 20), numeric.req.full_text.?.numeric_range.max.?);
+            try std.testing.expectEqual(true, numeric.req.full_text.?.numeric_range.inclusive_max);
+
+            var date_range = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"field":"created_at","start":"2026-03-01T00:00:00Z","end":"2026-03-31","inclusive_end":true}}
+            );
+            defer date_range.deinit(std.testing.allocator);
+            try std.testing.expect(date_range.req.full_text != null);
+            try std.testing.expect(date_range.req.full_text.? == .date_range);
+            try std.testing.expect(date_range.req.full_text.?.date_range.start_ns != null);
+            try std.testing.expect(date_range.req.full_text.?.date_range.end_ns != null);
+            try std.testing.expectEqual(true, date_range.req.full_text.?.date_range.inclusive_end);
+        }
+
+        test "query parser accepts bleve query string queries" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"body:alpha AND title:\"beta gamma\""},"limit":5}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .bool_query);
+            const root = owned.req.full_text.?.bool_query;
+            try std.testing.expectEqual(@as(usize, 2), root.must.len);
+            try std.testing.expect(root.must[0] == .match);
+            try std.testing.expectEqualStrings("body", root.must[0].match.field);
+            try std.testing.expectEqualStrings("alpha", root.must[0].match.text);
+            try std.testing.expect(root.must[1] == .match_phrase);
+            try std.testing.expectEqualStrings("title", root.must[1].match_phrase.field);
+            try std.testing.expectEqualStrings("beta gamma", root.must[1].match_phrase.text);
+        }
+
+        test "query parser accepts bleve query string boosts" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"body:alpha^2 AND title:\"beta gamma\"~3^4"}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .bool_query);
+            const root = owned.req.full_text.?.bool_query;
+            try std.testing.expectEqual(@as(usize, 2), root.must.len);
+            try std.testing.expect(root.must[0] == .match);
+            try std.testing.expectApproxEqAbs(@as(f32, 2.0), root.must[0].match.boost, 0.0001);
+            try std.testing.expect(root.must[1] == .match_phrase);
+            try std.testing.expectApproxEqAbs(@as(f32, 4.0), root.must[1].match_phrase.boost, 0.0001);
+        }
+
+        test "query parser accepts bleve query string field groups" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"title:(alpha beta)"}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .bool_query);
+            const root = owned.req.full_text.?.bool_query;
+            try std.testing.expectEqual(@as(usize, 2), root.must.len);
+            try std.testing.expect(root.must[0] == .match);
+            try std.testing.expect(root.must[1] == .match);
+            try std.testing.expectEqualStrings("title", root.must[0].match.field);
+            try std.testing.expectEqualStrings("alpha", root.must[0].match.text);
+            try std.testing.expectEqualStrings("title", root.must[1].match.field);
+            try std.testing.expectEqualStrings("beta", root.must[1].match.text);
+        }
+
+        test "query parser accepts bleve query string inline ranges" {
+            var numeric = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"score:[10 TO 20}"}}
+            );
+            defer numeric.deinit(std.testing.allocator);
+
+            try std.testing.expect(numeric.req.full_text != null);
+            try std.testing.expect(numeric.req.full_text.? == .numeric_range);
+            try std.testing.expectEqual(@as(f64, 10), numeric.req.full_text.?.numeric_range.min.?);
+            try std.testing.expectEqual(@as(f64, 20), numeric.req.full_text.?.numeric_range.max.?);
+            try std.testing.expect(numeric.req.full_text.?.numeric_range.inclusive_min);
+            try std.testing.expect(!numeric.req.full_text.?.numeric_range.inclusive_max);
+
+            var date = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"created:[2024-01-01T00:00:00Z TO 2024-12-31T00:00:00Z]"}}
+            );
+            defer date.deinit(std.testing.allocator);
+
+            try std.testing.expect(date.req.full_text != null);
+            try std.testing.expect(date.req.full_text.? == .date_range);
+            try std.testing.expect(date.req.full_text.?.date_range.start_ns != null);
+            try std.testing.expect(date.req.full_text.?.date_range.end_ns != null);
+
+            var term = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"title:[alpha TO omega]"}}
+            );
+            defer term.deinit(std.testing.allocator);
+
+            try std.testing.expect(term.req.full_text != null);
+            try std.testing.expect(term.req.full_text.? == .term_range);
+            try std.testing.expectEqualStrings("alpha", term.req.full_text.?.term_range.min.?);
+            try std.testing.expectEqualStrings("omega", term.req.full_text.?.term_range.max.?);
+        }
+
+        test "query parser accepts bleve query string filters" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"query":"alpha"},"filter_query":{"query":"status:published OR status:review"}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.full_text != null);
+            try std.testing.expect(owned.req.full_text.? == .match);
+            try ant_json.testing.expectEqualJsonText(std.testing.allocator,
+                \\{"bool":{"should":[{"match":{"path":"status","text":"published"}},{"match":{"path":"status","text":"review"}}],"minimum_should_match":1}}
+            , owned.req.filter_query_json);
+        }
+
+        test "query parser rejects invalid bleve date ranges" {
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"full_text_search":{"field":"created_at","start":"not-a-date"}}
+            ));
+        }
+
+        test "query parser resolves semantic search into dense query" {
+            var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+            try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+            try std.testing.expectEqual(@as(u32, 4), owned.req.dense_queries[0].query.k);
+            try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
+        }
+
+        test "query parser preserves search effort for semantic search" {
+            var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"search_effort":0.3}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.search_effort != null);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.3), owned.req.search_effort.?, 0.0001);
+        }
+
+        test "query parser accepts semantic embedding template" {
+            var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","embedding_template":"{{remotePDF url=this}}","indexes":["semantic_idx"],"limit":4}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+            try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+        }
+
+        test "query parser accepts precomputed embedding payload" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"semantic_idx":[0.5,1.5,2.5]},"limit":6}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+            try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+            try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
+            try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
+            try std.testing.expectEqual(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1]);
+        }
+
+        test "query parser accepts packed dense embedding payload" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"semantic_idx":"AAAAPwAAwD8AACBA"},"indexes":["semantic_idx"],"fields":["title"],"search_effort":0.3,"limit":6}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.dense_queries.len);
+            try std.testing.expectEqualStrings("semantic_idx", owned.req.dense_queries[0].index_name);
+            try std.testing.expectEqual(@as(u32, 6), owned.req.dense_queries[0].query.k);
+            try std.testing.expectEqual(@as(usize, 3), owned.req.dense_queries[0].query.vector.len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.5), owned.req.dense_queries[0].query.vector[0], 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 1.5), owned.req.dense_queries[0].query.vector[1], 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 2.5), owned.req.dense_queries[0].query.vector[2], 0.0001);
+            try std.testing.expectEqual(@as(?f32, 0.3), owned.req.search_effort);
+            try std.testing.expect(owned.req.defer_stored_projection);
+        }
+
+        test "query parser rejects packed dense indexes that reference a missing embedding" {
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"semantic_idx":"AAAAPwAAwD8AACBA"},"indexes":["missing_idx"],"limit":6}
+            ));
+        }
+
+        test "query parser rejects invalid packed dense embedding payload" {
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"semantic_idx":"not-base64"},"indexes":["semantic_idx"],"limit":6}
+            ));
+        }
+
+        test "query parser accepts sparse embedding payload" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"sparse_idx":{"indices":[1,7],"values":[0.4,0.9]}},"limit":6}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.sparse_queries.len);
+            try std.testing.expectEqualStrings("sparse_idx", owned.req.sparse_queries[0].index_name);
+            try std.testing.expectEqual(@as(u32, 6), owned.req.sparse_queries[0].query.k);
+            try std.testing.expectEqual(@as(usize, 2), owned.req.sparse_queries[0].query.indices.len);
+            try std.testing.expectEqual(@as(u32, 7), owned.req.sparse_queries[0].query.indices[1]);
+        }
+
+        test "query parser accepts merge config reranker and pruner" {
+            var owned = try parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"full_text_search":{"match":{"field":"body","text":"alpha concept"}},"merge_config":{"strategy":"rsf","window_size":25,"rank_constant":42.0,"weights":{"full_text":0.5,"semantic_idx":1.5}},"reranker":{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","field":"body","top_n":3},"pruner":{"min_score_ratio":0.5,"require_multi_index":true},"limit":6}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expect(owned.req.merge_config != null);
+            try std.testing.expectEqual(.rsf, owned.req.merge_config.?.strategy);
+            try std.testing.expectEqual(@as(u32, 25), owned.req.merge_config.?.window_size);
+            try std.testing.expectEqual(@as(usize, 2), owned.req.merge_config.?.weights.len);
+            try std.testing.expect(owned.req.reranker != null);
+            try std.testing.expectEqual(.antfly, owned.req.reranker.?.provider);
+            try std.testing.expectEqualStrings("body", owned.req.reranker.?.field);
+            try std.testing.expectEqual(@as(?u32, 3), owned.req.reranker.?.top_n);
+            try std.testing.expectEqualStrings("alpha concept", owned.req.reranker_query_text);
+            try std.testing.expect(owned.req.include_stored);
+            try std.testing.expect(owned.req.pruner != null);
+            try std.testing.expectEqual(@as(f64, 0.5), owned.req.pruner.?.min_score_ratio);
+            try std.testing.expect(owned.req.pruner.?.require_multi_index);
+        }
+
+        test "query parser rejects dense reranking without query text" {
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"reranker":{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","field":"body","top_n":2},"limit":6}
+            ));
+        }
+
+        test "query parser accepts graph queries" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"edge_types":["links"],"max_depth":1}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
+            try std.testing.expectEqualStrings("graph_idx", owned.req.graph_queries[0].query.index_name);
+            try std.testing.expect(owned.req.graph_queries[0].query.query_type == .traverse);
+            switch (owned.req.graph_queries[0].query.start_nodes) {
+                .identities => |identities| {
+                    try std.testing.expectEqualStrings("doc:a", identities[0].key);
+                    try std.testing.expect(identities[0].table == null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+
+        test "query parser preserves exact graph path endpoint identities" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"path":{"index":"graph_idx","shortest_path":{"from":{"key":"shared"},"to":{"key":"shared","table":"companies"}}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            const graph_query = owned.req.graph_queries[0].query;
+            switch (graph_query.start_nodes) {
+                .identities => |identities| {
+                    try std.testing.expectEqual(@as(usize, 1), identities.len);
+                    try std.testing.expectEqualStrings("shared", identities[0].key);
+                    try std.testing.expect(identities[0].table == null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (graph_query.target_nodes.?) {
+                .identities => |identities| {
+                    try std.testing.expectEqual(@as(usize, 1), identities.len);
+                    try std.testing.expectEqualStrings("shared", identities[0].key);
+                    try std.testing.expectEqualStrings("companies", identities[0].table.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+
+        test "query parser adapts deprecated graph searches" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"],"max_depth":1}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
+            try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
+            const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.legacy, transport.dialect);
+            try std.testing.expect(std.mem.startsWith(u8, transport.operations_json, "{\"neighbors\":"));
+        }
+
+        test "query parser rejects graph queries and graph searches together" {
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"new":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_searches":{"old":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]}}}}
+            ));
+        }
+
+        test "query parser accepts graph pattern searches" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"pattern_walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc:a"]}},"b":{"table":"entities"}},"edges":[{"from":"a","to":"b","types":["links"],"max_hops":2}]},"return":{"bindings":["b"],"limit":10}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expect(owned.req.graph_queries[0].query.query_type == .pattern);
+            try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.match_pattern.?.nodes.len);
+            try std.testing.expectEqualStrings("entities", owned.req.graph_queries[0].query.match_pattern.?.nodes[1].table.?);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.return_aliases.len);
+            try std.testing.expectEqual(@as(u32, 10), owned.req.graph_queries[0].query.params.max_results);
+        }
+
+        test "query parser owns graph match anchor through its required node alias" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"escaped":{"index":"graph_idx","match":{"anchor":"a\u0062","nodes":{"a\u0062":{}},"edges":[]},"return":{"bindings":["a\u0062"]}}}}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            const pattern = owned.req.graph_queries[0].query.match_pattern.?;
+            try std.testing.expect(pattern.anchor_alias != null);
+            const anchor_alias = pattern.anchor_alias.?;
+            try std.testing.expectEqualStrings("ab", anchor_alias);
+            try std.testing.expectEqual(@intFromPtr(pattern.nodes[0].alias.ptr), @intFromPtr(anchor_alias.ptr));
+        }
+
+        test "query parser treats explicit graph document fields as a projection" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]},"include_documents":true,"fields":["title"]}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            const graph_query = owned.req.graph_queries[0].query;
+            try std.testing.expect(graph_query.include_documents);
+            try std.testing.expect(!graph_query.include_all_fields);
+            try std.testing.expectEqual(@as(usize, 1), graph_query.fields.len);
+            try std.testing.expectEqualStrings("title", graph_query.fields[0]);
+        }
+
+        test "query parser accepts exact graph count aggregates" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+
+            const graph_query = owned.req.graph_queries[0].query;
+            try std.testing.expectEqual(@as(usize, 1), graph_query.aggregates.len);
+            try std.testing.expectEqualStrings("count", graph_query.aggregates[0].name);
+            try std.testing.expectEqualStrings("*", graph_query.aggregates[0].of);
+        }
+
+        test "query parser accepts duplicate graph count expressions under different names" {
+            var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"graph_queries":{"pattern_count":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"first":{"count":"a","distinct":true},"second":{"count":"a","distinct":true}}}}},"limit":10}
+            );
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 2), owned.req.graph_queries[0].query.aggregates.len);
+        }
+
+        test "query parser rejects semantic search offsets" {
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":4,"offset":1}
+            ));
+        }
+
+        test "query parser records approximate source diagnostic for semantic exact sort" {
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"created_at","desc":true}],"limit":4}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "query parser rejects semantic cursor-only pagination as approximate source" {
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_after":["doc:a"],"limit":4}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "query parser rejects semantic search_before pagination as approximate source" {
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_before":["doc:a"],"limit":4}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "query parser rejects semantic score sort as approximate source" {
+            const alloc = std.testing.allocator;
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, FakeSemanticResolver.iface(), "docs",
+                \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"order_by":[{"field":"_score","desc":true}],"limit":4}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "query encoder emits antfly-style response envelope" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.25,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+            defer encoded.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"responses\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"table\":\"docs\"") != null);
+        }
+
+        test "query encoder does not expose internal doc ordinals" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .doc_ordinal = 42,
+                .native_text_doc_id = 7,
+                .score = 1.25,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+            defer encoded.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "doc_ordinal") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "native_text_doc_id") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "ordinal") == null);
+        }
+
+        test "query encoder emits aggregations" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.25,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\",\"price\":10,\"category\":\"books\"}"),
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            const aggregation_results = try alloc.alloc(db_mod.aggregations.SearchAggregationResult, 2);
+            aggregation_results[0] = .{
+                .name = "price_stats",
+                .field = "price",
+                .type = "stats",
+                .value_json = try alloc.dupe(u8, "{\"count\":1,\"sum\":10,\"avg\":10,\"min\":10,\"max\":10,\"sum_squares\":100,\"variance\":0,\"std_dev\":0}"),
+            };
+            const buckets = try alloc.alloc(db_mod.aggregations.SearchAggregationBucket, 1);
+            buckets[0] = .{
+                .key_json = try alloc.dupe(u8, "\"books\""),
+                .count = 1,
+            };
+            aggregation_results[1] = .{
+                .name = "categories",
+                .field = "category",
+                .type = "terms",
+                .buckets = buckets,
+            };
+
+            var meta: QueryResponseMeta = .{
+                .aggregation_results = aggregation_results,
+            };
+            defer meta.deinit(alloc);
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{
+                .aggregations_json =
+                \\{"price_stats":{"type":"stats","field":"price"},"categories":{"type":"terms","field":"category","size":5}}
+                ,
+            }, meta, result);
+            defer encoded.deinit(alloc);
+
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"aggregations\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"price_stats\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"sum\":10") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"categories\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"key\":\"books\"") != null);
+        }
+
+        test "query encoder supports count-only and profile responses" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.25,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{ .count_only = true, .profile = true }, .{
+                .took_ms = 7,
+                .shard_count = 3,
+                .merged = true,
+                .dense_search = .{
+                    .resolved_search_width = 128,
+                    .resolved_epsilon = 0.15,
+                    .hbc_reranked_vectors = 42,
+                    .hbc_search_ns = 123456,
+                },
+            }, result);
+            defer encoded.deinit(alloc);
+            try ant_json.testing.expectSubsetJsonText(alloc,
+                \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[]}}]}
+            , encoded.json);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"took\":7") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"shards\":{\"total\":3,\"successful\":3,\"failed\":0}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"merge\":{\"strategy\":\"rrf\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"dense_search\":{\"total_ns\":0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_search_width\":128") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_epsilon\":0.15") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"hbc_reranked_vectors\":42") != null);
+        }
+
+        test "query encoder projects deferred stored fields without round-tripping bytes" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.25,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\",\"id\":\"stored-id\",\"body\":\"hello\"}"),
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{
+                .fields = &.{ "id", "title" },
+                .include_all_fields = false,
+                .defer_stored_projection = true,
+            }, .{}, result);
+            defer encoded.deinit(alloc);
+
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_source\":{\"id\":\"stored-id\",\"title\":\"alpha\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"body\"") == null);
+        }
+
+        test "query encoder omits _source for key-only hits" {
+            const alloc = std.testing.allocator;
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:key-only"),
+                .score = 0.75,
+                .stored_data = null,
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            var encoded = try encodeQueryResponses(alloc, "docs", .{
+                .include_all_fields = false,
+            }, .{}, result);
+            defer encoded.deinit(alloc);
+
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:key-only\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_source\"") == null);
+        }
+
+        test "query encoder emits graph results" {
+            const alloc = std.testing.allocator;
+            const graph_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+            graph_nodes[0] = .{
+                .key = try alloc.dupe(u8, "doc:b"),
+                .depth = 1,
+                .distance = 1,
+                .path = null,
+                .path_edges = null,
+            };
+            const graph_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            graph_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .score = 1,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
+            };
+            const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+            graph_results[0] = .{
+                .name = try alloc.dupe(u8, "neighbors"),
+                .nodes = graph_nodes,
+                .paths = &.{},
+                .hits = graph_hits,
+                .total_hits = 1,
+            };
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = graph_results,
+            };
+            defer result.deinit();
+
+            const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "neighbors",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .include_documents = true,
+                },
+            }};
+            var encoded = try encodeQueryResponses(alloc, "docs", .{
+                .graph_queries = &graph_queries,
+                .graph_query_transport = .{
+                    .dialect = .canonical,
+                    .operations_json =
+                    \\{"neighbors":{"traverse":{"index":"graph_idx","start":{"keys":["doc:a"]},"include_documents":true}}}
+                    ,
+                    .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+                    .admitted_operations_len = graph_queries.len,
+                },
+            }, .{ .took_ms = 4 }, result);
+            defer encoded.deinit(alloc);
+            var parsed = try ant_json.parseFromSlice(metadata_test_openapi.QueryResponses, alloc, encoded.json, .{});
+            defer parsed.deinit();
+            const responses = parsed.value.responses orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), responses.len);
+            const decoded_graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
+            const result_value = decoded_graph_results.map.get("neighbors") orelse return error.TestUnexpectedResult;
+            const neighbors = switch (result_value) {
+                .graph_nodes_result => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            const nodes = neighbors.nodes;
+            try std.testing.expectEqual(@as(usize, 1), nodes.len);
+            try std.testing.expectEqualStrings("doc:b", nodes[0].key);
+            const document = nodes[0].document orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("beta", document.map.get("title").?.string);
+        }
+
+        test "query merge applies global score ordering and offset" {
+            const alloc = std.testing.allocator;
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            left_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .doc_ordinal = 2,
+                .score = 2.0,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
+            };
+            left_hits[1] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .doc_ordinal = 1,
+                .score = 3.0,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+            };
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:c"),
+                .score = 1.0,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"gamma\"}"),
+            };
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "alpha" } } }, &.{ left, right }, 1, 1);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(u32, 3), merged.total_hits);
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
+            try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
+        }
+
+        test "query merge allocation scales with the selected page" {
+            const large_stored = "x" ** 1024;
+            var input_hits: [2048]db_mod.types.SearchHit = undefined;
+            for (&input_hits) |*hit| {
+                hit.* = .{
+                    .id = @constCast("doc:a"),
+                    .stored_data = @constCast(large_stored),
+                };
+            }
+            const input = db_mod.types.SearchResult{
+                .alloc = std.testing.allocator,
+                .hits = &input_hits,
+                .total_hits = input_hits.len,
+            };
+
+            // Enough for a bounded top-one heap plus one cloned page hit, but not for
+            // an O(candidate count) pointer array or cloned stored candidates.
+            var backing: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&backing);
+            var merged = try mergeSearchResults(fba.allocator(), .{}, &.{input}, 0, 1);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+            try std.testing.expectEqual(@as(usize, large_stored.len), merged.hits[0].stored_data.?.len);
+        }
+
+        test "query merge rejects score ordered hits without finite scores" {
+            const alloc = std.testing.allocator;
+
+            var missing_score_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            missing_score_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:missing"),
+            };
+            var missing_score = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = missing_score_hits,
+                .total_hits = 1,
+            };
+            defer missing_score.deinit();
+
+            const scoring_req = db_mod.types.SearchRequest{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, scoring_req, &.{missing_score}, 0, 10));
+
+            var non_finite_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            non_finite_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:nan"),
+                .score = std.math.nan(f32),
+            };
+            var non_finite = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = non_finite_hits,
+                .total_hits = 1,
+            };
+            defer non_finite.deinit();
+
+            try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResults(alloc, scoring_req, &.{non_finite}, 0, 10));
+        }
+
+        test "query merge orders non score bearing hits by id without requiring scores" {
+            const alloc = std.testing.allocator;
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .score = 100.0,
+            };
+            hits[1] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+            };
+
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
+            defer result.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{ .full_text = .{ .match_all = {} } }, &.{result}, 0, 10);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, 2), merged.hits.len);
+            try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+            try std.testing.expectEqualStrings("doc:b", merged.hits[1].id);
+        }
+
+        test "query merge treats hierarchy navigation positions as opaque cursor values" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "_hierarchy.position" },
+                .{ .field = "_id" },
+            };
+            const cursor = [_]std.json.Value{
+                .{ .string = "document_units_v1/00000000000000000007/00000000000000000000" },
+                .{ .string = "artifact:page:1" },
+            };
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyNavigationHitAlloc(
+                alloc,
+                "artifact:page:1",
+                "document_units_v1/00000000000000000007/00000000000000000000",
+            );
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyNavigationHitAlloc(
+                alloc,
+                "artifact:page:2",
+                "document_units_v1/00000000000000000007/00000000000000000001",
+            );
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2 };
+            defer right.deinit();
+
+            var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+                .hierarchy_children = .{ .parent_id = "doc:a" },
+                .order_by = &order_by,
+                .search_after = &cursor,
+                .limit = 20,
+            }, &.{ left, right }, 0, 20, .{});
+            defer merged.deinit();
+
+            // Duplicate parent plans use a logical maximum rather than inflating the
+            // unit count, and the coordinator applies the opaque tuple cursor.
+            try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqualStrings("artifact:page:2", merged.hits[0].id);
+        }
+
+        test "query merge treats conflicting hierarchy navigation plans as retryable" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "_hierarchy.position" },
+                .{ .field = "_id" },
+            };
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-b/page/1");
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
+                alloc,
+                .{
+                    .hierarchy_children = .{ .parent_id = "doc:a" },
+                    .order_by = &order_by,
+                    .limit = 20,
+                },
+                &.{ left, right },
+                0,
+                20,
+                .{},
+            ));
+        }
+
+        test "query merge treats malformed hierarchy navigation shard tuples as retryable" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "_hierarchy.position" },
+                .{ .field = "_id" },
+            };
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = try testHierarchyNavigationHitAlloc(alloc, "artifact:page:1", "hn3/revision-a/page/1");
+            alloc.free(hits[0].sort_values[1].string);
+            hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "artifact:wrong-tiebreaker") };
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResultsWithRuntimeSchema(
+                alloc,
+                .{
+                    .hierarchy_children = .{ .parent_id = "doc:a" },
+                    .order_by = &order_by,
+                    .limit = 20,
+                },
+                &.{result},
+                0,
+                20,
+                .{},
+            ));
+        }
+
+        test "query merge releases hierarchy navigation candidates once at the global budget" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "_hierarchy.position" },
+                .{ .field = "_id" },
+            };
+            const hit_count = db_mod.types.max_canonical_hierarchy_total_matches + 1;
+            const hits = try alloc.alloc(db_mod.types.SearchHit, hit_count);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+            for (hits, 0..) |*hit, i| {
+                const id = try std.fmt.allocPrint(alloc, "unit:{d}", .{i});
+                defer alloc.free(id);
+                const position = try std.fmt.allocPrint(alloc, "position/{d:0>8}", .{i});
+                defer alloc.free(position);
+                hit.* = try testHierarchyNavigationHitAlloc(alloc, id, position);
+                initialized += 1;
+            }
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = hits,
+                .total_hits = hit_count,
+            };
+            defer result.deinit();
+
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeSearchResultsWithRuntimeSchema(
+                alloc,
+                .{
+                    .hierarchy_children = .{ .parent_id = "doc:a" },
+                    .order_by = &order_by,
+                    .limit = 20,
+                },
+                &.{result},
+                0,
+                20,
+                .{},
+            ));
+        }
+
+        test "query merge globally coalesces hierarchy unit groups and bounded chunks" {
+            const alloc = std.testing.allocator;
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{
+                .{ .id = "chunk:a", .score = 0.8 },
+                .{ .id = "chunk:shared", .score = 0.4 },
+            });
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{
+                .{ .id = "chunk:b", .score = 0.9 },
+                .{ .id = "chunk:shared", .score = 0.5 },
+            });
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .return_mode = .unit_with_chunks,
+                .hierarchy_group_level = .unit,
+                .hierarchy_grouped_matches = true,
+                .max_chunks_per_parent = 2,
+                .limit = 10,
+            }, &.{ left, right }, 0, 10);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(u32, 1), merged.total_hits);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, merged.total_hits_relation);
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqual(@as(?f32, 0.9), merged.hits[0].score);
+            try std.testing.expectEqual(@as(usize, 2), merged.hits[0].chunk_hits.len);
+            try std.testing.expectEqualStrings("chunk:b", merged.hits[0].chunk_hits[0].id);
+            try std.testing.expectEqualStrings("chunk:a", merged.hits[0].chunk_hits[1].id);
+        }
+
+        test "query merge composes hierarchy unit groups with canonical graph results" {
+            const alloc = std.testing.allocator;
+            const cloneOneGraphResult = struct {
+                fn run(
+                    allocator: std.mem.Allocator,
+                    source: db_mod.types.GraphSearchResult,
+                ) ![]db_mod.types.GraphSearchResult {
+                    const out = try allocator.alloc(db_mod.types.GraphSearchResult, 1);
+                    errdefer allocator.free(out);
+                    out[0] = try cloneGraphSearchResult(allocator, source);
+                    return out;
+                }
+            }.run;
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+
+            var left_node = [_]graph_query_mod.GraphResultNode{.{
+                .key = "left",
+                .depth = 1,
+                .distance = 1,
+            }};
+            var right_node = [_]graph_query_mod.GraphResultNode{.{
+                .key = "right",
+                .depth = 1,
+                .distance = 1,
+            }};
+            const left_graph = db_mod.types.GraphSearchResult{
+                .name = @constCast("walk"),
+                .nodes = &left_node,
+                .hits = &.{},
+                .total_hits = 1,
+            };
+            const right_graph = db_mod.types.GraphSearchResult{
+                .name = @constCast("walk"),
+                .nodes = &right_node,
+                .hits = &.{},
+                .total_hits = 1,
+            };
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            left.graph_results = try cloneOneGraphResult(alloc, left_graph);
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+            right.graph_results = try cloneOneGraphResult(alloc, right_graph);
+
+            const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{} },
+                },
+            }};
+            var merged = try mergeSearchResults(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .graph_queries = &graph_queries,
+                .return_mode = .unit,
+                .hierarchy_group_level = .unit,
+                .limit = 10,
+            }, &.{ left, right }, 0, 10);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+            try std.testing.expectEqualStrings("walk", merged.graph_results[0].name);
+            try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
+            try std.testing.expectEqualStrings("left", merged.graph_results[0].nodes[0].key);
+            try std.testing.expectEqualStrings("right", merged.graph_results[0].nodes[1].key);
+        }
+
+        test "query merge treats conflicting hierarchy unit identities as retryable" {
+            const alloc = std.testing.allocator;
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+            const right_ref = &right_hits[0].artifact_ref.?;
+            alloc.free(right_ref.name);
+            right_ref.name = try alloc.dupe(u8, "document_units_v2");
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
+                alloc,
+                .{
+                    .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                    .return_mode = .unit,
+                    .hierarchy_group_level = .unit,
+                    .limit = 10,
+                },
+                &.{ left, right },
+                0,
+                10,
+            ));
+        }
+
+        test "query merge treats malformed hierarchy unit shard ranking as retryable" {
+            const alloc = std.testing.allocator;
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:0", 0.8, &.{});
+            left_hits[0].score = null;
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyUnitHitForIdAlloc(alloc, "unit:1", 0.7, &.{});
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, mergeSearchResults(
+                alloc,
+                .{
+                    .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                    .return_mode = .unit,
+                    .hierarchy_group_level = .unit,
+                    .limit = 10,
+                },
+                &.{ left, right },
+                0,
+                10,
+            ));
+        }
+
+        test "query merge reports an honest lower bound for a partial hierarchy unit union" {
+            const alloc = std.testing.allocator;
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.9, &.{});
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 10 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 12 };
+            defer right.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .return_mode = .unit,
+                .hierarchy_group_level = .unit,
+                .limit = 10,
+            }, &.{ left, right }, 0, 10);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(u32, 12), merged.total_hits);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+        }
+
+        test "query merge rejects exact sorting for hierarchy unit groups" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "_score", .desc = true },
+                .{ .field = "_id" },
+            };
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = try testHierarchyUnitHitAlloc(alloc, 0.8, &.{});
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .return_mode = .unit,
+                .hierarchy_group_level = .unit,
+                .order_by = &order_by,
+                .limit = 10,
+            }, &.{result}, 0, 10));
+        }
+
+        test "query merge bounds hierarchy unit selection by page instead of shard fanout" {
+            const alloc = std.testing.allocator;
+            const shard_count = 11;
+            const hits_per_shard = 100;
+            const results = try alloc.alloc(db_mod.types.SearchResult, shard_count);
+            var initialized: usize = 0;
+            defer {
+                for (results[0..initialized]) |*result| result.deinit();
+                alloc.free(results);
+            }
+            for (results, 0..) |*result, shard_index| {
+                result.* = try testHierarchyUnitShardResultAlloc(alloc, shard_index, hits_per_shard);
+                initialized += 1;
+            }
+
+            var merged = try mergeSearchResults(alloc, .{
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .return_mode = .unit,
+                .hierarchy_group_level = .unit,
+                .limit = hits_per_shard,
+            }, results, 0, hits_per_shard);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, hits_per_shard), merged.hits.len);
+            try std.testing.expectEqual(@as(u32, hits_per_shard), merged.total_hits);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+            for (merged.hits, 0..) |hit, i| {
+                if (i > 0) try std.testing.expect(merged.hits[i - 1].score.? >= hit.score.?);
+                for (merged.hits[0..i]) |previous| {
+                    try std.testing.expect(!std.mem.eql(u8, previous.id, hit.id));
+                }
+            }
+        }
+
+        test "query merge rejects explicit score sort without score-bearing source" {
+            const alloc = std.testing.allocator;
+            const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            hits[0] = try testScoreSortedQueryHitAlloc(alloc, "doc:b", 2.0);
+            hits[1] = try testScoreSortedQueryHitAlloc(alloc, "doc:a", 1.0);
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 2 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+                .order_by = &score_order,
+                .full_text = .{ .match_all = {} },
+            }, &.{result}, 0, 2));
+
+            var page = try mergeSearchResults(alloc, .{
+                .order_by = &score_order,
+                .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+            }, &.{result}, 0, 2);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:a", page.hits[1].id);
+        }
+
+        test "query merge applies distributed typed sort ordering and cursor paging" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+            const schema = testRankRuntimeSchema();
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+            left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+            left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+            left_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 4);
+            right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+            right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+            right_hits[2] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
+            right_hits[3] = try testSortedQueryHitAlloc(alloc, "doc:h", 8);
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 4, .total_hits_relation = .gte };
+            defer right.deinit();
+
+            var first_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ left, right }, 1, 3, schema);
+            defer first_page.deinit();
+            try std.testing.expectEqual(@as(u32, 7), first_page.total_hits);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, first_page.total_hits_relation);
+            try std.testing.expectEqual(@as(usize, 3), first_page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
+            try std.testing.expectEqualStrings("doc:d", first_page.hits[2].id);
+            try std.testing.expectEqual(@as(?u32, null), first_page.hits[0].doc_ordinal);
+
+            const after_cursor = [_]std.json.Value{
+                .{ .integer = 2 },
+                .{ .string = "doc:b" },
+            };
+            var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            after_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+            after_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
+            var after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            after_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+            after_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
+            var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 2 };
+            defer after_left.deinit();
+            var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 2 };
+            defer after_right.deinit();
+            var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+                .order_by = &order_by,
+                .search_after = &after_cursor,
+                .profile = true,
+            }, &.{ after_left, after_right }, 0, 2, schema);
+            defer after_page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+            try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
+            const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+            try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
+            try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
+            try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
+            try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
+            try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_window);
+
+            const before_cursor = [_]std.json.Value{
+                .{ .integer = 5 },
+                .{ .string = "doc:e" },
+            };
+            var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            before_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+            before_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+            var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            before_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+            before_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+            var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
+            defer before_left.deinit();
+            var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 2 };
+            defer before_right.deinit();
+            var before_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+                .order_by = &order_by,
+                .search_before = &before_cursor,
+            }, &.{ before_left, before_right }, 0, 2, schema);
+            defer before_page.deinit();
+            try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+            try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:d", before_page.hits[1].id);
+        }
+
+        test "query merge applies default id cursor ordering without explicit order_by" {
+            const alloc = std.testing.allocator;
+
+            // Distributed cursor shards must already have sought the cursor. The
+            // coordinator validates this invariant rather than silently filtering an
+            // incomplete per-shard window.
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:d");
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
+            var after_page = try mergeSearchResults(alloc, .{
+                .search_after = &after_cursor,
+                .limit = 2,
+                .profile = true,
+            }, &.{ left, right }, 0, 2);
+            defer after_page.deinit();
+
+            try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+            try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
+            const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("distributed_k_way_merge", after_profile.plan);
+            try std.testing.expectEqualStrings("bounded_exact", after_profile.exactness);
+            try std.testing.expectEqualStrings("distributed_merge", after_profile.source);
+
+            const before_cursor = [_]std.json.Value{.{ .string = "doc:d" }};
+            var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            before_left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:a");
+            before_left_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
+            var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            before_right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:b");
+            var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
+            defer before_left.deinit();
+            var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 1 };
+            defer before_right.deinit();
+            var before_page = try mergeSearchResults(alloc, .{
+                .search_before = &before_cursor,
+                .limit = 2,
+            }, &.{ before_left, before_right }, 0, 2);
+            defer before_page.deinit();
+
+            try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", before_page.hits[0].id);
+            try std.testing.expectEqualStrings("doc:c", before_page.hits[1].id);
+        }
+
+        test "query merge sort profile does not inherit stale rejection diagnostic" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+            const schema = testRankRuntimeSchema();
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 1 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            db_mod.recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+            var merged = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+                .order_by = &order_by,
+                .profile = true,
+            }, &.{ left, right }, 0, 2, schema);
+            defer merged.deinit();
+
+            const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+            try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
+            try std.testing.expectEqualStrings("", sort_profile.sort_rejection_reason);
+            try std.testing.expectEqualStrings("", sort_profile.sort_rejection_detail);
+            try std.testing.expectEqualStrings("", sort_profile.sort_rejection_field.slice());
+        }
+
+        test "query merge rejects distributed field sort without runtime schema" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+                .order_by = &order_by,
+            }, &.{result}, 0, 1));
+        }
+
+        test "query merge applies runtime schema to distributed date cursors" {
+            const alloc = std.testing.allocator;
+            const mapping = runtime_schema_mod.DynamicTemplate{
+                .name = "created_at",
+                .path_match = "created_at",
+                .mapping = .{
+                    .field_type = .datetime,
+                    .doc_values = true,
+                    .sortable = true,
+                    .analyzer = "keyword",
+                },
+            };
+            const templates = [_]runtime_schema_mod.DynamicTemplate{mapping};
+            const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+            const order_by = [_]db_mod.types.SortField{.{ .field = "created_at" }};
+
+            const ts_a = runtime_schema_mod.parseDateTimeToNs("2026-01-01T00:00:00Z") orelse return error.TestUnexpectedResult;
+            const ts_b = runtime_schema_mod.parseDateTimeToNs("2026-01-02T00:00:00Z") orelse return error.TestUnexpectedResult;
+            const ts_c = runtime_schema_mod.parseDateTimeToNs("2026-01-03T00:00:00Z") orelse return error.TestUnexpectedResult;
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            left_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:a", ts_a);
+            left_hits[1] = try testDateSortedQueryHitAlloc(alloc, "doc:c", ts_c);
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:b", ts_b);
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            const after_cursor = [_]std.json.Value{
+                .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{ts_b}) },
+                .{ .string = "doc:b" },
+            };
+            defer alloc.free(after_cursor[0].number_string);
+
+            var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            after_left_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:c", ts_c);
+            const after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 0);
+            var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 1 };
+            defer after_left.deinit();
+            var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 0 };
+            defer after_right.deinit();
+            var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
+                .order_by = &order_by,
+                .search_after = &after_cursor,
+                .profile = true,
+            }, &.{ after_left, after_right }, 0, 1, schema);
+            defer after_page.deinit();
+
+            try std.testing.expectEqual(@as(usize, 1), after_page.hits.len);
+            try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+            const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+            try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
+            try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
+        }
+
+        test "query merge rejects sorted shards without complete sort tuples" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+            const schema = testRankRuntimeSchema();
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .sort_values = try alloc.alloc(std.json.Value, 1),
+            };
+            hits[0].sort_values[0] = .{ .integer = 1 };
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
+        }
+
+        test "query merge rejects sorted shards whose id tiebreaker mismatches hit id" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+            const schema = testRankRuntimeSchema();
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .sort_values = try alloc.alloc(std.json.Value, 2),
+            };
+            hits[0].sort_values[0] = .{ .integer = 1 };
+            hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+            var result = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer result.deinit();
+
+            try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{result}, 0, 10, schema));
+        }
+
+        test "query merge rejects sorted shards with mixed sort value domains" {
+            const alloc = std.testing.allocator;
+            const order_by = [_]db_mod.types.SortField{
+                .{ .field = "rank" },
+                .{ .field = "_id" },
+            };
+            const schema = testRankRuntimeSchema();
+
+            var numeric_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            numeric_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+            var string_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            string_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .sort_values = try alloc.alloc(std.json.Value, 2),
+            };
+            string_hits[0].sort_values[0] = .{ .string = try alloc.dupe(u8, "two") };
+            string_hits[0].sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+
+            var numeric = db_mod.types.SearchResult{ .alloc = alloc, .hits = numeric_hits, .total_hits = 1 };
+            defer numeric.deinit();
+            var string = db_mod.types.SearchResult{ .alloc = alloc, .hits = string_hits, .total_hits = 1 };
+            defer string.deinit();
+
+            try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithRuntimeSchema(alloc, .{ .order_by = &order_by }, &.{ numeric, string }, 0, 10, schema));
+        }
+
+        test "query merge preserves single-result doc ordinals" {
+            const alloc = std.testing.allocator;
+
+            var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .doc_ordinal = 9,
+                .score = 1.0,
+            };
+
+            var single = db_mod.types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            defer single.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{}, &.{single}, 0, 1);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+            try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+            try std.testing.expectEqual(@as(?u32, 9), merged.hits[0].doc_ordinal);
+        }
+
+        test "query merge preserves graph table provenance under allocation failure" {
+            try std.testing.checkAllAllocationFailures(
+                std.testing.allocator,
+                expectGraphTableProvenanceMerge,
+                .{},
+            );
+        }
+
+        test "graph merge enforces query-wide row limit and exact distinct identity" {
+            try expectGraphMergeRowLimitAndDistinctIdentity(std.testing.allocator);
+        }
+
+        test "graph distinct merge preserves ownership under allocation failure" {
+            try std.testing.checkAllAllocationFailures(
+                std.testing.allocator,
+                expectGraphMergeRowLimitAndDistinctIdentity,
+                .{},
+            );
+        }
+
+        test "graph coordinator distinct merge shares one fail-closed request budget" {
+            const alloc = std.testing.allocator;
+            var budget = graph_pattern.DistinctBudget.init(1, 4096);
+            var builder = GraphAggregateResultBuilder{
+                .name = try alloc.dupe(u8, "unique"),
+                .distinct = true,
+                .distinct_budget = &budget,
+            };
+            defer builder.deinit(alloc);
+
+            const values = [_]graph_node_identity.Ref{
+                .{ .table = "people", .key = "one" },
+                .{ .table = "people", .key = "two" },
+            };
+            try std.testing.expectError(
+                error.GraphDistinctBudgetExceeded,
+                builder.appendDistinctValues(alloc, .{
+                    .name = @constCast("unique"),
+                    .value = values.len,
+                    .distinct_values = @constCast(values[0..]),
+                }),
+            );
+            try std.testing.expectEqual(@as(usize, 1), builder.distinct_values.items.len);
+        }
+
+        test "graph coordinator distinct merge honors configured limits and records the exhausted dimension" {
+            var diagnostic_storage: graph_distinct_budget_diagnostic.Storage = .{};
+            const diagnostic_binding = graph_distinct_budget_diagnostic.bind(&diagnostic_storage);
+            defer diagnostic_binding.deinit();
+            const alloc = std.testing.allocator;
+            const values = [_]graph_node_identity.Ref{
+                .{ .table = "people", .key = "one" },
+                .{ .table = "people", .key = "two" },
+            };
+            var aggregates = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = values.len,
+                .exact = true,
+                .distinct_values = @constCast(values[0..]),
+            }};
+            var graph_results = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("people"),
+                .aggregates = &aggregates,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const shard_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &graph_results,
+            }};
+            const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
+                .name = "unique",
+                .of = "person",
+                .distinct = true,
+            }};
+            const queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "people",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{} },
+                    .aggregates = &aggregate_specs,
+                },
+            }};
+
+            graph_distinct_budget_diagnostic.reset();
+            defer graph_distinct_budget_diagnostic.reset();
+            try std.testing.expectError(
+                error.GraphDistinctBudgetExceeded,
+                mergeGraphSearchResultsWithLimits(alloc, &queries, &shard_results, .{
+                    .max_distinct_identities = 1,
+                    .max_distinct_state_bytes = 4096,
+                }),
+            );
+            const diagnostic = graph_distinct_budget_diagnostic.take().?;
+            try std.testing.expectEqualStrings("people", diagnostic.operation);
+            try std.testing.expectEqual(
+                graph_pattern.DistinctBudget.Dimension.distinct_identities,
+                diagnostic.dimension,
+            );
+            try std.testing.expectEqual(@as(usize, 1), diagnostic.maximum);
+        }
+
+        test "incremental graph merge enforces distinct identities across released shards" {
+            const alloc = std.testing.allocator;
+            const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
+                .name = "unique",
+                .of = "person",
+                .distinct = true,
+            }};
+            const queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "people",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{} },
+                    .aggregates = &aggregate_specs,
+                },
+            }};
+            var first_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
+            var second_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "two" }};
+            var first_aggregates = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = 1,
+                .distinct_values = &first_values,
+            }};
+            var second_aggregates = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = 1,
+                .distinct_values = &second_values,
+            }};
+            const first = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("people"),
+                .aggregates = &first_aggregates,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const second = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("people"),
+                .aggregates = &second_aggregates,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+
+            var accumulator = try GraphSearchResultsAccumulator.init(alloc, &queries, .{
+                .max_distinct_identities = 1,
+                .max_distinct_state_bytes = 4096,
+            });
+            defer accumulator.deinit();
+            var first_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+            first_owned[0] = try cloneGraphSearchResult(alloc, first[0]);
+            defer {
+                for (first_owned) |*graph_result| graph_result.deinit(alloc);
+                if (first_owned.len > 0) alloc.free(first_owned);
+            }
+            var second_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+            second_owned[0] = try cloneGraphSearchResult(alloc, second[0]);
+            defer {
+                for (second_owned) |*graph_result| graph_result.deinit(alloc);
+                if (second_owned.len > 0) alloc.free(second_owned);
+            }
+            try accumulator.appendOwned(alloc, &first_owned);
+            try std.testing.expectEqual(@as(usize, 0), first_owned.len);
+            try std.testing.expectError(
+                error.GraphDistinctBudgetExceeded,
+                accumulator.appendOwned(alloc, &second_owned),
+            );
+        }
+
+        test "graph coordinator admits list capacity and ownership transfer before allocation" {
+            var diagnostic_storage: graph_work_budget_diagnostic.Storage = .{};
+            const diagnostic_binding = graph_work_budget_diagnostic.bind(&diagnostic_storage);
+            defer diagnostic_binding.deinit();
+            const alloc = std.testing.allocator;
+            const query: graph_query_mod.GraphQuery = .{
+                .query_type = .traverse,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{} },
+            };
+            var budget = graph_work_budget.WorkBudget.init(1, 1);
+            var builder = GraphSearchResultBuilder{ .name = try alloc.dupe(u8, "walk") };
+            defer builder.deinit(alloc);
+
+            try ensureGraphMergeListCapacity(
+                graph_query_mod.GraphResultNode,
+                alloc,
+                &budget,
+                builder.name,
+                query,
+                &builder.nodes,
+                1,
+            );
+            try std.testing.expectEqual(@as(usize, 8), builder.nodes.capacity);
+            try std.testing.expectEqual(
+                8 * @sizeOf(graph_query_mod.GraphResultNode),
+                budget.retained_state_bytes,
+            );
+
+            try retainGraphMergeBytes(&budget, builder.name, query, 1);
+            builder.nodes.appendAssumeCapacity(.{
+                .key = try alloc.dupe(u8, "n"),
+                .depth = 0,
+                .distance = 0,
+            });
+            budget.max_retained_state_bytes = budget.retained_state_bytes +
+                @sizeOf(graph_query_mod.GraphResultNode) - 1;
+            defer graph_work_budget_diagnostic.reset();
+            try std.testing.expectError(
+                error.GraphWorkBudgetExceeded,
+                builder.toOwned(alloc, &budget, query),
+            );
+            const diagnostic = graph_work_budget_diagnostic.take().?;
+            try std.testing.expectEqual(
+                graph_work_budget.Dimension.retained_state_bytes,
+                diagnostic.dimension,
+            );
+        }
+
+        test "graph coordinator rejects merged node collections above the public cap" {
+            const alloc = std.testing.allocator;
+            const first_count = public_limits.max_graph_result_items;
+            const first_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, first_count);
+            defer alloc.free(first_nodes);
+            for (first_nodes) |*node| node.* = .{ .key = @constCast("node"), .depth = 0, .distance = 0 };
+            const overflow_nodes = [_]graph_query_mod.GraphResultNode{.{
+                .key = @constCast("overflow"),
+                .depth = 0,
+                .distance = 0,
+            }};
+            var first_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("walk"),
+                .nodes = first_nodes,
+                .hits = &.{},
+                .total_hits = @intCast(first_count),
+            }};
+            var second_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("walk"),
+                .nodes = @constCast(overflow_nodes[0..]),
+                .hits = &.{},
+                .total_hits = 1,
+            }};
+            const shard_results = [_]db_mod.types.SearchResult{
+                .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &first_graph },
+                .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &second_graph },
+            };
+            const queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph",
+                    .start_nodes = .{ .keys = &.{} },
+                    .params = .{ .max_results = @intCast(first_count) },
+                },
+            }};
+
+            try std.testing.expectError(
+                error.QueryCandidateBudgetExceeded,
+                mergeGraphSearchResults(alloc, &queries, &shard_results),
+            );
+        }
+
+        test "graph merge rejects missing and inexact aggregate shards" {
+            const alloc = std.testing.allocator;
+            const aggregates = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
+            const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
+                .query_type = .pattern,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{} },
+                .aggregates = &aggregates,
+            } }};
+
+            var missing_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("counted"),
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const missing_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &missing_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &queries, &missing_results),
+            );
+
+            const omitted_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &.{},
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &queries, &omitted_results),
+            );
+
+            var partial = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("count"),
+                .value = 1,
+                .exact = false,
+            }};
+            var partial_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("counted"),
+                .aggregates = &partial,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const partial_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &partial_graph,
+            }};
+            try std.testing.expectError(
+                error.QueryCandidateBudgetExceeded,
+                mergeGraphSearchResults(alloc, &queries, &partial_results),
+            );
+
+            const distinct_aggregates = [_]graph_query_mod.NamedCountAggregate{.{
+                .name = "unique",
+                .of = "person",
+                .distinct = true,
+            }};
+            const distinct_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
+                .query_type = .pattern,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{} },
+                .aggregates = &distinct_aggregates,
+            } }};
+            var incomplete_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
+            var incomplete = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = 2,
+                .distinct_values = &incomplete_values,
+            }};
+            var incomplete_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("counted"),
+                .aggregates = &incomplete,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const incomplete_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &incomplete_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &distinct_queries, &incomplete_results),
+            );
+
+            var duplicate_values = [_]graph_node_identity.Ref{
+                .{ .table = "people", .key = "one" },
+                .{ .table = "people", .key = "one" },
+            };
+            var duplicate_distinct = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = duplicate_values.len,
+                .distinct_values = &duplicate_values,
+            }};
+            var duplicate_distinct_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("counted"),
+                .aggregates = &duplicate_distinct,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const duplicate_distinct_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &duplicate_distinct_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &distinct_queries, &duplicate_distinct_results),
+            );
+
+            var invalid_identity_values = [_]graph_node_identity.Ref{.{
+                .table = "people",
+                .key = "",
+            }};
+            var invalid_identity_distinct = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("unique"),
+                .value = invalid_identity_values.len,
+                .distinct_values = &invalid_identity_values,
+            }};
+            var invalid_identity_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("counted"),
+                .aggregates = &invalid_identity_distinct,
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const invalid_identity_results = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &invalid_identity_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &distinct_queries, &invalid_identity_results),
+            );
+        }
+
+        test "graph merge rejects missing duplicate and unknown traversal operations" {
+            const alloc = std.testing.allocator;
+            const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "walk", .query = .{
+                .query_type = .traverse,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+            } }};
+
+            const omitted = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &.{},
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &queries, &omitted),
+            );
+
+            var duplicate_graph = [_]db_mod.types.GraphSearchResult{
+                .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
+                .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
+            };
+            const duplicate = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &duplicate_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &queries, &duplicate),
+            );
+
+            var unknown_graph = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("other"),
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            const unknown = [_]db_mod.types.SearchResult{.{
+                .alloc = alloc,
+                .hits = &.{},
+                .total_hits = 0,
+                .graph_results = &unknown_graph,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                mergeGraphSearchResults(alloc, &queries, &unknown),
+            );
+        }
+
+        test "query merge preserves lower-bound total relation" {
+            const alloc = std.testing.allocator;
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.0,
+            };
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .score = 0.5,
+            };
+
+            var left = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = left_hits,
+                .total_hits = 1,
+                .total_hits_relation = .gte,
+            };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+        }
+
+        test "query merge preserves common identity read generation" {
+            const alloc = std.testing.allocator;
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            left_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.0,
+            };
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .score = 0.5,
+            };
+
+            var left = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = left_hits,
+                .total_hits = 1,
+                .identity_read_generation = 17,
+            };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = right_hits,
+                .total_hits = 1,
+                .identity_read_generation = 17,
+            };
+            defer right.deinit();
+
+            var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+            defer merged.deinit();
+            try std.testing.expectEqual(@as(?u64, 17), merged.identity_read_generation);
+
+            var stamped = try mergeSearchResults(alloc, .{ .identity_read_generation = 19 }, &.{ left, right }, 0, 10);
+            defer stamped.deinit();
+            try std.testing.expectEqual(@as(?u64, 19), stamped.identity_read_generation);
+
+            right.identity_read_generation = 18;
+            var mixed = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+            defer mixed.deinit();
+            try std.testing.expectEqual(@as(?u64, null), mixed.identity_read_generation);
+        }
+
+        test "query merge orders pure dense results by descending relevance score" {
+            const alloc = std.testing.allocator;
+
+            var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+            left_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:b"),
+                .score = 0.5,
+                .distance = 1.0,
+                .stored_data = null,
+            };
+            left_hits[1] = .{
+                .id = try alloc.dupe(u8, "doc:c"),
+                .score = 0.8,
+                .distance = 0.2,
+                .stored_data = null,
+            };
+            var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+            right_hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 1.0,
+                .distance = 0.0,
+                .stored_data = null,
+            };
+
+            var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+            defer left.deinit();
+            var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+            defer right.deinit();
+
+            var req: db_mod.types.SearchRequest = .{};
+            const dense_vec = try alloc.alloc(f32, 1);
+            defer alloc.free(dense_vec);
+            dense_vec[0] = 1.0;
+            const dense_queries = try alloc.alloc(db_mod.types.NamedDenseQuery, 1);
+            defer {
+                alloc.free(dense_queries[0].index_name);
+                alloc.free(dense_queries[0].query.vector);
+                alloc.free(dense_queries);
+            }
+            dense_queries[0] = .{
+                .name = "",
+                .index_name = try alloc.dupe(u8, "dense_idx"),
+                .query = .{ .vector = try alloc.dupe(f32, dense_vec), .k = 3 },
+            };
+            req.dense_queries = dense_queries;
+
+            var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 3);
+            defer merged.deinit();
+
+            try std.testing.expectEqual(@as(usize, 3), merged.hits.len);
+            try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+            try std.testing.expectEqualStrings("doc:c", merged.hits[1].id);
+            try std.testing.expectEqualStrings("doc:b", merged.hits[2].id);
+            try std.testing.expectEqual(@as(?f32, 0.0), merged.hits[0].distance);
+        }
+    };
+    return Suite;
 }
-
-test "graph distinct merge preserves ownership under allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        expectGraphMergeRowLimitAndDistinctIdentity,
-        .{},
-    );
-}
-
-test "graph coordinator distinct merge shares one fail-closed request budget" {
-    const alloc = std.testing.allocator;
-    var budget = graph_pattern.DistinctBudget.init(1, 4096);
-    var builder = GraphAggregateResultBuilder{
-        .name = try alloc.dupe(u8, "unique"),
-        .distinct = true,
-        .distinct_budget = &budget,
-    };
-    defer builder.deinit(alloc);
-
-    const values = [_]graph_node_identity.Ref{
-        .{ .table = "people", .key = "one" },
-        .{ .table = "people", .key = "two" },
-    };
-    try std.testing.expectError(
-        error.GraphDistinctBudgetExceeded,
-        builder.appendDistinctValues(alloc, .{
-            .name = @constCast("unique"),
-            .value = values.len,
-            .distinct_values = @constCast(values[0..]),
-        }),
-    );
-    try std.testing.expectEqual(@as(usize, 1), builder.distinct_values.items.len);
-}
-
-test "graph coordinator distinct merge honors configured limits and records the exhausted dimension" {
-    var diagnostic_storage: graph_distinct_budget_diagnostic.Storage = .{};
-    const diagnostic_binding = graph_distinct_budget_diagnostic.bind(&diagnostic_storage);
-    defer diagnostic_binding.deinit();
-    const alloc = std.testing.allocator;
-    const values = [_]graph_node_identity.Ref{
-        .{ .table = "people", .key = "one" },
-        .{ .table = "people", .key = "two" },
-    };
-    var aggregates = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = values.len,
-        .exact = true,
-        .distinct_values = @constCast(values[0..]),
-    }};
-    var graph_results = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("people"),
-        .aggregates = &aggregates,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const shard_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &graph_results,
-    }};
-    const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
-        .name = "unique",
-        .of = "person",
-        .distinct = true,
-    }};
-    const queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "people",
-        .query = .{
-            .query_type = .pattern,
-            .index_name = "graph",
-            .start_nodes = .{ .keys = &.{} },
-            .aggregates = &aggregate_specs,
-        },
-    }};
-
-    graph_distinct_budget_diagnostic.reset();
-    defer graph_distinct_budget_diagnostic.reset();
-    try std.testing.expectError(
-        error.GraphDistinctBudgetExceeded,
-        mergeGraphSearchResultsWithLimits(alloc, &queries, &shard_results, .{
-            .max_distinct_identities = 1,
-            .max_distinct_state_bytes = 4096,
-        }),
-    );
-    const diagnostic = graph_distinct_budget_diagnostic.take().?;
-    try std.testing.expectEqualStrings("people", diagnostic.operation);
-    try std.testing.expectEqual(
-        graph_pattern.DistinctBudget.Dimension.distinct_identities,
-        diagnostic.dimension,
-    );
-    try std.testing.expectEqual(@as(usize, 1), diagnostic.maximum);
-}
-
-test "incremental graph merge enforces distinct identities across released shards" {
-    const alloc = std.testing.allocator;
-    const aggregate_specs = [_]graph_query_mod.NamedCountAggregate{.{
-        .name = "unique",
-        .of = "person",
-        .distinct = true,
-    }};
-    const queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "people",
-        .query = .{
-            .query_type = .pattern,
-            .index_name = "graph",
-            .start_nodes = .{ .keys = &.{} },
-            .aggregates = &aggregate_specs,
-        },
-    }};
-    var first_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
-    var second_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "two" }};
-    var first_aggregates = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = 1,
-        .distinct_values = &first_values,
-    }};
-    var second_aggregates = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = 1,
-        .distinct_values = &second_values,
-    }};
-    const first = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("people"),
-        .aggregates = &first_aggregates,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const second = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("people"),
-        .aggregates = &second_aggregates,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-
-    var accumulator = try GraphSearchResultsAccumulator.init(alloc, &queries, .{
-        .max_distinct_identities = 1,
-        .max_distinct_state_bytes = 4096,
-    });
-    defer accumulator.deinit();
-    var first_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
-    first_owned[0] = try cloneGraphSearchResult(alloc, first[0]);
-    defer {
-        for (first_owned) |*graph_result| graph_result.deinit(alloc);
-        if (first_owned.len > 0) alloc.free(first_owned);
-    }
-    var second_owned = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
-    second_owned[0] = try cloneGraphSearchResult(alloc, second[0]);
-    defer {
-        for (second_owned) |*graph_result| graph_result.deinit(alloc);
-        if (second_owned.len > 0) alloc.free(second_owned);
-    }
-    try accumulator.appendOwned(alloc, &first_owned);
-    try std.testing.expectEqual(@as(usize, 0), first_owned.len);
-    try std.testing.expectError(
-        error.GraphDistinctBudgetExceeded,
-        accumulator.appendOwned(alloc, &second_owned),
-    );
-}
-
-test "graph coordinator admits list capacity and ownership transfer before allocation" {
-    var diagnostic_storage: graph_work_budget_diagnostic.Storage = .{};
-    const diagnostic_binding = graph_work_budget_diagnostic.bind(&diagnostic_storage);
-    defer diagnostic_binding.deinit();
-    const alloc = std.testing.allocator;
-    const query: graph_query_mod.GraphQuery = .{
-        .query_type = .traverse,
-        .index_name = "graph",
-        .start_nodes = .{ .keys = &.{} },
-    };
-    var budget = graph_work_budget.WorkBudget.init(1, 1);
-    var builder = GraphSearchResultBuilder{ .name = try alloc.dupe(u8, "walk") };
-    defer builder.deinit(alloc);
-
-    try ensureGraphMergeListCapacity(
-        graph_query_mod.GraphResultNode,
-        alloc,
-        &budget,
-        builder.name,
-        query,
-        &builder.nodes,
-        1,
-    );
-    try std.testing.expectEqual(@as(usize, 8), builder.nodes.capacity);
-    try std.testing.expectEqual(
-        8 * @sizeOf(graph_query_mod.GraphResultNode),
-        budget.retained_state_bytes,
-    );
-
-    try retainGraphMergeBytes(&budget, builder.name, query, 1);
-    builder.nodes.appendAssumeCapacity(.{
-        .key = try alloc.dupe(u8, "n"),
-        .depth = 0,
-        .distance = 0,
-    });
-    budget.max_retained_state_bytes = budget.retained_state_bytes +
-        @sizeOf(graph_query_mod.GraphResultNode) - 1;
-    defer graph_work_budget_diagnostic.reset();
-    try std.testing.expectError(
-        error.GraphWorkBudgetExceeded,
-        builder.toOwned(alloc, &budget, query),
-    );
-    const diagnostic = graph_work_budget_diagnostic.take().?;
-    try std.testing.expectEqual(
-        graph_work_budget.Dimension.retained_state_bytes,
-        diagnostic.dimension,
-    );
-}
-
-test "graph coordinator rejects merged node collections above the public cap" {
-    const alloc = std.testing.allocator;
-    const first_count = public_limits.max_graph_result_items;
-    const first_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, first_count);
-    defer alloc.free(first_nodes);
-    for (first_nodes) |*node| node.* = .{ .key = @constCast("node"), .depth = 0, .distance = 0 };
-    const overflow_nodes = [_]graph_query_mod.GraphResultNode{.{
-        .key = @constCast("overflow"),
-        .depth = 0,
-        .distance = 0,
-    }};
-    var first_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("walk"),
-        .nodes = first_nodes,
-        .hits = &.{},
-        .total_hits = @intCast(first_count),
-    }};
-    var second_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("walk"),
-        .nodes = @constCast(overflow_nodes[0..]),
-        .hits = &.{},
-        .total_hits = 1,
-    }};
-    const shard_results = [_]db_mod.types.SearchResult{
-        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &first_graph },
-        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &second_graph },
-    };
-    const queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "walk",
-        .query = .{
-            .query_type = .traverse,
-            .index_name = "graph",
-            .start_nodes = .{ .keys = &.{} },
-            .params = .{ .max_results = @intCast(first_count) },
-        },
-    }};
-
-    try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
-        mergeGraphSearchResults(alloc, &queries, &shard_results),
-    );
-}
-
-test "graph merge rejects missing and inexact aggregate shards" {
-    const alloc = std.testing.allocator;
-    const aggregates = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
-    const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
-        .query_type = .pattern,
-        .index_name = "graph",
-        .start_nodes = .{ .keys = &.{} },
-        .aggregates = &aggregates,
-    } }};
-
-    var missing_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("counted"),
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const missing_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &missing_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &queries, &missing_results),
-    );
-
-    const omitted_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &.{},
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &queries, &omitted_results),
-    );
-
-    var partial = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("count"),
-        .value = 1,
-        .exact = false,
-    }};
-    var partial_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("counted"),
-        .aggregates = &partial,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const partial_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &partial_graph,
-    }};
-    try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
-        mergeGraphSearchResults(alloc, &queries, &partial_results),
-    );
-
-    const distinct_aggregates = [_]graph_query_mod.NamedCountAggregate{.{
-        .name = "unique",
-        .of = "person",
-        .distinct = true,
-    }};
-    const distinct_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = .{
-        .query_type = .pattern,
-        .index_name = "graph",
-        .start_nodes = .{ .keys = &.{} },
-        .aggregates = &distinct_aggregates,
-    } }};
-    var incomplete_values = [_]graph_node_identity.Ref{.{ .table = "people", .key = "one" }};
-    var incomplete = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = 2,
-        .distinct_values = &incomplete_values,
-    }};
-    var incomplete_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("counted"),
-        .aggregates = &incomplete,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const incomplete_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &incomplete_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &distinct_queries, &incomplete_results),
-    );
-
-    var duplicate_values = [_]graph_node_identity.Ref{
-        .{ .table = "people", .key = "one" },
-        .{ .table = "people", .key = "one" },
-    };
-    var duplicate_distinct = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = duplicate_values.len,
-        .distinct_values = &duplicate_values,
-    }};
-    var duplicate_distinct_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("counted"),
-        .aggregates = &duplicate_distinct,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const duplicate_distinct_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &duplicate_distinct_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &distinct_queries, &duplicate_distinct_results),
-    );
-
-    var invalid_identity_values = [_]graph_node_identity.Ref{.{
-        .table = "people",
-        .key = "",
-    }};
-    var invalid_identity_distinct = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("unique"),
-        .value = invalid_identity_values.len,
-        .distinct_values = &invalid_identity_values,
-    }};
-    var invalid_identity_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("counted"),
-        .aggregates = &invalid_identity_distinct,
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const invalid_identity_results = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &invalid_identity_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &distinct_queries, &invalid_identity_results),
-    );
-}
-
-test "graph merge rejects missing duplicate and unknown traversal operations" {
-    const alloc = std.testing.allocator;
-    const queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "walk", .query = .{
-        .query_type = .traverse,
-        .index_name = "graph",
-        .start_nodes = .{ .keys = &.{"doc:a"} },
-    } }};
-
-    const omitted = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &.{},
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &queries, &omitted),
-    );
-
-    var duplicate_graph = [_]db_mod.types.GraphSearchResult{
-        .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
-        .{ .name = @constCast("walk"), .hits = &.{}, .total_hits = 0 },
-    };
-    const duplicate = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &duplicate_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &queries, &duplicate),
-    );
-
-    var unknown_graph = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("other"),
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    const unknown = [_]db_mod.types.SearchResult{.{
-        .alloc = alloc,
-        .hits = &.{},
-        .total_hits = 0,
-        .graph_results = &unknown_graph,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        mergeGraphSearchResults(alloc, &queries, &unknown),
-    );
-}
-
-test "query merge preserves lower-bound total relation" {
-    const alloc = std.testing.allocator;
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.0,
-    };
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .score = 0.5,
-    };
-
-    var left = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = left_hits,
-        .total_hits = 1,
-        .total_hits_relation = .gte,
-    };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
-    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
-}
-
-test "query merge preserves common identity read generation" {
-    const alloc = std.testing.allocator;
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    left_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.0,
-    };
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .score = 0.5,
-    };
-
-    var left = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = left_hits,
-        .total_hits = 1,
-        .identity_read_generation = 17,
-    };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = right_hits,
-        .total_hits = 1,
-        .identity_read_generation = 17,
-    };
-    defer right.deinit();
-
-    var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
-    defer merged.deinit();
-    try std.testing.expectEqual(@as(?u64, 17), merged.identity_read_generation);
-
-    var stamped = try mergeSearchResults(alloc, .{ .identity_read_generation = 19 }, &.{ left, right }, 0, 10);
-    defer stamped.deinit();
-    try std.testing.expectEqual(@as(?u64, 19), stamped.identity_read_generation);
-
-    right.identity_read_generation = 18;
-    var mixed = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
-    defer mixed.deinit();
-    try std.testing.expectEqual(@as(?u64, null), mixed.identity_read_generation);
-}
-
-test "query merge orders pure dense results by descending relevance score" {
-    const alloc = std.testing.allocator;
-
-    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
-    left_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .score = 0.5,
-        .distance = 1.0,
-        .stored_data = null,
-    };
-    left_hits[1] = .{
-        .id = try alloc.dupe(u8, "doc:c"),
-        .score = 0.8,
-        .distance = 0.2,
-        .stored_data = null,
-    };
-    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
-    right_hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 1.0,
-        .distance = 0.0,
-        .stored_data = null,
-    };
-
-    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
-    defer left.deinit();
-    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
-    defer right.deinit();
-
-    var req: db_mod.types.SearchRequest = .{};
-    const dense_vec = try alloc.alloc(f32, 1);
-    defer alloc.free(dense_vec);
-    dense_vec[0] = 1.0;
-    const dense_queries = try alloc.alloc(db_mod.types.NamedDenseQuery, 1);
-    defer {
-        alloc.free(dense_queries[0].index_name);
-        alloc.free(dense_queries[0].query.vector);
-        alloc.free(dense_queries);
-    }
-    dense_queries[0] = .{
-        .name = "",
-        .index_name = try alloc.dupe(u8, "dense_idx"),
-        .query = .{ .vector = try alloc.dupe(f32, dense_vec), .k = 3 },
-    };
-    req.dense_queries = dense_queries;
-
-    var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 3);
-    defer merged.deinit();
-
-    try std.testing.expectEqual(@as(usize, 3), merged.hits.len);
-    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
-    try std.testing.expectEqualStrings("doc:c", merged.hits[1].id);
-    try std.testing.expectEqualStrings("doc:b", merged.hits[2].id);
-    try std.testing.expectEqual(@as(?f32, 0.0), merged.hits[0].distance);
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

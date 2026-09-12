@@ -400,6 +400,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -702,6 +704,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -842,7 +846,7 @@ jobs:
       # Verbose output identifies the individual checks in the CI log.
       - name: Test runtime compilation and cache contracts
         working-directory: zig
-        run: python3 -u -m unittest -v tools/test_runtime_cache.py
+        run: python3 -u -m unittest -v tools/test_runtime_cache.py tools/test_linked_tests.py
 
       - name: Verify physical storage compilation ownership
         working-directory: zig

@@ -77,6 +77,19 @@ pub const TableWriteSource = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        /// Committed replication has distinct transaction and entry-identity
+        /// semantics from an ordinary request batch. Prepared application may
+        /// only borrow an already configured owner, never consult the catalog.
+        replicated_batch_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            metadata_prepared: bool,
+            entry: ?db_mod.types.RaftAppliedEntryIdentity,
+        ) anyerror!?void = null,
+
         create_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -869,6 +882,21 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("acknowledge_transaction_commit", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, coordinator_group_id, coordinator_table_name });
     }
 
+    pub fn replicatedBatchGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        metadata_prepared: bool,
+        entry: ?db_mod.types.RaftAppliedEntryIdentity,
+    ) !?void {
+        const callback = self.vtable.replicated_batch_group_local orelse return null;
+        return try BoundaryAbi.call("replicated_batch_group_local", self.boundary_dispatch, callback, .{
+            self.ptr, alloc, group_id, table_name, req, metadata_prepared, entry,
+        });
+    }
+
     pub fn batchGroupLocal(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1394,145 +1422,159 @@ pub const TableWriteSource = struct {
     }
 };
 
-test "compiled table write boundary transports cancellation and committed failure identity" {
-    const Fake = struct {
-        calls: usize = 0,
-        transaction_calls: usize = 0,
-        stateless_transaction_calls: usize = 0,
-        pre_decision_calls: usize = 0,
-        failure: ?anyerror = null,
+// Shared control tests belong to the consumer root, even when the physical
+// implementation imports these contracts to implement its own operations.
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "compiled table write boundary transports cancellation and committed failure identity" {
+            const Fake = struct {
+                calls: usize = 0,
+                transaction_calls: usize = 0,
+                stateless_transaction_calls: usize = 0,
+                pre_decision_calls: usize = 0,
+                failure: ?anyerror = null,
 
-        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
-            return null;
-        }
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return null;
+                }
 
-        fn commitBatch(_: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
-            return error.TestUnexpectedResult;
-        }
+                fn commitBatch(_: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+                    return error.TestUnexpectedResult;
+                }
 
-        fn commitBatchWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-            if (self.failure) |err| return err;
-            return .{ .committed = .{ .participant_count = 1 } };
-        }
+                fn commitBatchWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+                    if (self.failure) |err| return err;
+                    return .{ .committed = .{ .participant_count = 1 } };
+                }
 
-        fn commitTransactionWithId(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
-            return error.TestUnexpectedResult;
-        }
+                fn commitTransactionWithId(_: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+                    return error.TestUnexpectedResult;
+                }
 
-        fn commitTransactionWithIdAndCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.transaction_calls += 1;
-            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-            return .{ .committed = .{ .participant_count = 1 } };
-        }
+                fn commitTransactionWithIdAndCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.transaction_calls += 1;
+                    if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+                    return .{ .committed = .{ .participant_count = 1 } };
+                }
 
-        fn commitTransactionWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.stateless_transaction_calls += 1;
-            if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-            return .{ .committed = .{ .participant_count = 1 } };
-        }
+                fn commitTransactionWithCancellation(ptr: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.stateless_transaction_calls += 1;
+                    if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+                    return .{ .committed = .{ .participant_count = 1 } };
+                }
 
-        fn txnBeginWithPreDecisionContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: distributed_txn.PreDecisionContext) anyerror!?void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.pre_decision_calls += 1;
-            try std.testing.expectEqual(@as(?u64, 123), context.deadline_ns);
-            try context.cancellation.check();
-            if (self.failure) |err| return err;
-            return {};
-        }
+                fn txnBeginWithPreDecisionContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: distributed_txn.PreDecisionContext) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.pre_decision_calls += 1;
+                    try std.testing.expectEqual(@as(?u64, 123), context.deadline_ns);
+                    try context.cancellation.check();
+                    if (self.failure) |err| return err;
+                    return {};
+                }
 
-        fn foreignDispatch(
-            contract: *const runtime_native_abi.CallContract,
-            callback: *const anyopaque,
-            args: *const anyopaque,
-            output: ?*anyopaque,
-        ) callconv(.c) runtime_error_abi.Status {
-            return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                fn foreignDispatch(
+                    contract: *const runtime_native_abi.CallContract,
+                    callback: *const anyopaque,
+                    args: *const anyopaque,
+                    output: ?*anyopaque,
+                ) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+
+            var fake = Fake{};
+            const source: TableWriteSource = .{
+                .ptr = &fake,
+                .vtable = &.{
+                    .batch = Fake.batch,
+                    .commit_batch = Fake.commitBatch,
+                    .commit_batch_with_cancellation = Fake.commitBatchWithCancellation,
+                    .commit_transaction_with_id = Fake.commitTransactionWithId,
+                    .commit_transaction_with_id_with_cancellation = Fake.commitTransactionWithIdAndCancellation,
+                    .commit_transaction_with_cancellation = Fake.commitTransactionWithCancellation,
+                    .txn_begin_group_local_with_pre_decision_context = Fake.txnBeginWithPreDecisionContext,
+                },
+                .boundary_dispatch = Fake.foreignDispatch,
+            };
+
+            var canceled = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(
+                error.EnrichmentWaitCanceled,
+                source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
+            );
+            canceled.store(false, .release);
+            fake.failure = error.EnrichmentWorkerFailed;
+            try std.testing.expectError(
+                error.EnrichmentWorkerFailed,
+                source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
+            );
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            canceled.store(true, .release);
+            try std.testing.expectError(
+                error.EnrichmentWaitCanceled,
+                source.commitTransactionWithIdAndCancellation(
+                    std.testing.allocator,
+                    std.mem.zeroes(db_mod.types.TxnId),
+                    1,
+                    &.{},
+                    .enrichments,
+                    db_mod.types.CancellationToken.fromAtomic(&canceled),
+                ),
+            );
+            try std.testing.expectEqual(@as(usize, 1), fake.transaction_calls);
+            try std.testing.expectError(
+                error.EnrichmentWaitCanceled,
+                source.commitTransactionWithCancellation(
+                    std.testing.allocator,
+                    &.{},
+                    .enrichments,
+                    db_mod.types.CancellationToken.fromAtomic(&canceled),
+                ),
+            );
+            try std.testing.expectEqual(@as(usize, 1), fake.stateless_transaction_calls);
+            canceled.store(false, .release);
+            fake.failure = null;
+            try std.testing.expect((try source.txnBeginGroupLocalWithPreDecisionContext(
+                std.testing.allocator,
+                7,
+                "docs",
+                std.mem.zeroes(db_mod.types.TxnId),
+                1,
+                2,
+                false,
+                &.{},
+                .{
+                    .deadline_ns = 123,
+                    .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
+                },
+            )) != null);
+            try std.testing.expectEqual(@as(usize, 1), fake.pre_decision_calls);
+            fake.failure = error.PreDecisionDeadlineExceeded;
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
+                std.testing.allocator,
+                7,
+                "docs",
+                std.mem.zeroes(db_mod.types.TxnId),
+                1,
+                2,
+                false,
+                &.{},
+                .{ .deadline_ns = 123 },
+            ));
+            try std.testing.expectEqual(@as(usize, 2), fake.pre_decision_calls);
         }
     };
-
-    var fake = Fake{};
-    const source: TableWriteSource = .{
-        .ptr = &fake,
-        .vtable = &.{
-            .batch = Fake.batch,
-            .commit_batch = Fake.commitBatch,
-            .commit_batch_with_cancellation = Fake.commitBatchWithCancellation,
-            .commit_transaction_with_id = Fake.commitTransactionWithId,
-            .commit_transaction_with_id_with_cancellation = Fake.commitTransactionWithIdAndCancellation,
-            .commit_transaction_with_cancellation = Fake.commitTransactionWithCancellation,
-            .txn_begin_group_local_with_pre_decision_context = Fake.txnBeginWithPreDecisionContext,
-        },
-        .boundary_dispatch = Fake.foreignDispatch,
-    };
-
-    var canceled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(
-        error.EnrichmentWaitCanceled,
-        source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
-    );
-    canceled.store(false, .release);
-    fake.failure = error.EnrichmentWorkerFailed;
-    try std.testing.expectError(
-        error.EnrichmentWorkerFailed,
-        source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
-    );
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    canceled.store(true, .release);
-    try std.testing.expectError(
-        error.EnrichmentWaitCanceled,
-        source.commitTransactionWithIdAndCancellation(
-            std.testing.allocator,
-            std.mem.zeroes(db_mod.types.TxnId),
-            1,
-            &.{},
-            .enrichments,
-            db_mod.types.CancellationToken.fromAtomic(&canceled),
-        ),
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.transaction_calls);
-    try std.testing.expectError(
-        error.EnrichmentWaitCanceled,
-        source.commitTransactionWithCancellation(
-            std.testing.allocator,
-            &.{},
-            .enrichments,
-            db_mod.types.CancellationToken.fromAtomic(&canceled),
-        ),
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.stateless_transaction_calls);
-    canceled.store(false, .release);
-    fake.failure = null;
-    try std.testing.expect((try source.txnBeginGroupLocalWithPreDecisionContext(
-        std.testing.allocator,
-        7,
-        "docs",
-        std.mem.zeroes(db_mod.types.TxnId),
-        1,
-        2,
-        false,
-        &.{},
-        .{
-            .deadline_ns = 123,
-            .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
-        },
-    )) != null);
-    try std.testing.expectEqual(@as(usize, 1), fake.pre_decision_calls);
-    fake.failure = error.PreDecisionDeadlineExceeded;
-    try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
-        std.testing.allocator,
-        7,
-        "docs",
-        std.mem.zeroes(db_mod.types.TxnId),
-        1,
-        2,
-        false,
-        &.{},
-        .{ .deadline_ns = 123 },
-    ));
-    try std.testing.expectEqual(@as(usize, 2), fake.pre_decision_calls);
+    return Suite;
+}
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

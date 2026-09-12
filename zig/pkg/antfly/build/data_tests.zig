@@ -21,9 +21,12 @@ const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRu
 pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
     data_runtime_test_mod: *std.Build.Module,
+    data_implementation_module: *std.Build.Module,
     data_storage_test_mod: *std.Build.Module,
 };
 pub const AddTestsResult = struct {
+    consumer: @import("linked_tests.zig").Artifact,
+    linked_consumer_tests: []const *std.Build.Step.Compile,
     run_lib_data_runtime_tests: *std.Build.Step.Run,
     run_lib_data_storage_tests: *std.Build.Step.Run,
 };
@@ -208,7 +211,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
     };
-    const lib_data_runtime_tests = b.addTest(.{
+    const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
+        .name = "data-runtime-tests",
         .root_module = data_runtime_test_mod,
         .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
         .test_runner = .{
@@ -220,7 +224,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // honest reservation instead of forcing this root through -j1.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
-    const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
+    const implementation_tests = b.addTest(.{
+        .name = "data-runtime-implementation-tests",
+        .root_module = options.data_implementation_module,
+        .filters = lib_data_runtime_tests.object.filters,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = lib_data_runtime_tests.object.step.max_rss,
+    });
+    const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
 
@@ -352,6 +363,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
 
     return .{
+        .consumer = lib_data_runtime_tests,
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{lib_data_runtime_tests.executable}) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

@@ -44,6 +44,13 @@ pub const Context = struct {
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
+    pub fn ensureWithRuntime(self: *Context, request: @import("kernel_runtime_services.zig").Request) !void {
+        if (self.handle != null) return;
+        var handle: ?*anyopaque = null;
+        try statusToError(@import("kernel_runtime_services.zig").antfly_storage_context_create_with_runtime(&request, &handle));
+        self.handle = handle orelse return error.StorageKernelFailure;
+    }
+
     pub fn deinit(self: *Context) void {
         const status = abi.antfly_storage_context_destroy(self.handle);
         std.debug.assert(status == .ok);

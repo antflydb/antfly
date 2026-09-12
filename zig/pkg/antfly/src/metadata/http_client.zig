@@ -1658,2057 +1658,2069 @@ fn nodeStatusRouteForBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     });
 }
 
-test "metadata routing clients preserve the borrowed clock in every relative deadline" {
-    var sim = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
-    defer sim.deinit();
-    const Executor = struct {
-        calls: usize = 0,
-        expected_ms: []const u8 = "1501",
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings(self.expected_ms, req.header(routes.routing_remaining_ms_header).?);
-            self.calls += 1;
-            return .{
-                .status = 504,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "deadline exceeded"),
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "metadata routing clients preserve the borrowed clock in every relative deadline" {
+            var sim = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+            defer sim.deinit();
+            const Executor = struct {
+                calls: usize = 0,
+                expected_ms: []const u8 = "1501",
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings(self.expected_ms, req.header(routes.routing_remaining_ms_header).?);
+                    self.calls += 1;
+                    return .{
+                        .status = 504,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "deadline exceeded"),
+                    };
+                }
             };
-        }
-    };
-    var executor = Executor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
-    const budget = RequestBudget{ .io = sim.io(), .deadline_ns = 18 * std.time.ns_per_s + 501 * std.time.ns_per_ms };
-    const uri = "http://metadata.test";
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchLinearizableRoutingSnapshot(uri, budget));
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.waitForRoutingChange(uri, .{}, false, budget));
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.awaitCatalogRoute(uri, .{ .query = .{ .table_name = "docs", .selector = .table } }, budget));
-    sim.monotonic_ns += 500 * std.time.ns_per_ms;
-    executor.expected_ms = "1001";
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
-    try std.testing.expectEqual(@as(usize, 5), executor.calls);
-    sim.monotonic_ns = budget.deadline_ns;
-    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
-    try std.testing.expectEqual(@as(usize, 5), executor.calls);
-}
-
-test "metadata routing client forwards relative deadline and preserves timeout" {
-    const TimeoutExecutor = struct {
-        saw_budget: bool = false,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            var executor = Executor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+            const budget = RequestBudget{ .io = sim.io(), .deadline_ns = 18 * std.time.ns_per_s + 501 * std.time.ns_per_ms };
+            const uri = "http://metadata.test";
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchLinearizableRoutingSnapshot(uri, budget));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.waitForRoutingChange(uri, .{}, false, budget));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.awaitCatalogRoute(uri, .{ .query = .{ .table_name = "docs", .selector = .table } }, budget));
+            sim.monotonic_ns += 500 * std.time.ns_per_ms;
+            executor.expected_ms = "1001";
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+            try std.testing.expectEqual(@as(usize, 5), executor.calls);
+            sim.monotonic_ns = budget.deadline_ns;
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchRoutingSnapshotWithBudget(uri, budget));
+            try std.testing.expectEqual(@as(usize, 5), executor.calls);
         }
 
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routing_snapshot));
-            const raw = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
-            const remaining_ms = try std.fmt.parseUnsigned(u64, raw, 10);
-            try std.testing.expect(remaining_ms > 0);
-            try std.testing.expect(remaining_ms <= 1_000);
-            self.saw_budget = true;
-            return .{
-                .status = 504,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "request deadline exceeded"),
+        test "metadata routing client forwards relative deadline and preserves timeout" {
+            const TimeoutExecutor = struct {
+                saw_budget: bool = false,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.routing_snapshot));
+                    const raw = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+                    const remaining_ms = try std.fmt.parseUnsigned(u64, raw, 10);
+                    try std.testing.expect(remaining_ms > 0);
+                    try std.testing.expect(remaining_ms <= 1_000);
+                    self.saw_budget = true;
+                    return .{
+                        .status = 504,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "request deadline exceeded"),
+                    };
+                }
             };
-        }
-    };
 
-    var executor = TimeoutExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.CatalogRoutingSnapshotTimeout,
-        client.fetchRoutingSnapshotWithBudget("http://127.0.0.1:9000", .{
-            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-        }),
-    );
-    try std.testing.expect(executor.saw_budget);
-}
-
-test "budgeted admin snapshots reject cancellation after transport completion" {
-    const Executor = struct {
-        cancellation: *http_common.RequestCancellation,
-        expected_method: http_common.Method,
-        expected_path: []const u8,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            var executor = TimeoutExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.CatalogRoutingSnapshotTimeout,
+                client.fetchRoutingSnapshotWithBudget("http://127.0.0.1:9000", .{
+                    .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                }),
+            );
+            try std.testing.expect(executor.saw_budget);
         }
 
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(self.expected_method, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
-            // Simulate cancellation racing a successful response. The client
-            // must reject the parsed value instead of returning work that
-            // completed outside the caller's request lifetime.
-            self.cancellation.cancel();
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
-                ),
+        test "budgeted admin snapshots reject cancellation after transport completion" {
+            const Executor = struct {
+                cancellation: *http_common.RequestCancellation,
+                expected_method: http_common.Method,
+                expected_path: []const u8,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(self.expected_method, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+                    // Simulate cancellation racing a successful response. The client
+                    // must reject the parsed value instead of returning work that
+                    // completed outside the caller's request lifetime.
+                    self.cancellation.cancel();
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                        ),
+                    };
+                }
             };
-        }
-    };
 
-    var eventual_cancellation: http_common.RequestCancellation = .{};
-    var eventual_executor = Executor{
-        .cancellation = &eventual_cancellation,
-        .expected_method = .GET,
-        .expected_path = routes.Routes.admin_snapshot,
-    };
-    var eventual_client = MetadataHttpClient.init(std.testing.allocator, eventual_executor.executor());
-    try std.testing.expectError(
-        error.Cancelled,
-        eventual_client.fetchSnapshotWithBudget("http://127.0.0.1:9000", .{
-            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-            .cancellation = &eventual_cancellation,
-        }),
-    );
-
-    var linearizable_cancellation: http_common.RequestCancellation = .{};
-    var linearizable_executor = Executor{
-        .cancellation = &linearizable_cancellation,
-        .expected_method = .POST,
-        .expected_path = routes.Routes.internal_linearizable_snapshot,
-    };
-    var linearizable_client = MetadataHttpClient.init(std.testing.allocator, linearizable_executor.executor());
-    try std.testing.expectError(
-        error.Cancelled,
-        linearizable_client.fetchLinearizableSnapshot("http://127.0.0.1:9000", .{
-            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-            .cancellation = &linearizable_cancellation,
-        }),
-    );
-}
-
-test "budgeted metadata values reject cancellation after transport completion" {
-    const Executor = struct {
-        cancellation: *http_common.RequestCancellation,
-        expected_path: []const u8,
-        response_body: []const u8,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
-            self.cancellation.cancel();
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, self.response_body),
+            var eventual_cancellation: http_common.RequestCancellation = .{};
+            var eventual_executor = Executor{
+                .cancellation = &eventual_cancellation,
+                .expected_method = .GET,
+                .expected_path = routes.Routes.admin_snapshot,
             };
-        }
-    };
+            var eventual_client = MetadataHttpClient.init(std.testing.allocator, eventual_executor.executor());
+            try std.testing.expectError(
+                error.Cancelled,
+                eventual_client.fetchSnapshotWithBudget("http://127.0.0.1:9000", .{
+                    .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                    .cancellation = &eventual_cancellation,
+                }),
+            );
 
-    var head_cancellation: http_common.RequestCancellation = .{};
-    var head_executor = Executor{
-        .cancellation = &head_cancellation,
-        .expected_path = routes.Routes.head,
-        .response_body =
-        \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
-        ,
-    };
-    var head_client = MetadataHttpClient.init(std.testing.allocator, head_executor.executor());
-    try std.testing.expectError(
-        error.Cancelled,
-        head_client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
-            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-            .cancellation = &head_cancellation,
-        }),
-    );
-
-    var capabilities_cancellation: http_common.RequestCancellation = .{};
-    var capabilities_executor = Executor{
-        .cancellation = &capabilities_cancellation,
-        .expected_path = routes.Routes.capabilities,
-        .response_body =
-        \\{"catalog_routing_protocol_min":2,"catalog_routing_protocol_max":2}
-        ,
-    };
-    var capabilities_client = MetadataHttpClient.init(std.testing.allocator, capabilities_executor.executor());
-    try std.testing.expectError(
-        error.Cancelled,
-        capabilities_client.fetchCapabilities("http://127.0.0.1:9000", .{
-            .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-            .cancellation = &capabilities_cancellation,
-        }),
-    );
-}
-
-test "metadata capability client distinguishes advertised routing from N-1 absence" {
-    const Executor = struct {
-        status: u16,
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.capabilities));
-            return .{
-                .status = self.status,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, if (self.status == 200)
-                    "{\"catalog_routing_protocol_min\":2,\"catalog_routing_protocol_max\":2}"
-                else
-                    "not found"),
+            var linearizable_cancellation: http_common.RequestCancellation = .{};
+            var linearizable_executor = Executor{
+                .cancellation = &linearizable_cancellation,
+                .expected_method = .POST,
+                .expected_path = routes.Routes.internal_linearizable_snapshot,
             };
-        }
-    };
-
-    var current_executor = Executor{ .status = 200 };
-    var current_client = MetadataHttpClient.init(std.testing.allocator, current_executor.executor());
-    const capabilities = try current_client.fetchCapabilities("http://127.0.0.1:9000", null);
-    try std.testing.expect(capabilities.supportsCatalogRouting(metadata_api.catalog_routing_protocol_current));
-
-    var legacy_executor = Executor{ .status = 404 };
-    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
-    try std.testing.expectError(
-        error.UnsupportedOperation,
-        legacy_client.fetchCapabilities("http://127.0.0.1:9000", null),
-    );
-}
-
-test "metadata linearizable routing client uses compact internal endpoint" {
-    const Executor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            var linearizable_client = MetadataHttpClient.init(std.testing.allocator, linearizable_executor.executor());
+            try std.testing.expectError(
+                error.Cancelled,
+                linearizable_client.fetchLinearizableSnapshot("http://127.0.0.1:9000", .{
+                    .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                    .cancellation = &linearizable_cancellation,
+                }),
+            );
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_linearizable_routing_snapshot));
-            try std.testing.expectEqualStrings("{}", req.body);
-            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9,\"tables\":[],\"ranges\":[]}"),
+        test "budgeted metadata values reject cancellation after transport completion" {
+            const Executor = struct {
+                cancellation: *http_common.RequestCancellation,
+                expected_path: []const u8,
+                response_body: []const u8,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_path));
+                    self.cancellation.cancel();
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, self.response_body),
+                    };
+                }
             };
-        }
-    };
 
-    var executor = Executor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    var result = try client.fetchLinearizableRoutingSnapshot("http://127.0.0.1:9000", .{
-        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-    });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
-}
-
-test "metadata table routing client requests and preserves one full table definition" {
-    const Executor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_table_routing_snapshot));
-            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
-            const parsed = try std.json.parseFromSlice(metadata_api.CatalogTableRoutingSnapshotRequest, alloc, req.body, .{});
-            defer parsed.deinit();
-            try std.testing.expectEqualStrings("docs", parsed.value.table_name);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9," ++
-                    "\"tables\":[{\"table_id\":7,\"name\":\"docs\",\"schema_json\":\"{\\\"document\\\":{}}\",\"indexes_json\":\"{\\\"full_text_index_v0\\\":{}}\"}]," ++
-                    "\"ranges\":[{\"range_id\":4,\"group_id\":71,\"table_id\":7,\"start_key\":\"\"}]}"),
+            var head_cancellation: http_common.RequestCancellation = .{};
+            var head_executor = Executor{
+                .cancellation = &head_cancellation,
+                .expected_path = routes.Routes.head,
+                .response_body =
+                \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
+                ,
             };
-        }
-    };
+            var head_client = MetadataHttpClient.init(std.testing.allocator, head_executor.executor());
+            try std.testing.expectError(
+                error.Cancelled,
+                head_client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+                    .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                    .cancellation = &head_cancellation,
+                }),
+            );
 
-    var executor = Executor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    var result = try client.fetchTableRoutingSnapshot("http://127.0.0.1:9000", "docs", .{
-        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-    });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.value.tables.len);
-    try std.testing.expectEqualStrings("{\"document\":{}}", result.value.tables[0].schema_json);
-    try std.testing.expectEqualStrings("{\"full_text_index_v0\":{}}", result.value.tables[0].indexes_json);
-}
-
-test "metadata routing change client forwards an authority-scoped long poll" {
-    const Executor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_authority));
-            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
-            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
-            defer parsed.deinit();
-            try std.testing.expectEqual(@as(u64, 7), parsed.value.observed_token.metadata_group_id);
-            try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
-            try std.testing.expect(parsed.value.confirm_absence);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, "{\"token\":{\"metadata_group_id\":7,\"revision\":18},\"disposition\":\"advanced\",\"changed\":true}"),
+            var capabilities_cancellation: http_common.RequestCancellation = .{};
+            var capabilities_executor = Executor{
+                .cancellation = &capabilities_cancellation,
+                .expected_path = routes.Routes.capabilities,
+                .response_body =
+                \\{"catalog_routing_protocol_min":2,"catalog_routing_protocol_max":2}
+                ,
             };
-        }
-    };
-
-    var executor = Executor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    var result = try client.waitForRoutingChange(
-        "http://127.0.0.1:9000",
-        .{ .metadata_group_id = 7, .revision = 17 },
-        true,
-        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
-    );
-    defer result.deinit();
-    try std.testing.expect(result.value.changed);
-    try std.testing.expectEqual(metadata_api.CatalogRoutingChangeResult.Disposition.advanced, result.value.effectiveDisposition());
-    try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
-}
-
-test "metadata route authority client forwards the query and decodes a route plan" {
-    const Executor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            var capabilities_client = MetadataHttpClient.init(std.testing.allocator, capabilities_executor.executor());
+            try std.testing.expectError(
+                error.Cancelled,
+                capabilities_client.fetchCapabilities("http://127.0.0.1:9000", .{
+                    .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                    .cancellation = &capabilities_cancellation,
+                }),
+            );
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_await_route));
-            _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
-            const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveRequest, alloc, req.body, .{});
-            defer parsed.deinit();
-            try std.testing.expectEqualStrings("docs", parsed.value.query.table_name);
-            try std.testing.expectEqual(metadata_api.CatalogRouteSelector.key, parsed.value.query.selector);
-            try std.testing.expectEqualStrings("row-17", parsed.value.query.key);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"disposition":"found","token":{"metadata_group_id":1,"revision":9},"plan":{"metadata_group_id":1,"metadata_incarnation":null,"catalog_revision":9,"table_id":7,"topology_epoch":3,"groups":[{"group_id":71,"range_id":4,"identity_namespace":{"table_id":7,"shard_id":71,"range_id":4}}]}}
-                ),
+        test "metadata capability client distinguishes advertised routing from N-1 absence" {
+            const Executor = struct {
+                status: u16,
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.capabilities));
+                    return .{
+                        .status = self.status,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, if (self.status == 200)
+                            "{\"catalog_routing_protocol_min\":2,\"catalog_routing_protocol_max\":2}"
+                        else
+                            "not found"),
+                    };
+                }
             };
+
+            var current_executor = Executor{ .status = 200 };
+            var current_client = MetadataHttpClient.init(std.testing.allocator, current_executor.executor());
+            const capabilities = try current_client.fetchCapabilities("http://127.0.0.1:9000", null);
+            try std.testing.expect(capabilities.supportsCatalogRouting(metadata_api.catalog_routing_protocol_current));
+
+            var legacy_executor = Executor{ .status = 404 };
+            var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+            try std.testing.expectError(
+                error.UnsupportedOperation,
+                legacy_client.fetchCapabilities("http://127.0.0.1:9000", null),
+            );
         }
-    };
 
-    var executor = Executor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    var result = try client.awaitCatalogRoute(
-        "http://127.0.0.1:9000",
-        .{ .query = .{ .table_name = "docs", .selector = .key, .key = "row-17" } },
-        .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
-    );
-    defer result.deinit();
-    try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, result.value.disposition);
-    try std.testing.expectEqual(@as(u64, 71), result.value.plan.?.groups[0].group_id);
-}
+        test "metadata linearizable routing client uses compact internal endpoint" {
+            const Executor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
 
-test "metadata http client uses the reallocation route and maps upgrade gating" {
-    const UpgradeRequiredExecutor = struct {
-        fn executor(_: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{ .execute = execute },
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_linearizable_routing_snapshot));
+                    try std.testing.expectEqualStrings("{}", req.body);
+                    _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9,\"tables\":[],\"ranges\":[]}"),
+                    };
+                }
             };
+
+            var executor = Executor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            var result = try client.fetchLinearizableRoutingSnapshot("http://127.0.0.1:9000", .{
+                .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u64, 9), result.value.catalog_revision);
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate));
-            return .{
-                .status = 503,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "metadata voter upgrade required"),
+        test "metadata table routing client requests and preserves one full table definition" {
+            const Executor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_table_routing_snapshot));
+                    _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+                    const parsed = try std.json.parseFromSlice(metadata_api.CatalogTableRoutingSnapshotRequest, alloc, req.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqualStrings("docs", parsed.value.table_name);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, "{\"metadata_group_id\":1,\"catalog_revision\":9," ++
+                            "\"tables\":[{\"table_id\":7,\"name\":\"docs\",\"schema_json\":\"{\\\"document\\\":{}}\",\"indexes_json\":\"{\\\"full_text_index_v0\\\":{}}\"}]," ++
+                            "\"ranges\":[{\"range_id\":4,\"group_id\":71,\"table_id\":7,\"start_key\":\"\"}]}"),
+                    };
+                }
             };
-        }
-    };
 
-    var executor = UpgradeRequiredExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.ReallocationProtocolUpgradeRequired,
-        client.triggerReallocate("http://127.0.0.1:9000"),
-    );
-}
-
-test "metadata http client sends bounded restore progress synchronization pages" {
-    const RecordingExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            var executor = Executor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            var result = try client.fetchTableRoutingSnapshot("http://127.0.0.1:9000", "docs", .{
+                .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.tables.len);
+            try std.testing.expectEqualStrings("{\"document\":{}}", result.value.tables[0].schema_json);
+            try std.testing.expectEqualStrings("{\"full_text_index_v0\":{}}", result.value.tables[0].indexes_json);
         }
 
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(
-                u8,
-                req.uri,
-                routes.Routes.internal_restore_progress_sync,
-            ));
-            try ant_json.testing.expectEqualJsonText(
-                alloc,
+        test "metadata routing change client forwards an authority-scoped long poll" {
+            const Executor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_routing_authority));
+                    _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+                    const parsed = try std.json.parseFromSlice(metadata_api.CatalogRoutingChangeRequest, alloc, req.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(u64, 7), parsed.value.observed_token.metadata_group_id);
+                    try std.testing.expectEqual(@as(u64, 17), parsed.value.observed_token.revision);
+                    try std.testing.expect(parsed.value.confirm_absence);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, "{\"token\":{\"metadata_group_id\":7,\"revision\":18},\"disposition\":\"advanced\",\"changed\":true}"),
+                    };
+                }
+            };
+
+            var executor = Executor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            var result = try client.waitForRoutingChange(
+                "http://127.0.0.1:9000",
+                .{ .metadata_group_id = 7, .revision = 17 },
+                true,
+                .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+            );
+            defer result.deinit();
+            try std.testing.expect(result.value.changed);
+            try std.testing.expectEqual(metadata_api.CatalogRoutingChangeResult.Disposition.advanced, result.value.effectiveDisposition());
+            try std.testing.expectEqual(@as(u64, 18), result.value.token.revision);
+        }
+
+        test "metadata route authority client forwards the query and decodes a route plan" {
+            const Executor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_await_route));
+                    _ = req.header(routes.routing_remaining_ms_header) orelse return error.TestExpectedDeadline;
+                    const parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteResolveRequest, alloc, req.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqualStrings("docs", parsed.value.query.table_name);
+                    try std.testing.expectEqual(metadata_api.CatalogRouteSelector.key, parsed.value.query.selector);
+                    try std.testing.expectEqualStrings("row-17", parsed.value.query.key);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"disposition":"found","token":{"metadata_group_id":1,"revision":9},"plan":{"metadata_group_id":1,"metadata_incarnation":null,"catalog_revision":9,"table_id":7,"topology_epoch":3,"groups":[{"group_id":71,"range_id":4,"identity_namespace":{"table_id":7,"shard_id":71,"range_id":4}}]}}
+                        ),
+                    };
+                }
+            };
+
+            var executor = Executor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            var result = try client.awaitCatalogRoute(
+                "http://127.0.0.1:9000",
+                .{ .query = .{ .table_name = "docs", .selector = .key, .key = "row-17" } },
+                .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
+            );
+            defer result.deinit();
+            try std.testing.expectEqual(metadata_api.CatalogRouteResolveResult.Disposition.found, result.value.disposition);
+            try std.testing.expectEqual(@as(u64, 71), result.value.plan.?.groups[0].group_id);
+        }
+
+        test "metadata http client uses the reallocation route and maps upgrade gating" {
+            const UpgradeRequiredExecutor = struct {
+                fn executor(_: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_reallocate));
+                    return .{
+                        .status = 503,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "metadata voter upgrade required"),
+                    };
+                }
+            };
+
+            var executor = UpgradeRequiredExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.ReallocationProtocolUpgradeRequired,
+                client.triggerReallocate("http://127.0.0.1:9000"),
+            );
+        }
+
+        test "metadata http client sends bounded restore progress synchronization pages" {
+            const RecordingExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(
+                        u8,
+                        req.uri,
+                        routes.Routes.internal_restore_progress_sync,
+                    ));
+                    try ant_json.testing.expectEqualJsonText(
+                        alloc,
+                        "{\"upserts\":[],\"removals\":[{\"table_id\":1,\"node_id\":2,\"group_id\":7001}]}",
+                        req.body,
+                    );
+                    return .{
+                        .status = 202,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "accepted"),
+                    };
+                }
+            };
+
+            var executor = RecordingExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try client.syncRestoreProgress(
+                "http://127.0.0.1:9000",
                 "{\"upserts\":[],\"removals\":[{\"table_id\":1,\"node_id\":2,\"group_id\":7001}]}",
-                req.body,
             );
-            return .{
-                .status = 202,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "accepted"),
-            };
-        }
-    };
+            try std.testing.expectEqual(@as(usize, 1), executor.calls);
 
-    var executor = RecordingExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try client.syncRestoreProgress(
-        "http://127.0.0.1:9000",
-        "{\"upserts\":[],\"removals\":[{\"table_id\":1,\"node_id\":2,\"group_id\":7001}]}",
-    );
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-
-    const oversized = try std.testing.allocator.alloc(
-        u8,
-        metadata_table_manager.max_restore_progress_sync_body_bytes + 1,
-    );
-    defer std.testing.allocator.free(oversized);
-    try std.testing.expectError(
-        error.RestoreProgressSyncRequestTooLarge,
-        client.syncRestoreProgress("http://127.0.0.1:9000", oversized),
-    );
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-}
-
-test "metadata http client does not replay reallocation after ambiguous transport failures" {
-    const AmbiguousExecutor = struct {
-        failure: anyerror,
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            self.attempts += 1;
-            return self.failure;
-        }
-    };
-
-    const failures = [_]anyerror{
-        error.HttpConnectionClosing,
-        error.ConnectionResetByPeer,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.ConnectionTimedOut,
-        error.Timeout,
-    };
-    for (failures) |failure| {
-        var executor = AmbiguousExecutor{ .failure = failure };
-        var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-        try std.testing.expectError(
-            error.ReallocationOutcomeUnknown,
-            client.triggerReallocate("http://127.0.0.1:9000"),
-        );
-        try std.testing.expectEqual(@as(usize, 1), executor.attempts);
-    }
-}
-
-test "metadata http client does not replay schema mutations after ambiguous transport failures" {
-    const AmbiguousExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(
+            const oversized = try std.testing.allocator.alloc(
                 u8,
-                req.uri,
-                "/internal/v1/tables/docs/schema:mutate",
-            ));
-            self.attempts += 1;
-            return error.ConnectionResetByPeer;
-        }
-    };
-
-    var executor = AmbiguousExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        client.mutateSchema(
-            "http://127.0.0.1:9000",
-            "docs",
-            .merge_patch,
-            "{\"description\":\"patched\"}",
-            1,
-        ),
-    );
-    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
-}
-
-test "metadata http client retries reallocation only before connection admission" {
-    const PreAdmissionExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            self.attempts += 1;
-            if (self.attempts == 1) return error.ConnectionRefused;
-            return .{ .status = 202 };
-        }
-    };
-
-    var executor = PreAdmissionExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try client.triggerReallocate("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
-}
-
-test "metadata http client bounds mutation authority retry-after delay" {
-    var one_second = [_]http_common.Header{.{
-        .name = @constCast("Retry-After"),
-        .value = @constCast(" 1 "),
-    }};
-    try std.testing.expectEqual(
-        @as(u64, std.time.ns_per_s),
-        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = one_second[0..] }),
-    );
-
-    var excessive = [_]http_common.Header{.{
-        .name = @constCast("retry-after"),
-        .value = @constCast("999999999999"),
-    }};
-    try std.testing.expectEqual(
-        max_mutation_authority_retry_delay_ns,
-        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = excessive[0..] }),
-    );
-
-    var invalid = [_]http_common.Header{.{
-        .name = @constCast("Retry-After"),
-        .value = @constCast("tomorrow"),
-    }};
-    try std.testing.expectEqual(
-        default_mutation_authority_retry_delay_ns,
-        MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = invalid[0..] }),
-    );
-}
-
-test "metadata http client replays reallocation only with explicit mutation non-admission proof" {
-    const ProofKind = enum { mutation_not_admitted, broad_authority_hint };
-    const ProofExecutor = struct {
-        proof: ProofKind,
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn rejectionResponse(
-            alloc: std.mem.Allocator,
-            header_name: []const u8,
-            header_value: []const u8,
-        ) !http_common.HttpResponse {
-            const headers = try alloc.alloc(http_common.Header, 1);
-            errdefer alloc.free(headers);
-            headers[0] = .{
-                .name = try alloc.dupe(u8, header_name),
-                .value = &.{},
-            };
-            errdefer headers[0].deinit(alloc);
-            headers[0].value = try alloc.dupe(u8, header_value);
-            const body = try alloc.dupe(u8, "metadata authority unavailable");
-            errdefer alloc.free(body);
-            return .{ .status = 503, .headers = headers, .body = body };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            self.attempts += 1;
-            if (self.attempts > 1) return .{ .status = 202 };
-            return switch (self.proof) {
-                .mutation_not_admitted => try rejectionResponse(
-                    alloc,
-                    http_common.metadata_mutation_not_admitted_header,
-                    http_common.metadata_mutation_not_admitted_value,
-                ),
-                .broad_authority_hint => try rejectionResponse(
-                    alloc,
-                    http_common.metadata_not_leader_header,
-                    http_common.metadata_not_leader_value,
-                ),
-            };
-        }
-    };
-
-    var proved = ProofExecutor{ .proof = .mutation_not_admitted };
-    var proved_client = MetadataHttpClient.init(std.testing.allocator, proved.executor());
-    try proved_client.triggerReallocate("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(usize, 2), proved.attempts);
-
-    var ambiguous = ProofExecutor{ .proof = .broad_authority_hint };
-    var ambiguous_client = MetadataHttpClient.init(std.testing.allocator, ambiguous.executor());
-    try std.testing.expectError(
-        error.ReallocationOutcomeUnknown,
-        ambiguous_client.triggerReallocate("http://127.0.0.1:9000"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), ambiguous.attempts);
-}
-
-test "metadata http client requests a non-cacheable linearizable head fence" {
-    const FenceExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expectEqualStrings(
-                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-head",
-                req.uri,
+                metadata_table_manager.max_restore_progress_sync_body_bytes + 1,
             );
-            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
-                ),
-            };
-        }
-    };
-
-    var executor = FenceExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    const head = try client.fetchLinearizableHead("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
-    try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-}
-
-test "metadata http client signs internal routes without leaking authority to public routes" {
-    const CaptureExecutor = struct {
-        internal_calls: usize = 0,
-        public_calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            var service_headers: usize = 0;
-            for (req.headers) |header| {
-                if (!std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) continue;
-                service_headers += 1;
-                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
-            }
-            if (internal_service_auth.requestTargetsInternalApi(req.uri)) {
-                self.internal_calls += 1;
-                try std.testing.expectEqual(@as(usize, 1), service_headers);
-            } else {
-                self.public_calls += 1;
-                try std.testing.expectEqual(@as(usize, 0), service_headers);
-            }
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
-                ),
-            };
-        }
-    };
-
-    var executor = CaptureExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    _ = client.withInternalServiceAuth("metadata-client-test-service-secret", "cluster-a");
-    _ = try client.fetchHead("http://127.0.0.1:9000");
-    _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
-    try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
-}
-
-test "metadata http client fetches one bounded linearizable snapshot" {
-    const FenceExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expectEqualStrings(
-                "http://127.0.0.1:9000/internal/v1/catalog/linearizable-snapshot",
-                req.uri,
+            defer std.testing.allocator.free(oversized);
+            try std.testing.expectError(
+                error.RestoreProgressSyncRequestTooLarge,
+                client.syncRestoreProgress("http://127.0.0.1:9000", oversized),
             );
-            try std.testing.expectEqual(@as(?u32, linearizable_snapshot_request_timeout_ms), req.timeout_ms);
-            try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
-                ),
-            };
-        }
-    };
-
-    var executor = FenceExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    var snapshot = try client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null);
-    defer snapshot.deinit();
-    try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
-    try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
-    try std.testing.expectEqual(@as(usize, 1), executor.calls);
-}
-
-test "stamped definition replacement falls back to v0.2 text route" {
-    const LegacyExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            try std.testing.expectEqual(@as(usize, 1), executor.calls);
         }
 
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(http_common.Method.PUT, req.method);
-            if (self.calls == 1) {
-                try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition:stamped"));
-                return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
-            }
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition"));
-            return .{ .status = 202, .body = try alloc.dupe(u8, "accepted") };
-        }
-    };
+        test "metadata http client does not replay reallocation after ambiguous transport failures" {
+            const AmbiguousExecutor = struct {
+                failure: anyerror,
+                attempts: usize = 0,
 
-    var probe_executor = LegacyExecutor{};
-    var probe_client = MetadataHttpClient.init(std.testing.allocator, probe_executor.executor());
-    try std.testing.expect((try probe_client.tryReplaceTableDefinitionStamped(
-        "http://127.0.0.1:9000",
-        "docs",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 1), probe_executor.calls);
-
-    var executor = LegacyExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expect((try client.replaceTableDefinitionStamped(
-        "http://127.0.0.1:9000",
-        "docs",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 2), executor.calls);
-}
-
-test "definition replacement does not replay an ambiguous admitted request" {
-    const AmbiguousExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            return error.ConnectionResetByPeer;
-        }
-    };
-
-    var stamped_executor = AmbiguousExecutor{};
-    var stamped_client = MetadataHttpClient.init(std.testing.allocator, stamped_executor.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        stamped_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), stamped_executor.calls);
-
-    var legacy_executor = AmbiguousExecutor{};
-    var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        legacy_client.replaceTableDefinition("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), legacy_executor.calls);
-
-    const MalformedReceiptExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            return .{ .status = 202, .body = try alloc.dupe(u8, "not-a-receipt") };
-        }
-    };
-
-    var malformed_executor = MalformedReceiptExecutor{};
-    var malformed_client = MetadataHttpClient.init(std.testing.allocator, malformed_executor.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        malformed_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), malformed_executor.calls);
-}
-
-test "metadata http client treats missing linearizable snapshot route as unsupported" {
-    const LegacyExecutor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            return .{
-                .status = 404,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "not found"),
-            };
-        }
-    };
-
-    var executor = LegacyExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.UnsupportedOperation,
-        client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null),
-    );
-}
-
-test "metadata http client forwards table create and drop to the internal route" {
-    const RecordingExecutor = struct {
-        expected_method: http_common.Method,
-        expected_uri_suffix: []const u8,
-        expected_body: ?[]const u8,
-        success_status: u16,
-        success_body: []const u8 = "",
-        expect_service_auth: bool = false,
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            try std.testing.expectEqual(self.expected_method, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_uri_suffix));
-            if (self.expected_body) |body| {
-                try std.testing.expectEqualStrings(body, req.body);
-            }
-            var service_auth_headers: usize = 0;
-            var routing_headers: usize = 0;
-            for (req.headers) |header| {
-                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) {
-                    service_auth_headers += 1;
-                    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
                 }
-                if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_remaining_ms_header) or
-                    std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_forwards_remaining_header) or
-                    std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_campaign_allowed_header))
-                {
-                    routing_headers += 1;
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    self.attempts += 1;
+                    return self.failure;
                 }
+            };
+
+            const failures = [_]anyerror{
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.ConnectionTimedOut,
+                error.Timeout,
+            };
+            for (failures) |failure| {
+                var executor = AmbiguousExecutor{ .failure = failure };
+                var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+                try std.testing.expectError(
+                    error.ReallocationOutcomeUnknown,
+                    client.triggerReallocate("http://127.0.0.1:9000"),
+                );
+                try std.testing.expectEqual(@as(usize, 1), executor.attempts);
             }
-            try std.testing.expectEqual(@as(usize, if (self.expect_service_auth) 1 else 0), service_auth_headers);
-            try std.testing.expectEqual(@as(usize, 3), routing_headers);
-            const headers = try alloc.alloc(http_common.Header, 1);
-            errdefer alloc.free(headers);
-            headers[0] = .{
-                .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
-                .value = &.{},
+        }
+
+        test "metadata http client does not replay schema mutations after ambiguous transport failures" {
+            const AmbiguousExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(
+                        u8,
+                        req.uri,
+                        "/internal/v1/tables/docs/schema:mutate",
+                    ));
+                    self.attempts += 1;
+                    return error.ConnectionResetByPeer;
+                }
             };
-            errdefer headers[0].deinit(alloc);
-            headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
-            return .{
-                .status = self.success_status,
-                .headers = headers,
-                .body = try alloc.dupe(u8, self.success_body),
-            };
-        }
-    };
 
-    var create_exec = RecordingExecutor{
-        .expected_method = .POST,
-        .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
-        .expected_body = "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
-        .success_status = 201,
-        .expect_service_auth = true,
-    };
-    var create_client = MetadataHttpClient.init(std.testing.allocator, create_exec.executor());
-    _ = create_client.withInternalServiceAuth("cluster-secret", "cluster-a");
-    try create_client.createTableForwarded("http://127.0.0.1:9000", "sales/archive", "{\"num_shards\":1}");
-    try std.testing.expectEqual(@as(usize, 1), create_exec.attempts);
-
-    var drop_exec = RecordingExecutor{
-        .expected_method = .POST,
-        .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
-        .expected_body = null,
-        .success_status = 200,
-        .success_body = "{\"table_id\":7,\"expected_transition_generation\":11,\"cleanup\":\"replica_catalog_retirement_v1\"}",
-    };
-    var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
-    var drop_result = try drop_client.forwardTableDropMutationExact(
-        "http://127.0.0.1:9000",
-        "sales%2Farchive",
-        .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
-    );
-    defer drop_result.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), drop_result.group_ids.len);
-    try std.testing.expectEqual(@as(usize, 1), drop_exec.attempts);
-}
-
-test "metadata http client treats a missing forwarded mutation route as an upgrade gate" {
-    const LegacyExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(
-                u8,
-                req.uri,
-                routes.Routes.internal_forwarded_table_mutation,
-            ));
-            return .{
-                .status = 404,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "not found"),
-            };
-        }
-    };
-
-    var executor = LegacyExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.TableTopologyProtocolUpgradeRequired,
-        client.forwardTableMutation(
-            "http://127.0.0.1:9000",
-            .create_table,
-            "docs",
-            "{\"num_shards\":1}",
-            .{ .remaining_ms = 5_000, .forwards_remaining = 1, .campaign_allowed = false },
-        ),
-    );
-    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
-}
-
-test "metadata http client rejects invalid forwarded table names before I/O" {
-    const CountingExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            return error.TestUnexpectedResult;
-        }
-    };
-
-    var counting = CountingExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, counting.executor());
-    const too_long: [tables_api.max_table_name_bytes + 1]u8 = @splat('a');
-    try std.testing.expectError(
-        error.InvalidTableName,
-        client.createTableForwarded("http://127.0.0.1:9000", &too_long, "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 0), counting.attempts);
-}
-
-test "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof" {
-    const RejectingExecutor = struct {
-        header_name: []const u8,
-        header_value: []const u8,
-        outcome_value: []const u8,
-        status: u16 = 503,
-        attempts: usize = 0,
-
-        fn ownedHeader(
-            alloc: std.mem.Allocator,
-            name: []const u8,
-            value: []const u8,
-        ) !http_common.Header {
-            const owned_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(owned_name);
-            const owned_value = try alloc.dupe(u8, value);
-            return .{ .name = owned_name, .value = owned_value };
-        }
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            const headers = try alloc.alloc(http_common.Header, 3);
-            var initialized: usize = 0;
-            errdefer {
-                for (headers[0..initialized]) |*header| header.deinit(alloc);
-                alloc.free(headers);
-            }
-            headers[initialized] = try ownedHeader(alloc, self.header_name, self.header_value);
-            initialized += 1;
-            headers[initialized] = try ownedHeader(alloc, "Retry-After", "0");
-            initialized += 1;
-            headers[initialized] = try ownedHeader(
-                alloc,
-                routes.Routes.raft_mutation_outcome_header,
-                self.outcome_value,
+            var executor = AmbiguousExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                client.mutateSchema(
+                    "http://127.0.0.1:9000",
+                    "docs",
+                    .merge_patch,
+                    "{\"description\":\"patched\"}",
+                    1,
+                ),
             );
-            initialized += 1;
-            const body = try alloc.dupe(u8, "metadata authority unavailable");
-            return .{ .status = self.status, .headers = headers, .body = body };
-        }
-    };
-
-    var not_admitted = RejectingExecutor{
-        .header_name = http_common.metadata_mutation_not_admitted_header,
-        .header_value = http_common.metadata_mutation_not_admitted_value,
-        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
-    };
-    var not_admitted_client = MetadataHttpClient.init(std.testing.allocator, not_admitted.executor());
-    try std.testing.expectError(
-        error.NotLeader,
-        not_admitted_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), not_admitted.attempts);
-
-    var broad_hint = RejectingExecutor{
-        .header_name = http_common.metadata_not_leader_header,
-        .header_value = http_common.metadata_not_leader_value,
-        .outcome_value = routes.Routes.raft_mutation_outcome_unknown,
-    };
-    var broad_hint_client = MetadataHttpClient.init(std.testing.allocator, broad_hint.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        broad_hint_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), broad_hint.attempts);
-
-    var upgrade_gate = RejectingExecutor{
-        .header_name = "Retry-After",
-        .header_value = "1",
-        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
-        .status = 426,
-    };
-    var upgrade_client = MetadataHttpClient.init(std.testing.allocator, upgrade_gate.executor());
-    try std.testing.expectError(
-        error.TableTopologyProtocolUpgradeRequired,
-        upgrade_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), upgrade_gate.attempts);
-
-    var topology_too_large = RejectingExecutor{
-        .header_name = routes.Routes.raft_mutation_outcome_header,
-        .header_value = routes.Routes.raft_mutation_outcome_not_proposed,
-        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
-        .status = 413,
-    };
-    var topology_too_large_client = MetadataHttpClient.init(
-        std.testing.allocator,
-        topology_too_large.executor(),
-    );
-    try std.testing.expectError(
-        error.MetadataTopologyCommandTooLarge,
-        topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
-}
-
-test "metadata http client preserves transport ambiguity for forwarded table mutations" {
-    const DroppingExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+            try std.testing.expectEqual(@as(usize, 1), executor.attempts);
         }
 
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            return error.ConnectionResetByPeer;
-        }
-    };
+        test "metadata http client retries reallocation only before connection admission" {
+            const PreAdmissionExecutor = struct {
+                attempts: usize = 0,
 
-    var dropping = DroppingExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, dropping.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), dropping.attempts);
-}
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
 
-test "metadata http client classifies a provably unsent table mutation" {
-    const UnsentExecutor = struct {
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            req.delivery_tracker.?.markNotSent();
-            return error.ConnectionResetByPeer;
-        }
-    };
-
-    var executor = UnsentExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.RaftMutationRequestNotSent,
-        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-}
-
-test "metadata http client preserves extension ownership across forwarding" {
-    const ExtensionOwnedExecutor = struct {
-        fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
-            const owned_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(owned_name);
-            return .{
-                .name = owned_name,
-                .value = try alloc.dupe(u8, value),
-            };
-        }
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const headers = try alloc.alloc(http_common.Header, 2);
-            var initialized: usize = 0;
-            errdefer {
-                for (headers[0..initialized]) |*header| header.deinit(alloc);
-                alloc.free(headers);
-            }
-            headers[initialized] = try ownedHeader(
-                alloc,
-                routes.Routes.raft_mutation_outcome_header,
-                routes.Routes.raft_mutation_outcome_unknown,
-            );
-            initialized += 1;
-            headers[initialized] = try ownedHeader(
-                alloc,
-                routes.Routes.table_mutation_error_header,
-                routes.Routes.table_mutation_error_extension_owned,
-            );
-            initialized += 1;
-            return .{ .status = 409, .headers = headers };
-        }
-    };
-
-    var executor = ExtensionOwnedExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try std.testing.expectError(
-        error.ExtensionOwnedObject,
-        client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
-    );
-}
-
-test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {
-    const StatusExecutor = struct {
-        status: u16,
-        protocol_marker: bool = false,
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            if (self.protocol_marker) {
-                const headers = try alloc.alloc(http_common.Header, 1);
-                errdefer alloc.free(headers);
-                headers[0] = .{
-                    .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
-                    .value = &.{},
-                };
-                errdefer headers[0].deinit(alloc);
-                headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
-                return .{ .status = self.status, .headers = headers };
-            }
-            return .{ .status = self.status };
-        }
-    };
-
-    var server_error = StatusExecutor{ .status = 500, .protocol_marker = true };
-    var create_client = MetadataHttpClient.init(std.testing.allocator, server_error.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), server_error.attempts);
-
-    // An old metadata leader does not stamp the mutation protocol marker. Its
-    // headerless 404 is a definitive route-version gate, not table absence or
-    // an ambiguous admitted mutation outcome.
-    var old_leader = StatusExecutor{ .status = 404 };
-    var drop_client = MetadataHttpClient.init(std.testing.allocator, old_leader.executor());
-    try std.testing.expectError(
-        error.TableTopologyProtocolUpgradeRequired,
-        drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), old_leader.attempts);
-
-    var headerless_create_success = StatusExecutor{ .status = 201 };
-    var headerless_create_client = MetadataHttpClient.init(
-        std.testing.allocator,
-        headerless_create_success.executor(),
-    );
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        headerless_create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), headerless_create_success.attempts);
-
-    var headerless_drop_success = StatusExecutor{ .status = 204 };
-    var headerless_drop_client = MetadataHttpClient.init(
-        std.testing.allocator,
-        headerless_drop_success.executor(),
-    );
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        headerless_drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), headerless_drop_success.attempts);
-
-    var wrong_marked_success = StatusExecutor{ .status = 200, .protocol_marker = true };
-    var wrong_marked_client = MetadataHttpClient.init(
-        std.testing.allocator,
-        wrong_marked_success.executor(),
-    );
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        wrong_marked_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), wrong_marked_success.attempts);
-}
-
-test "metadata http client does not replay unmarked table mutation rejection proof" {
-    const UnmarkedRejectingExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.attempts += 1;
-            const headers = try alloc.alloc(http_common.Header, 1);
-            errdefer alloc.free(headers);
-            headers[0] = .{
-                .name = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_header),
-                .value = &.{},
-            };
-            errdefer headers[0].deinit(alloc);
-            headers[0].value = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_value);
-            return .{ .status = 503, .headers = headers };
-        }
-    };
-
-    var unmarked = UnmarkedRejectingExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, unmarked.executor());
-    try std.testing.expectError(
-        error.MetadataMutationOutcomeUnknown,
-        client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), unmarked.attempts);
-}
-
-test "metadata http client retries transient connection close on fetch status" {
-    const FlakyExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .execute = execute,
-                },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
-            self.attempts += 1;
-            if (self.attempts == 1) return error.HttpConnectionClosing;
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":77,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
-                ),
-            };
-        }
-    };
-
-    var flaky = FlakyExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, flaky.executor());
-    const status = try client.fetchStatus("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
-    try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
-}
-
-test "metadata http client retries bounded timeout on fetch status" {
-    const TimeoutExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
-            self.attempts += 1;
-            if (self.attempts == 1) return error.Timeout;
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
-                ),
-            };
-        }
-    };
-
-    var timeout_executor = TimeoutExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
-    const status = try client.fetchStatus("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
-    try std.testing.expectEqual(@as(u16, 0), status.reallocation_barrier_protocol_version);
-    try std.testing.expectEqual(@as(u16, 0), status.runtime_status_record_version);
-    try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
-}
-
-test "metadata http client shares deadline and cancellation across retries" {
-    const BudgetExecutor = struct {
-        attempts: usize = 0,
-        prior_timeout_ms: u32 = std.math.maxInt(u32),
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expect(req.cancellation != null);
-            const timeout_ms = req.timeout_ms.?;
-            try std.testing.expect(timeout_ms > 0 and timeout_ms <= 250);
-            try std.testing.expect(timeout_ms <= self.prior_timeout_ms);
-            self.prior_timeout_ms = timeout_ms;
-            self.attempts += 1;
-            if (self.attempts == 1) return error.HttpConnectionClosing;
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
-                ),
-            };
-        }
-    };
-
-    var cancellation = http_common.RequestCancellation{};
-    var executor = BudgetExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    const head = try client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
-        .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms,
-        .cancellation = &cancellation,
-    });
-    try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
-    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
-
-    cancellation.cancel();
-    try std.testing.expectError(error.Cancelled, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
-        .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
-        .cancellation = &cancellation,
-    }));
-    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
-
-    var active_cancellation = http_common.RequestCancellation{};
-    try std.testing.expectError(error.Timeout, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
-        .deadline_ns = platform_time.monotonicNs(),
-        .cancellation = &active_cancellation,
-    }));
-    try std.testing.expectEqual(@as(usize, 2), executor.attempts);
-}
-
-test "metadata http client retries explicit metadata not leader response" {
-    const NotLeaderExecutor = struct {
-        attempts: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
-            const headers = try alloc.alloc(http_common.Header, 1);
-            var initialized_headers: usize = 0;
-            errdefer {
-                for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
-                alloc.free(headers);
-            }
-            var header_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
-            errdefer if (header_name) |value| alloc.free(value);
-            var header_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
-            errdefer if (header_value) |value| alloc.free(value);
-            headers[0] = .{
-                .name = header_name.?,
-                .value = header_value.?,
-            };
-            header_name = null;
-            header_value = null;
-            initialized_headers += 1;
-            const body = try alloc.dupe(u8, "metadata leader unavailable");
-            errdefer alloc.free(body);
-            return .{
-                .status = 503,
-                .headers = headers,
-                .body = body,
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            self.attempts += 1;
-            if (self.attempts <= 2) return try notLeaderResponse(alloc);
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8,
-                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
-                ),
-            };
-        }
-    };
-
-    var executor = NotLeaderExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    const status = try client.fetchStatus("http://127.0.0.1:9000");
-    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
-    try std.testing.expectEqual(@as(usize, 3), executor.attempts);
-}
-
-test "metadata http client preserves split merge doc identity conflicts" {
-    const ConflictExecutor = struct {
-        split_calls: usize = 0,
-        merge_calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(http_common.Method.POST, req.method);
-            if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/split")) {
-                self.split_calls += 1;
-            } else if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/merge")) {
-                self.merge_calls += 1;
-            } else {
-                return error.TestUnexpectedResult;
-            }
-            return .{
-                .status = 409,
-                .body = try alloc.dupe(u8, "doc identity namespace mismatch"),
-            };
-        }
-    };
-
-    var executor = ConflictExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-
-    try std.testing.expectError(
-        error.DocIdentityNamespaceMismatch,
-        client.requestTableSplit("http://127.0.0.1:9000", "docs", "{\"split_key\":\"doc:m\"}"),
-    );
-    try std.testing.expectError(
-        error.DocIdentityNamespaceMismatch,
-        client.requestTableMerge("http://127.0.0.1:9000", "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}"),
-    );
-    try std.testing.expectEqual(@as(usize, 1), executor.split_calls);
-    try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
-}
-
-test "metadata http client preserves typed extension lifecycle conflicts" {
-    var headers = [_]http_common.Header{.{
-        .name = @constCast(routes.Routes.extension_lifecycle_error_header),
-        .value = @constCast(routes.Routes.extension_lifecycle_error_conflict),
-    }};
-    const response = http_common.HttpResponse{
-        .status = 409,
-        .headers = headers[0..],
-    };
-    try std.testing.expectError(
-        error.ExtensionLifecycleConflict,
-        MetadataHttpClient.mapResponseStatus(
-            response,
-            error.InvalidExtensionLifecycleRequest,
-            error.ExtensionNotInstalled,
-            error.ExtensionAlreadyInstalled,
-        ),
-    );
-}
-
-test "metadata http client preserves artifact dependency conflicts" {
-    var headers = [_]http_common.Header{.{
-        .name = @constCast(routes.Routes.table_mutation_error_header),
-        .value = @constCast(routes.Routes.table_mutation_error_artifact_dependency),
-    }};
-    const response = http_common.HttpResponse{
-        .status = 409,
-        .headers = headers[0..],
-    };
-    try std.testing.expectError(
-        error.InvalidEnrichmentConfig,
-        MetadataHttpClient.mapResponseStatus(
-            response,
-            null,
-            error.IndexNotFound,
-            error.TableTransitionActive,
-        ),
-    );
-}
-
-test "metadata http client percent-encodes artifact enrichment path components" {
-    const EncodingExecutor = struct {
-        calls: usize = 0,
-
-        fn executor(self: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            switch (self.calls) {
-                1 => {
-                    try std.testing.expectEqual(http_common.Method.PUT, req.method);
-                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
-                    try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", req.body);
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    self.attempts += 1;
+                    if (self.attempts == 1) return error.ConnectionRefused;
                     return .{ .status = 202 };
-                },
-                2 => {
-                    try std.testing.expectEqual(http_common.Method.DELETE, req.method);
-                    try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
-                    return .{ .status = 204 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        }
-    };
-
-    var executor = EncodingExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-    try client.putArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2", "{\"kind\":\"chunk\"}");
-    try client.deleteArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2");
-    try std.testing.expectEqual(@as(usize, 2), executor.calls);
-}
-
-test "metadata http client round-trips server endpoints" {
-    const httpx = @import("httpx");
-    const metadata_http_server = @import("http_server.zig");
-    const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-
-    const FakeSource = struct {
-        reallocate_count: usize = 0,
-        split_count: usize = 0,
-        merge_count: usize = 0,
-        create_count: usize = 0,
-        drop_count: usize = 0,
-        update_schema_count: usize = 0,
-        create_index_count: usize = 0,
-        drop_index_count: usize = 0,
-        put_artifact_enrichment_count: usize = 0,
-        delete_artifact_enrichment_count: usize = 0,
-        upsert_node_count: usize = 0,
-        upsert_store_count: usize = 0,
-        report_store_status_count: usize = 0,
-        forwarded_create_deadline_seen: bool = false,
-        forwarded_drop_deadline_seen: bool = false,
-
-        const tables = [_]metadata_table_manager.TableRecord{
-            .{ .table_id = 1, .name = "docs", .placement_role = "data" },
-        };
-        const ranges = [_]metadata_table_manager.RangeRecord{
-            .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
-            .{ .group_id = 11, .table_id = 1, .start_key = "doc:m", .end_key = "doc:z" },
-        };
-        const placement_peer_ids = [_]u64{2};
-        const placements = [_]raft_reconciler.PlacementIntent{
-            .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = placement_peer_ids[0..] },
-        };
-        const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{
-            .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
-        };
-        const merge_transitions = [_]metadata_transition_state.MergeTransitionRecord{
-            .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },
-        };
-        const replication_source_statuses = [_]metadata_table_manager.ReplicationSourceStatusRecord{
-            .{
-                .table_id = 1,
-                .source_ordinal = 0,
-                .source_kind = "postgres",
-                .external_table = "users",
-                .cutover_mode = "slot_resumed",
-                .slot_name = "slot_old",
-                .publication_name = "pub_old",
-                .phase = "streaming",
-                .checkpoint = "lsn:0/10",
-            },
-        };
-        const replication_source_action_hints = [_]metadata_api.ReplicationSourceActionHint{
-            .{
-                .table_id = 1,
-                .table_name = @constCast("docs"),
-                .source_ordinal = 0,
-                .action = "reseed_exact_cutover",
-                .reason = "existing_slot_non_exact_cutover",
-                .reseed_exact_cutover_path = @constCast("/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover"),
-            },
-        };
-        const merged_group_statuses = [_]metadata_reconciler.MergedGroupStatus{
-            .{
-                .group_id = 10,
-                .doc_identity = .{
-                    .namespace_table_id = 1,
-                    .namespace_shard_id = 10,
-                    .namespace_range_id = 10,
-                    .allocated_ordinals = 1,
-                    .complete = true,
-                },
-            },
-            .{
-                .group_id = 11,
-                .doc_identity = .{
-                    .namespace_table_id = 1,
-                    .namespace_shard_id = 10,
-                    .namespace_range_id = 10,
-                    .allocated_ordinals = 1,
-                    .complete = true,
-                },
-            },
-        };
-
-        fn iface(self: *@This()) metadata_http_server.AdminSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                    .routing_snapshot = routingSnapshot,
-                    .free_routing_snapshot = freeRoutingSnapshot,
-                    .create_table = createTable,
-                    .create_table_with_context = createTableWithContext,
-                    .drop_table = dropTable,
-                    .drop_table_with_context = dropTableWithContext,
-                    .update_schema = updateSchema,
-                    .create_index = createIndex,
-                    .drop_index = dropIndex,
-                    .put_artifact_enrichment = putArtifactEnrichment,
-                    .delete_artifact_enrichment = deleteArtifactEnrichment,
-                    .upsert_node = upsertNode,
-                    .upsert_store = upsertStore,
-                    .report_store_status = reportStoreStatus,
-                    .trigger_reallocate = triggerReallocate,
-                    .request_split = requestSplit,
-                    .request_merge = requestMerge,
-                },
+                }
             };
+
+            var executor = PreAdmissionExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try client.triggerReallocate("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(usize, 2), executor.attempts);
         }
 
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{
-                .metadata_group_id = 77,
-                .metrics = .{},
-                .projected_tables = 1,
-                .projected_ranges = 2,
-                .projected_placement_intents = 1,
-                .projected_split_transitions = 1,
-                .projected_merge_transitions = 1,
+        test "metadata http client bounds mutation authority retry-after delay" {
+            var one_second = [_]http_common.Header{.{
+                .name = @constCast("Retry-After"),
+                .value = @constCast(" 1 "),
+            }};
+            try std.testing.expectEqual(
+                @as(u64, std.time.ns_per_s),
+                MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = one_second[0..] }),
+            );
+
+            var excessive = [_]http_common.Header{.{
+                .name = @constCast("retry-after"),
+                .value = @constCast("999999999999"),
+            }};
+            try std.testing.expectEqual(
+                max_mutation_authority_retry_delay_ns,
+                MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = excessive[0..] }),
+            );
+
+            var invalid = [_]http_common.Header{.{
+                .name = @constCast("Retry-After"),
+                .value = @constCast("tomorrow"),
+            }};
+            try std.testing.expectEqual(
+                default_mutation_authority_retry_delay_ns,
+                MetadataHttpClient.metadataAuthorityRetryDelayNs(.{ .status = 503, .headers = invalid[0..] }),
+            );
+        }
+
+        test "metadata http client replays reallocation only with explicit mutation non-admission proof" {
+            const ProofKind = enum { mutation_not_admitted, broad_authority_hint };
+            const ProofExecutor = struct {
+                proof: ProofKind,
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn rejectionResponse(
+                    alloc: std.mem.Allocator,
+                    header_name: []const u8,
+                    header_value: []const u8,
+                ) !http_common.HttpResponse {
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    errdefer alloc.free(headers);
+                    headers[0] = .{
+                        .name = try alloc.dupe(u8, header_name),
+                        .value = &.{},
+                    };
+                    errdefer headers[0].deinit(alloc);
+                    headers[0].value = try alloc.dupe(u8, header_value);
+                    const body = try alloc.dupe(u8, "metadata authority unavailable");
+                    errdefer alloc.free(body);
+                    return .{ .status = 503, .headers = headers, .body = body };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    self.attempts += 1;
+                    if (self.attempts > 1) return .{ .status = 202 };
+                    return switch (self.proof) {
+                        .mutation_not_admitted => try rejectionResponse(
+                            alloc,
+                            http_common.metadata_mutation_not_admitted_header,
+                            http_common.metadata_mutation_not_admitted_value,
+                        ),
+                        .broad_authority_hint => try rejectionResponse(
+                            alloc,
+                            http_common.metadata_not_leader_header,
+                            http_common.metadata_not_leader_value,
+                        ),
+                    };
+                }
             };
+
+            var proved = ProofExecutor{ .proof = .mutation_not_admitted };
+            var proved_client = MetadataHttpClient.init(std.testing.allocator, proved.executor());
+            try proved_client.triggerReallocate("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(usize, 2), proved.attempts);
+
+            var ambiguous = ProofExecutor{ .proof = .broad_authority_hint };
+            var ambiguous_client = MetadataHttpClient.init(std.testing.allocator, ambiguous.executor());
+            try std.testing.expectError(
+                error.ReallocationOutcomeUnknown,
+                ambiguous_client.triggerReallocate("http://127.0.0.1:9000"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), ambiguous.attempts);
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{
-                    .metadata_group_id = 77,
-                    .metrics = .{},
-                    .projected_tables = 1,
-                },
-                .tables = @constCast(tables[0..]),
-                .ranges = @constCast(ranges[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                .placement_intents = @constCast(placements[0..]),
-                .split_transitions = @constCast(split_transitions[0..]),
-                .merge_transitions = @constCast(merge_transitions[0..]),
-                .replication_source_statuses = @constCast(replication_source_statuses[0..]),
-                .replication_source_action_hints = @constCast(replication_source_action_hints[0..]),
-                .merged_group_statuses = @constCast(merged_group_statuses[0..]),
+        test "metadata http client requests a non-cacheable linearizable head fence" {
+            const FenceExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expectEqualStrings(
+                        "http://127.0.0.1:9000/internal/v1/catalog/linearizable-head",
+                        req.uri,
+                    );
+                    try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
+                        ),
+                    };
+                }
             };
+
+            var executor = FenceExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            const head = try client.fetchLinearizableHead("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
+            try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
+            try std.testing.expectEqual(@as(usize, 1), executor.calls);
         }
 
-        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-            snapshot.* = undefined;
-        }
+        test "metadata http client signs internal routes without leaking authority to public routes" {
+            const CaptureExecutor = struct {
+                internal_calls: usize = 0,
+                public_calls: usize = 0,
 
-        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
-            return .{
-                .tables = @constCast(tables[0..]),
-                .ranges = @constCast(ranges[0..]),
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    var service_headers: usize = 0;
+                    for (req.headers) |header| {
+                        if (!std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) continue;
+                        service_headers += 1;
+                        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                    }
+                    if (internal_service_auth.requestTargetsInternalApi(req.uri)) {
+                        self.internal_calls += 1;
+                        try std.testing.expectEqual(@as(usize, 1), service_headers);
+                    } else {
+                        self.public_calls += 1;
+                        try std.testing.expectEqual(@as(usize, 0), service_headers);
+                    }
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
+                        ),
+                    };
+                }
             };
+
+            var executor = CaptureExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            _ = client.withInternalServiceAuth("metadata-client-test-service-secret", "cluster-a");
+            _ = try client.fetchHead("http://127.0.0.1:9000");
+            _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
+            try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
         }
 
-        fn freeRoutingSnapshot(_: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
-            snapshot.* = undefined;
-        }
+        test "metadata http client fetches one bounded linearizable snapshot" {
+            const FenceExecutor = struct {
+                calls: usize = 0,
 
-        fn triggerReallocate(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.reallocate_count += 1;
-        }
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
 
-        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
-            _ = alloc;
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("docs table", req.description.?);
-            self.create_count += 1;
-        }
-
-        fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (request.deadline_ns != null) self.forwarded_create_deadline_seen = true;
-            try createTable(ptr, alloc, table_name, req);
-        }
-
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            self.drop_count += 1;
-        }
-
-        fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (request.deadline_ns != null) self.forwarded_drop_deadline_seen = true;
-            try dropTable(ptr, alloc, table_name);
-        }
-
-        fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", schema_json);
-            self.update_schema_count += 1;
-        }
-
-        fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("embed_idx", index_name);
-            try std.testing.expectEqualStrings("{\"type\":\"managed_embeddings\"}", index_json);
-            self.create_index_count += 1;
-        }
-
-        fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("embed_idx", index_name);
-            self.drop_index_count += 1;
-        }
-
-        fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
-            try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", enrichment_json);
-            self.put_artifact_enrichment_count += 1;
-        }
-
-        fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
-            self.delete_artifact_enrichment_count += 1;
-        }
-
-        fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
-            defer metadata_table_manager.freeNode(alloc, record);
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(u64, 7), record.node_id);
-            try std.testing.expectEqualStrings("data", record.role);
-            self.upsert_node_count += 1;
-        }
-
-        fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) !void {
-            defer metadata_table_manager.freeStore(alloc, record);
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(u64, 7), record.store_id);
-            try std.testing.expectEqual(@as(u64, 7), record.node_id);
-            try std.testing.expectEqualStrings("data", record.role);
-            self.upsert_store_count += 1;
-        }
-
-        fn reportStoreStatus(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
-            defer alloc.free(report.health_class);
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(u64, 7), report.store_id);
-            try std.testing.expectEqualStrings("healthy", report.health_class);
-            self.report_store_status_count += 1;
-        }
-
-        fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqualStrings("doc:m", req.split_key);
-            self.split_count += 1;
-        }
-
-        fn requestMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.MergeRequest) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqual(@as(u64, 11), req.donor_group_id);
-            try std.testing.expectEqual(@as(u64, 10), req.receiver_group_id);
-            self.merge_count += 1;
-        }
-    };
-
-    var source = FakeSource{};
-    var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
-    var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer server_io.deinit();
-    var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
-        .host = "127.0.0.1",
-        .port = 0,
-    });
-    defer listener.deinit();
-    try server.registerRoutes(&listener);
-    try listener.bind();
-    var listener_thread = try std.testing.io.concurrent(struct {
-        fn listen(http_server: *httpx.Server) void {
-            http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
-        }
-    }.listen, .{&listener});
-    defer {
-        listener.stop();
-        listener_thread.await(std.testing.io);
-    }
-
-    const address = listener.boundAddress() orelse return error.AddressNotAvailable;
-    const base_uri = try std.fmt.allocPrint(std.heap.page_allocator, "http://127.0.0.1:{d}", .{address.ip4.port});
-    defer std.heap.page_allocator.free(base_uri);
-
-    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
-    defer executor.deinit();
-    var client = MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
-
-    const status = try client.fetchStatus(base_uri);
-    try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
-
-    var snapshot = try client.fetchSnapshot(base_uri);
-    defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_statuses.len);
-    try std.testing.expectEqualStrings("slot_resumed", snapshot.value.replication_source_statuses[0].cutover_mode);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_action_hints.len);
-    try std.testing.expectEqualStrings("reseed_exact_cutover", snapshot.value.replication_source_action_hints[0].action);
-
-    var routing_snapshot = try client.fetchRoutingSnapshotWithBudget(base_uri, null);
-    defer routing_snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 1), routing_snapshot.value.tables.len);
-    try std.testing.expectEqual(@as(usize, 2), routing_snapshot.value.ranges.len);
-
-    var ranges = try client.listTableRanges(base_uri, 1);
-    defer ranges.deinit();
-    try std.testing.expectEqual(@as(usize, 2), ranges.value.len);
-
-    var placement = try client.listGroupPlacement(base_uri, 10);
-    defer placement.deinit();
-    try std.testing.expectEqual(@as(usize, 1), placement.value.len);
-
-    var active = try client.listActiveTransitions(base_uri);
-    defer active.deinit();
-    try std.testing.expectEqual(@as(usize, 1), active.value.split.len);
-    try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
-
-    try client.triggerReallocate(base_uri);
-    try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
-    try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
-    try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
-    try client.createTableForwarded(base_uri, "docs", "{\"description\":\"docs table\"}");
-    try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
-    try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
-    try client.dropIndex(base_uri, "docs", "embed_idx");
-    try client.putArtifactEnrichment(base_uri, "docs", "document chunks/v2", "{\"kind\":\"chunk\"}");
-    try client.deleteArtifactEnrichment(base_uri, "docs", "document chunks/v2");
-    try client.dropTable(base_uri, "docs");
-    try client.dropTableForwarded(base_uri, "docs");
-    try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
-    try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
-    try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
-    try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
-    try std.testing.expectEqual(@as(usize, 2), source.create_count);
-    try std.testing.expectEqual(@as(usize, 2), source.drop_count);
-    try std.testing.expect(source.forwarded_create_deadline_seen);
-    try std.testing.expect(source.forwarded_drop_deadline_seen);
-    try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
-    try std.testing.expectEqual(@as(usize, 1), source.create_index_count);
-    try std.testing.expectEqual(@as(usize, 1), source.drop_index_count);
-    try std.testing.expectEqual(@as(usize, 1), source.put_artifact_enrichment_count);
-    try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
-    try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
-    try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
-    try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
-    try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
-    try std.testing.expectEqual(@as(usize, 1), source.split_count);
-    try std.testing.expectEqual(@as(usize, 1), source.merge_count);
-}
-
-test "metadata http client round-trips range doc identity fields" {
-    const RangeExecutor = struct {
-        fn executor(_: *@This()) http_common.RequestExecutor {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{ .execute = execute },
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expectEqualStrings(
+                        "http://127.0.0.1:9000/internal/v1/catalog/linearizable-snapshot",
+                        req.uri,
+                    );
+                    try std.testing.expectEqual(@as(?u32, linearizable_snapshot_request_timeout_ms), req.timeout_ms);
+                    try ant_json.testing.expectEqualJsonText(alloc, "{}", req.body);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"status":{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                        ),
+                    };
+                }
             };
+
+            var executor = FenceExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            var snapshot = try client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null);
+            defer snapshot.deinit();
+            try std.testing.expectEqual(@as(u64, 91), snapshot.value.status.metadata_group_id);
+            try std.testing.expectEqual(@as(u64, 3), snapshot.value.status.metadata_epoch);
+            try std.testing.expectEqual(@as(usize, 1), executor.calls);
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
-            try std.testing.expectEqual(http_common.Method.GET, req.method);
-            const body =
-                if (std.mem.endsWith(u8, req.uri, routes.Routes.admin_snapshot))
-                    \\{"status":{"metadata_group_id":77,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0}},"tables":[],"ranges":[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
-                else if (std.mem.endsWith(u8, req.uri, "/metadata/v1/tables/1/ranges"))
-                    \\[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}]
-                else
+        test "stamped definition replacement falls back to v0.2 text route" {
+            const LegacyExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(http_common.Method.PUT, req.method);
+                    if (self.calls == 1) {
+                        try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition:stamped"));
+                        return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+                    }
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/definition"));
+                    return .{ .status = 202, .body = try alloc.dupe(u8, "accepted") };
+                }
+            };
+
+            var probe_executor = LegacyExecutor{};
+            var probe_client = MetadataHttpClient.init(std.testing.allocator, probe_executor.executor());
+            try std.testing.expect((try probe_client.tryReplaceTableDefinitionStamped(
+                "http://127.0.0.1:9000",
+                "docs",
+                "{}",
+            )) == null);
+            try std.testing.expectEqual(@as(usize, 1), probe_executor.calls);
+
+            var executor = LegacyExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expect((try client.replaceTableDefinitionStamped(
+                "http://127.0.0.1:9000",
+                "docs",
+                "{}",
+            )) == null);
+            try std.testing.expectEqual(@as(usize, 2), executor.calls);
+        }
+
+        test "definition replacement does not replay an ambiguous admitted request" {
+            const AmbiguousExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return error.ConnectionResetByPeer;
+                }
+            };
+
+            var stamped_executor = AmbiguousExecutor{};
+            var stamped_client = MetadataHttpClient.init(std.testing.allocator, stamped_executor.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                stamped_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), stamped_executor.calls);
+
+            var legacy_executor = AmbiguousExecutor{};
+            var legacy_client = MetadataHttpClient.init(std.testing.allocator, legacy_executor.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                legacy_client.replaceTableDefinition("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), legacy_executor.calls);
+
+            const MalformedReceiptExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return .{ .status = 202, .body = try alloc.dupe(u8, "not-a-receipt") };
+                }
+            };
+
+            var malformed_executor = MalformedReceiptExecutor{};
+            var malformed_client = MetadataHttpClient.init(std.testing.allocator, malformed_executor.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                malformed_client.replaceTableDefinitionStamped("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), malformed_executor.calls);
+        }
+
+        test "metadata http client treats missing linearizable snapshot route as unsupported" {
+            const LegacyExecutor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    return .{
+                        .status = 404,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "not found"),
+                    };
+                }
+            };
+
+            var executor = LegacyExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.UnsupportedOperation,
+                client.fetchLinearizableSnapshot("http://127.0.0.1:9000", null),
+            );
+        }
+
+        test "metadata http client forwards table create and drop to the internal route" {
+            const RecordingExecutor = struct {
+                expected_method: http_common.Method,
+                expected_uri_suffix: []const u8,
+                expected_body: ?[]const u8,
+                success_status: u16,
+                success_body: []const u8 = "",
+                expect_service_auth: bool = false,
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    try std.testing.expectEqual(self.expected_method, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_uri_suffix));
+                    if (self.expected_body) |body| {
+                        try std.testing.expectEqualStrings(body, req.body);
+                    }
+                    var service_auth_headers: usize = 0;
+                    var routing_headers: usize = 0;
+                    for (req.headers) |header| {
+                        if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) {
+                            service_auth_headers += 1;
+                            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                        }
+                        if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_remaining_ms_header) or
+                            std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_forwards_remaining_header) or
+                            std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_campaign_allowed_header))
+                        {
+                            routing_headers += 1;
+                        }
+                    }
+                    try std.testing.expectEqual(@as(usize, if (self.expect_service_auth) 1 else 0), service_auth_headers);
+                    try std.testing.expectEqual(@as(usize, 3), routing_headers);
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    errdefer alloc.free(headers);
+                    headers[0] = .{
+                        .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
+                        .value = &.{},
+                    };
+                    errdefer headers[0].deinit(alloc);
+                    headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
+                    return .{
+                        .status = self.success_status,
+                        .headers = headers,
+                        .body = try alloc.dupe(u8, self.success_body),
+                    };
+                }
+            };
+
+            var create_exec = RecordingExecutor{
+                .expected_method = .POST,
+                .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
+                .expected_body = "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
+                .success_status = 201,
+                .expect_service_auth = true,
+            };
+            var create_client = MetadataHttpClient.init(std.testing.allocator, create_exec.executor());
+            _ = create_client.withInternalServiceAuth("cluster-secret", "cluster-a");
+            try create_client.createTableForwarded("http://127.0.0.1:9000", "sales/archive", "{\"num_shards\":1}");
+            try std.testing.expectEqual(@as(usize, 1), create_exec.attempts);
+
+            var drop_exec = RecordingExecutor{
+                .expected_method = .POST,
+                .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
+                .expected_body = null,
+                .success_status = 200,
+                .success_body = "{\"table_id\":7,\"expected_transition_generation\":11,\"cleanup\":\"replica_catalog_retirement_v1\"}",
+            };
+            var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
+            var drop_result = try drop_client.forwardTableDropMutationExact(
+                "http://127.0.0.1:9000",
+                "sales%2Farchive",
+                .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
+            );
+            defer drop_result.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 0), drop_result.group_ids.len);
+            try std.testing.expectEqual(@as(usize, 1), drop_exec.attempts);
+        }
+
+        test "metadata http client treats a missing forwarded mutation route as an upgrade gate" {
+            const LegacyExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(
+                        u8,
+                        req.uri,
+                        routes.Routes.internal_forwarded_table_mutation,
+                    ));
+                    return .{
+                        .status = 404,
+                        .content_type = try alloc.dupe(u8, "text/plain"),
+                        .body = try alloc.dupe(u8, "not found"),
+                    };
+                }
+            };
+
+            var executor = LegacyExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.TableTopologyProtocolUpgradeRequired,
+                client.forwardTableMutation(
+                    "http://127.0.0.1:9000",
+                    .create_table,
+                    "docs",
+                    "{\"num_shards\":1}",
+                    .{ .remaining_ms = 5_000, .forwards_remaining = 1, .campaign_allowed = false },
+                ),
+            );
+            try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+        }
+
+        test "metadata http client rejects invalid forwarded table names before I/O" {
+            const CountingExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
                     return error.TestUnexpectedResult;
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "application/json"),
-                .body = try alloc.dupe(u8, body),
+                }
             };
+
+            var counting = CountingExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, counting.executor());
+            const too_long: [tables_api.max_table_name_bytes + 1]u8 = @splat('a');
+            try std.testing.expectError(
+                error.InvalidTableName,
+                client.createTableForwarded("http://127.0.0.1:9000", &too_long, "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 0), counting.attempts);
+        }
+
+        test "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof" {
+            const RejectingExecutor = struct {
+                header_name: []const u8,
+                header_value: []const u8,
+                outcome_value: []const u8,
+                status: u16 = 503,
+                attempts: usize = 0,
+
+                fn ownedHeader(
+                    alloc: std.mem.Allocator,
+                    name: []const u8,
+                    value: []const u8,
+                ) !http_common.Header {
+                    const owned_name = try alloc.dupe(u8, name);
+                    errdefer alloc.free(owned_name);
+                    const owned_value = try alloc.dupe(u8, value);
+                    return .{ .name = owned_name, .value = owned_value };
+                }
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    const headers = try alloc.alloc(http_common.Header, 3);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (headers[0..initialized]) |*header| header.deinit(alloc);
+                        alloc.free(headers);
+                    }
+                    headers[initialized] = try ownedHeader(alloc, self.header_name, self.header_value);
+                    initialized += 1;
+                    headers[initialized] = try ownedHeader(alloc, "Retry-After", "0");
+                    initialized += 1;
+                    headers[initialized] = try ownedHeader(
+                        alloc,
+                        routes.Routes.raft_mutation_outcome_header,
+                        self.outcome_value,
+                    );
+                    initialized += 1;
+                    const body = try alloc.dupe(u8, "metadata authority unavailable");
+                    return .{ .status = self.status, .headers = headers, .body = body };
+                }
+            };
+
+            var not_admitted = RejectingExecutor{
+                .header_name = http_common.metadata_mutation_not_admitted_header,
+                .header_value = http_common.metadata_mutation_not_admitted_value,
+                .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
+            };
+            var not_admitted_client = MetadataHttpClient.init(std.testing.allocator, not_admitted.executor());
+            try std.testing.expectError(
+                error.NotLeader,
+                not_admitted_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), not_admitted.attempts);
+
+            var broad_hint = RejectingExecutor{
+                .header_name = http_common.metadata_not_leader_header,
+                .header_value = http_common.metadata_not_leader_value,
+                .outcome_value = routes.Routes.raft_mutation_outcome_unknown,
+            };
+            var broad_hint_client = MetadataHttpClient.init(std.testing.allocator, broad_hint.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                broad_hint_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), broad_hint.attempts);
+
+            var upgrade_gate = RejectingExecutor{
+                .header_name = "Retry-After",
+                .header_value = "1",
+                .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
+                .status = 426,
+            };
+            var upgrade_client = MetadataHttpClient.init(std.testing.allocator, upgrade_gate.executor());
+            try std.testing.expectError(
+                error.TableTopologyProtocolUpgradeRequired,
+                upgrade_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), upgrade_gate.attempts);
+
+            var topology_too_large = RejectingExecutor{
+                .header_name = routes.Routes.raft_mutation_outcome_header,
+                .header_value = routes.Routes.raft_mutation_outcome_not_proposed,
+                .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
+                .status = 413,
+            };
+            var topology_too_large_client = MetadataHttpClient.init(
+                std.testing.allocator,
+                topology_too_large.executor(),
+            );
+            try std.testing.expectError(
+                error.MetadataTopologyCommandTooLarge,
+                topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
+        }
+
+        test "metadata http client preserves transport ambiguity for forwarded table mutations" {
+            const DroppingExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    return error.ConnectionResetByPeer;
+                }
+            };
+
+            var dropping = DroppingExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, dropping.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), dropping.attempts);
+        }
+
+        test "metadata http client classifies a provably unsent table mutation" {
+            const UnsentExecutor = struct {
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    req.delivery_tracker.?.markNotSent();
+                    return error.ConnectionResetByPeer;
+                }
+            };
+
+            var executor = UnsentExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.RaftMutationRequestNotSent,
+                client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+        }
+
+        test "metadata http client preserves extension ownership across forwarding" {
+            const ExtensionOwnedExecutor = struct {
+                fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
+                    const owned_name = try alloc.dupe(u8, name);
+                    errdefer alloc.free(owned_name);
+                    return .{
+                        .name = owned_name,
+                        .value = try alloc.dupe(u8, value),
+                    };
+                }
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const headers = try alloc.alloc(http_common.Header, 2);
+                    var initialized: usize = 0;
+                    errdefer {
+                        for (headers[0..initialized]) |*header| header.deinit(alloc);
+                        alloc.free(headers);
+                    }
+                    headers[initialized] = try ownedHeader(
+                        alloc,
+                        routes.Routes.raft_mutation_outcome_header,
+                        routes.Routes.raft_mutation_outcome_unknown,
+                    );
+                    initialized += 1;
+                    headers[initialized] = try ownedHeader(
+                        alloc,
+                        routes.Routes.table_mutation_error_header,
+                        routes.Routes.table_mutation_error_extension_owned,
+                    );
+                    initialized += 1;
+                    return .{ .status = 409, .headers = headers };
+                }
+            };
+
+            var executor = ExtensionOwnedExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try std.testing.expectError(
+                error.ExtensionOwnedObject,
+                client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
+            );
+        }
+
+        test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {
+            const StatusExecutor = struct {
+                status: u16,
+                protocol_marker: bool = false,
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    if (self.protocol_marker) {
+                        const headers = try alloc.alloc(http_common.Header, 1);
+                        errdefer alloc.free(headers);
+                        headers[0] = .{
+                            .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
+                            .value = &.{},
+                        };
+                        errdefer headers[0].deinit(alloc);
+                        headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
+                        return .{ .status = self.status, .headers = headers };
+                    }
+                    return .{ .status = self.status };
+                }
+            };
+
+            var server_error = StatusExecutor{ .status = 500, .protocol_marker = true };
+            var create_client = MetadataHttpClient.init(std.testing.allocator, server_error.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), server_error.attempts);
+
+            // An old metadata leader does not stamp the mutation protocol marker. Its
+            // headerless 404 is a definitive route-version gate, not table absence or
+            // an ambiguous admitted mutation outcome.
+            var old_leader = StatusExecutor{ .status = 404 };
+            var drop_client = MetadataHttpClient.init(std.testing.allocator, old_leader.executor());
+            try std.testing.expectError(
+                error.TableTopologyProtocolUpgradeRequired,
+                drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), old_leader.attempts);
+
+            var headerless_create_success = StatusExecutor{ .status = 201 };
+            var headerless_create_client = MetadataHttpClient.init(
+                std.testing.allocator,
+                headerless_create_success.executor(),
+            );
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                headerless_create_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), headerless_create_success.attempts);
+
+            var headerless_drop_success = StatusExecutor{ .status = 204 };
+            var headerless_drop_client = MetadataHttpClient.init(
+                std.testing.allocator,
+                headerless_drop_success.executor(),
+            );
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                headerless_drop_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), headerless_drop_success.attempts);
+
+            var wrong_marked_success = StatusExecutor{ .status = 200, .protocol_marker = true };
+            var wrong_marked_client = MetadataHttpClient.init(
+                std.testing.allocator,
+                wrong_marked_success.executor(),
+            );
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                wrong_marked_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), wrong_marked_success.attempts);
+        }
+
+        test "metadata http client does not replay unmarked table mutation rejection proof" {
+            const UnmarkedRejectingExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.attempts += 1;
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    errdefer alloc.free(headers);
+                    headers[0] = .{
+                        .name = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_header),
+                        .value = &.{},
+                    };
+                    errdefer headers[0].deinit(alloc);
+                    headers[0].value = try alloc.dupe(u8, http_common.metadata_mutation_not_admitted_value);
+                    return .{ .status = 503, .headers = headers };
+                }
+            };
+
+            var unmarked = UnmarkedRejectingExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, unmarked.executor());
+            try std.testing.expectError(
+                error.MetadataMutationOutcomeUnknown,
+                client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), unmarked.attempts);
+        }
+
+        test "metadata http client retries transient connection close on fetch status" {
+            const FlakyExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{
+                            .execute = execute,
+                        },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
+                    self.attempts += 1;
+                    if (self.attempts == 1) return error.HttpConnectionClosing;
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":77,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                        ),
+                    };
+                }
+            };
+
+            var flaky = FlakyExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, flaky.executor());
+            const status = try client.fetchStatus("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
+            try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
+        }
+
+        test "metadata http client retries bounded timeout on fetch status" {
+            const TimeoutExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
+                    self.attempts += 1;
+                    if (self.attempts == 1) return error.Timeout;
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                        ),
+                    };
+                }
+            };
+
+            var timeout_executor = TimeoutExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
+            const status = try client.fetchStatus("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+            try std.testing.expectEqual(@as(u16, 0), status.reallocation_barrier_protocol_version);
+            try std.testing.expectEqual(@as(u16, 0), status.runtime_status_record_version);
+            try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
+        }
+
+        test "metadata http client shares deadline and cancellation across retries" {
+            const BudgetExecutor = struct {
+                attempts: usize = 0,
+                prior_timeout_ms: u32 = std.math.maxInt(u32),
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(req.cancellation != null);
+                    const timeout_ms = req.timeout_ms.?;
+                    try std.testing.expect(timeout_ms > 0 and timeout_ms <= 250);
+                    try std.testing.expect(timeout_ms <= self.prior_timeout_ms);
+                    self.prior_timeout_ms = timeout_ms;
+                    self.attempts += 1;
+                    if (self.attempts == 1) return error.HttpConnectionClosing;
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":4}
+                        ),
+                    };
+                }
+            };
+
+            var cancellation = http_common.RequestCancellation{};
+            var executor = BudgetExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            const head = try client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+                .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms,
+                .cancellation = &cancellation,
+            });
+            try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
+            try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+
+            cancellation.cancel();
+            try std.testing.expectError(error.Cancelled, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+                .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
+                .cancellation = &cancellation,
+            }));
+            try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+
+            var active_cancellation = http_common.RequestCancellation{};
+            try std.testing.expectError(error.Timeout, client.fetchHeadWithBudget("http://127.0.0.1:9000", .{
+                .deadline_ns = platform_time.monotonicNs(),
+                .cancellation = &active_cancellation,
+            }));
+            try std.testing.expectEqual(@as(usize, 2), executor.attempts);
+        }
+
+        test "metadata http client retries explicit metadata not leader response" {
+            const NotLeaderExecutor = struct {
+                attempts: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    var initialized_headers: usize = 0;
+                    errdefer {
+                        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+                        alloc.free(headers);
+                    }
+                    var header_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+                    errdefer if (header_name) |value| alloc.free(value);
+                    var header_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+                    errdefer if (header_value) |value| alloc.free(value);
+                    headers[0] = .{
+                        .name = header_name.?,
+                        .value = header_value.?,
+                    };
+                    header_name = null;
+                    header_value = null;
+                    initialized_headers += 1;
+                    const body = try alloc.dupe(u8, "metadata leader unavailable");
+                    errdefer alloc.free(body);
+                    return .{
+                        .status = 503,
+                        .headers = headers,
+                        .body = body,
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    self.attempts += 1;
+                    if (self.attempts <= 2) return try notLeaderResponse(alloc);
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8,
+                            \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                        ),
+                    };
+                }
+            };
+
+            var executor = NotLeaderExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            const status = try client.fetchStatus("http://127.0.0.1:9000");
+            try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+            try std.testing.expectEqual(@as(usize, 3), executor.attempts);
+        }
+
+        test "metadata http client preserves split merge doc identity conflicts" {
+            const ConflictExecutor = struct {
+                split_calls: usize = 0,
+                merge_calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(http_common.Method.POST, req.method);
+                    if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/split")) {
+                        self.split_calls += 1;
+                    } else if (std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs/merge")) {
+                        self.merge_calls += 1;
+                    } else {
+                        return error.TestUnexpectedResult;
+                    }
+                    return .{
+                        .status = 409,
+                        .body = try alloc.dupe(u8, "doc identity namespace mismatch"),
+                    };
+                }
+            };
+
+            var executor = ConflictExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+
+            try std.testing.expectError(
+                error.DocIdentityNamespaceMismatch,
+                client.requestTableSplit("http://127.0.0.1:9000", "docs", "{\"split_key\":\"doc:m\"}"),
+            );
+            try std.testing.expectError(
+                error.DocIdentityNamespaceMismatch,
+                client.requestTableMerge("http://127.0.0.1:9000", "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}"),
+            );
+            try std.testing.expectEqual(@as(usize, 1), executor.split_calls);
+            try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
+        }
+
+        test "metadata http client preserves typed extension lifecycle conflicts" {
+            var headers = [_]http_common.Header{.{
+                .name = @constCast(routes.Routes.extension_lifecycle_error_header),
+                .value = @constCast(routes.Routes.extension_lifecycle_error_conflict),
+            }};
+            const response = http_common.HttpResponse{
+                .status = 409,
+                .headers = headers[0..],
+            };
+            try std.testing.expectError(
+                error.ExtensionLifecycleConflict,
+                MetadataHttpClient.mapResponseStatus(
+                    response,
+                    error.InvalidExtensionLifecycleRequest,
+                    error.ExtensionNotInstalled,
+                    error.ExtensionAlreadyInstalled,
+                ),
+            );
+        }
+
+        test "metadata http client preserves artifact dependency conflicts" {
+            var headers = [_]http_common.Header{.{
+                .name = @constCast(routes.Routes.table_mutation_error_header),
+                .value = @constCast(routes.Routes.table_mutation_error_artifact_dependency),
+            }};
+            const response = http_common.HttpResponse{
+                .status = 409,
+                .headers = headers[0..],
+            };
+            try std.testing.expectError(
+                error.InvalidEnrichmentConfig,
+                MetadataHttpClient.mapResponseStatus(
+                    response,
+                    null,
+                    error.IndexNotFound,
+                    error.TableTransitionActive,
+                ),
+            );
+        }
+
+        test "metadata http client percent-encodes artifact enrichment path components" {
+            const EncodingExecutor = struct {
+                calls: usize = 0,
+
+                fn executor(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    switch (self.calls) {
+                        1 => {
+                            try std.testing.expectEqual(http_common.Method.PUT, req.method);
+                            try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                            try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", req.body);
+                            return .{ .status = 202 };
+                        },
+                        2 => {
+                            try std.testing.expectEqual(http_common.Method.DELETE, req.method);
+                            try std.testing.expectEqualStrings("http://127.0.0.1:9000/internal/v1/tables/docs%20table/enrichments/document%20chunks%2Fv2", req.uri);
+                            return .{ .status = 204 };
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                }
+            };
+
+            var executor = EncodingExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+            try client.putArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2", "{\"kind\":\"chunk\"}");
+            try client.deleteArtifactEnrichment("http://127.0.0.1:9000", "docs table", "document chunks/v2");
+            try std.testing.expectEqual(@as(usize, 2), executor.calls);
+        }
+
+        test "metadata http client round-trips server endpoints" {
+            const httpx = @import("httpx");
+            const metadata_http_server = @import("http_server.zig");
+            const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+
+            const FakeSource = struct {
+                reallocate_count: usize = 0,
+                split_count: usize = 0,
+                merge_count: usize = 0,
+                create_count: usize = 0,
+                drop_count: usize = 0,
+                update_schema_count: usize = 0,
+                create_index_count: usize = 0,
+                drop_index_count: usize = 0,
+                put_artifact_enrichment_count: usize = 0,
+                delete_artifact_enrichment_count: usize = 0,
+                upsert_node_count: usize = 0,
+                upsert_store_count: usize = 0,
+                report_store_status_count: usize = 0,
+                forwarded_create_deadline_seen: bool = false,
+                forwarded_drop_deadline_seen: bool = false,
+
+                const tables = [_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 1, .name = "docs", .placement_role = "data" },
+                };
+                const ranges = [_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 10, .table_id = 1, .start_key = "doc:a", .end_key = "doc:m" },
+                    .{ .group_id = 11, .table_id = 1, .start_key = "doc:m", .end_key = "doc:z" },
+                };
+                const placement_peer_ids = [_]u64{2};
+                const placements = [_]raft_reconciler.PlacementIntent{
+                    .{ .record = .{ .group_id = 10, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .peer_node_ids = placement_peer_ids[0..] },
+                };
+                const split_transitions = [_]metadata_transition_state.SplitTransitionRecord{
+                    .{ .transition_id = 9001, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 12, .phase = .bootstrap_peer },
+                };
+                const merge_transitions = [_]metadata_transition_state.MergeTransitionRecord{
+                    .{ .transition_id = 9010, .donor_group_id = 11, .receiver_group_id = 10, .phase = .prepare },
+                };
+                const replication_source_statuses = [_]metadata_table_manager.ReplicationSourceStatusRecord{
+                    .{
+                        .table_id = 1,
+                        .source_ordinal = 0,
+                        .source_kind = "postgres",
+                        .external_table = "users",
+                        .cutover_mode = "slot_resumed",
+                        .slot_name = "slot_old",
+                        .publication_name = "pub_old",
+                        .phase = "streaming",
+                        .checkpoint = "lsn:0/10",
+                    },
+                };
+                const replication_source_action_hints = [_]metadata_api.ReplicationSourceActionHint{
+                    .{
+                        .table_id = 1,
+                        .table_name = @constCast("docs"),
+                        .source_ordinal = 0,
+                        .action = "reseed_exact_cutover",
+                        .reason = "existing_slot_non_exact_cutover",
+                        .reseed_exact_cutover_path = @constCast("/internal/v1/tables/docs/replication-sources/0/reseed-exact-cutover"),
+                    },
+                };
+                const merged_group_statuses = [_]metadata_reconciler.MergedGroupStatus{
+                    .{
+                        .group_id = 10,
+                        .doc_identity = .{
+                            .namespace_table_id = 1,
+                            .namespace_shard_id = 10,
+                            .namespace_range_id = 10,
+                            .allocated_ordinals = 1,
+                            .complete = true,
+                        },
+                    },
+                    .{
+                        .group_id = 11,
+                        .doc_identity = .{
+                            .namespace_table_id = 1,
+                            .namespace_shard_id = 10,
+                            .namespace_range_id = 10,
+                            .allocated_ordinals = 1,
+                            .complete = true,
+                        },
+                    },
+                };
+
+                fn iface(self: *@This()) metadata_http_server.AdminSource {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{
+                            .status = status,
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = routingSnapshot,
+                            .free_routing_snapshot = freeRoutingSnapshot,
+                            .create_table = createTable,
+                            .create_table_with_context = createTableWithContext,
+                            .drop_table = dropTable,
+                            .drop_table_with_context = dropTableWithContext,
+                            .update_schema = updateSchema,
+                            .create_index = createIndex,
+                            .drop_index = dropIndex,
+                            .put_artifact_enrichment = putArtifactEnrichment,
+                            .delete_artifact_enrichment = deleteArtifactEnrichment,
+                            .upsert_node = upsertNode,
+                            .upsert_store = upsertStore,
+                            .report_store_status = reportStoreStatus,
+                            .trigger_reallocate = triggerReallocate,
+                            .request_split = requestSplit,
+                            .request_merge = requestMerge,
+                        },
+                    };
+                }
+
+                fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+                    return .{
+                        .metadata_group_id = 77,
+                        .metrics = .{},
+                        .projected_tables = 1,
+                        .projected_ranges = 2,
+                        .projected_placement_intents = 1,
+                        .projected_split_transitions = 1,
+                        .projected_merge_transitions = 1,
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{
+                            .metadata_group_id = 77,
+                            .metrics = .{},
+                            .projected_tables = 1,
+                        },
+                        .tables = @constCast(tables[0..]),
+                        .ranges = @constCast(ranges[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast(placements[0..]),
+                        .split_transitions = @constCast(split_transitions[0..]),
+                        .merge_transitions = @constCast(merge_transitions[0..]),
+                        .replication_source_statuses = @constCast(replication_source_statuses[0..]),
+                        .replication_source_action_hints = @constCast(replication_source_action_hints[0..]),
+                        .merged_group_statuses = @constCast(merged_group_statuses[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+                    snapshot.* = undefined;
+                }
+
+                fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    return .{
+                        .tables = @constCast(tables[0..]),
+                        .ranges = @constCast(ranges[0..]),
+                    };
+                }
+
+                fn freeRoutingSnapshot(_: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+                    snapshot.* = undefined;
+                }
+
+                fn triggerReallocate(ptr: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.reallocate_count += 1;
+                }
+
+                fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                    _ = alloc;
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("docs table", req.description.?);
+                    self.create_count += 1;
+                }
+
+                fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (request.deadline_ns != null) self.forwarded_create_deadline_seen = true;
+                    try createTable(ptr, alloc, table_name, req);
+                }
+
+                fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    self.drop_count += 1;
+                }
+
+                fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (request.deadline_ns != null) self.forwarded_drop_deadline_seen = true;
+                    try dropTable(ptr, alloc, table_name);
+                }
+
+                fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", schema_json);
+                    self.update_schema_count += 1;
+                }
+
+                fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("embed_idx", index_name);
+                    try std.testing.expectEqualStrings("{\"type\":\"managed_embeddings\"}", index_json);
+                    self.create_index_count += 1;
+                }
+
+                fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("embed_idx", index_name);
+                    self.drop_index_count += 1;
+                }
+
+                fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+                    try std.testing.expectEqualStrings("{\"kind\":\"chunk\"}", enrichment_json);
+                    self.put_artifact_enrichment_count += 1;
+                }
+
+                fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
+                    self.delete_artifact_enrichment_count += 1;
+                }
+
+                fn upsertNode(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.NodeRecord) !void {
+                    defer metadata_table_manager.freeNode(alloc, record);
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7), record.node_id);
+                    try std.testing.expectEqualStrings("data", record.role);
+                    self.upsert_node_count += 1;
+                }
+
+                fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) !void {
+                    defer metadata_table_manager.freeStore(alloc, record);
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7), record.store_id);
+                    try std.testing.expectEqual(@as(u64, 7), record.node_id);
+                    try std.testing.expectEqualStrings("data", record.role);
+                    self.upsert_store_count += 1;
+                }
+
+                fn reportStoreStatus(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
+                    defer alloc.free(report.health_class);
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7), report.store_id);
+                    try std.testing.expectEqualStrings("healthy", report.health_class);
+                    self.report_store_status_count += 1;
+                }
+
+                fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqualStrings("doc:m", req.split_key);
+                    self.split_count += 1;
+                }
+
+                fn requestMerge(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.MergeRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    try std.testing.expectEqual(@as(u64, 11), req.donor_group_id);
+                    try std.testing.expectEqual(@as(u64, 10), req.receiver_group_id);
+                    self.merge_count += 1;
+                }
+            };
+
+            var source = FakeSource{};
+            var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
+            var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer server_io.deinit();
+            var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+            });
+            defer listener.deinit();
+            try server.registerRoutes(&listener);
+            try listener.bind();
+            var listener_thread = try std.testing.io.concurrent(struct {
+                fn listen(http_server: *httpx.Server) void {
+                    http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
+                }
+            }.listen, .{&listener});
+            defer {
+                listener.stop();
+                listener_thread.await(std.testing.io);
+            }
+
+            const address = listener.boundAddress() orelse return error.AddressNotAvailable;
+            const base_uri = try std.fmt.allocPrint(std.heap.page_allocator, "http://127.0.0.1:{d}", .{address.ip4.port});
+            defer std.heap.page_allocator.free(base_uri);
+
+            var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+            defer executor.deinit();
+            var client = MetadataHttpClient.init(std.heap.page_allocator, executor.executor());
+
+            const status = try client.fetchStatus(base_uri);
+            try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
+
+            var snapshot = try client.fetchSnapshot(base_uri);
+            defer snapshot.deinit();
+            try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_statuses.len);
+            try std.testing.expectEqualStrings("slot_resumed", snapshot.value.replication_source_statuses[0].cutover_mode);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.value.replication_source_action_hints.len);
+            try std.testing.expectEqualStrings("reseed_exact_cutover", snapshot.value.replication_source_action_hints[0].action);
+
+            var routing_snapshot = try client.fetchRoutingSnapshotWithBudget(base_uri, null);
+            defer routing_snapshot.deinit();
+            try std.testing.expectEqual(@as(usize, 1), routing_snapshot.value.tables.len);
+            try std.testing.expectEqual(@as(usize, 2), routing_snapshot.value.ranges.len);
+
+            var ranges = try client.listTableRanges(base_uri, 1);
+            defer ranges.deinit();
+            try std.testing.expectEqual(@as(usize, 2), ranges.value.len);
+
+            var placement = try client.listGroupPlacement(base_uri, 10);
+            defer placement.deinit();
+            try std.testing.expectEqual(@as(usize, 1), placement.value.len);
+
+            var active = try client.listActiveTransitions(base_uri);
+            defer active.deinit();
+            try std.testing.expectEqual(@as(usize, 1), active.value.split.len);
+            try std.testing.expectEqual(@as(usize, 1), active.value.merge.len);
+
+            try client.triggerReallocate(base_uri);
+            try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
+            try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
+            try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
+            try client.createTableForwarded(base_uri, "docs", "{\"description\":\"docs table\"}");
+            try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
+            try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
+            try client.dropIndex(base_uri, "docs", "embed_idx");
+            try client.putArtifactEnrichment(base_uri, "docs", "document chunks/v2", "{\"kind\":\"chunk\"}");
+            try client.deleteArtifactEnrichment(base_uri, "docs", "document chunks/v2");
+            try client.dropTable(base_uri, "docs");
+            try client.dropTableForwarded(base_uri, "docs");
+            try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
+            try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
+            try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
+            try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
+            try std.testing.expectEqual(@as(usize, 2), source.create_count);
+            try std.testing.expectEqual(@as(usize, 2), source.drop_count);
+            try std.testing.expect(source.forwarded_create_deadline_seen);
+            try std.testing.expect(source.forwarded_drop_deadline_seen);
+            try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
+            try std.testing.expectEqual(@as(usize, 1), source.create_index_count);
+            try std.testing.expectEqual(@as(usize, 1), source.drop_index_count);
+            try std.testing.expectEqual(@as(usize, 1), source.put_artifact_enrichment_count);
+            try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
+            try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
+            try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
+            try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
+            try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
+            try std.testing.expectEqual(@as(usize, 1), source.split_count);
+            try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+        }
+
+        test "metadata http client round-trips range doc identity fields" {
+            const RangeExecutor = struct {
+                fn executor(_: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    try std.testing.expectEqual(http_common.Method.GET, req.method);
+                    const body =
+                        if (std.mem.endsWith(u8, req.uri, routes.Routes.admin_snapshot))
+                            \\{"status":{"metadata_group_id":77,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0}},"tables":[],"ranges":[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                        else if (std.mem.endsWith(u8, req.uri, "/metadata/v1/tables/1/ranges"))
+                            \\[{"group_id":11,"range_id":1100,"table_id":1,"doc_identity_shard_id":10,"doc_identity_range_id":1000,"start_key":"m","end_key":null}]
+                        else
+                            return error.TestUnexpectedResult;
+                    return .{
+                        .status = 200,
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try alloc.dupe(u8, body),
+                    };
+                }
+            };
+
+            var executor = RangeExecutor{};
+            var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+
+            var snapshot = try client.fetchSnapshot("http://127.0.0.1:9000");
+            defer snapshot.deinit();
+            try std.testing.expectEqual(@as(usize, 1), snapshot.value.ranges.len);
+            try std.testing.expectEqual(@as(u64, 10), snapshot.value.ranges[0].doc_identity_shard_id);
+            try std.testing.expectEqual(@as(u64, 1000), snapshot.value.ranges[0].doc_identity_range_id);
+
+            var ranges = try client.listTableRanges("http://127.0.0.1:9000", 1);
+            defer ranges.deinit();
+            try std.testing.expectEqual(@as(usize, 1), ranges.value.len);
+            try std.testing.expectEqual(@as(u64, 10), metadata_table_manager.rangeDocIdentityShardId(ranges.value[0]));
+            try std.testing.expectEqual(@as(u64, 1000), metadata_table_manager.rangeDocIdentityRangeId(ranges.value[0]));
+        }
+
+        test "metadata http client parses legacy range records without doc identity fields" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseJson([]metadata_table_manager.RangeRecord, alloc,
+                \\[
+                \\  {"group_id":42,"range_id":4200,"table_id":7,"start_key":"","end_key":null},
+                \\  {"group_id":43,"range_id":4300,"table_id":7,"doc_identity_shard_id":42,"doc_identity_range_id":4200,"start_key":"m","end_key":null}
+                \\]
+            );
+            defer parsed.deinit();
+
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
+            try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_shard_id);
+            try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_range_id);
+            try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[0]));
+            try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[0]));
+            try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[1]));
+            try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[1]));
         }
     };
-
-    var executor = RangeExecutor{};
-    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
-
-    var snapshot = try client.fetchSnapshot("http://127.0.0.1:9000");
-    defer snapshot.deinit();
-    try std.testing.expectEqual(@as(usize, 1), snapshot.value.ranges.len);
-    try std.testing.expectEqual(@as(u64, 10), snapshot.value.ranges[0].doc_identity_shard_id);
-    try std.testing.expectEqual(@as(u64, 1000), snapshot.value.ranges[0].doc_identity_range_id);
-
-    var ranges = try client.listTableRanges("http://127.0.0.1:9000", 1);
-    defer ranges.deinit();
-    try std.testing.expectEqual(@as(usize, 1), ranges.value.len);
-    try std.testing.expectEqual(@as(u64, 10), metadata_table_manager.rangeDocIdentityShardId(ranges.value[0]));
-    try std.testing.expectEqual(@as(u64, 1000), metadata_table_manager.rangeDocIdentityRangeId(ranges.value[0]));
+    return Suite;
 }
-
-test "metadata http client parses legacy range records without doc identity fields" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseJson([]metadata_table_manager.RangeRecord, alloc,
-        \\[
-        \\  {"group_id":42,"range_id":4200,"table_id":7,"start_key":"","end_key":null},
-        \\  {"group_id":43,"range_id":4300,"table_id":7,"doc_identity_shard_id":42,"doc_identity_range_id":4200,"start_key":"m","end_key":null}
-        \\]
-    );
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
-    try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_shard_id);
-    try std.testing.expectEqual(@as(u64, 0), parsed.value[0].doc_identity_range_id);
-    try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[0]));
-    try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[0]));
-    try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[1]));
-    try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[1]));
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

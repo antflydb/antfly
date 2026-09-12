@@ -21,6 +21,7 @@ pub fn add(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     imports: AntflyRootImports,
+    vopr: *std.Build.Module,
     artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 ) Result {
     const test_metadata = @import("../../../lib/build_info/build_support.zig").create(b, .{
@@ -37,28 +38,34 @@ pub fn add(
             .target = target,
             .optimize = optimize,
         });
+        if (index == 0) module.addImport("vopr", vopr);
         var owner_imports = imports;
         owner_imports.boundary_profile = if (index == 2) .enrichment else .owner;
         if (index == 2)
             owner_imports.configureEnrichment(b, module, true)
         else
             owner_imports.configureStorage(b, module, true);
-        test_metadata.link(module);
         owner_imports.storage_boundary.configureProfile(module, true, true, owner_imports.boundary_profile);
         if (comptime index < 3) {
-            const tests = b.addTest(.{
+            const tests = @import("linked_tests.zig").add(b, .{
                 .name = if (index == 0) "storage-owner-tests" else if (index == 1) "storage-owner-source-tests" else "storage-owner-enrichment-tests",
                 .root_module = module,
                 .filters = &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
             });
-            runs[index] = @import("test_support.zig").addFilteredTestRunArtifact(b, tests);
+            tests.executable.root_module.addObject(test_metadata.object);
+            runs[index] = tests.run(b);
+            if (index == 2) {
+                tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+            } else {
+                inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+                    tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+            }
         } else {
+            test_metadata.link(module);
             benchmark = b.addExecutable(.{ .name = "storage_boundary_bench", .root_module = module });
         }
-        if (index == 2) {
-            module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
-        } else {
+        if (index == 3) {
             inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
                 module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }

@@ -34,6 +34,27 @@ pub const WalScanAction = enum {
 
 pub const WalStats = abi.WalStats;
 
+pub const CommitBackend = enum { sync, worker_thread, async_io, adaptive };
+pub const StorageBackend = enum { lmdb, lsm, lsm_memory };
+
+/// The opaque owner accepts logical WAL policy, not native backend handles.
+/// Keep the control-side options independent of LMDB and physical LSM types.
+pub const WalOptions = struct {
+    no_sync: bool = false,
+    artificial_sync_delay_ns: u64 = 0,
+    group_commit_window_ns: u64 = 0,
+    group_commit_max_requests: usize = 64,
+    commit_backend: CommitBackend = .adaptive,
+    backend: ?StorageBackend = null,
+    read_only: bool = false,
+    clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
+    model_commit_backend_completions: bool = false,
+
+    pub fn resolvedBackend(self: WalOptions) StorageBackend {
+        return self.backend orelse .lsm;
+    }
+};
+
 pub const WAL = struct {
     clock: @import("sim_runtime.zig").Clock,
     handle: ?*anyopaque = null,
@@ -93,6 +114,17 @@ pub const WAL = struct {
         try statusToError(abi.antfly_storage_wal_sync(self.handle, &.{
             .force = @intFromBool(force),
         }));
+    }
+
+    pub fn appendIdempotent(self: *WAL, key: []const u8, digest: []const u8, data: []const u8) !struct { lsn: u64, appended: bool } {
+        var result = abi.WalIdempotentAppendResult{};
+        try statusToError(abi.antfly_storage_wal_append_idempotent(self.handle, &.{
+            .key = .fromSlice(key),
+            .digest = .fromSlice(digest),
+            .data = .fromSlice(data),
+        }, &result));
+        if (result.lsn == 0 or result.appended > 1) return error.StorageKernelFailure;
+        return .{ .lsn = result.lsn, .appended = result.appended != 0 };
     }
 
     pub fn truncate(self: *WAL, up_to_lsn: u64) !void {
@@ -240,13 +272,20 @@ fn commitBackendRaw(value: anytype) u32 {
 }
 
 fn validateOptions(opts: anytype) !void {
-    if (opts.resolvedBackend() != .lsm or opts.storage != null)
+    if (opts.resolvedBackend() != .lsm)
         return error.UnsupportedKernelWalOptions;
+    if (@hasField(@TypeOf(opts), "storage")) {
+        if (opts.storage != null) return error.UnsupportedKernelWalOptions;
+    }
 
     // Every supported scalar is copied into the ABI request above. Reject
     // simulation hooks and non-default physical-LSM tuning rather than
     // silently changing their semantics at the compiled boundary.
-    if (!std.meta.eql(opts.lsm_options, @TypeOf(opts.lsm_options){}) or
-        opts.clock.ctx != null or opts.commit_scheduler.ctx != null)
-        return error.UnsupportedKernelWalOptions;
+    if (@hasField(@TypeOf(opts), "lsm_options")) {
+        if (!std.meta.eql(opts.lsm_options, @TypeOf(opts.lsm_options){})) return error.UnsupportedKernelWalOptions;
+    }
+    if (@hasField(@TypeOf(opts), "commit_scheduler")) {
+        if (!std.meta.eql(opts.commit_scheduler, @import("sim_runtime.zig").real_completion_scheduler)) return error.UnsupportedKernelWalOptions;
+    }
+    if (!std.meta.eql(opts.clock, @import("sim_runtime.zig").real_clock)) return error.UnsupportedKernelWalOptions;
 }

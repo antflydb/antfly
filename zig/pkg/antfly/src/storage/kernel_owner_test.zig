@@ -83,13 +83,12 @@ const TestWalOptions = struct {
     const Backend = enum { lmdb, lsm, lsm_memory };
     const CommitBackend = enum { sync, worker_thread, async_io, adaptive };
     const Empty = struct {};
-    const Hook = struct { ctx: ?*anyopaque = null };
 
     backend: ?Backend = null,
     storage: ?*anyopaque = null,
     lsm_options: Empty = .{},
     clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
-    commit_scheduler: Hook = .{},
+    commit_scheduler: @import("sim_runtime.zig").CompletionScheduler = @import("sim_runtime.zig").real_completion_scheduler,
     artificial_sync_delay_ns: u64 = 0,
     group_commit_window_ns: u64 = 0,
     group_commit_max_requests: usize = 64,
@@ -163,6 +162,34 @@ test "opaque WAL preserves durable operations and exact failure identity" {
         error.UnsupportedKernelWalOptions,
         wal_client.WAL.open(path_z.ptr, TestWalOptions{ .backend = .lsm_memory }),
     );
+}
+
+test "opaque WAL idempotency survives truncation and reopen" {
+    const path = "/tmp/antfly-storage-kernel-wal-idempotency";
+    cleanup(path);
+    defer cleanup(path);
+    {
+        var wal = try wal_client.WAL.open(path, wal_client.WalOptions{});
+        defer wal.close();
+        const first = try wal.appendIdempotent("receipt-1", "digest-a", "payload");
+        try std.testing.expect(first.appended);
+        try std.testing.expectEqual(@as(u64, 1), first.lsn);
+        const retry = try wal.appendIdempotent("receipt-1", "digest-a", "payload");
+        try std.testing.expect(!retry.appended);
+        try std.testing.expectEqual(first.lsn, retry.lsn);
+        try std.testing.expectError(error.IdempotencyConflict, wal.appendIdempotent("receipt-1", "digest-b", "changed"));
+        try std.testing.expectError(error.InvalidIdempotencyKey, wal.appendIdempotent("", "digest", "payload"));
+        _ = try wal.append("second");
+        try wal.truncate(first.lsn);
+        try std.testing.expect((try wal.readAt(std.testing.allocator, first.lsn)) == null);
+    }
+    var reopened = try wal_client.WAL.open(path, wal_client.WalOptions{});
+    defer reopened.close();
+    const retained = try reopened.appendIdempotent("receipt-1", "digest-a", "payload");
+    try std.testing.expect(!retained.appended);
+    try std.testing.expectEqual(@as(u64, 1), retained.lsn);
+    try std.testing.expectEqual(@as(u64, 2), reopened.lastLsn());
+    try std.testing.expectError(error.IdempotencyConflict, reopened.appendIdempotent("receipt-1", "digest-b", "changed"));
 }
 
 test "coarse aggregation ABI preserves results and semantic error identities" {
@@ -1683,4 +1710,83 @@ test "storage query contract preserves each vector candidate budget" {
     }) |invalid| {
         try std.testing.expectError(error.InvalidQueryRequest, query.parseQueryRequest(alloc, null, "docs", invalid));
     }
+}
+
+fn contextAllocationLifecycle(alloc: std.mem.Allocator) !void {
+    const services = @import("kernel_runtime_services.zig");
+    var bridge = services.memory.Allocator.fromStd(&alloc);
+    // Keep executor creation outside the allocation sweep. std.Io.Threaded
+    // reports thread admission failure as ConcurrencyUnavailable; this sweep
+    // verifies the context's own fallible construction and unwind paths.
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    var context = client.Context{};
+    try context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor });
+    defer context.deinit();
+    try std.testing.expectEqual(@as(u64, 0), (try context.metrics()).lsm_cache_entry_count);
+}
+
+test "opaque context allocator failures release partial construction" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, contextAllocationLifecycle, .{});
+}
+
+test "opaque context rejects invalid runtime contracts before allocation" {
+    const services = @import("kernel_runtime_services.zig");
+    var context = client.Context{};
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = services.abi_version + 1 }));
+    try std.testing.expect(context.handle == null);
+    const alloc = std.testing.allocator;
+    var bridge = services.memory.Allocator.fromStd(&alloc);
+    bridge.version += 1;
+    try std.testing.expectError(error.InvalidArgument, context.ensureWithRuntime(.{ .allocator = &bridge }));
+    try std.testing.expect(context.handle == null);
+}
+
+test "opaque context stores use the borrowed VOPR filesystem and release handles" {
+    const services = @import("kernel_runtime_services.zig");
+    const alloc = std.testing.allocator;
+    var simulator = try @import("vopr").vopr_io.VoprIo.init(.{
+        .task_allocator = alloc,
+        .file_allocator = alloc,
+        .net_allocator = alloc,
+        .process_allocator = alloc,
+        .instrumentation_allocator = alloc,
+    });
+    defer simulator.deinit();
+    const io = simulator.io();
+    var borrow = services.executor.Borrow.init(&io);
+    var allocator_bridge = services.memory.Allocator.fromStd(&alloc);
+    {
+        var context = client.Context{};
+        try context.ensureWithRuntime(.{
+            .context = .{ .auth_storage_path = .fromSlice("/vopr/linked-context/auth") },
+            .allocator = &allocator_bridge,
+            .io = &borrow,
+        });
+        defer context.deinit();
+        var users = try context.systemStore(alloc, "system/auth-users");
+        defer users.deinit();
+        var write = try users.beginWrite();
+        errdefer write.abort();
+        try write.put("user", "value");
+        try write.commit();
+        var read = try users.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("value", try read.get("user"));
+        try std.testing.expect(try simulator.storageBytesUnderPrefix("/vopr/linked-context") > 0);
+    }
+    const resources = simulator.resourceSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), resources.open_file_handles);
+    try std.testing.expectEqual(@as(usize, 0), resources.active_tasks);
+}
+
+test "opaque WAL rejects custom simulation hooks even without a context pointer" {
+    const Hooks = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 1;
+        }
+        fn sleep(_: ?*anyopaque, _: u64) void {}
+        fn wait(_: ?*anyopaque, _: u64) !void {}
+    };
+    try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", wal_client.WalOptions{ .clock = .{ .now_ns_fn = Hooks.now, .sleep_ns_fn = Hooks.sleep } }));
+    try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", TestWalOptions{ .commit_scheduler = .{ .wait_ns_fn = Hooks.wait } }));
 }

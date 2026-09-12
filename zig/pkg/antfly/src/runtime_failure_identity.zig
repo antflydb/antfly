@@ -317,6 +317,7 @@ const mappings = [_]Mapping{
     .{ .status = .empty_artifact, .err = error.EmptyArtifact },
     .{ .status = .generation_conflict, .err = error.GenerationConflict },
     .{ .status = .idempotency_conflict, .err = error.IdempotencyConflict },
+    .{ .status = .invalid_idempotency_key, .err = error.InvalidIdempotencyKey },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },

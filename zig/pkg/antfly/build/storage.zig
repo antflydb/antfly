@@ -127,6 +127,7 @@ pub fn makeLmdbModule(
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("antfly_source_root", mod);
     mod.addOptions("build_options", build_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly_platform", platform_mod);

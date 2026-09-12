@@ -43,7 +43,8 @@ pub fn open(
     const commit_backend = decodeCommitBackend(request.commit_backend) orelse
         return .invalid_argument;
     const handle = alloc.create(Handle) catch return .out_of_memory;
-    errdefer alloc.destroy(handle);
+    var success = false;
+    defer if (!success) alloc.destroy(handle);
     handle.* = .{
         .wal = wal_mod.WAL.open(path.ptr, .{
             .backend = .lsm,
@@ -56,6 +57,7 @@ pub fn open(
             .model_commit_backend_completions = request.model_commit_backend_completions != 0,
         }) catch |err| return statusFromError(err),
     };
+    success = true;
     out_result.* = .{
         .handle = handle,
         .next_lsn = handle.wal.next_lsn,
@@ -267,4 +269,17 @@ fn decodeCommitBackend(raw: u32) ?wal_mod.CommitBackend {
 
 fn statusFromError(err: anyerror) abi.Status {
     return error_identity.statusFromError(err);
+}
+
+pub fn appendIdempotent(
+    raw: ?*anyopaque,
+    request: *const abi.WalIdempotentAppendRequest,
+    result: *abi.WalIdempotentAppendResult,
+) callconv(.c) abi.Status {
+    result.* = .{};
+    if (request.version != abi.abi_version) return .invalid_abi;
+    const handle = asHandle(raw) orelse return .invalid_argument;
+    const appended = handle.wal.appendIdempotent(request.key.slice(), request.digest.slice(), request.data.slice()) catch |err| return statusFromError(err);
+    result.* = .{ .lsn = appended.lsn, .appended = @intFromBool(appended.appended) };
+    return .ok;
 }

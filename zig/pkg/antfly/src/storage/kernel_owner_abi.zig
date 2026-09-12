@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 50;
+pub const abi_version: u32 = 51;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -98,6 +98,20 @@ pub const WalAppendRequest = extern struct {
 pub const WalAppendResult = extern struct {
     assigned_lsn: u64 = 0,
     next_lsn: u64 = 1,
+};
+
+pub const WalIdempotentAppendRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved0: u32 = 0,
+    key: BorrowedBytes = .{},
+    digest: BorrowedBytes = .{},
+    data: BorrowedBytes = .{},
+};
+
+pub const WalIdempotentAppendResult = extern struct {
+    lsn: u64 = 0,
+    appended: u8 = 0,
+    _reserved0: [7]u8 = @splat(0),
 };
 
 pub const WalPositionRequest = extern struct {
@@ -1903,3 +1917,9 @@ pub extern fn antfly_storage_owner_merge_artifacts_page(
 /// Process-wide interactive admission state, owned by physical storage.
 /// kind: 0 = embedding, 1 = generation; delta: +1 begin, -1 end, 0 observe.
 pub extern fn antfly_storage_interactive_activity(kind: u32, delta: i32) callconv(.c) u32;
+
+pub extern fn antfly_storage_wal_append_idempotent(
+    handle: ?*anyopaque,
+    request: *const WalIdempotentAppendRequest,
+    result: *WalIdempotentAppendResult,
+) Status;

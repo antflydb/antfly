@@ -316,6 +316,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
+                .replicated_batch_group_local = replicatedBatchGroupLocal,
                 .backup_table_group_local = backupTableGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -2552,6 +2553,44 @@ pub const ProvisionedKernelOwnerSource = struct {
         var summary = try table_reads.parseStorageKernelPreflightSummary(alloc, response.bytes());
         table_reads.annotateVectorWorkerPreflight(alloc, &summary, req);
         return summary;
+    }
+
+    fn acquirePreparedOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !Lease {
+        const generation = self.visibleRootGeneration(group_id);
+        if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.retired or entry.closing or entry.generation != generation or
+                !tryReserveEntryLeaseLocked(entry, false)) return error.RaftApplyWriterUnavailable;
+            return .{ .source = self, .entry = entry, .created = false, .exclusive = false };
+        }
+        return error.RaftApplyWriterUnavailable;
+    }
+
+    fn replicatedBatchGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        metadata_prepared: bool,
+        entry: ?db_types.RaftAppliedEntryIdentity,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = if (metadata_prepared)
+            try self.acquirePreparedOwner(group_id, table_name)
+        else
+            try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        const encoded = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(encoded);
+        var response = if (entry) |identity|
+            try lease.owner().replicatedBatchAtRaftEntryJson(table_name, encoded, identity.term, identity.index)
+        else
+            try lease.owner().replicatedBatchJson(table_name, encoded);
+        defer response.deinit();
+        return {};
     }
 
     fn batchGroupLocal(

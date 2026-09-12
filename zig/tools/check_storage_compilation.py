@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -36,7 +38,83 @@ ARCHIVES = {
         )
     ),
 }
-COMPILES = re.compile(r"compile (?:lib|test) (\S+) Debug \S+ (cached|success)\b")
+CONSUMERS = {
+    "api-table-read-tests",
+    "api-table-write-tests",
+    "api-table-write-lifecycle-tests",
+    "data-runtime-tests",
+}
+COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) Debug \S+ (cached|success)\b")
+
+
+def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
+    """Return summed and largest RSS for this build, excluding other builds."""
+    processes = {}
+    for line in snapshot.splitlines():
+        fields = line.split()
+        if len(fields) == 3:
+            pid, parent, rss_kib = map(int, fields)
+            processes[pid] = (parent, rss_kib * 1024)
+    descendants = {root_pid}
+    while True:
+        added = {pid for pid, (parent, _) in processes.items() if parent in descendants}
+        if added <= descendants:
+            break
+        descendants |= added
+    sizes = [rss for pid, (_, rss) in processes.items() if pid in descendants]
+    return sum(sizes), max(sizes, default=0)
+
+
+def measured_build(command: list[str], cwd: Path) -> tuple[int, str, dict]:
+    """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
+    started = time.monotonic()
+    peak_tree = peak_process = samples = 0
+    with tempfile.TemporaryFile(mode="w+") as output:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            while True:
+                pid, status, usage = os.wait4(process.pid, os.WNOHANG)
+                if pid:
+                    process.returncode = os.waitstatus_to_exitcode(status)
+                    break
+                if time.monotonic() - started > 1800:
+                    raise TimeoutError("production compilation exceeded 30 minutes")
+                snapshot = subprocess.check_output(
+                    ["ps", "-axo", "pid=,ppid=,rss="],
+                    text=True,
+                )
+                tree, largest = tree_rss(snapshot, process.pid)
+                peak_tree = max(peak_tree, tree)
+                peak_process = max(peak_process, largest)
+                samples += 1
+                time.sleep(0.25)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        output.seek(0)
+        return (
+            process.returncode,
+            output.read(),
+            {
+                "wall_seconds": round(time.monotonic() - started, 3),
+                "cpu_seconds": round(usage.ru_utime + usage.ru_stime, 3),
+                "peak_build_tree_rss_bytes": peak_tree,
+                "peak_process_rss_bytes": peak_process,
+                "rss_samples": samples,
+                "rss_sample_interval_seconds": 0.25,
+            },
+        )
 
 
 def link_children(source: Path, destination: Path) -> None:
@@ -102,19 +180,37 @@ def main() -> None:
                 "physical DB",
                 "storage/db/db.zig",
                 {"antfly-storage-kernel"},
-                ARCHIVES - {"antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-storage-kernel"})
+                | {
+                    "storage-owner-tests",
+                    "storage-owner-source-tests",
+                    "storage-owner-enrichment-tests",
+                }
+                | CONSUMERS,
             ),
             (
                 "physical local query",
                 "storage/local_query.zig",
                 {"antfly-storage-kernel"},
-                ARCHIVES - {"antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-storage-kernel"})
+                | {
+                    "storage-owner-tests",
+                    "storage-owner-source-tests",
+                    "storage-owner-enrichment-tests",
+                }
+                | CONSUMERS,
             ),
             (
                 "owner integration test",
                 "storage/kernel_owner_test.zig",
                 {"storage-owner-tests"},
                 ARCHIVES,
+            ),
+            (
+                "consumer test root",
+                "api_table_reads_test_root.zig",
+                {"api-table-read-tests"},
+                ARCHIVES | (CONSUMERS - {"api-table-read-tests"}),
             ),
             (
                 "storage contract",
@@ -144,6 +240,9 @@ def main() -> None:
                 "build",
                 "check-storage-compilation",
                 "-Doptimize=Debug",
+                "-Dmetal=false",
+                "-Dsystem-blas=false",
+                "-Donnx=false",
                 "-Dantfly-version=compilation-check",
                 f"-j{args.jobs}",
                 "--summary",
@@ -155,35 +254,27 @@ def main() -> None:
             ]
             if args.global_cache_dir:
                 command += ["--global-cache-dir", args.global_cache_dir]
-            started = time.monotonic()
-            result = subprocess.run(
-                command,
-                cwd=root / "zig",
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=1800,
-                check=False,
-            )
-            states = dict(COMPILES.findall(result.stdout))
-            elapsed = round(time.monotonic() - started, 3)
+            returncode, output, measurements = measured_build(command, root / "zig")
+            states = {
+                ("link:" + name if kind == "exe" else name): state
+                for kind, name, state in COMPILES.findall(output)
+            }
+            elapsed = measurements["wall_seconds"]
             records.append(
                 {
                     "case": label,
-                    "wall_seconds": elapsed,
-                    "returncode": result.returncode,
+                    **measurements,
+                    "returncode": returncode,
                     "artifacts": states,
                 }
             )
-            if result.returncode:
+            if returncode:
                 # Zig's failed compiler command can span hundreds of KB.
                 print(
-                    "\n".join(
-                        line for line in result.stdout.splitlines() if len(line) < 1000
-                    )
+                    "\n".join(line for line in output.splitlines() if len(line) < 1000)
                 )
-                raise RuntimeError(f"{label}: build failed ({result.returncode})")
-            missing = ARCHIVES - states.keys()
+                raise RuntimeError(f"{label}: build failed ({returncode})")
+            missing = (ARCHIVES | CONSUMERS) - states.keys()
             if missing:
                 raise AssertionError(
                     f"{label}: missing compiler results: {sorted(missing)}"
@@ -201,7 +292,7 @@ def main() -> None:
 
         build("cold")
         warm = build("warm")
-        assert all(warm[name] == "cached" for name in ARCHIVES), warm
+        assert all(warm[name] == "cached" for name in ARCHIVES | CONSUMERS), warm
         for label, relative, rebuilt, cached in cases:
             path = own(root, f"zig/pkg/antfly/src/{relative}")
             # Keep earlier edits in this private overlay. Restoring one would
@@ -215,6 +306,13 @@ def main() -> None:
                 assert states.get(name) == "success", (label, name, states)
             for name in cached:
                 assert states.get(name) == "cached", (label, name, states)
+            if label in {"physical DB", "physical local query"}:
+                for name in CONSUMERS:
+                    assert states.get("link:" + name) == "success", (
+                        label,
+                        name,
+                        states,
+                    )
 
 
 if __name__ == "__main__":

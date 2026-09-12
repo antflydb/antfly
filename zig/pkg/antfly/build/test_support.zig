@@ -20,6 +20,17 @@ pub const Imports = struct {
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
 
+    /// Consumer tests compile only the control-side dependency profile. The
+    /// final executable receives provider archives from root composition.
+    pub fn configureConsumer(self: Imports, b: *std.Build, module: *std.Build.Module) void {
+        var imports = self.runtime;
+        imports.boundary_profile = .owner;
+        imports.configureApi(module, true);
+        module.addImport("vopr", self.vopr);
+        imports.storage_boundary.configureProfile(module, true, true, .owner);
+        @import("snowball.zig").addSnowballModule(b, module);
+    }
+
     /// Tests and simulation tools explicitly own VOPR and LMDB dependencies.
     pub fn configure(self: Imports, b: *std.Build, module: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         self.runtime.configure(b, module, link_libc);

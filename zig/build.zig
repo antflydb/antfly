@@ -1346,7 +1346,19 @@ pub fn create(b: *std.Build) ?Artifacts {
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
-    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, runtime_library_artifacts);
+    const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
+        .root = b.path("lib/build_info"),
+        .target = target,
+        .optimize = optimize,
+        .version = "test",
+    });
+    for (owner_tests.linked_consumer_tests) |tests| {
+        tests.root_module.addObject(consumer_test_metadata.object);
+        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+    }
+
+    const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);

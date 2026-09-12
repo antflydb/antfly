@@ -425,6 +425,29 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             .sync_level = .full_index,
         },
     );
+    {
+        // Prepared replay must remain usable while the catalog is unavailable,
+        // and must fail closed if no resident generation was prepared.
+        const saved_catalog = owner_source.catalog;
+        owner_source.catalog = table_catalog.emptyCatalogSource();
+        defer owner_source.catalog = saved_catalog;
+        try std.testing.expect((try owner_source.writeSource().replicatedBatchGroupLocal(
+            alloc,
+            7001,
+            "articles",
+            .{ .deletes = &.{"doc:missing"} },
+            true,
+            null,
+        )) != null);
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, owner_source.writeSource().replicatedBatchGroupLocal(
+            alloc,
+            7002,
+            "unprepared",
+            .{},
+            true,
+            null,
+        ));
+    }
     try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
     try owner_source.applyHAReplicationRecordGroupLocal(7001, "articles", .{
         .kind = .checkpoint,
