@@ -1793,6 +1793,58 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupGraphMetricMaintenance(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupGraphMetricMaintenanceWithCancellation(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupGraphMetricMaintenanceWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.graph_metric_maintenance_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => if (std.mem.eql(u8, resp.body, @errorName(error.InvalidGraphMetricAction)))
+                return error.InvalidGraphMetricAction
+            else
+                return error.InvalidGraphMetricRuntimeConfig,
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupVectorWorker(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -3802,6 +3854,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
@@ -3866,6 +3919,7 @@ test "api http client preserves public batch retry safety classifications" {
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
     if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
         return error.StorageReadTemporarilyUnavailable;
     }
@@ -4456,7 +4510,14 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
 
+    conflict_executor.body = "IndexGenerationMismatch";
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+
     conflict_executor.status = 503;
+    conflict_executor.body = "GenerationTransitionActive";
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 
@@ -4619,6 +4680,9 @@ test "api http client authenticates only the internal API namespace" {
         .headers = &spoofed_headers,
     });
     nested.deinit(std.testing.allocator);
+
+    var maintenance = try client.fetchGroupGraphMetricMaintenance("http://node:8080", 7, "docs", "{}");
+    maintenance.deinit(std.testing.allocator);
 
     capture.expected_internal = false;
     var public = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status" });

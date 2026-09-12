@@ -7,9 +7,12 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.graph_query_type import GraphQueryType
+from ..models.legacy_graph_query_metric_freshness import LegacyGraphQueryMetricFreshness
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_metric_filter import GraphMetricFilter
+    from ..models.graph_metric_order import GraphMetricOrder
     from ..models.graph_query_params import GraphQueryParams
     from ..models.legacy_graph_node_selector import LegacyGraphNodeSelector
     from ..models.pattern_step import PatternStep
@@ -35,6 +38,12 @@ class LegacyGraphQuery:
         include_documents (bool | Unset):
         include_edges (bool | Unset):
         fields (list[str] | Unset):
+        metrics (list[str] | Unset): Graph metric names to project onto legacy graph_searches result nodes.
+        order_by (list[GraphMetricOrder] | Unset): Sort legacy graph_searches result nodes by graph metric score.
+        where_metric (list[GraphMetricFilter] | Unset): Filter legacy graph_searches result nodes by graph metric score.
+        metric_freshness (LegacyGraphQueryMetricFreshness | Unset): Freshness required for projected, ordered, and
+            filtered graph metrics.
+        include_metric_status (bool | Unset): Include graph metric status metadata in the legacy graph_searches result.
     """
 
     type_: GraphQueryType
@@ -47,6 +56,11 @@ class LegacyGraphQuery:
     include_documents: bool | Unset = UNSET
     include_edges: bool | Unset = UNSET
     fields: list[str] | Unset = UNSET
+    metrics: list[str] | Unset = UNSET
+    order_by: list[GraphMetricOrder] | Unset = UNSET
+    where_metric: list[GraphMetricFilter] | Unset = UNSET
+    metric_freshness: LegacyGraphQueryMetricFreshness | Unset = UNSET
+    include_metric_status: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,6 +99,30 @@ class LegacyGraphQuery:
         if not isinstance(self.fields, Unset):
             fields = self.fields
 
+        metrics: list[str] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics
+
+        order_by: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.order_by, Unset):
+            order_by = []
+            for order_by_item_data in self.order_by:
+                order_by_item = order_by_item_data.to_dict()
+                order_by.append(order_by_item)
+
+        where_metric: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.where_metric, Unset):
+            where_metric = []
+            for where_metric_item_data in self.where_metric:
+                where_metric_item = where_metric_item_data.to_dict()
+                where_metric.append(where_metric_item)
+
+        metric_freshness: str | Unset = UNSET
+        if not isinstance(self.metric_freshness, Unset):
+            metric_freshness = self.metric_freshness.value
+
+        include_metric_status = self.include_metric_status
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -109,11 +147,23 @@ class LegacyGraphQuery:
             field_dict["include_edges"] = include_edges
         if fields is not UNSET:
             field_dict["fields"] = fields
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
+        if order_by is not UNSET:
+            field_dict["order_by"] = order_by
+        if where_metric is not UNSET:
+            field_dict["where_metric"] = where_metric
+        if metric_freshness is not UNSET:
+            field_dict["metric_freshness"] = metric_freshness
+        if include_metric_status is not UNSET:
+            field_dict["include_metric_status"] = include_metric_status
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_metric_filter import GraphMetricFilter
+        from ..models.graph_metric_order import GraphMetricOrder
         from ..models.graph_query_params import GraphQueryParams
         from ..models.legacy_graph_node_selector import LegacyGraphNodeSelector
         from ..models.pattern_step import PatternStep
@@ -161,6 +211,35 @@ class LegacyGraphQuery:
 
         fields = cast(list[str], d.pop("fields", UNSET))
 
+        metrics = cast(list[str], d.pop("metrics", UNSET))
+
+        _order_by = d.pop("order_by", UNSET)
+        order_by: list[GraphMetricOrder] | Unset = UNSET
+        if _order_by is not UNSET:
+            order_by = []
+            for order_by_item_data in _order_by:
+                order_by_item = GraphMetricOrder.from_dict(order_by_item_data)
+
+                order_by.append(order_by_item)
+
+        _where_metric = d.pop("where_metric", UNSET)
+        where_metric: list[GraphMetricFilter] | Unset = UNSET
+        if _where_metric is not UNSET:
+            where_metric = []
+            for where_metric_item_data in _where_metric:
+                where_metric_item = GraphMetricFilter.from_dict(where_metric_item_data)
+
+                where_metric.append(where_metric_item)
+
+        _metric_freshness = d.pop("metric_freshness", UNSET)
+        metric_freshness: LegacyGraphQueryMetricFreshness | Unset
+        if isinstance(_metric_freshness, Unset):
+            metric_freshness = UNSET
+        else:
+            metric_freshness = LegacyGraphQueryMetricFreshness(_metric_freshness)
+
+        include_metric_status = d.pop("include_metric_status", UNSET)
+
         legacy_graph_query = cls(
             type_=type_,
             index_name=index_name,
@@ -172,6 +251,11 @@ class LegacyGraphQuery:
             include_documents=include_documents,
             include_edges=include_edges,
             fields=fields,
+            metrics=metrics,
+            order_by=order_by,
+            where_metric=where_metric,
+            metric_freshness=metric_freshness,
+            include_metric_status=include_metric_status,
         )
 
         legacy_graph_query.additional_properties = d

@@ -7715,6 +7715,8 @@ pub fn makeRunAtLevel(comptime BackendType: type, backend: *BackendType, state: 
         );
         if (run.state) |*persisted_state| persisted_state.deinit(backend.allocator);
         run.state = null;
+    } else {
+        try run.shareMemory(backend.allocator);
     }
     return run;
 }

@@ -5510,6 +5510,7 @@ pub const ApiHttpServer = struct {
                 .doc_count = index.doc_count,
                 .term_count = index.term_count,
                 .edge_count = index.edge_count,
+                .graph_counts_pending = index.graph_counts_pending,
                 .node_count = index.node_count,
                 .root_node = index.root_node,
                 .publication_target_count = index.publication_target_count,
@@ -11029,6 +11030,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_get_index = executePublicTableGetIndex,
                 .execute_table_create_index = executePublicTableCreateIndex,
                 .execute_table_delete_index = executePublicTableDeleteIndex,
+                .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
                 .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
@@ -11216,6 +11218,9 @@ pub const ApiHttpServer = struct {
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -11470,6 +11475,9 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
+                error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+                error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+                error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -11537,6 +11545,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded,
@@ -11636,6 +11647,9 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
+            error.GraphMetricMaterializationRejected => return error.GraphMetricMaterializationRejected,
+            error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -12415,10 +12429,28 @@ pub const ApiHttpServer = struct {
         const start_ns = retryMonotonicNs(retry_io);
         const retry_deadline_ns = retryDeadlineFromNative(retry_io, req.execution_deadline_ns);
         var attempts: u32 = 0;
+        var index_generation_retries: u8 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
             if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
+                error.IndexGenerationMismatch => {
+                    // Release the failed query's entire snapshot before one
+                    // fresh attempt. Never retry just a reverse-edge probe:
+                    // its base scan and cached negative routes share identity.
+                    // Cap expensive graph replay independently of time-based
+                    // storage retries; ongoing reconciliation is a retryable
+                    // readiness response, not an internal failure or a loop.
+                    try ensureRequestActive(req.cancellation);
+                    const now_ns = retryMonotonicNs(retry_io);
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
+                    if (index_generation_retries != 0) return error.IndexRebuilding;
+                    index_generation_retries += 1;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return error.IndexRebuilding;
+                    if (sleep_ns == 0) return error.Timeout;
+                    try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
+                    continue;
+                },
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
                 // picks up a fresh manifest. TableReadChurn: the read cache
@@ -12427,6 +12459,7 @@ pub const ApiHttpServer = struct {
                 error.EndOfStream,
                 error.FileNotFound,
                 error.TableReadChurn,
+                error.GenerationTransitionActive,
                 error.IdentityReadGenerationChanged,
                 error.TopologyChanged,
                 => {
@@ -12434,7 +12467,7 @@ pub const ApiHttpServer = struct {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return if (err == error.GenerationTransitionActive) error.StorageReadTemporarilyUnavailable else err;
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
@@ -13838,6 +13871,43 @@ pub const ApiHttpServer = struct {
         }) orelse error.MethodNotAllowed;
     }
 
+    fn executePublicTableGraphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        request: api_operation.RequestContext,
+    ) public_table_http.TableApi.ExecuteGraphMetricActionError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        try ensureTableOperationActive(request);
+        const source = self.table_writes orelse return error.MethodNotAllowed;
+        var status = (source.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, request.cancellation) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary,
+            => return error.NotLeader,
+            error.TableTransitionActive,
+            error.TableGenerationChanged,
+            error.GraphMetricDisabled,
+            error.GraphMetricStatusConflict,
+            error.GraphMetricActionPartialOutcome,
+            => return error.Conflict,
+            error.LeaderUnavailable, error.UnknownGroup => return error.NotLeader,
+            error.PersistentDescriptorAdmissionExhausted, error.ResourceBudgetExceeded, error.BackendRuntimeShuttingDown => return error.Backpressured,
+            error.InvalidGraphMetricAction => return error.InvalidGraphMetricAction,
+            error.TableNotFound, error.IndexNotFound, error.MetricNotReady => return error.NotFound,
+            else => {
+                std.log.err("public graph metric action failed table={s} index={s} metric={s} action={s} err={}", .{ table_name, index_name, metric_name, action, err });
+                return error.InternalFailure;
+            },
+        }) orelse return error.NotFound;
+        defer status.deinit(alloc);
+        return indexes_api.encodeGraphMetricStatusResponse(alloc, status) catch return error.InternalFailure;
+    }
+
     fn executePublicClusterBackupList(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -14170,6 +14240,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             if (lease_heartbeat.lost.load(.acquire))
                 return trace.internal(error.BackupAttemptLeaseLost);
@@ -14280,6 +14351,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             // Close the last renewal/publication race. If another process took
             // an expired lease, this conditional renewal fences publication.
@@ -14300,6 +14372,7 @@ pub const ApiHttpServer = struct {
             operation_control.ensureActive() catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 error.Timeout => return error.DeadlineExceeded,
+                else => return trace.internal(err),
             };
             cluster_cleanup_safe = false;
             backups_api.writeClusterManifestToLocationWithIoAndCancellation(
@@ -15865,6 +15938,21 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
             error.UnsupportedExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .unsupported),
             error.UnsupportedExactSort => try contextualUnsupportedExactSortResponse(self.alloc),
+            error.GraphMetricGlobalMaterializationRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricGlobalMaterializationRequiredBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricMaterializationRejected => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
+                false,
+            ),
+            error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphMetricQueryBudgetExceededBody(self.alloc),
+                false,
+            ),
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
@@ -20601,6 +20689,10 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
+        .POST => try tablePermission(alloc, metric_action.table_name, .admin),
+        .GET, .PUT, .DELETE => null,
+    };
     if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
         .GET => .read,
         .POST => .admin,
@@ -20762,6 +20854,38 @@ test "inference connection invocation requires inference write permission" {
         std.testing.allocator,
         .POST,
         "/connections/local-inference/inference/generate/extra",
+    )) == null);
+}
+
+test "graph metric operational actions require table admin permission" {
+    const alloc = std.testing.allocator;
+    const required = (try requiredPermissionForRequest(
+        alloc,
+        .POST,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
+    )).?;
+    defer required.deinit(alloc);
+    try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+    try std.testing.expectEqualStrings("docs archive", required.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+
+    const reader_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .read,
+    }};
+    try std.testing.expect(!permissionsAllow(&reader_permissions, required.resource_type, required.resource, required.permission_type));
+
+    const admin_permissions = [_]usermgr.Permission{.{
+        .resource_type = .table,
+        .resource = @constCast("docs archive"),
+        .type = .admin,
+    }};
+    try std.testing.expect(permissionsAllow(&admin_permissions, required.resource_type, required.resource, required.permission_type));
+    try std.testing.expect((try requiredPermissionForRequest(
+        alloc,
+        .GET,
+        "/tables/docs%20archive/indexes/graph_idx/graph-metrics/pagerank:delete",
     )) == null);
 }
 
@@ -24401,6 +24525,57 @@ test "api http retries identity generation and topology churn from a fresh query
     defer topology_response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", topology_response.json);
+    reads.attempts = 0;
+    reads.transient = error.GenerationTransitionActive;
+    var transition_response = (try ApiHttpServer.queryWithTransientReadRetry(std.testing.allocator, null, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer transition_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+}
+
+test "api http index generation retry refreshes once and preserves readiness cancellation and deadlines" {
+    const FakeReads = struct {
+        attempts: usize = 0,
+        fail_count: usize = 1,
+        cancel: ?*std.atomic.Value(bool) = null,
+        cancel_at: usize = 1,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            if (self.cancel) |cancel| if (self.attempts == self.cancel_at) cancel.store(true, .release);
+            if (self.attempts <= self.fail_count) return error.IndexGenerationMismatch;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var reads = FakeReads{};
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    reads = .{ .fail_count = 100 };
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 2), reads.attempts);
+
+    for ([_]usize{ 1, 2 }) |cancel_at| {
+        var canceled = std.atomic.Value(bool).init(false);
+        reads = .{ .fail_count = 100, .cancel = &canceled, .cancel_at = cancel_at };
+        try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .none));
+        try std.testing.expectEqual(cancel_at, reads.attempts);
+    }
+
+    reads = .{};
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .execution_deadline_ns = 0 }, .read_index, .none));
+    try std.testing.expectEqual(@as(usize, 0), reads.attempts);
 }
 
 test "api http maps missing physical index only for rebuilding lifecycle" {

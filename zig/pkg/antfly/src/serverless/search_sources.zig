@@ -320,6 +320,20 @@ pub fn publishedSearchSourcesForTableDefinitionAlloc(
     read_schema_json: []const u8,
     indexes_json: []const u8,
 ) !PublishedSearchSources {
+    return publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(alloc, schema_json, read_schema_json, indexes_json, .managed_defaults);
+}
+
+/// External sidecars are opt-in declarations, while managed namespaces retain
+/// their established implicit text-index behavior.
+pub const IndexDefaults = enum { managed_defaults, explicit_only };
+
+pub fn publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    defaults: IndexDefaults,
+) !PublishedSearchSources {
     if (indexes_json.len == 0) return .{};
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
@@ -341,11 +355,14 @@ pub fn publishedSearchSourcesForTableDefinitionAlloc(
         for (full_text_index_names) |name| alloc.free(name);
         alloc.free(full_text_index_names);
     }
-    if (full_text_index_names.len == 0) {
+    if (full_text_index_names.len == 0 and defaults == .managed_defaults) {
+        const fallback_names = names: {
+            const names = try alloc.alloc([]u8, 1);
+            errdefer alloc.free(names);
+            names[0] = try alloc.dupe(u8, default_full_text_index_name);
+            break :names names;
+        };
         alloc.free(full_text_index_names);
-        const fallback_names = try alloc.alloc([]u8, 1);
-        errdefer alloc.free(fallback_names);
-        fallback_names[0] = try alloc.dupe(u8, default_full_text_index_name);
         full_text_index_names = fallback_names;
         if (active_text_index_name == null) active_text_index_name = try alloc.dupe(u8, default_full_text_index_name);
     }
@@ -374,13 +391,14 @@ pub fn publishedSearchSourcesForTableDefinitionAlloc(
         }
     }
 
-    const sources = try publishedSearchSourcesForDefinitionListsAlloc(
+    var sources = try publishedSearchSourcesForDefinitionListsAlloc(
         alloc,
         active_text_index_name,
         full_text_index_names,
         vector_index_names.items,
         sparse_index_names.items,
     );
+    errdefer deinitPublishedSearchSources(alloc, &sources);
     if (sources.items) |items| {
         for (items) |*item| switch (item.*) {
             .vector => |*value| {
@@ -394,6 +412,37 @@ pub fn publishedSearchSourcesForTableDefinitionAlloc(
         };
     }
     return sources;
+}
+
+test "explicit search source targets do not synthesize managed defaults" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "{}", "{ }", "{\"g\":{\"type\":\"graph\"}}" }) |indexes| {
+        var explicit = try publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(a, "", "", indexes, .explicit_only);
+        defer deinitPublishedSearchSources(a, &explicit);
+        try std.testing.expect(explicit.findText() == null);
+    }
+    var managed = try publishedSearchSourcesForTableDefinitionAlloc(a, "", "", "{}");
+    defer deinitPublishedSearchSources(a, &managed);
+    try std.testing.expect(managed.findText() != null);
+    var declared = try publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(a, "", "", "{\"full_text_index_v0\":{\"type\":\"full_text\"}}", .explicit_only);
+    defer deinitPublishedSearchSources(a, &declared);
+    try std.testing.expectEqualStrings(default_full_text_index_name, declared.findText().?.index_name);
+}
+
+test "search source target policy releases allocation failures and invalid distances" {
+    const Exercise = struct {
+        fn run(a: Allocator, defaults: IndexDefaults, indexes: []const u8) !void {
+            var sources = try publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(a, "", "", indexes, defaults);
+            defer deinitPublishedSearchSources(a, &sources);
+        }
+    };
+    const indexes = "{\"vec\":{\"type\":\"embeddings\",\"distance_metric\":\"cosine\"},\"sparse\":{\"type\":\"embeddings\",\"sparse\":true}}";
+    for ([_]IndexDefaults{ .managed_defaults, .explicit_only }) |defaults| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, indexes });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{}" });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"}}" });
+        try std.testing.expectError(error.InvalidTableIndexMetadata, Exercise.run(std.testing.allocator, defaults, "{\"vec\":{\"type\":\"embeddings\",\"distance_metric\":\"bad\"}}"));
+    }
 }
 
 fn parseEmbeddingsDistanceMetric(config: std.json.ObjectMap) !?shared_vector.DistanceMetric {
@@ -436,8 +485,10 @@ pub fn cloneVectorSourceDescriptorAlloc(
     alloc: Allocator,
     descriptor: VectorSourceDescriptor,
 ) !VectorSourceDescriptor {
+    const index_name = try alloc.dupe(u8, descriptor.index_name);
+    errdefer alloc.free(index_name);
     return .{
-        .index_name = try alloc.dupe(u8, descriptor.index_name),
+        .index_name = index_name,
         .document_source = descriptor.document_source,
         .embedding_name = if (descriptor.embedding_name) |name| try alloc.dupe(u8, name) else null,
         .distance_metric = descriptor.distance_metric,
@@ -448,8 +499,10 @@ pub fn cloneSparseSourceDescriptorAlloc(
     alloc: Allocator,
     descriptor: SparseSourceDescriptor,
 ) !SparseSourceDescriptor {
+    const index_name = try alloc.dupe(u8, descriptor.index_name);
+    errdefer alloc.free(index_name);
     return .{
-        .index_name = try alloc.dupe(u8, descriptor.index_name),
+        .index_name = index_name,
         .document_source = descriptor.document_source,
         .embedding_name = if (descriptor.embedding_name) |name| try alloc.dupe(u8, name) else null,
     };
@@ -589,13 +642,17 @@ pub fn listVectorSourcesAlloc(
             matches.deinit(alloc);
         }
         for (items) |item| switch (item) {
-            .vector => |value| try matches.append(alloc, try cloneVectorSourceDescriptorAlloc(alloc, value)),
+            .vector => |value| {
+                try matches.ensureUnusedCapacity(alloc, 1);
+                matches.appendAssumeCapacity(try cloneVectorSourceDescriptorAlloc(alloc, value));
+            },
             else => {},
         };
         return try matches.toOwnedSlice(alloc);
     }
     if (sources.vector) |value| {
         const out = try alloc.alloc(VectorSourceDescriptor, 1);
+        errdefer alloc.free(out);
         out[0] = try cloneVectorSourceDescriptorAlloc(alloc, value);
         return out;
     }
@@ -613,13 +670,17 @@ pub fn listSparseSourcesAlloc(
             matches.deinit(alloc);
         }
         for (items) |item| switch (item) {
-            .sparse => |value| try matches.append(alloc, try cloneSparseSourceDescriptorAlloc(alloc, value)),
+            .sparse => |value| {
+                try matches.ensureUnusedCapacity(alloc, 1);
+                matches.appendAssumeCapacity(try cloneSparseSourceDescriptorAlloc(alloc, value));
+            },
             else => {},
         };
         return try matches.toOwnedSlice(alloc);
     }
     if (sources.sparse) |value| {
         const out = try alloc.alloc(SparseSourceDescriptor, 1);
+        errdefer alloc.free(out);
         out[0] = try cloneSparseSourceDescriptorAlloc(alloc, value);
         return out;
     }
@@ -794,33 +855,30 @@ pub fn publishedSearchSourcesForDefinitionListsAlloc(
         for (items.items) |*item| deinitSearchSourceDescriptor(alloc, item);
         items.deinit(alloc);
     }
+    try items.ensureTotalCapacity(alloc, full_text_index_names.len + chunk_embedding_index_names.len + sparse_embedding_index_names.len + @as(usize, @intFromBool(active_text_index_name != null)));
     if (active_text_index_name) |name| {
-        try items.append(alloc, .{ .text = .{
-            .index_name = try alloc.dupe(u8, name),
-        } });
+        items.appendAssumeCapacity(.{ .text = try cloneTextSourceDescriptorAlloc(alloc, .{ .index_name = name }) });
     }
     for (full_text_index_names) |name| {
         if (active_text_index_name) |active| {
             if (std.mem.eql(u8, active, name)) continue;
         }
-        try items.append(alloc, .{ .text = .{
-            .index_name = try alloc.dupe(u8, name),
-        } });
+        items.appendAssumeCapacity(.{ .text = try cloneTextSourceDescriptorAlloc(alloc, .{ .index_name = name }) });
     }
     for (chunk_embedding_index_names) |name| {
-        try items.append(alloc, .{ .vector = .{
-            .index_name = try alloc.dupe(u8, name),
+        items.appendAssumeCapacity(.{ .vector = try cloneVectorSourceDescriptorAlloc(alloc, .{
+            .index_name = name,
             .document_source = .chunk_embeddings_or_top_level,
-            .embedding_name = if (std.mem.eql(u8, name, default_chunk_embedding_index_name)) null else try alloc.dupe(u8, name),
+            .embedding_name = if (std.mem.eql(u8, name, default_chunk_embedding_index_name)) null else name,
             .distance_metric = null,
-        } });
+        }) });
     }
     for (sparse_embedding_index_names) |name| {
-        try items.append(alloc, .{ .sparse = .{
-            .index_name = try alloc.dupe(u8, name),
+        items.appendAssumeCapacity(.{ .sparse = try cloneSparseSourceDescriptorAlloc(alloc, .{
+            .index_name = name,
             .document_source = .sparse_embedding,
-            .embedding_name = if (std.mem.eql(u8, name, default_sparse_embedding_index_name)) null else try alloc.dupe(u8, name),
-        } });
+            .embedding_name = if (std.mem.eql(u8, name, default_sparse_embedding_index_name)) null else name,
+        }) });
     }
     if (items.items.len == 0) return .{};
     return publishedSearchSourcesFromOwnedItems(try items.toOwnedSlice(alloc));

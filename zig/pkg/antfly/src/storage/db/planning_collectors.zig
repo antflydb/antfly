@@ -107,8 +107,9 @@ pub fn resolveGraphIndexEstimate(
     index_name: []const u8,
 ) !?query_search.GraphIndexEstimate {
     const entry = core.graphIndex(index_name) orelse return null;
-    var graph_index = entry.index;
-    const graph_stats = try graph_index.stats(alloc);
+    // Planning uses conservative maintained counts; an estimate must not
+    // scan the graph under the request's apply lock during ownership cleanup.
+    const graph_stats = entry.index.operationalStats();
     return .{
         .name = try alloc.dupe(u8, entry.config.name),
         .edge_count = graph_stats.edge_count,

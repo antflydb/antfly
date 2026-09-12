@@ -803,6 +803,7 @@ pub const MetricsResult = struct {
     chunk_embeddings_incomplete_namespaces: usize,
     rerank_terms_incomplete_namespaces: usize,
     published_namespaces: usize,
+    publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize,
     compacted_namespaces: usize,
     compact_head_conflicts: usize,
