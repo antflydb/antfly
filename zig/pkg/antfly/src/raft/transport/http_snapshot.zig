@@ -3534,10 +3534,7 @@ test "async snapshot sender rolls back partial startup and can restart without s
 }
 
 test "http snapshot sender borrows capacity and restarts after refused partial startup" {
-    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
-    defer lane.deinit();
-    var full_lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
-    defer full_lane.deinit();
+    const AdmissionLane = @import("test_admission_lane.zig");
     const Unused = struct {
         fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
             return error.UnexpectedRequest;
@@ -3547,31 +3544,39 @@ test "http snapshot sender borrows capacity and restarts after refused partial s
         }
         fn done() void {}
     };
-    var transport = try HttpSnapshotTransport.initShared(std.testing.allocator, .{
-        .root_dir = "/tmp",
-        .sender_io = lane.io(),
-        .async_send_worker_count = 2,
-    }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute, .supports_concurrent_requests = Unused.supportsConcurrent } }, null, std.testing.io);
-    defer transport.deinit();
-    try std.testing.expectError(error.ConcurrencyUnavailable, transport.startAsyncSender());
-    try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
-    try std.testing.expectEqual(@as(usize, 0), transport.send_workers.len);
-    try std.testing.expect(transport.sender_io == null);
-    // Awaiting the rolled-back future joins its body, but Threaded publishes
-    // completion before decrementing its busy count. Observe eventual capacity
-    // reuse through the public API instead of racing that worker bookkeeping.
-    const deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s;
-    var probe = while (true) {
-        break lane.io().concurrent(Unused.done, .{}) catch {
-            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline)
-                return error.TestBorrowedSenderCapacityNotReleased;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-            continue;
-        };
-    };
-    probe.await(lane.io());
-    transport.cfg.sender_io = full_lane.io();
-    try transport.startAsyncSender();
-    transport.stopAsyncSender();
-    try std.testing.expect(transport.sender_io == null);
+    // Task completion does not guarantee immediate Threaded capacity reuse.
+    // Inject refusal at each startup prefix, then allow a retry on the same
+    // borrowed executor independently of worker-retirement scheduling.
+    for (0..4) |refuse_after| {
+        var lane = AdmissionLane.init(std.testing.allocator, refuse_after);
+        defer lane.deinit();
+        const io = lane.io();
+        {
+            var transport = try HttpSnapshotTransport.initShared(std.testing.allocator, .{
+                .root_dir = "/tmp",
+                .sender_io = io,
+                .async_send_worker_count = 4,
+            }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute, .supports_concurrent_requests = Unused.supportsConcurrent } }, null, std.testing.io);
+            defer transport.deinit();
+            try std.testing.expectError(error.ConcurrencyUnavailable, transport.startAsyncSender());
+            try std.testing.expectEqual(refuse_after, lane.admitted);
+            try std.testing.expectEqual(lane.admitted, lane.awaited);
+            try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
+            try std.testing.expectEqual(@as(usize, 0), transport.send_workers.len);
+            try std.testing.expect(transport.sender_io == null);
+
+            lane.refuse_after = null;
+            try transport.startAsyncSender();
+            try std.testing.expectEqual(refuse_after + 4, lane.admitted);
+            transport.stopAsyncSender();
+            try std.testing.expectEqual(lane.admitted, lane.awaited);
+            try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
+            try std.testing.expectEqual(@as(usize, 0), transport.send_workers.len);
+            try std.testing.expect(transport.sender_io == null);
+        }
+        var probe = try io.concurrent(Unused.done, .{});
+        probe.await(io);
+        try std.testing.expectEqual(refuse_after + 5, lane.admitted);
+        try std.testing.expectEqual(lane.admitted, lane.awaited);
+    }
 }
