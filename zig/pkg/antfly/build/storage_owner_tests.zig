@@ -5,6 +5,13 @@ const std = @import("std");
 const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const runtime = @import("runtime.zig");
 
+/// These sources require separately linked owner suites, not source shards.
+pub const test_sources = [_][]const u8{
+    "kernel_owner_test.zig",
+    "kernel_owner_provisioned_source_test.zig",
+    "enrichment_compute_test.zig",
+};
+
 /// Exercise the same storage archive linked by serving and embedded consumers.
 /// Root composition attaches these runs to the owning test aggregates.
 pub const Result = struct { runs: [3]*std.Build.Step.Run, benchmark: *std.Build.Step.Compile };
@@ -42,7 +49,7 @@ pub fn add(
             const tests = b.addTest(.{
                 .name = if (index == 0) "storage-owner-tests" else if (index == 1) "storage-owner-source-tests" else "storage-owner-enrichment-tests",
                 .root_module = module,
-                .filters = if (index == 0) &.{"storage.kernel_owner_test."} else if (index == 1) &.{"storage.kernel_owner_provisioned_source_test."} else &.{"storage.enrichment_compute_test."},
+                .filters = &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
             });
             runs[index] = @import("test_support.zig").addFilteredTestRunArtifact(b, tests);

@@ -14366,10 +14366,8 @@ pub const DataServer = struct {
                     op.table_contract,
                 );
                 defer runtime.deinit();
-                const merge = runtime.runtime();
-                if (op.allow_doc_identity_reassignment) {
-                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
-                }
+                const transition: antfly.raft.TransitionRuntime = .{ .merge = runtime.runtime() };
+                try transition.execute(.{ .accept_merge_receiver = op });
             }
         }
         self.invalidateLocalGroupStatusCache();
@@ -14443,10 +14441,8 @@ pub const DataServer = struct {
                     op.table_contract,
                 );
                 defer runtime.deinit();
-                const merge = runtime.runtime();
-                if (op.allow_doc_identity_reassignment) {
-                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
-                }
+                const transition: antfly.raft.TransitionRuntime = .{ .merge = runtime.runtime() };
+                try transition.execute(.{ .catch_up_merge_receiver = op });
             }
         }
         self.invalidateLocalGroupStatusCache();
@@ -14551,10 +14547,8 @@ pub const DataServer = struct {
                     op.table_contract,
                 );
                 defer runtime.deinit();
-                const merge = runtime.runtime();
-                if (op.allow_doc_identity_reassignment) {
-                    try merge.recordDocIdentityReassignment(op.donor_group_id, op.receiver_group_id);
-                }
+                const transition: antfly.raft.TransitionRuntime = .{ .merge = runtime.runtime() };
+                try transition.execute(.{ .finalize_merge = op });
             }
         }
         self.invalidateLocalGroupStatusCache();
@@ -21220,7 +21214,7 @@ const RemoteMetadataSource = struct {
         linearizable: bool,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
         const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline|
-            .{ .deadline_ns = deadline }
+            .{ .deadline_ns = deadline, .io = self.io }
         else
             null;
         var last_err: anyerror = error.MissingMetadataApi;
@@ -21228,8 +21222,8 @@ const RemoteMetadataSource = struct {
             ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
             const index = self.metadataReadApiIndexForAttempt(attempt);
             const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| blk: {
-                const now_ns = platform_time.monotonicNs();
-                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt) };
+                const now_ns = self.awakeNs();
+                break :blk .{ .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline, self.base_uris.len - attempt), .io = self.io };
             } else null;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
@@ -21272,7 +21266,7 @@ const RemoteMetadataSource = struct {
             return owned;
         }
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         return last_err;
     }
@@ -21523,13 +21517,13 @@ const RemoteMetadataSource = struct {
         deadline_ns: ?u64,
     ) !antfly.metadata_api.CatalogRoutingSnapshot {
         if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+            if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
         try self.acceptMetadataIdentity(metadata_group_id, metadata_incarnation);
         const source_table = blk: {
             for (source_tables) |*table| {
                 if (deadline_ns) |deadline| {
-                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                    if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
                 }
                 if (std.mem.eql(u8, table.name, table_name)) break :blk table;
             }
@@ -21547,7 +21541,7 @@ const RemoteMetadataSource = struct {
         if (source_table) |table| {
             for (source_ranges) |range| {
                 if (deadline_ns) |deadline| {
-                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                    if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
                 }
                 if (range.table_id == table.table_id) range_count += 1;
             }
@@ -21562,7 +21556,7 @@ const RemoteMetadataSource = struct {
             for (source_ranges) |range| {
                 if (range.table_id != table.table_id) continue;
                 if (deadline_ns) |deadline| {
-                    if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                    if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
                 }
                 ranges[initialized] = try antfly.metadata.table_manager.cloneRoutingRange(self.alloc, range);
                 initialized += 1;
@@ -29239,6 +29233,14 @@ test "data runtime split apply store seeding reuses cached source writer" {
 }
 
 test "data runtime local merge fallback uses its durable table contract" {
+    try exerciseLocalMergeFallback(.finalized);
+}
+
+test "data runtime local merge fallback uses its durable table contract on rollback" {
+    try exerciseLocalMergeFallback(.rolled_back);
+}
+
+fn exerciseLocalMergeFallback(comptime terminal: enum { finalized, rolled_back }) !void {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -29405,6 +29407,13 @@ test "data runtime local merge fallback uses its durable table contract" {
         });
     }
 
+    const record: antfly.metadata.MergeTransitionRecord = .{
+        .transition_id = 9002,
+        .donor_group_id = 190,
+        .receiver_group_id = 191,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = table_contract,
+    };
     var ops = server.localShardOperationAdapter();
     try ops.execute(.{ .accept_merge_receiver = .{
         .transition_id = 9002,
@@ -29413,6 +29422,9 @@ test "data runtime local merge fallback uses its durable table contract" {
         .allow_doc_identity_reassignment = true,
         .table_contract = table_contract,
     } });
+    const accepted = try ops.observeMerge(record);
+    try std.testing.expect(accepted.receiver.receiver_accepts_donor_range);
+    try std.testing.expect(!accepted.receiver.bootstrapped);
     try ops.execute(.{ .catch_up_merge_receiver = .{
         .transition_id = 9002,
         .donor_group_id = 190,
@@ -29420,6 +29432,11 @@ test "data runtime local merge fallback uses its durable table contract" {
         .allow_doc_identity_reassignment = true,
         .table_contract = table_contract,
     } });
+
+    const caught_up = try ops.observeMerge(record);
+    try std.testing.expect(caught_up.receiver.bootstrapped);
+    try std.testing.expect(caught_up.receiver.replay_caught_up);
+    try std.testing.expect(caught_up.receiver.cutover_ready);
 
     if (comptime control_only_storage_sources) {
         var receiver_doc = (try server.read_source.source().lookupGroupLocal(
@@ -29467,6 +29484,33 @@ test "data runtime local merge fallback uses its durable table contract" {
         const donor_state = (try doc_identity.lookupStateTxn(&txn, donor_ordinal)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(target_namespace, "doc:t"), donor_state.canonical_doc_id);
         try std.testing.expect(receiver_ordinal != donor_ordinal);
+    }
+
+    // Exercise terminal actions and exact retries through the same dispatcher.
+    // A successful catch-up alone cannot detect an omitted finalize call.
+    for (0..2) |_| {
+        const action: antfly.metadata.TransitionAction = switch (terminal) {
+            .finalized => .{ .finalize_merge = .{
+                .transition_id = record.transition_id,
+                .donor_group_id = record.donor_group_id,
+                .receiver_group_id = record.receiver_group_id,
+                .allow_doc_identity_reassignment = true,
+                .table_contract = table_contract,
+            } },
+            .rolled_back => .{ .rollback_merge = .{
+                .transition_id = record.transition_id,
+                .donor_group_id = record.donor_group_id,
+                .receiver_group_id = record.receiver_group_id,
+                .allow_doc_identity_reassignment = true,
+                .table_contract = table_contract,
+            } },
+        };
+        try ops.execute(action);
+        const completed = try ops.observeMerge(record);
+        try std.testing.expectEqual(
+            @field(antfly.data.storage.range_transition.TransitionPhase, @tagName(terminal)),
+            completed.receiver.phase,
+        );
     }
 }
 
@@ -41935,8 +41979,8 @@ test "remote routing capture cache and session share a virtual deadline clock" {
                     .metadata_group_id = 1,
                     .metadata_incarnation = .{'1'} ** 32,
                     .catalog_revision = 9,
-                    .tables = &.{},
-                    .ranges = &.{},
+                    .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }}),
+                    .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "" }}),
                 }, .{});
             };
             return .{ .status = 200, .body = body };
@@ -41957,9 +42001,21 @@ test "remote routing capture cache and session share a virtual deadline clock" {
     defer session.deinit();
     try std.testing.expectEqual(@as(u64, 0), session.catalog().budget(deadline).nowNs());
     try session.catalog().budget(deadline).checkpoint();
+    for ([_]bool{ false, true }) |linearizable| {
+        var table = try source.remoteTableRoutingSnapshotWithMode("docs", deadline, linearizable);
+        defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &table);
+        try std.testing.expectEqualStrings("docs", table.tables[0].name);
+        try std.testing.expectEqual(@as(usize, 1), table.ranges.len);
+    }
     vopr_io.monotonic_ns = deadline;
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.catalog().budget(deadline).checkpoint());
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithMode(deadline, false));
+    const calls_before_expiry = stub.calls;
+    for ([_]bool{ false, true }) |linearizable| {
+        try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteTableRoutingSnapshotWithMode("docs", deadline, linearizable));
+    }
+    try std.testing.expectEqual(calls_before_expiry, stub.calls);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.ownedTableRoutingSnapshotUntil(1, .{'1'} ** 32, 9, "docs", captured.tables, captured.ranges, deadline));
     vopr_io.monotonic_ns += metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms;
     var refreshed = try source.remoteRoutingSnapshotWithMode(@intCast(vopr_io.monotonic_ns + std.time.ns_per_s), false);
     defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &refreshed);

@@ -90,6 +90,9 @@ pub const NativeSnapshotAttemptMarker = struct {
     created_at_unix_ns: i128,
 };
 
+/// Process/crash ownership for one native snapshot export. The kernel lease is
+/// the authority that an attempt is still active; wall-clock age is used only
+/// to bound how often abandoned attempts are considered for reclamation.
 pub const NativeSnapshotAttempt = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1860,4 +1863,91 @@ fn runTestBeforeBatchExecutionHook() void {
 
 fn runTestBeforeNativeBackupCopyHook() void {
     if (comptime builtin.is_test) @import("../api/local_write_test_hooks.zig").runTestBeforeNativeBackupCopyHook();
+}
+
+test "native backup local attempt tokens are retry unique" {
+    const first = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(first);
+    const second = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, "backup-g7-attempt-"));
+}
+
+test "native backup reclaims crash-left snapshot attempts from durable markers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-00000000000000000000000000000000";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer attempt.deinit();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+    const staging_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/.{s}.staging-deadbeef", .{ db_path, token });
+    defer alloc.free(staging_root);
+    try fs_paths.createDirPathPortable(std.testing.io, staging_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, staging_root, .{}));
+}
+
+test "native backup reclaims a crash marker before snapshot root creation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-11111111111111111111111111111111";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+}
+
+test "native backup never reclaims an old attempt with a live lease" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-22222222222222222222222222222222";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer attempt.deinit();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.Io.Dir.cwd().access(std.testing.io, attempt.marker_path, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{});
 }

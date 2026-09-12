@@ -4493,6 +4493,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         &.{
             "storage.db.aggregations.",
+            "storage.db.aggregations_contract.",
             "storage.db.apply_rw_lock.",
             "storage.db.artifact_ids.",
             "storage.db.backfill_state.",
@@ -4511,11 +4512,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_edge_contender.",
             "storage.db.graph_state_name.",
             "storage.db.lease.",
-            "storage.db.merge_state.",
+            "storage.db.merge_contract.",
             "storage.db.mod.",
             "storage.db.native_backup.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
+            "storage.db.planning_bindings.",
             "storage.db.promotion_runtime.",
             "storage.db.publication.",
             "storage.db.query_metrics.",
@@ -4526,6 +4528,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.snapshot_admission.",
             "storage.db.template_remote_stub.",
             "storage.db.template_stub.",
+            "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
@@ -4557,6 +4560,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.backup_codec.",
             "storage.backup_repository.",
             "storage.coverage_identity.",
+            "storage.data_raft_projection_wire.",
             "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
@@ -4567,7 +4571,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
             "storage.internal_keys.",
+            "storage.kernel_owner_client.",
+            "storage.kernel_wal_wire.",
             "storage.lmdb.",
+            "storage.local_write.",
             "storage.lmdb_backend.",
             "storage.lmdb_vopr.",
             "storage.maintenance.",
@@ -4620,6 +4627,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         for (shard_filters) |shard_filter| {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
         }
+    }
+    for (@import("storage_owner_tests.zig").test_sources) |source| {
+        unit_storage_shard_audit.addArg("--dedicated");
+        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
     unit_storage_shard_audit.addArg("--runtime-partition-source");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/db/db.zig"));

@@ -3,9 +3,10 @@
 
 //! Authoritative storage-test discovery surface.
 //!
-//! Every storage source containing a test declaration is imported exactly once
-//! here. The bounded shard builds compile this manifest through root.zig and
-//! select disjoint test-name prefixes. The accompanying audit rejects missing,
+//! Storage sources containing tests are imported exactly once here, except
+//! dedicated ABI suites declared by build/storage_owner_tests.zig. The bounded
+//! shard builds compile this manifest through root.zig and select disjoint
+//! test-name prefixes. The accompanying audit rejects missing,
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
@@ -62,7 +63,7 @@ comptime {
     _ = @import("db/catalog/index_manager.zig");
     _ = @import("db/catalog/resolver_catalog.zig");
     _ = @import("db/config.zig");
-    _ = @import("antfly_source_root").antfly_sources.physical_db;
+    _ = @import("db/db.zig");
     _ = @import("db/dense_exact.zig");
     _ = @import("db/derived/apply_state.zig");
     _ = @import("db/derived/backlog_tracker.zig");
@@ -103,8 +104,8 @@ comptime {
     _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
-    _ = @import("db/merge_state.zig");
-    _ = @import("antfly_source_root").antfly_sources.selected_db;
+    _ = @import("db/merge_contract.zig");
+    _ = @import("db/mod.zig");
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_bindings.zig");
@@ -192,6 +193,7 @@ comptime {
     _ = @import("lite/native.zig");
     _ = @import("lite/paths.zig");
     _ = @import("lite/restore_staging.zig");
+    _ = @import("local_write.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
     _ = @import("lmdb_vopr.zig");
