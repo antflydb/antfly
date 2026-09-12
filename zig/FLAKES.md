@@ -4,6 +4,22 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-12: combined unit build/test budget terminates progressing DB-core (#716)
+
+[The Linux unit job](https://github.com/antflydb/antfly/actions/runs/34714680318/job/103609868433)
+started its combined build/test step at 19:49:03 UTC, but DB-core execution only
+started at 20:41:19. The hard watchdog terminated the step at 20:49:05 after
+3,602 seconds. The remaining partition advanced from test 512 to 539 in the
+last 45 seconds; the category partition had already passed. No assertion
+failures or OOM kills were reported. The physical-usage tests and original
+physical-churn benchmark passed, including both GC configurations.
+
+Increase the combined hard limit from 60 to 90 minutes while preserving the
+30-minute idle watchdog and 120-minute outer job limit. The build-tooling
+contract tests check these defaults and their ordering. This gives cold builds
+execution headroom; it does not establish that a future run will complete or
+replace future work on phase-specific budgets and per-partition progress.
+
 ## 2026-09-12: physical-churn measurement races obsolete-file deletion (#503)
 
 [PR #503's Linux unit job](https://github.com/antflydb/antfly/actions/runs/34672950333/job/103497870209)
