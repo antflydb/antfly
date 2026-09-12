@@ -207,6 +207,25 @@ namespace. Add `--deployment cluster` to exercise durable metadata projections
 and per-group runtime report selection. Page and concurrent workloads are opt-in
 so the same harness can measure an older binary that lacks pagination.
 
+## Scoped relational application workloads
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --binary zig-out/bin/antfly --scenario catalog --storage-mode relational \
+  --table-counts 10 --samples 10 --warmup 3 \
+  --output /tmp/system-catalog-relational.json
+```
+
+This models tenant event tables backed by authoritative packed rows: scoped point
+reads, search, customer joins, repeated-target NDJSON requests, concurrent reads,
+inventory discovery and identity-preserving rename. The fixture uses a closed
+schema with a required body and optional customer key. Add `--schema-fields 200`
+for wide rows or `--deployment cluster` for replicated metadata and data routing.
+The `listing` scenario also accepts `--storage-mode relational`; other scenarios
+reject it because their fixtures have different schema requirements. Provisioning
+and shard readiness stay outside steady-state read measurements. Each operation
+checks its result, but latency is an observation rather than a test assertion.
+
 ## Many-range control-plane reports and heartbeat framing
 
 ```sh

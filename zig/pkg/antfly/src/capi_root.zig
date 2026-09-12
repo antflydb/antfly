@@ -36,3 +36,4 @@ pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
 pub const testing = @import("common/test_directory.zig");
+pub const test_error_logs = @import("test_error_logs.zig");

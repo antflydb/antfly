@@ -3363,6 +3363,16 @@ export interface components {
             name: string;
         };
         /**
+         * @description The metadata mutation committed, but requested visibility or local
+         *     materialization is not yet fully healthy. Clients must observe status
+         *     instead of automatically replaying the mutation. `committed_superseded`
+         *     is terminal: a newer schema version became visible first.
+         */
+        CommittedMutationOutcome: {
+            /** @enum {string} */
+            status: "committed_visibility_pending" | "committed_superseded" | "committed_repair_required" | "committed_repair_unavailable";
+        };
+        /**
          * @description RFC 7396 JSON Merge Patch for a table schema. Object members are merged
          *     recursively; null removes a member. The resulting document must be a
          *     valid TableSchema and `version` remains server-managed.
@@ -16168,6 +16178,15 @@ export interface components {
         };
     };
     responses: {
+        /** @description Mutation committed with pending visibility or explicit repair debt */
+        CommittedMutationAccepted: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["CommittedMutationOutcome"];
+            };
+        };
         /** @description Bad request */
         BadRequest: {
             headers: {
@@ -17689,6 +17708,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["IndexMutationBadRequest"];
             /** @description Durable destinations cannot be bound to this credential type */
             422: {
@@ -17714,6 +17734,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            202: components["responses"]["CommittedMutationAccepted"];
             /** @description Table dropped successfully */
             204: {
                 headers: {
@@ -18026,6 +18047,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -18063,6 +18085,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -19449,7 +19472,7 @@ export interface operations {
         };
         responses: {
             /** @description Table created */
-            200: {
+            201: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -19457,6 +19480,7 @@ export interface operations {
                     "application/json": components["schemas"]["TableStatus"];
                 };
             };
+            202: components["responses"]["CommittedMutationAccepted"];
             400: components["responses"]["BadRequest"];
             /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
             501: {
@@ -19483,6 +19507,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            202: components["responses"]["CommittedMutationAccepted"];
             /** @description Table dropped */
             204: {
                 headers: {

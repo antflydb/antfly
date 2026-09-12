@@ -459,7 +459,7 @@ pub const GraphIndex = struct {
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
-                    if (handle.backend.runs.items.len != 0) return;
+                    if (handle.backend.runs.count() != 0) return;
                     try handle.backend.persistManifest();
                 },
             }

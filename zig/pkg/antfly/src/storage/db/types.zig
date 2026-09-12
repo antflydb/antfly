@@ -1230,7 +1230,55 @@ pub const LookupResult = struct {
     }
 };
 
+pub const ColumnarScanStats = struct {
+    scan_plans_built: u64 = 0,
+    scan_plan_hits: u64 = 0,
+    selection_reused_rows: u64 = 0,
+    primary_predicate_rows: u64 = 0,
+    late_materialized_rows: u64 = 0,
+    late_materialized_bytes: u64 = 0,
+    column_view_bytes: u64 = 0,
+    logical_slots_initialized: u64 = 0,
+    decoded_cache_hits: u64 = 0,
+    decoded_cache_misses: u64 = 0,
+    decoded_cache_admissions: u64 = 0,
+    decoded_cache_evictions: u64 = 0,
+    decoded_cache_bypasses: u64 = 0,
+    decoded_cache_peak_bytes: u64 = 0,
+    overlay_tombstones_skipped: u64 = 0,
+    cell_slots_initialized: u64 = 0,
+    cell_cache_hits: u64 = 0,
+    payload_pages_read: u64 = 0,
+    primary_owners_examined: u64 = 0,
+    used: bool = false,
+    blocks_read: u64 = 0,
+    blocks_pruned: u64 = 0,
+    columns_read: u64 = 0,
+    encoded_bytes_read: u64 = 0,
+    metadata_bytes_read: u64 = 0,
+    column_metadata_reads: u64 = 0,
+    overlay_rows_read: u64 = 0,
+    dense_delta_scans: u64 = 0,
+    costed_dirty_records: u64 = 0,
+    estimated_overlay_bytes: u64 = 0,
+    estimated_primary_bytes: u64 = 0,
+    uncovered_ranges_read: u64 = 0,
+    payload_bytes_read: u64 = 0,
+    rows_selected: u64 = 0,
+    values_materialized: u64 = 0,
+    dirty_ranges_read: u64 = 0,
+    primary_rows_read: u64 = 0,
+};
+
 pub const ScanOptions = struct {
+    /// Internal differential-testing and benchmark baseline; never serialized.
+    disable_columnar_scan: bool = false,
+    /// Internal request-local decoded payload reuse budget. Includes retained
+    /// payload allocations and cache metadata; excludes active block workspace.
+    /// Zero disables cross-block reuse. Never serialized on the wire.
+    columnar_decoded_cache_bytes: usize = 1024 * 1024,
+    /// Optional request-local instrumentation; never part of the wire format.
+    columnar_stats: ?*ColumnarScanStats = null,
     inclusive_from: bool = false,
     exclusive_to: bool = false,
     include_documents: bool = false,
@@ -1241,6 +1289,12 @@ pub const ScanOptions = struct {
     /// Internal-only response mode used by linear merge. Public scans leave
     /// this false and retain their existing NDJSON shape.
     include_content_hashes: bool = false,
+    /// Internal request lifetime controls. These are deliberately omitted from
+    /// the scan wire body: each transport hop derives its own remaining budget
+    /// and borrows the caller's cancellation source only for the synchronous
+    /// scan lifetime.
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
 };
 
 pub const ScanDocument = struct {
@@ -1263,6 +1317,20 @@ pub const ScanHash = struct {
         alloc.free(self.id);
         self.* = undefined;
     }
+};
+
+/// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
+/// duration of the callback; consumers that retain them must copy them.
+pub const ScanVisitEntry = struct {
+    id: []const u8,
+    hash: u64,
+    content_hash: ?DocumentContentHash = null,
+    document_json: ?[]const u8 = null,
+};
+
+pub const ScanVisitor = struct {
+    context: ?*anyopaque,
+    visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
 };
 
 pub const ScanResult = struct {
@@ -2648,7 +2716,42 @@ pub const VisibilityStats = struct {
     overflow_total: u64 = 0,
 };
 
+pub const ColumnarMaintenanceStats = struct {
+    /// Typed source rows reused by clean coverage coalescing (no AROW reads).
+    covered_rows_read: u64 = 0,
+    cell_slots_examined: u64 = 0,
+    payloads_reused: u64 = 0,
+    payload_bytes_written: u64 = 0,
+    payload_encoding_bytes: u64 = 0,
+    payload_slices_repacked: u64 = 0,
+    /// Authoritative rows decoded during bootstrap/dirty range preparation.
+    primary_rows_read: u64 = 0,
+    admission_root_reads: u64 = 0,
+    admission_dirty_probes: u64 = 0,
+    owners_examined: u64 = 0,
+    scheduler_candidates: u64 = 0,
+    scheduler_commits: u64 = 0,
+    waiting_until_ns: u64 = 0,
+    ranges_deferred: u64 = 0,
+    bootstrap_quanta: u64 = 0,
+    bytes_written: u64 = 0,
+    pending: bool = false,
+    backing_off: bool = false,
+    /// Age since this process observed pending work, not the row's write time.
+    pending_age_ns: u64 = 0,
+    passes: u64 = 0,
+    ranges_compacted: u64 = 0,
+    blocks_written: u64 = 0,
+    rows_written: u64 = 0,
+    ranges_merged: u64 = 0,
+    dirty_markers_cleared: u64 = 0,
+    gc_records_deleted: u64 = 0,
+    failures: u64 = 0,
+    last_pass_ns: u64 = 0,
+};
+
 pub const DBStats = struct {
+    columnar_maintenance: ColumnarMaintenanceStats = .{},
     /// Process-local identity of the resident DB owner that sampled this
     /// status. Cache merge logic uses it only with an exact table root and
     /// index incarnation; it is not part of the public status contract.
@@ -2659,6 +2762,11 @@ pub const DBStats = struct {
     /// Canonical live primary-document cardinality from durable identity metadata.
     /// Unlike doc_count, this is independent of derived index fan-out.
     source_doc_count: u64 = 0,
+    /// Active immutable schema epoch and durable table-catalog state.
+    schema_epoch: u32 = 0,
+    row_format_version: u32 = 0,
+    table_catalog_generation: u64 = 0,
+    schema_index_state: []const u8 = "none",
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},

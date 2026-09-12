@@ -213,6 +213,27 @@ fn queryRequestCancellation(req: db_mod.types.SearchRequest) http_common.Request
     return if (req.cancellation) |token| .fromToken(token) else .{};
 }
 
+fn checkScanOptionsActive(opts: db_mod.types.ScanOptions) !void {
+    if (opts.cancellation) |value| {
+        if (value.isCancelled()) return error.Canceled;
+    }
+    const deadline_ns = opts.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.DeadlineExceeded;
+}
+
+fn scanRemainingTimeoutMs(opts: db_mod.types.ScanOptions) !?u32 {
+    try checkScanOptionsActive(opts);
+    const deadline_ns = opts.execution_deadline_ns orelse return null;
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= deadline_ns) return error.DeadlineExceeded;
+    const remaining_ns = deadline_ns - now_ns;
+    const rounded_ms = @max(
+        @as(u64, 1),
+        std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1,
+    );
+    return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
+
 fn checkLookupOptionsActive(opts: db_mod.types.LookupOptions) !void {
     if (opts.cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
@@ -320,6 +341,31 @@ const algebraic_planner = db_mod.algebraic.planner;
 
 pub const LookupResponse = table_read_source.LookupResponse;
 pub const ScanResponse = table_read_source.ScanResponse;
+pub const ScanStreamSink = table_read_source.ScanStreamSink;
+
+const ScanStartOnce = struct {
+    downstream: ScanStreamSink,
+    started: bool = false,
+    lines: u32 = 0,
+
+    fn sink(self: *@This()) ScanStreamSink {
+        return .{ .context = self, .start_fn = start, .write_fn = write };
+    }
+
+    fn start(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+        if (self.started) return;
+        try self.downstream.start();
+        self.started = true;
+    }
+
+    fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+        try start(self);
+        try self.downstream.write(bytes);
+        self.lines +|= @intCast(std.mem.count(u8, bytes, "\n"));
+    }
+};
 pub const TextStatsResponse = table_read_source.TextStatsResponse;
 pub const BackgroundTextStatsResponse = table_read_source.BackgroundTextStatsResponse;
 pub const LsmStorageStats = table_read_source.LsmStorageStats;
@@ -2456,11 +2502,13 @@ pub const BoundTableReadSource = struct {
             .vtable = &.{
                 .lookup = lookup,
                 .scan = scan,
+                .scan_stream = scanStream,
                 .query = query,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_stream = scanGroupLocalStream,
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
@@ -2581,20 +2629,33 @@ pub const BoundTableReadSource = struct {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
 
-        var result = try self.reads.scanWithConsistency(alloc, self.db, from_key, to_key, opts, consistency);
-        defer result.deinit(alloc);
-
-        var out = std.ArrayListUnmanaged(u8).empty;
-        defer out.deinit(alloc);
-
-        for (result.hashes, 0..) |entry, i| {
-            const json = if (opts.include_documents) result.documents[i].json else null;
-            try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
-        }
-
         return .{
-            .ndjson = try out.toOwnedSlice(alloc),
+            .ndjson = try scanNdjsonWithConsistencyAlloc(
+                alloc,
+                self.reads,
+                self.db,
+                from_key,
+                to_key,
+                opts,
+                consistency,
+            ),
         };
+    }
+
+    fn scanStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return false;
+        try scanNdjsonWithConsistencyToSink(alloc, self.reads, self.db, from_key, to_key, opts, consistency, sink);
+        return true;
     }
 
     fn query(
@@ -2658,7 +2719,10 @@ pub const BoundTableReadSource = struct {
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
         try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{ .source_table = table_name });
+        try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
+            .source_table = table_name,
+            .backend_runtime = self.db.backend_runtime,
+        });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
         const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -2735,6 +2799,20 @@ pub const BoundTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         return try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn scanGroupLocalStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        return try scanStream(ptr, alloc, table_name, from_key, to_key, opts, consistency, sink);
     }
 
     fn queryGroupLocal(
@@ -3245,6 +3323,7 @@ pub const ProvisionedTableReadSource = struct {
             .vtable = &.{
                 .lookup = lookup,
                 .scan = scan,
+                .scan_stream = scanStream,
                 .query = query,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
@@ -3252,7 +3331,9 @@ pub const ProvisionedTableReadSource = struct {
                 .lookup_group_local = lookupGroupLocal,
                 .lookup_group_local_routed = lookupGroupLocalRouted,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_stream = scanGroupLocalStream,
                 .scan_group_local_routed = scanGroupLocalRouted,
+                .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
                 .query_group_local = queryGroupLocal,
                 .query_group_local_routed = queryGroupLocalRouted,
                 .search_result_group_local = searchResultGroupLocal,
@@ -3463,6 +3544,67 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             return .{ .route = route.route, .metadata_group_id = route.metadata_group_id, .metadata_incarnation = route.metadata_incarnation, .table_id = if (route.route) |value| value.identity_namespace.table_id else 0, .catalog_revision = route.catalog_revision, .topology_epoch = route.topology_epoch, .activity = activity };
+        }
+        unreachable;
+    }
+
+    fn scanStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        var attempt: usize = 0;
+        retry: while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var prepared = try self.prepareRoutedSpanRead(alloc, table_name, from_key, to_key, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general);
+            defer prepared.deinit();
+            const group_ids = prepared.group_ids;
+            if (group_ids.len == 0) return false;
+            try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+            var stream = ScanStartOnce{ .downstream = sink };
+            for (group_ids, prepared.routes) |group_id, group_route| {
+                var group_opts = opts;
+                if (opts.limit > 0) {
+                    if (stream.lines >= opts.limit) break;
+                    group_opts.limit = opts.limit - stream.lines;
+                }
+                scanProvisionedHostedLocalToSink(
+                    self.resident_db,
+                    self.cache,
+                    self.replica_root_dir,
+                    self.catalog,
+                    self.read_safety_barrier,
+                    alloc,
+                    group_id,
+                    self.visibleRootGeneration(group_id),
+                    self.backend_runtime,
+                    table_name,
+                    from_key,
+                    to_key,
+                    group_opts,
+                    .stale,
+                    true,
+                    docIdentityNamespaceForRoute(group_route),
+                    stream.sink(),
+                ) catch |err| switch (err) {
+                    error.ResidentDbRetryRequired => {
+                        if (stream.started) return err;
+                        prepared.releaseActivity();
+                        try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
+                        if (attempt + 1 < topology_read_attempt_limit) continue :retry;
+                        return error.StorageReadTemporarilyUnavailable;
+                    },
+                    else => return err,
+                };
+            }
+            try stream.sink().start();
+            return true;
         }
         unreachable;
     }
@@ -4160,6 +4302,15 @@ pub const ProvisionedTableReadSource = struct {
         return try scanGroupLocal(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
+    fn scanGroupLocalRoutedStream(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency, sink: ScanStreamSink) !bool {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try scanGroupLocalStream(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency, sink);
+    }
+
     fn queryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -4406,6 +4557,41 @@ pub const ProvisionedTableReadSource = struct {
                 },
                 else => return err,
             };
+        }
+        unreachable;
+    }
+
+    fn scanGroupLocalStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            var stream = ScanStartOnce{ .downstream = sink };
+            scanProvisionedHostedLocalToSink(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, .stale, true, null, stream.sink()) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (stream.started) return err;
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+            try stream.sink().start();
+            return true;
         }
         unreachable;
     }
@@ -4867,7 +5053,7 @@ fn mergeObservedDynamicFieldCapabilitySet(
     for (merged.items) |*existing| {
         if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
         for (incoming.field_capabilities) |capability| {
-            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
+            if (try mergeObservedFieldCapabilityIntoSet(alloc, existing.field_capabilities, capability)) continue;
             const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
             const old_len = existing.field_capabilities.len;
             const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
@@ -4892,12 +5078,13 @@ fn mergeObservedDynamicFieldCapabilitySet(
 }
 
 fn mergeObservedFieldCapabilityIntoSet(
+    alloc: std.mem.Allocator,
     capabilities: []storage_schema.FieldCapability,
     needle: storage_schema.FieldCapability,
-) bool {
+) !bool {
     for (capabilities) |*capability| {
         if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
-        mergeObservedFieldCapability(capability, needle);
+        try mergeObservedFieldCapability(alloc, capability, needle);
         return true;
     }
     return false;
@@ -4917,23 +5104,33 @@ fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, righ
 }
 
 fn mergeObservedFieldCapability(
+    alloc: std.mem.Allocator,
     existing: *storage_schema.FieldCapability,
     incoming: storage_schema.FieldCapability,
-) void {
+) !void {
     existing.searchable = existing.searchable and incoming.searchable;
     existing.filterable = existing.filterable and incoming.filterable;
     existing.aggregatable = existing.aggregatable and incoming.aggregatable;
     existing.doc_values = existing.doc_values and incoming.doc_values;
     existing.sortable = existing.sortable and incoming.sortable;
-    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
-    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
-    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
+    try replaceOwnedCapabilityState(alloc, &existing.doc_value_coverage, storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedCapabilityState(alloc, &existing.queryability_state, storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedCapabilityState(alloc, &existing.sort_lifecycle_state, storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
-        existing.missing_null_policy = "mixed";
+        try replaceOwnedCapabilityState(alloc, &existing.missing_null_policy, "mixed");
     }
     if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
         existing.index_sort = null;
     }
+}
+
+fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8, replacement: []const u8) !void {
+    if (std.mem.eql(u8, state.*, replacement)) return;
+    // Conservative-state helpers return borrowed strings. Preserve the owned
+    // aggregate's contract, including when allocation fails or aliases input.
+    const owned = try alloc.dupe(u8, replacement);
+    alloc.free(state.*);
+    state.* = owned;
 }
 
 fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -4944,6 +5141,36 @@ fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
 fn indexSortMembershipEqual(left: ?storage_schema.IndexSortMembership, right: ?storage_schema.IndexSortMembership) bool {
     if (left == null or right == null) return left == null and right == null;
     return left.?.position == right.?.position and left.?.desc == right.?.desc;
+}
+
+test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var source = storage_schema.observedDynamicFieldCapability(null, "price", .{
+                .field_type = .numeric,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = true,
+            });
+            source.doc_value_coverage = "covered";
+            source.queryability_state = "queryable";
+            storage_schema.refreshSortLifecycleState(&source);
+            var owned = try storage_schema.cloneFieldCapabilityAlloc(alloc, source);
+            defer storage_schema.freeOwnedFieldCapability(alloc, owned);
+            const incoming = storage_schema.observedDynamicFieldCapability(null, "price", .{
+                .field_type = .numeric,
+                .do_index = true,
+                .doc_values = true,
+                .sortable = true,
+            });
+            try mergeObservedFieldCapability(alloc, &owned, incoming);
+            var differing_policy = incoming;
+            differing_policy.missing_null_policy = "different";
+            try mergeObservedFieldCapability(alloc, &owned, differing_policy);
+            try std.testing.expectEqualStrings("mixed", owned.missing_null_policy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "provisioned observed dynamic capability merge is conservative across groups" {
@@ -5125,7 +5352,88 @@ pub const HostedProvisionedTableReadSource = struct {
     }
 
     fn internalExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
-        return .{ .ptr = self, .vtable = &.{ .execute = executeInternalRequest } };
+        return .{ .ptr = self, .vtable = &.{
+            .execute = executeInternalRequest,
+            .execute_stream = executeInternalRequestStream,
+        } };
+    }
+
+    fn executeInternalRequestStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: http_common.HttpRequest,
+        writer: http_common.StreamWriter,
+    ) anyerror!bool {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        var routed_request = request;
+        var encoded_fence: ?[]u8 = null;
+        defer if (encoded_fence) |value| alloc.free(value);
+        var owned_headers: ?[]http_common.RequestHeader = null;
+        defer if (owned_headers) |value| alloc.free(value);
+        var route_deadline_buf: [10]u8 = undefined;
+        if (internalGroupIdFromUri(request.uri)) |group_id| {
+            if (!isJoinJobStateRequest(request)) {
+                const resolve = self.catalog.vtable.route_fence orelse return error.CatalogRouteFenceRequired;
+                const fence = (try resolve(self.catalog.ptr, group_id)) orelse return error.CatalogRouteFenceRequired;
+                encoded_fence = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+                const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 2);
+                @memcpy(headers[0..request.headers.len], request.headers);
+                headers[request.headers.len] = .{
+                    .name = metadata_api.catalog_route_fence_header,
+                    .value = encoded_fence.?,
+                };
+                headers[request.headers.len + 1] = .{
+                    .name = metadata_api.catalog_route_deadline_ms_header,
+                    .value = try std.fmt.bufPrint(&route_deadline_buf, "{d}", .{@min(
+                        request.timeout_ms orelse metadata_api.catalog_route_default_deadline_ms,
+                        metadata_api.catalog_route_max_deadline_ms,
+                    )}),
+                };
+                owned_headers = headers;
+                routed_request.headers = headers;
+            }
+        }
+
+        const FenceWriter = struct {
+            downstream: http_common.StreamWriter,
+            require_ack: bool,
+
+            fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.require_ack) {
+                    var ack: ?[]const u8 = null;
+                    for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_ack_header)) {
+                        ack = header.value;
+                        break;
+                    };
+                    if (ack == null or !std.mem.eql(u8, ack.?, metadata_api.catalog_route_fence_ack_value))
+                        return error.StorageReadTemporarilyUnavailable;
+                }
+                try adapter.downstream.start(response_alloc, response);
+            }
+
+            fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.downstream.writeAll(bytes);
+            }
+
+            fn flush(raw: *anyopaque) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.downstream.flush();
+            }
+
+            fn streamWriter(adapter: *@This()) http_common.StreamWriter {
+                return .{ .ptr = adapter, .vtable = &.{
+                    .start = start,
+                    .write_all = writeAll,
+                    .flush = flush,
+                } };
+            }
+        };
+        var fence_writer = FenceWriter{ .downstream = writer, .require_ack = encoded_fence != null };
+        return (try client.executeRequestStream(routed_request, fence_writer.streamWriter())) orelse false;
     }
 
     fn executeInternalRequest(
@@ -5330,6 +5638,15 @@ pub const HostedProvisionedTableReadSource = struct {
         return try scanGroupLocal(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
+    fn scanGroupLocalRoutedStream(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency, sink: ScanStreamSink) !bool {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try scanGroupLocalStream(&routed, alloc, group_id, table_name, from_key, to_key, opts, consistency, sink);
+    }
+
     fn queryGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5435,6 +5752,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .vtable = &.{
                 .lookup = lookup,
                 .scan = scan,
+                .scan_stream = scanStream,
                 .query = query,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
@@ -5442,7 +5760,9 @@ pub const HostedProvisionedTableReadSource = struct {
                 .lookup_group_local = lookupGroupLocal,
                 .lookup_group_local_routed = lookupGroupLocalRouted,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_stream = scanGroupLocalStream,
                 .scan_group_local_routed = scanGroupLocalRouted,
+                .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
                 .query_group_local = queryGroupLocal,
                 .query_group_local_routed = queryGroupLocalRouted,
                 .search_result_group_local = searchResultGroupLocal,
@@ -5697,6 +6017,38 @@ pub const HostedProvisionedTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
+        const Capture = struct {
+            alloc: std.mem.Allocator,
+            bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+            fn sink(state: *@This()) ScanStreamSink {
+                return .{ .context = state, .start_fn = start, .write_fn = write };
+            }
+
+            fn start(_: ?*anyopaque) anyerror!void {}
+
+            fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                try state.bytes.appendSlice(state.alloc, bytes);
+            }
+        };
+        var capture = Capture{ .alloc = alloc };
+        defer capture.bytes.deinit(alloc);
+        if (!(try scanStream(ptr, alloc, table_name, from_key, to_key, opts, consistency, capture.sink())))
+            return null;
+        return .{ .ndjson = try capture.bytes.toOwnedSlice(alloc) };
+    }
+
+    fn scanStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, null);
         defer routing_session.deinit();
@@ -5706,33 +6058,37 @@ pub const HostedProvisionedTableReadSource = struct {
         var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, null);
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
-        if (group_ids.len == 0) return null;
+        if (group_ids.len == 0) return false;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
 
-        var out = std.ArrayListUnmanaged(u8).empty;
-        defer out.deinit(alloc);
-        var emitted: u32 = 0;
-
+        var stream = ScanStartOnce{ .downstream = sink };
         for (group_ids) |group_id| {
             var group_opts = opts;
             if (opts.limit > 0) {
-                if (emitted >= opts.limit) break;
-                group_opts.limit = opts.limit - emitted;
+                if (stream.lines >= opts.limit) break;
+                group_opts.limit = opts.limit - stream.lines;
             }
-
-            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return false;
             defer route.deinit(alloc);
-
-            var result = switch (route) {
-                .local => try self.scanLocal(alloc, group_id, table_name, from_key, to_key, group_opts, consistency),
-                .remote => |remote| try scanRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
-            } orelse return null;
-            defer result.deinit(alloc);
-
-            try out.appendSlice(alloc, result.ndjson);
-            emitted += @intCast(std.mem.count(u8, result.ndjson, "\n"));
+            switch (route) {
+                .local => try scanProvisionedHostedLocalToSink(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency, false, null, stream.sink()),
+                .remote => |remote| {
+                    if (!(try scanRemoteToSink(
+                        self.internalExecutor(),
+                        alloc,
+                        remote.base_uri,
+                        group_id,
+                        table_name,
+                        from_key,
+                        to_key,
+                        group_opts,
+                        stream.sink(),
+                    ))) return false;
+                },
+            }
         }
-        return .{ .ndjson = try out.toOwnedSlice(alloc) };
+        try stream.sink().start();
+        return true;
     }
 
     fn query(
@@ -6015,6 +6371,24 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?ScanResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try self.scanLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn scanGroupLocalStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+        sink: ScanStreamSink,
+    ) !bool {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var stream = ScanStartOnce{ .downstream = sink };
+        try scanProvisionedHostedLocalToSink(null, null, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency, false, null, stream.sink());
+        try stream.sink().start();
+        return true;
     }
 
     fn queryGroupLocal(
@@ -10650,7 +11024,7 @@ fn lookupLocal(
     defer db.close();
     try checkLookupOptionsActive(opts);
 
-    var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
+    const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
@@ -10732,7 +11106,7 @@ fn lookupProvisionedLocal(
     defer db.close();
     try checkLookupOptionsActive(opts);
 
-    var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
+    const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     var result = (try reads.lookupWithConsistency(alloc, &db, key, opts, consistency)) orelse return null;
     defer result.deinit(alloc);
     const version = try db.getTimestamp(alloc, key);
@@ -10883,17 +11257,8 @@ fn scanLocal(
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();
 
-    var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
-    var result = try reads.scanWithConsistency(alloc, &db, from_key, to_key, opts, consistency);
-    defer result.deinit(alloc);
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    for (result.hashes, 0..) |entry, i| {
-        const json = if (opts.include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
-    }
-    return .{ .ndjson = try out.toOwnedSlice(alloc) };
+    const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
+    return .{ .ndjson = try scanNdjsonWithConsistencyAlloc(alloc, reads, &db, from_key, to_key, opts, consistency) };
 }
 
 fn scanProvisionedLocal(
@@ -10916,17 +11281,33 @@ fn scanProvisionedLocal(
 ) !?ScanResponse {
     var owner = try provisionedLocalQueryDbOwnerPinned(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held, expected_identity_namespace);
     defer owner.deinit();
-    var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
-    var result = try reads.scanWithConsistency(alloc, owner.db(), from_key, to_key, opts, consistency);
-    defer result.deinit(alloc);
+    const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
+    return .{ .ndjson = try scanNdjsonWithConsistencyAlloc(alloc, reads, owner.db(), from_key, to_key, opts, consistency) };
+}
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    for (result.hashes, 0..) |entry, i| {
-        const json = if (opts.include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
-    }
-    return .{ .ndjson = try out.toOwnedSlice(alloc) };
+fn scanProvisionedLocalToSink(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    read_safety_barrier: raft_mod.ReadSafetyBarrier,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+    consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
+    expected_identity_namespace: ?db_mod.DocIdentityNamespace,
+    sink: ScanStreamSink,
+) !void {
+    var owner = try provisionedLocalQueryDbOwnerPinned(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held, expected_identity_namespace);
+    defer owner.deinit();
+    const reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
+    try scanNdjsonWithConsistencyToSink(alloc, reads, owner.db(), from_key, to_key, opts, consistency, sink);
 }
 
 fn scanHostedLocal(
@@ -10965,6 +11346,31 @@ fn scanProvisionedHostedLocal(
 ) !?ScanResponse {
     return scanProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, from_key, to_key, opts, consistency, read_activity_held, expected_identity_namespace) catch |err| switch (err) {
         error.NotLeader => if (consistency == .stale) err else try scanProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, from_key, to_key, opts, .stale, read_activity_held, expected_identity_namespace),
+        else => err,
+    };
+}
+
+fn scanProvisionedHostedLocalToSink(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    read_safety_barrier: raft_mod.ReadSafetyBarrier,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+    consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
+    expected_identity_namespace: ?db_mod.DocIdentityNamespace,
+    sink: ScanStreamSink,
+) !void {
+    return scanProvisionedLocalToSink(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, from_key, to_key, opts, consistency, read_activity_held, expected_identity_namespace, sink) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try scanProvisionedLocalToSink(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, from_key, to_key, opts, .stale, read_activity_held, expected_identity_namespace, sink),
         else => err,
     };
 }
@@ -18860,7 +19266,10 @@ fn documentArtifactManifestsRemote(
     return try parseRemoteDocumentArtifactManifests(alloc, result.body);
 }
 
-fn scanRemote(
+/// Stream one snapshot-stable remote-shard read into the downstream response.
+/// A scan is one read transaction, so executors without streaming support must
+/// fail closed instead of silently stitching independently-versioned pages.
+fn scanRemoteToSink(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
     base_uri: []const u8,
@@ -18869,13 +19278,195 @@ fn scanRemote(
     from_key: []const u8,
     to_key: []const u8,
     opts: db_mod.types.ScanOptions,
-) !?ScanResponse {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    const body = try encodeScanRequest(alloc, from_key, to_key, opts);
-    defer alloc.free(body);
-    var result = try client.fetchGroupScan(base_uri, group_id, table_name, body);
-    defer result.deinit(alloc);
-    return .{ .ndjson = try alloc.dupe(u8, result.body) };
+    sink: ScanStreamSink,
+) !bool {
+    // Prefer one transport-streamed request. The server then keeps one read
+    // transaction for the complete range, preserving the ScanVisit snapshot
+    // contract while downstream writes provide byte-level backpressure.
+    const StreamAdapter = struct {
+        downstream: ScanStreamSink,
+
+        fn start(raw: *anyopaque, _: std.mem.Allocator, _: http_common.StreamingResponse) anyerror!void {
+            const adapter: *@This() = @ptrCast(@alignCast(raw));
+            try adapter.downstream.start();
+        }
+
+        fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+            const adapter: *@This() = @ptrCast(@alignCast(raw));
+            try adapter.downstream.write(bytes);
+        }
+
+        fn flush(_: *anyopaque) anyerror!void {}
+
+        fn writer(adapter: *@This()) http_common.StreamWriter {
+            return .{ .ptr = adapter, .vtable = &.{
+                .start = start,
+                .write_all = writeAll,
+                .flush = flush,
+            } };
+        }
+    };
+    var stream_adapter = StreamAdapter{ .downstream = sink };
+    var streaming_client = http_client.ApiHttpClient.init(alloc, executor);
+    const stream_body = try encodeScanRequest(alloc, from_key, to_key, opts);
+    defer alloc.free(stream_body);
+    const timeout_ms = try scanRemainingTimeoutMs(opts);
+    var request_cancellation = if (opts.cancellation) |token|
+        http_common.RequestCancellation.fromToken(token)
+    else
+        http_common.RequestCancellation{};
+    const cancellation: ?*const http_common.RequestCancellation = if (opts.cancellation != null)
+        &request_cancellation
+    else
+        null;
+    const streamed = streaming_client.fetchGroupScanStream(
+        base_uri,
+        group_id,
+        table_name,
+        stream_body,
+        timeout_ms,
+        cancellation,
+        stream_adapter.writer(),
+    ) catch |err| switch (err) {
+        error.Timeout => return error.DeadlineExceeded,
+        error.Cancelled => return error.Canceled,
+        else => return err,
+    };
+    if (streamed) |handled| if (handled) return true;
+    // Surface this as retryable availability rather than an internal error;
+    // rolling deployments can recover as soon as the routed executor exposes
+    // the snapshot-streaming capability.
+    return error.StorageReadTemporarilyUnavailable;
+}
+
+test "remote scan prefers one snapshot-stable streaming request" {
+    const alloc = std.testing.allocator;
+    const FakeExecutor = struct {
+        buffered_calls: usize = 0,
+        streamed_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{
+                .execute = execute,
+                .execute_stream = executeStream,
+            } };
+        }
+
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.buffered_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn executeStream(
+            raw: *anyopaque,
+            response_alloc: std.mem.Allocator,
+            _: http_common.HttpRequest,
+            writer: http_common.StreamWriter,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.streamed_calls += 1;
+            try writer.start(response_alloc, .{ .status = 200 });
+            try writer.writeAll("{\"_id\":\"a\"}\n{\"_id\":\"b\"}\n");
+            try writer.flush();
+            return true;
+        }
+    };
+    const CapturingSink = struct {
+        alloc: std.mem.Allocator,
+        starts: usize = 0,
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.bytes.deinit(self.alloc);
+        }
+
+        fn start(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.starts += 1;
+        }
+
+        fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(self.alloc, bytes);
+        }
+
+        fn iface(self: *@This()) ScanStreamSink {
+            return .{ .context = self, .start_fn = start, .write_fn = write };
+        }
+    };
+
+    var executor = FakeExecutor{};
+    var capture = CapturingSink{ .alloc = alloc };
+    defer capture.deinit();
+    try std.testing.expect(try scanRemoteToSink(
+        executor.iface(),
+        alloc,
+        "http://peer",
+        7,
+        "docs",
+        "",
+        "",
+        .{},
+        capture.iface(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), executor.streamed_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.buffered_calls);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqualStrings("{\"_id\":\"a\"}\n{\"_id\":\"b\"}\n", capture.bytes.items);
+}
+
+test "remote scan fails closed without streaming and honors cancellation before transport" {
+    const alloc = std.testing.allocator;
+    const FakeExecutor = struct {
+        buffered_calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.buffered_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const NullSink = struct {
+        fn start(_: ?*anyopaque) anyerror!void {}
+        fn write(_: ?*anyopaque, _: []const u8) anyerror!void {}
+
+        fn iface() ScanStreamSink {
+            return .{ .context = null, .start_fn = start, .write_fn = write };
+        }
+    };
+
+    var executor = FakeExecutor{};
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, scanRemoteToSink(
+        executor.iface(),
+        alloc,
+        "http://peer",
+        7,
+        "docs",
+        "",
+        "",
+        .{},
+        NullSink.iface(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), executor.buffered_calls);
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, scanRemoteToSink(
+        executor.iface(),
+        alloc,
+        "http://peer",
+        7,
+        "docs",
+        "",
+        "",
+        .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) },
+        NullSink.iface(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), executor.buffered_calls);
 }
 
 fn queryRemote(
@@ -21623,6 +22214,79 @@ fn appendJsonStringArray(
     try out.append(alloc, ']');
 }
 
+fn scanNdjsonWithConsistencyAlloc(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+    consistency: raft_mod.ReadConsistency,
+) ![]u8 {
+    const NdjsonVisitor = struct {
+        alloc: std.mem.Allocator,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
+            const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            try appendScanLine(
+                visitor.alloc,
+                &visitor.out,
+                entry.id,
+                entry.document_json,
+                entry.content_hash,
+            );
+        }
+    };
+
+    var visitor = NdjsonVisitor{ .alloc = alloc };
+    errdefer visitor.out.deinit(alloc);
+    try reads.scanVisitWithConsistency(alloc, db, from_key, to_key, opts, consistency, .{
+        .context = &visitor,
+        .visit = NdjsonVisitor.visit,
+    });
+    return try visitor.out.toOwnedSlice(alloc);
+}
+
+fn scanNdjsonWithConsistencyToSink(
+    alloc: std.mem.Allocator,
+    reads: raft_mod.FeatureDBReads,
+    db: *db_mod.DB,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+    consistency: raft_mod.ReadConsistency,
+    sink: ScanStreamSink,
+) !void {
+    const NdjsonVisitor = struct {
+        alloc: std.mem.Allocator,
+        sink: ScanStreamSink,
+        line: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
+            const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            visitor.line.clearRetainingCapacity();
+            try appendScanLine(
+                visitor.alloc,
+                &visitor.line,
+                entry.id,
+                entry.document_json,
+                entry.content_hash,
+            );
+            try visitor.sink.write(visitor.line.items);
+        }
+    };
+
+    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink };
+    defer visitor.line.deinit(alloc);
+    try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, opts, consistency);
+    try sink.start();
+    try db.scanVisit(alloc, from_key, to_key, opts, .{
+        .context = &visitor,
+        .visit = NdjsonVisitor.visit,
+    });
+}
+
 fn appendScanLine(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -22003,6 +22667,9 @@ test "bound table read source reranks hits after materialization" {
 
     var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var ts = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
+            .body = "{\"rerankers\":{\"cross-encoder/ms-marco-MiniLM-L-6-v2\":{}}}",
+        } },
         .{ .method = .POST, .path = "/rerank", .respond = .{
             .body = "{\"scores\":[0.1,0.9]}",
         } },
@@ -22012,41 +22679,28 @@ test "bound table read source reranks hits after materialization" {
     const url = try std.fmt.allocPrint(alloc, "{s}", .{ts.baseUrl()});
     defer alloc.free(url);
 
-    var response: ?query_api.QueryResponse = null;
-    defer if (response) |*value| value.deinit(alloc);
-    var run_err: ?anyerror = null;
-    var group = std.Io.Group.init;
-
-    const Fiber = struct {
-        fn run(
-            a: std.mem.Allocator,
-            read_source: *BoundTableReadSource,
-            out: *?query_api.QueryResponse,
-            err_out: *?anyerror,
-            reranker_url: []const u8,
-        ) std.Io.Cancelable!void {
-            out.* = read_source.source().query(a, "docs", .{
-                .query = .{ .match = .{ .field = "body", .text = "hello" } },
-                .limit = 10,
-                .profile = true,
-                .reranker = .{
-                    .provider = .antfly,
-                    .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                    .field = "body",
-                    .url = reranker_url,
-                },
-                .reranker_query_text = "hello",
-            }, .read_index) catch |err| {
-                err_out.* = err;
-                return;
-            };
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) !void {
+            for (0..2) |_| try server.handleOne();
         }
     };
-
-    group.concurrent(io_impl.io(), Fiber.run, .{ alloc, &source, &response, &run_err, url }) catch return;
-    try ts.handleOne();
-    group.await(io_impl.io()) catch {};
-    if (run_err) |err| return err;
+    var serving = try io_impl.io().concurrent(Serve.run, .{&ts});
+    defer _ = serving.cancel(io_impl.io()) catch {};
+    // An early query failure must cancel the listener instead of leaving the
+    // test blocked forever in accept with the actual error hidden in a fiber.
+    var response = try source.source().query(alloc, "docs", .{
+        .query = .{ .match = .{ .field = "body", .text = "hello" } },
+        .limit = 10,
+        .profile = true,
+        .reranker = .{
+            .provider = .antfly,
+            .model = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            .field = "body",
+            .url = url,
+        },
+        .reranker_query_text = "hello",
+    }, .read_index);
+    defer if (response) |*value| value.deinit(alloc);
 
     try std.testing.expect(response != null);
     const RerankResponse = struct {
@@ -22061,12 +22715,13 @@ test "bound table read source reranks hits after materialization" {
             } = null,
         },
     };
-    var parsed = try parseJsonTestBody(RerankResponse, alloc, response.?.json);
+    var parsed = try ant_json.parseFromSlice(RerankResponse, alloc, response.?.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const inner = parsed.value.responses[0];
     try std.testing.expectEqualStrings("doc:b", inner.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("doc:a", inner.hits.?.hits.?[1]._id);
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", inner.profile.?.reranker.?.model);
+    try serving.await(io_impl.io());
 }
 
 test "provisioned table read source routes lookup and scan across ranges" {
@@ -22265,12 +22920,12 @@ test "fanout planner uses io cap and request shape" {
     try std.testing.expectEqual(@as(usize, 1), no_io_plan.width);
     try std.testing.expectEqual(FanoutPlanReason.no_io, no_io_plan.reason);
 
-    const text_stats_plan = planFanout(.text_stats, &io_impl, 6);
+    const text_stats_plan = planFanout(.text_stats, .fromThreaded(&io_impl), 6);
     try std.testing.expect(text_stats_plan.parallel);
     try std.testing.expectEqual(@as(usize, 4), text_stats_plan.width);
     try std.testing.expectEqual(FanoutPlanReason.parallel, text_stats_plan.reason);
 
-    const small_query_plan = planQueryFanout(&io_impl, 2, .{
+    const small_query_plan = planQueryFanout(.fromThreaded(&io_impl), 2, .{
         .query = .{ .match = .{ .field = "body", .text = "hello" } },
         .limit = 10,
     });
@@ -22278,7 +22933,7 @@ test "fanout planner uses io cap and request shape" {
     try std.testing.expectEqual(@as(usize, 1), small_query_plan.width);
     try std.testing.expectEqual(FanoutPlanReason.small_request, small_query_plan.reason);
 
-    const larger_query_plan = planQueryFanout(&io_impl, 6, .{
+    const larger_query_plan = planQueryFanout(.fromThreaded(&io_impl), 6, .{
         .query = .{ .match = .{ .field = "body", .text = "hello" } },
         .limit = 100,
     });
@@ -22294,7 +22949,7 @@ test "fanout planner uses io cap and request shape" {
             .start_nodes = .{ .keys = &.{} },
         },
     }};
-    const graph_query_plan = planQueryFanout(&io_impl, 6, .{
+    const graph_query_plan = planQueryFanout(.fromThreaded(&io_impl), 6, .{
         .graph_queries = &graph_queries,
         .limit = 100,
     });
@@ -22319,9 +22974,9 @@ test "provisioned table read source merges query results across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 } });
     defer right_db.close();
 
     try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -22408,8 +23063,12 @@ test "provisioned table read source merges query results across ranges" {
     var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, response.json);
     defer parsed.deinit();
     const hits = parsed.value.responses.?[0].hits.?.hits.?;
-    try std.testing.expectEqualStrings("doc:a", hits[0]._id);
-    try std.testing.expectEqualStrings("doc:z", hits[1]._id);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    // Equal-score hits may use either shard's identity as their tie breaker.
+    // This test verifies that both ranges contribute exactly one result.
+    const first_is_a = std.mem.eql(u8, "doc:a", hits[0]._id);
+    try std.testing.expectEqualStrings("doc:a", hits[if (first_is_a) 0 else 1]._id);
+    try std.testing.expectEqualStrings("doc:z", hits[if (first_is_a) 1 else 0]._id);
 }
 
 test "provisioned table read source serves dense queries for explicit external embeddings" {
@@ -22425,7 +23084,7 @@ test "provisioned table read source serves dense queries for explicit external e
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     try db.addIndex(.{
@@ -22539,7 +23198,9 @@ test "provisioned local query execution returns stamped identity request" {
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
     {
-        var db = try db_mod.DB.open(alloc, group_path, .{});
+        var db = try db_mod.DB.open(alloc, group_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        });
         defer db.close();
         try db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -23512,7 +24173,7 @@ test "provisioned table read source serves public dense query requests with read
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -23594,7 +24255,7 @@ test "provisioned table read source serves profiled public dense query requests 
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -23680,7 +24341,7 @@ test "provisioned table read source serves public dense query requests without e
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -23762,7 +24423,7 @@ test "provisioned table read source serves benchmark-shaped packed dense query w
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
-    var db = try db_mod.DB.open(alloc, group_path, .{});
+    var db = try db_mod.DB.open(alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 } });
     defer db.close();
 
     const FakeCatalog = struct {
@@ -23904,11 +24565,13 @@ test "provisioned table read source preflights every local group" {
 
     var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     _ = source.withIo(&io_impl);
-    try std.testing.expectError(error.InvalidArgument, source.source().preflightQuery(alloc, "docs", .{
+    // The second group has no physical index. Read-only preflight reports the
+    // missing index without materializing the metadata-declared catalog.
+    try std.testing.expectError(error.IndexNotFound, source.source().preflightQuery(alloc, "docs", .{
         .index_name = "dense_idx",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, source.source().preflightQuery(alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, source.source().preflightQuery(alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",
@@ -24015,7 +24678,7 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
     try std.testing.expectEqual(@as(u64, 0), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned query db installs asset producer from indexes_json and replays assets" {
+test "provisioned query db does not run writer-owned asset producers" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("antfly-api-provisioned-asset-enrichment");
     defer path_tmp.cleanup();
@@ -24029,7 +24692,10 @@ test "provisioned query db installs asset producer from indexes_json and replays
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(group_path);
     {
-        var db = try db_mod.DB.open(alloc, group_path, .{});
+        var db = try db_mod.DB.open(alloc, group_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
         defer db.close();
         try db.batch(.{
             .writes = &.{.{
@@ -24038,6 +24704,8 @@ test "provisioned query db installs asset producer from indexes_json and replays
             }},
             .sync_level = .write,
         });
+        // Query-only handles consume the published snapshot, not writer WAL.
+        try db.sync(true);
     }
 
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{});
@@ -24141,19 +24809,19 @@ test "provisioned query db installs asset producer from indexes_json and replays
     cache.backend_runtime = &backend_runtime;
     cache.antfly_provider = local_provider;
 
-    var db_lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 0, "docs");
+    var db_lease = try cache.getOrOpen(group_path, FakeCatalog.iface(), 7001, 0, "docs");
     defer db_lease.release();
 
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    var lookup = (try db_lease.db.lookup(alloc, "doc:a", .{
-        .fields = &.{"_artifacts"},
-        .include_all_fields = false,
-    })).?;
-    defer lookup.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{});
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(db_mod.OpenMode.query_readonly, db_lease.db.open_mode);
+    const raw = (try db_lease.db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
-    const artifacts = parsed.value.object.get("_artifacts").?.object;
-    try std.testing.expectEqualStrings("generator:hello", artifacts.get("generated_title_v1").?.object.get("value").?.string);
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("body").?.string);
+    if (parsed.value.object.get("_artifacts")) |artifacts| {
+        try std.testing.expect(artifacts.object.get("generated_title_v1") == null);
+    }
 }
 
 test "provisioned table read source runtime status stays cache-only without shared snapshot" {
@@ -28961,7 +29629,7 @@ test "hosted textStatsGroupLocal serves only the local group" {
 
     const group_path = try metadata_mod.groupDbPathFromReplicaRoot(test_alloc, path, 7);
     defer test_alloc.free(group_path);
-    var db = try db_mod.DB.open(test_alloc, group_path, .{});
+    var db = try db_mod.DB.open(test_alloc, group_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 7, .range_id = 7 } });
     defer db.close();
 
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
@@ -29347,11 +30015,11 @@ test "hosted table read source preflights every local group" {
     );
     _ = hosted.withIo(&io_impl);
 
-    try std.testing.expectError(error.InvalidArgument, hosted.source().preflightQuery(test_alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, hosted.source().preflightQuery(test_alloc, "docs", .{
         .index_name = "dv_v1",
         .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 5 },
     }, .read_index, 0));
-    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().preflightQuery(test_alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, hosted.source().preflightQuery(test_alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",

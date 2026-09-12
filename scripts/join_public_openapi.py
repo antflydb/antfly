@@ -370,6 +370,8 @@ def main(argv: list[str]) -> int:
     options, args = parser.parse_known_args(argv)
     if options.output is not None:
         args.append(str(options.output.resolve()))
+    if options.depfile is not None and args and not args[0].startswith("--"):
+        args[0] = str(Path(args[0]).resolve())
     with record_dependencies(options.depfile):
         return generate(args)
 

@@ -2,7 +2,7 @@
   "date": "2026-09-11",
   "baseline_commit": "23335d33603e6baf7b5ff72d0e260fbfa94ff83a",
   "source_parent_commit": "72794f05a8e85628c15124c5a0b6c195b0c3660e",
-  "merged_main": "aefe3bad405036df320ff7aee3bb11ed5c513bbd",
+  "merged_main": "5460d04901b8341cfba934c1dc3cf4c543c7d042",
   "source_sha256": {
     "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig": "870e4b3bfdac8f5ff1297c1fb9305e93594e682c2b5c268467cf921066f54f61",
     "zig/pkg/antfly/src/metadata/store_observer.zig": "3d0553126253b345cd54fe391cb0e25cda30a0fd440ba68580d7c2251e38c4f2",

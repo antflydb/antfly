@@ -1,0 +1,455 @@
+{
+  "date": "2026-09-11",
+  "source_parent_commit": "c4044610ac3cd16562a07ee1b900fe47a8303fb0",
+  "merged_main": "aefe3bad405036df320ff7aee3bb11ed5c513bbd",
+  "source_sha256": {
+    "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig": "870e4b3bfdac8f5ff1297c1fb9305e93594e682c2b5c268467cf921066f54f61",
+    "zig/pkg/antfly/src/metadata/store_observer.zig": "3d0553126253b345cd54fe391cb0e25cda30a0fd440ba68580d7c2251e38c4f2",
+    "zig/pkg/antfly/src/metadata/service.zig": "42a78d6721d4bd1d99ca2aa6da1a9fa46a4638bd903e6ac9bfbd3a08db63565c",
+    "zig/pkg/antfly/src/storage/lsm_backend.zig": "16b9b0c74db945afbf6c397b25bebf14af8d551ee771965e270df840a6627b92",
+    "zig/pkg/antfly/src/storage/lsm_backend/manifest_set.zig": "0ebd5fe2280214af4fd24dbad705b8a7eb537a2617a576e4abe7cf6c74795efd",
+    "zig/tools/benchmark_system_catalog.py": "20e58594e16db1d4a951e3f89f751c21dc229415c55507fc58da3f6ca478a322"
+  },
+  "mode": "Report components: ReleaseFast, c_allocator, Zig 0.16.0; server: Debug",
+  "methodology": [
+    "Post-relational-merge observations; not a new matched before/after comparison.",
+    "Component targets compiled before timing. Components, standalone relational and live cluster runs were sequential; no task-owned builds/tests overlapped measurement. Unrelated host activity was uncontrolled.",
+    "Component samples and timing boundaries match system_catalog_admission_workloads_2026_09_11.json.",
+    "Relational fixture: 10 tables, one selected event row and one customer row; result-validated lookup, search, join, repeated-target NDJSON, listing, concurrent lookup and rename. This is a catalog-routing workload, not a bulk relational row throughput test.",
+    "Live discovery: disposable three-metadata/three-data-node cluster, 30 tables with 200 extra fields each, ten samples after three warmups. No production capacity claim."
+  ],
+  "components": [
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 0.256,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 0.243,
+      "wal_bytes_per_apply": 4280,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 0.259,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 0.245,
+      "wal_bytes_per_apply": 22886,
+      "full_record_bytes": 82218,
+      "command_bytes": 82224
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.147,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 82218,
+      "command_bytes": 12424
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "full_store_read_p50_ms": 0.058
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 100,
+      "placement_drain_read_p50_ms": 0.007
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 1.394,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 1.329,
+      "wal_bytes_per_apply": 35324,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 1.216,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 1.15,
+      "wal_bytes_per_apply": 223766,
+      "full_record_bytes": 821118,
+      "command_bytes": 821124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 0.526,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 821118,
+      "command_bytes": 123124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "full_store_read_p50_ms": 0.505
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 1000,
+      "placement_drain_read_p50_ms": 0.00586
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "cached_heartbeat",
+      "apply_p50_ms": 15.248,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "fresh_clocks",
+      "apply_p50_ms": 20.227,
+      "wal_bytes_per_apply": 347228,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "one_group_change",
+      "apply_p50_ms": 17.326,
+      "wal_bytes_per_apply": 14591,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "all_groups_change",
+      "apply_p50_ms": 22.193,
+      "wal_bytes_per_apply": 2233295,
+      "full_record_bytes": 8210118,
+      "command_bytes": 8210124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "scenario": "referenced_runtime",
+      "apply_p50_ms": 8.837,
+      "wal_bytes_per_apply": 304,
+      "full_record_bytes": 8210118,
+      "command_bytes": 1230124
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "full_store_read_p50_ms": 5.55
+    },
+    {
+      "kind": "REPORT_BENCH",
+      "groups": 10000,
+      "placement_drain_read_p50_ms": 0.00585
+    },
+    {
+      "kind": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": false,
+      "p50_ms": 0.001
+    },
+    {
+      "kind": "REPAIR_ADMISSION_BENCH",
+      "groups": 1000,
+      "repair": true,
+      "p50_ms": 0.659
+    },
+    {
+      "kind": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": false,
+      "p50_ms": 0.014
+    },
+    {
+      "kind": "REPAIR_ADMISSION_BENCH",
+      "groups": 10000,
+      "repair": true,
+      "p50_ms": 5.994
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.017
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 1,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.016
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 0.165
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 10,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.015
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": false,
+      "p50_ms": 1.613
+    },
+    {
+      "kind": "ADMISSION_CACHE_BENCH",
+      "stores": 100,
+      "groups_per_store": 100,
+      "selected": true,
+      "p50_ms": 0.016
+    }
+  ],
+  "relational": {
+    "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+    "binary_sha256": "2d6116422e8327ee386585792dde062e198172c9587a547e3826191c6933e691",
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "settings": {
+      "binary": "zig-out/bin/antfly",
+      "scenario": "catalog",
+      "deployment": "standalone",
+      "restart_after_ddl": false,
+      "listing_distinct_schemas": false,
+      "listing_page_size": 0,
+      "listing_concurrent": false,
+      "listing_reader_rate": 0,
+      "table_counts": [
+        10
+      ],
+      "resolution_workload": "exact",
+      "schema_fields": 0,
+      "tenant_counts": [
+        10,
+        100
+      ],
+      "storage_mode": "relational",
+      "entity_shards": 1,
+      "entity_key_layout": "clustered",
+      "mentions": [
+        10,
+        100
+      ],
+      "documents": 5,
+      "concurrency": 8,
+      "samples": 10,
+      "warmup": 3,
+      "ndjson_lines": 20,
+      "poll_ms": 20,
+      "readiness_timeout": 115,
+      "output": "/private/tmp/catalog-round11-relational.json"
+    },
+    "scenarios": {
+      "catalog": {
+        "deployment": "standalone",
+        "startup_ms": 562.0492910966277,
+        "checkpoints": [
+          {
+            "table_count": 10,
+            "table_create": {
+              "samples": 10,
+              "p50_ms": 26.5724375,
+              "p95_ms": 28.767833,
+              "max_ms": 28.767833
+            },
+            "shard_readiness": {
+              "samples": 10,
+              "p50_ms": 0.0,
+              "p95_ms": 0.0,
+              "max_ms": 0.0
+            },
+            "operations": {
+              "qualified_lookup": {
+                "samples": 10,
+                "p50_ms": 0.44127099999999997,
+                "p95_ms": 0.553542,
+                "max_ms": 0.553542
+              },
+              "qualified_query": {
+                "samples": 10,
+                "p50_ms": 0.763146,
+                "p95_ms": 1.026875,
+                "max_ms": 1.026875
+              },
+              "qualified_join": {
+                "samples": 10,
+                "p50_ms": 1.437979,
+                "p95_ms": 1.638541,
+                "max_ms": 1.638541
+              },
+              "ndjson_repeated_target": {
+                "samples": 10,
+                "p50_ms": 5.388583000000001,
+                "p95_ms": 5.887125,
+                "max_ms": 5.887125
+              },
+              "scoped_listing": {
+                "samples": 10,
+                "p50_ms": 2.745813,
+                "p95_ms": 2.886834,
+                "max_ms": 2.886834
+              },
+              "concurrent_qualified_lookup": {
+                "samples": 80,
+                "p50_ms": 2.182333,
+                "p95_ms": 3.752833,
+                "max_ms": 4.395292,
+                "concurrency": 8,
+                "elapsed_seconds": 0.023828875,
+                "requests_per_second": 3357.2713776877845
+              },
+              "table_rename": {
+                "samples": 10,
+                "p50_ms": 0.6211045,
+                "p95_ms": 0.669542,
+                "max_ms": 0.669542
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "live_discovery": {
+    "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+    "binary_sha256": "2d6116422e8327ee386585792dde062e198172c9587a547e3826191c6933e691",
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "settings": {
+      "binary": "zig-out/bin/antfly",
+      "scenario": "listing",
+      "deployment": "cluster",
+      "restart_after_ddl": false,
+      "listing_distinct_schemas": false,
+      "listing_page_size": 25,
+      "listing_concurrent": false,
+      "listing_reader_rate": 0,
+      "table_counts": [
+        30
+      ],
+      "resolution_workload": "exact",
+      "schema_fields": 200,
+      "tenant_counts": [
+        10,
+        100
+      ],
+      "storage_mode": "document",
+      "entity_shards": 1,
+      "entity_key_layout": "clustered",
+      "mentions": [
+        10,
+        100
+      ],
+      "documents": 5,
+      "concurrency": 8,
+      "samples": 10,
+      "warmup": 3,
+      "ndjson_lines": 20,
+      "poll_ms": 20,
+      "readiness_timeout": 115,
+      "output": "/private/tmp/catalog-round11-postmerge-cluster.json"
+    },
+    "scenarios": {
+      "listing": {
+        "deployment": "cluster",
+        "startup_ms": 3946.134667377919,
+        "checkpoints": [
+          {
+            "unrelated_tables": 30,
+            "small_namespace": {
+              "samples": 10,
+              "p50_ms": 24.3387295,
+              "p95_ms": 118.179625,
+              "max_ms": 118.179625
+            },
+            "selective_prefix": {
+              "samples": 10,
+              "p50_ms": 25.498478499999997,
+              "p95_ms": 218.898416,
+              "max_ms": 218.898416
+            },
+            "large_namespace": {
+              "samples": 10,
+              "p50_ms": 80.605479,
+              "p95_ms": 271.918375,
+              "max_ms": 271.918375
+            },
+            "single_table_status": {
+              "samples": 10,
+              "p50_ms": 27.2878545,
+              "p95_ms": 403.44,
+              "max_ms": 403.44
+            },
+            "empty_default_namespace": {
+              "samples": 10,
+              "p50_ms": 16.7015835,
+              "p95_ms": 28.507167,
+              "max_ms": 28.507167
+            },
+            "first_page": {
+              "samples": 10,
+              "p50_ms": 81.326729,
+              "p95_ms": 271.081084,
+              "max_ms": 271.081084
+            },
+            "paged_inventory": {
+              "samples": 10,
+              "p50_ms": 104.211771,
+              "p95_ms": 287.773083,
+              "max_ms": 287.773083
+            }
+          }
+        ]
+      }
+    }
+  }
+}

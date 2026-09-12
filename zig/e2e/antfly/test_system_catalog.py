@@ -532,3 +532,56 @@ def test_catalog_failures_use_shared_error_contract(stateful_api):
         }
     finally:
         api.delete(f"/databases/{name}")
+
+
+def test_catalog_relational_rows_keep_scope_and_identity_after_rename(stateful_api):
+    api = stateful_api
+    database = "relational_" + uuid.uuid4().hex[:10]
+    renamed = database + "_renamed"
+    api.post(f"/databases/{database}", {})
+    path = f"/databases/{database}/namespaces/public/tables/rows"
+    schema = {
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+            "row": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "x-antfly-types": ["keyword"]},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["id", "count"],
+                    "additionalProperties": False,
+                }
+            }
+        },
+    }
+    response = api._request("POST", path, payload={"schema": schema})
+    assert response.status_code == 201, response.text
+    created = response.json()
+    literal = f"{database}.public.rows"
+    api.post(f"/tables/{literal}", {})
+    api.post(
+        f"/tables/{literal}/batch",
+        {"inserts": {"row1": {"scope": "literal"}}, "sync_level": "full_index"},
+    )
+    row = {"id": "row1", "count": 42}
+    api.post(path + "/batch", {"inserts": {"row1": row}, "sync_level": "full_index"})
+    assert api.get(path + "/documents/row1") == row
+    assert api.get(f"/tables/{literal}/documents/row1") == {"scope": "literal"}
+    result = api.post(
+        path + "/query", {"full_text_search": {"match_all": {}}, "limit": 10}
+    )
+    assert result["responses"][0]["table"] == literal
+    api.post(path + "/rename", {"name": "events"})
+    api.post(f"/databases/{database}/rename", {"name": renamed})
+    destination = f"/databases/{renamed}/namespaces/public/tables/events"
+    assert api.get(destination)["table_id"] == created["table_id"]
+    api.restart_server()
+    assert api.get(destination)["table_id"] == created["table_id"]
+    assert api.get(destination + "/documents/row1") == row
+    assert api.get(f"/tables/{literal}/documents/row1") == {"scope": "literal"}
+    api.delete(destination)
+    api.delete(f"/databases/{renamed}")
+    api.delete(f"/tables/{literal}")

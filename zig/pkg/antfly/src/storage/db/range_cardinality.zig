@@ -2,7 +2,15 @@
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,6 +30,34 @@ pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
     };
     defer alloc.free(raw);
     return try decode(raw);
+}
+
+/// Read related publication counters through the same pinned store revision.
+pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    const raw = txn.get(&internal_keys.range_document_count_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try decode(raw);
+}
+
+pub fn loadOrCountFromTxn(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, byte_range: types.ByteRange) !u64 {
+    if (try loadFromTxn(txn)) |count| return count;
+    const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
+    defer alloc.free(lower);
+    const upper = if (byte_range.end.len == 0) null else try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end);
+    defer if (upper) |key| alloc.free(key);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setUpperBound(upper);
+    var count: u64 = 0;
+    var next = try cursor.seekAtOrAfter(lower);
+    while (next) |entry| : (next = try cursor.next()) {
+        if (upper) |key| if (std.mem.order(u8, entry.key, key) != .lt) break;
+        if (internal_keys.isStoredDocumentRowKey(entry.key))
+            count = std.math.add(u64, count, 1) catch return error.RangeDocumentCountOverflow;
+    }
+    return count;
 }
 
 /// A new empty store has no range counter until its first primary mutation.
@@ -67,7 +103,7 @@ pub fn countPrimaryDocuments(
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isPrimaryDocumentKey(key)) state.count = std.math.add(u64, state.count, 1) catch
+            if (internal_keys.isStoredDocumentRowKey(key)) state.count = std.math.add(u64, state.count, 1) catch
                 return error.RangeDocumentCountOverflow;
             return .@"continue";
         }

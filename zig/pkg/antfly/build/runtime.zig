@@ -199,14 +199,15 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 19.51 GB (18.17 GiB) with the platform frameworks enabled.
+                // 23.03 GB (21.44 GiB) with the platform frameworks enabled;
+                // reserve 24 GiB on macOS for observed codegen plus headroom.
                 // A clean native aarch64-linux-musl production container build
                 // reached 19.89 GB (18.52 GiB) for the current production
-                // graph. Reserve 20 GiB on both targets so Zig's scheduler does
+                // graph. Reserve 20 GiB on other targets so Zig's scheduler does
                 // not discard a successfully compiled production artifact.
                 // Use the same Linux-target claim for native and cross builds;
                 // the target artifact determines the dominant codegen shape.
-                .distributed => 20 * 1024 * 1024 * 1024,
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 24 else 20) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

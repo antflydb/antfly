@@ -1054,3 +1054,59 @@ stale generations and changed group inventory. Rust SDK generation and all
 14 tests passed with the locked dependencies; heterogeneous catalog 202 responses
 retain typed pending-visibility variants. These are focused checks, not a full
 repository-suite pass.
+
+## Relational main integration
+
+Merged relational storage from `origin/main` at `aefe3bad4` into the implementation
+above (`c4044610a`). Scoped create/drop now expose the shared committed mutation
+outcomes; Rust decodes scoped HTTP 201 as a typed completed `TableStatus`, retaining
+the status and ETag. The merge keeps one deadline/clock visibility type. Packed
+rows continue to use immutable catalog destinations, without a new migration.
+
+[Post-merge raw results and source hashes](system_catalog_relational_merge_2026_09_11.json)
+record a fresh component run and two application workloads. These are post-merge
+observations, not a new matched comparison. Compilation and other task-owned
+tests finished before timing; all measured workloads ran sequentially. Unrelated
+host activity was uncontrolled. The original comparison's raw `merged_main`
+provenance has been corrected to `5460d0490`, matching merge `72794f05a`; its
+measurements were taken before the relational merge.
+
+At 10,000 groups, repair admission measured 5.994 ms p50, referenced-runtime
+apply 8.837 ms, cached full apply 15.248 ms and full hydration 5.550 ms. WAL sizes
+were unchanged from the prior implementation run. With 100 stores, selected
+admission measured 0.016 ms versus 1.613 ms for the reproduced whole-inventory
+preparation. The full-report and hydration tradeoffs described above remain.
+
+The new standalone relational catalog scenario provisions ten closed-schema
+tables and validates event/customer rows while measuring scoped operations.
+Ten samples follow three warmups; concurrent lookup uses eight clients and
+80 measured requests. This exercises catalog routing over packed rows, with
+one selected event and one customer row, not bulk relational ingestion capacity.
+
+| Scoped relational operation | p50 | p95 |
+| --- | --- | --- |
+| Point lookup | 0.441 ms | 0.554 ms |
+| Query | 0.763 ms | 1.027 ms |
+| Customer join | 1.438 ms | 1.639 ms |
+| 20-line repeated-target NDJSON | 5.389 ms | 5.887 ms |
+| Ten-table listing | 2.746 ms | 2.887 ms |
+| Concurrent point lookup | 2.182 ms | 3.753 ms |
+| Identity-preserving rename | 0.621 ms | 0.670 ms |
+
+The repeated three-metadata/three-data-node, 30-wide-table discovery workload
+measured inventory p50/p95 80.605/271.918 ms, first page 81.327/271.081 ms,
+cursor walk 104.212/287.773 ms and selected status 27.288/403.440 ms. Tail latency
+varied materially. These small unpaired runs establish neither a distributed
+speedup nor resolution of the earlier larger-capacity failures. Both application
+runs used the merged Debug server SHA-256
+`2d6116422e8327ee386585792dde062e198172c9587a547e3826191c6933e691`.
+
+Post-merge validation: server and focused storage/API/metadata/HTTP suites passed
+(69/58/117/46 tests). The E2E selection passed 22 cases initially; after correcting
+the new fixtures to omit server-managed schema version and await the committed
+runtime baseline before pausing the owner, both remaining cases passed. The
+relational regression checks scoped-versus-literal row isolation, logical query
+labels, table/database rename, stable identity and restart persistence. Go SDK
+packages, 15 Rust tests, 283 TypeScript tests (one skipped), SDK/Antfarm type
+checks and the canonical Antfarm rebuild passed. The earlier 396-test Raft library
+run remains recorded above; this merge did not change those library sources.

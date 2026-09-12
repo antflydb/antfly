@@ -16,7 +16,6 @@
 
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
-
 pub const RuntimeError = error{AsyncWorkerFailed};
 
 pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;

@@ -1217,7 +1217,7 @@ pub const Client = struct {
 
     /// Drop namespace table
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
-    pub fn dropNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(std.json.Value) {
+    pub fn dropNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.CommittedMutationOutcome) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1227,7 +1227,7 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CommittedMutationOutcome).fromResponse(self.allocator, &resp);
     }
 
     /// Backup an explicit namespace table
@@ -1750,13 +1750,13 @@ pub const Client = struct {
 
     /// Drop a table
     /// DELETE /db/v1/tables/{tableName}
-    pub fn dropTable(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
+    pub fn dropTable(self: *@This(), table_name: []const u8) !ApiResponse(types.CommittedMutationOutcome) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CommittedMutationOutcome).fromResponse(self.allocator, &resp);
     }
 
     /// List table artifact enrichments

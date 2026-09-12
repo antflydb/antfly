@@ -387,24 +387,35 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     assert status["missing_groups"] == 0
     assert status["index_type"] == "full_text"
 
+    def raw_store() -> dict[str, Any]:
+        snapshot = _check_response(
+            session.get(
+                f"{split_status_cluster.metadata_admin_url}/metadata/v1/admin/snapshot",
+                timeout=10,
+            )
+        )
+        return next(
+            store for store in snapshot["stores"] if int(store["store_id"]) == 2
+        )
+
+    # The public status route can observe the live data owner before its full
+    # report is committed. Require the persisted runtime baseline for references.
+    committed = wait_until(
+        lambda: any(
+            _runtime_report_has_index(report, index_name, store_id=2)
+            for report in raw_store().get("runtime_statuses", [])
+        ),
+        timeout_s=45,
+        interval_s=0.1,
+    )
+    assert committed, split_status_cluster.debug_logs()
+
     # Hold the real owner so a reference update can be observed without a newer
     # full report racing it. Always resume it before fixture teardown.
     owner = split_status_cluster.data_proc
     assert owner is not None
     owner.send_signal(signal.SIGSTOP)
     try:
-
-        def raw_store() -> dict[str, Any]:
-            snapshot = _check_response(
-                session.get(
-                    f"{split_status_cluster.metadata_admin_url}/metadata/v1/admin/snapshot",
-                    timeout=10,
-                )
-            )
-            return next(
-                store for store in snapshot["stores"] if int(store["store_id"]) == 2
-            )
-
         heartbeat_url = f"{split_status_cluster.metadata_admin_url}/internal/v1/nodes/2/status/heartbeat"
 
         def admit_reference() -> dict[str, Any] | None:

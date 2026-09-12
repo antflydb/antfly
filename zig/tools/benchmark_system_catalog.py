@@ -231,7 +231,7 @@ def wait_for_catalog_shards(
 
 def listing_table_config(args):
     table_config = {"num_shards": 1}
-    if args.schema_fields:
+    if args.schema_fields or args.storage_mode == "relational":
         table_config["schema"] = {
             "document_schemas": {
                 "default": {
@@ -252,6 +252,16 @@ def listing_table_config(args):
                 }
             }
         }
+        if args.storage_mode == "relational":
+            schema = table_config["schema"]
+            schema.update(storage_mode="relational", default_type="default")
+            row = schema["document_schemas"]["default"]["schema"]
+            row["additionalProperties"] = False
+            row["required"] = ["body"]
+            row["properties"]["customer_id"] = {
+                "type": "string",
+                "x-antfly-types": ["keyword"],
+            }
     return table_config
 
 
@@ -287,7 +297,10 @@ def catalog_scenario(args, binary: Path) -> dict:
                     properties = created["schema"]["document_schemas"]["default"][
                         "schema"
                     ]["properties"]
-                    if len(properties) != args.schema_fields + 1:
+                    expected_fields = args.schema_fields + (
+                        2 if args.storage_mode == "relational" else 1
+                    )
+                    if len(properties) != expected_fields:
                         raise RuntimeError(
                             "table did not retain benchmark schema fields"
                         )
@@ -933,6 +946,12 @@ def main():
         help="Extra string fields per catalog table",
     )
     parser.add_argument("--tenant-counts", nargs="+", type=positive, default=[10, 100])
+    parser.add_argument(
+        "--storage-mode",
+        choices=["document", "relational"],
+        default="document",
+        help="Storage mode for catalog/listing workloads; relational uses a closed row schema",
+    )
     parser.add_argument("--entity-shards", type=positive, default=1)
     parser.add_argument(
         "--entity-key-layout", choices=["clustered", "spread"], default="clustered"
@@ -947,6 +966,11 @@ def main():
     parser.add_argument("--readiness-timeout", type=positive, default=115)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.storage_mode == "relational" and args.scenario not in (
+        "catalog",
+        "listing",
+    ):
+        parser.error("--storage-mode relational requires --scenario catalog or listing")
     if args.restart_after_ddl and args.deployment != "standalone":
         parser.error("--restart-after-ddl requires --deployment standalone")
     if args.listing_page_size < 0 or args.listing_page_size > 1000:

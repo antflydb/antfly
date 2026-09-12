@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.committed_mutation_outcome import CommittedMutationOutcome
 from ...models.create_table_request import CreateTableRequest
 from ...models.error import Error
 from ...models.table_status import TableStatus
@@ -40,11 +41,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | Error | TableStatus | None:
-    if response.status_code == 200:
-        response_200 = TableStatus.from_dict(response.json())
+) -> Any | CommittedMutationOutcome | Error | TableStatus | None:
+    if response.status_code == 201:
+        response_201 = TableStatus.from_dict(response.json())
 
-        return response_200
+        return response_201
+
+    if response.status_code == 202:
+        response_202 = CommittedMutationOutcome.from_dict(response.json())
+
+        return response_202
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -63,7 +69,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | Error | TableStatus]:
+) -> Response[Any | CommittedMutationOutcome | Error | TableStatus]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -79,7 +85,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Response[Any | Error | TableStatus]:
+) -> Response[Any | CommittedMutationOutcome | Error | TableStatus]:
     """Create namespace table
 
      Creates a table through an explicit database and namespace route.
@@ -95,7 +101,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error | TableStatus]
+        Response[Any | CommittedMutationOutcome | Error | TableStatus]
     """
 
     kwargs = _get_kwargs(
@@ -119,7 +125,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Any | Error | TableStatus | None:
+) -> Any | CommittedMutationOutcome | Error | TableStatus | None:
     """Create namespace table
 
      Creates a table through an explicit database and namespace route.
@@ -135,7 +141,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error | TableStatus
+        Any | CommittedMutationOutcome | Error | TableStatus
     """
 
     return sync_detailed(
@@ -154,7 +160,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Response[Any | Error | TableStatus]:
+) -> Response[Any | CommittedMutationOutcome | Error | TableStatus]:
     """Create namespace table
 
      Creates a table through an explicit database and namespace route.
@@ -170,7 +176,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | Error | TableStatus]
+        Response[Any | CommittedMutationOutcome | Error | TableStatus]
     """
 
     kwargs = _get_kwargs(
@@ -192,7 +198,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreateTableRequest,
-) -> Any | Error | TableStatus | None:
+) -> Any | CommittedMutationOutcome | Error | TableStatus | None:
     """Create namespace table
 
      Creates a table through an explicit database and namespace route.
@@ -208,7 +214,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | Error | TableStatus
+        Any | CommittedMutationOutcome | Error | TableStatus
     """
 
     return (

@@ -18,6 +18,7 @@ const resource_manager_mod = @import("../resource_manager.zig");
 pub const max_in_flight_jobs = 256;
 
 pub const Options = struct {
+    allocator: std.mem.Allocator = std.heap.page_allocator,
     max_concurrent_jobs: usize = 1,
     max_in_flight_input_bytes: u64 = 128 * 1024 * 1024,
     resource_reservation_bytes: u64 = 32 * 1024 * 1024,
@@ -29,8 +30,17 @@ pub const Work = struct {
     input_runs: usize = 0,
     input_bytes: u64 = 0,
     run_ids: []const u64 = &.{},
+    /// Prepared off-lock by the owned job; borrowed until Grant.complete.
+    run_id_index: ?RunIdIndex = null,
     key_range: ?KeyRange = null,
 };
+
+pub const RunIdIndex = std.AutoHashMapUnmanaged(u64, void);
+/// Includes hash metadata, spare capacity, and the original ID array.
+pub fn runIdMemoryBound(count: usize) u64 {
+    if (count == 0) return 0;
+    return @as(u64, @intCast(count)) *| 64 +| 128;
+}
 
 pub const KeyRange = struct {
     output_level: u32,
@@ -68,15 +78,17 @@ pub const Grant = struct {
     pub fn complete(self: *Grant) void {
         if (self.completed) return;
         self.completed = true;
-        if (self.reservation) |*reservation| reservation.release();
         self.scheduler.complete(self.job_id, self.input_bytes);
+        // Release credit only after any grant-owned index has been freed.
+        if (self.reservation) |*reservation| reservation.release();
     }
 };
 
 const ActiveJob = struct {
     id: u64,
     started_ns: u64,
-    run_ids: []const u64,
+    run_id_index: RunIdIndex,
+    owns_index: bool,
     key_range: ?KeyRange,
 };
 
@@ -111,16 +123,6 @@ pub const Scheduler = struct {
             self.denied_capacity += 1;
             return null;
         }
-        if (work.run_ids.len > 0 and self.conflictsWithInFlightRuns(work.run_ids)) {
-            self.conflict_denials += 1;
-            return null;
-        }
-        if (work.key_range) |range| {
-            if (self.conflictsWithInFlightKeyRange(range)) {
-                self.conflict_denials += 1;
-                return null;
-            }
-        }
         const max_jobs = @max(@as(usize, 1), self.options.max_concurrent_jobs);
         if (self.active_jobs >= max_jobs) {
             self.denied_capacity += 1;
@@ -142,9 +144,19 @@ pub const Scheduler = struct {
             }
         }
 
+        // Capacity denial must be O(1), even for a million-file candidate.
+        if (work.key_range) |range| if (self.conflictsWithInFlightKeyRange(range)) {
+            self.conflict_denials += 1;
+            return null;
+        };
+        if (self.conflictsWithInFlightRuns(work)) {
+            self.conflict_denials += 1;
+            return null;
+        }
+
         var reservation: ?resource_manager_mod.Reservation = null;
         if (resource_manager) |manager| {
-            const reserve_bytes = self.options.resource_reservation_bytes;
+            const reserve_bytes = self.options.resource_reservation_bytes +| if (work.run_id_index == null) runIdMemoryBound(work.run_ids.len) else @as(u64, 0);
             if (reserve_bytes > 0) {
                 reservation = manager.reserve(.lsm_compaction_work, reserve_bytes) catch {
                     self.denied_resource_pressure += 1;
@@ -153,13 +165,28 @@ pub const Scheduler = struct {
             }
         }
 
+        var index = work.run_id_index orelse RunIdIndex.empty;
+        if (work.run_id_index == null) {
+            index.ensureTotalCapacity(self.options.allocator, std.math.cast(u32, work.run_ids.len) orelse {
+                if (reservation) |*lease| lease.release();
+                self.denied_resource_pressure += 1;
+                return null;
+            }) catch {
+                if (reservation) |*lease| lease.release();
+                self.denied_resource_pressure += 1;
+                return null;
+            };
+            for (work.run_ids) |id| index.putAssumeCapacity(id, {});
+        }
+
         self.active_jobs += 1;
         self.in_flight_input_bytes = next_bytes;
         const job_id = self.nextJobId();
         self.active_job_slots[self.active_jobs - 1] = .{
             .id = job_id,
             .started_ns = now_ns,
-            .run_ids = work.run_ids,
+            .run_id_index = index,
+            .owns_index = work.run_id_index == null,
             .key_range = work.key_range,
         };
         self.grants += 1;
@@ -187,13 +214,16 @@ pub const Scheduler = struct {
         return id;
     }
 
-    fn conflictsWithInFlightRuns(self: *const Scheduler, run_ids: []const u64) bool {
-        for (run_ids) |candidate| {
-            for (self.active_job_slots[0..self.active_jobs]) |job| {
-                for (job.run_ids) |active| {
-                    if (candidate == active) return true;
-                }
-            }
+    fn conflictsWithInFlightRuns(self: *const Scheduler, work: Work) bool {
+        for (self.active_job_slots[0..self.active_jobs]) |job| {
+            // Probe the smaller side when both jobs have prepared indexes.
+            // A tiny active job must not force a scan of a broad candidate.
+            if (work.run_id_index) |index| if (job.run_id_index.count() < work.run_ids.len) {
+                var ids = job.run_id_index.keyIterator();
+                while (ids.next()) |id| if (index.contains(id.*)) return true;
+                continue;
+            };
+            for (work.run_ids) |candidate| if (job.run_id_index.contains(candidate)) return true;
         }
         return false;
     }
@@ -211,6 +241,8 @@ pub const Scheduler = struct {
         var idx: usize = 0;
         while (idx < self.active_jobs) : (idx += 1) {
             if (self.active_job_slots[idx].id != job_id) continue;
+            if (self.active_job_slots[idx].owns_index)
+                self.active_job_slots[idx].run_id_index.deinit(self.options.allocator);
             const tail_len = self.active_jobs - idx - 1;
             if (tail_len > 0) {
                 std.mem.copyForwards(ActiveJob, self.active_job_slots[idx .. idx + tail_len], self.active_job_slots[idx + 1 .. self.active_jobs]);
@@ -452,4 +484,57 @@ test "lsm compaction scheduler tracks large run-id sets without fixed work cap" 
     try std.testing.expectEqual(@as(u64, 3), stats.grants);
     try std.testing.expectEqual(@as(u64, 1), stats.conflict_denials);
     try std.testing.expectEqual(@as(u64, 0), stats.active_jobs);
+}
+
+test "lsm compaction scheduler index allocation denial releases resource credit" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var scheduler = Scheduler.init(.{ .allocator = failing.allocator(), .resource_reservation_bytes = 128 });
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    try std.testing.expect(scheduler.tryAcquire(testWork(1, 10, &.{ 9, 3, 9 }), &manager) == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.active_jobs);
+    try std.testing.expectEqual(@as(u64, 1), scheduler.denied_resource_pressure);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
+    scheduler.options.allocator = std.testing.allocator;
+    var grant = scheduler.tryAcquire(testWork(1, 10, &.{ 9, 3, 9 }), &manager) orelse return error.TestUnexpectedResult;
+    grant.complete();
+    grant.complete();
+    try std.testing.expectEqual(@as(u64, 1), scheduler.completions);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
+}
+
+test "lsm compaction scheduler prepared membership scales for concurrent admission" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const ids = try allocator.alloc(u64, count * 2);
+        defer allocator.free(ids);
+        var first_index: RunIdIndex = .empty;
+        defer first_index.deinit(allocator);
+        var second_index: RunIdIndex = .empty;
+        defer second_index.deinit(allocator);
+        for (ids, 0..) |*id, i| id.* = i + 1;
+        for (ids[0..count]) |id| try first_index.put(allocator, id, {});
+        for (ids[count..]) |id| try second_index.put(allocator, id, {});
+        var scheduler = Scheduler.init(.{ .allocator = allocator, .max_concurrent_jobs = 2, .resource_reservation_bytes = 0 });
+        var first_work = testWork(1, 1, ids[0..count]);
+        first_work.run_id_index = first_index;
+        var second_work = testWork(1, 1, ids[count..]);
+        second_work.run_id_index = second_index;
+        var first = scheduler.tryAcquire(first_work, null) orelse return error.TestUnexpectedResult;
+        defer first.complete();
+        const started = @import("antfly_platform").time.monotonicNs();
+        const rounds = if (@import("builtin").mode == .ReleaseFast) 100 else 1;
+        for (0..rounds) |_| {
+            var second = scheduler.tryAcquire(second_work, null) orelse return error.TestUnexpectedResult;
+            second.complete();
+        }
+        const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM concurrent indexed admission inputs={d} ns_per_grant={d}\n", .{ count, elapsed / rounds });
+        scheduler.options.max_concurrent_jobs = 1;
+        const denied_start = @import("antfly_platform").time.monotonicNs();
+        for (0..1000) |_| try std.testing.expect(scheduler.tryAcquire(second_work, null) == null);
+        if (@import("builtin").mode == .ReleaseFast) std.debug.print("LSM capacity denial inputs={d} ns_per_denial={d}\n", .{ count, (@import("antfly_platform").time.monotonicNs() - denied_start) / 1000 });
+        // Borrowed prepared indexes must survive all grants and denials.
+        try std.testing.expectEqual(@as(u32, @intCast(count)), second_index.count());
+    }
 }

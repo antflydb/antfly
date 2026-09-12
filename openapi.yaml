@@ -3801,6 +3801,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/IndexMutationBadRequest'
         '422':
@@ -3823,6 +3825,8 @@ paths:
       responses:
         '204':
           description: Table dropped successfully
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -4300,6 +4304,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -4355,6 +4361,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Table'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -6126,12 +6134,14 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateTableRequest'
       responses:
-        '200':
+        '201':
           description: Table created
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TableStatus'
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '501':
@@ -6150,6 +6160,8 @@ paths:
       responses:
         '204':
           description: Table dropped
+        '202':
+          $ref: '#/components/responses/CommittedMutationAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -9454,6 +9466,26 @@ components:
         name:
           type: string
           description: New logical name. The durable resource identity remains unchanged.
+    CommittedMutationOutcome:
+      type: object
+      required:
+        - status
+      description: >
+        The metadata mutation committed, but requested visibility or local
+
+        materialization is not yet fully healthy. Clients must observe status
+
+        instead of automatically replaying the mutation. `committed_superseded`
+
+        is terminal: a newer schema version became visible first.
+      properties:
+        status:
+          type: string
+          enum:
+            - committed_visibility_pending
+            - committed_superseded
+            - committed_repair_required
+            - committed_repair_unavailable
     TableSchemaPatch:
       type: object
       additionalProperties: true
@@ -30883,6 +30915,12 @@ components:
         audio:
           $ref: '#/components/schemas/InferenceAudioChunkConfig'
   responses:
+    CommittedMutationAccepted:
+      description: Mutation committed with pending visibility or explicit repair debt
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CommittedMutationOutcome'
     BadRequest:
       description: Bad request
       content:

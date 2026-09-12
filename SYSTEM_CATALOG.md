@@ -124,6 +124,15 @@ Resource mutations that have committed but are not yet visible return typed HTTP
 with GET rather than replaying the mutation. The OpenAPI contract and generated
 clients preserve this outcome.
 
+Scoped table creation returns HTTP 201 with `TableStatus`; default-scope creation
+retains HTTP 200. Both scopes use the shared `CommittedMutationOutcome` for
+accepted table mutations, including visibility, supersession and repair outcomes.
+Scoped drop retains HTTP 204 on completion. SDKs preserve the actual status and
+typed result; Rust's shared mutation decoder accepts both completed create codes.
+The same immutable catalog binding routes document and relational storage. Packed
+rows require no additional catalog identity or migration: table/database rename
+changes logical bindings while preserving their physical row destination.
+
 Data nodes read the catalog directly from a remembered metadata endpoint,
 without a preceding status RPC. Each successful read returns metadata group and
 incarnation evidence. The reader validates it against its pinned identity and

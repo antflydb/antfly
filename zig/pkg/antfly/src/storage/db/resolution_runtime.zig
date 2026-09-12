@@ -30,6 +30,7 @@ const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
 const internal_keys = @import("../internal_keys.zig");
+const relational_store = @import("relational_store.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -1035,13 +1036,15 @@ const PrefixCandidateProvider = struct {
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
             if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
-            const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
+            const entity_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.allocator, key)) orelse return;
             defer self.allocator.free(entity_key);
-            const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
+            const logical_value = try self.store.materializeRow(self.allocator, key, value);
+            defer self.allocator.free(logical_value);
+            const resolved_key = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
             const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
-            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
+            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, logical_value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
         }
     };
@@ -1073,6 +1076,12 @@ const PrefixCandidateProvider = struct {
 };
 
 fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.ArtifactStore, entity_key: []const u8) !?[]u8 {
+    const row_store_key = try relational_store.keyAlloc(allocator, entity_key);
+    defer allocator.free(row_store_key);
+    if (try store.get(allocator, row_store_key)) |packed_row| {
+        defer allocator.free(packed_row);
+        return try store.materializeRow(allocator, row_store_key, packed_row);
+    }
     const doc_store_key = try internal_keys.documentKeyAlloc(allocator, entity_key);
     defer allocator.free(doc_store_key);
     return try store.get(allocator, doc_store_key);
@@ -1904,7 +1913,10 @@ pub const ResolutionRuntime = struct {
                 return;
             }
 
-            var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+            var das = DbArtifactStore(backend_erased.Store){
+                .store = &self.store_handle.store,
+                .index_manager = self.index_manager,
+            };
             const max_seen = try catchUpWindow(
                 self.alloc,
                 self.replay_source,
@@ -1991,7 +2003,10 @@ pub const ResolutionRuntime = struct {
             return .{};
         }
 
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        var das = DbArtifactStore(backend_erased.Store){
+            .store = &self.store_handle.store,
+            .index_manager = self.index_manager,
+        };
         var result = try enqueueReresolveBacklogWindow(
             self.alloc,
             das.artifactStore(),
@@ -2041,7 +2056,10 @@ pub const ResolutionRuntime = struct {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(resolvers);
         }
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        var das = DbArtifactStore(backend_erased.Store){
+            .store = &self.store_handle.store,
+            .index_manager = self.index_manager,
+        };
         return listPendingReviews(alloc, das.artifactStore(), resolvers);
     }
 
@@ -2073,6 +2091,7 @@ const testing = std.testing;
 pub fn DbArtifactStore(comptime Store: type) type {
     return struct {
         store: *Store,
+        index_manager: ?*index_manager_mod.IndexManager = null,
 
         const Self = @This();
 
@@ -2087,7 +2106,19 @@ pub fn DbArtifactStore(comptime Store: type) type {
             .put = putFn,
             .delete = deleteFn,
             .scan_prefix = if (Store == backend_erased.Store) scanPrefixFn else null,
+            .materialize_row = materializeRowFn,
         };
+
+        fn materializeRowFn(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            key: []const u8,
+            value: []const u8,
+        ) anyerror![]u8 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.index_manager) |manager| return manager.materializeStoredValueAlloc(allocator, key, value);
+            return relational_store.materializeStoredValueAlloc(allocator, key, value);
+        }
 
         fn scanPrefixFn(
             ptr: *anyopaque,

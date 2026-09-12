@@ -12864,6 +12864,7 @@ test "text stats use postings when segment source is omitted" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -17799,8 +17800,8 @@ const MatchAllPrimaryKeyScanBatch = struct {
         self.scanned += 1;
         if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, key)) orelse return .@"continue";
+        if (!internal_keys.isStoredDocumentRowKey(key)) return .@"continue";
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return .@"continue";
         errdefer self.alloc.free(raw_key);
 
         try self.raw_keys.append(self.alloc, raw_key);
@@ -17859,8 +17860,8 @@ const MatchAllCandidateCollectState = struct {
         self.processed += 1;
         if (self.processed % 1024 == 0) try checkSearchRequestDeadline(self.req);
 
-        if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
-        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        if (!internal_keys.isStoredDocumentRowKey(store_key)) return;
+        var raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, store_key)) orelse return;
         errdefer self.alloc.free(raw_key);
 
         const owned = raw_key;
@@ -20179,6 +20180,7 @@ test "match_all native doc values sort streams candidates without exact candidat
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -20366,6 +20368,7 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -23566,6 +23569,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -23883,6 +23887,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24038,6 +24043,7 @@ test "match_all index sort uses doc values collector for selective native filter
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24245,6 +24251,7 @@ test "text field sort uses exact native doc values filter path without index sor
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24524,6 +24531,7 @@ test "text score query exposes score top k sort profile" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24692,6 +24700,7 @@ test "text ordered query rejects unresolved stored pattern filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24855,6 +24864,7 @@ test "text field sort uses sorted segment membership path when index sort matche
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25121,6 +25131,7 @@ test "text index sort uses doc values collector for selective term filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25310,6 +25321,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25492,6 +25504,7 @@ test "match_all sorted segment seek enforces scan budget" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25578,6 +25591,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25675,6 +25689,7 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25790,6 +25805,7 @@ test "match_all sorted segment seek rejects cursor when segment bounds are unava
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25874,6 +25890,7 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25966,6 +25983,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26115,6 +26133,7 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -27933,6 +27952,7 @@ test "match_all native doc values without stream reports bounded exact collector
     const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .io = std.Options.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,

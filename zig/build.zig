@@ -935,7 +935,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog" },
+        .filters = &.{ "request gate", "request watchdog", "request task admission", "successful H1 requests do not wait" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
