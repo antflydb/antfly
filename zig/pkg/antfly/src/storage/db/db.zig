@@ -31832,6 +31832,12 @@ pub const DB = struct {
     }
 
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
+        // These bytes enter compressed durable tables, so even a diagnostic
+        // timestamp can change disk usage and subsequent placement decisions.
+        const now = if (index_manager.io) |io|
+            @as(u64, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds)))
+        else
+            platform_time.monotonicNs();
         if (index_manager.textIndex(index_name)) |entry| {
             // Applied-sequence persistence runs outside the DB apply lock; keep this
             // snapshot cheap and avoid walking full-text segment internals here.
@@ -31840,7 +31846,7 @@ pub const DB = struct {
             return .{
                 .kind = .full_text,
                 .doc_count = text_snapshot.liveDocCount(),
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.denseIndex(index_name)) |entry| {
@@ -31850,7 +31856,7 @@ pub const DB = struct {
                 .doc_count = dense_stats.active_count,
                 .node_count = dense_stats.node_count,
                 .root_node = dense_stats.root_node,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.sparseIndex(index_name)) |entry| {
@@ -31859,7 +31865,7 @@ pub const DB = struct {
                 .kind = .sparse_vector,
                 .doc_count = sparse_stats.doc_count,
                 .term_count = sparse_stats.term_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
@@ -31870,7 +31876,7 @@ pub const DB = struct {
                 .edge_count = graph_stats.edge_count,
                 .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
-                .updated_at_ns = platform_time.monotonicNs(),
+                .updated_at_ns = now,
             };
         }
         return null;
@@ -66200,6 +66206,8 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 closed.* = true;
             }
             try database.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+            const initial_status = (try database.loadIndexStatusSnapshot(std.testing.allocator, "g")) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
             try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
             try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
             const merge = types.BatchRequest{ .merge_checkpoint = .{
