@@ -5155,6 +5155,12 @@ pub const AntflyApiHandler = struct {
         return self.dropIndex(ctx, table_name, index_name);
     }
 
+    pub fn executeNamespaceTableGraphMetricAction(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.executeGraphMetricAction(ctx, table_name, index_name, metric_name, action);
+    }
+
     pub fn queryNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
@@ -6486,7 +6492,7 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);

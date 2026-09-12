@@ -10232,7 +10232,7 @@ fn queryProvisionedAcrossGroupsAtGenerations(
 
 fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
     return req.filter_doc_ids_positive and req.filter_doc_ids.len > 0 and req.filter_doc_ids.len <= 256 and req.query == .match_all and
-        req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0 and !searchRequestHasResolvedDocFilter(req);
+        req.full_text == null and req.full_text_queries.len == 0 and req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0 and req.graph_metric_queries.len == 0 and req.graph_metric_rerank == null and req.hierarchy_children == null and !req.hierarchy_grouped_matches and req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0 and req.filter_text == null and req.exclusion_text == null and req.aggregations_json.len == 0 and !searchRequestHasResolvedDocFilter(req);
 }
 
 fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
@@ -32800,6 +32800,16 @@ test "system catalog document lookup batches partition keys without broadening e
     try std.testing.expectEqual(@as(usize, 0), excluded.filter_doc_ids.len);
     try std.testing.expect(excluded.filter_doc_ids_positive);
     request.full_text = .{ .match_all = {} };
+    try std.testing.expect(!isDocumentLookupBatch(request));
+}
+
+test "system catalog document lookup shortcut excludes graph metric reads and reranking" {
+    var request: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{"a"} };
+    try std.testing.expect(isDocumentLookupBatch(request));
+    request.graph_metric_queries = &.{.{ .name = "rank", .query = .{ .index_name = "graph_idx", .metric_name = "pagerank" } }};
+    try std.testing.expect(!isDocumentLookupBatch(request));
+    request.graph_metric_queries = &.{};
+    request.graph_metric_rerank = .{ .index_name = "graph_idx", .metric_name = "pagerank" };
     try std.testing.expect(!isDocumentLookupBatch(request));
 }
 

@@ -49,6 +49,9 @@ const Segment = union(enum) {
         name: []const u8,
         suffix: []const u8,
     },
+    /// `:left::right` captures two values separated by the last raw colon.
+    /// Percent-encoded colons remain data until the handler decodes a value.
+    colon_params: struct { left: []const u8, right: []const u8 },
     wildcard: void,
 };
 
@@ -173,6 +176,10 @@ pub const Router = struct {
                 .param_suffix => |right_param| if (!mem.eql(u8, left_param.suffix, right_param.suffix)) return false,
                 else => return false,
             },
+            .colon_params => switch (right_segment) {
+                .colon_params => {},
+                else => return false,
+            },
             .wildcard => switch (right_segment) {
                 .wildcard => {},
                 else => return false,
@@ -183,6 +190,7 @@ pub const Router = struct {
 
     fn parsePattern(self: *Self, pattern: []const u8) ![]const Segment {
         var segments = std.ArrayListUnmanaged(Segment).empty;
+        errdefer segments.deinit(self.allocator);
 
         var iter = mem.splitScalar(u8, pattern, '/');
         while (iter.next()) |part| {
@@ -191,7 +199,12 @@ pub const Router = struct {
             if (part[0] == ':') {
                 if (mem.indexOfScalar(u8, part[1..], ':')) |suffix_idx| {
                     const suffix_start = 1 + suffix_idx;
-                    try segments.append(self.allocator, .{ .param_suffix = .{
+                    if (mem.startsWith(u8, part[suffix_start..], "::")) {
+                        const left = part[1..suffix_start];
+                        const right = part[suffix_start + 2 ..];
+                        if (left.len == 0 or right.len == 0 or mem.indexOfScalar(u8, right, ':') != null) return error.InvalidRoutePattern;
+                        try segments.append(self.allocator, .{ .colon_params = .{ .left = left, .right = right } });
+                    } else try segments.append(self.allocator, .{ .param_suffix = .{
                         .name = part[1..suffix_start],
                         .suffix = part[suffix_start..],
                     } });
@@ -305,6 +318,13 @@ pub const Router = struct {
                     if (param_idx >= params.len) return null;
                     params[param_idx] = .{ .name = param.name, .value = part[0 .. part.len - param.suffix.len] };
                     param_idx += 1;
+                },
+                .colon_params => |pair| {
+                    const delimiter = mem.lastIndexOfScalar(u8, part, ':') orelse return null;
+                    if (delimiter == 0 or delimiter + 1 == part.len or params.len - param_idx < 2) return null;
+                    params[param_idx] = .{ .name = pair.left, .value = part[0..delimiter] };
+                    params[param_idx + 1] = .{ .name = pair.right, .value = part[delimiter + 1 ..] };
+                    param_idx += 2;
                 },
                 .wildcard => {
                     return param_idx;
@@ -807,4 +827,36 @@ test "RouteGroup convenience methods" {
     try std.testing.expect(router.find(.PATCH, "/api/patch", &pbuf) != null);
     try std.testing.expect(router.find(.HEAD, "/api/head", &pbuf) != null);
     try std.testing.expect(router.find(.OPTIONS, "/api/options", &pbuf) != null);
+}
+
+test "Router colon parameter pairs preserve encoded names and enforce bounds" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+    try router.add(.POST, "/metrics/:metric::action", handler);
+    var params: [16]RouteParam = undefined;
+    const result = router.find(.POST, "/metrics/rank%3Aarchive:pause", &params).?;
+    try std.testing.expectEqual(@as(usize, 2), result.params.len);
+    try std.testing.expectEqualStrings("metric", result.params[0].name);
+    try std.testing.expectEqualStrings("rank%3Aarchive", result.params[0].value);
+    try std.testing.expectEqualStrings("action", result.params[1].name);
+    try std.testing.expectEqualStrings("pause", result.params[1].value);
+    const raw_colon = router.find(.POST, "/metrics/rank:archive:pause", &params).?;
+    try std.testing.expectEqualStrings("rank:archive", raw_colon.params[0].value);
+    for ([_][]const u8{ "/metrics/rank", "/metrics/:pause", "/metrics/rank:", "/metrics/rank%3Apause", "/metrics/rank:pause/extra" }) |path| {
+        try std.testing.expect(router.find(.POST, path, &params) == null);
+    }
+    try std.testing.expectError(error.DuplicateRoute, router.add(.POST, "/metrics/:other::verb", handler));
+    try std.testing.expectError(error.InvalidRoutePattern, router.add(.POST, "/metrics/:name::", handler));
+    try std.testing.expectError(error.InvalidRoutePattern, router.add(.POST, "/metrics/:::verb", handler));
+    try std.testing.expectError(error.InvalidRoutePattern, router.add(.POST, "/metrics/:name::verb::third", handler));
+    var methods: [16]types.Method = undefined;
+    try std.testing.expectEqual(@as(usize, 1), router.allowedMethods("/metrics/rank:pause", &methods));
+    try std.testing.expectEqual(types.Method.POST, methods[0]);
+    try router.add(.POST, "/:a/:b/:c/:d/:e/:f/:g/:h/:i/:j/:k/:l/:m/:n/:o/:p::q", handler);
+    try std.testing.expect(router.find(.POST, "/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16:17", &params) == null);
 }

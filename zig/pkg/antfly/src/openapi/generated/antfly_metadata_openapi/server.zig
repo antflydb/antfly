@@ -264,6 +264,22 @@ pub const DropNamespaceTableIndexPathParams = struct {
     index_name: []const u8,
 };
 
+/// Execute a graph metric operational action
+pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
+    /// Database name
+    database_name: []const u8,
+    /// Namespace name
+    namespace_name: []const u8,
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the graph index
+    index_name: []const u8,
+    /// Name of the configured graph metric
+    metric_name: []const u8,
+    /// Operational action to apply to the graph metric materialization
+    action: []const u8,
+};
+
 /// Query an explicit namespace table
 pub const QueryNamespaceTablePathParams = struct {
     /// Database name
@@ -952,6 +968,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
@@ -1066,6 +1083,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "getNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndex'");
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
         if (!@hasDecl(Impl, "dropNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTableIndex'");
+        if (!@hasDecl(Impl, "executeNamespaceTableGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeNamespaceTableGraphMetricAction'");
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
         if (!@hasDecl(Impl, "renameNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'renameNamespaceTable'");
         if (!@hasDecl(Impl, "restoreNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'restoreNamespaceTable'");
@@ -1178,6 +1196,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropNamespaceTableIndex));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeNamespaceTableGraphMetricAction));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rename", httpx.Handler.bind(self.impl, renameNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreNamespaceTable));
@@ -1482,6 +1501,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.dropNamespaceTableIndex(ctx, database_name, namespace_name, table_name, index_name);
+        }
+
+        /// Execute a graph metric operational action
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+        fn executeNamespaceTableGraphMetricAction(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            const metric_name = ctx.param("metricName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: metricName" });
+            const action = ctx.param("action") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: action" });
+            return impl.executeNamespaceTableGraphMetricAction(ctx, database_name, namespace_name, table_name, index_name, metric_name, action);
         }
 
         /// Query an explicit namespace table
@@ -2084,6 +2115,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response

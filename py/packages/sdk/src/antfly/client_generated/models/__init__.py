@@ -259,6 +259,7 @@ from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
 from .exact_sort_error_status import ExactSortErrorStatus
 from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
+from .execute_namespace_table_graph_metric_action_action import ExecuteNamespaceTableGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -1329,6 +1330,7 @@ __all__ = (
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
+    "ExecuteNamespaceTableGraphMetricActionAction",
     "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",

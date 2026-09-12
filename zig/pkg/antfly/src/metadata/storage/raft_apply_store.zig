@@ -18157,6 +18157,13 @@ test "system catalog store report workload benchmark" {
         }
         std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
         std.debug.print("REPORT_BENCH groups={d} full_store_read_p50_ms={d:.3}\n", .{ count, @as(f64, @floatFromInt(elapsed[3])) / 1e6 });
+        // Count caller-owned hydration and scratch allocations separately from
+        // timing so instrumentation does not perturb the historical comparison.
+        var read_counter = std.testing.FailingAllocator.init(alloc, .{});
+        const counted_records = try store.listStores(read_counter.allocator(), 21);
+        store.freeStores(read_counter.allocator(), counted_records);
+        try std.testing.expectEqual(read_counter.allocated_bytes, read_counter.freed_bytes);
+        std.debug.print("REPORT_BENCH groups={d} full_store_read_allocations={d} full_store_read_allocated_bytes={d}\n", .{ count, read_counter.allocations, read_counter.allocated_bytes });
         for (&elapsed) |*sample| {
             const start = platform_time.monotonicNs();
             for (0..100) |_| {

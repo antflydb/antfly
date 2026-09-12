@@ -186,7 +186,7 @@ Bounded exact-document candidate queries select only owning shards from the
 request's pinned routing snapshot. Sorted range references support binary search
 per key, and each shard receives only its own keys. They retain the existing
 index-independent document-value execution path and route/generation fencing;
-scored, graph, and hierarchy queries keep their existing fan-out semantics.
+scored, graph, and hierarchy queries keep their existing fan-out semantics. Graph metric reads and reranking also use the general routing path. Metric maintenance actions resolve the same immutable destination through literal or scoped routes, require table admin permission, and continue to address that identity after rename. The shared HTTP router captures both fields in the colon-delimited metric/action segment before handlers decode names.
 
 Table listings build an identity map and select scope, prefix, and authorized
 tables before per-table status collection and public schema materialization.

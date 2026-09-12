@@ -290,7 +290,7 @@ its reference omits the old in-flight hash operations, making that comparison
 conservative. Neither queue benchmark measures network throughput or elections.
 
 Run these after task-owned builds and tests finish. The report target includes
-cached/fresh/sparse/full/reference updates, WAL bytes, full hydration, repair
+cached/fresh/sparse/full/reference updates, WAL bytes, full hydration and its caller-owned allocation count/bytes (counted outside the timing loop), repair
 comparison, and selected-store preparation. Keep the full and reference paths
 in the results, including regressions. Pair component results with the existing
 live tenant-provisioning/restart, scoped discovery and relational-query scenarios;

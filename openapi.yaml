@@ -2496,6 +2496,107 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  ? /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+  : parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: >
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+
+        graph metric. The metric configuration remains owned by the graph index.
+
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+
+        return the aggregate shard status without waiting for graph-sized work.
+
+        `delete` clears materialized metric state and durably disables automatic
+
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeNamespaceTableGraphMetricAction
+      responses:
+        '200':
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphMetricActionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: The table topology or write-owner generation changed, or only some shards accepted
+            the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        '429':
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/commit:
     post:
       summary: Commit an OCC transaction

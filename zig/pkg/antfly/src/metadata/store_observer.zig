@@ -1327,3 +1327,30 @@ test "store observer repair admission allocation failures preserve owned records
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
+
+test "store observer borrowed admission preserves prior ownership through allocation failures" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .lifecycle_work_class = .repair, .repair_status = .waiting, .coverage_generation = 1, .coverage_config_hash = 2, .coverage_identity_ready = true }};
+            var runtimes = [_]table_manager.RuntimeGroupStatusReport{.{ .table_id = 1, .group_id = 7, .store_id = 20, .node_id = 30, .indexes = &indexes }};
+            const prior = try table_manager.cloneStore(alloc, .{ .store_id = 20, .node_id = 30, .runtime_statuses = &runtimes });
+            defer table_manager.freeStore(alloc, prior);
+            const observation: StoreObservation = .{ .store_id = 20, .health_class = "changed", .available_bytes = 10, .runtime_statuses = &runtimes };
+            const admitted = admitObservation(alloc, prior, observation, false) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), prior.available_bytes);
+                try std.testing.expectEqualStrings("healthy", prior.health_class);
+                try std.testing.expect(prior.runtime_statuses[0].indexes[0].repair_status == .waiting);
+                return err;
+            };
+            const replacement = admitted.?;
+            defer table_manager.freeStore(alloc, replacement);
+            try std.testing.expectEqual(@as(u64, 10), replacement.available_bytes);
+            try std.testing.expect(replacement.runtime_statuses[0].indexes[0].repair_status == .waiting);
+            try std.testing.expectEqual(@as(u64, 0), prior.available_bytes);
+            try std.testing.expectEqualStrings("healthy", prior.health_class);
+            try std.testing.expect(prior.runtime_statuses.ptr != replacement.runtime_statuses.ptr);
+            try std.testing.expect(runtimes[0].indexes[0].repair_status == .waiting);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}

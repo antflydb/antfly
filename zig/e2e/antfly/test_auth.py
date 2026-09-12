@@ -815,6 +815,12 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
             api.url + path + "/batch", json={"inserts": {"bad": {}}}, timeout=30
         )
         assert forbidden.status_code == 403, forbidden.text
+        forbidden = api.s.post(
+            api.url + path + "/indexes/graph_idx/graph-metrics/rank:pause",
+            json={},
+            timeout=30,
+        )
+        assert forbidden.status_code == 403, forbidden.text
     for path in ("/databases/tenant/namespaces/secret/tables/events",):
         forbidden = api.s.get(api.url + path + "/documents/gold", timeout=30)
         assert forbidden.status_code == 403, forbidden.text

@@ -183,6 +183,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
 
+    const store_observer_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[2],
+        .filters = &.{"store observer "},
+    });
+    b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
+
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },

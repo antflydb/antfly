@@ -210,6 +210,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     Refresh and rebuild durably enqueue bounded, resumable maintenance and
+         *     return the aggregate shard status without waiting for graph-sized work.
+         *     `delete` clears materialized metric state and durably disables automatic
+         *     maintenance. A later refresh, rebuild, or resume action re-enables the
+         *     metric and can publish a new generation.
+         */
+        post: operations["executeNamespaceTableGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -17403,6 +17442,69 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregate graph metric status after the action is durably accepted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Local storage resources are temporarily exhausted */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    executeNamespaceTableGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
                 /** @description Name of the table */
                 tableName: string;
                 /** @description Name of the graph index */

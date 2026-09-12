@@ -610,3 +610,27 @@ def test_catalog_mutation_results_keep_resource_and_binding_identities(stateful_
     assert replacement["database_id"] != first["database_id"]
     api.delete(f"/databases/{database}")
     api.delete(f"/tablespaces/{space}")
+
+
+def test_catalog_graph_metric_actions_follow_identity_after_rename(stateful_api):
+    api = stateful_api
+    database = "graph_catalog_" + uuid.uuid4().hex[:12]
+    api.post(f"/databases/{database}", {})
+    tables = f"/databases/{database}/namespaces/public/tables"
+    path = tables + "/documents"
+    created = api.post(path, {})
+    api.post(
+        path + "/indexes/graph_idx",
+        {"type": "graph", "metrics": {"rank": {"kind": "pagerank"}}},
+    )
+    metric = "/indexes/graph_idx/graph-metrics/rank"
+    paused = api.post(path + metric + ":pause", {})
+    assert paused["status"]["maintenance_paused"] is True
+    api.post(path + "/rename", {"name": "renamed"})
+    renamed = tables + "/renamed"
+    assert api.get(renamed)["table_id"] == created["table_id"]
+    assert api._request("POST", path + metric + ":resume", {}).status_code == 404
+    resumed = api.post(renamed + metric + ":resume", {})
+    assert resumed["status"]["maintenance_paused"] is False
+    api.delete(renamed)
+    api.delete(f"/databases/{database}")
