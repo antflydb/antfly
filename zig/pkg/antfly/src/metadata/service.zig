@@ -19876,6 +19876,10 @@ test "metadata service store report workload benchmark reconciliation view" {
                     var view = try StoreReadView.capture(alloc, &snapshot);
                     defer view.deinit(alloc);
                     try std.testing.expectEqual(count, view.stores.len);
+                    for (view.stores) |record| {
+                        try std.testing.expectEqual(@as(usize, 100), record.runtime_statuses.len);
+                        try std.testing.expectEqualStrings("tenant_events", record.runtime_statuses[99].table_name);
+                    }
                 } else {
                     const records = try cloneProjectedStoresOwned(alloc, snapshot.stores);
                     defer {
@@ -19883,6 +19887,10 @@ test "metadata service store report workload benchmark reconciliation view" {
                         alloc.free(records);
                     }
                     try std.testing.expectEqual(count, records.len);
+                    for (records) |record| {
+                        try std.testing.expectEqual(@as(usize, 100), record.runtime_statuses.len);
+                        try std.testing.expectEqualStrings("tenant_events", record.runtime_statuses[99].table_name);
+                    }
                 };
                 sample.* = (platform_time.monotonicNs() - start) / iterations;
             }
