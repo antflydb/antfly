@@ -4024,7 +4024,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
-    const scheduler_bench = b.addTest(.{ .root_module = antfly_test_mod, .filters = &.{"http frame driver scheduler workload benchmark"} });
+    const scheduler_bench = b.addTest(.{
+        .root_module = antfly_test_mod,
+        // Retain the module reachability anchors as well as the workload;
+        // otherwise Zig can report passing tests without importing the driver.
+        .filters = &.{ "raft integration module compiles", "raft transport module compiles", "http driver module compiles", "http frame driver scheduler workload benchmark" },
+    });
     b.step("antfly-http-scheduler-bench", "Measure peer scheduling after node backlogs drain").dependOn(&b.addRunArtifact(scheduler_bench).step);
     const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
