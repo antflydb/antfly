@@ -764,22 +764,40 @@ test "http frame sender drains partial startup and releases private capacity" {
 }
 
 test "http frame sender borrows capacity and drains a refused partial startup" {
-    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
-    defer lane.deinit();
+    const AdmissionLane = @import("test_admission_lane.zig");
     const Unused = struct {
         fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
             return error.UnexpectedRequest;
         }
         fn done() void {}
     };
-    var driver = HttpFrameDriver.init(std.testing.allocator, .{ .sender_io = lane.io(), .async_send_worker_count = 2 }, .{
-        .ptr = undefined,
-        .vtable = &.{ .execute = Unused.execute },
-    }, std.testing.io);
-    defer driver.deinit();
-    try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
-    try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
-    try std.testing.expect(driver.sender_io == null);
-    var probe = try lane.io().concurrent(Unused.done, .{});
-    probe.await(lane.io());
+    // Await guarantees task completion, not immediate reuse of a Threaded
+    // concurrency slot: its busy count is retired after waking the awaiter.
+    // Inject admission refusal instead of racing that executor bookkeeping.
+    // Check every rollback prefix, including refusal before the first worker.
+    for (0..4) |refuse_after| {
+        var lane = AdmissionLane.init(std.testing.allocator, refuse_after);
+        defer lane.deinit();
+        const io = lane.io();
+        {
+            var driver = HttpFrameDriver.init(std.testing.allocator, .{ .sender_io = io, .async_send_worker_count = 4 }, .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = Unused.execute },
+            }, std.testing.io);
+            defer driver.deinit();
+            try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
+            try std.testing.expectEqual(refuse_after, lane.admitted);
+            try std.testing.expectEqual(lane.admitted, lane.awaited);
+            try std.testing.expectEqual(@as(usize, 0), driver.workers.len);
+            try std.testing.expect(driver.sender_io == null);
+            try std.testing.expect(driver.closing);
+        }
+        // Destroying the borrower must leave the owner's executor usable.
+        // Admission now succeeds independently of worker-retirement timing.
+        lane.refuse_after = null;
+        var probe = try io.concurrent(Unused.done, .{});
+        probe.await(io);
+        try std.testing.expectEqual(refuse_after + 1, lane.admitted);
+        try std.testing.expectEqual(lane.admitted, lane.awaited);
+    }
 }
