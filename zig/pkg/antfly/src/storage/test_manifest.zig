@@ -234,6 +234,7 @@ comptime {
     _ = @import("lsm_backend/manifest_set.zig");
     _ = @import("lsm_backend/manifest_replay.zig");
     _ = @import("lsm_backend/obsolete_ledger.zig");
+    _ = @import("lsm_backend/physical_usage_test.zig");
     _ = @import("lsm_backend/repository.zig");
     _ = @import("lsm_backend/run_directory.zig");
     _ = @import("lsm_backend/run_store.zig");
