@@ -14,20 +14,20 @@ Use it to answer:
 
 The public contract target is the finished Go implementation:
 
-- [../antfly/openapi.yaml](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly/openapi.yaml)
+- [../antfly/openapi.yaml](../openapi.yaml)
   - `/backup`
   - `/restore`
   - `/backups`
   - `/tables/{tableName}/backup`
   - `/tables/{tableName}/restore`
-- [../antfly/go/e2e/backup_restore_test.go](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly/go/e2e/backup_restore_test.go)
+- `go/e2e/backup_restore_test.go` (removed with the Go server; see [zig/e2e/antfly](e2e/antfly))
 
 ## Current State
 
 ### Already Exists
 
 Low-level DB snapshot and restore primitives already exist in
-[db.zig](/Users/ajroetker/go/pkg/antfly/src/github.com/antflydb/antfly-zig/go/pkg/antfly/src/storage/db/db.zig):
+[db.zig](pkg/antfly/src/storage/db/db.zig):
 
 - `DB.snapshot(id)`
 - `DB.restoreSnapshotTo(snapshot_root, path, opts)`
