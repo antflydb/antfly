@@ -105,17 +105,6 @@ def main() -> None:
         if isinstance(module, torch.nn.Dropout):
             module.forward = dropout_forward(name, module)
 
-    def layer_hook(name):
-        def hook(_module, _inputs, output):
-            if isinstance(output, tuple):
-                output = output[0]
-            capture(f"{active['prefix']}.intermediate.{name}", output)
-        return hook
-
-    model.embeddings.register_forward_hook(layer_hook("embeddings"))
-    for index, layer in enumerate(model.encoder.layer):
-        layer.register_forward_hook(layer_hook(f"layer.{index}"))
-
     weights = {name: tensor.detach().contiguous().clone() for name, tensor in model.state_dict().items()}
     for name, batch, sequence, lengths in (("padded7", 2, 7, [7, 4]), ("buckets19", 1, 19, [19])):
         ids = (torch.arange(batch * sequence).reshape(batch, sequence) * 7 + 3) % 63 + 1

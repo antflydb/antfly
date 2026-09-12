@@ -2554,7 +2554,7 @@
   },
   "dropout_masks": {},
   "format_version": 1,
-  "generator_sha256": "a8158ddc47d36e1c5c533f2a60c2f6e47253847703dbf5941f72b5351f260f8a",
+  "generator_sha256": "02596a2894905699d8ee647a26a267ca7324131efcf8b0ccc48d4445b73fe1a5",
   "inputs": {
     "pair_logits": {
       "shape": [

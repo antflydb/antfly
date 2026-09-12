@@ -587,7 +587,7 @@
     "rng_equivalence_claim": false
   },
   "format_version": 1,
-  "generator_sha256": "cf5dd604efa77228b5c2a537219f30b598227004b622bc92de96b8441b59bccb",
+  "generator_sha256": "b245b2b7f1c8c745180d009ccc731fea47fd006df5e92e5258e91167c7b1c389",
   "notes": [
     "No pretrained checkpoint or corpus is loaded; every profile constructs the same tiny random DeBERTa baseline.",
     "model.train() executes real auxiliary losses with encoder/head/PEFT dropout .125 replaced only by explicit captured inverted masks.",

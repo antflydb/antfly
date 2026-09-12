@@ -359,6 +359,11 @@ def capture(source, output, modes):
             composition.capture(source, payload, modes)
             for file in payload.iterdir():
                 checked(file.is_file(), "unexpected composed fixture directory")
+                # Numerical dropout fixtures use captured inputs. Keep the tiny
+                # tokenizer once in training_step for native dataset preflight.
+                if file.name in ("tokenizer.json", "tokenizer_config.json"):
+                    file.unlink()
+                    continue
                 file.rename(staging / file.name)
             payload.rmdir()
     return {"profiles": modes, "capture_sha256": oracle.sha256_file(output / "capture.json"),

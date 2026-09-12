@@ -101,9 +101,6 @@ def prepare(output, source):
             path = staging / (split + ".jsonl")
             path.write_bytes(b"".join(encoded(example) for example in rows))
             files[split] = {"path": path.name, "size_bytes": path.stat().st_size, "sha256": oracle.sha256_file(path), "records": len(rows)}
-        path = staging / "schema.json"
-        path.write_bytes(encoded(fixed_schema))
-        files["schema"] = {"path": path.name, "size_bytes": path.stat().st_size, "sha256": oracle.sha256_file(path)}
         manifest = {"scope": "gliner25_training_job_fixture/v1", "version": 1, "qualification": False,
             "dataset_format": "gliner_boundary_dataset.Row/version=1", "source_kind": "authored_synthetic_integration_examples",
             "no_model_execution": True, "heldout_quality_claim": False, "unicode_version": unicodedata.unidata_version,

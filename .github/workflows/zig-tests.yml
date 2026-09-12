@@ -420,8 +420,7 @@ jobs:
         run: |
           uv run --no-project --isolated --no-python-downloads --no-build \
             --with-requirements scripts/gliner25/requirements-contract.txt \
-            python scripts/gliner25/bootstrap_monitoring.py --temp-dir "$RUNNER_TEMP" -- \
-            python3 scripts/run_model_contract_tests.py gliner25
+            python scripts/run_model_contract_tests.py gliner25
 
       - name: Check inference kernels through the root build graph
         working-directory: zig
@@ -732,8 +731,7 @@ jobs:
         run: |
           uv run --no-project --isolated --no-python-downloads --no-build \
             --with-requirements scripts/gliner25/requirements-contract.txt \
-            python scripts/gliner25/bootstrap_monitoring.py --temp-dir "$RUNNER_TEMP" -- \
-            python3 scripts/run_model_contract_tests.py gliner25
+            python scripts/run_model_contract_tests.py gliner25
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget and the 22 GiB largest-step claim.

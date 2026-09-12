@@ -10,7 +10,8 @@ test integration and cannot qualify extraction quality or convergence.
 
 `prepare_training_job_fixture.py` uses the exact pinned upstream word pattern
 to check every UTF-8 byte span. It never opens a model or tokenizer. All four
-prepared artifacts reproduced byte-for-byte. Actual native Source/Dataset
+prepared rows reproduced byte-for-byte. The complete schema stays inline in
+each row; no separate schema copy is required. Actual native Source/Dataset
 preflight remains a separate test, followed by admitted optimizer execution,
 durable resume, final export and validation inference.
 
@@ -18,8 +19,7 @@ durable resume, final export and validation inference.
 | --- | ---: | --- |
 | `train.jsonl` | 2,192 | `47a7b27b46bbfa25c77754c4e88e97f82530b73db9e80f8cb918f64b8d04b517` |
 | `validation.jsonl` | 2,238 | `638bd525f38eb071c4fbd84bd2726a1bbf020d1a05694b0934e03e392f20f531` |
-| `schema.json` | 395 | `1eb946c6b140fba2ef24ee4e84c85536153ebcc933aadbca36bb290a68b1bd41` |
-| `manifest.json` | 5,788 | `e4f7ab891ab01cba48798c784a0cb5b1d120109f0b05c113336dd65243ae85c6` |
+| `manifest.json` | 5,628 | `ac0b079bfd36994310fd1063701cef78f60f88aa372c3b88bc5a0374a9dc1abf` |
 
 The manifest references all five immutable files of
 `fastino/gliner2.5-small-v1` revision

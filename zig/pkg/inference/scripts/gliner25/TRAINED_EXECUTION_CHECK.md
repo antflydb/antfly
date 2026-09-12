@@ -176,12 +176,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
 PYTHONDONTWRITEBYTECODE=1 python3 zig/pkg/inference/scripts/run_model_contract_tests.py gliner25
 ```
 
-The complete GLiNER2.5 Python contract checkpoint with the verified official
-promtool completed **157 tests, all passed with no skips**. Its log is
-`/private/tmp/gliner25-contracts-promtool-trained-v5.log`, SHA-256
-`62c744adc5684c2ac2754f26c3fa53ad81811f32831c737b00bef4e52e993160`.
-This aggregates several independent contract suites; it is not 157 model runs.
-
 ## Actual small all-target trained-artifact execution
 
 Both materialized rank-2/alpha-4, zero-dropout adapters covering all 131

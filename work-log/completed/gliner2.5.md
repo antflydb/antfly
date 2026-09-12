@@ -229,8 +229,23 @@ python3 zig/pkg/inference/scripts/gliner25/oracle.py verify-references
 Source regeneration requires the exact checkout, model artifacts, and
 [pinned environment](../../zig/pkg/inference/scripts/gliner25/requirements.txt).
 Generators and checkers expose their inputs through `--help`; the adjacent
-oracle/checker guides describe the individual proof boundaries. Run native
-tests through the build graph from `zig/`, with heavy model/device work serial:
+oracle/checker guides describe the individual proof boundaries. Synthetic
+training captures use two grouped commands, with one profile per process:
+
+- `capture_training_heads.py`: `boundary`, `explicit`, `records`, `relations`.
+- `capture_training_objectives.py`: `losses`, `selection`, `matching`, `record-loss`.
+
+Both accept `--source` (also `--upstream`) and `--output`. Each profile retains
+its existing fixture filename, cases, numerical checks, and source provenance.
+For example, from the repository root in the pinned environment:
+
+```sh
+python3 zig/pkg/inference/scripts/gliner25/capture_training_heads.py boundary --source /path/to/pinned/GLiNER2 --output /tmp/training_head.json
+python3 zig/pkg/inference/scripts/gliner25/capture_training_objectives.py record-loss --source /path/to/pinned/GLiNER2 --output /tmp/training_record_loss.json
+```
+
+Run native tests through the build graph from `zig/`, with heavy model/device
+work serial:
 
 ```sh
 zig build inference-test -Dmetal=false -Dcuda=false -j1 -- --test-filter 'gliner boundary' --test-filter 'boundary processor'
@@ -241,7 +256,7 @@ Real-model tests require the explicitly selected `ANTFLY_GLINER25_*_MODEL_DIR`
 fixtures; Metal tests require an available device and Metal-enabled build.
 Missing artifacts or devices are explicit skips, not correctness evidence.
 
-## Operations and monitoring
+## Runtime metrics
 
 V2 dispatch instrumentation records fixed-enum outcomes, phases, admission,
 solver work, and request-owned memory without request-derived labels. The
@@ -249,50 +264,8 @@ inference metrics route is `/ml/v1/metrics`. Dispatch timing excludes HTTP body
 collection and response publication; decoded items can belong to a later
 failed atomic request, and returned items are not client acknowledgments.
 The request-heap high-water gauge is not process RSS or device/model residency.
-
-Optional dashboard/rule examples use `gliner25_monitor="enabled"` and retain
-`job`/`instance` identity. Rates precede aggregation; missing telemetry remains
-missing. They do not configure a running scrape, alert receiver, or paging.
-The [monitoring contracts](../../zig/pkg/inference/scripts/gliner25/test_monitoring.py)
-check selectors, units, bounds, and alert scenarios; the
-[bootstrap](../../zig/pkg/inference/scripts/gliner25/bootstrap_monitoring.py)
-verifies a pinned promtool in temporary storage for native rule evaluation.
-Offline checks do not prove live scraping, dashboard rendering, or delivery.
-
-### GLiNER25ScrapeUnavailable
-
-Check the opted-in worker's listener, network, TLS/auth, and parent/worker
-lifecycle. Missing completions after termination are not successful requests.
-
-### GLiNER25MetricsMissing
-
-Confirm `/ml/v1/metrics`, the actual binary, and V2 metric presence. A healthy
-legacy endpoint may lack these metrics; do not replace missing series with zero.
-
-### GLiNER25ServerFailureRatio
-
-Inspect backing OOM, model/internal failures, artifact identity, and worker
-logs. Pause a canary or backfill when its reviewed error budget is exceeded.
-
-### GLiNER25AdmissionPressure
-
-Reduce offered concurrency and check capacity leases. Retry only transient
-admission failures under the caller's bounded policy.
-
-### GLiNER25FixedLimitRejections
-
-Identify the failing input, output, window, or memory ceiling. An unchanged
-request cannot fit through retry alone; adjust admitted capacity explicitly.
-
-### GLiNER25DispatchLatency
-
-Check phase timing, cold loads, and window counts against the workload and
-client-observed SLO. Dispatch latency excludes network publication.
-
-### GLiNER25StrictSearchExhaustion
-
-Review declared search capacity and constraints. Never silently drop constraints
-or switch to best effort; preserve witness validity and exhaustion metadata.
+The [native metric renderer](../../zig/pkg/inference/src/server/extraction_metrics.zig)
+defines the exported metric families and their collection boundaries.
 
 ## Remaining qualification
 

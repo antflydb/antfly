@@ -3472,9 +3472,9 @@
       "object_weight": 1.0
     }
   ],
-  "fixture_dependency_sha256": "f3641dfe43b23ac318cadb09598f474f79202760581d5aef313aa9f5f8584111",
+  "fixture_dependency_sha256": "77831df67dc07d3fa179c7bf1302b4e62f1c2bba438fc768e133c7fddf27c9d9",
   "format_version": 1,
-  "generator_sha256": "d6601c2f69e836ef037b5982937591903c3a046fe004dc94635403cea69566c8",
+  "generator_sha256": "77831df67dc07d3fa179c7bf1302b4e62f1c2bba438fc768e133c7fddf27c9d9",
   "notes": [
     "No checkpoint, tokenizer, encoder or optimizer is loaded.",
     "Actual compute_dense_batch_loss supplies both scalar values and raw-logit gradients.",

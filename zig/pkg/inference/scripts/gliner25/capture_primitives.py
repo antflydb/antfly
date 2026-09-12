@@ -18,7 +18,6 @@ def flat(tensor: Any) -> list[Any]:
 
 def pool_cases(torch: Any) -> list[dict[str, Any]]:
     from gliner2.models.boundary.pool import DocumentCandidatePool
-    from gliner2.models.boundary.proposal import select_top_boundaries
 
     class PreparedProjection(torch.nn.Module):
         """Inject projected states at the native primitive's input boundary."""
@@ -73,20 +72,11 @@ def pool_cases(torch: Any) -> list[dict[str, Any]]:
         pool.end_projection = PreparedProjection(pe)
         with torch.inference_mode():
             output = pool(ps, boundary_mask, qm, start, end)
-            keep = boundary_mask[:, None, :] & qm[:, :, None]
-            union_start = start.masked_fill(~keep, -10000).amax(1)
-            union_end = end.masked_fill(~keep, -10000).amax(1)
-            union_valid = boundary_mask & qm.any(-1, keepdim=True)
-            _, si, sv = select_top_boundaries(union_start[:, None], union_valid[:, None], 4)
-            _, ei, ev = select_top_boundaries(union_end[:, None], union_valid[:, None], 4)
         cases.append({
             "id": name, "batch": batch, "boundaries": boundaries, "queries": queries, "dim": dim,
             "lengths": flat(lengths), "query_mask": flat(qm), "boundary_mask": flat(boundary_mask),
             "start_logits": flat(start), "end_logits": flat(end),
             "projected_starts": flat(ps), "projected_ends": flat(pe), "config": config,
-            "intermediates": {"union_start": flat(union_start), "union_end": flat(union_end),
-                              "start_indices": flat(si), "start_valid": flat(sv),
-                              "end_indices": flat(ei), "end_valid": flat(ev)},
             "expected": {"indices": flat(output.indices), "valid": flat(output.mask),
                          "proposal_logits": flat(output.proposal_logits),
                          "compat_logits": flat(output.compat_logits)},

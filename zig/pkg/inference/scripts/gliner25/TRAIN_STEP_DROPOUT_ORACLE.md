@@ -79,17 +79,18 @@ through shared query/key projections.
 | LoRA | 37 / 36 / 36 | Exact |
 | DoRA | 37 / 36 / 36 | Exact |
 
-The four files under
+The two files under
 [`training_step_dropout`](../../testdata/gliner25/training_step_dropout)
-total 3,270,482 bytes. The capture and tensor hashes are:
+total 3,263,333 bytes. The capture and tensor hashes are:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `capture.json` | 848,615 | `dd99256c83bb53d3334689fa28ec9edeb48d851a8623490f96fdf6c821239f5f` |
+| `capture.json` | 848,615 | `8433304f12b568e6e210f845725d88bb0a07aab40248723ed57550537bc340e1` |
 | `tensors.safetensors` | 2,414,718 | `02ab3f449e94f8dc996171f616b3bce4f0740a897d54b3682b64262743d5ee45` |
 
-The tokenizer bytes are identical to the existing zero-dropout fixture.
-All four files and the generator are enrolled in `reference_manifest.json`
+The shared tiny tokenizer is retained in the zero-dropout `training_step`
+fixture for native dataset preflight; this capture uses its recorded inputs.
+Both files and the generator are enrolled in `reference_manifest.json`
 after the four native consumer tests passed. Numerical tensor values and frozen evaluation helpers remain unchanged.
 The [fixture policy](../../testdata/gliner25/README.md) describes retained
 numerical results, omitted diagnostics and the verified source replay.

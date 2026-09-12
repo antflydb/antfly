@@ -1,11 +1,6 @@
 {
   "dataset_format": "gliner_boundary_dataset.Row/version=1",
   "files": {
-    "schema": {
-      "path": "schema.json",
-      "sha256": "1eb946c6b140fba2ef24ee4e84c85536153ebcc933aadbca36bb290a68b1bd41",
-      "size_bytes": 395
-    },
     "train": {
       "path": "train.jsonl",
       "records": 2,
@@ -19,7 +14,7 @@
       "size_bytes": 2238
     }
   },
-  "generator_sha256": "64c0a5bba7fc46c31223ca367bf5ed820c9edcdbe112f88c5d61d9e5c82cfabf",
+  "generator_sha256": "9eb3685f4335305892985e8b2d2f379df2b64da3e094ae1a7ad1f2873d5d79a6",
   "heldout_quality_claim": false,
   "limitations": [
     "Four authored examples test job plumbing only; validation is not a production or benchmark holdout.",

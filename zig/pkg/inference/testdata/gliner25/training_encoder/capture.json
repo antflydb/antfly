@@ -250,12 +250,12 @@
     "torch": "2.9.1",
     "transformers": "4.55.4",
     "transformers_source_sha256": "98fa398f62e446e1f6303ff67fa7aceddac4f746a1a6013226896c3fa4e6cdd6",
-    "generator_sha256": "716f43a26ee5b4d3713c3940e1e1b3fbbc8ee13846a4147699a58e79679ee3de",
+    "generator_sha256": "3a18f2d3a1ab25bc5c19b59c1b3ed5389cb62fbda917ba6d3361ab1d278dacca",
     "mask_protocol": "splitmix64_site_element_v1",
     "dtype": "float32"
   },
   "files_sha256": {
     "weights.safetensors": "9a083f8b2ea99cd201aa3b9d0af5e9ab760ba6fdbbe0d078a22031ea51302926",
-    "tensors.safetensors": "e0201f61b565265ba26a630614c350707e8c6ae66c59b64c27ce1c6bf55eda2c"
+    "tensors.safetensors": "45724767f77460ea145d3911b673bd9f3d7c03cb6b10969d6f9f49c72bcf4f01"
   }
 }

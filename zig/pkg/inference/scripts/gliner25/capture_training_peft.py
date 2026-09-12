@@ -108,8 +108,6 @@ def main() -> None:
                     for name, parameter in module.named_parameters():
                         if parameter.requires_grad:
                             capture(weights, f"{case_id}.base_model.model.{canonical}.{name}", parameter)
-                    if kind == "dora":
-                        capture(tensors, f"{case_id}.norm.{canonical}", torch.linalg.norm(base.weight + 1.5 * module.lora_B["default"].weight @ module.lora_A["default"].weight, dim=1))
                     modules.append((module, canonical))
 
                 x0 = wave((2, 4), 0.23, -0.3, 0.9).requires_grad_()

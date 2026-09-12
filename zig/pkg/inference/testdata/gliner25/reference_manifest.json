@@ -77,8 +77,8 @@
       "size_bytes": 61812
     },
     "primitives.json": {
-      "sha256": "ae6c01113dcb0d31140e7f5e370b2b35f8140412ddb482d2af5303425788375a",
-      "size_bytes": 46792
+      "sha256": "1059cd3f77d0967da65ea14d3a1d4076cb1bd8932d717692f861b089406e0bd0",
+      "size_bytes": 42274
     },
     "records.json": {
       "sha256": "84713a997a2f9d4e456d8bb03764dd69081764594217cab73ab97aefaa6b5e8b",
@@ -165,23 +165,23 @@
       "size_bytes": 215030
     },
     "training_encoder/capture.json": {
-      "sha256": "58d12bbded44429800ae7e6bf648b743f84ea1f76e1b15cd16c0d0d4a342c0b9",
+      "sha256": "5b5310c37d89ea1302583c82ac1c1e60430a0bd341e256c5c213e12440cb98bf",
       "size_bytes": 7943
     },
     "training_encoder/tensors.safetensors": {
-      "sha256": "e0201f61b565265ba26a630614c350707e8c6ae66c59b64c27ce1c6bf55eda2c",
-      "size_bytes": 114224
+      "sha256": "45724767f77460ea145d3911b673bd9f3d7c03cb6b10969d6f9f49c72bcf4f01",
+      "size_bytes": 100320
     },
     "training_encoder/weights.safetensors": {
       "sha256": "9a083f8b2ea99cd201aa3b9d0af5e9ab760ba6fdbbe0d078a22031ea51302926",
       "size_bytes": 28056
     },
     "training_explicit.json": {
-      "sha256": "c1217ae2e76ec8d3fd3c98016354128e314199166e4720d3883151a8f424db94",
+      "sha256": "f46bcecb051082bc5d7e4dfd1636f4a0076b844f2fe0d460fdf31407d3581620",
       "size_bytes": 59189
     },
     "training_head.json": {
-      "sha256": "69e77bdd751771f132f5bf26d8222e0b3cb5aa801d6cbd6775be791987d9f75c",
+      "sha256": "1bd086ae7934d420ea7e9d0a974b9926feffdc088adc8bf350b18cc63f39d1d7",
       "size_bytes": 114847
     },
     "training_losses.json": {
@@ -197,27 +197,27 @@
       "size_bytes": 78616
     },
     "training_peft/capture.json": {
-      "sha256": "1d6fbaac74fc9a66cb57a1b44b107ba77286e10897d1ab21e9f49fd2151375b1",
+      "sha256": "929a7c7fd7608895fe99b730a3f2407f7bae7689399e89baeaaca43f2565c3c3",
       "size_bytes": 4308
     },
     "training_peft/tensors.safetensors": {
-      "sha256": "d6327f6310030d7714ec762f7d2d7620fe1ed71ee5e67d98eaa48d6d8de31040",
-      "size_bytes": 19504
+      "sha256": "93b1c17e5d6f852a6181d904e12a546718b17a69585700b06d10f0ff1a855e70",
+      "size_bytes": 18560
     },
     "training_peft/weights.safetensors": {
       "sha256": "53b2b780fec707d8ce4f7b51a8139520cd7946dbcdd423ceffefeca3b9708150",
       "size_bytes": 10744
     },
     "training_record_loss.json": {
-      "sha256": "0279ccb2101cc94498e300ee6095a6da34dadaee278521bb64a5634318e6b80c",
+      "sha256": "7664527cb85d5ff2b19f8a048cc1fa58b860a760ea114588fbfd03dac3f22465",
       "size_bytes": 91781
     },
     "training_records.json": {
-      "sha256": "a6ad7855b0adda10728594922fe642fda1366393df18a9e9f828e8c8a4b3a693",
+      "sha256": "3c789ead07a4225a6be6dd2bbe2b6d774b57c382c54cd301ceb83920a7fefb0b",
       "size_bytes": 76411
     },
     "training_relations.json": {
-      "sha256": "b20d07cb9d35e7276b883076ba65b23e036ffa02cf4c5228debb15693e2ec8bc",
+      "sha256": "2e8552cd764ceba24f72ec8145c68cbff6d1ceaf11bbb3a75288f484158a1339",
       "size_bytes": 90851
     },
     "training_selection.json": {
@@ -241,20 +241,12 @@
       "size_bytes": 588
     },
     "training_step_dropout/capture.json": {
-      "sha256": "dd99256c83bb53d3334689fa28ec9edeb48d851a8623490f96fdf6c821239f5f",
+      "sha256": "8433304f12b568e6e210f845725d88bb0a07aab40248723ed57550537bc340e1",
       "size_bytes": 848615
     },
     "training_step_dropout/tensors.safetensors": {
       "sha256": "02ab3f449e94f8dc996171f616b3bce4f0740a897d54b3682b64262743d5ee45",
       "size_bytes": 2414718
-    },
-    "training_step_dropout/tokenizer.json": {
-      "sha256": "ee7f0d2f277c34191fe76227371cc95d7b55e0f7a10f1a153eec36b5d5865cc8",
-      "size_bytes": 6561
-    },
-    "training_step_dropout/tokenizer_config.json": {
-      "sha256": "2ea7f1b38011a9f3f7b4c895bd876160e8672cfe62f26d8303fa875e3eaa5f80",
-      "size_bytes": 588
     },
     "training_targets.json": {
       "sha256": "5180e46025b037dcbed9327d6b8455a62c92f30e118671aaea5bd5c5bbd59f6f",
@@ -276,8 +268,8 @@
       "size_bytes": 6134
     },
     "capture_primitives.py": {
-      "sha256": "705d1b8b65e604fbe7bf114b73551ed0e7f0413da7528d79efe3c9218d695727",
-      "size_bytes": 9765
+      "sha256": "ee24f4f02a0a39fc0cd77f4ed7f0c06764550982e873e0c252e9f124bdfa6fc2",
+      "size_bytes": 8996
     },
     "capture_regex.py": {
       "sha256": "4e02feaef6874e39ff51794bf788190d897d1f3bcf980087c3d8c0df1e40e523",
@@ -300,56 +292,32 @@
       "size_bytes": 17507
     },
     "capture_training_encoder.py": {
-      "sha256": "716f43a26ee5b4d3713c3940e1e1b3fbbc8ee13846a4147699a58e79679ee3de",
-      "size_bytes": 7632
+      "sha256": "3a18f2d3a1ab25bc5c19b59c1b3ed5389cb62fbda917ba6d3361ab1d278dacca",
+      "size_bytes": 7201
     },
-    "capture_training_explicit.py": {
-      "sha256": "217ddb7b1daed4e33b8b434eec574197d92f5f6860b1980a12809e6ceec2463b",
-      "size_bytes": 11237
+    "capture_training_heads.py": {
+      "sha256": "02596a2894905699d8ee647a26a267ca7324131efcf8b0ccc48d4445b73fe1a5",
+      "size_bytes": 40032
     },
-    "capture_training_head.py": {
-      "sha256": "0afd738017fbfa19b5524bbd123680062122865a2f2c53dd477fef4c13530692",
-      "size_bytes": 13183
-    },
-    "capture_training_losses.py": {
-      "sha256": "96759350f1fcb5466c1295137e2853a25bc140e1bf75409f8a9fe8a52b297366",
-      "size_bytes": 13013
-    },
-    "capture_training_matching.py": {
-      "sha256": "f3641dfe43b23ac318cadb09598f474f79202760581d5aef313aa9f5f8584111",
-      "size_bytes": 9558
+    "capture_training_objectives.py": {
+      "sha256": "77831df67dc07d3fa179c7bf1302b4e62f1c2bba438fc768e133c7fddf27c9d9",
+      "size_bytes": 41829
     },
     "capture_training_optimizer_groups.py": {
       "sha256": "e6c4760c44bd2ac9f92527d496862126f57424781621c201da74393652111fb2",
       "size_bytes": 8150
     },
     "capture_training_peft.py": {
-      "sha256": "60888b3df9cf56d156c3f3bc378433d525a6247422a6f43fe0dc255705101cdb",
-      "size_bytes": 9011
-    },
-    "capture_training_record_loss.py": {
-      "sha256": "d6601c2f69e836ef037b5982937591903c3a046fe004dc94635403cea69566c8",
-      "size_bytes": 11585
-    },
-    "capture_training_records.py": {
-      "sha256": "a8158ddc47d36e1c5c533f2a60c2f6e47253847703dbf5941f72b5351f260f8a",
-      "size_bytes": 9376
-    },
-    "capture_training_relations.py": {
-      "sha256": "d3562cb1c4b6836e0ad5c4f54e70db86f8a494a625fd1fff6408458316b0e889",
-      "size_bytes": 9128
-    },
-    "capture_training_selection.py": {
-      "sha256": "7d70280c3852c3b8d27b1a79eb01db0db86fc49ee309588bb78ab590bf61283d",
-      "size_bytes": 10223
+      "sha256": "4bc714f55d85bbae1e61aff4b7775b08fa4cce20d25f719e3f41ed79438714df",
+      "size_bytes": 8787
     },
     "capture_training_step.py": {
       "sha256": "2ca6610037b8a357766a81c7a0002af59e6e433bfea60fb0d51cf1d5eebf831b",
       "size_bytes": 47291
     },
     "capture_training_step_dropout.py": {
-      "sha256": "cf5dd604efa77228b5c2a537219f30b598227004b622bc92de96b8441b59bccb",
-      "size_bytes": 22425
+      "sha256": "b245b2b7f1c8c745180d009ccc731fea47fd006df5e92e5258e91167c7b1c389",
+      "size_bytes": 22725
     },
     "capture_training_targets.py": {
       "sha256": "1d16c4b7406dd2dc173a21ca8ea65d666d295b628d6b751c24fe7fe0c6048bc8",
