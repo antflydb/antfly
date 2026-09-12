@@ -4,6 +4,50 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: last dense bulk-lease fixture races physical publication (#694)
+
+While investigating [the Linux DB-core abort in run 34658598331](https://github.com/antflydb/antfly/actions/runs/34658598331/job/103457081854),
+the complete local Linux Debug partitions exposed a separate assertion in
+`db last external dense bulk lease finalizes covered rebuilding generations`.
+The fixture failed in **10/10 full runs** on `17eed29b0`: two isolated containers
+ran five repetitions each, one with the default allocator and one with
+`MALLOC_PERTURB_=165` and the glibc tcache disabled. All ten runs passed the
+watermark-reopen test that aborted in CI; their only failure was this assertion.
+
+The fixture used best-effort online publication before creating a rebuilding
+checkpoint and expecting the last external bulk lease to certify it immediately.
+Online publication can leave the asynchronous physical checkpoint build pending.
+Logical embedding coverage alone does not establish that publication boundary.
+The fixture now calls `publishVectorBlockBasesAtStableTip` before introducing
+the rebuilding checkpoint. Its immediate completion, clean status, generation
+increment, and independent query-readiness assertions are preserved. Production
+publication, scheduling, and timeout behavior are unchanged.
+
+Local full-partition runs mount the repository read-only at `/workspace`, use
+`/workspace/zig` as their working directory, and provide a writable `.zig-cache`.
+This makes the split-replay and WebP fixture files available; the initial
+reproduction's missing-file failures were harness errors.
+
+The corrected fixture passed **100/100 native macOS Debug** and **100/100 Linux
+x86_64 Debug** repetitions, with no failed-case retries. Evidence:
+`/private/tmp/ci694-bulk-lease-fixed-native.log` and
+`/private/tmp/ci694-bulk-lease-fixed-linux/results.json`.
+The full Linux Debug DB-core run then passed both CI partitions: **1,116 passed,
+eight skipped, zero failed, zero leaked**, exit 0 in 144 seconds. It used the
+CI selection filters with the corrected fixture mounts and no allocator
+instrumentation. Evidence: `/private/tmp/ci694-db-core-fixed-validation`.
+`zig fmt --check` and `git diff --check` also passed.
+Run the focused regression from `zig/`:
+
+```sh
+zig build antfly-storage-db-test -Doptimize=Debug -- \
+  --test-filter 'db last external dense bulk lease finalizes covered rebuilding generations'
+```
+
+The original CI `munmap_chunk(): invalid pointer` abort remains unreproduced;
+this fixture correction does not establish a fix for that memory error.
+Before-fix evidence is retained in `/private/tmp/ci694-db-core-repeat-{1,2}`.
+
 ## 2026-09-11: forwarding-retirement native Debug soak passed (#694)
 
 The executable built from `c11eead5aabe7027e4a84498bbd08489b580a89e`

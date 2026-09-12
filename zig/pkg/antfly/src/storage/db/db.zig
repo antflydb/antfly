@@ -97207,7 +97207,11 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
         .sync_level = .full_index,
     });
 
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // Establish the physical publication boundary before introducing the
+    // rebuilding checkpoint. Online publication may leave an asynchronous
+    // checkpoint builder pending; this fixture exercises bulk-lease release
+    // against a generation whose coverage is already complete.
+    _ = try db.publishVectorBlockBasesAtStableTip();
 
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
