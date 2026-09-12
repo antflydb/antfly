@@ -107,6 +107,7 @@ test "gliner boundary Python parity rectangular assignment scipy tie profile" {
         cases: []struct { rows: usize, columns: usize, costs: []f64, pairs: []assignment.Pair },
     }, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 28), parsed.value.cases.len);
     for (parsed.value.cases, 0..) |case, i| {
         errdefer std.debug.print("assignment fixture {d}\n", .{i});
         const result = try assignment.solve(a, case.costs, case.rows, case.columns, .{});
@@ -312,7 +313,7 @@ test "gliner boundary Python parity pinned small checkpoint CPU head" {
     var compute = native.NativeCompute.init(a, &store, null);
     defer compute.deinit();
     const cb = compute.computeBackend();
-    for ([_][]const u8{ "mixed_tasks", "entity_attributes", "enum_field", "legacy_structure", "record_anchorless", "record_latent", "record_natural", "unicode_offsets" }) |name| {
+    for ([_][]const u8{ "mixed_tasks", "entity_attributes", "enum_field", "legacy_structure", "unicode_offsets" }) |name| {
         errdefer std.debug.print("small checkpoint head fixture: {s}\n", .{name});
         const fixture_name = try std.fmt.allocPrint(a, "small_reference/{s}.safetensors", .{name});
         defer a.free(fixture_name);

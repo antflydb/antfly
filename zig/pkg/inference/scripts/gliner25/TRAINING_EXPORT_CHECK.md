@@ -13,7 +13,7 @@ The first actual small head-only export passed strict pinned-upstream loading
 and all ten bounded extraction requests, as recorded below. Separate small
 CPU task-head LoRA/DoRA jobs now also have exact partial-resume and standard
 PEFT 0.18.0 loading evidence in the
-[adapter export guide](../../../../../docs/GLINER25_TRAINING_EXPORT.md).
+[adapter export guide](../../../../../work-log/completed/gliner2.5.md#export-and-adapter-materialization).
 The original PEFT 0.17.1 loader fails on the valid `inside_weight` target;
 the official fixed loader uses an explicit isolated profile with unchanged
 adapter keys and strict byte checks. `qualification`

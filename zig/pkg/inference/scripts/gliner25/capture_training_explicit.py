@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import oracle
@@ -125,7 +126,7 @@ def capture(source: Path):
     native_sites = {"explicit.start": ("boundary_head.pair_scorer.dropout/call_0", [12, 4]),
                     "explicit.end": ("boundary_head.pair_scorer.dropout/call_1", [12, 4]),
                     "boundary_head.pair_scorer.content_pooler": ("boundary_head.pair_scorer.content_pooler.dropout/call_0", [12, 2])}
-    return {"format_version": 1, "scope": "synthetic_boundary_explicit_forward_vjp", "qualification": False,
+    report = {"format_version": 1, "scope": "synthetic_boundary_explicit_forward_vjp", "qualification": False,
             "source_commit": oracle.UPSTREAM_COMMIT, "provenance": provenance,
             "generator_sha256": oracle.sha256_file(Path(__file__)), "oracle_sha256": oracle.sha256_file(Path(oracle.__file__)),
             "source_files": {name: oracle.sha256_file(source / name) for name in (
@@ -148,6 +149,15 @@ def capture(source: Path):
                       "The pinned inside-centering mean is detached; each case retains it for native graph binding.",
                       "Inactive query and padded candidate outputs receive cotangents but their masks determine zero VJPs.",
                       "Training uses explicit inverted masks without claiming RNG-stream equivalence."]}
+
+
+    # Share exact serialized seeds; a case with different seeds keeps its override.
+    report["cotangents"] = report["cases"][0]["cotangents"]
+    common = json.dumps(report["cotangents"], sort_keys=True, allow_nan=False)
+    for case in report["cases"]:
+        if json.dumps(case["cotangents"], sort_keys=True, allow_nan=False) == common:
+            del case["cotangents"]
+    return report
 
 
 def main():

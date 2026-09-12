@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -33,9 +32,7 @@ def fixture_schemas() -> tuple[Any, Any]:
 
 def describe_batch(batch: Any) -> dict[str, Any]:
     scalar_names = (
-        "mapped_indices", "schema_counts", "original_lengths", "structure_labels", "task_types",
-        "text_tokens", "schema_tokens_list", "start_mappings", "end_mappings", "original_texts",
-        "original_schemas", "text_word_counts", "schema_special_indices", "model_texts",
+        "text_tokens", "schema_tokens_list", "start_mappings", "end_mappings",
     )
     tensor_names = (
         "input_ids", "attention_mask", "text_word_indices", "text_word_mask",
@@ -43,7 +40,11 @@ def describe_batch(batch: Any) -> dict[str, Any]:
         "cls_marker_mask", "cls_group_index",
     )
     result = {name: getattr(batch, name) for name in scalar_names}
-    result["query_layouts"] = [dataclasses.asdict(layout) for layout in batch.query_layouts]
+    query_names = ("task_index", "task_name", "role_index", "role_name")
+    result["query_layouts"] = [
+        {"queries": [{name: getattr(query, name) for name in query_names} for query in layout.queries]}
+        for layout in batch.query_layouts
+    ]
     result["tensors"] = {
         name: {"shape": list(tensor.shape), "dtype": str(tensor.dtype).removeprefix("torch."),
                "values": tensor.reshape(-1).tolist()}

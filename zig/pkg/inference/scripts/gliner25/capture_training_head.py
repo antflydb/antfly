@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -182,7 +183,7 @@ def capture(source: Path) -> dict[str, Any]:
         "marginals.inside": ("boundary_head.boundary_query_head.dropout/call_2", [6, 4]),
         "classifier": ("classifier.2/call_0", [3, 8]),
     }
-    return {"format_version": 1, "scope": "synthetic_boundary_stage_one_forward_vjp", "qualification": False,
+    report = {"format_version": 1, "scope": "synthetic_boundary_stage_one_forward_vjp", "qualification": False,
             "source_commit": oracle.UPSTREAM_COMMIT, "provenance": provenance,
             "generator_sha256": oracle.sha256_file(Path(__file__)), "oracle_sha256": oracle.sha256_file(Path(oracle.__file__)),
             "source_files": {name: oracle.sha256_file(source / name) for name in source_files},
@@ -202,6 +203,15 @@ def capture(source: Path) -> dict[str, Any]:
                       "Cotangents are independent of masks/gold and include inactive output positions; masked operations decide their VJP.",
                       "Training SDPA dropout is replaced by explicitly supplied probability masks; no training RNG equivalence is claimed.",
                       "Discrete candidate selection and sparse reranking/record/relation heads are outside this stage-one fixture."]}
+
+
+    # Share exact serialized seeds; a case with different seeds keeps its override.
+    report["cotangents"] = report["cases"][0]["cotangents"]
+    common = json.dumps(report["cotangents"], sort_keys=True, allow_nan=False)
+    for case in report["cases"]:
+        if json.dumps(case["cotangents"], sort_keys=True, allow_nan=False) == common:
+            del case["cotangents"]
+    return report
 
 
 def main():

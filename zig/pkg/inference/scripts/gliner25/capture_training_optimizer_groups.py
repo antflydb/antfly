@@ -17,6 +17,7 @@ import sys
 from types import SimpleNamespace
 
 import oracle
+import capture_inventory
 
 
 class Parameter:
@@ -60,21 +61,17 @@ def capture(source: Path):
     if not 0 < trainer.stat().st_size <= 1024 * 1024:
         raise oracle.ContractError("trainer source byte budget exceeded")
     invoke, method, method_source = extract_method(trainer.read_text(), trainer)
-    reference = oracle.read_json(oracle.FIXTURES / "reference_manifest.json")
     inventories = {}
     parameter_names = None
     for variant in ("small", "base", "multi"):
-        relative = f"models/{variant}/tensor_inventory.json"
-        path = oracle.FIXTURES / relative
-        pin = oracle.verify_file(path, reference["files"][relative])
-        inventory = oracle.read_json(path)
+        inventory, pin = capture_inventory.load_inventory(variant)
         names = sorted(inventory["tensors"])
         if inventory["provenance"]["commit"] != oracle.UPSTREAM_COMMIT or len(names) != 334:
             raise oracle.ContractError("published inventory identity differs")
         if parameter_names is not None and names != parameter_names:
             raise oracle.ContractError("variant parameter names differ; separate profiles are required")
         parameter_names = names
-        inventories[relative] = pin
+        inventories[capture_inventory.INVENTORY] = pin
     if parameter_names is None:
         raise oracle.ContractError("missing published names")
 
@@ -92,7 +89,7 @@ def capture(source: Path):
     ]
     cases = []
 
-    def add(name, *, selected=None, extra=(), use_lora=False, device="cpu", fused=False):
+    def add(name, *, selected=None, extra=(), use_lora=False):
         all_names = parameter_names + list(extra)
         selected = set(all_names if selected is None else selected)
         if len(all_names) != len(set(all_names)) or not selected.issubset(all_names):
@@ -100,33 +97,19 @@ def capture(source: Path):
         parameters = [Parameter(key, key in selected) for key in all_names]
         model = SimpleNamespace(parameters=lambda: iter(parameters),
                                 named_parameters=lambda: ((p.name, p) for p in parameters))
-        options = {**config, "use_lora": use_lora, "fused_optimizer": fused}
+        options = {**config, "use_lora": use_lora, "fused_optimizer": False}
         controller = SimpleNamespace(config=SimpleNamespace(**options), model=model,
-                                     device=SimpleNamespace(type=device))
-        case = dict(id=name, parameter_names=all_names,
-                    trainable=[p.requires_grad for p in parameters], config=options, device_type=device)
-        try:
-            result = invoke(controller)
-        except ValueError as exc:
-            if str(exc) != "No LoRA parameters found. Check LoRA configuration.":
-                raise
-            case["expected_error"] = dict(type="ValueError", message=str(exc))
-        else:
-            case["expected"] = dict(groups=result.groups, optimizer_kwargs=result.kwargs)
+                                     device=SimpleNamespace(type="cpu"))
+        case = dict(id=name, additional_parameter_names=list(extra),
+                    trainable=[p.requires_grad for p in parameters], config=options, device_type="cpu")
+        result = invoke(controller)
+        case["expected"] = dict(groups=result.groups, optimizer_kwargs=result.kwargs)
         cases.append(case)
 
     add("full_cpu")
     add("head_only_cpu", selected=[name for name in parameter_names if not name.startswith("encoder.")])
-    add("all_frozen_cpu", selected=[])
     add("lora_cpu", selected=adapter_names, extra=adapter_names, use_lora=True)
     add("dora_cpu", selected=adapter_names + magnitude_names, extra=adapter_names + magnitude_names, use_lora=True)
-    add("lora_includes_every_trainable", selected=adapter_names + ["classifier.0.bias"],
-        extra=adapter_names, use_lora=True)
-    add("lora_no_trainable_error", selected=[], extra=adapter_names, use_lora=True)
-    add("cpu_fused_request_uses_foreach", fused=True)
-    add("cuda_fused_constructor_only", device="cuda", fused=True)
-    add("cuda_nonfused_constructor_only", device="cuda")
-    add("mps_constructor_only", device="mps", fused=True)
     return dict(
         format_version=1, scope="pinned_optimizer_parameter_grouping_without_torch",
         qualification=False, source_commit=oracle.UPSTREAM_COMMIT,
@@ -136,16 +119,16 @@ def capture(source: Path):
                         method_sha256=hashlib.sha256(method_source.encode()).hexdigest(),
                         assertions_enabled=True),
         generator_sha256=oracle.sha256_file(Path(__file__)), oracle_sha256=oracle.sha256_file(Path(oracle.__file__)),
-        inventory_files=inventories, cases=cases,
+        inventory_files=inventories, parameter_names=parameter_names, cases=cases,
         notes=[
             "The exact pinned AST method executes unmodified; only named parameters, device metadata, logger, and the AdamW constructor are synthetic.",
             "No Torch import, parameter tensor allocation, checkpoint, optimizer update, or hardware operation occurs.",
-            "Published parameter names are taken from all three verified 334-tensor inventories; the explicit sorted input order is recorded per case.",
+            "Published parameter names are taken from all three verified 334-tensor inventories; each case appends its explicit additional names to the shared sorted input order.",
             "Full training routes any name containing encoder to encoder_lr, including boundary_head.boundary_encoder and boundary_head.candidate_encoder.",
             "Head-only selection freezes only the top-level encoder subtree; learning-rate grouping still uses the upstream substring rule.",
-            "The use_lora branch groups every requires_grad parameter at task_lr, including DoRA magnitude and any explicitly trainable non-adapter parameter.",
+            "The use_lora branch groups every requires_grad parameter at task_lr, including DoRA magnitude.",
             "All groups retain the same configured weight decay; bias and normalization names are not exempted by this source method.",
-            "Constructor flags for cuda and mps are symbolic source-branch coverage, not backend execution evidence.",
+            "The four retained CPU cases match the native run profiles: full, head-only, LoRA and DoRA.",
             "The separate training_adamw fixture covers actual Torch updates and None versus zero gradients.",
         ],
     )

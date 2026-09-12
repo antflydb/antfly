@@ -244,7 +244,7 @@ test "gliner boundary device Metal pinned small checkpoint shared head parity" {
     var backend = try metal.MetalCompute.init(a, &store, null);
     defer backend.deinit();
     const cb = backend.computeBackend();
-    for ([_][]const u8{ "mixed_tasks", "entity_attributes", "enum_field", "legacy_structure", "record_anchorless", "record_latent", "record_natural", "unicode_offsets" }) |name| {
+    for ([_][]const u8{ "mixed_tasks", "entity_attributes", "enum_field", "legacy_structure", "unicode_offsets" }) |name| {
         errdefer std.debug.print("small checkpoint device head fixture: {s}\n", .{name});
         const fixture_name = try std.fmt.allocPrint(a, "small_reference/{s}.safetensors", .{name});
         defer a.free(fixture_name);

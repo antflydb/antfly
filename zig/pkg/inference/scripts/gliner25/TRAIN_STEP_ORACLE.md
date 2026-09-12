@@ -1,9 +1,9 @@
 # Tiny mixed-task training-step oracle
 
 The tiny source capture is complete for full-parameter, head-only, LoRA and
-DoRA profiles. Two executions produced byte-identical artifacts. All four native
-CPU consumers passed exact preprocessing and mention targets, every scalar
-loss, every trainable gradient's presence/value, and both AdamW flushes,
+DoRA profiles. All four native CPU consumers passed exact preprocessing and
+mention targets, every scalar loss, every trainable gradient's presence/value,
+and both AdamW flushes,
 including the next microbatch after native weight updates. This fixture does
 not qualify a production training run. The capture targets upstream commit
 `3c913c7369301133d3b7699252074c4303ada50e` and the already pinned
@@ -12,7 +12,7 @@ Torch/Transformers/PEFT runtime. It needs no downloaded model.
 [`capture_training_step.py`](capture_training_step.py) writes
 [`training_step/capture.json`](../../testdata/gliner25/training_step/capture.json),
 the typed tensor file, and the exact tiny tokenizer artifacts. The tensor file
-is 2,685,776 bytes; total fixture size stays below 4.7 MiB. Each profile contains
+is 1,228,022 bytes; total fixture size stays below 2 MiB. Each profile contains
 three microbatches, two exact source AdamW flushes, all parameter gradients with
 `None` preserved, and a byte-exact in-memory mid-window resume. Source full,
 head-only, LoRA and DoRA trainable tensor counts are 168, 130, 24 and 36.
@@ -141,9 +141,16 @@ Head-only freezing excludes only the top-level `model.encoder` subtree; it does
 not change this learning-rate rule. All source groups retain the configured
 weight decay, including biases and normalization tensors. With `use_lora`, all
 trainable parameters use `task_lr`, including DoRA magnitude and any separately
-trainable head. `training_optimizer_groups.json` captures this exact AST method
-with a recording AdamW constructor and no Torch import; `training_adamw.json`
-separately captures actual Torch updates and partial accumulation.
+trainable head. `training_optimizer_groups.json` captures the four native CPU
+profiles (full, head-only, LoRA and DoRA) through this exact AST method with a
+recording AdamW constructor and no Torch import.
+`training_adamw.json` separately captures actual Torch updates and partial
+accumulation.
+
+The scalar head fixtures store shared cotangents once; an explicit case replaces
+the entire seed set, including zeros. Optimizer-group cases append their adapter
+names to one shared ordered base-name list. These storage changes preserve every
+case, expected gradient and optimizer-group result.
 
 Run fresh full-parameter and head-only instances first. Then compose the pinned
 LoRA and DoRA profile, preserving actual adapter names, scale, per-use dropout,

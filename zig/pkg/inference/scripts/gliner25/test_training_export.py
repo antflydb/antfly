@@ -133,8 +133,15 @@ class TrainingExportTests(unittest.TestCase):
                 check.hex_digest(invalid)
 
     def test_all_published_metadata_inventory_is_pinned_and_complete(self):
-        for variant in ("small", "base", "multi"):
-            self.assertEqual(len(check.published_inventory(variant)), 334)
+        inventories = {variant: check.published_inventory(variant) for variant in ("small", "base", "multi")}
+        for value in inventories.values():
+            self.assertEqual(len(value), 334)
+        # Check both the common-shape fallback and the model-specific overrides.
+        for variant, vocabulary, width in (("small", 128011, 384), ("base", 128011, 768), ("multi", 250112, 768)):
+            self.assertEqual(inventories[variant]["encoder.embeddings.word_embeddings.weight"]["shape"], [vocabulary, width])
+            self.assertEqual(inventories[variant]["classifier.0.weight"]["shape"], [2 * width, width])
+        with self.assertRaises(check.oracle.ContractError):
+            check.published_inventory("unknown")
 
     def test_checker_versions_match_native_config_contract(self):
         source = (check.HERE.parent.parent / "src/models/gliner_boundary.zig").read_text()

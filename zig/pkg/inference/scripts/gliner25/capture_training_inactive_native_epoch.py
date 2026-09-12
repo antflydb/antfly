@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Additive inactive-adapter oracle with an immutable native five-row epoch.
 
-The pinned control generator and its successful fixtures remain unchanged.
+The control profile and captured tensor values remain unchanged.
 Only classifier flush positions differ: [2, 4, 5] instead of [2, 3, 5].
 No trainer, model, backward, optimizer, or source resume equation is replaced.
 """
@@ -22,8 +22,8 @@ CONTROL_CONTRACT = HERE / "training_inactive_adapters_contract_v1.json"
 CONTRACT = HERE / "training_inactive_native_epoch_contract_v1.json"
 SCOPE = "gliner25_inactive_adapter_native_epoch/v1"
 CONTROL_PINS = {
-    "generator": {"size_bytes": 24573, "sha256": "142eabbc7cb78b1f6563bf4234d9c49b526d4f5154053b0b2b9df0d6554c1b92"},
-    "contract": {"size_bytes": 4541, "sha256": "4e3edc790cdfce5c38960fc064242d0ef6b8d02ff9095954838cfeab532b4c2c"},
+    "generator": {"size_bytes": 25119, "sha256": "8f63e2ccb46fcf2ee00033ea3577c02615d59c07b233da7ed9303de0fea45380"},
+    "contract": {"size_bytes": 4680, "sha256": "d88ece37ce0873baf481d957a4e30c53b5fb35e5780ea542dc360931d5e810cd"},
 }
 NATIVE_EPOCH = {
     "version": 1,

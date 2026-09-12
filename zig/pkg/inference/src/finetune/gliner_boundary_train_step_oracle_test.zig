@@ -84,16 +84,25 @@ const DecisionCalls = struct {
     }
 };
 const Strings = std.json.ArrayHashMap([]const u8);
+const metadata = @import("gliner_boundary_fixture_metadata.zig");
 const Sample = struct { text: []const u8, schema_version: u32, schema_json: []const u8, annotations: target.Annotations };
 const Batch = struct { id: []const u8, samples: []Sample, expected_record_count: usize, expected_relation_count: usize };
 const Parameter = struct { name: []const u8, shape: []const i32, trainable: bool };
 const Group = struct { parameters: []const []const u8, lr: f32, weight_decay: f32, betas: [2]f32, eps: f32 };
 const ExplicitMask = struct { name: []const u8, shape: []const i64, probability: f32, tensor: []const u8 };
+const ExplicitDropout = struct { masks: []const ExplicitMask };
+const SharedMetadata = struct {
+    version: u32 = 1,
+    bindings: []const Strings = &.{},
+    encoder_configs: []const model.EncoderConfig = &.{},
+    dropout: []const ExplicitDropout = &.{},
+};
 pub const Microbatch = struct {
     id: []const u8,
     microbatch: u64,
     optimizer_step_before: u64,
-    inputs: Strings,
+    inputs: ?Strings = null,
+    inputs_ref: ?usize = null,
     outputs: Strings,
     losses: std.json.ArrayHashMap(f32),
     gradients: std.json.ArrayHashMap(?[]const u8),
@@ -102,16 +111,19 @@ pub const Microbatch = struct {
     relation_positive_count: usize,
     classification_label_count: usize,
     encoder_forward_calls: usize,
-    explicit_dropout: ?struct { masks: []const ExplicitMask } = null,
+    explicit_dropout: ?ExplicitDropout = null,
+    explicit_dropout_ref: ?usize = null,
 };
 const FlushParameter = struct { weight: []const u8, exp_avg: ?[]const u8, exp_avg_sq: ?[]const u8, state_present: bool, step: u32 };
 const Flush = struct { after_microbatch: u64, optimizer_step: u64, microbatches: u32, grad_norm: f64, parameters: std.json.ArrayHashMap(FlushParameter) };
 pub const Profile = struct {
     mode: Mode,
-    encoder_config: model.EncoderConfig,
+    encoder_config: ?model.EncoderConfig = null,
+    encoder_config_ref: ?usize = null,
     parameters: []Parameter,
     optimizer_groups: []Group,
-    initial: Strings,
+    initial: ?Strings = null,
+    initial_ref: ?usize = null,
     microbatches: []Microbatch,
     flushes: []Flush,
     mid_window_resume_exact: bool,
@@ -129,6 +141,21 @@ pub const Oracle = struct {
     batches: []Batch,
     profiles: []Profile,
     sequence: []const usize,
+    shared_metadata: SharedMetadata = .{},
+
+    pub fn resolveMetadata(self: *Oracle) !void {
+        const shared = self.shared_metadata;
+        try metadata.validate(shared.version, &.{ shared.bindings.len, shared.encoder_configs.len, shared.dropout.len });
+        for (self.profiles) |*profile| {
+            profile.encoder_config = try metadata.resolve(model.EncoderConfig, profile.encoder_config, profile.encoder_config_ref, shared.encoder_configs);
+            profile.initial = try metadata.resolve(Strings, profile.initial, profile.initial_ref, shared.bindings);
+            for (profile.microbatches) |*micro| {
+                micro.inputs = try metadata.resolve(Strings, micro.inputs, micro.inputs_ref, shared.bindings);
+                if (micro.explicit_dropout != null or micro.explicit_dropout_ref != null)
+                    micro.explicit_dropout = try metadata.resolve(ExplicitDropout, micro.explicit_dropout, micro.explicit_dropout_ref, shared.dropout);
+            }
+        }
+    }
 };
 
 /// Exact captured fragment lookup. Unknown fragments fail instead of using
@@ -221,9 +248,9 @@ fn expectBooleans(a: Allocator, reference: *const fixture.TensorFixture, key: []
 pub fn checkPrepared(a: Allocator, reference: *const fixture.TensorFixture, prepared: *const Prepared, micro: Microbatch) !void {
     inline for (.{ "input_ids", "attention_mask", "text_word_indices", "query_marker_indices", "cls_marker_indices" }) |field| {
         errdefer std.debug.print("training preprocessing field {s}\n", .{field});
-        try expectIntegers(reference, micro.inputs.map.get(field) orelse return error.MissingFixtureTensor, @field(prepared.batch, field));
+        try expectIntegers(reference, micro.inputs.?.map.get(field) orelse return error.MissingFixtureTensor, @field(prepared.batch, field));
     }
-    inline for (.{ "text_word_mask", "query_marker_mask", "cls_marker_mask" }) |field| try expectBooleans(a, reference, micro.inputs.map.get(field) orelse return error.MissingFixtureTensor, @field(prepared.batch, field));
+    inline for (.{ "text_word_mask", "query_marker_mask", "cls_marker_mask" }) |field| try expectBooleans(a, reference, micro.inputs.?.map.get(field) orelse return error.MissingFixtureTensor, @field(prepared.batch, field));
     var targets = try target.compileBatch(a, prepared.batch.samples, prepared.pointers, prepared.annotations, .{ .gold_capacity = 8 });
     defer targets.deinit();
     try expectBooleans(a, reference, micro.outputs.map.get("mention_mask").?, targets.mention_mask);
@@ -258,7 +285,7 @@ pub fn mappedParameters(a: Allocator, profile: Profile) ![]MappedParameter {
             group = index;
         };
         try std.testing.expectEqual(parameter.trainable, group != null);
-        out.* = .{ .source = parameter, .name = try nativeName(a, parameter.name), .initial = profile.initial.map.get(parameter.name) orelse return error.MissingFixtureTensor, .group = group };
+        out.* = .{ .source = parameter, .name = try nativeName(a, parameter.name), .initial = profile.initial.?.map.get(parameter.name) orelse return error.MissingFixtureTensor, .group = group };
     }
     for (mapped, 0..) |parameter, i| for (mapped[0..i]) |prior| try std.testing.expect(!std.mem.eql(u8, parameter.name, prior.name));
     return mapped;
@@ -269,7 +296,7 @@ pub fn findParameter(parameters: []const MappedParameter, name: []const u8) !Map
     return error.MissingFixtureParameter;
 }
 pub fn configure(reference: *const fixture.TensorFixture, oracle: Oracle, profile: Profile, mapped: []const MappedParameter) !model.Config {
-    var encoder = profile.encoder_config;
+    var encoder = profile.encoder_config.?;
     const relative = try reference.tensor((try findParameter(mapped, "encoder.rel_embeddings.weight")).initial);
     try std.testing.expectEqual(@as(usize, 2), relative.shape.len);
     try std.testing.expectEqual(@as(i64, @intCast(2 * encoder.position_buckets)), relative.shape[0]);
@@ -455,6 +482,7 @@ fn runOracleWithProfiles(mode: Mode, directory: []const u8, profiles: Profiles) 
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(Oracle, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    try parsed.value.resolveMetadata();
     const oracle = parsed.value;
     try std.testing.expectEqual(@as(u32, 1), oracle.format_version);
     try std.testing.expectEqualStrings("3c913c7369301133d3b7699252074c4303ada50e", oracle.source_commit);

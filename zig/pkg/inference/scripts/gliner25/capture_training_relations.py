@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import oracle
@@ -111,7 +112,7 @@ def capture(source: Path):
                 "head_length": pack((he - hs).clamp_min(1).float().unsqueeze(-1)),
                 "tail_length": pack((te - ts).clamp_min(1).float().unsqueeze(-1)),
                 "geometry": pack(torch.stack((torch.sign(delta), delta.abs() / 3), -1)), "valid": pack(valid)}
-    return {"format_version": 1, "scope": "synthetic_boundary_relation_forward_vjp", "qualification": False,
+    report = {"format_version": 1, "scope": "synthetic_boundary_relation_forward_vjp", "qualification": False,
             "source_commit": oracle.UPSTREAM_COMMIT, "provenance": provenance,
             "generator_sha256": oracle.sha256_file(Path(__file__)), "oracle_sha256": oracle.sha256_file(Path(oracle.__file__)),
             "source_files": {name: oracle.sha256_file(source / name) for name in (
@@ -129,6 +130,15 @@ def capture(source: Path):
                       "Invalid pair slots return exactly zero; unmasked intermediate outputs remain observable.",
                       "The final-logits-only case proves invalid pair routes contribute no loss gradient, independently of intermediate cotangents.",
                       "Training dropout uses one caller-supplied inverted mask and claims no RNG-stream equivalence."]}
+
+
+    # Share exact serialized seeds; a case with different seeds keeps its override.
+    report["cotangents"] = report["cases"][0]["cotangents"]
+    common = json.dumps(report["cotangents"], sort_keys=True, allow_nan=False)
+    for case in report["cases"]:
+        if json.dumps(case["cotangents"], sort_keys=True, allow_nan=False) == common:
+            del case["cotangents"]
+    return report
 
 
 def main():

@@ -23,7 +23,9 @@ def main() -> None:
     import scipy
     assignments = []
     for rows, columns in ((2, 3), (3, 4), (4, 3), (3, 3)):
-        for seed in range(32):
+        # Costs repeat every seven seeds modulo 7. Capture each distinct
+        # matrix once, retaining the source solver's exact tie decisions.
+        for seed in range(7):
             values = [float((seed * 37 + i * i * 13 + i * seed * 7) % 7 - 3)
                       for i in range(rows * columns)]
             r, c = linear_sum_assignment(torch.tensor(values, dtype=torch.float64).reshape(rows, columns))

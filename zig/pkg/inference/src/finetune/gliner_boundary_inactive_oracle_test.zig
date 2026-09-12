@@ -15,6 +15,7 @@ const device = @import("../graph/resident_training_fixture.zig");
 const metal = @import("../backends/metal_runtime.zig");
 const metal_tensor = @import("../backends/metal_tensor.zig");
 const bundle = @import("../models/gliner_boundary_bundle.zig");
+const metadata = @import("gliner_boundary_fixture_metadata.zig");
 const Allocator = std.mem.Allocator;
 const mib = 1024 * 1024;
 pub const Names = std.json.ArrayHashMap(?[]const u8);
@@ -41,23 +42,36 @@ pub const Microbatch = struct {
     gradients_scaled: Names,
     gradients_unscaled: Names,
     accumulated_gradients: Names,
-    inputs: Names,
+    inputs: ?Names = null,
+    inputs_ref: ?usize = null,
     losses: std.json.ArrayHashMap(f32),
 };
 pub const Profile = struct {
     id: []const u8,
     parameters: []const Parameter,
-    initial: Names,
+    initial: ?Names = null,
+    initial_ref: ?usize = null,
     sequence: []const []const u8,
     targets: []const []const u8,
     flush_after: []const u64,
-    microbatches: []const Microbatch,
+    microbatches: []Microbatch,
     flushes: []const Flush,
     frozen_parameters_unchanged: bool,
     fresh_owner_mid_window_resume_exact: ?bool,
 };
 pub const Optimizer = struct { accumulation_steps: u32, max_grad_norm: f32, betas: [2]f32, eps: f32, task_lr: f32, weight_decay: f32 };
-const Fixture = struct { version: u32, qualification: bool, scope: []const u8, source_commit: []const u8, optimizer: Optimizer, profiles: []const Profile };
+pub const SharedMetadata = struct { version: u32 = 1, bindings: []const Names = &.{} };
+const Fixture = struct { version: u32, qualification: bool, scope: []const u8, source_commit: []const u8, optimizer: Optimizer, profiles: []Profile, shared_metadata: SharedMetadata = .{} };
+
+pub fn resolveMetadata(profiles: []Profile, shared: SharedMetadata) !void {
+    try metadata.validate(shared.version, &.{shared.bindings.len});
+    for (profiles) |*profile| {
+        profile.initial = try metadata.resolve(Names, profile.initial, profile.initial_ref, shared.bindings);
+        for (profile.microbatches) |*micro| {
+            micro.inputs = try metadata.resolve(Names, micro.inputs, micro.inputs_ref, shared.bindings);
+        }
+    }
+}
 
 pub fn expectDigest(bytes: []const u8, hex: []const u8) !void {
     // Bundle digests are canonical 64-byte lowercase hexadecimal. Controller
@@ -77,7 +91,7 @@ fn values(fixture: *const parity.TensorFixture, names: Names, name: []const u8) 
 fn create(a: Allocator, cb: *const ops.ComputeBackend, fixture: *const parity.TensorFixture, profile: Profile, optimizer: Optimizer, execution: controller.Execution) !controller.Trainer {
     const parameters = try a.alloc(controller.Parameter, profile.parameters.len);
     defer a.free(parameters);
-    for (profile.parameters, parameters) |source, *target| target.* = .{ .name = source.name, .dimensions = source.shape, .values = try values(fixture, profile.initial, source.name), .group = 0 };
+    for (profile.parameters, parameters) |source, *target| target.* = .{ .name = source.name, .dimensions = source.shape, .values = try values(fixture, profile.initial.?, source.name), .group = 0 };
     return controller.Trainer.init(a, cb, parameters, .{
         .execution = execution,
         .groups = &.{.{ .optimizer = .{ .beta1 = optimizer.betas[0], .beta2 = optimizer.betas[1], .eps = optimizer.eps, .weight_decay = optimizer.weight_decay }, .schedule = .{ .constant = optimizer.task_lr } }},
@@ -241,10 +255,11 @@ fn exercise(a: Allocator, cb: *const ops.ComputeBackend, execution: controller.E
     const bytes = try parity.fixtureBytes(a, "training_inactive_adapters/capture.json");
     defer a.free(bytes);
     if (bytes.len > mib) return error.InvalidInactiveTrainingFixture;
-    try expectDigest(bytes, "f7bb532ad38f54c105b44e703f0af8bb837b02a7ec1850679b2da17b2ecdbfc0");
+    try expectDigest(bytes, "d0d5f8dbbd39446cf8050021623f2eda7db6992447bd65029970e93a3a1eff53");
     const parsed = try std.json.parseFromSlice(Fixture, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     const source = parsed.value;
+    try resolveMetadata(source.profiles, source.shared_metadata);
     try std.testing.expectEqual(@as(u32, 1), source.version);
     try std.testing.expect(!source.qualification);
     try std.testing.expectEqualStrings("gliner25_inactive_adapter_training/v1", source.scope);
@@ -252,7 +267,7 @@ fn exercise(a: Allocator, cb: *const ops.ComputeBackend, execution: controller.E
     try std.testing.expectEqual(@as(usize, 8), source.profiles.len);
     var tensors = try parity.TensorFixture.init(a, "training_inactive_adapters/tensors.safetensors");
     defer tensors.deinit();
-    try expectDigest(tensors.reader.file_bytes, "4607cc7ff24066eb53e18936d95b20b17b5fc4e0281a23c565b357d8b60f1f2f");
+    try expectDigest(tensors.reader.file_bytes, "9394123bccbaa959e6aa2b4a32905208e3f2df5917626824edff7af741e0192a");
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/inactive-oracle.safetensors", .{temporary.sub_path});

@@ -16,13 +16,13 @@ import os
 from pathlib import Path
 import platform
 import statistics
-import struct
 import subprocess
 import sys
 import time
 from typing import Any
 
 import benchmark_cpu as cpu
+import extract_token_evidence as token_contract
 import generate_pipeline_cases as adaptation
 import oracle
 import paired_benchmark
@@ -229,6 +229,54 @@ def checked_result(response: dict[str, Any], expected: dict[str, Any], arm: str,
     return actual
 
 
+def reference_input_ids(variant: str, fixture: dict[str, Any], case_path: Path) -> dict[str, list[int]]:
+    """Read the existing derived CPU evidence without loading tensor diagnostics."""
+    path = oracle.FIXTURES / "token_evidence.json"
+    pin = adaptation.reference_inventory().get(path.name)
+    if pin is None:
+        raise BenchmarkError("reference manifest must retain encoder token evidence")
+    oracle.verify_file(path, pin)
+    report = oracle.read_json(path)
+    if (report.get("format_version") != 1
+            or report.get("scope") != "completed_cpu_benchmark_encoder_token_evidence"
+            or report.get("fresh_model_execution") is not False
+            or report.get("native_runtime_qualified") is not False
+            or report.get("source_commit") != oracle.UPSTREAM_COMMIT
+            or report.get("runtime") != oracle.load_manifest()["runtime"]
+            or report.get("report_sha256") != token_contract.REPORT_SHA256
+            or report.get("benchmark_driver_sha256") != token_contract.DRIVER_SHA256
+            or report.get("native_binary_sha256") != token_contract.NATIVE_SHA256
+            or report.get("generator_sha256") != oracle.sha256_file(Path(token_contract.__file__))):
+        raise BenchmarkError("encoder token evidence source profile differs")
+    models = report.get("models", [])
+    if (len(models) != len(VARIANTS) or {row.get("model") for row in models} != set(VARIANTS)):
+        raise BenchmarkError("encoder token evidence must cover all three model variants")
+    evidence = next(row for row in models if row["model"] == variant)
+    if (any(evidence.get(key) != fixture[key] for key in
+            ("model", "model_id", "revision", "model_files", "reference_sha256", "requests_sha256"))
+            or evidence.get("cases_sha256") != oracle.sha256_file(case_path)):
+        raise BenchmarkError("encoder token evidence model or request identity differs")
+    validation = evidence.get("validation", {})
+    cases = fixture["cases"]
+    if (len(cases) != len(validation) or set(validation) != {case["id"] for case in cases}):
+        raise BenchmarkError("encoder token evidence case coverage differs")
+    result = {}
+    for case in cases:
+        packet = validation[case["id"]]
+        ids = packet.get("input_ids")
+        if (not isinstance(ids, list) or not 0 < len(ids) <= oracle.MAX_ENCODED_TOKENS
+                or any(type(token) is not int or not 0 <= token < 2**32 for token in ids)):
+            raise BenchmarkError("invalid bounded reference encoder token sequence")
+        request = json.dumps({"text": case["text"], "schema": case["schema"]}, ensure_ascii=False,
+                             allow_nan=False, separators=(",", ":")).encode()
+        token_bytes = b"".join(token.to_bytes(4, "little") for token in ids)
+        if (hashlib.sha256(request).hexdigest() != packet.get("canonical_request_sha256")
+                or hashlib.sha256(token_bytes).hexdigest() != packet.get("input_ids_u32_le_sha256")):
+            raise BenchmarkError("encoder token evidence ordered request or token values differ")
+        result[case["id"]] = ids
+    return result
+
+
 def load_contract(variant: str, model_root: Path, requested: list[str] | None) -> dict[str, Any]:
     case_path = cpu.case_fixture(variant)
     fixture = oracle.read_json(case_path)
@@ -240,41 +288,10 @@ def load_contract(variant: str, model_root: Path, requested: list[str] | None) -
     selected = requested if requested is not None else list(all_cases)
     if not selected or len(set(selected)) != len(selected) or any(name not in all_cases for name in selected):
         raise BenchmarkError("case selection must be unique captured requests")
-    reference_ids = {}
-    captures = oracle.read_json(oracle.FIXTURES / f"{variant}_reference" / "capture.json")
-    for capture in captures["requests"]:
-        tensor_capture = capture.get("tensor_capture")
-        if not tensor_capture or capture["id"] not in selected:
-            continue
-        path = oracle.FIXTURES / f"{variant}_reference" / tensor_capture["file"]
-        # The oracle manifest has already verified this entire immutable file.
-        # Reading just the token tensor avoids importing Torch in the supervisor.
-        with path.open("rb") as source:
-            prefix = source.read(8)
-            if len(prefix) != 8:
-                raise BenchmarkError("truncated reference tensor header")
-            header_bytes = struct.unpack("<Q", prefix)[0]
-            if not 0 < header_bytes <= 4 * 1024**2:
-                raise BenchmarkError("reference tensor header exceeds bounds")
-            header = cpu.strict_json(source.read(header_bytes))
-            tensor = header.get("input.ids")
-            if tensor is None:
-                continue
-            shape = tensor["shape"]
-            if (tensor["dtype"] != "I64" or len(shape) != 2 or shape[0] != 1
-                    or type(shape[1]) is not int or not 1 <= shape[1] <= oracle.MAX_ENCODED_TOKENS):
-                raise BenchmarkError("reference encoder token tensor has invalid shape/type")
-            begin, end = tensor["data_offsets"]
-            if not 0 <= begin <= end or end - begin != shape[1] * 8:
-                raise BenchmarkError("invalid reference encoder token byte offsets")
-            source.seek(8 + header_bytes + begin)
-            data = source.read(end - begin)
-            if len(data) != end - begin:
-                raise BenchmarkError("truncated reference encoder tokens")
-            reference_ids[capture["id"]] = list(struct.unpack(f"<{shape[1]}q", data))
+    reference_ids = reference_input_ids(variant, fixture, case_path)
     return {"model": variant, "bundle": oracle.verify_model_dir(variant, model_root / variant),
             "case_path": case_path, "cases": selected,
-            "reference_input_ids": reference_ids,
+            "reference_input_ids": {name: reference_ids[name] for name in selected},
             "expected": {name: cpu.canonical_result(all_cases[name]["expected"]) for name in selected}}
 
 

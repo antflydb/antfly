@@ -6,25 +6,9 @@ multilingual FP32 checkpoints, the ten existing task requests, batch size one,
 and one CPU math thread per process. These short correctness fixtures are not
 a representative throughput corpus or a serving performance qualification.
 
-## Recorded comparison
-
-The complete 2026-09-10 AC campaign on an Apple M4 passed all 60 comparisons
-across three fresh-process repetitions. A separate verification pass checked
-13,080 inference outputs, recomputed all 180 per-repetition distributions and
-confidence intervals, and verified source, binary, evidence, and cleanup
-receipts. The ReleaseFast Metal build and 61 focused benchmark tests passed.
-
-Against Python MPS, Metal was repeatably 2.04–3.62 times faster on the latent
-and anchorless record cases across the three models (6 of 30 comparisons).
-Python MPS was repeatably 1.29–6.66 times faster on the other 24 comparisons.
-The separate Python CPU comparisons favored Python in all 30 cases, by
-5.57–11.16 times. These factors use the paired estimator described below.
-
-The [complete recorded tables and provenance](METAL_BENCHMARK_RESULTS.md)
-retain every comparison and all three confidence intervals. These results
-describe the ten short batch-one fixtures on this machine. They establish a
-fair direct-core comparison and identify performance gaps; they do not
-establish serving throughput or qualify a release.
+This document specifies the original request-owned reference profile. Use the
+[v2 comparison and scaling profiles](METAL_BENCHMARK_V2.md) to compare the
+optimized runtime or check native CPU preservation.
 
 ## Measurement contract
 
@@ -94,11 +78,19 @@ and the profile-change diagnosis remain available.
 
 Every warmup and measured result must match the frozen output decisions,
 text, order, spans, records, attributes and relations. Only confidence permits
-an absolute difference of 5e-4. Actual encoder tokens must match between arms;
-the eight extraction cases also match saved token tensors. Classification and
-JointIE reference captures have no saved encoder-token tensor, which is
-reported explicitly. Their output references and cross-arm token checks
-still apply.
+an absolute difference of 5e-4. Actual encoder tokens must match between arms
+and the existing pinned `token_evidence.json` for all thirty model/request
+combinations, including classification and JointIE. That compact artifact
+records completed CPU benchmark validation; it is not a new model capture.
+Its model files, original capture, ordered request and token hashes are checked
+before workers start.
+
+Original `capture.json`, request and expected-output files remain unchanged.
+`reference_manifest.json` explicitly lists retained diagnostic attachments:
+small encoder/head numerical references and the tiny boundary weights/tensors
+remain; unused base/multilingual intermediates and tiny per-request tensors do
+not. Original capture reports retain their historical attachment hashes. A
+missing attachment still declared in the retention manifest is an error.
 
 Workers use a 120-second startup deadline, a 30-second native request budget
 with a five-second parent-response grace, an 8 GiB combined process-tree RSS

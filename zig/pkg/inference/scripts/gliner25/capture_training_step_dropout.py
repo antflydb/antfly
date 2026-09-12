@@ -20,7 +20,7 @@ from unittest.mock import patch
 import capture_training_step as composition
 import oracle
 
-HELPER_SHA256 = "844069a5b1c8139eb809de303562f436dc4502973b9226c8c441511c252c4810"
+HELPER_SHA256 = "2ca6610037b8a357766a81c7a0002af59e6e433bfea60fb0d51cf1d5eebf831b"
 PROBABILITY = 0.125
 SCALE = struct.unpack("<f", struct.pack("<f", 1 / (1 - PROBABILITY)))[0]
 MICROBATCHES = (0, 1, 2, 1, 2)
@@ -301,6 +301,8 @@ def capture(source, output, modes):
         checked(not training or p == 0, "uncontrolled functional dropout in composed capture")
         return input
 
+    tensor_aliases = {}
+
     def save(path, tensors, runtime):
         checked(len(managers) == len(modes) and all(manager.calls == 5 and manager.active is None for manager in managers),
                 "composed mask capture did not complete every forward/resume")
@@ -310,10 +312,13 @@ def capture(source, output, modes):
             combined.update(manager.tensors)
         checked(sum(value.numel() * value.element_size() for value in combined.values()) <= 16 * 1024 * 1024,
                 "composed dropout fixture exceeds 16 MiB")
-        return save_tensors(path, combined, runtime)
+        unique, aliases = composition.deduplicate_tensors(combined)
+        tensor_aliases.update(aliases)
+        return save_tensors(path, unique, runtime)
 
     def write(path, value):
         if path.name == "capture.json":
+            value = composition.expand_metadata(value)
             value["scope"] = "synthetic_explicit_dropout_mixed_task_training_step"
             value["generator_sha256"] = oracle.sha256_file(Path(__file__))
             value["composition_helper_sha256"] = HELPER_SHA256
@@ -327,13 +332,18 @@ def capture(source, output, modes):
                 checked(profile["mode"] == manager.mode, "composed mask profile order differs")
                 profile["zero_dropout_sdpa_check"] = manager.sdpa_check
                 for micro in profile["microbatches"]:
-                    micro["explicit_dropout"] = manager.reports[micro["microbatch"]]
+                    # Live route/resume checks already consumed the diagnostic
+                    # source calls. Native consumers need the exact mask bindings.
+                    micro["explicit_dropout"] = {"masks": [
+                        {key: item for key, item in mask.items() if key != "source_calls"}
+                        for mask in manager.reports[micro["microbatch"]]["masks"]]}
             for name in ("encoding.py", "heads.py", "pool.py", "content.py"):
                 path_in_source = "gliner2/models/boundary/" + name
                 value["source_files"][path_in_source] = oracle.sha256_file(source / path_in_source)
             value["notes"][1] = "model.train() executes real auxiliary losses with encoder/head/PEFT dropout .125 replaced only by explicit captured inverted masks."
             value["notes"].append("The immutable composition driver supplies all objectives, gradients, AdamW and resume checks unchanged. Source classifier task slices and valid relation pair rows determine mask routing; gold never chooses mask bits.")
             value["notes"].append("The boundary SDPA probability dropout is expanded; zero-dropout forward and Q/K/V gradients are checked against genuine SDPA on the same actual activation shape.")
+            value = composition.consolidate_metadata(composition.resolve_tensor_aliases(value, tensor_aliases))
         return write_json(path, value)
 
     with ExitStack() as stack:

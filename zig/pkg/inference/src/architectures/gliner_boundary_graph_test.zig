@@ -43,6 +43,28 @@ fn field(value: std.json.Value, name: []const u8) !std.json.Value {
     if (value != .object) return error.InvalidGraphOracle;
     return value.object.get(name) orelse error.InvalidGraphOracle;
 }
+fn fixtureCotangent(fixture: std.json.Value, case: std.json.Value, name: []const u8) !std.json.Value {
+    if (case != .object) return error.InvalidGraphOracle;
+    // An explicit case replaces the entire shared seed set, including zeros.
+    return field(case.object.get("cotangents") orelse try field(fixture, "cotangents"), name);
+}
+
+test "boundary training graph shared cotangents retain explicit zero and reject incomplete overrides" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"cotangents":{"logits":1,"auxiliary":2},"cases":[{},
+        \\{"cotangents":{"logits":0}},{"cotangents":null}]}
+    , .{});
+    defer parsed.deinit();
+    const fixture = parsed.value;
+    const cases = (try field(fixture, "cases")).array.items;
+    try std.testing.expectEqual(@as(i64, 1), (try fixtureCotangent(fixture, cases[0], "logits")).integer);
+    try std.testing.expectEqual(@as(i64, 0), (try fixtureCotangent(fixture, cases[1], "logits")).integer);
+    try std.testing.expectError(error.InvalidGraphOracle, fixtureCotangent(fixture, cases[1], "auxiliary"));
+    try std.testing.expectError(error.InvalidGraphOracle, fixtureCotangent(fixture, cases[2], "logits"));
+    try std.testing.expectError(error.InvalidGraphOracle, fixtureCotangent(cases[0], cases[0], "logits"));
+}
+
 fn number(value: std.json.Value) !f32 {
     return switch (value) {
         .float => @floatCast(value.float),
@@ -183,7 +205,7 @@ fn checkGraphFixture(comptime with_candidates: bool, comptime use_staged: bool) 
             const shape = graph.node(output.node).output_shape;
             const cotangent = try builder.parameter(try std.fmt.bufPrint(&name, "__cotangent.{s}", .{output.name}), shape);
             seed.* = .{ .output = output.node, .cotangent = cotangent };
-            const value = try tensor(a, &cb, try field(try field(case, "cotangents"), output.name), shape);
+            const value = try tensor(a, &cb, try fixtureCotangent(fixture, case, output.name), shape);
             errdefer cb.free(value);
             try cotangents.append(a, value);
         }
@@ -521,7 +543,7 @@ const TaskOracle = struct {
             var name: [192]u8 = undefined;
             const shape = graph.node(output.node).output_shape;
             seed.* = .{ .output = output.node, .cotangent = try g.builder.parameter(try std.fmt.bufPrint(&name, "__cotangent.{s}", .{output.name}), shape) };
-            const uploaded = try tensor(a, cb, try field(try field(self.case, "cotangents"), output.name), shape);
+            const uploaded = try tensor(a, cb, try fixtureCotangent(self.fixture, self.case, output.name), shape);
             errdefer cb.free(uploaded);
             try cotangents.append(a, uploaded);
         }

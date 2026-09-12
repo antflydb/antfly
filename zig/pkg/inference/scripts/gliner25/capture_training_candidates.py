@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -221,7 +222,7 @@ def capture(source: Path) -> dict[str, Any]:
                 "starts": pack((retained_spans[..., 0] + offsets).reshape(-1)),
                 "ends": pack((retained_spans[..., 1] + offsets).reshape(-1)),
                 "lengths": pack(lengths.reshape(6, 1)), "length_features": pack(length_features.reshape(6, 3))}
-    return {"format_version": 1, "scope": "synthetic_boundary_shared_pool_forward_vjp", "qualification": False,
+    report = {"format_version": 1, "scope": "synthetic_boundary_shared_pool_forward_vjp", "qualification": False,
             "source_commit": oracle.UPSTREAM_COMMIT, "provenance": provenance,
             "generator_sha256": oracle.sha256_file(Path(__file__)), "oracle_sha256": oracle.sha256_file(Path(oracle.__file__)),
             "source_files": {name: oracle.sha256_file(source / name) for name in source_files},
@@ -249,6 +250,15 @@ def capture(source: Path) -> dict[str, Any]:
                       "Inside centering mean is detached by pinned upstream code; each case records its own value as external geometry.",
                       "Shared-pool scoring uses the genuine upstream SharedPoolScorer with span content and FiLM dropout.",
                       "Candidate states are the live masked endpoint encoder used by record training; record and relation scorers are outside this fixture."]}
+
+
+    # Share exact serialized seeds; a case with different seeds keeps its override.
+    report["cotangents"] = report["cases"][0]["cotangents"]
+    common = json.dumps(report["cotangents"], sort_keys=True, allow_nan=False)
+    for case in report["cases"]:
+        if json.dumps(case["cotangents"], sort_keys=True, allow_nan=False) == common:
+            del case["cotangents"]
+    return report
 
 
 def main():

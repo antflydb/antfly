@@ -750,10 +750,11 @@ test "extraction regex matches pinned Python fullmatch search and match oracle" 
         format_version: u32,
         provenance: std.json.Value,
         decimal_ranges: []const Range,
+        texts: []const []const u8,
         cases: []const struct {
             pattern: []const u8,
             flags: u32,
-            texts: []const struct { text: []const u8, fullmatch: bool, search: bool, match: bool },
+            expected: struct { fullmatch: []const bool, search: []const bool, match: []const bool },
         },
     };
     const allocator = std.testing.allocator;
@@ -761,16 +762,20 @@ test "extraction regex matches pinned Python fullmatch search and match oracle" 
     defer allocator.free(bytes);
     var fixture = try std.json.parseFromSlice(Fixture, allocator, bytes, .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(u32, 1), fixture.value.format_version);
+    try std.testing.expectEqual(@as(u32, 2), fixture.value.format_version);
     try std.testing.expectEqualStrings("15.0.0", fixture.value.provenance.object.get("unicode").?.string);
+    try std.testing.expectEqual(@as(usize, 390), fixture.value.cases.len);
+    try std.testing.expectEqual(@as(usize, 57), fixture.value.texts.len);
     for (fixture.value.cases) |case| {
+        inline for (.{ Mode.fullmatch, Mode.search, Mode.match }) |mode|
+            try std.testing.expectEqual(fixture.value.texts.len, @field(case.expected, @tagName(mode)).len);
         var program = try compile(allocator, case.pattern, case.flags, .{});
         defer program.deinit();
-        for (case.texts) |expected| {
+        for (fixture.value.texts, 0..) |text, index| {
             inline for (.{ Mode.fullmatch, Mode.search, Mode.match }) |mode| {
-                const got = try program.run(allocator, expected.text, mode, .{});
-                if (got.matched != @field(expected, @tagName(mode))) {
-                    std.debug.print("regex mismatch pattern={f} flags={d} mode={s} text={f}\n", .{ std.json.fmt(case.pattern, .{}), case.flags, @tagName(mode), std.json.fmt(expected.text, .{}) });
+                const got = try program.run(allocator, text, mode, .{});
+                if (got.matched != @field(case.expected, @tagName(mode))[index]) {
+                    std.debug.print("regex mismatch pattern={f} flags={d} mode={s} text={f}\n", .{ std.json.fmt(case.pattern, .{}), case.flags, @tagName(mode), std.json.fmt(text, .{}) });
                     return error.TestExpectedEqual;
                 }
             }

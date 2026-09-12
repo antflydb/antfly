@@ -147,11 +147,11 @@ test "joint fastino profile matches all nine pinned source optimizer cases" {
     const a = std.testing.allocator;
     const bytes = try fixtures.fixtureBytes(a, "joint_optimizer_source_v1/capture.json");
     defer a.free(bytes);
-    try std.testing.expectEqual(@as(usize, 444862), bytes.len);
+    try std.testing.expectEqual(@as(usize, 76043), bytes.len);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     const hex = std.fmt.bytesToHex(hash, .lower);
-    try std.testing.expectEqualStrings("bbe2a7a56166988380a0b0ec2c154a9e1e519745bfc15696d7ad57c132d94967", &hex);
+    try std.testing.expectEqualStrings("bf4e0ea8a1b8f5d2fea0b292a37d59ebd870393c283b1eddc3c16a11cc093336", &hex);
     const parsed = try std.json.parseFromSlice(Capture, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     const capture = parsed.value;

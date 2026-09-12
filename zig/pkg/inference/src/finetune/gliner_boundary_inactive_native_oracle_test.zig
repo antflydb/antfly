@@ -36,7 +36,8 @@ const Oracle = struct {
     base_parameters: Names,
     tokenizer_fragments: std.json.ArrayHashMap([]const i32),
     optimizer: control_oracle.Optimizer,
-    profiles: []const control_oracle.Profile,
+    profiles: []control_oracle.Profile,
+    shared_metadata: control_oracle.SharedMetadata = .{},
 };
 
 const Tokens = struct {
@@ -119,14 +120,14 @@ const Observation = struct {
         const self: *Observation = @ptrCast(@alignCast(raw.?));
         const micro = self.micro orelse return error.InvalidInactiveTrainingFixture;
         const prepared = event.prepared;
-        try integers(self.reference, micro.inputs, "input_ids", prepared.input_ids);
-        try integers(self.reference, micro.inputs, "attention_mask", prepared.attention_mask);
-        try integers(self.reference, micro.inputs, "text_word_indices", prepared.text_word_indices);
-        try integers(self.reference, micro.inputs, "query_marker_indices", prepared.query_marker_indices);
-        try integers(self.reference, micro.inputs, "cls_marker_indices", prepared.cls_marker_indices);
-        try booleans(self.reference, micro.inputs, "text_word_mask", prepared.text_word_mask);
-        try booleans(self.reference, micro.inputs, "query_marker_mask", prepared.query_marker_mask);
-        try booleans(self.reference, micro.inputs, "cls_marker_mask", prepared.cls_marker_mask);
+        try integers(self.reference, micro.inputs.?, "input_ids", prepared.input_ids);
+        try integers(self.reference, micro.inputs.?, "attention_mask", prepared.attention_mask);
+        try integers(self.reference, micro.inputs.?, "text_word_indices", prepared.text_word_indices);
+        try integers(self.reference, micro.inputs.?, "query_marker_indices", prepared.query_marker_indices);
+        try integers(self.reference, micro.inputs.?, "cls_marker_indices", prepared.cls_marker_indices);
+        try booleans(self.reference, micro.inputs.?, "text_word_mask", prepared.text_word_mask);
+        try booleans(self.reference, micro.inputs.?, "query_marker_mask", prepared.query_marker_mask);
+        try booleans(self.reference, micro.inputs.?, "cls_marker_mask", prepared.cls_marker_mask);
         try std.testing.expectEqual(micro.fallback, event.zero_loss_fallback);
         if (micro.fallback) try std.testing.expectEqual(@as(f32, 0), event.optimizer_loss) else try parity.expectFloats(&.{micro.reported_loss}, &.{event.optimizer_loss}, 1e-3, 2e-5);
         // Same complete-model loss/VJP tolerances as the existing mixed Step
@@ -207,7 +208,7 @@ fn replay(a: Allocator, store: *native.WeightStore, originals: []const run.Param
     // Initialization is copied only into a fresh zero-counter owner. Every
     // subsequent state comparison uses native-updated values.
     for (owner.optimizer.owner.regular_params.items) |slot| {
-        const initial = (try control_oracle.optionalTensor(observation.reference, profile.initial, slot.name)).?;
+        const initial = (try control_oracle.optionalTensor(observation.reference, profile.initial.?, slot.name)).?;
         try std.testing.expectEqualSlices(f32, initial, slot.weights);
         try std.testing.expectEqual(@as(u32, 0), slot.adam_step_count);
         const moment = owner.optimizer.owner.optimizer_state.param_states.get(slot.name).?;
@@ -306,10 +307,11 @@ fn exerciseWithProfiles(a: Allocator, execution: controller.Execution, attention
     const capture_bytes = try parity.fixtureBytes(a, directory ++ "capture.json");
     defer a.free(capture_bytes);
     if (capture_bytes.len > mib) return error.InvalidInactiveTrainingFixture;
-    try control_oracle.expectDigest(capture_bytes, "9947cc37d6adc8b209c7769b2cd61f239738c3583646747444e655bb1afa44f1");
+    try control_oracle.expectDigest(capture_bytes, "24cefafa4dde1f7067b3ba81e7b9209495a58a0cb31620c5805b00bec9abdc24");
     const parsed = try std.json.parseFromSlice(Oracle, a, capture_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     const oracle = parsed.value;
+    try control_oracle.resolveMetadata(oracle.profiles, oracle.shared_metadata);
     try std.testing.expectEqual(@as(u32, 1), oracle.version);
     try std.testing.expect(!oracle.qualification);
     try std.testing.expectEqualStrings("gliner25_inactive_adapter_native_epoch/v1", oracle.scope);
@@ -317,7 +319,7 @@ fn exerciseWithProfiles(a: Allocator, execution: controller.Execution, attention
     try std.testing.expectEqual(@as(usize, 8), oracle.profiles.len);
     var reference = try parity.TensorFixture.init(a, directory ++ "tensors.safetensors");
     defer reference.deinit();
-    try control_oracle.expectDigest(reference.reader.file_bytes, "374658ee67127b2f81ec597a65eabe72ee52263d88a718ebf4ef7e9b246741e9");
+    try control_oracle.expectDigest(reference.reader.file_bytes, "eb8d7939308642c9587c73789070516e632078850473feecd3416f57d665246c");
     const settings = try parity.fixtureBytes(a, directory ++ "native_settings.json");
     defer a.free(settings);
     try control_oracle.expectDigest(settings, "0c041c7f9123e507cebc7d85860b03380a7f413a54427c1bcc068c9241443fd6");
@@ -395,7 +397,7 @@ fn exerciseWithProfiles(a: Allocator, execution: controller.Execution, attention
         defer samples.deinit();
         try std.testing.expectEqual(profile.sequence.len, samples.index.len);
         const initial = try scratch.alloc(run.Parameter, profile.parameters.len);
-        for (profile.parameters, initial) |parameter, *out| out.* = .{ .name = parameter.name, .canonical_name = parameter.name, .dimensions = parameter.shape, .values = (try control_oracle.optionalTensor(&reference, profile.initial, parameter.name)).?, .kind = .adapter };
+        for (profile.parameters, initial) |parameter, *out| out.* = .{ .name = parameter.name, .canonical_name = parameter.name, .dimensions = parameter.shape, .values = (try control_oracle.optionalTensor(&reference, profile.initial.?, parameter.name)).?, .kind = .adapter };
         std.mem.sort(run.Parameter, initial, {}, struct {
             fn less(_: void, lhs: run.Parameter, rhs: run.Parameter) bool {
                 return std.mem.order(u8, lhs.name, rhs.name) == .lt;

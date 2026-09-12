@@ -2,8 +2,10 @@
 """Adapt a verified, pinned variant capture to canonical native schema cases.
 
 This command imports no ML runtime and performs no model download or inference.
-It verifies the capture's provenance and all captured tensor hashes before
-publishing expectations. The native consumer rehashes the actual model bundle.
+It verifies the capture's provenance and retained diagnostic tensor hashes
+before publishing expectations. The native consumer rehashes the actual model
+bundle. The reference manifest declares which historical attachments remain
+in the repository; final outputs do not depend on those optional attachments.
 """
 from __future__ import annotations
 import argparse
@@ -57,6 +59,14 @@ def values(value, attributes=()):
             for item in (value if isinstance(value, list) else [value])]
 
 
+def reference_inventory():
+    manifest = oracle.read_json(oracle.FIXTURES / "reference_manifest.json")
+    if (manifest.get("format_version") != 1 or manifest.get("upstream_commit") != oracle.UPSTREAM_COMMIT
+            or not isinstance(manifest.get("files"), dict)):
+        raise oracle.ContractError("reference retention manifest must identify the pinned upstream")
+    return manifest["files"]
+
+
 def verified_capture(model: str, capture_dir: Path, requests_path: Path):
     manifest = oracle.load_manifest()
     pinned = manifest["models"][model]
@@ -78,12 +88,26 @@ def verified_capture(model: str, capture_dir: Path, requests_path: Path):
         raise oracle.ContractError("capture model bundle identity is not pinned")
     if reference.get("requests_sha256") != oracle.sha256_file(requests_path):
         raise oracle.ContractError("capture requests do not match the requested fixture")
+    retained = reference_inventory()
+    capture_pin = retained.get(f"{model}_reference/capture.json")
+    if capture_pin is None:
+        raise oracle.ContractError("reference manifest must retain the complete capture")
+    # Preserve the original report bytes and its output/token provenance even
+    # when unused intermediate attachments are no longer retained locally.
+    oracle.verify_file(capture_dir / "capture.json", capture_pin)
     for row in reference["requests"]:
         if tensor := row.get("tensor_capture"):
             filename = tensor["file"]
             if Path(filename).name != filename or not filename.endswith(".safetensors"):
                 raise oracle.ContractError("capture tensor filename must be a safe basename")
-            oracle.verify_file(capture_dir / filename, tensor)
+            attachment = f"{model}_reference/{filename}"
+            if attachment in retained:
+                attachment_pin = retained[attachment]
+                if attachment_pin != {key: tensor[key] for key in ("size_bytes", "sha256")}:
+                    raise oracle.ContractError("retained tensor identity differs from the original capture")
+                # A declared attachment is mandatory. Its absence is never an
+                # implicit opt-out of numerical evidence verification.
+                oracle.verify_file(capture_dir / filename, attachment_pin)
     return reference, pinned
 
 

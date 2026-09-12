@@ -138,7 +138,7 @@ class MonitoringContracts(unittest.TestCase):
                      if c["alertname"] == alert["alert"]]
             self.assertTrue(any(c["exp_alerts"] for c in cases), alert["alert"])
             self.assertTrue(any(not c["exp_alerts"] for c in cases), alert["alert"])
-            self.assertIn("docs/GLINER25_MONITORING.md#", alert["annotations"]["runbook"])
+            self.assertIn("work-log/completed/gliner2.5.md#", alert["annotations"]["runbook"])
         # Loading the examples does not configure an Alertmanager or receiver.
         self.assertNotIn("alerting", read_json("prometheus.example.json"))
 

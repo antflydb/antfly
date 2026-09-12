@@ -3,12 +3,12 @@
   "alpha": 3,
   "baseline": {
     "capture.json": {
-      "sha256": "b408c21f99c08b55b5d2148025ad19c47c09803628f1551a26028a59c312a59b",
-      "size_bytes": 1989406
+      "sha256": "3d0541e2c3d2b99f2032db2825c30f0f1be5bbbc0e5dd18bf6caceb59ec6361e",
+      "size_bytes": 791932
     },
     "tensors.safetensors": {
-      "sha256": "407c25d629f1fe2752d3ed3f73045cc972b00c09753856d70f011d777d5271db",
-      "size_bytes": 2685776
+      "sha256": "4236272817561a1828076446c3069053a730f5b21e7642c3ef87138ed1131abe",
+      "size_bytes": 1228022
     },
     "tokenizer.json": {
       "sha256": "ee7f0d2f277c34191fe76227371cc95d7b55e0f7a10f1a153eec36b5d5865cc8",
@@ -118,6 +118,10 @@
       "sha256": "8b720f6da4fa3d74ad2c0adda3b5ef5a71c001f01d7822ba48dfaf974dec05d3",
       "size_bytes": 95112
     }
+  },
+  "tensor_storage_helper": {
+    "sha256": "2ca6610037b8a357766a81c7a0002af59e6e433bfea60fb0d51cf1d5eebf831b",
+    "size_bytes": 47291
   },
   "trainer_methods": {
     "_backward_one": {

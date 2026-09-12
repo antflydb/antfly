@@ -60,6 +60,14 @@ division. Source parameter names and exact shapes are retained. The baseline
 parameters are included once; tokenizer files remain pinned references to the
 existing tiny fixture.
 
+The four mixed-step, dropout, and inactive captures store exact repeated input
+bindings, encoder configuration, initial bindings, and dropout maps in local
+`shared_metadata` tables. References are zero-based indices into typed tables
+limited to 64 entries each. Readers reject missing, ambiguous, and out-of-range
+references before running numerical checks. Tensor names, scalar expectations,
+`None` gradients, mask values and resume assertions retain their original
+meaning; no metadata reference crosses a capture file.
+
 Fresh-owner resume compares full model parameters, gradient presence and
 accumulators, optimizer moments/state membership, scheduler/counters and RNG
 bytes. This is an owned in-memory source snapshot. Durable native checkpoint
@@ -105,25 +113,27 @@ The stable files are checked in under `testdata/gliner25/training_inactive_adapt
 
 | File | Bytes | SHA-256 |
 |---|---:|---|
-| `capture.json` | 864,250 | `f7bb532ad38f54c105b44e703f0af8bb837b02a7ec1850679b2da17b2ecdbfc0` |
-| `tensors.safetensors` | 591,162 | `4607cc7ff24066eb53e18936d95b20b17b5fc4e0281a23c565b357d8b60f1f2f` |
+| `capture.json` | 420,293 | `d0d5f8dbbd39446cf8050021623f2eda7db6992447bd65029970e93a3a1eff53` |
+| `tensors.safetensors` | 207,375 | `9394123bccbaa959e6aa2b4a32905208e3f2df5917626824edff7af741e0192a` |
 
 The generator SHA-256 is
-`142eabbc7cb78b1f6563bf4234d9c49b526d4f5154053b0b2b9df0d6554c1b92`;
+`8f63e2ccb46fcf2ee00033ea3577c02615d59c07b233da7ed9303de0fea45380`;
 the v1 contract SHA-256 is
-`4e3edc790cdfce5c38960fc064242d0ef6b8d02ff9095954838cfeab532b4c2c`.
-Four pure Python tests verify file/tensor/provenance integrity and the recorded
+`d88ece37ce0873baf481d957a4e30c53b5fb35e5780ea542dc360931d5e810cd`.
+Pure Python tests verify bounded tensor headers, provenance and the recorded
 presence/objective/counter distinctions without a model import. Supplemental
 native CPU and resident Metal `Controller` consumers now pass this exact
 control fixture, including its `[2,3,5]` flush schedule. They replay source
 cotangents to qualify accumulation and optimizer ownership; the complete
 native forward/backward/update proof uses the companion below. All source,
-baseline and prior execution fixtures remain unchanged.
+baseline numerical values and expected results remain unchanged. See the
+[fixture metadata policy](../../testdata/gliner25/README.md) for exact tensor deduplication
+and updated writer pins.
 
 ## Native epoch companion
 
 `capture_training_inactive_native_epoch.py` is an additive companion. The
-original generator, contract and successful fixture bytes above remain fixed.
+original control profile and captured tensor bytes above remain fixed.
 An ordinary immutable five-row native training epoch with accumulation two
 flushes after rows `[2,4,5]`; the control fixture's `[2,3,5]` schedule represents
 a three-row partial epoch followed by a separate inactive window. Comparing
@@ -167,15 +177,15 @@ one of their seven output files is byte-identical. Process receipts are under
 `/private/tmp/gliner25-training-inactive-native-epoch-probe-v{1,2}/process.json`.
 
 All seven files are checked in together under
-`testdata/gliner25/training_inactive_native_epoch/`, totaling 1,461,933 bytes.
-The 867,431-byte `capture.json` has SHA-256
-`9947cc37d6adc8b209c7769b2cd61f239738c3583646747444e655bb1afa44f1`;
-the 591,162-byte tensor file has SHA-256
-`374658ee67127b2f81ec597a65eabe72ee52263d88a718ebf4ef7e9b246741e9`.
+`testdata/gliner25/training_inactive_native_epoch/`, totaling 634,237 bytes.
+The 423,554-byte `capture.json` has SHA-256
+`24cefafa4dde1f7067b3ba81e7b9209495a58a0cb31620c5805b00bec9abdc24`;
+the 207,343-byte tensor file has SHA-256
+`eb8d7939308642c9587c73789070516e632078850473feecd3416f57d665246c`.
 Capture metadata binds each exact JSONL/settings file. Its wrapper SHA-256 is
-`be795b735ef003e6bc902bff87904581c0c5747dfc4daf513b54822f90895fd5`
+`7a38842add551cad17397fcaefb8f3b2bb00ecc163afb8afb72a1a66c0fd9944`
 and companion contract SHA-256 is
-`7adfee8c6a9cab1198e448851570cf03fd78930a9eefb0861e3b6c7dd1468142`.
+`b901882abbb3842d6f3eda9554b583e78b686411e218acca3499262b4e2516d8`.
 
 Six additional pure tests verify profile isolation, exact JSONL/schema/
 annotation mapping, tamper rejection, atomic publication, fixture provenance,
@@ -220,5 +230,5 @@ The retained tiny source fixtures above remain the numerical regression
 contract. Published restart/reload consistency does not establish published
 Fastino VJP parity, equality of CPU/Metal updates, broader ranks/backbones,
 full-context training, useful trained quality or release readiness. See
-[training](../../../../../docs/GLINER25_TRAINING.md) and
-[export compatibility](../../../../../docs/GLINER25_TRAINING_EXPORT.md).
+[training](../../../../../work-log/completed/gliner2.5.md#training-and-export) and
+[export compatibility](../../../../../work-log/completed/gliner2.5.md#export-and-adapter-materialization).

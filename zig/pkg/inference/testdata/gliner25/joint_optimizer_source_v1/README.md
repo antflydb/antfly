@@ -9,9 +9,19 @@ benchmark, or quality evaluation is involved.
 `capture.json` is the authoritative source result. It retains the exact inputs,
 Python body-token candidate IDs and their `str` representations, returned node
 and edge order, utility, explicit feasibility flag, and independent final
-constraint validation. The retained beam finish states are diagnostic evidence
-for pruning and greedy-baseline behavior. They are not an alternate optimizer.
+constraint validation. Small beam-finish summaries retain the count, best
+feasible score and whether the independent greedy result beats every retained
+finish. Full intermediate snapshots are omitted; no native or Python regression
+needs those repeated candidate graphs.
 The capture's source-file pins cover the exact bytes compiled by the generator.
+
+The compact metadata was projected from the original capture without changing
+any of its nine inputs, final solutions, semantic keys or summary values.
+Only intermediate snapshots and the generator identity changed; the source
+contract remains byte-identical. This edit did not run a numerical model.
+`test_saved_compact_capture_matches_source_replay_and_provenance` separately
+replays the pinned, model-free source and compares the entire compact file,
+including its generator, source and interpreter identities.
 
 | Fixed case | Source beam32 | Source greedy |
 | --- | --- | --- |
@@ -59,7 +69,8 @@ returns and is restored on success or error. No upstream methods are replaced.
 Bounds are nine cases, at most 32 nodes and 16 edges per case, beam width 32,
 15 seconds, and a 1 MiB result. Output creation fails if the destination exists.
 The retained tests cover exact control results, source-pin rejection, forbidden
-imports, source-exception cleanup and deterministic replay. Expected warnings
+imports, source-exception cleanup and byte-exact replay against the saved fixture.
+The replay comparison requires the captured CPython 3.12.3 version. Expected warnings
 describe the deliberately infeasible greedy derived-cycle case.
 
 `capture.json` and `contract.json` retain the authoritative input, source and

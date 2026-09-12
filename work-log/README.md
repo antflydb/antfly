@@ -50,6 +50,7 @@ This directory tracks major features and architectural changes in Antfly. Each d
 
 | Feature | Document | Summary |
 |---------|----------|---------|
+| GLiNER2.5 | [gliner2.5.md](completed/gliner2.5.md) | Native CPU/Metal extraction, training, artifact compatibility, and qualification boundaries |
 | HuggingFace Direct Pull | [huggingface-direct.md](completed/huggingface-direct.md) | `hf:` prefix support with variant auto-detection |
 | Termite Controllers GKE Autopilot | [termite-operator-autopilot.md](completed/termite-operator-autopilot.md) | GKE Autopilot compute classes and spot scheduling |
 | Termite Controllers TPUs | [termite-operator-tpus.md](completed/termite-operator-tpus.md) | GKE TPU node pool integration |

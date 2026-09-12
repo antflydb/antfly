@@ -4,7 +4,7 @@ The dedicated replay-tiled training attention capture contains nine cases.
 Each checks the unmodified source forward against an exact projection-leaf
 replay and records all five autograd VJPs. Native CPU and Metal consumers use
 the same fixed tolerances. This qualifies the primitive boundary separately
-from [regional training](../../../../../docs/GLINER25_RECOMPUTED_TRAINING.md),
+from [regional training](../../../../../work-log/completed/gliner2.5.md#activation-recomputation),
 published-model gradients and full-context training.
 
 The [generator](capture_training_attention.py) and
@@ -126,7 +126,7 @@ capture and evidence directories. Partial artifacts and process logs remain
 evidence if any assertion or guard fails.
 
 Run from the repository root using the environment pinned in
-[GLINER25_ORACLE.md](../../../../../docs/GLINER25_ORACLE.md). Supply the local
+[oracle reproduction](../../../../../work-log/completed/gliner2.5.md#reproduction-entry-points). Supply the local
 Fastino checkout explicitly. Model-free preflight and tests:
 
 ```sh

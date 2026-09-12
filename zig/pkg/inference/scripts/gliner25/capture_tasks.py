@@ -120,6 +120,8 @@ def capture(source: Path, destination: Path) -> dict[str, Any]:
                   "real_model_qualified": False, "native_runtime_qualified": False, "training_qualified": False,
                   "records": rows, "weights": oracle.save_tensors(output / "weights.safetensors", weights, torch),
                   "tensors": oracle.save_tensors(output / "tensors.safetensors", tensors, torch)}
+        for binding in ("weights", "tensors"):
+            report[binding].pop("tensors")  # Shapes and dtypes live in the pinned SafeTensors header.
         oracle.write_json(output / "capture.json", report)
     return {"status": "captured", "output": str(destination.resolve()), "records": len(rows)}
 

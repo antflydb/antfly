@@ -21,6 +21,138 @@ from types import SimpleNamespace
 import oracle
 
 
+def compact_profiles(profiles):
+    """Keep source values consumed by the composed CPU/Metal regressions."""
+    outputs = {"mention_mask", "mention_pairs", "negative_uniform", "inside_prefix_mean",
+               "relation_labels", "pair_query_mask", "hard_negative_mask"}
+    diagnostics = ("classification_logits", "routing", "records", "schema_tokens_list",
+                   "structure_labels", "targets", "task_types", "text_tokens")
+    for profile in profiles:
+        # The inactive-adapter generator reconstructs the full baseline config.
+        if profile["mode"] != "full":
+            profile.pop("config", None)
+        for flush in profile["flushes"]:
+            flush.pop("gradients_before_clip", None)
+        for micro in profile["microbatches"]:
+            for key in diagnostics:
+                micro.pop(key, None)
+            micro["outputs"] = {key: value for key, value in micro["outputs"].items() if key in outputs}
+            micro["pool"] = {key: micro["pool"][key] for key in ("indices", "mask", "gold_mask")}
+
+
+def tensor_references(value):
+    """Visit string values to select named tensors without importing a runtime."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from tensor_references(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from tensor_references(child)
+
+
+def deduplicate_tensors(tensors):
+    """Store each exact dtype/shape/payload once, using stable existing names."""
+    unique, aliases, canonical = {}, {}, {}
+    for name in sorted(tensors):
+        tensor = tensors[name]
+        # Bytes are compared exactly, including signed zeros. These CPU
+        # captures are already detached, contiguous and bounded to 16 MiB.
+        key = (str(tensor.dtype), tuple(tensor.shape), tensor.numpy().tobytes())
+        if key in canonical:
+            aliases[name] = canonical[key]
+        else:
+            canonical[key] = name
+            unique[name] = tensor
+    return unique, aliases
+
+
+def resolve_tensor_aliases(value, aliases):
+    if isinstance(value, str):
+        return aliases.get(value, value)
+    if isinstance(value, dict):
+        return {key: resolve_tensor_aliases(child, aliases) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [resolve_tensor_aliases(child, aliases) for child in value]
+    return value
+
+
+MAX_SHARED_METADATA_ENTRIES = 64
+
+
+def metadata_sites(report):
+    for profile in report["profiles"]:
+        yield profile, "initial", "bindings"
+        if "encoder_config" in profile or "encoder_config_ref" in profile:
+            yield profile, "encoder_config", "encoder_configs"
+        for micro in profile["microbatches"]:
+            yield micro, "inputs", "bindings"
+            if "explicit_dropout" in micro or "explicit_dropout_ref" in micro:
+                yield micro, "explicit_dropout", "dropout"
+
+
+def expand_metadata(report):
+    """Resolve one level of local typed pools; numerical fields stay untouched."""
+    report = copy.deepcopy(report)
+    shared = report.pop("shared_metadata", None)
+    if shared is None:
+        return report
+    if (not isinstance(shared, dict) or type(shared.get("version")) is not int or shared["version"] != 1 or
+            set(shared) - {"version", "bindings", "encoder_configs", "dropout"}):
+        raise oracle.ContractError("invalid shared training metadata")
+    for name in ("bindings", "encoder_configs", "dropout"):
+        table = shared.get(name, [])
+        if not isinstance(table, list) or len(table) > MAX_SHARED_METADATA_ENTRIES:
+            raise oracle.ContractError("shared training metadata table exceeds bound")
+        for value in table:
+            if not isinstance(value, dict):
+                raise oracle.ContractError("invalid shared training metadata entry")
+            if name == "bindings" and any(not isinstance(k, str) or not k or
+                                           not isinstance(v, str) or not v for k, v in value.items()):
+                raise oracle.ContractError("invalid shared tensor binding")
+            if name == "dropout" and (set(value) != {"masks"} or not isinstance(value["masks"], list)):
+                raise oracle.ContractError("invalid shared dropout metadata")
+    for owner, field, pool in metadata_sites(report):
+        reference = field + "_ref"
+        if reference not in owner:
+            if field not in owner:
+                raise oracle.ContractError("missing training metadata: " + field)
+            continue
+        index = owner.pop(reference)
+        table = shared.get(pool, [])
+        if field in owner or type(index) is not int or not 0 <= index < len(table):
+            raise oracle.ContractError("invalid shared training metadata reference: " + field)
+        owner[field] = copy.deepcopy(table[index])
+    return report
+
+
+def consolidate_metadata(report):
+    """Keep exact repeated inputs/configuration/masks once in local typed pools."""
+    report = expand_metadata(report)
+    sites = list(metadata_sites(report))
+    counts = {}
+    for owner, field, pool in sites:
+        key = (pool, json.dumps(owner[field], sort_keys=True, separators=(",", ":"), allow_nan=False))
+        counts[key] = counts.get(key, 0) + 1
+    shared, indices = {"version": 1}, {}
+    for owner, field, pool in sites:
+        key = (pool, json.dumps(owner[field], sort_keys=True, separators=(",", ":"), allow_nan=False))
+        if counts[key] < 2:
+            continue
+        if key not in indices:
+            table = shared.setdefault(pool, [])
+            if len(table) >= MAX_SHARED_METADATA_ENTRIES:
+                raise oracle.ContractError("shared training metadata table exceeds bound")
+            indices[key] = len(table)
+            table.append(owner[field])
+        owner[field + "_ref"] = indices[key]
+        del owner[field]
+    if len(shared) > 1:
+        report["shared_metadata"] = shared
+    return report
+
+
 def examples():
     records = {
         "deal": {"mode": "natural", "anchor": "party", "fields": {
@@ -556,7 +688,15 @@ def capture(source: Path, output: Path, modes):
         reports.append(report)
 
     output.mkdir(parents=False, exist_ok=False)
-    tensors = oracle.save_tensors(output / "tensors.safetensors", all_tensors, torch)
+    # Persist the numerical contract exercised by the CPU/Metal consumers.
+    # Full diagnostic routing trees are checked during source execution above;
+    # their unused snapshots do not belong in the regression artifact.
+    compact_profiles(reports)
+    referenced = set(tensor_references(reports))
+    retained_tensors = {name: value for name, value in all_tensors.items() if name in referenced}
+    retained_tensors, aliases = deduplicate_tensors(retained_tensors)
+    tensors = oracle.save_tensors(output / "tensors.safetensors", retained_tensors, torch)
+    tensors.pop("tensors")  # Shapes and dtypes live in the pinned SafeTensors header.
     oracle.write_json(output / "tokenizer.json", tokenizer_data)
     oracle.write_json(output / "tokenizer_config.json", tokenizer_config)
     tokenizer_files = {name: {"sha256": oracle.sha256_file(output / name), "size_bytes": (output / name).stat().st_size}
@@ -581,7 +721,7 @@ def capture(source: Path, output: Path, modes):
                "The exact pinned trainer optimizer construction, partial-window renormalization and update methods run on actual Torch parameters.",
                "An in-memory mid-window snapshot reproduces final weights and optimizer states byte-exactly; durable publication and native equality are separate tests.",
                "None gradients remain distinct from explicit optional-head zero gradients; frozen/unused weights are unchanged."])
-    oracle.write_json(output / "capture.json", report)
+    oracle.write_json(output / "capture.json", consolidate_metadata(resolve_tensor_aliases(report, aliases)))
     return {"path": str(output), "profiles": modes, "tensor_bytes": tensors["size_bytes"],
             "capture_bytes": (output / "capture.json").stat().st_size,
             "capture_sha256": oracle.sha256_file(output / "capture.json"), "qualification": False}

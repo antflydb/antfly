@@ -8,7 +8,7 @@ materialization job. The immutable contract is
 measure task quality, or establish convergence or performance.
 
 The native producer and its resource/publication contracts are documented in
-[GLINER25_MERGE.md](../../../../../docs/GLINER25_MERGE.md). This checker currently
+[adapter materialization](../../../../../work-log/completed/gliner2.5.md#export-and-adapter-materialization). This checker currently
 requires an Antfly training export and its completed run receipt. The native
 materializer also accepts explicitly bound standard adapters without that
 training receipt; those artifacts are outside this checker version's scope.
@@ -147,9 +147,10 @@ requests matched across all three pairwise comparisons. Maximum adapted
 absolute errors were `2.9802322387695312e-8` and `7.152557373046875e-7`,
 respectively. Maximum output confidence/probability differences were
 `1.7881393432617188e-6` and `2.205371856689453e-6`. Both completed 37 events
-and cleaned their owned scratch. The exact artifact/report/build digests and
-resource observations are in the
-[actual materialization evidence](../../../../../docs/GLINER25_MERGE.md#actual-small-all-target-materialization).
+and cleaned their owned scratch. Exact artifact/report/build digests and
+resource observations remain with the external run receipts. The
+[work log](../../../../../work-log/completed/gliner2.5.md#export-and-adapter-materialization)
+summarizes the implementation and qualification limits.
 These three forms execute through Python; a native-produced artifact is not
 evidence of trained-artifact Zig CPU/Metal inference. That execution proof,
 other variants/ranks, quality and release qualification remain separate.

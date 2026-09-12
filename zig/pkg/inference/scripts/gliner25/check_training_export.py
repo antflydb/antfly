@@ -25,6 +25,7 @@ import warnings
 from unittest import mock
 
 import oracle
+import capture_inventory
 
 HERE = Path(__file__).resolve().parent
 CONTRACT = HERE / "training_export_contract.json"
@@ -179,11 +180,11 @@ def expected_source(variant):
 
 
 def published_inventory(variant):
-    name = f"models/{variant}/tensor_inventory.json"
+    name = capture_inventory.INVENTORY
     manifest = oracle.read_json(oracle.FIXTURES / "reference_manifest.json")
     data, pin = read_json(oracle.FIXTURES / name)
     verify_pin(pin, manifest["files"][name], name)
-    checked(data["model"] == variant and len(data["tensors"]) == 334, "published inventory identity differs")
+    data = capture_inventory.expand_inventory(data, variant)
     return {name: {"shape": value["shape"], "dtype": "F32"} for name, value in data["tensors"].items()}
 
 

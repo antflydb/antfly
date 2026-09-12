@@ -2,9 +2,9 @@
 
 The tiny Python capture is complete for full-parameter, head-only, LoRA and
 DoRA training with dropout `0.125` in the encoder, boundary/task heads and
-adapters. Two complete executions produced byte-identical artifacts. All four
-source profiles passed the existing objective, gradient-presence, gold
-coverage, two AdamW flushes and exact mid-window resume checks. All four native
+adapters. All four source profiles passed the existing objective, gradient
+presence, gold coverage, two AdamW flushes and exact mid-window resume checks.
+All four native
 CPU consumers also passed every component loss, every gradient's
 absence/zero/value, durable fresh-controller mid-window restore and both AdamW
 updates. All four complete controlled-dropout GPU consumers also passed the
@@ -16,7 +16,7 @@ or corpus was loaded, and `qualification` remains false.
 [`capture_training_step_dropout.py`](capture_training_step_dropout.py) reuses
 the immutable [zero-dropout composition driver](capture_training_step.py),
 whose SHA-256 is
-`844069a5b1c8139eb809de303562f436dc4502973b9226c8c441511c252c4810`.
+`2ca6610037b8a357766a81c7a0002af59e6e433bfea60fb0d51cf1d5eebf831b`.
 It modifies only dropout configuration and dropout operations. The actual
 pinned Fastino preprocessing, candidate/relation selection, record matching,
 losses, backward, accumulation, clipping, AdamW and resume methods execute
@@ -37,8 +37,9 @@ has a complete native mask but no source classifier call. Source relation
 training retains padded `[B,R,pair_cap]` proposal rows; the capture assigns
 mask rows in the source's compact valid-pair order. Invalid source rows have
 zero final-logit cotangents. The native mask capacity is the actual
-relation-task count times `pair_cap`. Exact source row metadata accompanies
-every mask.
+relation-task count times `pair_cap`. Capture-time checks verify exact source
+row routing and resume behavior; the persisted fixture retains the mask values
+and bindings consumed by native tests.
 
 The complete Metal consumer compares selected relation identities and labels
 through an exhaustive one-to-one permutation, including every valid pair and
@@ -80,17 +81,18 @@ through shared query/key projections.
 
 The four files under
 [`training_step_dropout`](../../testdata/gliner25/training_step_dropout)
-total 10,266,387 bytes. The capture and tensor hashes are:
+total 3,270,482 bytes. The capture and tensor hashes are:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `capture.json` | 2,574,918 | `5b2ce5ceee254002bea98bdf63024395be14cb53328d6d6d89bbb7e9d43d43e7` |
-| `tensors.safetensors` | 7,684,320 | `bbc1c28c5fd7ba0925068a6063492ece2392800fe031e61060ae360eb998da60` |
+| `capture.json` | 848,615 | `dd99256c83bb53d3334689fa28ec9edeb48d851a8623490f96fdf6c821239f5f` |
+| `tensors.safetensors` | 2,414,718 | `02ab3f449e94f8dc996171f616b3bce4f0740a897d54b3682b64262743d5ee45` |
 
 The tokenizer bytes are identical to the existing zero-dropout fixture.
 All four files and the generator are enrolled in `reference_manifest.json`
-after the four native consumer tests passed. Existing zero-dropout fixture
-bytes and frozen evaluation helpers remain unchanged.
+after the four native consumer tests passed. Numerical tensor values and frozen evaluation helpers remain unchanged.
+The [fixture policy](../../testdata/gliner25/README.md) describes retained
+numerical results, omitted diagnostics and the verified source replay.
 
 With the shared compute lane assigned and a new output destination:
 
@@ -109,4 +111,4 @@ four controlled-dropout GPU consumers and all four zero-dropout GPU consumers.
 Separate tests in that checkpoint establish tiny GPU Controller updates and
 managed full/head-only exact resume. Published-model GPU jobs, managed adapter
 updates, real-checkpoint convergence and public training-run qualification
-remain separate gates. See [the scoped training evidence](../../../../../docs/GLINER25_TRAINING.md).
+remain separate gates. See [the scoped training evidence](../../../../../work-log/completed/gliner2.5.md#training-and-export).

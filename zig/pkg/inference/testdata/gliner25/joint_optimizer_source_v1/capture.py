@@ -254,7 +254,6 @@ def capture_case(case, modules):
         "greedy_strictly_beats_all_feasible_beam_finishes": bool(
             feasible_finish_scores and greedy_result.feasible and
             greedy.validate_solution(problem, greedy_result) and greedy_result.score > max(feasible_finish_scores)),
-        "beam_finish_candidates": finish_rows,
     }
 
 

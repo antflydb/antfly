@@ -77,9 +77,9 @@ and sampled process-RSS guard. These runs contain no fair timing measurement,
 and process RSS is not a complete GPU-memory accounting. They do not cover
 long documents, concurrent service requests, sustained load, all language or
 domain slices, or fine-tuned checkpoints. Dataset-specific held-out gates are
-described in [GLINER25_EVALUATION.md](../../../../../docs/GLINER25_EVALUATION.md).
+described in [held-out evaluation](../../../../../work-log/completed/gliner2.5.md#held-out-evaluation).
 
-Reproduction and report rejection rules are in
-[GLINER25_BUNDLES.md](../../../../../docs/GLINER25_BUNDLES.md). A fresh run is
+The [work log](../../../../../work-log/completed/gliner2.5.md#artifacts-and-precision)
+summarizes bundle integrity and precision policy. A fresh run is
 required after a model, conversion policy, runtime math, tokenizer, schema,
 decoder, fixture or checker contract change.

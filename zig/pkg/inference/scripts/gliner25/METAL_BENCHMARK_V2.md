@@ -1,11 +1,10 @@
 # FP32 comparison and scaling profiles
 
-See [the v2 results](METAL_BENCHMARK_RESULTS_V2.md) for measured results, source/build
-identity, independent validation, and the retained scaling limitations.
-
 The additive v2 runner compares Zig Metal with pinned Fastino/PyTorch MPS.
 Native CPU preservation is a separate native-CPU/Fastino-CPU campaign. Original
-helpers, ten requests, model bundles, tolerances and v1 reports are unchanged.
+helpers, ten requests, model bundles and tolerances remain shared with the
+[reference profile](METAL_BENCHMARK.md). Keep each run's results and exact build
+identity in its output directory.
 
 The fixture milestone is Metal latency within 20% of Fastino MPS on each of
 30 model/task combinations. Every one of three independent process repetitions

@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-import struct
 import sys
 import tempfile
 import unittest
@@ -12,9 +11,28 @@ from unittest import mock
 
 import capture_training_inactive_adapters as control
 import capture_training_inactive_native_epoch as epoch
+from test_training_inactive_adapters import tensor_header
 
 
 class InactiveNativeEpochContract(unittest.TestCase):
+    def assert_tensor_bindings_equal(self, actual, expected, actual_tensors, expected_tensors, path=""):
+        """Compare logical metadata and every referenced tensor's exact stored value."""
+        self.assertIs(type(actual),type(expected),path)
+        if isinstance(expected,str) and expected in expected_tensors:
+            self.assertIn(actual,actual_tensors,path)
+            self.assertEqual(expected_tensors[expected],actual_tensors[actual],path)
+            return 1
+        if isinstance(expected,dict):
+            self.assertEqual(expected.keys(),actual.keys(),path)
+            return sum(self.assert_tensor_bindings_equal(actual[key],expected[key],actual_tensors,expected_tensors,
+                       path+"."+key) for key in expected)
+        if isinstance(expected,list):
+            self.assertEqual(len(expected),len(actual),path)
+            return sum(self.assert_tensor_bindings_equal(value,expected[index],actual_tensors,expected_tensors,
+                       path+"["+str(index)+"]") for index,value in enumerate(actual))
+        self.assertEqual(expected,actual,path)
+        return 0
+
     def test_only_declared_epoch_changes_and_private_helper_preserves_control(self):
         original_profiles = copy.deepcopy(control.PROFILES)
         original_contract = control.CONTRACT
@@ -101,8 +119,8 @@ class InactiveNativeEpochContract(unittest.TestCase):
     def test_captured_fixture_pins_native_rows_and_source_generator_provenance(self):
         directory = epoch.oracle.FIXTURES / "training_inactive_native_epoch"
         expected = {
-            "capture.json": {"size_bytes": 867431, "sha256": "9947cc37d6adc8b209c7769b2cd61f239738c3583646747444e655bb1afa44f1"},
-            "tensors.safetensors": {"size_bytes": 591162, "sha256": "374658ee67127b2f81ec597a65eabe72ee52263d88a718ebf4ef7e9b246741e9"},
+            "capture.json": {"size_bytes": 423554, "sha256": "24cefafa4dde1f7067b3ba81e7b9209495a58a0cb31620c5805b00bec9abdc24"},
+            "tensors.safetensors": {"size_bytes": 207343, "sha256": "eb8d7939308642c9587c73789070516e632078850473feecd3416f57d665246c"},
         }
         report = epoch.oracle.read_json(directory / "capture.json")
         expected.update(report["native_inputs"])
@@ -114,6 +132,8 @@ class InactiveNativeEpochContract(unittest.TestCase):
         self.assertEqual(epoch.digest(epoch.CONTRACT), report["contract"])
         self.assertEqual(epoch.digest(Path(epoch.__file__)), report["capture_wrapper"])
         self.assertEqual(epoch.CONTROL_PINS["generator"], report["generator"])
+        self.assertEqual(control.digest(Path(control.step_capture.__file__)), report["tensor_storage_helper"])
+        self.assertEqual(epoch.expected_contract()["tensor_storage_helper"], report["tensor_storage_helper"])
         self.assertEqual(epoch.NATIVE_EPOCH, report["profile_adapter"])
         self.assertIn(epoch.NEW_EPOCH_NOTE, report["notes"])
         self.assertNotIn(epoch.OLD_EPOCH_NOTE, report["notes"])
@@ -126,14 +146,37 @@ class InactiveNativeEpochContract(unittest.TestCase):
     def test_captured_epoch_changes_only_classifier_schedule_and_preserves_initial_state(self):
         directory = epoch.oracle.FIXTURES / "training_inactive_native_epoch"
         original = epoch.oracle.FIXTURES / "training_inactive_adapters"
-        report = epoch.oracle.read_json(directory / "capture.json")
-        prior = epoch.oracle.read_json(original / "capture.json")
+        report = control.step_capture.expand_metadata(epoch.oracle.read_json(directory / "capture.json"))
+        prior = control.step_capture.expand_metadata(epoch.oracle.read_json(original / "capture.json"))
+
+        def tensors(path):
+            with path.open('rb') as stream:
+                raw=stream.read(8 * 1024**2 + 1)
+            header,start=tensor_header(raw)
+            return {name: (item["dtype"],tuple(item["shape"]),raw[start+item["data_offsets"][0]:start+item["data_offsets"][1]])
+                    for name,item in header.items()}
+
+        actual,expected=tensors(directory/"tensors.safetensors"),tensors(original/"tensors.safetensors")
         profiles = {profile["id"]: profile for profile in prior["profiles"]}
+        self.assertEqual(set(profiles),{profile["id"] for profile in report["profiles"]})
+        self.assertEqual(8,len(profiles))
+        self.assertEqual(8,len(report["profiles"]))
         for key in ("config", "encoder_config", "base_parameters", "optimizer", "cases", "tokenizer_fragments"):
-            self.assertEqual(prior[key], report[key])
+            self.assert_tensor_bindings_equal(report[key],prior[key],actual,expected,key)
+        unchanged=0
+        initial_states=0
         for profile in report["profiles"]:
+            profile_id=profile["id"]
+            # Canonical physical names are chosen across each entire capture.
+            # A changed classifier schedule can change which name holds an
+            # unchanged value; dtype, shape, payload and None remain exact.
+            self.assertGreater(self.assert_tensor_bindings_equal(profile["initial"],profiles[profile_id]["initial"],
+                               actual,expected,profile_id+".initial"),0)
+            initial_states+=1
             if not profile["id"].endswith(".classifier_only"):
-                self.assertEqual(profiles[profile["id"]], profile)
+                self.assertGreater(self.assert_tensor_bindings_equal(profile,profiles[profile_id],
+                                   actual,expected,profile_id),0)
+                unchanged+=1
                 continue
             self.assertEqual([2, 4, 5], profile["flush_after"])
             self.assertEqual([2, 2, 1], [f["microbatches"] for f in profile["flushes"]])
@@ -154,22 +197,8 @@ class InactiveNativeEpochContract(unittest.TestCase):
                 self.assertEqual(index, flush["scheduler_last_epoch"])
                 self.assertTrue(all(slot["state_present"] and slot["step"] == index for slot in flush["parameters"].values()))
 
-        def tensors(path):
-            raw = path.read_bytes()
-            length = struct.unpack("<Q", raw[:8])[0]
-            self.assertLess(length, 1024**2)
-            header = json.loads(raw[8:8 + length])
-            start = 8 + length
-            return {name: (item["dtype"], item["shape"], raw[start + item["data_offsets"][0]:start + item["data_offsets"][1]])
-                    for name, item in header.items()}
-
-        actual, expected = tensors(directory / "tensors.safetensors"), tensors(original / "tensors.safetensors")
-        unchanged = 0
-        for key, value in actual.items():
-            if ".classifier_only." not in key or ".classifier_only.initial." in key:
-                self.assertEqual(expected[key], value, key)
-                unchanged += 1
-        self.assertEqual(1552, unchanged)
+        self.assertEqual(6,unchanged)
+        self.assertEqual(8,initial_states)
 
 
 if __name__ == "__main__":

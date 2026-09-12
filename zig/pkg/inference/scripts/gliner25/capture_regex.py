@@ -40,11 +40,10 @@ def main():
     for pattern in patterns:
         for flags in (0, re.I, re.I | re.A, re.M | re.S, re.I | re.M | re.X):
             compiled = re.compile(pattern, flags)
-            cases.append({"pattern": pattern, "flags": int(flags), "texts": [
-                {"text": text, "fullmatch": compiled.fullmatch(text) is not None,
-                 "search": compiled.search(text) is not None, "match": compiled.match(text) is not None}
-                for text in texts
-            ]})
+            cases.append({"pattern": pattern, "flags": int(flags), "expected": {
+                mode: [getattr(compiled, mode)(text) is not None for text in texts]
+                for mode in ("fullmatch", "search", "match")
+            }})
     ranges = []
     for cp in range(0x110000):
         if unicodedata.category(chr(cp)) == "Nd":
@@ -52,12 +51,12 @@ def main():
                 ranges[-1]["last"] = cp
             else:
                 ranges.append({"first": cp, "last": cp})
-    result = {"format_version": 1, "provenance": {"python": platform.python_version(),
+    result = {"format_version": 2, "provenance": {"python": platform.python_version(),
               "unicode": unicodedata.unidata_version, "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e"},
-              "decimal_ranges": ranges, "cases": cases}
+              "decimal_ranges": ranges, "texts": texts, "cases": cases}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=True, separators=(",", ":")) + "\n")
-    print(f"wrote {len(cases)} programs, {sum(len(case['texts']) for case in cases)} text cases, {len(ranges)} Nd ranges")
+    print(f"wrote {len(cases)} programs, {len(cases) * len(texts)} text cases, {len(ranges)} Nd ranges")
 
 
 if __name__ == "__main__":

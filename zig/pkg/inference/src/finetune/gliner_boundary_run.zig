@@ -349,9 +349,10 @@ test "boundary training run allocation failures reclaim order and fingerprint bu
 test "boundary training run selected profiles match exact pinned optimizer group membership" {
     const a = std.testing.allocator;
     const Fixture = struct {
+        parameter_names: []const []const u8,
         cases: []const struct {
             id: []const u8,
-            parameter_names: []const []const u8,
+            additional_parameter_names: []const []const u8,
             trainable: []const bool,
             expected: ?struct { groups: []const struct { params: []const []const u8, lr: f32, weight_decay: f32 } } = null,
         },
@@ -360,13 +361,20 @@ test "boundary training run selected profiles match exact pinned optimizer group
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(Fixture, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    var count: usize = 0;
+    try std.testing.expectEqual(@as(usize, 334), parsed.value.parameter_names.len);
+    var seen: [4]bool = @splat(false);
     for (parsed.value.cases) |case| {
-        const mode: Mode = if (std.mem.eql(u8, case.id, "full_cpu")) .full else if (std.mem.eql(u8, case.id, "head_only_cpu")) .heads else if (std.mem.eql(u8, case.id, "lora_cpu")) .lora else if (std.mem.eql(u8, case.id, "dora_cpu")) .dora else continue;
-        count += 1;
-        const parameters = try a.alloc(Parameter, case.parameter_names.len);
+        const mode: Mode = if (std.mem.eql(u8, case.id, "full_cpu")) .full else if (std.mem.eql(u8, case.id, "head_only_cpu")) .heads else if (std.mem.eql(u8, case.id, "lora_cpu")) .lora else if (std.mem.eql(u8, case.id, "dora_cpu")) .dora else return error.InvalidOptimizerGroupFixture;
+        try std.testing.expect(!seen[@intFromEnum(mode)]);
+        seen[@intFromEnum(mode)] = true;
+        const names = try a.alloc([]const u8, try std.math.add(usize, parsed.value.parameter_names.len, case.additional_parameter_names.len));
+        defer a.free(names);
+        @memcpy(names[0..parsed.value.parameter_names.len], parsed.value.parameter_names);
+        @memcpy(names[parsed.value.parameter_names.len..], case.additional_parameter_names);
+        try std.testing.expectEqual(names.len, case.trainable.len);
+        const parameters = try a.alloc(Parameter, names.len);
         defer a.free(parameters);
-        for (parameters, case.parameter_names) |*parameter, name| parameter.* = .{ .name = name, .canonical_name = name, .dimensions = &.{1}, .values = &.{0}, .kind = if (std.mem.indexOf(u8, name, ".lora_")) |_| .adapter else .original };
+        for (parameters, names) |*parameter, name| parameter.* = .{ .name = name, .canonical_name = name, .dimensions = &.{1}, .values = &.{0}, .kind = if (std.mem.indexOf(u8, name, ".lora_")) |_| .adapter else .original };
         const plan = try Plan.init(.{ .mode = mode, .adapter_config_sha256 = if (mode == .lora or mode == .dora) @splat(1) else null }, testSource(), .{ .examples = 11, .train_sha256 = @splat(2), .schema_sha256 = @splat(3) }, .{});
         const selected = try plan.selectParameters(a, parameters);
         defer a.free(selected);
@@ -385,7 +393,7 @@ test "boundary training run selected profiles match exact pinned optimizer group
             try std.testing.expectEqual(want.weight_decay, group.optimizer.weight_decay);
         }
         try std.testing.expectEqual(total, selected.len);
-        for (case.parameter_names, case.trainable) |name, trainable| {
+        for (names, case.trainable) |name, trainable| {
             var present = false;
             for (selected) |parameter| if (std.mem.eql(u8, parameter.name, name)) {
                 present = true;
@@ -394,7 +402,5 @@ test "boundary training run selected profiles match exact pinned optimizer group
             try std.testing.expectEqual(trainable, present);
         }
     }
-    // CUDA constructor flags and arbitrary additionally unfrozen base modules
-    // are recorded upstream, but are outside these four native run profiles.
-    try std.testing.expectEqual(@as(usize, 4), count);
+    for (seen) |present| try std.testing.expect(present);
 }

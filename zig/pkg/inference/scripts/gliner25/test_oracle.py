@@ -196,6 +196,53 @@ class PipelineAdaptationTest(unittest.TestCase):
             with self.assertRaisesRegex(oracle.ContractError, "SHA256 mismatch"):
                 generate_pipeline_cases.generate("small", directory, oracle.FIXTURES / "requests.json")
 
+    def test_output_adaptation_uses_explicit_retention_without_rewriting_capture(self):
+        for variant in ("base", "multi"):
+            with self.subTest(model=variant), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                original = oracle.FIXTURES / f"{variant}_reference"
+                raw = (original / "capture.json").read_bytes()
+                (directory / "capture.json").write_bytes(raw)
+                retained = {name: pin for name, pin in generate_pipeline_cases.reference_inventory().items()
+                            if not (name.startswith(f"{variant}_reference/") and name.endswith(".safetensors"))}
+                with mock.patch.object(generate_pipeline_cases, "reference_inventory", return_value=retained):
+                    generated = generate_pipeline_cases.generate(variant, directory, oracle.FIXTURES / "requests.json")
+                expected = oracle.read_json(oracle.FIXTURES / f"pipeline_cases_{variant}.json")
+                self.assertEqual(json.dumps(expected, ensure_ascii=False), json.dumps(generated, ensure_ascii=False))
+                self.assertEqual(raw, (directory / "capture.json").read_bytes())
+
+    def test_missing_retained_attachment_still_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            original = oracle.FIXTURES / "small_reference"
+            (directory / "capture.json").write_bytes((original / "capture.json").read_bytes())
+            with self.assertRaisesRegex(oracle.ContractError, "required regular file is missing"):
+                generate_pipeline_cases.generate("small", directory, oracle.FIXTURES / "requests.json")
+
+    def test_optional_diagnostics_do_not_allow_modified_public_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            raw = (oracle.FIXTURES / "base_reference/capture.json").read_bytes()
+            changed = raw.replace(b'"John"', b'"Joan"', 1)
+            self.assertNotEqual(raw, changed)
+            (directory / "capture.json").write_bytes(changed)
+            with self.assertRaisesRegex(oracle.ContractError, "SHA256 mismatch"):
+                generate_pipeline_cases.generate("base", directory, oracle.FIXTURES / "requests.json")
+
+    def test_retention_cannot_omit_capture_or_substitute_retained_tensor_identity(self):
+        retained = generate_pipeline_cases.reference_inventory()
+        for name, value in (("small_reference/capture.json", None),
+                            ("small_reference/mixed_tasks.safetensors", {"size_bytes": 1, "sha256": "0" * 64})):
+            changed = dict(retained)
+            if value is None:
+                del changed[name]
+            else:
+                changed[name] = value
+            with self.subTest(path=name), \
+                 mock.patch.object(generate_pipeline_cases, "reference_inventory", return_value=changed), \
+                 self.assertRaises(oracle.ContractError):
+                generate_pipeline_cases.generate("small", oracle.FIXTURES / "small_reference", oracle.FIXTURES / "requests.json")
+
     def test_generator_request_or_profile_drift_never_becomes_reference(self):
         original_read = oracle.read_json
         original = original_read(oracle.FIXTURES / "small_reference/capture.json")

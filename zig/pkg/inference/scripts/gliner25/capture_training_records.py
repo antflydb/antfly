@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import oracle
@@ -97,7 +98,7 @@ def capture(source: Path):
             raise oracle.ContractError("dense-record replay differs")
     finally:
         hook.remove()
-    return {"format_version": 1, "scope": "synthetic_boundary_dense_record_forward_vjp", "qualification": False,
+    report = {"format_version": 1, "scope": "synthetic_boundary_dense_record_forward_vjp", "qualification": False,
             "source_commit": oracle.UPSTREAM_COMMIT, "provenance": provenance,
             "generator_sha256": oracle.sha256_file(Path(__file__)), "oracle_sha256": oracle.sha256_file(Path(oracle.__file__)),
             "source_files": {name: oracle.sha256_file(source / name) for name in (
@@ -118,6 +119,15 @@ def capture(source: Path):
                       "Group masking affects instance/object masks but does not erase field membership or assignment rows.",
                       "Cotangents include masked objects, masked candidate columns and unmasked padded assignment rows to distinguish their VJPs.",
                       "RecordHead contains no dropout modules; train mode does not require a synthetic RNG substitute."]}
+
+
+    # Share exact serialized seeds; a case with different seeds keeps its override.
+    report["cotangents"] = report["cases"][0]["cotangents"]
+    common = json.dumps(report["cotangents"], sort_keys=True, allow_nan=False)
+    for case in report["cases"]:
+        if json.dumps(case["cotangents"], sort_keys=True, allow_nan=False) == common:
+            del case["cotangents"]
+    return report
 
 
 def main():

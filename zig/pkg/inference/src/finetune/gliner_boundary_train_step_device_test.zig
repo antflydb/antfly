@@ -314,6 +314,7 @@ fn runOracleWithProfiles(mode: reference_mod.Mode, directory: []const u8, profil
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(reference_mod.Oracle, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    try parsed.value.resolveMetadata();
     var decisions = try std.json.parseFromSlice(struct { profiles: []struct { mode: reference_mod.Mode, microbatches: []decision_trace.Source } }, a, bytes, .{ .ignore_unknown_fields = true });
     defer decisions.deinit();
     const oracle = parsed.value;

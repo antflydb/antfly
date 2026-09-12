@@ -21,6 +21,7 @@ import time
 from types import SimpleNamespace
 
 import oracle
+import capture_training_step as step_capture
 
 HERE = Path(__file__).resolve().parent
 CONTRACT = HERE / "training_inactive_adapters_contract_v1.json"
@@ -75,6 +76,8 @@ def preflight(source):
             "inactive adapter contract differs")
     oracle.verify_upstream_checkout(source)
     checked(digest(Path(oracle.__file__)) == contract["oracle"], "oracle helper changed")
+    checked(digest(Path(step_capture.__file__)) == contract["tensor_storage_helper"],
+            "tensor storage helper changed")
     for name, expected in contract["baseline"].items():
         checked(digest(BASELINE / name) == expected, "tiny baseline changed: " + name)
     for name, expected in contract["source_files"].items():
@@ -129,7 +132,7 @@ def capture(source, destination):
                  "logger": logging.getLogger(__name__), "dist": torch.distributed}
     exec(compile(tree, str(source / "gliner2/training/trainer.py"), "exec"), namespace)
     SourceTrainer = namespace["SourceTrainer"]
-    baseline = oracle.read_json(BASELINE / "capture.json")
+    baseline = step_capture.expand_metadata(oracle.read_json(BASELINE / "capture.json"))
     baseline_full = next(profile for profile in baseline["profiles"] if profile["mode"] == "full")
     with safe_open(str(BASELINE / "tensors.safetensors"), framework="pt", device="cpu") as owner:
         base_weights = {name: owner.get_tensor(key).clone() for name, key in baseline_full["initial"].items()}
@@ -344,9 +347,12 @@ def capture(source, destination):
     guard();preflight(source)
     with oracle.atomic_output_directory(destination) as output:
         initial=values("base.initial",base_weights)
-        tensor_report=oracle.save_tensors(output/"tensors.safetensors",tensors,torch)
+        retained,aliases=step_capture.deduplicate_tensors(tensors)
+        tensor_report=oracle.save_tensors(output/"tensors.safetensors",retained,torch)
+        tensor_report.pop("tensors")  # Shapes and dtypes live in the pinned SafeTensors header.
         report={"version":1,"scope":SCOPE,"qualification":False,"source_commit":oracle.UPSTREAM_COMMIT,
             "provenance":provenance,"contract":digest(CONTRACT),"generator":digest(Path(__file__)),
+            "tensor_storage_helper":digest(Path(step_capture.__file__)),
             "baseline":contract["baseline"],"trainer_methods":contract["trainer_methods"],
             "config":baseline_full["config"],"encoder_config":baseline_full["encoder_config"],
             "base_parameters":initial,"cases":cases,"tokenizer_fragments":fragments,
@@ -363,6 +369,7 @@ def capture(source, destination):
                 "The first three classifier microbatches form an epoch with a partial flush; two later inactive batches test an all-zero window.",
                 "Fresh-owner in-memory resume compares full parameters, gradient presence, moments, counters and RNG bytes exactly. Durable native publication is separate.",
                 "No native training, optimizer, quality, convergence or release qualification is implied by source capture."]}
+        report=step_capture.consolidate_metadata(step_capture.resolve_tensor_aliases(report,aliases))
         raw=(json.dumps(report,ensure_ascii=False,sort_keys=True,indent=2,allow_nan=False)+"\n").encode()
         checked(len(raw)<=MAX_METADATA,"inactive adapter metadata ceiling exceeded")
         (output/"capture.json").write_bytes(raw)

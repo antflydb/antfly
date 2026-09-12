@@ -93,16 +93,64 @@ class ContractTests(unittest.TestCase):
         for name in bench.cpu.THREAD_ENV:
             self.assertEqual("1", env[name])
 
-    def test_frozen_extraction_token_captures_are_loaded_for_all_variants(self):
+    def test_frozen_token_evidence_covers_all_thirty_ordered_requests(self):
+        evidence = bench.oracle.read_json(bench.oracle.FIXTURES / "token_evidence.json")
         for variant in bench.VARIANTS:
             with self.subTest(variant=variant), mock.patch.object(bench.oracle, "verify_model_dir", return_value={}):
                 loaded = bench.load_contract(variant, Path("/unused"), None)
             self.assertEqual(10, len(loaded["cases"]))
-            self.assertEqual(8, len(loaded["reference_input_ids"]))
-            self.assertNotIn("constrained_classification", loaded["reference_input_ids"])
-            self.assertNotIn("joint_ie", loaded["reference_input_ids"])
+            self.assertEqual(10, len(loaded["reference_input_ids"]))
+            saved = next(row for row in evidence["models"] if row["model"] == variant)
+            self.assertEqual({name: packet["input_ids"] for name, packet in saved["validation"].items()},
+                             loaded["reference_input_ids"])
+            self.assertIn("constrained_classification", loaded["reference_input_ids"])
+            self.assertIn("joint_ie", loaded["reference_input_ids"])
             self.assertTrue(all(ids and all(type(token) is int for token in ids)
                                 for ids in loaded["reference_input_ids"].values()))
+
+    def test_token_evidence_rejects_profile_bundle_request_and_value_drift(self):
+        original_read = bench.oracle.read_json
+        original = original_read(bench.oracle.FIXTURES / "token_evidence.json")
+        case_path = bench.cpu.case_fixture("small")
+        fixture = original_read(case_path)
+        mutations = (
+            lambda report, model, packet: report.update(fresh_model_execution=True),
+            lambda report, model, packet: report.update(generator_sha256="0" * 64),
+            lambda report, model, packet: report.update(models=[model, model, model]),
+            lambda report, model, packet: model.update(model_files={}),
+            lambda report, model, packet: model.update(cases_sha256="0" * 64),
+            lambda report, model, packet: model.update(reference_sha256="0" * 64),
+            lambda report, model, packet: model["validation"].pop("joint_ie"),
+            lambda report, model, packet: packet.update(canonical_request_sha256="0" * 64),
+            lambda report, model, packet: packet.update(input_ids_u32_le_sha256="0" * 64),
+            lambda report, model, packet: packet.update(input_ids=[True]),
+            lambda report, model, packet: packet.update(input_ids=[2**32]),
+            lambda report, model, packet: packet.update(input_ids=[1] * (bench.oracle.MAX_ENCODED_TOKENS + 1)),
+        )
+        for index, mutate in enumerate(mutations):
+            report = copy.deepcopy(original)
+            model = next(row for row in report["models"] if row["model"] == "small")
+            mutate(report, model, model["validation"][fixture["cases"][0]["id"]])
+            def read(path):
+                return report if Path(path).name == "token_evidence.json" else original_read(path)
+            with self.subTest(mutation=index), mock.patch.object(bench.oracle, "read_json", side_effect=read), \
+                 self.assertRaises(bench.BenchmarkError):
+                bench.reference_input_ids("small", fixture, case_path)
+
+    def test_missing_or_same_size_substituted_token_evidence_fails(self):
+        case_path = bench.cpu.case_fixture("small")
+        fixture = bench.oracle.read_json(case_path)
+        raw = (bench.oracle.FIXTURES / "token_evidence.json").read_bytes()
+        inventory = (bench.oracle.FIXTURES / "reference_manifest.json").read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "reference_manifest.json").write_bytes(inventory)
+            with mock.patch.object(bench.oracle, "FIXTURES", directory):
+                with self.assertRaisesRegex(bench.oracle.ContractError, "required regular file is missing"):
+                    bench.reference_input_ids("small", fixture, case_path)
+                (directory / "token_evidence.json").write_bytes(raw[:-1] + b" ")
+                with self.assertRaisesRegex(bench.oracle.ContractError, "SHA256 mismatch"):
+                    bench.reference_input_ids("small", fixture, case_path)
 
     def run_fake(self, *, phase="measurement", mutate=None, cleanup_complete=True, power_change=False):
         fixture = contract()

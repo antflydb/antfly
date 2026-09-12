@@ -37,7 +37,7 @@ TOLERANCES = {"adapted_absolute": 1e-6, "adapted_relative": 1e-5, "confidence_ab
               "untouched": "exact_bytes", "bias": "exact_bytes", "sidecars": "exact_bytes",
               "token_ids": "exact", "decisions": "exact"}
 HELPERS = ("oracle.py", "oracle_manifest.json", "benchmark_cpu.py", "check_bundles.py",
-           "generate_pipeline_cases.py", "check_training_export.py", "training_export_contract.json",
+           "generate_pipeline_cases.py", "capture_inventory.py", "check_training_export.py", "training_export_contract.json",
            "training_export_runtime.py", "training_export_peft018.json", "../paired_benchmark.py")
 MAX_JSON = 8 * 1024**2
 CHUNK = 1024**2

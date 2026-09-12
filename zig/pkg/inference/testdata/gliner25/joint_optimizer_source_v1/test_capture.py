@@ -118,6 +118,18 @@ class SourceControlTests(unittest.TestCase):
         self.assertEqual(repeated["forbidden_imports_observed"], [])
         self.assertTrue(repeated["profile_hook_removed"])
 
+    def test_saved_compact_capture_matches_source_replay_and_provenance(self):
+        raw = target.read_regular(ROOT / "capture.json", target.MAX_OUTPUT)
+        reproduced = {
+            **self.report,
+            "contract": target.digest(target.read_regular(ROOT / "contract.json")),
+            "generator": target.digest(target.read_regular(Path(target.__file__))),
+        }
+        self.assertEqual(target.encode(reproduced), raw)
+        for row in self.report["cases"]:
+            self.assertNotIn("beam_finish_candidates", row)
+            self.assertLessEqual(row["beam_finish_count"], row["input"]["beam_width"])
+
 
 if __name__ == "__main__":
     unittest.main()
