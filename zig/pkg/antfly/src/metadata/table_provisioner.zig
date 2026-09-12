@@ -245,15 +245,16 @@ pub fn reconcileReplicaRootWithOptions(
             options.backend_runtime,
         );
 
-        const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
-        defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
+        const schema_json = tables_api.effectiveSchemaJson(table.schema_json);
+        const runtime_schema = try runtimeTableSchemaFromJson(alloc, schema_json);
+        defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
         var open_options = provisioningDbOpenOptions();
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
-        open_options.schema_before_index_load = if (runtime_schema) |schema| .{
-            .runtime_schema = schema,
-            .public_schema_json = table.schema_json,
-        } else null;
+        open_options.schema_before_index_load = .{
+            .runtime_schema = runtime_schema,
+            .public_schema_json = schema_json,
+        };
         open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
@@ -269,8 +270,7 @@ pub fn reconcileReplicaRootWithOptions(
     return summary;
 }
 
-fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !?@import("../storage/schema.zig").TableSchema {
-    if (schema_json.len == 0) return null;
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("../storage/schema.zig").TableSchema {
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -1786,11 +1786,10 @@ test "table provisioner fingerprint changes with hosted index metadata" {
 }
 
 test "table provisioner materializes metadata indexes into hosted group dbs" {
-    const path = "/tmp/antfly-metadata-table-provisioner";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
 
     const summary = try reconcileReplicaRoot(
         std.testing.allocator,
@@ -1819,6 +1818,10 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+    const schema_json = (try db.getSchemaJson(std.testing.allocator)) orelse
+        return error.TestExpectedLocalTableManifest;
+    defer std.testing.allocator.free(schema_json);
+    try std.testing.expectEqualStrings(tables_api.default_schema_json, schema_json);
 }
 
 test "table provisioner materializes array-form metadata indexes" {

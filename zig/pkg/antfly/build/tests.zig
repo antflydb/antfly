@@ -1695,6 +1695,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "DataServer store status",
             "data runtime runRound backs off retryable provision metadata failures",
             "data runtime provisioned root refresh worker backs off retryable metadata failures",
+            "data runtime split apply store seeding reuses cached source writer",
         },
         .max_rss = production_vopr_compile_max_rss,
     });
@@ -3619,18 +3620,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     domain_vopr_test_step.dependOn(&run_backup_restore_vopr_tests.step);
     domain_vopr_test_step.dependOn(&run_clock_fault_vopr_tests.step);
 
+    const vopr_runtime_adapter_filters = &.{
+        "VOPR durable job",
+        "backend runtime durable owner lifecycle",
+        "backend runtime borrows backend-agnostic std.Io lanes",
+        "ttl runtime executes production pass on borrowed VoprIo",
+        "transaction recovery executes production pass on borrowed VoprIo",
+        "background maintenance services lifecycle runs on borrowed VoprIo",
+        "generation publication replays durable identities on borrowed VoprIo",
+        "replicated split destination seeds inherited doc identity before range publication",
+        "table provisioner materializes metadata indexes into hosted group dbs",
+    };
     const vopr_runtime_adapter_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
-            "VOPR durable job",
-            "backend runtime durable owner lifecycle",
-            "backend runtime borrows backend-agnostic std.Io lanes",
-            "ttl runtime executes production pass on borrowed VoprIo",
-            "transaction recovery executes production pass on borrowed VoprIo",
-            "background maintenance services lifecycle runs on borrowed VoprIo",
-        },
+        // These named module tests make the schema admission regressions
+        // reachable; runtime filtering executes only the selected tests.
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, vopr_runtime_adapter_filters),
     });
-    const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
+    const run_vopr_runtime_adapter_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, vopr_runtime_adapter_tests, vopr_runtime_adapter_filters);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     vopr_runtime_adapter_test_step.dependOn(&run_data_runtime_vopr_tests.step);

@@ -2694,7 +2694,7 @@ pub const ProvisionedTableWriteCache = struct {
         metadata: StartupCatchUpMetadata,
     ) bool {
         return entryManagedConfigMatches(entry, metadata.indexes_json) and
-            optionalMetadataBytesEqual(entry.schema_json, metadata.schema_json) and
+            optionalSchemaJsonEqual(entry.schema_json, metadata.schema_json) and
             entryIdentityMatchesMetadata(entry, metadata);
     }
 
@@ -2710,12 +2710,12 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
-    fn optionalMetadataBytesEqual(
+    fn optionalSchemaJsonEqual(
         lhs: ?[]const u8,
         rhs: ?[]const u8,
     ) bool {
         if (lhs == null or rhs == null) return lhs == null and rhs == null;
-        return std.mem.eql(u8, lhs.?, rhs.?);
+        return std.mem.eql(u8, tables_api.effectiveSchemaJson(lhs.?), tables_api.effectiveSchemaJson(rhs.?));
     }
 
     fn publishEntryManagedConfig(entry: *Entry, indexes_json: ?[]const u8) void {
@@ -4878,9 +4878,9 @@ pub const ProvisionedTableWriteCache = struct {
                     else
                         current.indexes_json.len == 0;
                     const schema_match = if (metadata.schema_json) |cached|
-                        std.mem.eql(u8, cached, current.schema_json)
+                        std.mem.eql(u8, tables_api.effectiveSchemaJson(cached), tables_api.effectiveSchemaJson(current.schema_json))
                     else
-                        current.schema_json.len == 0;
+                        false;
                     if (indexes_match and schema_match) return metadata;
                 } else if (metadata.indexes_json == null and metadata.schema_json == null) {
                     return metadata;
@@ -4896,7 +4896,7 @@ pub const ProvisionedTableWriteCache = struct {
         }
 
         const indexes_json = if (table) |current| current.indexes_json else null;
-        const schema_json = if (table) |current| current.schema_json else null;
+        const schema_json = if (table) |current| tables_api.effectiveSchemaJson(current.schema_json) else null;
         var replacement = try self.cloneTableMetadataAlloc(table_name, indexes_json, schema_json);
         errdefer replacement.deinit(self.alloc);
 
@@ -13254,6 +13254,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .{}
             else
                 self.transactionRecoveryConfig();
+            const direct_schema = if (prepared_open.?.indexes_json == null)
+                try prepareManagedSchemaBeforeIndexLoad(cache.alloc, mode, prepared_open.?.schema_json)
+            else
+                null;
+            defer if (direct_schema) |schema| storage_schema.freeSchema(cache.alloc, schema.runtime_schema);
             var retry_prepared_open = false;
             var opened: ?db_mod.DB = while (true) {
                 // The initial identity lookup happens before cold-open
@@ -13293,6 +13298,7 @@ pub const ProvisionedTableWriteSource = struct {
                     )
                 else
                     db_mod.DB.open(cache.alloc, path, .{
+                        .schema_before_index_load = direct_schema,
                         .lsm_cache = cache.lsm_cache,
                         .hbc_cache = cache.hbc_cache,
                         .lsm_root_generation = lsm_root_generation,
@@ -14438,6 +14444,11 @@ pub const ProvisionedTableWriteSource = struct {
             return error.DocIdentityNamespaceUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, self.ha_async_mirror);
+        const direct_schema = if (metadata.indexes_json == null)
+            try prepareManagedSchemaBeforeIndexLoad(alloc, .default, metadata.schema_json)
+        else
+            null;
+        defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
         var db = if (metadata.indexes_json) |indexes_json|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
@@ -14466,6 +14477,7 @@ pub const ProvisionedTableWriteSource = struct {
             )
         else
             try db_mod.DB.open(alloc, path, .{
+                .schema_before_index_load = direct_schema,
                 .lsm_root_generation = lsm_root_generation,
                 .backend_runtime = self.backend_runtime,
                 .secret_store = self.secret_store,
@@ -29901,15 +29913,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
-                if (schema_json.len == 0) break :blk null;
-                var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
-                defer parsed_schema.deinit(allocator);
-                break :blk .{
-                    .runtime_schema = try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema),
-                    .public_schema_json = schema_json,
-                };
-            } else null;
+            const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
             if (open_options.native_restore_open_plan) |native_plan| {
@@ -33408,7 +33412,9 @@ fn loadTableManagedMetadata(
     const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
     const indexes_json = if (table.indexes_json.len == 0) null else try alloc.dupe(u8, table.indexes_json);
     errdefer if (indexes_json) |value| alloc.free(value);
-    const schema_json = if (table.schema_json.len == 0) null else try alloc.dupe(u8, table.schema_json);
+    // This is a complete catalog contract. Persist the default schema for an
+    // empty contract so a later Raft apply can reopen without catalog access.
+    const schema_json = try alloc.dupe(u8, tables_api.effectiveSchemaJson(table.schema_json));
     return .{
         .indexes_json = indexes_json,
         .schema_json = schema_json,
@@ -33839,6 +33845,23 @@ fn validateSplitReplicationIdentityAgainstCatalog(
     if (!source_namespace.eql(replication.identity_namespace)) return error.DocIdentityNamespaceMismatch;
 }
 
+fn prepareManagedSchemaBeforeIndexLoad(
+    alloc: std.mem.Allocator,
+    mode: ManagedDbOpenMode,
+    schema_json: ?[]const u8,
+) !?db_mod.SchemaBeforeIndexLoad {
+    if (mode == .query_readonly or mode == .status_only) return null;
+    // Null means no authoritative contract was supplied; an explicit empty
+    // contract means the default schema, even when there are no indexes.
+    const effective = tables_api.effectiveSchemaJson(schema_json orelse return null);
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, effective);
+    defer parsed.deinit(alloc);
+    return .{
+        .runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed),
+        .public_schema_json = effective,
+    };
+}
+
 fn openManagedDbForReplicatedApply(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -33862,6 +33885,11 @@ fn openManagedDbForReplicatedApply(
     const indexes_json = if (metadata) |owned| owned.indexes_json else null;
     const schema_json = if (metadata) |owned| owned.schema_json else null;
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
+    const direct_schema = if (indexes_json == null)
+        try prepareManagedSchemaBeforeIndexLoad(alloc, .default_async, schema_json)
+    else
+        null;
+    defer if (direct_schema) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
     var db = if (indexes_json) |value|
         try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
@@ -33889,6 +33917,7 @@ fn openManagedDbForReplicatedApply(
         )
     else
         try db_mod.DB.open(alloc, path, .{
+            .schema_before_index_load = direct_schema,
             .backend_runtime = backend_runtime,
             .identity_namespace = namespace,
             .prefer_existing_identity_namespace = true,
@@ -34608,6 +34637,10 @@ test "provisioned table write source seeds doc identity namespace from table ran
 }
 
 test "replicated split destination seeds inherited doc identity before range publication" {
+    inline for (.{ "", "{}" }) |indexes_json| try testReplicatedSplitDestinationAdmission(indexes_json);
+}
+
+fn testReplicatedSplitDestinationAdmission(comptime indexes_json: []const u8) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -34638,8 +34671,8 @@ test "replicated split destination seeds inherited doc identity before range pub
                     .table_id = 7,
                     .name = "docs",
                     .placement_role = "data",
-                    .indexes_json = "{}",
-                    .schema_json = tables_api.default_schema_json,
+                    .indexes_json = indexes_json,
+                    .schema_json = "",
                 }})[0..]),
                 // The destination deliberately remains unpublished until cutover.
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -34701,10 +34734,21 @@ test "replicated split destination seeds inherited doc identity before range pub
         var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
             return error.TestUnexpectedResult;
         defer destination.deinit(alloc);
-        // Production admission persists this manifest before the Raft group
-        // can accept writes. This focused test provisions the destination
-        // through the lower-level apply path, so establish the same invariant.
-        try applyLocalTableSchemaJson(alloc, destination.db, tables_api.default_schema_json);
+        // An empty catalog contract still has an authoritative default schema.
+        // Admission must persist it before any catalog-free Raft reopen.
+        const schema_json = (try loadLocalTableSchemaJson(alloc, destination.db)) orelse
+            return error.TestExpectedLocalTableManifest;
+        defer alloc.free(schema_json);
+        try std.testing.expectEqualStrings(tables_api.default_schema_json, schema_json);
+        // Equivalent complete contracts must share the resident writer rather
+        // than retiring it while a transition still holds its lease.
+        var equivalent = (try source.leaseCachedGroupWriterWithMetadata(alloc, 7002, "docs", .{
+            .indexes_json = indexes_json,
+            .schema_json = "",
+            .identity_namespace = namespace,
+        })) orelse return error.TestUnexpectedResult;
+        defer equivalent.deinit(alloc);
+        try std.testing.expect(equivalent.db == destination.db);
         try std.testing.expect(destination.db.core.identity_namespace.eql(namespace));
         var doc = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
         defer doc.deinit(alloc);

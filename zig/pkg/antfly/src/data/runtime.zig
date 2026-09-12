@@ -12736,10 +12736,10 @@ pub const DataServer = struct {
         );
         const metadata: antfly.public_api.table_writes.StartupCatchUpMetadata = .{
             .indexes_json = table_contract.indexes_json,
-            .schema_json = if (table_contract.schema_json.len == 0)
-                null
-            else
-                table_contract.schema_json,
+            // A transition carries a complete table contract. Its empty
+            // schema denotes the default schema, not permission to omit the
+            // durable manifest required by subsequent catalog-free Raft apply.
+            .schema_json = antfly.public_api.tables.effectiveSchemaJson(table_contract.schema_json),
             .identity_namespace = identity_namespace,
             .identity_validation = identity_validation,
         };
@@ -12982,10 +12982,7 @@ pub const DataServer = struct {
                     null
                 else
                     table_contract.indexes_json,
-                .schema_json = if (table_contract.schema_json.len == 0)
-                    null
-                else
-                    table_contract.schema_json,
+                .schema_json = antfly.public_api.tables.effectiveSchemaJson(table_contract.schema_json),
                 .identity_namespace = identityNamespaceFromTransitionContract(
                     table_contract,
                     .source,
@@ -28441,6 +28438,10 @@ test "data runtime split apply store seeding reuses cached source writer" {
             transition_lease.db.backend_runtime == server.backend_runtime.?,
         );
         try std.testing.expect(transition_lease.db.owned_backend_runtime == null);
+        const schema = (try transition_lease.db.getSchemaJson(alloc)) orelse
+            return error.TestExpectedLocalTableManifest;
+        defer alloc.free(schema);
+        try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, schema);
     }
 
     // Replica replacement can preserve this DB while a new Raft generation
@@ -28475,6 +28476,19 @@ test "data runtime split apply store seeding reuses cached source writer" {
 
     // The uncached path must release its maintenance writer before the scoped
     // operation returns. A direct authoritative open proves no owner escaped.
+    try server.write_source.clearWriteCache();
+    {
+        // The destination is absent from the catalog. Reopening it from the
+        // persisted contract must work after its original writer is retired.
+        var reopened = (try server.write_source.leasePreparedTransitionGroupWriter(
+            alloc,
+            181,
+            "docs",
+            source_namespace,
+        )) orelse return error.TestUnexpectedResult;
+        defer reopened.deinit(alloc);
+        try std.testing.expectEqualStrings(antfly.public_api.tables.default_schema_json, reopened.schema_json.?);
+    }
     try server.write_source.clearWriteCache();
     server.write_source.write_cache = null;
     try server.ensureSplitSourceApplyStoreSeeded(

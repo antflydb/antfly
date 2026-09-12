@@ -822,14 +822,13 @@ fn replayKnownScenarioWithRecorder(
     recorded: *const vopr.trace.Trace,
     recorder: *vopr.flight_recorder.Recorder,
 ) !vopr.trace.Trace {
-    var source = vopr.choice.Replay{ .records = recorded.choices.items };
+    var source = vopr.choice.Replay{
+        .records = recorded.choices.items,
+        .expected_transitions = recorded.transitions.items,
+    };
     var replayed = try runKnownScenarioWithChoicesAndRecorder(alloc, recorded, source.source(), recorder);
     errdefer replayed.deinit();
-    const expected = try recorded.renderAlloc(alloc);
-    defer alloc.free(expected);
-    const actual = try replayed.renderAlloc(alloc);
-    defer alloc.free(actual);
-    if (!std.mem.eql(u8, expected, actual)) return error.VoprReplayArtifactDiverged;
+    if (!try recorded.canonicalEqual(&replayed, alloc)) return error.VoprReplayArtifactDiverged;
     return replayed;
 }
 
@@ -3035,6 +3034,21 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();
     }
+}
+
+test "VOPR scenario registry recorder replay checks selected transition payloads" {
+    const alloc = std.testing.allocator;
+    var artifact = try antfly.transaction_vopr.record(alloc, 1);
+    defer artifact.deinit();
+    var recorder = try vopr.flight_recorder.Recorder.init(alloc, 16);
+    defer recorder.deinit();
+    var replayed = try replayKnownScenarioWithRecorder(alloc, &artifact, &recorder);
+    replayed.deinit();
+
+    // The same stable choice can carry different bytes. Diagnose that at the
+    // selected transition, before executing the rest of a long campaign.
+    artifact.transitions.items[0].payload_digest ^= 1;
+    try std.testing.expectError(error.ReplaySelectedTransitionDiverged, replayKnownScenarioWithRecorder(alloc, &artifact, &recorder));
 }
 
 test "VOPR scenario registry accepts production HA scaling in run and campaign" {
