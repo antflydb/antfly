@@ -19,11 +19,14 @@ const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
+const graph_metric_config = @import("../build/graph_metric_config.zig");
 const cache_mod = @import("cache.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const operation = @import("../../api/operation.zig");
+const CancellationToken = operation.CancellationToken;
+const read_lease = @import("../manifest/read_lease.zig");
 
 pub const QueryExecutionMetrics = struct {
     total_queries: u64 = 0,
@@ -47,6 +50,207 @@ pub const NamespaceQueryExecutionMetrics = struct {
     }
 };
 
+pub const AuthenticatedSubrange = cache_mod.AuthenticatedSubrange;
+pub const AuthenticatedBlockPublication = cache_mod.AuthenticatedBlockPublication;
+pub const max_authenticated_publication_blocks = cache_mod.max_authenticated_publication_blocks;
+
+pub const GraphMetricReadLimits = struct {
+    /// Shared by every graph-metric surface in one pinned request. These are
+    /// deliberately aggregate limits, not per metric.
+    max_range_requests: u64 = 128,
+    max_range_bytes: u64 = 256 * 1024 * 1024,
+    max_decoded_blocks: u64 = 16 * 1024,
+    max_work_items: u64 = 32 * 1024 * 1024,
+    max_retained_bytes: u64 = 128 * 1024 * 1024,
+};
+
+pub const GraphMetricRangeCapacity = struct { requests: u64, bytes: u64 };
+
+pub const GraphMetricReadBudget = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    limits: GraphMetricReadLimits = .{},
+    range_requests: u64 = 0,
+    range_bytes: u64 = 0,
+    decoded_blocks: u64 = 0,
+    work_items: u64 = 0,
+    retained_bytes: u64 = 0,
+
+    /// Move-only live-memory ownership. Unlike cumulative I/O/work admission,
+    /// scratch and replaced outputs release their capacity when destroyed.
+    /// The shared request budget must outlive every reservation.
+    pub const Reservation = struct {
+        budget: ?*GraphMetricReadBudget = null,
+        bytes: usize = 0,
+
+        /// A read scope can collect conservative scratch/cache-lease charges
+        /// from concurrent children. Only its owner may split or destroy it,
+        /// after those children have joined.
+        pub fn grow(self: *@This(), bytes: usize) !void {
+            const budget = self.budget orelse return error.GraphMetricQueryBudgetExceeded;
+            lockAtomic(&budget.mutex);
+            defer budget.mutex.unlock();
+            const owned = std.math.add(usize, self.bytes, bytes) catch return error.GraphMetricQueryBudgetExceeded;
+            const retained = try checkedCharge(budget.retained_bytes, bytes, budget.limits.max_retained_bytes);
+            self.bytes = owned;
+            budget.retained_bytes = retained;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.budget) |budget| {
+                lockAtomic(&budget.mutex);
+                std.debug.assert(budget.retained_bytes >= self.bytes);
+                budget.retained_bytes -= self.bytes;
+                budget.mutex.unlock();
+            }
+            self.* = .{};
+        }
+
+        pub fn split(self: *@This(), bytes: usize) @This() {
+            std.debug.assert(bytes <= self.bytes);
+            self.bytes -= bytes;
+            return .{ .budget = self.budget, .bytes = bytes };
+        }
+
+        /// Move two exclusively owned reservations into one without dropping
+        /// admission between construction and publication. Not for shared
+        /// grow-only scopes until their workers have joined.
+        pub fn absorb(self: *@This(), other: *@This()) void {
+            std.debug.assert(self.budget == other.budget);
+            self.bytes += other.bytes;
+            other.* = .{};
+        }
+
+        pub fn shrinkTo(self: *@This(), bytes: usize) void {
+            std.debug.assert(bytes <= self.bytes);
+            var released = self.split(self.bytes - bytes);
+            released.deinit();
+        }
+
+        /// Escaping public output keeps its request charge, but must not keep
+        /// a pointer to a query session that can already have been destroyed.
+        pub fn detach(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+
+    pub fn reserveRetained(self: *@This(), bytes: usize) !Reservation {
+        try self.chargeRetained(bytes);
+        return .{ .budget = self, .bytes = bytes };
+    }
+
+    pub fn remainingMemory(self: *@This()) usize {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return std.math.cast(usize, self.limits.max_retained_bytes -| self.retained_bytes) orelse std.math.maxInt(usize);
+    }
+
+    fn checkedCharge(current: u64, amount: u64, limit: u64) !u64 {
+        const next = std.math.add(u64, current, amount) catch return error.GraphMetricQueryBudgetExceeded;
+        if (next > limit) return error.GraphMetricQueryBudgetExceeded;
+        return next;
+    }
+
+    pub fn chargeRange(self: *@This(), bytes: usize) !void {
+        return self.reserveRanges(1, bytes);
+    }
+
+    pub fn reserveRanges(self: *@This(), requests: usize, bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next_requests = try checkedCharge(self.range_requests, @intCast(requests), self.limits.max_range_requests);
+        const next_bytes = try checkedCharge(self.range_bytes, @intCast(bytes), self.limits.max_range_bytes);
+        self.range_requests = next_requests;
+        self.range_bytes = next_bytes;
+    }
+
+    pub fn remainingRequests(self: *@This()) u64 {
+        return self.remainingRanges().requests;
+    }
+
+    pub fn remainingRanges(self: *@This()) GraphMetricRangeCapacity {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return .{ .requests = self.limits.max_range_requests -| self.range_requests, .bytes = self.limits.max_range_bytes -| self.range_bytes };
+    }
+
+    pub fn chargeDecode(self: *@This(), blocks: usize, work_items: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next_blocks = try checkedCharge(self.decoded_blocks, @intCast(blocks), self.limits.max_decoded_blocks);
+        const next_items = try checkedCharge(self.work_items, @intCast(work_items), self.limits.max_work_items);
+        self.decoded_blocks = next_blocks;
+        self.work_items = next_items;
+    }
+
+    pub fn chargeRetained(self: *@This(), bytes: usize) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.retained_bytes = try checkedCharge(self.retained_bytes, @intCast(bytes), self.limits.max_retained_bytes);
+    }
+};
+
+test "serverless graph metric request budget composes reads and rejects charges atomically" {
+    var budget = GraphMetricReadBudget{ .limits = .{
+        .max_range_requests = 2,
+        .max_range_bytes = 10,
+        .max_decoded_blocks = 2,
+        .max_work_items = 10,
+        .max_retained_bytes = 10,
+    } };
+
+    try budget.chargeRange(6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(5));
+    try std.testing.expectEqual(@as(u64, 1), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 6), budget.range_bytes);
+    try budget.chargeRange(4);
+
+    try budget.chargeDecode(1, 6);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(2, 1));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeDecode(1, 5));
+    try std.testing.expectEqual(@as(u64, 1), budget.decoded_blocks);
+    try std.testing.expectEqual(@as(u64, 6), budget.work_items);
+
+    try budget.chargeRetained(10);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRetained(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.retained_bytes);
+}
+
+test "serverless graph metric memory reservations transfer release and preserve work charges" {
+    var budget = GraphMetricReadBudget{ .limits = .{ .max_retained_bytes = 64 } };
+    try budget.chargeDecode(1, 10);
+    var scratch = try budget.reserveRetained(48);
+    var output = scratch.split(16);
+    scratch.deinit();
+    try std.testing.expectEqual(@as(u64, 16), budget.retained_bytes);
+    for (0..100) |_| {
+        var replacement = try budget.reserveRetained(48);
+        try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRetained(1));
+        replacement.deinit();
+    }
+    output.deinit();
+    try std.testing.expectEqual(@as(u64, 0), budget.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 10), budget.work_items);
+    var escaping = try budget.reserveRetained(8);
+    escaping.detach();
+    escaping.deinit();
+    try std.testing.expectEqual(@as(u64, 8), budget.retained_bytes);
+}
+
+test "serverless graph metric score-plan reservation is atomic across ranges and bytes" {
+    var budget = GraphMetricReadBudget{ .limits = .{ .max_range_requests = 3, .max_range_bytes = 10 } };
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(2, 11));
+    try std.testing.expectEqual(@as(u64, 0), budget.range_requests);
+    try std.testing.expectEqual(@as(u64, 0), budget.range_bytes);
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.reserveRanges(4, 5));
+    try std.testing.expectEqual(@as(u64, 3), budget.remainingRequests());
+    try budget.reserveRanges(3, 10);
+    try std.testing.expectEqual(@as(u64, 0), budget.remainingRequests());
+    try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, budget.chargeRange(1));
+    try std.testing.expectEqual(@as(u64, 10), budget.range_bytes);
+}
+
 pub const QueryRuntime = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -56,6 +260,7 @@ pub const QueryRuntime = struct {
     metrics_mu: std.atomic.Mutex = .unlocked,
     metrics: QueryExecutionMetrics = .{},
     namespace_metrics: std.StringHashMapUnmanaged(QueryExecutionMetrics) = .empty,
+    read_leases: read_lease.Cache = .{},
 
     pub fn init(
         alloc: Allocator,
@@ -93,17 +298,38 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSession(self: *QueryRuntime, namespace: []const u8, version: u64) !QuerySession {
+        var manifest = try self.manifests.getAlloc(namespace, version);
+        errdefer manifest.deinit(self.alloc);
+        var lease: ?read_lease.Lease = null;
+        for (manifest.artifacts) |artifact| {
+            if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
+                lease = try self.read_leases.acquire(self.progress, namespace, version);
+                break;
+            }
+        }
         return .{
             .alloc = self.alloc,
             .artifacts = self.artifacts,
             .cache = self.cache,
-            .manifest = try self.manifests.getAlloc(namespace, version),
+            .manifest = manifest,
+            .read_lease = lease,
         };
     }
 
     pub fn openHeadSession(self: *QueryRuntime, namespace: []const u8) !QuerySession {
-        const version = try self.progress.getHead(namespace);
-        return try self.openVersionSession(namespace, version);
+        var version = try self.progress.getHead(namespace);
+        for (0..3) |_| {
+            return self.openVersionSession(namespace, version) catch |err| switch (err) {
+                error.FileNotFound, error.ManifestVersionRetired => {
+                    const next = try self.progress.getHead(namespace);
+                    if (next == version) return err;
+                    version = next;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        return error.ManifestReadLeaseContended;
     }
 
     pub fn recordSearchStats(self: *QueryRuntime, namespace: []const u8, mode: request_mod.QueryMode, stats: anytype) !void {
@@ -164,11 +390,91 @@ pub const QuerySession = struct {
     artifacts: *artifacts_mod.ArtifactStore,
     cache: ?*cache_mod.QueryCache = null,
     manifest: manifest_mod.Manifest,
+    owns_manifest: bool = true,
+    io: ?std.Io = null,
     cancellation: CancellationToken = .none,
+    read_lease: ?read_lease.Lease = null,
+    diagnostics: ?*operation.RequestDiagnostics = null,
+    graph_metric_specs: ?[]graph_metric_config.IndexSpec = null,
+    owns_graph_metric_specs: bool = true,
+    graph_metric_read_budget: GraphMetricReadBudget = .{},
+    graph_metric_read_budget_shared: ?*GraphMetricReadBudget = null,
+    // Borrowed read-lifetime scratch reservation, propagated to joined child
+    // reads. Output reservations are independent and may outlive this scope.
+    graph_metric_retained_scope: ?*GraphMetricReadBudget.Reservation = null,
+    // Pre-admitted transport workspace owned by a joined parent execution.
+    graph_metric_transport_credit: usize = 0,
+
+    pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
+        if (self.cache == null) return null;
+        return .{ .ptr = self, .read = readGraphAdjacencyBlock };
+    }
+
+    fn readGraphAdjacencyBlock(ptr: *anyopaque, alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, source: manifest_mod.ArtifactRef, offset: u64, len: usize, checksum: [32]u8, cancellation: CancellationToken, remaining: *u64) ![]u8 {
+        const self: *QuerySession = @ptrCast(@alignCast(ptr));
+        const cache = self.cache.?;
+        const fills = @import("authenticated_block_fills.zig");
+        // Document bodies can be larger than a shared-cache fill. Cache
+        // admission is an optimization, not a stricter document-size contract.
+        if (len > fills.Cache.max_batch_bytes) {
+            try cancellation.check();
+            if (len > remaining.*) return error.GraphMetricBuildBudgetExceeded;
+            remaining.* -= len;
+            const bytes = try artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, offset, len, cancellation);
+            errdefer alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
+            try cancellation.check();
+            return bytes;
+        }
+        const key = fills.blockKey(source.artifact_id, source.checksum, offset, len, &checksum);
+        var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, &.{.{ .key = key, .len = len }}, self.io, cancellation);
+        defer batch.deinit();
+        const item = batch.items[0];
+        if (item.producer) {
+            if (len > remaining.*) return error.GraphMetricBuildBudgetExceeded;
+            remaining.* -= len;
+            const bytes = try artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, offset, len, cancellation);
+            defer alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
+            @memcpy(item.buffer(), bytes);
+        }
+        try cancellation.check();
+        batch.publish(self.io);
+        return alloc.dupe(u8, item.bytes());
+    }
 
     pub fn deinit(self: *QuerySession) void {
-        self.manifest.deinit(self.alloc);
+        if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
+        if (self.owns_manifest) self.manifest.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    /// Lazily parses graph metric configuration once for this pinned request.
+    /// QuerySession is request-owned and, like its other mutable caches, must
+    /// not be accessed concurrently without external synchronization.
+    pub fn graphMetricSpecs(self: *QuerySession) ![]const graph_metric_config.IndexSpec {
+        if (self.graph_metric_specs == null) {
+            self.graph_metric_specs = try graph_metric_config.parseIndexSpecsAlloc(
+                self.alloc,
+                self.manifest.stats.indexes_json,
+            );
+        }
+        return self.graph_metric_specs.?;
+    }
+
+    pub fn clearGraphMetricSpecs(self: *QuerySession) void {
+        if (!self.owns_graph_metric_specs) {
+            self.graph_metric_specs = null;
+            return;
+        }
+        if (self.graph_metric_specs) |specs| graph_metric_config.freeIndexSpecs(self.alloc, specs);
+        self.graph_metric_specs = null;
     }
 
     pub fn namespace(self: *const QuerySession) []const u8 {
@@ -192,8 +498,94 @@ pub const QuerySession = struct {
         self.cancellation = cancellation;
     }
 
+    pub fn setDiagnostics(self: *QuerySession, diagnostics: ?*operation.RequestDiagnostics) void {
+        self.diagnostics = diagnostics;
+    }
+
+    pub fn setIo(self: *QuerySession, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    /// Create a non-owning view of the pinned request for a concurrent range
+    /// fetch. Callers provide a thread-safe allocator; the manifest, cache,
+    /// cancellation token, and aggregate graph budget remain shared.
+    pub fn forkGraphMetricRead(self: *QuerySession, alloc: Allocator) QuerySession {
+        return .{
+            .alloc = alloc,
+            .artifacts = self.artifacts,
+            .cache = self.cache,
+            .manifest = self.manifest,
+            .owns_manifest = false,
+            .io = self.io,
+            .cancellation = self.cancellation,
+            .read_lease = self.read_lease,
+            .diagnostics = null,
+            .graph_metric_specs = self.graph_metric_specs,
+            .owns_graph_metric_specs = false,
+            .graph_metric_read_budget_shared = self.effectiveGraphMetricReadBudget(),
+            .graph_metric_retained_scope = self.graph_metric_retained_scope,
+            .graph_metric_transport_credit = self.graph_metric_transport_credit,
+        };
+    }
+
+    fn effectiveGraphMetricReadBudget(self: *QuerySession) *GraphMetricReadBudget {
+        return self.graph_metric_read_budget_shared orelse &self.graph_metric_read_budget;
+    }
+
+    pub fn recordGraphMetricRejection(
+        self: *QuerySession,
+        graph_index_name: []const u8,
+        metric_name: []const u8,
+        materializer_fingerprint: u64,
+    ) void {
+        const diagnostics = self.diagnostics orelse return;
+        diagnostics.recordGraphMetricRejection(graph_index_name, metric_name, materializer_fingerprint);
+    }
+
     pub fn checkCancellation(self: *const QuerySession) !void {
+        if (self.read_lease) |lease| lease.check() catch return error.DeadlineExceeded;
         return self.cancellation.check();
+    }
+
+    /// Borrow only after the session is in its final request-owned location,
+    /// exactly like graphAdjacencyCache. Joined children finish before deinit.
+    pub fn readCancellation(self: *const QuerySession) CancellationToken {
+        return .{ .ptr = self, .check_fn = checkReadCancellation };
+    }
+
+    fn checkReadCancellation(ptr: *const anyopaque) !void {
+        const self: *const QuerySession = @ptrCast(@alignCast(ptr));
+        return self.checkCancellation();
+    }
+
+    pub fn chargeGraphMetricRange(self: *QuerySession, bytes: usize) !void {
+        return self.effectiveGraphMetricReadBudget().chargeRange(bytes);
+    }
+
+    pub fn graphMetricRangeBudget(self: *QuerySession) GraphMetricRangeCapacity {
+        return self.effectiveGraphMetricReadBudget().remainingRanges();
+    }
+
+    pub fn reserveGraphMetricRanges(self: *QuerySession, requests: usize, bytes: usize) !void {
+        try self.checkCancellation();
+        return self.effectiveGraphMetricReadBudget().reserveRanges(requests, bytes);
+    }
+
+    pub fn chargeGraphMetricDecode(self: *QuerySession, blocks: usize, work_items: usize) !void {
+        return self.effectiveGraphMetricReadBudget().chargeDecode(blocks, work_items);
+    }
+
+    pub fn chargeGraphMetricRetained(self: *QuerySession, bytes: usize) !void {
+        if (self.graph_metric_retained_scope) |scope| return scope.grow(bytes);
+        return self.effectiveGraphMetricReadBudget().chargeRetained(bytes);
+    }
+
+    pub fn reserveGraphMetricMemory(self: *QuerySession, bytes: usize) !GraphMetricReadBudget.Reservation {
+        return self.effectiveGraphMetricReadBudget().reserveRetained(bytes);
+    }
+
+    pub fn graphMetricMemoryAvailable(self: *QuerySession) usize {
+        return self.effectiveGraphMetricReadBudget().remainingMemory();
     }
 
     pub fn findArtifactIndex(self: *const QuerySession, kind: manifest_mod.ArtifactKind) ?usize {
@@ -222,7 +614,7 @@ pub const QuerySession = struct {
                 artifact.artifact_id,
                 artifact.byte_len,
                 artifact.checksum,
-                self.cancellation,
+                self.readCancellation(),
             )
         else
             try self.artifacts.getVerifiedAllocWithCancellationUsingAllocator(
@@ -230,11 +622,28 @@ pub const QuerySession = struct {
                 artifact.artifact_id,
                 artifact.byte_len,
                 artifact.checksum,
-                self.cancellation,
+                self.readCancellation(),
             );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
+    }
+
+    /// Authenticates an artifact against the manifest without materializing it
+    /// in the query allocator. Object and filesystem backends use their
+    /// bounded identity caches after the first full verification.
+    pub fn verifyArtifact(self: *QuerySession, index: usize) !void {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactForQuery(artifact);
+        try self.artifacts.verifyContentWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            artifact.byte_len,
+            artifact.checksum,
+            self.readCancellation(),
+        );
+        try self.checkCancellation();
     }
 
     pub fn fetchArtifactRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize) ![]u8 {
@@ -242,9 +651,26 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, offset, len, self.cancellation)
+            try cache.getVerifiedRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.readCancellation(),
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.readCancellation(),
+            );
         errdefer self.alloc.free(result);
         try self.checkCancellation();
         return result;
@@ -255,10 +681,169 @@ pub const QuerySession = struct {
         const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
         try validateArtifactRange(artifact, offset, len);
         const result = if (self.cache) |cache|
-            try cache.getBlockOrFetchRangeAllocWithCancellationUsingAllocator(self.alloc, self.artifacts, artifact.artifact_id, block_id, offset, len, self.cancellation)
+            try cache.getVerifiedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.readCancellation(),
+            )
         else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(self.alloc, artifact.artifact_id, offset, len, self.cancellation);
+            try self.artifacts.getVerifiedRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                self.readCancellation(),
+            );
         errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
+    pub fn fetchArtifactAuthenticatedBlockAlloc(
+        self: *QuerySession,
+        index: usize,
+        block_id: []const u8,
+        offset: u64,
+        len: usize,
+        checksum: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    ) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0) return error.InvalidArtifactRange;
+        const result = if (self.cache) |cache|
+            try cache.getAuthenticatedBlockOrFetchRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                block_id,
+                artifact.byte_len,
+                artifact.checksum,
+                checksum,
+                offset,
+                len,
+                self.readCancellation(),
+            )
+        else blk: {
+            const bytes = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+                self.alloc,
+                artifact.artifact_id,
+                offset,
+                len,
+                self.readCancellation(),
+            );
+            errdefer self.alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, checksum)) return error.ArtifactIntegrityMismatch;
+            break :blk bytes;
+        };
+        errdefer self.alloc.free(result);
+        try self.checkCancellation();
+        return result;
+    }
+
+    pub fn readCachedAuthenticatedBlockAlloc(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?[]u8 {
+        var lease = (try self.readCachedAuthenticatedBlockLease(alloc, index, block_id, offset, len, checksum)) orelse return null;
+        if (lease == .owned) return lease.owned.data;
+        defer lease.deinit();
+        return try alloc.dupe(u8, lease.bytes());
+    }
+
+    pub fn readCachedAuthenticatedBlockLease(self: *QuerySession, alloc: Allocator, index: usize, block_id: []const u8, offset: u64, len: usize, checksum: *const [32]u8) !?cache_mod.AuthenticatedBlockLease {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        const cache = self.cache orelse return null;
+        return cache.readAuthenticatedBlockIfPresentLease(alloc, artifact.artifact_id, block_id, artifact.byte_len, artifact.checksum, checksum, offset, len, self.readCancellation()) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            // A damaged/unavailable local cache is a miss, never authority.
+            // The origin read still authenticates against the manifest digest.
+            else => null,
+        };
+    }
+
+    pub fn cacheAuthenticatedBlocks(self: *QuerySession, index: usize, blocks: []const AuthenticatedBlockPublication) !void {
+        const cache = self.cache orelse return;
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        cache.retainAuthenticatedBlocks(artifact.artifact_id, artifact.byte_len, artifact.checksum, blocks);
+    }
+
+    /// Fetches a bounded range and authenticates every byte against digests
+    /// rooted in the published manifest or an already-authenticated routing
+    /// footer. Subranges must exactly and contiguously cover the response.
+    pub fn fetchArtifactAuthenticatedRangeAlloc(
+        self: *QuerySession,
+        index: usize,
+        offset: u64,
+        len: usize,
+        subranges: []const AuthenticatedSubrange,
+    ) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, true);
+    }
+
+    pub fn fetchArtifactAuthenticatedRangeUncachedAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange) ![]u8 {
+        return self.fetchAuthenticatedRangeAlloc(index, offset, len, subranges, false);
+    }
+
+    fn fetchAuthenticatedRangeAlloc(self: *QuerySession, index: usize, offset: u64, len: usize, subranges: []const AuthenticatedSubrange, retain_range: bool) ![]u8 {
+        try self.checkCancellation();
+        const artifact = self.artifactRef(index) orelse return error.ArtifactNotFound;
+        try validateArtifactRange(artifact, offset, len);
+        if (len == 0 or subranges.len == 0) return error.InvalidArtifactRange;
+        var covered: usize = 0;
+        for (subranges) |subrange| {
+            if (subrange.len == 0 or subrange.relative_offset != covered) return error.InvalidArtifactRange;
+            covered = std.math.add(usize, covered, subrange.len) catch return error.InvalidArtifactRange;
+            if (covered > len) return error.InvalidArtifactRange;
+        }
+        if (covered != len) return error.InvalidArtifactRange;
+
+        if (if (retain_range) self.cache else null) |cache| {
+            const result = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+                self.alloc,
+                self.artifacts,
+                artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
+                offset,
+                len,
+                subranges,
+                self.readCancellation(),
+            );
+            errdefer self.alloc.free(result);
+            try self.checkCancellation();
+            return result;
+        }
+
+        const result = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            offset,
+            len,
+            self.readCancellation(),
+        );
+        errdefer self.alloc.free(result);
+        if (result.len != len) return error.ArtifactIntegrityMismatch;
+        for (subranges, 0..) |subrange, subrange_index| {
+            if (subrange_index % 64 == 0) try self.checkCancellation();
+            var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(
+                result[subrange.relative_offset..][0..subrange.len],
+                &actual,
+                .{},
+            );
+            if (!std.mem.eql(u8, &actual, &subrange.checksum)) return error.ArtifactIntegrityMismatch;
+        }
         try self.checkCancellation();
         return result;
     }
@@ -295,7 +880,24 @@ fn validateArtifactIdentity(artifact: manifest_mod.ArtifactRef) !void {
         return error.ArtifactIntegrityMismatch;
 }
 
-test "query runtime pins manifest version while head advances" {
+test "serverless query read lease expiry fences transport and joined metric sessions" {
+    var session = QuerySession{
+        .alloc = std.testing.allocator,
+        .artifacts = undefined, // no I/O may escape the expired lease
+        .manifest = .{ .namespace = @constCast("docs"), .version = 1, .built_at_ns = 1, .wal_start_lsn = 1, .wal_end_lsn = 1, .stats = .{}, .artifacts = @constCast(&.{}) },
+        .owns_manifest = false,
+        .read_lease = .{ .unix_deadline = 1, .authority_deadline = 1 },
+    };
+    defer session.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, session.checkCancellation());
+    try std.testing.expectError(error.DeadlineExceeded, session.readCancellation().check());
+    try std.testing.expectError(error.DeadlineExceeded, session.fetchArtifactAlloc(0));
+    var joined = session.forkGraphMetricRead(std.testing.allocator);
+    defer joined.deinit();
+    try std.testing.expectError(error.DeadlineExceeded, joined.readCancellation().check());
+}
+
+test "serverless query runtime pins manifest version while head advances" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -377,7 +979,7 @@ test "query runtime pins manifest version while head advances" {
     try std.testing.expectEqualStrings("version-two", latest);
 }
 
-test "query session named artifact lookup does not fall back to unnamed artifact" {
+test "serverless query session named artifact lookup does not fall back to unnamed artifact" {
     const alloc = std.testing.allocator;
 
     var session = QuerySession{
@@ -415,7 +1017,7 @@ test "query session named artifact lookup does not fall back to unnamed artifact
     try std.testing.expectEqual(@as(?usize, null), session.findNamedArtifactIndex(.sparse_segment, "missing"));
 }
 
-test "graph reader routes named graph artifacts by index name" {
+test "serverless query runtime routes named graph artifacts by index name" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -437,45 +1039,28 @@ test "graph reader routes named graph artifacts by index name" {
     var progress_store = fs_progress.progressStore();
     defer progress_store.deinit();
 
-    var graph_a = graph_segment_mod.Segment{
-        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = reads;
+    var pages: graph_segment_mod.page_store.PageStore = .{
+        .domain = graph_segment_mod.page_store.PageStore.namespaceDomain("docs"),
+        .attempt = @splat(1),
+        .artifacts = &artifact_store,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
     };
-    defer graph_segment_mod.freeSegment(alloc, &graph_a);
-    graph_a.adjacencies[0] = .{
-        .node_id = try alloc.dupe(u8, "doc-a"),
-        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
-        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
-    };
-    graph_a.adjacencies[0].out_edges[0] = .{
-        .neighbor_id = try alloc.dupe(u8, "doc-b"),
-        .edge_type = try alloc.dupe(u8, "cites"),
-        .weight = 1.0,
-    };
-
-    var graph_b = graph_segment_mod.Segment{
-        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
-    };
-    defer graph_segment_mod.freeSegment(alloc, &graph_b);
-    graph_b.adjacencies[0] = .{
-        .node_id = try alloc.dupe(u8, "doc-a"),
-        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
-        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 0),
-    };
-    graph_b.adjacencies[0].out_edges[0] = .{
-        .neighbor_id = try alloc.dupe(u8, "doc-z"),
-        .edge_type = try alloc.dupe(u8, "rel"),
-        .weight = 2.0,
-    };
-
-    const payload_a = try graph_segment_mod.encodeAlloc(alloc, graph_a);
-    defer alloc.free(payload_a);
-    const payload_b = try graph_segment_mod.encodeAlloc(alloc, graph_b);
-    defer alloc.free(payload_b);
-
-    var artifact_a = try artifact_store.put(payload_a);
-    defer artifact_a.deinit(alloc);
-    var artifact_b = try artifact_store.put(payload_b);
-    defer artifact_b.deinit(alloc);
+    const empty: graph_segment_mod.page_graph.Root = .{ .domain = pages.domain };
+    var plan_a = try graph_segment_mod.page_graph.plan(alloc, pages.store(), empty, &.{.{ .id = "doc-a", .edges = &.{.{ .source = "doc-a", .target = "doc-b", .kind = "cites", .weight = 1 }} }});
+    defer plan_a.deinit();
+    const artifact_a = try pages.publishRoot(alloc, try plan_a.publish(pages.store(), empty), "graph_a");
+    defer alloc.free(artifact_a.name);
+    defer alloc.free(artifact_a.artifact_id);
+    defer alloc.free(artifact_a.checksum);
+    var plan_b = try graph_segment_mod.page_graph.plan(alloc, pages.store(), empty, &.{.{ .id = "doc-a", .edges = &.{.{ .source = "doc-a", .target = "doc-z", .kind = "rel", .weight = 2 }} }});
+    defer plan_b.deinit();
+    const artifact_b = try pages.publishRoot(alloc, try plan_b.publish(pages.store(), empty), "graph_b");
+    defer alloc.free(artifact_b.name);
+    defer alloc.free(artifact_b.artifact_id);
+    defer alloc.free(artifact_b.checksum);
 
     var manifest = manifest_mod.Manifest{
         .namespace = try alloc.dupe(u8, "docs"),
@@ -493,6 +1078,7 @@ test "graph reader routes named graph artifacts by index name" {
         .artifact_id = try alloc.dupe(u8, artifact_a.artifact_id),
         .byte_len = artifact_a.byte_len,
         .checksum = try alloc.dupe(u8, artifact_a.checksum),
+        .metadata_version = artifact_a.metadata_version,
     };
     manifest.artifacts[1] = .{
         .kind = .graph_segment,
@@ -500,11 +1086,13 @@ test "graph reader routes named graph artifacts by index name" {
         .artifact_id = try alloc.dupe(u8, artifact_b.artifact_id),
         .byte_len = artifact_b.byte_len,
         .checksum = try alloc.dupe(u8, artifact_b.checksum),
+        .metadata_version = artifact_b.metadata_version,
     };
     try manifest_store.put(manifest);
     try std.testing.expect(try progress_store.compareAndSwapHead("docs", null, 1));
 
     var runtime = QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer runtime.deinit();
     var session = try runtime.openHeadSession("docs");
     defer session.deinit();
 
@@ -524,7 +1112,53 @@ test "graph reader routes named graph artifacts by index name" {
     try std.testing.expectEqualStrings("rel", neighbors[0].edge_type);
 }
 
-test "query runtime warming keeps artifact available through cache" {
+test "serverless authenticated body reads bypass cache size limits but enforce integrity and admission" {
+    const alloc = std.testing.allocator;
+    var artifact_root_buf: [256]u8 = undefined;
+    var cache_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "large-facts-artifacts");
+    const cache_root = tmpPath(&cache_root_buf, "large-facts-cache");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(cache_root);
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifacts = fs_artifacts.artifactStore();
+    defer artifacts.deinit();
+    var cache = try cache_mod.QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+    const len = @import("authenticated_block_fills.zig").Cache.max_batch_bytes + 1;
+    const payload = try alloc.alloc(u8, len);
+    defer alloc.free(payload);
+    @memset(payload, 'a');
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    var metadata = try artifacts.put(payload);
+    defer metadata.deinit(alloc);
+    const source: manifest_mod.ArtifactRef = .{ .kind = .document_facts, .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    var session = QuerySession{ .alloc = alloc, .artifacts = &artifacts, .cache = &cache, .owns_manifest = false, .manifest = .{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = &.{},
+    } };
+    defer session.deinit();
+    var remaining: u64 = len - 1;
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining));
+    try std.testing.expectEqual(@as(u64, len - 1), remaining);
+    remaining = len;
+    const loaded = try QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining);
+    defer alloc.free(loaded);
+    try std.testing.expectEqualSlices(u8, payload, loaded);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    try std.testing.expectEqual(@as(usize, 0), cache.graph_metric_blocks.retained);
+    digest[0] ^= 1;
+    remaining = len;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, QuerySession.readGraphAdjacencyBlock(&session, alloc, &artifacts, source, 0, len, digest, .none, &remaining));
+}
+
+test "serverless query runtime warming keeps artifact available through cache" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -600,7 +1234,7 @@ fn applyModeCount(metrics: *QueryExecutionMetrics, mode: request_mod.QueryMode) 
     }
 }
 
-test "query runtime block range fetch uses cache after artifact deletion" {
+test "serverless query runtime block range fetch uses cache after artifact deletion" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -775,7 +1409,7 @@ test "serverless query session propagates cancellation through full and cached r
     try std.testing.expectEqual(@as(usize, 2), state.range_calls);
 }
 
-test "query runtime tracks namespace-scoped search metrics" {
+test "serverless query runtime tracks namespace-scoped search metrics" {
     const alloc = std.testing.allocator;
 
     var runtime = QueryRuntime.init(alloc, undefined, undefined, undefined);

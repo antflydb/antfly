@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_types = @import("types.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const PublishResult = struct {
     published: bool,
@@ -35,6 +36,8 @@ pub const ManifestStore = struct {
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         list_versions_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u64,
         delete_version: *const fn (*anyopaque, []const u8, u64) anyerror!void,
+        delete_retired_candidate: ?*const fn (*anyopaque, []const u8, u64, u64) anyerror!bool = null,
+        cleanup_retired_temporaries: ?*const fn (*anyopaque, []const u8, u64, CancellationToken) anyerror!void = null,
     };
 
     pub fn deinit(self: *ManifestStore) void {
@@ -70,6 +73,23 @@ pub const ManifestStore = struct {
         try self.vtable.delete_version(self.ptr, namespace, version);
     }
 
+    /// The caller must have acquired the namespace publication barrier at
+    /// `cutoff`. Candidate versions can be reused, so validation and removal
+    /// must be atomic against immutable creation, never GET followed by DELETE.
+    pub fn deleteRetiredCandidate(self: *ManifestStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        const remove = self.vtable.delete_retired_candidate orelse return error.ConditionalManifestDeletionUnsupported;
+        return remove(self.ptr, namespace, version, cutoff);
+    }
+
+    /// Filesystem implementations retire staging files only after the namespace
+    /// publication barrier has fenced their owning token out of HEAD.
+    pub fn cleanupRetiredTemporaries(self: *ManifestStore, namespace: []const u8, cutoff: u64, cancellation: CancellationToken) !void {
+        try cancellation.check();
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        if (self.vtable.cleanup_retired_temporaries) |cleanup| try cleanup(self.ptr, namespace, cutoff, cancellation);
+    }
+
     pub fn publish(self: *ManifestStore, manifest: manifest_types.Manifest, expected_head: ?u64) !PublishResult {
         try self.put(manifest);
         const published = try self.compareAndSwapHead(manifest.namespace, expected_head, manifest.version);
@@ -90,3 +110,43 @@ pub const ManifestStore = struct {
         };
     }
 };
+
+/// Shared regression for two collectors with the same retired snapshot: the
+/// second must not delete a replacement occupying the first one's freed slot.
+pub fn testRetiredCandidateRecreation(store: *ManifestStore) !void {
+    var unsupported_vtable = store.vtable.*;
+    unsupported_vtable.delete_retired_candidate = null;
+    var unsupported = store.*;
+    unsupported.vtable = &unsupported_vtable;
+    try std.testing.expectError(error.ConditionalManifestDeletionUnsupported, unsupported.deleteRetiredCandidate("bootstrap", 1, 2));
+    for ([_]bool{ false, true }) |has_head| {
+        const namespace = if (has_head) "normal" else "bootstrap";
+        var candidate: manifest_types.Manifest = .{
+            .namespace = @constCast(namespace),
+            .version = 1,
+            .built_at_ns = 1,
+            .wal_start_lsn = 0,
+            .wal_end_lsn = 0,
+            .stats = .{},
+            .artifacts = @constCast(&.{}),
+            .publication_fencing_token = 1,
+        };
+        if (has_head) {
+            try store.put(candidate);
+            try store.setHead(namespace, 1);
+            candidate.version = 2;
+        }
+        try store.put(candidate);
+        try std.testing.expect(try store.deleteRetiredCandidate(namespace, candidate.version, 2));
+        try std.testing.expect(!try store.deleteRetiredCandidate(namespace, candidate.version, 2));
+        candidate.publication_fencing_token = 3;
+        try store.put(candidate);
+        try std.testing.expect(!try store.deleteRetiredCandidate(namespace, candidate.version, 2));
+        try std.testing.expect(!try store.deleteRetiredCandidate(namespace, candidate.version, 3));
+        try std.testing.expect(try store.compareAndSwapHead(namespace, if (has_head) 1 else null, candidate.version));
+        var published = try store.getAlloc(namespace, candidate.version);
+        defer published.deinit(store.allocator);
+        try std.testing.expectEqual(@as(u64, 3), published.publication_fencing_token);
+        try std.testing.expectError(error.CannotDeleteHead, store.deleteRetiredCandidate(namespace, candidate.version, 4));
+    }
+}

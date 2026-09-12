@@ -399,6 +399,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,
+        // Storage-backed Mach-O ReleaseSafe codegen needs 12 GiB headroom.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

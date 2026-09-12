@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const shared_vector = @import("antfly_vector").vector;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
 const artifact_store = @import("../artifacts/store.zig");
@@ -36,6 +37,7 @@ pub const VectorSidecarBuildOptions = struct {
     embedding_name: ?[]const u8 = null,
     artifact_id: []const u8 = &.{},
     limits: lake_build_limits.Limits = .{},
+    cancellation: CancellationToken = .none,
 };
 
 pub const VectorSidecarBuildResult = struct {
@@ -88,7 +90,9 @@ fn buildVectorSidecarBoundedAlloc(
     };
     var dims: ?u32 = null;
 
-    while (try source.next(alloc)) |batch| {
+    while (true) {
+        try options.cancellation.check();
+        const batch = try source.next(alloc) orelse break;
         try budget.admitBatch(batch);
         try sidecar_manifest.validateBatchAgainstDeclaredArtifact(.{
             .name = options.name,
@@ -148,7 +152,7 @@ pub fn publishVectorSidecarFromRowSourceAlloc(
     defer alloc.free(built.payload);
     errdefer freeOwnedDeclaration(alloc, built.declaration);
 
-    var metadata = try artifacts.put(built.payload);
+    var metadata = try artifacts.putWithCancellation(built.payload, options.cancellation);
     var metadata_owned = true;
     errdefer if (metadata_owned) metadata.deinit(alloc);
 

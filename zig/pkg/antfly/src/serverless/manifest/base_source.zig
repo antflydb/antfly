@@ -103,6 +103,34 @@ pub const BaseSourceDescriptor = union(BaseSourceKind) {
     }
 };
 
+/// Exact identity of a resolved external source. Selection policy ("current"
+/// versus a user pin) is catalog intent, not part of the immutable data identity.
+/// Inventory and delete metadata remain part of that identity even when the
+/// provider reuses a snapshot label.
+pub fn externalDescriptorsEqual(left: BaseSourceDescriptor, right: BaseSourceDescriptor) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    const a = switch (left) {
+        .external_parquet, .external_iceberg, .external_lance => |source| source,
+        else => return false,
+    };
+    const b = switch (right) {
+        .external_parquet, .external_iceberg, .external_lance => |source| source,
+        else => return false,
+    };
+    return a.format == b.format and
+        std.mem.eql(u8, a.source_uri, b.source_uri) and
+        std.mem.eql(u8, a.snapshot_id, b.snapshot_id) and
+        std.mem.eql(u8, a.schema_fingerprint, b.schema_fingerprint) and
+        optionalStringEqual(a.file_inventory_artifact, b.file_inventory_artifact) and
+        optionalStringEqual(a.row_group_metadata_artifact, b.row_group_metadata_artifact) and
+        optionalStringEqual(a.delete_metadata_artifact, b.delete_metadata_artifact);
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
 pub fn cloneDescriptorAlloc(alloc: Allocator, src: BaseSourceDescriptor) !BaseSourceDescriptor {
     return switch (src) {
         .antfly_document_segments => .{ .antfly_document_segments = {} },

@@ -54,3 +54,23 @@ def test_native_debug_exec_preserves_child_pid():
     assert proc.returncode == 0
     assert output.splitlines() == [str(proc.pid), "argument with spaces"]
     assert proc.pid != os.getpid()
+
+
+@pytest.mark.parametrize("partial", [b"#0 persisted_ready\n", "#0 persisted_ready\n"])
+def test_native_stack_timeout_retains_partial_frames(monkeypatch, partial):
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+    def timeout(command, **kwargs):
+        assert "--readnever" in command
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=partial)
+
+    monkeypatch.setattr(native_debug.sys, "platform", "linux")
+    monkeypatch.setattr(native_debug.shutil, "which", lambda _: "/usr/bin/gdb")
+    monkeypatch.setattr(native_debug.subprocess, "run", timeout)
+    result = native_debug.native_stack_dumps([("data", Process())])
+    assert "gdb timed out" in result
+    assert "#0 persisted_ready" in result

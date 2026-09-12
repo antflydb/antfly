@@ -13566,6 +13566,7 @@ pub fn isInvalidBackupManifestError(err: anyerror) bool {
         error.InvalidBackupRequest,
         error.IncompleteClusterBackup,
         error.BackupManifestTooLarge,
+        error.BackupSchemaHistoryTooLarge,
         => true,
         else => false,
     };
@@ -18532,10 +18533,11 @@ test "remote cluster artifact cleanup advances within a strict operation budget"
     );
 
     for (1..tables.len + 1) |expected_index| {
-        // Portable cleanup uses five exact object operations. Every quantum
+        // Portable cleanup uses six exact object operations, including the
+        // forwarded artifact envelope. Every quantum
         // completes exactly one table, and its immutable-generation tombstone
         // remains durable after the cursor advances.
-        var operation_budget: usize = 5;
+        var operation_budget: usize = 6;
         try std.testing.expect(!try cleanupClusterBackupAttemptIncrementally(
             alloc,
             io,

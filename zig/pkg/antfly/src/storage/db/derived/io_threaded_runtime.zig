@@ -204,11 +204,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn waitForAllWithVisibilityWait(
         self: *@This(),
         sequence: u64,
-        cancellation: types.CancellationToken,
-        deadline_ns: ?u64,
+        wait: runtime_types.VisibilityWait,
     ) !void {
-        _ = cancellation;
-        _ = deadline_ns;
+        _ = wait;
         return try self.waitForAll(sequence);
     }
 
@@ -223,11 +221,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self: *@This(),
         sequence: u64,
         index_names: []const []const u8,
-        cancellation: types.CancellationToken,
-        deadline_ns: ?u64,
+        wait: runtime_types.VisibilityWait,
     ) !void {
-        _ = cancellation;
-        _ = deadline_ns;
+        _ = wait;
         return try self.waitForIndexes(sequence, index_names);
     }
 } else struct {
@@ -623,14 +619,13 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForAll(self: *DerivedRuntime, sequence: u64) !void {
-        return try self.waitForAllWithVisibilityWait(sequence, .none, null);
+        return try self.waitForAllWithVisibilityWait(sequence, .{});
     }
 
     pub fn waitForAllWithVisibilityWait(
         self: *DerivedRuntime,
         sequence: u64,
-        cancellation: types.CancellationToken,
-        deadline_ns: ?u64,
+        wait: runtime_types.VisibilityWait,
     ) !void {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
@@ -691,7 +686,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.mutex.unlock(io);
                     io.sleep(Io.Duration.zero, .awake) catch {};
                     self.mutex.lockUncancelable(io);
-                    try checkVisibilityWait(cancellation, deadline_ns);
+                    try wait.check();
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -713,7 +708,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 return;
             }
-            try checkVisibilityWait(cancellation, deadline_ns);
+            try wait.check();
             self.mutex.unlock(io);
             io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
             self.mutex.lockUncancelable(io);
@@ -721,15 +716,14 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForIndexes(self: *DerivedRuntime, sequence: u64, index_names: []const []const u8) !void {
-        return try self.waitForIndexesWithVisibilityWait(sequence, index_names, .none, null);
+        return try self.waitForIndexesWithVisibilityWait(sequence, index_names, .{});
     }
 
     pub fn waitForIndexesWithVisibilityWait(
         self: *DerivedRuntime,
         sequence: u64,
         index_names: []const []const u8,
-        cancellation: types.CancellationToken,
-        deadline_ns: ?u64,
+        wait: runtime_types.VisibilityWait,
     ) !void {
         if (index_names.len == 0) return;
         const io = self.ioContext();
@@ -796,7 +790,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.mutex.unlock(io);
                     io.sleep(Io.Duration.zero, .awake) catch {};
                     self.mutex.lockUncancelable(io);
-                    try checkVisibilityWait(cancellation, deadline_ns);
+                    try wait.check();
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -818,7 +812,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 return;
             }
-            try checkVisibilityWait(cancellation, deadline_ns);
+            try wait.check();
             self.mutex.unlock(io);
             io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
             self.mutex.lockUncancelable(io);
@@ -843,24 +837,23 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 };
 
-fn checkVisibilityWait(cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
-    if (cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-    if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.EnrichmentWaitTimeout;
-    }
-}
-
 test "derived enrichment visibility guard observes cancellation and deadline" {
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.EnrichmentWaitCanceled,
-        checkVisibilityWait(types.CancellationToken.fromAtomic(&cancelled), null),
+        (runtime_types.VisibilityWait{ .cancellation = types.CancellationToken.fromAtomic(&cancelled) }).check(),
     );
     cancelled.store(false, .release);
     try std.testing.expectError(
         error.EnrichmentWaitTimeout,
-        checkVisibilityWait(.none, platform_time.monotonicNs()),
+        (runtime_types.VisibilityWait{ .deadline_ns = platform_time.monotonicNs() }).check(),
     );
+    var clock = @import("antfly_platform").clock.ManualClock{};
+    clock.setRealtimeNs(100);
+    const wait = runtime_types.VisibilityWait{ .clock = clock.clock(), .deadline_ns = 200 };
+    try wait.check();
+    clock.setRealtimeNs(200);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, wait.check());
 }
 
 fn workerStep(worker: *Worker) ?u64 {
@@ -1672,7 +1665,7 @@ test "io threaded deferred source capture advances empty targets only through co
     var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager);
     defer runtime.deinit();
     try runtime.addWorker("dense", .{ .name = "dense", .kind = .dense_vector }, 0);
-    try runtime.waitForAllWithVisibilityWait(1, .none, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    try runtime.waitForAllWithVisibilityWait(1, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
     try std.testing.expectEqual(@as(u64, 2), capture.empty_coverage_checks.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.begin_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));

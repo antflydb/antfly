@@ -1507,7 +1507,37 @@ pub const RaftApplyStore = struct {
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         try self.waitForGenerationPreparationLocked(shard, group_id);
-        try self.writeBatchLocked(shard, group_id, commit_index, entries_bytes);
+        self.writeBatchLocked(shard, group_id, commit_index, entries_bytes) catch |err| {
+            if (!builtin.is_test and err == error.ConflictingDataApplyBatch) {
+                self.logConflictingBatch(shard, group_id, commit_index, entries_bytes);
+            }
+            return err;
+        };
+    }
+
+    fn logConflictingBatch(self: *RaftApplyStore, shard: *BatchShard, group_id: u64, commit_index: u64, bytes: []const u8) void {
+        std.log.err("data apply conflict group_id={d} incoming_commit={d} persisted_commit={d}", .{
+            group_id, commit_index, if (shard.batches.get(group_id)) |batch| batch.commit_index else 0,
+        });
+        self.logBatchIdentities(group_id, "incoming", bytes);
+        const group_store = (self.groupStoreLocked(shard, group_id, false) catch return) orelse return;
+        var key_buf: [128]u8 = undefined;
+        const key = keyForGroup(&key_buf, group_id) catch return;
+        const persisted = group_store.store.get(self.alloc, key) catch return;
+        defer self.alloc.free(persisted);
+        if (persisted.len >= 8) self.logBatchIdentities(group_id, "persisted", persisted[8..]);
+    }
+
+    fn logBatchIdentities(self: *RaftApplyStore, group_id: u64, source: []const u8, bytes: []const u8) void {
+        const entries = raft_state_machine.decodeCommittedEntries(self.alloc, bytes) catch return;
+        defer self.alloc.free(entries);
+        for (entries, 0..) |entry, i| {
+            // Bound fatal diagnostics without logging document payloads.
+            if (i >= 8 and i + 1 != entries.len) continue;
+            std.log.err("data apply conflict identity group_id={d} source={s} index={d} term={d} type={s} bytes={d} digest={x}", .{
+                group_id, source, entry.index, entry.term, @tagName(entry.entry_type), entry.data.len, std.hash.Wyhash.hash(0, entry.data),
+            });
+        }
     }
 
     fn writeBatchLocked(

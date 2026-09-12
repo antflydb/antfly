@@ -2207,6 +2207,11 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.MetadataMutationNotApplied) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_applied);
+            try ctx.setHeader("Retry-After", "1");
+            return ctx.status(503).text("metadata mutation was superseded before application; retry on the current leader");
+        }
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.InvalidRestoreProgressRequest)
             return ctx.status(400).text("invalid restore progress request");
@@ -3021,6 +3026,7 @@ pub const MetadataHttpServer = struct {
     fn metadataUpdateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         self.tableOperations().updateSchema(ctx.allocator, requestContext(ctx), table_name, (try ctx.body()) orelse "") catch |err| switch (err) {
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
@@ -3058,6 +3064,7 @@ pub const MetadataHttpServer = struct {
         ) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.SchemaVersionChanged, error.TableGenerationChanged => return ctx.status(409).text("schema version changed"),
+            error.SchemaInUse => return ctx.status(409).text("prepared transactions still use the current storage mode; resolve them before changing it"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
@@ -3445,6 +3452,7 @@ const ParsedRuntimeIndexStatus = struct {
     doc_count: ?u64 = null,
     term_count: ?u64 = null,
     edge_count: ?u64 = null,
+    graph_counts_pending: ?bool = null,
     node_count: ?u64 = null,
     root_node: ?u64 = null,
     publication_target_count: ?u64 = null,
@@ -3895,6 +3903,7 @@ fn cloneParsedRuntimeIndexStatus(
         .doc_count = parsed.doc_count orelse 0,
         .term_count = parsed.term_count orelse 0,
         .edge_count = parsed.edge_count orelse 0,
+        .graph_counts_pending = parsed.graph_counts_pending orelse false,
         .node_count = parsed.node_count orelse 0,
         .root_node = parsed.root_node orelse 0,
         .publication_target_count = parsed.publication_target_count orelse 0,
@@ -7098,6 +7107,19 @@ test "invalid forwarded table mutation never preflights or campaigns" {
         routes.Routes.raft_mutation_outcome_not_proposed,
         response.headers.get(routes.Routes.raft_mutation_outcome_header).?,
     );
+}
+
+test "table topology mutation non-application response never claims non-admission" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+    var response = try MetadataHttpServer.metadataMutationError(&ctx, error.MetadataMutationNotApplied);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_not_applied, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+    try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
 }
 
 test "metadata mutation pre-admission responses prove proposal was not admitted" {

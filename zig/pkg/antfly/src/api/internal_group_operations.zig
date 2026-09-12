@@ -1,7 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0.
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Transport-neutral operations for internal group coordination.
 
@@ -26,6 +35,8 @@ const platform_time = @import("antfly_platform").time;
 pub const Error = operation.ApiError || error{
     TopologyChanged,
     IdentityReadGenerationChanged,
+    IndexGenerationMismatch,
+    GenerationTransitionActive,
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
@@ -38,6 +49,7 @@ pub const Error = operation.ApiError || error{
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
+    TransactionTooLarge,
     EnrichmentWaitCanceled,
     EnrichmentWaitTimeout,
     EnrichmentRetryInProgress,
@@ -144,6 +156,8 @@ pub const Operations = struct {
             error.Cancelled, error.Canceled => error.Canceled,
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+            error.IndexGenerationMismatch => error.IndexGenerationMismatch,
+            error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
             error.CatalogRoutingUnavailable,
@@ -494,6 +508,8 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
+            error.TransactionTooLarge => return error.TransactionTooLarge,
+            error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -832,6 +848,26 @@ pub const Operations = struct {
             return mapCommonReadError(err) orelse error.Internal) orelse error.NotFound;
     }
 
+    /// Stream group-local NDJSON with transport backpressure. The source starts
+    /// the sink only after route/table admission succeeds, so callers can still
+    /// return a normal error response for a missing table.
+    pub fn scanStream(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        group_id: u64,
+        table_name: []const u8,
+        from: []const u8,
+        to: []const u8,
+        options: db_mod.types.ScanOptions,
+        sink: table_reads.ScanStreamSink,
+    ) Error!bool {
+        try request.ensureActive();
+        const reads = try self.routedReads(alloc, request, group_id);
+        return reads.scanGroupLocalStream(alloc, group_id, table_name, from, to, options, .read_index, sink) catch |err|
+            return mapCommonReadError(err) orelse error.Internal;
+    }
+
     /// Execute a schema-routed group-local query. The returned response owns
     /// its JSON buffer and must be deinitialized with `alloc`.
     pub fn query(
@@ -898,6 +934,7 @@ pub const Operations = struct {
         return (reads.graphHydrateGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
+                error.InvalidArgument => error.InvalidArgument,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1670,6 +1707,8 @@ test "typed internal query workers preserve identity generation validation" {
 
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.GenerationTransitionActive, Operations.mapCommonReadError(error.GenerationTransitionActive).?);
+    try std.testing.expectEqual(error.IndexGenerationMismatch, Operations.mapCommonReadError(error.IndexGenerationMismatch).?);
     try std.testing.expectEqual(
         error.DeadlineExceeded,
         Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,

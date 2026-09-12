@@ -725,6 +725,15 @@ pub const ArtifactStore = struct {
             ctx: *anyopaque,
             consume: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
         ) anyerror!void = null,
+        /// Optional physical-row decoder supplied by the storage integration.
+        /// Keeping this at the seam lets candidate scans pin the row's exact
+        /// immutable schema epoch without teaching the resolver about formats.
+        materialize_row: ?*const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            key: []const u8,
+            value: []const u8,
+        ) anyerror![]u8 = null,
     };
 
     pub fn get(self: ArtifactStore, allocator: std.mem.Allocator, key: []const u8) anyerror!?[]u8 {
@@ -745,6 +754,15 @@ pub const ArtifactStore = struct {
     ) anyerror!void {
         const f = self.vtable.scan_prefix orelse return error.ScanUnsupported;
         return f(self.ptr, lower, upper, ctx, consume);
+    }
+    pub fn materializeRow(
+        self: ArtifactStore,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        value: []const u8,
+    ) anyerror![]u8 {
+        const f = self.vtable.materialize_row orelse return allocator.dupe(u8, value);
+        return f(self.ptr, allocator, key, value);
     }
 };
 

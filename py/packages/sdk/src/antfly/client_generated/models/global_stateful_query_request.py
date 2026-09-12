@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
     from ..models.geo_distance_query import GeoDistanceQuery
     from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_metric_query import GraphMetricQuery
+    from ..models.graph_metric_rerank import GraphMetricRerank
     from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
@@ -298,6 +300,12 @@ class GlobalStatefulQueryRequest:
             Has minor performance overhead — not recommended for production traffic.
         reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
             'cohere', 'model': 'rerank-v4.0-pro', 'field': 'content'}.
+        graph_metric (GraphMetricQuery | Unset): Reads a published graph metric. Score-bearing graph metric queries on
+            multi-shard tables require a globally coordinated metric snapshot and otherwise return
+            graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
+        graph_metric_rerank (GraphMetricRerank | Unset): Blends a published graph metric into hit scores. Multi-shard
+            tables require a globally coordinated metric snapshot and otherwise return
+            graph_metric_global_materialization_required.
         analyses (Analyses | Unset):
         graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
             contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
@@ -502,6 +510,8 @@ class GlobalStatefulQueryRequest:
     count: bool | Unset = UNSET
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
+    graph_metric: GraphMetricQuery | Unset = UNSET
+    graph_metric_rerank: GraphMetricRerank | Unset = UNSET
     analyses: Analyses | Unset = UNSET
     graph_queries: GraphQueries | Unset = UNSET
     document_renderer: str | Unset = UNSET
@@ -780,6 +790,14 @@ class GlobalStatefulQueryRequest:
         if not isinstance(self.reranker, Unset):
             reranker = self.reranker.to_dict()
 
+        graph_metric: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric, Unset):
+            graph_metric = self.graph_metric.to_dict()
+
+        graph_metric_rerank: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric_rerank, Unset):
+            graph_metric_rerank = self.graph_metric_rerank.to_dict()
+
         analyses: dict[str, Any] | Unset = UNSET
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
@@ -869,6 +887,10 @@ class GlobalStatefulQueryRequest:
             field_dict["profile"] = profile
         if reranker is not UNSET:
             field_dict["reranker"] = reranker
+        if graph_metric is not UNSET:
+            field_dict["graph_metric"] = graph_metric
+        if graph_metric_rerank is not UNSET:
+            field_dict["graph_metric_rerank"] = graph_metric_rerank
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
         if graph_queries is not UNSET:
@@ -902,6 +924,8 @@ class GlobalStatefulQueryRequest:
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
         from ..models.geo_distance_query import GeoDistanceQuery
         from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_metric_query import GraphMetricQuery
+        from ..models.graph_metric_rerank import GraphMetricRerank
         from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
@@ -1739,6 +1763,20 @@ class GlobalStatefulQueryRequest:
         else:
             reranker = RerankerConfig.from_dict(_reranker)
 
+        _graph_metric = d.pop("graph_metric", UNSET)
+        graph_metric: GraphMetricQuery | Unset
+        if isinstance(_graph_metric, Unset):
+            graph_metric = UNSET
+        else:
+            graph_metric = GraphMetricQuery.from_dict(_graph_metric)
+
+        _graph_metric_rerank = d.pop("graph_metric_rerank", UNSET)
+        graph_metric_rerank: GraphMetricRerank | Unset
+        if isinstance(_graph_metric_rerank, Unset):
+            graph_metric_rerank = UNSET
+        else:
+            graph_metric_rerank = GraphMetricRerank.from_dict(_graph_metric_rerank)
+
         _analyses = d.pop("analyses", UNSET)
         analyses: Analyses | Unset
         if isinstance(_analyses, Unset):
@@ -1818,6 +1856,8 @@ class GlobalStatefulQueryRequest:
             count=count,
             profile=profile,
             reranker=reranker,
+            graph_metric=graph_metric,
+            graph_metric_rerank=graph_metric_rerank,
             analyses=analyses,
             graph_queries=graph_queries,
             document_renderer=document_renderer,

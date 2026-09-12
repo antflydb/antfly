@@ -95,6 +95,16 @@ const TestBeforeDurableSnapshotCaptureHook = *const fn (?*anyopaque, *HBCIndex) 
 var test_before_durable_snapshot_capture_ctx: ?*anyopaque = null;
 var test_before_durable_snapshot_capture_hook: ?TestBeforeDurableSnapshotCaptureHook = null;
 
+const TestCheckpointBuildClaimHook = *const fn (?*anyopaque, *HBCIndex) void;
+var test_checkpoint_build_claim_ctx: ?*anyopaque = null;
+var test_checkpoint_build_claim_hook: ?TestCheckpointBuildClaimHook = null;
+
+pub fn setTestCheckpointBuildClaimHook(ctx: ?*anyopaque, hook: ?TestCheckpointBuildClaimHook) void {
+    if (!builtin.is_test) return;
+    test_checkpoint_build_claim_ctx = ctx;
+    test_checkpoint_build_claim_hook = hook;
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -5231,6 +5241,10 @@ pub const HBCIndex = struct {
     experimental_posting_delta_base_state: ?*ExperimentalPostingReadState = null,
     experimental_posting_write_store: ?posting_segment_store_mod.Store = null,
     experimental_posting_checkpoint_build: ?*ExperimentalPostingCheckpointBuild = null,
+    /// Serializes ownership transfer of the asynchronous checkpoint build.
+    /// Write, idle-maintenance, and recovery lanes can all observe one
+    /// completed build; only one may detach and destroy it.
+    experimental_posting_checkpoint_build_mu: std.atomic.Mutex = .unlocked,
     native_acceleration_retry: NativeAccelerationRetry = .{},
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
     experimental_posting_capture_started_ns: u64 = 0,
@@ -8278,9 +8292,8 @@ pub const HBCIndex = struct {
     }
 
     fn deinitWithBackendDisposition(self: *HBCIndex, abandon_after_crash: bool) void {
-        if (!abandon_after_crash and self.experimental_posting_checkpoint_build != null) {
-            self.experimental_posting_checkpoint_build.?.force_progress.store(true, .release);
-            self.experimental_posting_checkpoint_build.?.awaitCompletion();
+        if (!abandon_after_crash and self.experimentalPostingCheckpointBuildPresent()) {
+            _ = self.forceExperimentalPostingCheckpointBuild(true);
             if (self.experimental_posting_write_store) |*posting_store| {
                 _ = self.publishCompletedExperimentalPostingCheckpointBuild(posting_store) catch |err| {
                     // The committed WAL remains authoritative. Graceful close
@@ -8976,7 +8989,15 @@ pub const HBCIndex = struct {
         var total_values: usize = 0;
         var total_leaf_scan_costs: usize = 0;
         var immutable_root: ?*ExperimentalPostingReadGeneration = null;
-        const preparation_boundary = if (self.experimental_posting_checkpoint_build) |build| build.rebase_source else null;
+        const preparation_boundary: ?*ExperimentalPostingReadGeneration = blk: {
+            lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+            defer self.experimental_posting_checkpoint_build_mu.unlock();
+            const build = self.experimental_posting_checkpoint_build orelse break :blk null;
+            const boundary = build.rebase_source orelse break :blk null;
+            boundary.retain();
+            break :blk boundary;
+        };
+        defer if (preparation_boundary) |boundary| boundary.release();
         var current: ?*ExperimentalPostingReadGeneration = newest;
         while (current) |generation| : (current = generation.parent) {
             if (generation == preparation_boundary) {
@@ -9406,9 +9427,33 @@ pub const HBCIndex = struct {
     }
 
     fn discardExperimentalPostingCheckpointBuild(self: *HBCIndex) void {
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
         const build = self.experimental_posting_checkpoint_build orelse return;
         self.experimental_posting_checkpoint_build = null;
         build.deinit();
+    }
+
+    pub fn experimentalPostingCheckpointBuildPresent(self: *HBCIndex) bool {
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
+        return self.experimental_posting_checkpoint_build != null;
+    }
+
+    fn forceExperimentalPostingCheckpointBuild(self: *HBCIndex, await_completion: bool) bool {
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
+        const build = self.experimental_posting_checkpoint_build orelse return false;
+        build.force_progress.store(true, .release);
+        if (await_completion) build.awaitCompletion();
+        return true;
+    }
+
+    pub fn experimentalPostingCheckpointBuildCompleted(self: *HBCIndex) bool {
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
+        const build = self.experimental_posting_checkpoint_build orelse return false;
+        return build.completed.load(.acquire);
     }
 
     fn startExperimentalPostingCheckpointBuild(
@@ -9416,6 +9461,11 @@ pub const HBCIndex = struct {
         posting_store: *posting_segment_store_mod.Store,
         kind_override: ?ExperimentalPostingCheckpointKind,
     ) !bool {
+        // Reserve the build slot for the complete construction and task
+        // handoff. Publication and teardown may run from independent
+        // maintenance/recovery notifications.
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
         if (self.experimental_posting_checkpoint_build != null) return false;
         const checkpoint = posting_store.checkpoint orelse return false;
         const source_generation = self.retainCurrentExperimentalPostingReadGeneration() orelse return false;
@@ -9536,8 +9586,16 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         posting_store: *posting_segment_store_mod.Store,
     ) !bool {
+        // Multiple maintenance lanes may be notified for the same completed
+        // build. Hold the ownership lock through the handoff and destructor so
+        // a second lane cannot read a build after the first one frees it.
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
         const build = self.experimental_posting_checkpoint_build orelse return false;
         if (!build.completed.load(.acquire)) return false;
+        // Test-only synchronization point used to prove that teardown cannot
+        // reclaim a build after a publisher has acquired its pointer.
+        self.notifyCheckpointBuildClaimedForTest();
         build.awaitCompletion();
         if (build.build_error == null and build.staged_readers != null and build.rebase_source == null and
             !build.force_progress.load(.acquire) and
@@ -9783,12 +9841,10 @@ pub const HBCIndex = struct {
         // fence, and waiting would turn corpus I/O into a foreground/replay
         // stall. The WAL's independent format limit remains the final explicit
         // backpressure boundary if the promoted builder cannot keep up.
-        if (self.experimental_posting_checkpoint_build) |build| {
-            if (!build.completed.load(.acquire) and
-                posting_store.wal_committed_bytes >= managedPostingCheckpointHardWalBytes)
-            {
-                build.force_progress.store(true, .release);
-            }
+        if (posting_store.wal_committed_bytes >= managedPostingCheckpointHardWalBytes and
+            !self.experimentalPostingCheckpointBuildCompleted())
+        {
+            _ = self.forceExperimentalPostingCheckpointBuild(false);
         }
         _ = try self.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
         const next_overlay_collapse = std.math.add(
@@ -9810,7 +9866,7 @@ pub const HBCIndex = struct {
                 });
             }
         }
-        if (self.experimental_posting_checkpoint_build == null and
+        if (!self.experimentalPostingCheckpointBuildPresent() and
             posting_store.checkpoint != null and
             (self.rowRepackDue() or shouldStartExperimentalPostingCheckpoint(
                 posting_store.wal_committed_bytes,
@@ -9844,7 +9900,7 @@ pub const HBCIndex = struct {
         }
         const posting_store = &self.experimental_posting_write_store.?;
         const generation_before = posting_store.latestSegmentGeneration() orelse 0;
-        const build_before = self.experimental_posting_checkpoint_build != null;
+        const build_before = self.experimentalPostingCheckpointBuildPresent();
         try self.maintainExperimentalPostingCheckpoint(posting_store);
         const compact_obsolete_scans = blk: {
             const generation = self.retainCurrentExperimentalPostingReadGeneration() orelse break :blk false;
@@ -9858,7 +9914,7 @@ pub const HBCIndex = struct {
         // A bounded chain alone is not a reason to rewrite it; measured dead
         // serving rows, however, must eventually be reclaimed even if no new
         // WAL traffic arrives. That build still yields to foreground work.
-        if (self.experimental_posting_checkpoint_build == null and
+        if (!self.experimentalPostingCheckpointBuildPresent() and
             (self.rowRepackDue() or compact_obsolete_scans or shouldStartExperimentalPostingIdleCheckpoint(
                 posting_store.wal_committed_bytes,
                 posting_store.deltaSegmentCount(),
@@ -9868,7 +9924,7 @@ pub const HBCIndex = struct {
         }
         const generation_after = posting_store.latestSegmentGeneration() orelse 0;
         const progressed = generation_after != generation_before or
-            (!build_before and self.experimental_posting_checkpoint_build != null);
+            (!build_before and self.experimentalPostingCheckpointBuildPresent());
         // `posting_store` is dead after this point. Detachment may close and
         // recreate its borrowed storage handle without invalidating a caller.
         self.drainLegacyLsmDetachAfterNativeActivationBestEffort();
@@ -9888,8 +9944,7 @@ pub const HBCIndex = struct {
         {
             return false;
         }
-        const build = self.experimental_posting_checkpoint_build orelse return false;
-        if (!build.completed.load(.acquire)) return false;
+        if (!self.experimentalPostingCheckpointBuildCompleted()) return false;
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
@@ -9928,7 +9983,7 @@ pub const HBCIndex = struct {
         }
         const posting_store = &self.experimental_posting_write_store.?;
         _ = try self.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
-        if (self.experimental_posting_checkpoint_build != null) return true;
+        if (self.experimentalPostingCheckpointBuildPresent()) return true;
         if (!shouldStartExperimentalPostingReadinessCheckpoint(
             posting_store.wal_has_state_records,
             posting_store.deltaSegmentCount(),
@@ -9941,9 +9996,7 @@ pub const HBCIndex = struct {
     /// lifecycle fence; ordinary background checkpoints remain preemptible by
     /// foreground queries.
     pub fn finishExperimentalPostingCheckpointForReadiness(self: *HBCIndex) !bool {
-        const build = self.experimental_posting_checkpoint_build orelse return false;
-        build.force_progress.store(true, .release);
-        build.awaitCompletion();
+        if (!self.forceExperimentalPostingCheckpointBuild(true)) return false;
         if (self.experimental_posting_write_store == null) {
             self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         }
@@ -10063,7 +10116,7 @@ pub const HBCIndex = struct {
                 // on this response path. Only WAL authority needs mandatory
                 // native capacity recovery.
                 const wal_authoritative = self.experimental_posting_wal_authoritative.load(.acquire);
-                if (wal_authoritative and self.experimental_posting_checkpoint_build == null) {
+                if (wal_authoritative and !self.experimentalPostingCheckpointBuildPresent()) {
                     _ = self.startExperimentalPostingCheckpointBuild(
                         &self.experimental_posting_write_store.?,
                         .full,
@@ -10076,11 +10129,7 @@ pub const HBCIndex = struct {
                         });
                     };
                 }
-                if (wal_authoritative) {
-                    if (self.experimental_posting_checkpoint_build) |build| {
-                        build.force_progress.store(true, .release);
-                    }
-                }
+                if (wal_authoritative) _ = self.forceExperimentalPostingCheckpointBuild(false);
                 return first_err;
             }
             self.closeExperimentalPostingWalWriter();
@@ -10376,6 +10425,8 @@ pub const HBCIndex = struct {
 
     fn observeCompletedCheckpointCaptureOverlap(self: *HBCIndex) void {
         if (!self.experimental_posting_capture_enabled) return;
+        lockAtomic(&self.experimental_posting_checkpoint_build_mu);
+        defer self.experimental_posting_checkpoint_build_mu.unlock();
         const build = self.experimental_posting_checkpoint_build orelse return;
         if (!build.completed.load(.acquire) and build.rebase_source == null) return;
         const overlap = nowNs() -| @max(self.experimental_posting_capture_started_ns, build.completed_ns);
@@ -12631,7 +12682,7 @@ pub const HBCIndex = struct {
             self.write_session_depth != 0 or
             self.experimental_posting_capture_enabled or
             self.experimental_posting_maintenance_capture_active or
-            self.experimental_posting_checkpoint_build != null)
+            self.experimentalPostingCheckpointBuildPresent())
         {
             return;
         }
@@ -12691,8 +12742,7 @@ pub const HBCIndex = struct {
         // Initial acceleration is finite publication work, not optional
         // reclustering. It must make progress even if fallback queries keep
         // arriving before accelerated readiness; memory admission still holds.
-        if (self.experimental_posting_checkpoint_build) |build|
-            build.force_progress.store(true, .release);
+        _ = self.forceExperimentalPostingCheckpointBuild(false);
         return requested;
     }
 
@@ -12737,10 +12787,10 @@ pub const HBCIndex = struct {
         if (!self.nativePostingBaseHasVectors()) return try self.requestInitialNativePostingBase();
         if (!self.nativePostingAccelerationPending() or self.write_session_depth != 0 or self.experimental_posting_capture_enabled)
             return false;
-        if (self.experimental_posting_checkpoint_build != null) return false;
+        if (self.experimentalPostingCheckpointBuildPresent()) return false;
         if (self.experimental_posting_write_store == null) self.experimental_posting_write_store = try self.openExperimentalPostingStore();
         const requested = try self.startExperimentalPostingCheckpointBuild(&self.experimental_posting_write_store.?, null);
-        if (self.experimental_posting_checkpoint_build) |build| build.force_progress.store(true, .release);
+        _ = self.forceExperimentalPostingCheckpointBuild(false);
         return requested;
     }
 
@@ -13496,6 +13546,13 @@ pub const HBCIndex = struct {
         if (!builtin.is_test) return;
         if (test_before_durable_snapshot_capture_hook) |hook| {
             hook(test_before_durable_snapshot_capture_ctx, self);
+        }
+    }
+
+    fn notifyCheckpointBuildClaimedForTest(self: *HBCIndex) void {
+        if (!builtin.is_test) return;
+        if (test_checkpoint_build_claim_hook) |hook| {
+            hook(test_checkpoint_build_claim_ctx, self);
         }
     }
 
@@ -29186,6 +29243,67 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             try Fixture.checkpoint(&idx, .delta);
             try Fixture.checkpoint(&idx, .full);
             try Fixture.check(&idx, deleted[0..4]);
+
+            // Hold a publisher after it has acquired the build pointer, then
+            // race teardown against that held pointer. The old implementation
+            // frees the build here; the publisher resumes with a dangling
+            // pointer. The ownership lock makes teardown wait until handoff
+            // completes.
+            try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, .full));
+            const concurrent_build = idx.experimental_posting_checkpoint_build.?;
+            concurrent_build.awaitCompletion();
+            try concurrent_build.stageReaders();
+            const PublishRace = struct {
+                index: *HBCIndex,
+                claimed: std.atomic.Value(bool) = .init(false),
+                allow_resume: std.atomic.Value(bool) = .init(false),
+                discard_started: std.atomic.Value(bool) = .init(false),
+                discard_finished: std.atomic.Value(bool) = .init(false),
+                publish_failed: std.atomic.Value(bool) = .init(false),
+
+                fn onClaim(raw_ctx: ?*anyopaque, _: *HBCIndex) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+                    self.claimed.store(true, .release);
+                    while (!self.allow_resume.load(.acquire)) std.atomic.spinLoopHint();
+                }
+
+                fn publish(self: *@This()) void {
+                    _ = self.index.publishReadyExperimentalPostingCheckpointForRecovery() catch {
+                        self.publish_failed.store(true, .release);
+                        return;
+                    };
+                }
+
+                fn discard(self: *@This()) void {
+                    self.discard_started.store(true, .release);
+                    self.index.discardExperimentalPostingCheckpointBuild();
+                    self.discard_finished.store(true, .release);
+                }
+            };
+            var race = PublishRace{ .index = &idx };
+            setTestCheckpointBuildClaimHook(&race, PublishRace.onClaim);
+            defer setTestCheckpointBuildClaimHook(null, null);
+            var publisher: ?std.Io.Future(void) = null;
+            var discarder: ?std.Io.Future(void) = null;
+            defer {
+                race.allow_resume.store(true, .release);
+                if (publisher) |*task| task.await(runtime.io());
+                if (discarder) |*task| task.await(runtime.io());
+            }
+            publisher = try runtime.io().concurrent(PublishRace.publish, .{&race});
+            while (!race.claimed.load(.acquire)) {
+                try runtime.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+            discarder = try runtime.io().concurrent(PublishRace.discard, .{&race});
+            while (!race.discard_started.load(.acquire)) {
+                try runtime.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            }
+            race.allow_resume.store(true, .release);
+            publisher.?.await(runtime.io());
+            discarder.?.await(runtime.io());
+            try std.testing.expect(!race.publish_failed.load(.acquire));
+            try std.testing.expect(race.discard_finished.load(.acquire));
+            try std.testing.expect(!idx.experimentalPostingCheckpointBuildPresent());
 
             const pinned = idx.retainCurrentExperimentalPostingReadGeneration().?;
             defer pinned.release();

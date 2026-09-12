@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
@@ -56,6 +57,8 @@ const vector_block_mod = @import("antfly_vectorindex").vector_block;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const schema_api = @import("../../../schema/mod.zig");
+const schema_registry_mod = @import("../schema_registry.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import("../../lmdb.zig") else struct {
@@ -67,6 +70,8 @@ const lmdb = if (storage_build_options.lmdb_enabled or builtin.is_test) @import(
     };
 };
 const mapper = @import("../document_mapper.zig");
+const relational_store = @import("../relational_store.zig");
+const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
@@ -291,6 +296,8 @@ pub var test_before_vector_block_primary_snapshot_build: ?struct {
     call: *const fn (*anyopaque) anyerror!void,
 } = null;
 const sparse_backfill_batch_size: usize = 1024;
+const vector_backfill_page_items: usize = 1024;
+const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
@@ -611,17 +618,6 @@ const TextMergeBudgetAllocator = struct {
     }
 };
 
-fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
-            std.atomic.spinLoopHint();
-        } else {
-            @import("antfly_platform").time.yieldNow();
-        }
-    }
-}
-
 test "text merge bounded task allocator enforces live reservation" {
     var stats = PhaseAllocStats{};
     var tracking = PhaseTrackingAllocator.initBounded(std.testing.allocator, &stats, 64);
@@ -743,6 +739,36 @@ pub const TextPublicationPlan = struct {
     pub fn deinit(self: *TextPublicationPlan) void {
         if (self.chunks.len > 0) self.alloc.free(self.chunks);
         self.* = undefined;
+    }
+};
+
+/// Immutable full-text artifacts built after producer admission but before
+/// entering the per-index apply section. The catalog and analysis read locks
+/// pin every borrowed projection dependency while the segments are built;
+/// callers then validate TextPublicationContext once more before publishing.
+pub const PreparedTextMapperPublication = struct {
+    alloc: Allocator,
+    segment_alloc: Allocator,
+    segments: [][]u8 = &.{},
+    observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
+
+    pub fn deinit(self: *PreparedTextMapperPublication) void {
+        for (self.segments) |segment| {
+            if (segment.len > 0) self.segment_alloc.free(segment);
+        }
+        if (self.segments.len > 0) self.alloc.free(self.segments);
+        for (self.observed_field_analyzers) |item| {
+            self.alloc.free(item.field_name);
+            self.alloc.free(item.analyzer_name);
+        }
+        if (self.observed_field_analyzers.len > 0) self.alloc.free(self.observed_field_analyzers);
+        self.* = undefined;
+    }
+
+    pub fn estimate(self: PreparedTextMapperPublication) TextPublicationEstimate {
+        var byte_count: u64 = 0;
+        for (self.segments) |segment| byte_count +|= @intCast(segment.len);
+        return .{ .segment_count = @intCast(self.segments.len), .byte_count = byte_count };
     }
 };
 
@@ -1361,6 +1387,8 @@ pub const IndexManager = struct {
     hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
+    relational_base_rows: bool = false,
+    schema_registry: ?*schema_registry_mod.Registry = null,
     // The primary DocStore intentionally erases its concrete backend. Keep a
     // non-owning pointer to the DB-owned LSM solely for opportunistic derived
     // publication admission; explicit stable lifecycle fences do not consult
@@ -1410,6 +1438,17 @@ pub const IndexManager = struct {
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
     next_text_index_instance_id: std.atomic.Value(u64) = .init(1),
+    /// Process-local generation of the extraction plan consumed by writes.
+    /// Prepared batches compare this scalar instead of rereading and hashing
+    /// the serialized catalog under the DB apply lock.
+    write_plan_generation: std.atomic.Value(u64) = .init(1),
+    write_plan_cache_mutex: std.Io.Mutex = .init,
+    /// Non-zero while one request is constructing the immutable plan for a
+    /// cold generation. Publication is rare; acquisitions remain lock-free
+    /// apart from the short cache pointer fence and never duplicate the owned
+    /// catalog clone under a thundering herd.
+    write_plan_build_generation: std.atomic.Value(u64) = .init(0),
+    write_plan_cache: ?*WritePlanSnapshotEpoch = null,
     next_dense_capture_incarnation: std.atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
@@ -1421,6 +1460,18 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    graph_ownership_cleanup_cursor: usize = 0,
+    /// Lock-free cursors give bounded scheduler sweeps stable round-robin
+    /// fairness while the catalog shared lock keeps the indexed slices stable.
+    graph_metric_coordinator_cursor: std.atomic.Value(usize) = .init(0),
+    graph_metric_worker_cursor: std.atomic.Value(usize) = .init(0),
+    /// Worker snapshots pin the inline graph-index array after releasing the
+    /// catalog lock. Structural graph catalog mutations wait for these bounded
+    /// page quanta, while unrelated catalog readers and writers no longer wait
+    /// for an entire maintenance drain.
+    graph_metric_schedule_pins: std.atomic.Value(usize) = .init(0),
+    graph_metric_schedule_pin_mutex: std.Io.Mutex = .init,
+    graph_metric_schedule_pins_drained: std.Io.Condition = .init,
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -1678,7 +1729,8 @@ pub const IndexManager = struct {
         /// producer admission estimates while the caller waits for a permit.
         projection_revision: u64 = 1,
         apply_mutex: *std.atomic.Mutex,
-        merge_delta_mutex: std.atomic.Mutex = .unlocked,
+        io: std.Io,
+        merge_delta_mutex: std.Io.Mutex = .init,
         merge_deletion_states: std.ArrayListUnmanaged(*TextMergeDeletionState) = .empty,
         analysis_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
         config: types.IndexConfig,
@@ -1705,14 +1757,14 @@ pub const IndexManager = struct {
         }
 
         fn attachMergeDeletionState(self: *TextIndex, alloc: Allocator, state: *TextMergeDeletionState) !void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             try self.merge_deletion_states.append(alloc, state);
         }
 
         fn detachMergeDeletionState(self: *TextIndex, state: *const TextMergeDeletionState) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items, 0..) |candidate, i| {
                 if (candidate != state) continue;
                 _ = self.merge_deletion_states.orderedRemove(i);
@@ -1721,14 +1773,14 @@ pub const IndexManager = struct {
         }
 
         fn detachAllMergeDeletionStates(self: *TextIndex) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             self.merge_deletion_states.clearRetainingCapacity();
         }
 
         fn mergeDeletionStateCurrent(self: *TextIndex, state: *const TextMergeDeletionState) bool {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items) |candidate| {
                 if (candidate == state) return candidate.valid;
             }
@@ -1740,17 +1792,17 @@ pub const IndexManager = struct {
         /// makes the lower-level public batch helpers safe even when a caller
         /// omits the customary per-index apply lease.
         fn lockMergeDeletionStateCurrent(self: *TextIndex, state: *const TextMergeDeletionState) bool {
-            lockAtomicMutex(&self.merge_delta_mutex);
+            self.merge_delta_mutex.lockUncancelable(self.io);
             for (self.merge_deletion_states.items) |candidate| {
                 if (candidate == state and candidate.valid) return true;
             }
-            self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.unlock(self.io);
             return false;
         }
 
         fn recordCommittedDeletes(self: *TextIndex, delete_infos: []const index_mod.IndexWriter.DeleteInfo) void {
-            lockAtomicMutex(&self.merge_delta_mutex);
-            defer self.merge_delta_mutex.unlock();
+            self.merge_delta_mutex.lockUncancelable(self.io);
+            defer self.merge_delta_mutex.unlock(self.io);
             for (self.merge_deletion_states.items) |state| state.recordCommittedDeletes(delete_infos);
         }
     };
@@ -2730,6 +2782,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
+        metric_configs: []graph_mod.GraphMetricConfig,
         artifact_sources: []GraphArtifactSource = &.{},
         max_edges_per_document: u32 = 0,
         rebuild_root_path: []u8,
@@ -2891,6 +2944,7 @@ pub const IndexManager = struct {
             .dense_native_migration_policy_source = opts.dense_native_migration_policy_source,
             .dense_native_candidate_build_authorized = opts.dense_native_candidate_build_authorized,
             .primary_store = null,
+            .relational_base_rows = false,
             .applied_sequence_checkpoint_path = null,
             .vector_block_generation = null,
             .load_parallelism = null,
@@ -2937,18 +2991,18 @@ pub const IndexManager = struct {
         self.alloc.destroy(mutex);
     }
 
-    fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    fn lockAtomicWithBackoff(self: *const IndexManager, mutex: *std.atomic.Mutex) void {
         var attempts: usize = 0;
         while (!mutex.tryLock()) : (attempts += 1) {
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
             if (attempts < 64) {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            @import("antfly_platform").time.yieldNow();
+            // Yield through the injected runtime so callers running on fibers
+            // do not block an executor thread while another apply lane owns
+            // the mutex. The fallback IO remains valid for test-only managers
+            // which have not yet been attached to a DB runtime.
+            self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
@@ -2977,7 +3031,7 @@ pub const IndexManager = struct {
                 break :blk entry.apply_mutex;
             },
         };
-        lockAtomicWithBackoff(mutex);
+        self.lockAtomicWithBackoff(mutex);
         return .{
             .manager = self,
             .mutex = mutex,
@@ -2993,7 +3047,7 @@ pub const IndexManager = struct {
             entry.apply_mutex
         else
             return error.IndexNotFound;
-        lockAtomicWithBackoff(mutex);
+        self.lockAtomicWithBackoff(mutex);
         return .{
             .manager = self,
             .mutex = mutex,
@@ -3085,6 +3139,385 @@ pub const IndexManager = struct {
         }
     }
 
+    pub fn setRelationalBaseRows(self: *IndexManager, enabled: bool) void {
+        self.relational_base_rows = enabled;
+    }
+
+    pub fn setSchemaRegistry(self: *IndexManager, registry: *schema_registry_mod.Registry) void {
+        self.schema_registry = registry;
+    }
+
+    /// Snapshot the active schema identity without borrowing catalog state.
+    /// Prepared request-local projections use this together with the write-plan
+    /// generation to fail safely to AROW materialization after publication.
+    pub fn activeSchemaVersion(self: *IndexManager) ?u32 {
+        const registry = self.schema_registry orelse return null;
+        var view = registry.acquire() orelse return null;
+        defer view.release();
+        return view.version();
+    }
+
+    /// Decode one base row against the immutable layout version carried by the
+    /// row. Schema epochs are retained for the duration of decoding. Historical
+    /// epochs load on demand into the registry's bounded cache, avoiding eager
+    /// startup work, lifetime races, and unbounded schema-history residency.
+    pub fn materializeStoredValueAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+        );
+    }
+
+    fn acquireSchemaVersionView(self: *IndexManager, version: u32) !schema_registry_mod.SchemaView {
+        const registry = self.schema_registry orelse return error.SchemaRegistryUnavailable;
+        if (registry.acquireVersion(version)) |view| return view;
+        registry.lockHistoricalFault(version);
+        defer registry.unlockHistoricalFault(version);
+        if (registry.acquireVersion(version)) |view| return view;
+        const store = self.primary_store orelse return error.SchemaRegistryUnavailable;
+        const historical = try schema_mod.loadSchemaVersion(store, self.alloc, version) orelse
+            return error.UnknownSchemaVersion;
+        var historical_owned = true;
+        errdefer if (historical_owned) schema_mod.freeSchema(self.alloc, historical);
+        const epoch = try schema_registry_mod.Epoch.createOwned(self.alloc, historical);
+        historical_owned = false;
+        errdefer epoch.release();
+        return try registry.installHistorical(epoch);
+    }
+
+    /// Pins a bounded, scan-resistant cache of epochs encountered by a backfill.
+    /// Historical rows are common immediately after schema evolution; this
+    /// avoids per-row registry traffic without letting an adversarial archive
+    /// or long-lived scan retain every schema generation it encounters.
+    pub const SchemaViewSet = struct {
+        const max_resident_views = 32;
+        const Entry = struct {
+            view: schema_registry_mod.SchemaView,
+            access: u64,
+        };
+
+        manager: *IndexManager,
+        views: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+        clock: u64 = 0,
+        admission: @import("../schema_cache_admission.zig").Admission = .{},
+        transient: ?schema_registry_mod.SchemaView = null,
+
+        pub fn init(manager: *IndexManager) @This() {
+            return .{ .manager = manager };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.transient) |*view| view.release();
+            var values = self.views.valueIterator();
+            while (values.next()) |entry| entry.view.release();
+            self.views.deinit(self.manager.alloc);
+            self.* = undefined;
+        }
+
+        pub fn get(self: *@This(), version: u32) !*const schema_registry_mod.SchemaView {
+            self.admission.record(version);
+            self.clock +%= 1;
+            if (self.clock == 0) self.clock = 1;
+            if (self.views.getPtr(version)) |entry| {
+                entry.access = self.clock;
+                return &entry.view;
+            }
+            if (self.transient) |*view| {
+                if (view.version() == version) return view;
+            }
+            var view = try self.manager.acquireSchemaVersionView(version);
+            errdefer view.release();
+            if (self.views.count() >= max_resident_views) {
+                var candidate_version: ?u32 = null;
+                var candidate_access: u64 = std.math.maxInt(u64);
+                var iterator = self.views.iterator();
+                while (iterator.next()) |entry| {
+                    const frequency = self.admission.frequency(entry.key_ptr.*);
+                    const candidate_frequency = if (candidate_version) |candidate| self.admission.frequency(candidate) else 255;
+                    if (candidate_version == null or frequency < candidate_frequency or
+                        (frequency == candidate_frequency and entry.value_ptr.access < candidate_access))
+                    {
+                        candidate_version = entry.key_ptr.*;
+                        candidate_access = entry.value_ptr.access;
+                    }
+                }
+                if (!self.admission.admits(version, candidate_version.?)) {
+                    if (self.transient) |*previous| previous.release();
+                    self.transient = view;
+                    return &self.transient.?;
+                }
+                if (candidate_version) |evicted_version| {
+                    var evicted = self.views.fetchRemove(evicted_version).?.value;
+                    evicted.view.release();
+                }
+            }
+            try self.views.put(self.manager.alloc, version, .{ .view = view, .access = self.clock });
+            return &self.views.getPtr(version).?.view;
+        }
+    };
+
+    pub const MaterializedStoredDocument = struct {
+        value: []u8,
+        root: ?std.json.Value = null,
+        root_arena: ?*std.heap.ArenaAllocator = null,
+        retained_bytes: usize,
+
+        pub fn retainedBytes(self: *const @This()) usize {
+            return self.retained_bytes;
+        }
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.value);
+            if (self.root_arena) |arena| {
+                arena.deinit();
+                alloc.destroy(arena);
+            }
+            self.* = undefined;
+        }
+    };
+
+    pub fn materializeStoredDocumentWithSchemaViewsAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        schema_views: *SchemaViewSet,
+    ) !MaterializedStoredDocument {
+        if (!internal_keys.isRelationalRowKey(store_key)) {
+            const value = try alloc.dupe(u8, stored_value);
+            return .{ .value = value, .retained_bytes = value.len };
+        }
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        const view = try schema_views.get(version);
+        const row = if (self.primary_store != null and self.primary_store.?.valuesAreAuthenticated())
+            try relational_row_codec.ordinalRowViewTrusted(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            )
+        else
+            try relational_row_codec.ordinalRowView(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            );
+        var materialized = try row.materializeRootAlloc(alloc);
+        errdefer materialized.deinit(alloc);
+        // Text rebuilds never persist source JSON in their segments. Supply an
+        // owned empty slice for the generic MapperDoc lifetime contract while
+        // indexing directly from the typed root.
+        const empty_source = try alloc.alloc(u8, 0);
+        return .{
+            .value = empty_source,
+            .root = materialized.root,
+            .root_arena = materialized.root_arena,
+            .retained_bytes = materialized.retainedBytes(),
+        };
+    }
+
+    /// Batch-read variant that reuses a request-pinned active epoch. Rows from
+    /// older epochs still fall through to the historical registry lookup.
+    pub fn materializeStoredValueWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_store.decodeValueForSchemaAndLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+            );
+        };
+        return try self.materializeStoredValueAlloc(alloc, store_key, stored_value);
+    }
+
+    fn extractDenseVectorFromStoredAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        field_name: []const u8,
+        dims: u32,
+        schema_views: ?*SchemaViewSet,
+    ) !?[]f32 {
+        if (internal_keys.isRelationalRowKey(store_key)) {
+            const version = try relational_store.rowSchemaVersion(stored_value);
+            var owned_view: ?schema_registry_mod.SchemaView = null;
+            defer if (owned_view) |*view| view.release();
+            const view = if (schema_views) |views|
+                try views.get(version)
+            else blk: {
+                owned_view = try self.acquireSchemaVersionView(version);
+                break :blk &owned_view.?;
+            };
+            const ordinal = view.physicalLayout().ordinalForName(
+                view.tableSchema().relational_columns,
+                field_name,
+            ) orelse return null;
+            const column = view.tableSchema().relational_columns[ordinal];
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                ordinal,
+            )) orelse return null;
+            if (cell.is_null or cell.value != .bytes_val) return null;
+            if (column.column_type == .dense_vector) {
+                const vector = try relational_row_codec.decodeDenseVectorValueAlloc(alloc, cell.value.bytes_val);
+                errdefer alloc.free(vector);
+                if (vector.len != dims) return error.InvalidVectorDimensions;
+                return vector;
+            }
+            if (!cell.is_json) return null;
+            return try mapper.extractDenseVectorValue(alloc, cell.value.bytes_val, dims);
+        }
+        return try mapper.extractDenseVectorField(alloc, stored_value, field_name, dims);
+    }
+
+    fn extractSparseVectorFromStoredAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        field_name: []const u8,
+        schema_views: ?*SchemaViewSet,
+    ) !?mapper.SparseVectorData {
+        if (internal_keys.isRelationalRowKey(store_key)) {
+            const version = try relational_store.rowSchemaVersion(stored_value);
+            var owned_view: ?schema_registry_mod.SchemaView = null;
+            defer if (owned_view) |*view| view.release();
+            const view = if (schema_views) |views|
+                try views.get(version)
+            else blk: {
+                owned_view = try self.acquireSchemaVersionView(version);
+                break :blk &owned_view.?;
+            };
+            const ordinal = view.physicalLayout().ordinalForName(
+                view.tableSchema().relational_columns,
+                field_name,
+            ) orelse return null;
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                ordinal,
+            )) orelse return null;
+            if (cell.is_null or cell.value != .bytes_val or !cell.is_json) return null;
+            return try mapper.extractSparseVectorValue(alloc, cell.value.bytes_val);
+        }
+        return try mapper.extractSparseVectorField(alloc, stored_value, field_name);
+    }
+
+    pub fn projectStoredOrdinalFieldsWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_row_codec.projectOrdinalFieldsWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                fields,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
+    pub fn projectStoredOrdinalFieldsTrustedWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version) {
+            return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                fields,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
+    /// Use a projection compiled once for the active epoch. Historical rows
+    /// resolve through their own immutable schema version.
+    pub fn projectStoredOrdinalPlanTrustedWithPinnedSchemaAlloc(
+        self: *IndexManager,
+        alloc: Allocator,
+        store_key: []const u8,
+        stored_value: []const u8,
+        fields: []const []const u8,
+        plan: relational_row_codec.OrdinalProjectionPlan,
+        pinned: ?schema_registry_mod.SchemaView,
+    ) ![]u8 {
+        if (!internal_keys.isRelationalRowKey(store_key)) return try alloc.dupe(u8, stored_value);
+        const version = try relational_store.rowSchemaVersion(stored_value);
+        if (pinned) |view| if (view.version() == version and plan.schema_version == version) {
+            return try relational_row_codec.projectOrdinalPlanTrustedWithLayoutAlloc(
+                alloc,
+                stored_value,
+                view.tableSchema().*,
+                view.physicalLayout(),
+                plan,
+            );
+        };
+        var view = try self.acquireSchemaVersionView(version);
+        defer view.release();
+        return try relational_row_codec.projectOrdinalFieldsTrustedWithLayoutAlloc(
+            alloc,
+            stored_value,
+            view.tableSchema().*,
+            view.physicalLayout(),
+            fields,
+        );
+    }
+
     /// Status-only opens consume durable catalog and lifecycle records from the
     /// primary store, but never serve vectors or own native-file maintenance.
     /// Keep that observational binding separate from the runtime binding:
@@ -3107,7 +3540,7 @@ pub const IndexManager = struct {
 
     pub fn refreshSourcePayloadGeneration(self: *IndexManager) !void {
         if (self.source_payload_store == null) return;
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         defer self.vector_block_build_mu.unlock();
         const current = self.acquireVectorBlockGeneration() orelse return;
         defer current.release();
@@ -3251,7 +3684,7 @@ pub const IndexManager = struct {
         snapshot_sequence: u64,
     ) !bool {
         const storage = self.vector_block_storage orelse return true;
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         defer self.vector_block_build_mu.unlock();
 
         const root = try self.vectorBlockRootAlloc();
@@ -3313,7 +3746,7 @@ pub const IndexManager = struct {
     }
 
     fn acquireVectorBlockGeneration(self: *IndexManager) ?*SharedVectorBlockGeneration {
-        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         defer self.vector_block_generation_mu.unlock();
         const generation = self.vector_block_generation orelse return null;
         generation.retain();
@@ -3576,7 +4009,7 @@ pub const IndexManager = struct {
 
     fn installVectorBlockGeneration(self: *IndexManager, generation: *SharedVectorBlockGeneration) void {
         generation.opened.resource_manager = self.resource_manager;
-        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = generation;
         self.advanceVectorBlockPublicationRevision();
@@ -3600,7 +4033,7 @@ pub const IndexManager = struct {
     }
 
     fn clearVectorBlockGeneration(self: *IndexManager) void {
-        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_generation_mu);
         const previous = self.vector_block_generation;
         self.vector_block_generation = null;
         self.advanceVectorBlockPublicationRevision();
@@ -3839,7 +4272,7 @@ pub const IndexManager = struct {
     ) !bool {
         if (self.vector_block_storage == null) return false;
         if (self.vector_block_base_staging.load(.acquire)) return false;
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         var locked = true;
         defer if (locked) self.vector_block_build_mu.unlock();
         if (self.vector_block_base_staging.swap(true, .acq_rel)) return false;
@@ -3909,7 +4342,7 @@ pub const IndexManager = struct {
             var installed = false;
             defer if (!installed) generation.release();
 
-            lockAtomicWithBackoff(&self.vector_block_build_mu);
+            self.lockAtomicWithBackoff(&self.vector_block_build_mu);
             locked = true;
             const tip = self.acquireVectorBlockGeneration();
             const unchanged = tip == live and !self.vector_block_projection_dirty.load(.acquire);
@@ -4025,7 +4458,7 @@ pub const IndexManager = struct {
         // because its physical watermark trails the source handoff.
         if (!self.vector_block_projection_dirty.load(.acquire)) {
             const current_tip = blk: {
-                lockAtomicWithBackoff(&self.vector_block_build_mu);
+                self.lockAtomicWithBackoff(&self.vector_block_build_mu);
                 defer self.vector_block_build_mu.unlock();
                 const tip = primary.lastReplaySequence(0);
                 if (tip == applied_sequence) {
@@ -4076,7 +4509,7 @@ pub const IndexManager = struct {
             return;
         }
 
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         var build_mu_locked = true;
         defer if (build_mu_locked) self.vector_block_build_mu.unlock();
 
@@ -4197,7 +4630,7 @@ pub const IndexManager = struct {
         };
         defer build.deinit();
 
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         build_mu_locked = true;
         var publisher = vector_block_store_mod.Store.open(build_alloc, storage, root) catch |err| {
             if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
@@ -4292,7 +4725,7 @@ pub const IndexManager = struct {
         // The copied suffix and replacement readers are fully prepared. The
         // source proof and in-process generation must still be the same at
         // publication; no allocation or reader admission follows CURRENT.
-        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        self.lockAtomicWithBackoff(&self.vector_block_build_mu);
         build_mu_locked = true;
         const tip = self.acquireVectorBlockGeneration();
         const unchanged = tip == previous and was_dirty == self.vector_block_projection_dirty.load(.acquire) and
@@ -4372,7 +4805,7 @@ pub const IndexManager = struct {
         // query-ready, but is an authoritative repair source for the stable
         // posting transaction below.
         try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, applied_sequence);
-        lockAtomicWithBackoff(entry.apply_mutex);
+        self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
         // A streaming source window durably closes its write session before
         // the applied-sequence callback publishes the source_handoff capture.
@@ -4398,14 +4831,16 @@ pub const IndexManager = struct {
 
     /// Caller owns entry.apply_mutex. This quiescent maintenance path may build
     /// a missing vector base inline, but it still leaves bounded native delta
-    /// consolidation to the background lane.
-    fn finalizeVectorBlockBaseAtStableTipLocked(
+    /// consolidation to the background lane. False means another finalizer
+    /// owns the table-wide claim, not that this build lost its generation.
+    /// Never wait for that owner while holding an index's apply mutex.
+    fn tryFinalizeVectorBlockBaseAtStableTipLocked(
         self: *IndexManager,
         entry: *DenseIndex,
         applied_sequence: u64,
-    ) !void {
+    ) !bool {
         if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-            return error.VectorBlockGenerationReservationLost;
+            return false;
         self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
         self.vector_block_stable_tip_sequence.store(applied_sequence, .release);
         defer {
@@ -4419,6 +4854,7 @@ pub const IndexManager = struct {
             .validate_payloads = true,
             .flatten = true,
         });
+        return true;
     }
 
     pub const NativePostingStableTipOptions = struct {
@@ -4438,7 +4874,7 @@ pub const IndexManager = struct {
         options: NativePostingStableTipOptions,
     ) !bool {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
-        lockAtomicWithBackoff(entry.apply_mutex);
+        self.lockAtomicWithBackoff(entry.apply_mutex);
         defer entry.apply_mutex.unlock();
         return try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, options);
     }
@@ -4725,7 +5161,7 @@ pub const IndexManager = struct {
             }
         };
 
-        try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+        if (!try self.tryFinalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence)) return .pending;
         self.vector_block_candidate_sequence.store(0, .release);
         self.vector_block_candidate_since_ns.store(0, .release);
         return .progressed;
@@ -4829,6 +5265,9 @@ pub const IndexManager = struct {
     /// or the capability fingerprint is unchanged.
     pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
         if (schema_json.len == 0) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        var changed = false;
         for (self.algebraic_indexes.items) |*entry| {
             const cur = entry.index.config();
             const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
@@ -4894,7 +5333,745 @@ pub const IndexManager = struct {
             try entry.index.reloadConfigJson(merged_json);
             self.alloc.free(entry.config.config_json);
             entry.config.config_json = owned;
+            changed = true;
         }
+        if (changed) _ = self.write_plan_generation.fetchAdd(1, .release);
+    }
+
+    pub fn writePlanGeneration(self: *const IndexManager) u64 {
+        return self.write_plan_generation.load(.acquire);
+    }
+
+    pub const AssetContentTypeSnapshot = struct {
+        const Entry = struct {
+            name: []u8,
+            content_type: []u8,
+        };
+
+        alloc: Allocator,
+        entries: []Entry,
+
+        pub fn deinit(self: *AssetContentTypeSnapshot) void {
+            for (self.entries) |entry| {
+                self.alloc.free(entry.name);
+                self.alloc.free(entry.content_type);
+            }
+            self.alloc.free(self.entries);
+            self.* = undefined;
+        }
+
+        pub fn contentTypeAlloc(self: AssetContentTypeSnapshot, alloc: Allocator, name: []const u8) ![]u8 {
+            var lower: usize = 0;
+            var upper = self.entries.len;
+            while (lower < upper) {
+                const middle = lower + (upper - lower) / 2;
+                switch (std.mem.order(u8, self.entries[middle].name, name)) {
+                    .lt => lower = middle + 1,
+                    .gt => upper = middle,
+                    .eq => return try alloc.dupe(u8, self.entries[middle].content_type),
+                }
+            }
+            return try alloc.dupe(u8, "application/octet-stream");
+        }
+    };
+
+    /// Capture the only catalog data required by artifact projection. The
+    /// returned snapshot is request-owned, so scans never retain the catalog
+    /// lock while reading rows or decoding artifact payloads.
+    pub fn assetContentTypeSnapshotAlloc(self: *IndexManager, alloc: Allocator) !AssetContentTypeSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        var asset_count: usize = 0;
+        for (self.enrichments.items) |entry| if (entry.kind == .asset) {
+            asset_count += 1;
+        };
+        const entries = try alloc.alloc(AssetContentTypeSnapshot.Entry, asset_count);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |entry| {
+                alloc.free(entry.name);
+                alloc.free(entry.content_type);
+            }
+            alloc.free(entries);
+        }
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            const name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(name);
+            const content_type = try alloc.dupe(
+                u8,
+                if (entry.content_type.len > 0) entry.content_type else "text/plain",
+            );
+            entries[initialized] = .{ .name = name, .content_type = content_type };
+            initialized += 1;
+        }
+        std.mem.sort(AssetContentTypeSnapshot.Entry, entries, {}, struct {
+            fn lessThan(_: void, lhs: AssetContentTypeSnapshot.Entry, rhs: AssetContentTypeSnapshot.Entry) bool {
+                return std.mem.lessThan(u8, lhs.name, rhs.name);
+            }
+        }.lessThan);
+        return .{ .alloc = alloc, .entries = entries };
+    }
+
+    pub const DenseFieldWritePlan = struct {
+        index_name: []u8,
+        field_name: []u8,
+        dims: u32,
+    };
+
+    pub const SparseFieldWritePlan = struct {
+        index_name: []u8,
+        field_name: []u8,
+    };
+
+    pub const GraphFieldEdgeWritePlan = struct {
+        edge_type: []u8,
+        field_name: []u8,
+    };
+
+    pub const GraphFieldWritePlan = struct {
+        index_name: []u8,
+        coverage_generation: u64,
+        edges: []GraphFieldEdgeWritePlan,
+    };
+
+    /// Fully-owned extraction inputs for one immutable catalog generation.
+    /// Foreground preparation never borrows live index entries after this is
+    /// built, so catalog publication is independent of batch size.
+    pub const WritePlanSnapshot = struct {
+        alloc: Allocator,
+        generation: u64,
+        /// Artifact-only text indexes consume generated records, not base rows.
+        has_text_consumers: bool = false,
+        text_requires_root: bool = true,
+        text_fields: [][]u8 = &.{},
+        dense_fields: []DenseFieldWritePlan,
+        sparse_fields: []SparseFieldWritePlan,
+        graph_fields: []GraphFieldWritePlan,
+        /// Catalog-derived provider work compiled once for this generation.
+        /// Per-row planning only substitutes the document identity and removes
+        /// consumers already satisfied by explicit/direct vectors.
+        generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// For each chunk template, indexes of embedding templates consuming
+        /// its artifact. Compiling this adjacency once avoids an all-template
+        /// scan for every chunk of every row.
+        chunk_dependents: [][]u32,
+
+        pub fn deinit(self: *WritePlanSnapshot) void {
+            for (self.text_fields) |field| self.alloc.free(field);
+            if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
+            for (self.dense_fields) |field| {
+                self.alloc.free(field.index_name);
+                self.alloc.free(field.field_name);
+            }
+            self.alloc.free(self.dense_fields);
+            for (self.sparse_fields) |field| {
+                self.alloc.free(field.index_name);
+                self.alloc.free(field.field_name);
+            }
+            self.alloc.free(self.sparse_fields);
+            for (self.graph_fields) |graph| {
+                self.alloc.free(graph.index_name);
+                for (graph.edges) |edge| {
+                    self.alloc.free(edge.edge_type);
+                    self.alloc.free(edge.field_name);
+                }
+                self.alloc.free(graph.edges);
+            }
+            self.alloc.free(self.graph_fields);
+            for (self.chunk_dependents) |dependents| if (dependents.len > 0) self.alloc.free(dependents);
+            self.alloc.free(self.chunk_dependents);
+            enrichment_types.deinitGeneratedRequests(self.alloc, self.generated_templates);
+            self.* = undefined;
+        }
+
+        pub fn graphCoverageGeneration(self: WritePlanSnapshot, index_name: []const u8) ?u64 {
+            for (self.graph_fields) |graph|
+                if (std.mem.eql(u8, graph.index_name, index_name)) return graph.coverage_generation;
+            return null;
+        }
+
+        fn cloneDense(alloc: Allocator, entry: DenseIndex) !DenseFieldWritePlan {
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            return .{
+                .index_name = index_name,
+                .field_name = try alloc.dupe(u8, entry.field_name),
+                .dims = entry.dims,
+            };
+        }
+
+        fn cloneSparse(alloc: Allocator, entry: SparseIndex) !SparseFieldWritePlan {
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            return .{
+                .index_name = index_name,
+                .field_name = try alloc.dupe(u8, entry.field_name),
+            };
+        }
+
+        fn cloneGraphEdge(
+            alloc: Allocator,
+            edge_type: []const u8,
+            field_name: []const u8,
+        ) !GraphFieldEdgeWritePlan {
+            const owned_edge_type = try alloc.dupe(u8, edge_type);
+            errdefer alloc.free(owned_edge_type);
+            return .{
+                .edge_type = owned_edge_type,
+                .field_name = try alloc.dupe(u8, field_name),
+            };
+        }
+
+        fn cloneGraph(alloc: Allocator, entry: GraphIndex) !GraphFieldWritePlan {
+            var edge_count: usize = 0;
+            for (entry.edge_type_configs) |edge| if (edge.field_name != null) {
+                edge_count += 1;
+            };
+            const edges = try alloc.alloc(GraphFieldEdgeWritePlan, edge_count);
+            var edge_initialized: usize = 0;
+            errdefer {
+                for (edges[0..edge_initialized]) |edge| {
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.field_name);
+                }
+                alloc.free(edges);
+            }
+            for (entry.edge_type_configs) |edge| if (edge.field_name) |field_name| {
+                edges[edge_initialized] = try cloneGraphEdge(alloc, edge.name, field_name);
+                edge_initialized += 1;
+            };
+            return .{
+                .index_name = try alloc.dupe(u8, entry.config.name),
+                .coverage_generation = entry.config.coverage_generation,
+                .edges = edges,
+            };
+        }
+
+        fn appendDenseField(
+            alloc: Allocator,
+            field: DenseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            row: relational_row_codec.OrdinalRowView,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            const vector = (try mapper.extractDenseVectorFieldFromPrepared(alloc, row, root, field.field_name, field.dims)) orelse return;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        fn appendSparseField(
+            alloc: Allocator,
+            field: SparseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, field.field_name)) orelse return;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+
+        pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            root: std.json.Value,
+            row: relational_row_codec.OrdinalRowView,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            for (self.dense_fields) |field| {
+                if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
+                try appendDenseField(alloc, field, doc_key, root, row, extracted);
+            }
+            for (self.sparse_fields) |field| {
+                if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
+                try appendSparseField(alloc, field, doc_key, root, extracted);
+            }
+        }
+
+        fn generatedConsumerSatisfied(
+            extracted: mapper.ExtractedWrite,
+            kind: enrichment_types.GeneratedEnrichmentKind,
+            index_name: []const u8,
+        ) bool {
+            return switch (kind) {
+                .dense_embedding => hasExplicitDenseEmbedding(extracted.dense_embeddings, index_name),
+                .sparse_embedding => hasExplicitSparseEmbedding(extracted.sparse_embeddings, index_name),
+                .chunk_text, .asset => false,
+            };
+        }
+
+        fn generatedEmbeddingRequired(
+            extracted: mapper.ExtractedWrite,
+            request: enrichment_types.GeneratedEnrichmentRequest,
+        ) bool {
+            if (request.kind != .dense_embedding and request.kind != .sparse_embedding) return false;
+            if (request.consumer_indexes.len == 0)
+                return !generatedConsumerSatisfied(extracted, request.kind, request.index_name);
+            for (request.consumer_indexes) |consumer|
+                if (!generatedConsumerSatisfied(extracted, request.kind, consumer)) return true;
+            return false;
+        }
+
+        fn generatedChunkRequired(
+            self: WritePlanSnapshot,
+            extracted: mapper.ExtractedWrite,
+            template_index: usize,
+        ) bool {
+            const request = self.generated_templates[template_index];
+            if (request.kind != .chunk_text) return false;
+            if (request.persist_artifact or request.full_text_index or request.consumer_indexes.len > 0) return true;
+            for (self.chunk_dependents[template_index]) |dependent_index| {
+                const consumer = self.generated_templates[dependent_index];
+                if (!generatedEmbeddingRequired(extracted, consumer)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        fn generatedTemplateRequired(
+            self: WritePlanSnapshot,
+            extracted: mapper.ExtractedWrite,
+            template_index: usize,
+        ) bool {
+            const request = self.generated_templates[template_index];
+            return switch (request.kind) {
+                .dense_embedding, .sparse_embedding => generatedEmbeddingRequired(extracted, request),
+                .chunk_text => self.generatedChunkRequired(extracted, template_index),
+                // Asset enrichments are explicit producers in their own right,
+                // not merely implementation details of an index consumer.
+                .asset => true,
+            };
+        }
+
+        /// Instantiate an owned generated-work plan without consulting the live
+        /// catalog. The template's consumer set is narrowed so a user-supplied
+        /// vector is never overwritten while other consumers can still share
+        /// the same generated artifact.
+        pub fn planGeneratedEnrichmentsForRow(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+        ) ![]enrichment_types.GeneratedEnrichmentRequest {
+            var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+            errdefer {
+                for (requests.items) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+                requests.deinit(alloc);
+            }
+            for (self.generated_templates, 0..) |template, template_index| {
+                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+
+                var request = try enrichment_types.cloneGeneratedRequest(alloc, template);
+                errdefer enrichment_types.freeGeneratedRequest(alloc, request);
+                const owned_doc_key = try alloc.dupe(u8, doc_key);
+                alloc.free(request.doc_key);
+                request.doc_key = owned_doc_key;
+
+                if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
+                    var consumers = std.ArrayListUnmanaged([]u8).empty;
+                    errdefer {
+                        for (consumers.items) |consumer| alloc.free(consumer);
+                        consumers.deinit(alloc);
+                    }
+                    for (request.consumer_indexes) |consumer| {
+                        if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                        const owned_consumer = try alloc.dupe(u8, consumer);
+                        consumers.append(alloc, owned_consumer) catch |err| {
+                            alloc.free(owned_consumer);
+                            return err;
+                        };
+                    }
+                    const owned_consumers = try consumers.toOwnedSlice(alloc);
+                    for (request.consumer_indexes) |consumer| alloc.free(consumer);
+                    if (request.consumer_indexes.len > 0) alloc.free(request.consumer_indexes);
+                    request.consumer_indexes = owned_consumers;
+                }
+                try requests.append(alloc, request);
+            }
+            return try requests.toOwnedSlice(alloc);
+        }
+
+        /// Request-local view of immutable templates. Only the request array
+        /// and filtered consumer pointer arrays are allocated; configuration
+        /// strings and consumer names stay borrowed from the pinned epoch.
+        pub const BorrowedGeneratedRowPlan = struct {
+            alloc: Allocator,
+            requests: []enrichment_types.GeneratedEnrichmentRequest,
+
+            pub fn deinit(self: *@This()) void {
+                for (self.requests) |request| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        self.alloc.free(request.consumer_indexes);
+                }
+                if (self.requests.len > 0) self.alloc.free(self.requests);
+                self.* = undefined;
+            }
+        };
+
+        pub fn planGeneratedEnrichmentsForRowBorrowed(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            extracted: mapper.ExtractedWrite,
+        ) !BorrowedGeneratedRowPlan {
+            var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+            errdefer {
+                for (requests.items) |request| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        alloc.free(request.consumer_indexes);
+                }
+                requests.deinit(alloc);
+            }
+            for (self.generated_templates, 0..) |template, template_index| {
+                if (!self.generatedTemplateRequired(extracted, template_index)) continue;
+                var request = template;
+                request.doc_key = doc_key;
+                if (request.kind == .dense_embedding or request.kind == .sparse_embedding) {
+                    request.consumer_indexes = &.{};
+                    if (template.consumer_indexes.len > 0) {
+                        var consumers = std.ArrayListUnmanaged([]u8).empty;
+                        errdefer consumers.deinit(alloc);
+                        for (template.consumer_indexes) |consumer| {
+                            if (generatedConsumerSatisfied(extracted, request.kind, consumer)) continue;
+                            try consumers.append(alloc, consumer);
+                        }
+                        request.consumer_indexes = try consumers.toOwnedSlice(alloc);
+                    }
+                }
+                requests.append(alloc, request) catch |err| {
+                    if ((request.kind == .dense_embedding or request.kind == .sparse_embedding) and
+                        request.consumer_indexes.len > 0)
+                        alloc.free(request.consumer_indexes);
+                    return err;
+                };
+            }
+            return .{ .alloc = alloc, .requests = try requests.toOwnedSlice(alloc) };
+        }
+    };
+
+    pub fn writePlanSnapshotAlloc(self: *IndexManager, alloc: Allocator) !WritePlanSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        var text_fields = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (text_fields.items) |field| alloc.free(field);
+            text_fields.deinit(alloc);
+        }
+        var text_requires_root = false;
+        for (self.text_indexes.items) |*entry| {
+            if (textEntryHasExplicitArtifactSources(entry)) continue;
+            if (entry.selected_field) |field| {
+                if (std.mem.indexOfAny(u8, field, "*[]/") != null) {
+                    text_requires_root = true;
+                    continue;
+                }
+                var found = false;
+                for (text_fields.items) |existing| if (std.mem.eql(u8, existing, field)) {
+                    found = true;
+                    break;
+                };
+                if (!found) {
+                    const owned = try alloc.dupe(u8, field);
+                    errdefer alloc.free(owned);
+                    try text_fields.append(alloc, owned);
+                }
+            } else text_requires_root = true;
+        }
+
+        const dense_fields = try alloc.alloc(DenseFieldWritePlan, self.dense_indexes.items.len);
+        var dense_initialized: usize = 0;
+        errdefer {
+            for (dense_fields[0..dense_initialized]) |field| {
+                alloc.free(field.index_name);
+                alloc.free(field.field_name);
+            }
+            alloc.free(dense_fields);
+        }
+        for (self.dense_indexes.items, 0..) |entry, i| {
+            dense_fields[i] = try WritePlanSnapshot.cloneDense(alloc, entry);
+            dense_initialized += 1;
+        }
+
+        const sparse_fields = try alloc.alloc(SparseFieldWritePlan, self.sparse_indexes.items.len);
+        var sparse_initialized: usize = 0;
+        errdefer {
+            for (sparse_fields[0..sparse_initialized]) |field| {
+                alloc.free(field.index_name);
+                alloc.free(field.field_name);
+            }
+            alloc.free(sparse_fields);
+        }
+        for (self.sparse_indexes.items, 0..) |entry, i| {
+            sparse_fields[i] = try WritePlanSnapshot.cloneSparse(alloc, entry);
+            sparse_initialized += 1;
+        }
+
+        const graph_fields = try alloc.alloc(GraphFieldWritePlan, self.graph_indexes.items.len);
+        var graph_initialized: usize = 0;
+        errdefer {
+            for (graph_fields[0..graph_initialized]) |graph| {
+                alloc.free(graph.index_name);
+                for (graph.edges) |edge| {
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.field_name);
+                }
+                alloc.free(graph.edges);
+            }
+            alloc.free(graph_fields);
+        }
+        for (self.graph_indexes.items, 0..) |entry, i| {
+            graph_fields[i] = try WritePlanSnapshot.cloneGraph(alloc, entry);
+            graph_initialized += 1;
+        }
+        const generated_templates = try self.planGeneratedEnrichments(alloc, "", "{}", &.{}, &.{});
+        errdefer enrichment_types.deinitGeneratedRequests(alloc, generated_templates);
+        const chunk_dependents = try alloc.alloc([]u32, generated_templates.len);
+        @memset(chunk_dependents, &.{});
+        var chunk_dependents_initialized: usize = 0;
+        errdefer {
+            for (chunk_dependents[0..chunk_dependents_initialized]) |dependents|
+                if (dependents.len > 0) alloc.free(dependents);
+            alloc.free(chunk_dependents);
+        }
+        for (generated_templates, 0..) |template, template_index| {
+            if (template.kind != .chunk_text) {
+                chunk_dependents_initialized += 1;
+                continue;
+            }
+            var dependent_count: usize = 0;
+            for (generated_templates) |consumer| {
+                if (consumer.kind != .dense_embedding and consumer.kind != .sparse_embedding) continue;
+                if (std.mem.eql(u8, consumer.artifact_name, template.artifact_name)) dependent_count += 1;
+            }
+            if (dependent_count > 0) {
+                const dependents = try alloc.alloc(u32, dependent_count);
+                errdefer alloc.free(dependents);
+                var dependent_index: usize = 0;
+                for (generated_templates, 0..) |consumer, consumer_index| {
+                    if (consumer.kind != .dense_embedding and consumer.kind != .sparse_embedding) continue;
+                    if (!std.mem.eql(u8, consumer.artifact_name, template.artifact_name)) continue;
+                    dependents[dependent_index] = std.math.cast(u32, consumer_index) orelse
+                        return error.InvalidArgument;
+                    dependent_index += 1;
+                }
+                chunk_dependents[template_index] = dependents;
+            }
+            chunk_dependents_initialized += 1;
+        }
+        return .{
+            .alloc = alloc,
+            .generation = self.writePlanGeneration(),
+            .has_text_consumers = blk: {
+                for (self.text_indexes.items) |*entry| {
+                    if (!textEntryHasExplicitArtifactSources(entry)) break :blk true;
+                }
+                break :blk false;
+            },
+            .dense_fields = dense_fields,
+            .sparse_fields = sparse_fields,
+            .graph_fields = graph_fields,
+            .generated_templates = generated_templates,
+            .chunk_dependents = chunk_dependents,
+            .text_requires_root = text_requires_root,
+            .text_fields = try text_fields.toOwnedSlice(alloc),
+        };
+    }
+
+    const WritePlanSnapshotEpoch = struct {
+        ref_count: std.atomic.Value(usize) = .init(1),
+        value: WritePlanSnapshot,
+
+        fn retain(self: *@This()) void {
+            const previous = self.ref_count.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0);
+        }
+
+        fn release(self: *@This()) void {
+            const previous = self.ref_count.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous != 1) return;
+            const alloc = self.value.alloc;
+            self.value.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    pub const WritePlanSnapshotView = struct {
+        epoch: *WritePlanSnapshotEpoch,
+
+        pub fn plan(self: @This()) *const WritePlanSnapshot {
+            return &self.epoch.value;
+        }
+
+        pub fn generation(self: @This()) u64 {
+            return self.epoch.value.generation;
+        }
+
+        pub fn release(self: *@This()) void {
+            self.epoch.release();
+            self.* = undefined;
+        }
+    };
+
+    /// Pin the immutable extraction generation. The expensive owned clone is
+    /// shared by all requests in a catalog epoch and rebuilt lazily only after
+    /// a durable index/enrichment publication advances the generation.
+    pub fn acquireWritePlanSnapshot(self: *IndexManager) !WritePlanSnapshotView {
+        while (true) {
+            const target_generation = self.writePlanGeneration();
+            self.write_plan_cache_mutex.lockUncancelable(self.checkpointIo());
+            if (self.write_plan_cache) |cached| if (cached.value.generation == target_generation) {
+                cached.retain();
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
+                return .{ .epoch = cached };
+            };
+            self.write_plan_cache_mutex.unlock(self.checkpointIo());
+
+            if (self.write_plan_build_generation.cmpxchgStrong(
+                0,
+                target_generation,
+                .acq_rel,
+                .acquire,
+            ) != null) {
+                // This path can execute on an std.Io fiber. Yield through the
+                // injected runtime so a cold-plan single-flight never parks an
+                // executor thread behind the builder.
+                self.checkpointIo().sleep(.fromNanoseconds(1), .awake) catch {};
+                continue;
+            }
+            defer self.write_plan_build_generation.store(0, .release);
+
+            // Clone under the catalog's shared publication fence, but outside
+            // the cache mutex. The single-flight generation token keeps cold
+            // callers from multiplying this allocation-heavy work.
+            var snapshot = try self.writePlanSnapshotAlloc(self.alloc);
+            errdefer snapshot.deinit();
+            const replacement = try self.alloc.create(WritePlanSnapshotEpoch);
+            errdefer self.alloc.destroy(replacement);
+            replacement.* = .{ .value = snapshot };
+
+            self.write_plan_cache_mutex.lockUncancelable(self.checkpointIo());
+            const current_generation = self.writePlanGeneration();
+            if (self.write_plan_cache) |cached| if (cached.value.generation == current_generation) {
+                cached.retain();
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
+                replacement.release();
+                return .{ .epoch = cached };
+            };
+            if (snapshot.generation != current_generation) {
+                self.write_plan_cache_mutex.unlock(self.checkpointIo());
+                replacement.release();
+                continue;
+            }
+
+            const displaced = self.write_plan_cache;
+            self.write_plan_cache = replacement;
+            replacement.retain();
+            self.write_plan_cache_mutex.unlock(self.checkpointIo());
+            if (displaced) |old| old.release();
+            return .{ .epoch = replacement };
+        }
+    }
+
+    test "immutable write plan cache shares an epoch and retires safely" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        var first = try manager.acquireWritePlanSnapshot();
+        defer first.release();
+        var same = try manager.acquireWritePlanSnapshot();
+        defer same.release();
+        try std.testing.expect(first.plan() == same.plan());
+
+        _ = manager.write_plan_generation.fetchAdd(1, .release);
+        var next = try manager.acquireWritePlanSnapshot();
+        defer next.release();
+        try std.testing.expect(first.plan() != next.plan());
+        try std.testing.expectEqual(first.generation() + 1, next.generation());
+        try std.testing.expectEqual(@as(usize, 0), first.plan().dense_fields.len);
+        try std.testing.expect(!first.plan().has_text_consumers);
+    }
+
+    test "schema view set reuses transient epoch without consulting the registry" {
+        var manager = try IndexManager.init(std.testing.allocator, ".");
+        defer manager.deinit();
+        var views = SchemaViewSet.init(&manager);
+        defer views.deinit();
+        const epoch = try schema_registry_mod.Epoch.createCloned(std.testing.allocator, .{ .version = 77 });
+        views.transient = .{ .epoch = epoch };
+        for (0..256) |_| {
+            const view = try views.get(77);
+            try std.testing.expect(view.epoch == epoch);
+            try std.testing.expectEqual(@as(usize, 1), epoch.ref_count.load(.monotonic));
+        }
+        // No registry is installed: a real miss must attempt the loader rather
+        // than returning a cached epoch with the wrong schema identity.
+        try std.testing.expectError(error.SchemaRegistryUnavailable, views.get(78));
+        try std.testing.expectEqual(@as(u32, 77), views.transient.?.version());
+    }
+
+    test "borrowed generated row plan preserves chunk consumer routing" {
+        var consumers = [_][]u8{ @constCast("text-index"), @constCast("graph-index") };
+        var templates = [_]enrichment_types.GeneratedEnrichmentRequest{.{
+            .kind = .chunk_text,
+            .index_name = "text-index",
+            .artifact_name = "chunks",
+            .doc_key = "",
+            .source_field = "body",
+            .consumer_indexes = &consumers,
+        }};
+        var dependents = [_][]u32{&.{}};
+        const snapshot = WritePlanSnapshot{
+            .alloc = std.testing.allocator,
+            .generation = 1,
+            .dense_fields = &.{},
+            .sparse_fields = &.{},
+            .graph_fields = &.{},
+            .generated_templates = &templates,
+            .chunk_dependents = &dependents,
+        };
+        var plan = try snapshot.planGeneratedEnrichmentsForRowBorrowed(
+            std.testing.allocator,
+            "doc:1",
+            .{
+                .cleaned_value = @constCast("{}"),
+                .graph_writes = &.{},
+                .mentioned_graph_indexes = &.{},
+                .dense_embeddings = &.{},
+                .sparse_embeddings = &.{},
+            },
+        );
+        defer plan.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), plan.requests.len);
+        try std.testing.expectEqualStrings("doc:1", plan.requests[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 2), plan.requests[0].consumer_indexes.len);
+        try std.testing.expect(plan.requests[0].consumer_indexes.ptr == consumers[0..].ptr);
     }
 
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
@@ -5038,6 +6215,9 @@ pub const IndexManager = struct {
     }
 
     pub fn resetDenseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
+        // The caller must drain catalog readers before replacing inline index
+        // storage. Apply serialization alone does not exclude native publishers.
+        std.debug.assert(self.published_dense_admission.load(.acquire) == @as(u32, 1) << 31);
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
@@ -5096,6 +6276,7 @@ pub const IndexManager = struct {
         deleteIndexDirIfPresent(path);
 
         entry.index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, entry.config.name, .{
+            .managed_ownership_range = true,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .reverse_backend = self.graph_reverse_backend,
@@ -5108,6 +6289,7 @@ pub const IndexManager = struct {
             .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
             .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
         });
+        entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
@@ -5217,10 +6399,31 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(self.alloc, entry.metric_configs);
         for (entry.artifact_sources) |*source| source.deinit(self.alloc);
         if (entry.artifact_sources.len > 0) self.alloc.free(entry.artifact_sources);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
+    }
+
+    fn waitForGraphMetricSchedulePins(self: *IndexManager) void {
+        if (self.io) |io| {
+            self.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+            defer self.graph_metric_schedule_pin_mutex.unlock(io);
+            while (self.graph_metric_schedule_pins.load(.acquire) != 0) {
+                self.graph_metric_schedule_pins_drained.waitUncancelable(io, &self.graph_metric_schedule_pin_mutex);
+            }
+            return;
+        }
+        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) {
+            if (self.graph_metric_schedule_pins.load(.acquire) != 0)
+                @panic("cannot drain graph metric schedule pins without an I/O coordinator");
+            return;
+        }
+        // Manually configured managers may not own an executor. Their worker
+        // sweeps are normally synchronous; retain the established teardown
+        // fallback for a structural mutation racing such a sweep.
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) std.Thread.yield() catch {};
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -5245,6 +6448,11 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        self.waitForGraphMetricSchedulePins();
+        if (self.write_plan_cache) |cached| {
+            self.write_plan_cache = null;
+            cached.release();
+        }
         self.clearVectorBlockGeneration();
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
@@ -5763,7 +6971,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
 
         for (self.text_indexes.items) |*entry| {
-            lockAtomicWithBackoff(entry.apply_mutex);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             entry.analysis_mutex.lockExclusive();
             defer entry.analysis_mutex.unlockExclusive();
@@ -6009,7 +7217,7 @@ pub const IndexManager = struct {
         self: *IndexManager,
         admissions: []const docstore_mod.OwnedKVPair,
     ) !void {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         self.clearManagedAdmissionSnapshot();
         try self.managed_admission_indexes.ensureTotalCapacity(self.alloc, @intCast(admissions.len));
@@ -6025,7 +7233,7 @@ pub const IndexManager = struct {
     }
 
     pub fn clearManagedAdmissionSnapshotForIndex(self: *IndexManager, name: []const u8) void {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         if (self.managed_admission_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
     }
@@ -6037,7 +7245,7 @@ pub const IndexManager = struct {
             names.deinit(self.alloc);
         }
         {
-            lockAtomicWithBackoff(&self.managed_admission_mutex);
+            self.lockAtomicWithBackoff(&self.managed_admission_mutex);
             defer self.managed_admission_mutex.unlock();
             try names.ensureTotalCapacity(self.alloc, self.managed_admission_indexes.count());
             var it = self.managed_admission_indexes.keyIterator();
@@ -6047,7 +7255,7 @@ pub const IndexManager = struct {
     }
 
     fn managedAdmissionPending(self: *IndexManager, name: []const u8) bool {
-        lockAtomicWithBackoff(&self.managed_admission_mutex);
+        self.lockAtomicWithBackoff(&self.managed_admission_mutex);
         defer self.managed_admission_mutex.unlock();
         return self.managed_admission_indexes.contains(name);
     }
@@ -6702,6 +7910,12 @@ pub const IndexManager = struct {
 
     pub fn updateRange(self: *IndexManager, byte_range: docstore_mod.ByteRange) void {
         self.byte_range = byte_range;
+        for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
+    }
+
+    pub fn validateRangeTransition(self: *IndexManager, byte_range: docstore_mod.ByteRange) !void {
+        if (std.mem.eql(u8, self.byte_range.start, byte_range.start) and std.mem.eql(u8, self.byte_range.end, byte_range.end)) return;
+        for (self.graph_indexes.items) |*entry| try entry.index.validateOwnershipRange(byte_range.start, byte_range.end);
     }
 
     pub fn syncAll(self: *IndexManager, force: bool) !void {
@@ -7967,6 +9181,979 @@ pub const IndexManager = struct {
         return steps;
     }
 
+    pub fn runGraphMetricMaintenance(self: *IndexManager) !usize {
+        var total_steps: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                if (cfg.refresh != .background) continue;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+                switch (status.state) {
+                    .not_ready, .stale, .failed => {
+                        var published = entry.index.runGraphMetric(cfg.name) catch |err| switch (err) {
+                            error.GraphMetricDisabled => continue,
+                            else => return err,
+                        };
+                        published.deinit(entry.index.alloc);
+                        total_steps += 1;
+                    },
+                    .disabled, .fresh, .building => {},
+                }
+            }
+        }
+        return total_steps;
+    }
+
+    pub fn refreshGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.enableGraphMetric(metric_name);
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.graphMetricStatus(metric_name);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.pauseGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.resumeGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.ensureGraphMetricPlannedBuild(metric_name, target_generation);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetric(metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        err: anyerror,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.failGraphMetricPlannedBuild(metric_name, err);
+    }
+
+    pub fn runGraphMetricPlannedDrain(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+        options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedDrain(metric_name, target_generation, options);
+    }
+
+    pub const GraphMetricPlannedSchedulerSweepOptions = struct {
+        max_metrics: usize = 64,
+        start_background_builds: bool = true,
+        now_ms: ?u64 = null,
+        auto_idle_options: ?GraphMetricPlannedAutoIdleOptions = null,
+    };
+
+    pub const GraphMetricPlannedWorkerSweepOptions = struct {
+        worker_id: []const u8,
+        max_pages: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    const GraphMetricScheduleEntry = struct {
+        entry: *GraphIndex,
+        config: *const graph_mod.GraphMetricConfig,
+    };
+
+    const GraphMetricWorkerSnapshotEntry = struct {
+        entry: *GraphIndex,
+        metric_name: []const u8,
+        lifecycle_canonical: bool,
+    };
+
+    const GraphMetricWorkerSnapshot = struct {
+        manager: *IndexManager,
+        entries: []GraphMetricWorkerSnapshotEntry,
+        names: []u8,
+
+        fn deinit(self: *@This()) void {
+            self.manager.alloc.free(self.names);
+            self.manager.alloc.free(self.entries);
+            if (self.manager.io) |io| {
+                self.manager.graph_metric_schedule_pin_mutex.lockUncancelable(io);
+                const prior = self.manager.graph_metric_schedule_pins.fetchSub(1, .release);
+                std.debug.assert(prior != 0);
+                if (prior == 1) self.manager.graph_metric_schedule_pins_drained.broadcast(io);
+                self.manager.graph_metric_schedule_pin_mutex.unlock(io);
+            } else {
+                const prior = self.manager.graph_metric_schedule_pins.fetchSub(1, .release);
+                std.debug.assert(prior != 0);
+            }
+            self.* = undefined;
+        }
+    };
+
+    fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const metric_count = self.graphMetricScheduleEntryCount();
+        const entry_count = metric_count + self.graph_indexes.items.len;
+        const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, entry_count);
+        errdefer self.alloc.free(entries);
+        var names_len: usize = 0;
+        for (self.graph_indexes.items) |entry| {
+            for (entry.metric_configs) |config| names_len = std.math.add(usize, names_len, config.name.len) catch return error.OutOfMemory;
+        }
+        const names = try self.alloc.alloc(u8, names_len);
+        errdefer self.alloc.free(names);
+        const start = if (entry_count == 0) 0 else self.graph_metric_worker_cursor.fetchAdd(1, .monotonic) % entry_count;
+        if (metric_count != 0) {
+            var schedule = GraphMetricScheduleIterator.init(self, 0);
+            var names_offset: usize = 0;
+            for (0..metric_count) |i| {
+                const snapshot_entry = &entries[(i + start) % entry_count];
+                const scheduled = schedule.next();
+                const metric_name = names[names_offset..][0..scheduled.config.name.len];
+                @memcpy(metric_name, scheduled.config.name);
+                names_offset += metric_name.len;
+                snapshot_entry.* = .{
+                    .entry = scheduled.entry,
+                    .metric_name = metric_name,
+                    .lifecycle_canonical = graphMetricLifecycleCanonical(scheduled.entry.metric_configs, scheduled.config.*),
+                };
+            }
+            std.debug.assert(names_offset == names.len);
+        }
+        // Index-scoped topology reclamation must survive removal of the last
+        // metric. Rotate these entries with numerical work to avoid starvation.
+        for (self.graph_indexes.items, 0..) |*entry, i| {
+            entries[(metric_count + i + start) % entry_count] = .{
+                .entry = entry,
+                .metric_name = "",
+                .lifecycle_canonical = false,
+            };
+        }
+        _ = self.graph_metric_schedule_pins.fetchAdd(1, .acq_rel);
+        return .{ .manager = self, .entries = entries, .names = names };
+    }
+
+    const GraphMetricScheduleIterator = struct {
+        manager: *IndexManager,
+        graph_index: usize,
+        metric_index: usize,
+
+        fn init(manager: *IndexManager, start: usize) GraphMetricScheduleIterator {
+            var remaining = start;
+            for (manager.graph_indexes.items, 0..) |entry, graph_index| {
+                if (remaining < entry.metric_configs.len) return .{
+                    .manager = manager,
+                    .graph_index = graph_index,
+                    .metric_index = remaining,
+                };
+                remaining -= entry.metric_configs.len;
+            }
+            unreachable;
+        }
+
+        fn next(self: *GraphMetricScheduleIterator) GraphMetricScheduleEntry {
+            const entry = &self.manager.graph_indexes.items[self.graph_index];
+            const result: GraphMetricScheduleEntry = .{
+                .entry = entry,
+                .config = &entry.metric_configs[self.metric_index],
+            };
+            self.metric_index += 1;
+            if (self.metric_index == entry.metric_configs.len) {
+                self.metric_index = 0;
+                while (true) {
+                    self.graph_index = (self.graph_index + 1) % self.manager.graph_indexes.items.len;
+                    if (self.manager.graph_indexes.items[self.graph_index].metric_configs.len != 0) break;
+                }
+            }
+            return result;
+        }
+    };
+
+    fn graphMetricScheduleEntryCount(self: *IndexManager) usize {
+        var total: usize = 0;
+        for (self.graph_indexes.items) |entry| total +|= entry.metric_configs.len;
+        return total;
+    }
+
+    pub const GraphMetricPlannedSchedulerSweepResult = struct {
+        metrics_scanned: usize = 0,
+        active_builds: usize = 0,
+        builds_started: usize = 0,
+        planning_steps: usize = 0,
+        worker_steps: usize = 0,
+        coordinator_steps: usize = 0,
+        publication_checkpoints: usize = 0,
+        retired_input_records: usize = 0,
+        pages_claimed: usize = 0,
+        pages_completed: usize = 0,
+        phases_advanced: usize = 0,
+        published: usize = 0,
+        failed_builds: usize = 0,
+        rounds_executed: usize = 0,
+        budget_exhausted: bool = false,
+
+        pub fn progressed(self: @This()) bool {
+            return self.planning_steps != 0 or self.builds_started != 0 or
+                self.worker_steps != 0 or
+                self.coordinator_steps != 0 or
+                self.retired_input_records != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn durableProgressed(self: @This()) bool {
+            return self.publication_checkpoints != 0 or self.planning_steps != 0 or self.builds_started != 0 or
+                self.retired_input_records != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn add(self: *@This(), other: @This()) void {
+            self.planning_steps += other.planning_steps;
+            self.metrics_scanned += other.metrics_scanned;
+            self.active_builds += other.active_builds;
+            self.builds_started += other.builds_started;
+            self.worker_steps += other.worker_steps;
+            self.coordinator_steps += other.coordinator_steps;
+            self.retired_input_records += other.retired_input_records;
+            self.publication_checkpoints += other.publication_checkpoints;
+            self.pages_claimed += other.pages_claimed;
+            self.pages_completed += other.pages_completed;
+            self.phases_advanced += other.phases_advanced;
+            self.published += other.published;
+            self.failed_builds += other.failed_builds;
+            self.rounds_executed += other.rounds_executed;
+            self.budget_exhausted = self.budget_exhausted or other.budget_exhausted;
+        }
+    };
+
+    pub const GraphMetricPlannedMaintenanceOptions = struct {
+        worker_id: []const u8 = "graph-metric-idle-worker",
+        worker_ids: []const []const u8 = &.{},
+        max_rounds: usize = 1024,
+        max_metrics_per_round: usize = 64,
+        max_pages_per_round: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    pub const GraphMetricPlannedWorkStats = struct {
+        metrics_scanned: usize = 0,
+        queued_builds: usize = 0,
+        active_builds: usize = 0,
+        active_pages: usize = 0,
+        failed_pages: usize = 0,
+        paused_metrics: usize = 0,
+        truncated_pages: bool = false,
+
+        pub fn hasWork(self: @This()) bool {
+            return self.queued_builds != 0 or
+                self.active_builds != 0 or
+                self.active_pages != 0 or
+                self.failed_pages != 0;
+        }
+    };
+
+    pub const GraphMetricPlannedAutoIdleOptions = struct {
+        max_pagerank_iterations: u32 = std.math.maxInt(u32),
+        max_eigenvector_iterations: u32 = std.math.maxInt(u32),
+        max_hits_iterations: u32 = std.math.maxInt(u32),
+        max_active_builds: usize = 4,
+        max_active_builds_per_index: usize = 2,
+    };
+
+    pub const GraphMetricPlannedAutoIdleDecision = struct {
+        active_builds: usize = 0,
+        eligible_queued: usize = 0,
+        deferred_queued: usize = 0,
+        ineligible_queued: usize = 0,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            return self.active_builds != 0 or self.eligible_queued != 0;
+        }
+    };
+
+    pub const GraphMetricDegreeCanaryOptions = struct {
+        max_control_records: usize = 64,
+    };
+
+    pub const GraphMetricDegreeCanaryDecision = struct {
+        active_degree_builds: usize = 0,
+        eligible_queued_degree: usize = 0,
+        blocked_active_non_degree: usize = 0,
+        blocked_queued_non_degree: usize = 0,
+        control_records: usize = 0,
+        queued_degree_control_records: usize = 0,
+        failed_pages: usize = 0,
+        truncated_pages: bool = false,
+        max_control_records: usize = 64,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            if (self.blocked_active_non_degree != 0) return false;
+            if (self.blocked_queued_non_degree != 0) return false;
+            if (self.failed_pages != 0) return false;
+            if (self.truncated_pages) return false;
+            if (self.control_records > self.max_control_records) return false;
+            if (self.control_records +| self.queued_degree_control_records > self.max_control_records) return false;
+            if (self.active_degree_builds == 1 and self.eligible_queued_degree == 0) return true;
+            if (self.active_degree_builds == 0 and self.eligible_queued_degree == 1) return true;
+            return false;
+        }
+    };
+
+    fn graphMetricLifecycleCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
+        if (cfg.kind != .hits_hub) return true;
+        for (configs) |candidate| {
+            if (candidate.kind == .hits_authority and graph_mod.graphMetricHitsPairCompatible(cfg, candidate)) return false;
+        }
+        return true;
+    }
+
+    pub fn graphMetricPlannedWorkStats(self: *IndexManager) !GraphMetricPlannedWorkStats {
+        var stats = GraphMetricPlannedWorkStats{};
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                stats.metrics_scanned += 1;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) {
+                    stats.paused_metrics += 1;
+                    continue;
+                }
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                if (status.build_pages_truncated) stats.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    switch (page.state) {
+                        .leased => stats.active_pages += 1,
+                        .failed => stats.failed_pages += 1,
+                        .pending, .complete => {},
+                    }
+                }
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    stats.active_builds += 1;
+                    continue;
+                }
+                const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+                if (cfg.refresh != .background and !requested) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale => stats.queued_builds += 1,
+                    .disabled, .building => {},
+                    .fresh, .failed => if (requested) {
+                        stats.queued_builds += 1;
+                    },
+                }
+            }
+        }
+        return stats;
+    }
+
+    pub fn shouldRunGraphMetricPlannedAutoIdle(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !bool {
+        const decision = try self.graphMetricPlannedAutoIdleDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn shouldRunGraphMetricDegreeCanary(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !bool {
+        const decision = try self.graphMetricDegreeCanaryDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn graphMetricDegreeCanaryDecision(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !GraphMetricDegreeCanaryDecision {
+        var decision = GraphMetricDegreeCanaryDecision{
+            .max_control_records = options.max_control_records,
+        };
+
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+
+                const active = status.state == .building or status.phase == .cleanup_old_generations;
+                if (active) decision.control_records += 1;
+                decision.control_records += status.build_pages.len;
+                if (status.build_pages_truncated) decision.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    if (page.state == .failed) decision.failed_pages += 1;
+                }
+
+                const queued = cfg.refresh == .background and
+                    graphMetricLifecycleCanonical(entry.metric_configs, cfg) and
+                    (status.state == .not_ready or status.state == .stale);
+                if (cfg.kind == .degree) {
+                    if (active) decision.active_degree_builds += 1;
+                    if (queued) {
+                        decision.eligible_queued_degree += 1;
+                        decision.queued_degree_control_records +|= entry.index.graphMetricPlannedBuildControlRecordEstimate(cfg);
+                    }
+                } else {
+                    if (active) decision.blocked_active_non_degree += 1;
+                    if (queued) decision.blocked_queued_non_degree += 1;
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    pub fn graphMetricPlannedAutoIdleDecision(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedAutoIdleDecision {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var decision = GraphMetricPlannedAutoIdleDecision{};
+        for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = try graphMetricIndexActiveBuilds(entry);
+            var index_scheduled_builds: usize = 0;
+            decision.active_builds += index_active_builds;
+            for (entry.metric_configs) |cfg| {
+                const status = try entry.index.graphMetricSchedulerStatus(cfg.name, null);
+                if (status.maintenance_paused) continue;
+
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    continue;
+                }
+
+                const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+                if (cfg.refresh != .background and !requested) continue;
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale, .fresh, .failed => {
+                        if ((status.state == .fresh or status.state == .failed) and !requested) continue;
+                        if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
+                            decision.ineligible_queued += 1;
+                        } else if (graphMetricPlannedAutoCanStart(
+                            options,
+                            decision.active_builds,
+                            decision.eligible_queued,
+                            index_active_builds,
+                            index_scheduled_builds,
+                        )) {
+                            decision.eligible_queued += 1;
+                            index_scheduled_builds += 1;
+                        } else {
+                            decision.deferred_queued += 1;
+                        }
+                    },
+                    .disabled, .building => {},
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    fn graphMetricIndexActiveBuilds(entry: *GraphIndex) !usize {
+        return graphMetricIndexActiveBuildsAt(entry, null);
+    }
+
+    fn graphMetricIndexActiveBuildsAt(entry: *GraphIndex, now_ms: ?u64) !usize {
+        var active_builds: usize = 0;
+        for (entry.metric_configs) |cfg| {
+            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, now_ms);
+            if (status.maintenance_paused) continue;
+            if (status.state == .building or status.phase == .cleanup_old_generations) {
+                if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                active_builds += 1;
+            }
+        }
+        return active_builds;
+    }
+
+    fn graphMetricPlannedAutoCanStart(
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        eligible_queued: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (options.max_active_builds == 0 or options.max_active_builds_per_index == 0) return false;
+        if (active_builds + eligible_queued >= options.max_active_builds) return false;
+        if (index_active_builds + index_scheduled_builds >= options.max_active_builds_per_index) return false;
+        return true;
+    }
+
+    fn graphMetricQueuedPlannedAutoEligible(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        _ = configs;
+        return switch (cfg.kind) {
+            .degree => true,
+            .pagerank => cfg.max_iterations <= options.max_pagerank_iterations,
+            .eigenvector => cfg.max_iterations <= options.max_eigenvector_iterations,
+            // Pairing shares a lifecycle; it is not an execution eligibility
+            // constraint. Standalone lanes use the same bounded worker pages.
+            .hits_authority, .hits_hub => options.max_hits_iterations != 0 and
+                cfg.max_iterations <= options.max_hits_iterations,
+        };
+    }
+
+    fn graphMetricShouldAutoStartQueuedBuild(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        scheduled_builds: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (!graphMetricLifecycleCanonical(configs, cfg)) return false;
+        if (!graphMetricQueuedPlannedAutoEligible(configs, cfg, options)) return false;
+        return graphMetricPlannedAutoCanStart(
+            options,
+            active_builds,
+            scheduled_builds,
+            index_active_builds,
+            index_scheduled_builds,
+        );
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedSchedulerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
+    }
+
+    fn runGraphMetricPlannedCoordinatorSweepUnlocked(
+        self: *IndexManager,
+        options: GraphMetricPlannedSchedulerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_metrics == 0) return result;
+        const active_builds_before_start: usize = if (options.auto_idle_options != null)
+            try self.graphMetricActiveBuildCount()
+        else
+            0;
+        var scheduled_builds: usize = 0;
+
+        const entry_count = self.graphMetricScheduleEntryCount();
+        if (entry_count == 0) return result;
+        const start = self.graph_metric_coordinator_cursor.fetchAdd(1, .monotonic) % entry_count;
+        var schedule = GraphMetricScheduleIterator.init(self, start);
+        var counted_entry: ?*GraphIndex = null;
+        var index_active_builds: usize = 0;
+        var index_scheduled_builds: usize = 0;
+        for (0..entry_count) |_| {
+            const scheduled = schedule.next();
+            const entry = scheduled.entry;
+            if (entry.index.ownershipTransitionPending()) continue;
+            const cfg = scheduled.config.*;
+            if (options.auto_idle_options != null and counted_entry != entry) {
+                counted_entry = entry;
+                index_active_builds = try graphMetricIndexActiveBuildsAt(entry, options.now_ms);
+                index_scheduled_builds = 0;
+            }
+            if (result.metrics_scanned >= options.max_metrics) {
+                result.budget_exhausted = true;
+                return result;
+            }
+            result.metrics_scanned += 1;
+
+            const status = try entry.index.graphMetricSchedulerStatus(cfg.name, options.now_ms);
+            if (status.maintenance_paused) continue;
+            if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+
+            var active = status.state == .building;
+            const requested = try entry.index.graphMetricBuildRequested(cfg.name);
+            if (!active and (requested or (options.start_background_builds and cfg.refresh == .background))) {
+                switch (status.state) {
+                    .not_ready, .stale, .failed, .fresh => {
+                        if (status.state == .fresh and !requested) continue;
+                        if (status.state == .failed and !requested) {
+                            // Preserve terminal failures for the same
+                            // generation, but do not let a superseded
+                            // snapshot permanently block newer graph
+                            // traffic. A newer dirty generation is a new
+                            // unit of work, not a blind retry.
+                            const failed_generation = status.failed_target_generation;
+                            if (failed_generation >= status.target_edge_generation) continue;
+                        }
+                        if (options.auto_idle_options) |auto_options| {
+                            if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, auto_options)) continue;
+                        } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
+                        if (!try entry.index.prepareGraphMetricPartitionForConfigStep(cfg, 4096)) {
+                            result.planning_steps += 1;
+                            continue;
+                        }
+                        const preparation = entry.index.prepareGraphMetricTopologyDetailed(cfg, status.target_edge_generation) catch |err| switch (err) {
+                            error.GraphMetricBuildSnapshotChanged => continue,
+                            else => return err,
+                        };
+                        switch (preparation) {
+                            .ready => {},
+                            .queued => {
+                                result.planning_steps += 1;
+                                continue;
+                            },
+                            .waiting => continue,
+                        }
+                        if (options.auto_idle_options) |auto_options| {
+                            if (!graphMetricShouldAutoStartQueuedBuild(
+                                entry.metric_configs,
+                                cfg,
+                                auto_options,
+                                active_builds_before_start,
+                                scheduled_builds,
+                                index_active_builds,
+                                index_scheduled_builds,
+                            )) continue;
+                        }
+                        var started = entry.index.ensureGraphMetricPlannedBuildFromCachedPlan(cfg.name, status.target_edge_generation) catch |err| switch (err) {
+                            error.GraphMetricDisabled => continue,
+                            error.GraphMetricBuildSnapshotChanged => continue,
+                            else => return err,
+                        };
+                        defer started.deinit(entry.index.alloc);
+                        result.builds_started += 1;
+                        scheduled_builds += 1;
+                        index_scheduled_builds += 1;
+                        active = true;
+                    },
+                    .disabled, .building => {},
+                }
+            }
+            if (!active) continue;
+            result.active_builds += 1;
+
+            const step = (if (options.now_ms) |now_ms|
+                entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
+            else
+                entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
+                error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
+                else => return err,
+            };
+            result.coordinator_steps += 1;
+            if (step.checkpointed_publication) result.publication_checkpoints += 1;
+            result.retired_input_records += step.retired_input_records;
+            if (step.advanced_phase) result.phases_advanced += 1;
+            if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {
+                result.published += 1;
+            }
+            if (step.failed_build) result.failed_builds += 1;
+        }
+        return result;
+    }
+
+    fn graphMetricActiveBuildCount(self: *IndexManager) !usize {
+        var active_builds: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            active_builds += try graphMetricIndexActiveBuilds(entry);
+        }
+        return active_builds;
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedWorkerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        var snapshot = try self.graphMetricWorkerSnapshotAlloc();
+        defer snapshot.deinit();
+        return try self.runGraphMetricPlannedWorkerSweepSnapshot(options, snapshot.entries);
+    }
+
+    fn runGraphMetricPlannedWorkerSweepSnapshot(
+        _: *IndexManager,
+        options: GraphMetricPlannedWorkerSweepOptions,
+        scheduled_entries: []const GraphMetricWorkerSnapshotEntry,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_pages == 0) return result;
+
+        const entry_count = scheduled_entries.len;
+        if (entry_count == 0) return result;
+        var topology_census_steps: usize = 0;
+        for (scheduled_entries) |scheduled| {
+            const entry = scheduled.entry;
+            if (entry.index.ownershipTransitionPending()) continue;
+            const metric_name = scheduled.metric_name;
+            if (result.worker_steps >= options.max_pages) {
+                result.budget_exhausted = true;
+                return result;
+            }
+
+            if (metric_name.len == 0) {
+                // Idle reads are bounded too, but do not report eligible work
+                // and keep runUntilIdle spinning through a retained catalog.
+                if (topology_census_steps >= options.max_pages) continue;
+                topology_census_steps += 1;
+                const prepared = entry.index.runGraphMetricTopologyPreparationStep(options.worker_id) catch |err| switch (err) {
+                    error.GraphMetricBuildSuperseded, error.GraphMetricBuildSnapshotChanged => continue,
+                    else => return err,
+                };
+                if (prepared) {
+                    result.worker_steps += 1;
+                    // This may be only a packing checkpoint or retirement
+                    // slice, not a completed numerical page.
+                    result.planning_steps += 1;
+                    continue;
+                }
+                const topology = try entry.index.cleanupGraphMetricTopologyPageDetailed();
+                if (topology.removed != 0) {
+                    result.worker_steps += 1;
+                    result.pages_completed += 1;
+                    result.retired_input_records += topology.removed;
+                }
+                continue;
+            }
+            if (try entry.index.cleanupDeletedGraphMetricMaterializationPage(metric_name)) {
+                result.metrics_scanned += 1;
+                result.worker_steps += 1;
+                result.pages_completed += 1;
+                continue;
+            }
+            if (try entry.index.cleanupFailedGraphMetricBuildJobPage(metric_name)) {
+                result.metrics_scanned += 1;
+                result.worker_steps += 1;
+                result.pages_completed += 1;
+                continue;
+            }
+            const status = try entry.index.graphMetricSchedulerStatus(metric_name, options.now_ms);
+            if (status.maintenance_paused) continue;
+            if (try entry.index.cleanupRetiredGraphMetricScoreGenerationPage(metric_name)) {
+                result.metrics_scanned += 1;
+                result.worker_steps += 1;
+                result.pages_completed += 1;
+                continue;
+            }
+            if (!scheduled.lifecycle_canonical) continue;
+            const active = status.state == .building or status.phase == .cleanup_old_generations;
+            if (!active) continue;
+            result.metrics_scanned += 1;
+            result.active_builds += 1;
+
+            const step = (if (options.now_ms) |now_ms|
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, options.worker_id, now_ms)
+            else
+                entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, options.worker_id)) catch |err| switch (err) {
+                error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive, error.GraphMetricDisabled => continue,
+                // Graph mutations may supersede a snapshot after the
+                // coordinator sweep but before this worker sweep. Treat
+                // that as expected scheduler churn: the coordinator owns
+                // durable failure/cancellation and will retire the exact
+                // stale job on its next tick. A worker must neither turn
+                // normal write traffic into a runtime error nor race a
+                // replacement lease by failing a job it no longer owns.
+                error.GraphMetricBuildSuperseded => continue,
+                else => return err,
+            };
+            result.worker_steps += 1;
+            if (step.claimed_page) result.pages_claimed += 1;
+            if (step.completed_page) result.pages_completed += 1;
+            if (step.advanced_phase) result.phases_advanced += 1;
+            if (result.worker_steps >= options.max_pages) {
+                const after_status = try entry.index.graphMetricSchedulerStatus(metric_name, options.now_ms);
+                if (after_status.state == .building or after_status.phase == .cleanup_old_generations) {
+                    result.budget_exhausted = true;
+                }
+                return result;
+            }
+        }
+        return result;
+    }
+
+    pub fn runGraphMetricPlannedMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
+    }
+
+    pub fn runGraphMetricPlannedAutoMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
+    }
+
+    fn runGraphMetricPlannedMaintenanceWithAuto(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: ?GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        try validateGraphMetricPlannedMaintenanceWorkers(options);
+        var total = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_rounds == 0) {
+            total.budget_exhausted = true;
+            return total;
+        }
+
+        var rounds: usize = 0;
+        while (rounds < options.max_rounds) : (rounds += 1) {
+            var round = GraphMetricPlannedSchedulerSweepResult{};
+            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_before);
+
+            if (options.worker_ids.len == 0) {
+                const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                    .worker_id = options.worker_id,
+                    .max_pages = options.max_pages_per_round,
+                    .now_ms = options.now_ms,
+                });
+                round.add(worker);
+            } else {
+                var pages_remaining = options.max_pages_per_round;
+                while (pages_remaining > 0) {
+                    var worker_progressed = false;
+                    for (options.worker_ids) |worker_id| {
+                        if (pages_remaining == 0) break;
+                        const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                            .worker_id = worker_id,
+                            .max_pages = 1,
+                            .now_ms = options.now_ms,
+                        });
+                        round.add(worker);
+                        pages_remaining -= @min(pages_remaining, worker.worker_steps);
+                        worker_progressed = worker_progressed or worker.durableProgressed();
+                    }
+                    if (!worker_progressed) break;
+                }
+            }
+
+            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_after);
+
+            const round_budget_exhausted = round.budget_exhausted;
+            round.budget_exhausted = false;
+            round.rounds_executed = 1;
+            total.add(round);
+            if (!round.durableProgressed()) {
+                total.budget_exhausted = round_budget_exhausted;
+                return total;
+            }
+        }
+        total.budget_exhausted = true;
+        return total;
+    }
+
+    fn validateGraphMetricPlannedMaintenanceWorkers(options: GraphMetricPlannedMaintenanceOptions) !void {
+        if (options.worker_ids.len == 0) {
+            if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            return;
+        }
+
+        for (options.worker_ids, 0..) |worker_id, i| {
+            if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            for (options.worker_ids[0..i]) |prior_worker_id| {
+                if (std.mem.eql(u8, worker_id, prior_worker_id)) return error.InvalidGraphMetricBuildWorker;
+            }
+        }
+    }
+
+    fn graphMetricStatusHasRunnableWorkerPage(
+        status: graph_mod.GraphIndex.GraphMetricStatus,
+        worker_id: []const u8,
+        now_ms: ?u64,
+    ) bool {
+        if (status.state == .building or status.phase == .cleanup_old_generations) return true;
+        if (status.build_pages_truncated) return true;
+        const now: u64 = now_ms orelse platform_clock.Clock.real().nowRealtimeMs();
+        for (status.build_pages) |page| {
+            switch (page.state) {
+                .pending, .failed => return true,
+                .leased => {
+                    if (std.mem.eql(u8, page.worker_id, worker_id)) return true;
+                    if (page.lease_expires_at_ms <= now) return true;
+                },
+                .complete => {},
+            }
+        }
+        return false;
+    }
+
     pub const DensePostingMaintenanceOptions = struct {
         max_postings_per_index: usize = 64,
         validate_payloads: bool = false,
@@ -7993,11 +10180,10 @@ pub const IndexManager = struct {
                 continue;
             }
             defer entry.apply_mutex.unlock();
-            const build = entry.index.experimental_posting_checkpoint_build orelse continue;
-            if (!build.completed.load(.acquire)) continue;
+            if (!entry.index.experimentalPostingCheckpointBuildCompleted()) continue;
             if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) {
                 result.published += 1;
-            } else if (entry.index.experimental_posting_checkpoint_build != null) {
+            } else if (entry.index.experimentalPostingCheckpointBuildPresent()) {
                 result.deferred = true;
             }
         }
@@ -8021,7 +10207,7 @@ pub const IndexManager = struct {
             if (foreground_busy) {
                 if (!entry.apply_mutex.tryLock()) continue;
             } else {
-                lockAtomicWithBackoff(entry.apply_mutex);
+                self.lockAtomicWithBackoff(entry.apply_mutex);
             }
             defer entry.apply_mutex.unlock();
 
@@ -8075,7 +10261,7 @@ pub const IndexManager = struct {
         var total_steps: usize = 0;
         for (self.dense_indexes.items) |*entry| {
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
-            lockAtomicWithBackoff(entry.apply_mutex);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             total_steps += try drainDensePostingMaintenanceEntry(entry, options);
         }
@@ -8149,7 +10335,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (self.repairUnavailable(entry.config.name)) continue;
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
-            lockAtomicWithBackoff(entry.apply_mutex);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             if (try self.maintainVectorBlockBaseIfQuiescent(entry) == .progressed) total_steps += 1;
         }
@@ -8256,7 +10442,7 @@ pub const IndexManager = struct {
                 // Backoff means waiting for projection inputs, not ready.
                 // Keep the scheduler/lifecycle obligation alive even when
                 // there is intentionally no worker or publication in flight.
-                if (entry.index.experimental_posting_checkpoint_build != null or
+                if (entry.index.experimentalPostingCheckpointBuildPresent() or
                     entry.index.nativePostingAccelerationPending()) deferred = true;
                 continue;
             }
@@ -8283,7 +10469,7 @@ pub const IndexManager = struct {
             // base creates a dependency inversion: projection maintenance
             // fails before posting repair is allowed to run.
             if (self.repairUnavailable(entry.config.name)) continue;
-            lockAtomicWithBackoff(entry.apply_mutex);
+            self.lockAtomicWithBackoff(entry.apply_mutex);
             defer entry.apply_mutex.unlock();
             const source_sequence = primary.lastReplaySequence(0);
             const posting_sequence_before = entry.index.experimentalPostingDurableAppliedSequence();
@@ -8306,7 +10492,10 @@ pub const IndexManager = struct {
             ) or (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
                 !entry.index.nativePostingBaseHasVectors()))
             {
-                try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+                // Explicit lifecycle publication must not report success if
+                // another owner prevented the required certification.
+                if (!try self.tryFinalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence))
+                    return error.VectorBlockGenerationReservationLost;
                 changed = self.vectorBlockReadyAtSequenceAndCount(
                     source_sequence,
                     entry,
@@ -8347,6 +10536,45 @@ pub const IndexManager = struct {
 
     pub fn load(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, true, false);
+    }
+
+    /// Restore activation deliberately stays single-threaded. Individual
+    /// index-open failures are quarantined by the ordinary sequential loader,
+    /// while avoiding the parallel loader's fallible directory-preparation
+    /// pass after the primary-store generation has already been published.
+    pub fn loadForRestore(self: *IndexManager, store: anytype) !void {
+        // Restore targets are required to be pristine. Make the activation
+        // attempt transactional at the in-memory catalog boundary so a
+        // top-level allocation/backend failure can be retried without
+        // duplicating enrichments, resolvers, or partially opened indexes.
+        self.resetRestoreLoadAttempt();
+        errdefer self.resetRestoreLoadAttempt();
+        const previous_parallelism = self.load_parallelism;
+        defer self.load_parallelism = previous_parallelism;
+        self.load_parallelism = 1;
+        try self.loadWithBackfill(store, true, false);
+    }
+
+    fn resetRestoreLoadAttempt(self: *IndexManager) void {
+        self.releaseFullTextPendingBytes();
+        self.text_merge_scheduler.deinit(self.alloc);
+        self.text_merge_scheduler = .{};
+        for (self.text_indexes.items) |*entry| self.freeTextIndexEntry(entry);
+        for (self.dense_indexes.items) |*entry| self.freeDenseIndexEntry(entry);
+        for (self.sparse_indexes.items) |*entry| self.freeSparseIndexEntry(entry);
+        for (self.graph_indexes.items) |*entry| self.freeGraphIndexEntry(entry);
+        for (self.algebraic_indexes.items) |*entry| self.freeAlgebraicIndexEntry(entry);
+        self.text_indexes.clearRetainingCapacity();
+        self.dense_indexes.clearRetainingCapacity();
+        self.sparse_indexes.clearRetainingCapacity();
+        self.graph_indexes.clearRetainingCapacity();
+        self.algebraic_indexes.clearRetainingCapacity();
+        self.truncateEnrichments(0);
+        self.truncateResolvers(0);
+        self.clearStatusOnlyIndexConfigs();
+        self.clearFailedIndexLoads();
+        self.clearIndexLoadStates();
+        self.storeGeneratedEnrichmentTargetCache(false);
     }
 
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
@@ -8632,6 +10860,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.text_indexes.items) |*entry| entry.io = self.checkpointIo();
         for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
@@ -8857,6 +11086,11 @@ pub const IndexManager = struct {
     }
 
     pub fn registerShadowIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        // Algebraic projections live in the logical document store rather than
+        // the manager's physical index directory. Replaying them through a
+        // shadow manager would mutate the primary projection a second time;
+        // split destination construction rebuilds them against its own store.
+        if (cfg.kind == .algebraic) return;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
@@ -9881,6 +12115,7 @@ pub const IndexManager = struct {
                     name,
                     try combineRemovalCatalogMutation(atomic_mutation, &cleanup),
                 );
+                self.waitForGraphMetricSchedulePins();
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
@@ -11196,6 +13431,42 @@ pub const IndexManager = struct {
             }
         }
 
+        // Resolve every mutable catalog lookup into the owned request. The
+        // caller may now release its structural/apply fence before chunking,
+        // remote rendering, model inference, or asset-provider calls.
+        for (requests.items) |*request| {
+            if (request.input_kind == .materialized_chunks and request.artifact_name.len > 0) {
+                const chunk_cfg = self.getEnrichment(.chunk, request.artifact_name) orelse
+                    return error.InvalidIndexConfig;
+                if (chunk_cfg.source_artifact_name.len == 0) return error.InvalidIndexConfig;
+                request.upstream_artifact_name = try alloc.dupe(u8, chunk_cfg.source_artifact_name);
+            }
+            request.consumer_indexes = switch (request.kind) {
+                .asset => try self.textIndexesForChunk(
+                    alloc,
+                    if (request.artifact_name.len > 0) request.artifact_name else request.index_name,
+                    request.full_text_index,
+                ),
+                .chunk_text => blk: {
+                    const include_default = request.full_text_index or
+                        try chunking_types.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
+                    break :blk try self.textIndexesForChunk(
+                        alloc,
+                        if (request.artifact_name.len > 0) request.artifact_name else request.index_name,
+                        include_default,
+                    );
+                },
+                .dense_embedding => try self.denseIndexesForEmbedding(
+                    alloc,
+                    if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
+                    request.expected_dims,
+                ),
+                .sparse_embedding => try self.sparseIndexesForEmbedding(
+                    alloc,
+                    if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
+                ),
+            };
+        }
         return try requests.toOwnedSlice(alloc);
     }
 
@@ -11241,6 +13512,48 @@ pub const IndexManager = struct {
             });
             index_name = &.{};
             owned_doc_key = &.{};
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+    }
+
+    pub fn appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(
+        self: *const IndexManager,
+        alloc: Allocator,
+        doc_key: []const u8,
+        root: std.json.Value,
+        row: relational_row_codec.OrdinalRowView,
+        extracted: *mapper.ExtractedWrite,
+    ) !void {
+        for (self.dense_indexes.items) |entry| {
+            if (hasExplicitDenseEmbedding(extracted.dense_embeddings, entry.config.name)) continue;
+            const vector = (try mapper.extractDenseVectorFieldFromPrepared(alloc, row, root, entry.field_name, entry.dims)) orelse continue;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        for (self.sparse_indexes.items) |entry| {
+            if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, entry.config.name)) continue;
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, entry.field_name)) orelse continue;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, entry.config.name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
             sparse_vec.indices = &.{};
             sparse_vec.values = &.{};
         }
@@ -12418,6 +14731,28 @@ pub const IndexManager = struct {
         }
     }
 
+    pub fn fenceGraphSplitRange(self: *IndexManager, split_key: []const u8, original_range_end: []const u8) !void {
+        for (self.graph_indexes.items) |*entry| {
+            try entry.index.fenceOwnedRange(self.alloc, split_key, original_range_end);
+            entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
+        }
+    }
+
+    /// One page across the catalog per turn, independent of metric enablement.
+    pub fn runGraphOwnershipCleanupStep(self: *IndexManager) !bool {
+        const entries = self.graph_indexes.items;
+        if (entries.len == 0) return false;
+        for (0..entries.len) |_| {
+            const index = self.graph_ownership_cleanup_cursor % entries.len;
+            self.graph_ownership_cleanup_cursor = (index + 1) % entries.len;
+            const entry = &entries[index];
+            if (!entry.index.ownershipCleanupPending()) continue;
+            _ = try entry.index.pruneOwnedRangePage();
+            return true;
+        }
+        return false;
+    }
+
     pub fn textChunkName(self: *const IndexManager, name: []const u8) ?[]const u8 {
         for (self.text_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) return entry.chunk_name;
@@ -12937,7 +15272,7 @@ pub const IndexManager = struct {
         }
         var vector_mutations_published = false;
         if (self.vector_block_storage != null and exact_vector_mutations.len != 0) {
-            lockAtomicWithBackoff(&self.vector_block_build_mu);
+            self.lockAtomicWithBackoff(&self.vector_block_build_mu);
             vector_mutations_published = self.publishVectorBlockMutationWal(
                 entry,
                 exact_vector_mutations,
@@ -12994,7 +15329,7 @@ pub const IndexManager = struct {
             // another index cannot advance CURRENT after this transaction has
             // dirtied it but before the replacement generation is published.
             {
-                lockAtomicWithBackoff(&self.vector_block_build_mu);
+                self.lockAtomicWithBackoff(&self.vector_block_build_mu);
                 defer self.vector_block_build_mu.unlock();
                 if (posting_capture_has_mutations and !vector_mutations_published) {
                     // Never let an older exact-vector generation answer across a
@@ -14116,6 +16451,7 @@ pub const IndexManager = struct {
             .vector_field_paths = paths,
             .strip_numeric_array_heuristic = false,
             .schema_less_fast_projection = schema_less_fast_projection,
+            .retain_stored_data = false,
         };
     }
 
@@ -14425,7 +16761,10 @@ pub const IndexManager = struct {
         }
 
         const source_target_bytes = textProjectionSourceBuildTargetBytes();
-        const projection_options = try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null);
+        const projection_options = try self.textProjectionOptionsForSchema(
+            arena,
+            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+        );
         var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
         defer atomic_ranges.deinit(arena);
         var start: usize = 0;
@@ -14469,6 +16808,300 @@ pub const IndexManager = struct {
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
     }
 
+    /// Plan publication from an already-parsed document boundary. Relational
+    /// callers supply MapperDoc.root, so both admission estimation and the
+    /// eventual apply avoid reparsing a materialized JSON document.
+    pub fn planTextMapperDocsPublication(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        docs: []const mapper.MapperDoc,
+        reservation_limit: usize,
+    ) !TextPublicationPlan {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+
+        var chunks = std.ArrayListUnmanaged(TextPublicationChunk).empty;
+        errdefer chunks.deinit(context.alloc);
+        if (docs.len == 0) {
+            try chunks.append(context.alloc, .{ .end = 0, .estimate = .{} });
+            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer filtered.deinit(arena);
+        var original_ends = std.ArrayListUnmanaged(usize).empty;
+        defer original_ends.deinit(arena);
+        for (docs, 0..) |doc, doc_idx| {
+            if (!self.keyInRange(doc.key)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(arena, doc);
+            try original_ends.append(arena, doc_idx + 1);
+        }
+        if (filtered.items.len == 0) {
+            try chunks.append(context.alloc, .{ .end = docs.len, .estimate = .{} });
+            return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+        }
+
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const projection_options = try self.textProjectionOptionsForSchema(
+            arena,
+            entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+        );
+        var atomic_ranges = std.ArrayListUnmanaged(TextPublicationAtomicRange).empty;
+        defer atomic_ranges.deinit(arena);
+        var start: usize = 0;
+        while (start < filtered.items.len) {
+            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
+            var projection_arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer projection_arena_state.deinit();
+            const projection_arena = projection_arena_state.allocator();
+            const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+                projection_arena,
+                filtered.items[start..end],
+                projection_options,
+            );
+            var projected_source_indices = std.ArrayListUnmanaged(usize).empty;
+            defer projected_source_indices.deinit(projection_arena);
+            const projection_batch = try buildTextProjectionBatchForEntry(
+                projection_arena,
+                entry,
+                source_batch.docs,
+                null,
+                &projected_source_indices,
+            );
+            if (projected_source_indices.items.len != projection_batch.docs.len)
+                return error.InvalidTextProjection;
+            var projected_original_ends = std.ArrayListUnmanaged(usize).empty;
+            defer projected_original_ends.deinit(projection_arena);
+            try projected_original_ends.ensureTotalCapacity(projection_arena, projection_batch.docs.len);
+            for (projected_source_indices.items) |source_idx| {
+                projected_original_ends.appendAssumeCapacity(original_ends.items[start + source_idx]);
+            }
+            try appendProjectedTextPublicationAtomicRanges(
+                projection_batch.docs,
+                projected_original_ends.items,
+                original_ends.items[end - 1],
+                0,
+                projection_batch.docs.len,
+                estimateProjectedTextPublication(projection_batch.docs),
+                reservation_limit,
+                arena,
+                &atomic_ranges,
+            );
+            start = end;
+        }
+
+        var current = TextPublicationEstimate{};
+        var current_end: usize = 0;
+        for (atomic_ranges.items) |range| {
+            if (current.segment_count > 0 and reservation_limit != std.math.maxInt(usize) and
+                current.segment_count +| range.estimate.segment_count > reservation_limit)
+            {
+                try chunks.append(context.alloc, .{ .end = current_end, .estimate = current });
+                current = .{};
+            }
+            current.segment_count +|= range.estimate.segment_count;
+            current.byte_count +|= range.estimate.byte_count;
+            current_end = range.end;
+        }
+        std.debug.assert(current_end > 0);
+        try chunks.append(context.alloc, .{ .end = docs.len, .estimate = current });
+        return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc) };
+    }
+
+    /// Build immutable text segments while only read locks are held. This is
+    /// deliberately separate from publication: callers acquire their producer
+    /// capacity first, perform the CPU- and allocation-heavy projection and
+    /// tokenization here, then enter the serialized apply section only to
+    /// commit metadata and publish the finished segment bytes.
+    pub fn prepareTextMapperDocsPublication(
+        self: *IndexManager,
+        alloc: Allocator,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        context: *TextPublicationContext,
+        docs: []const mapper.MapperDoc,
+    ) !PreparedTextMapperPublication {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) {
+            context.projection_revision = entry.projection_revision;
+            context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
+            return error.TextProjectionChanged;
+        }
+
+        const segment_alloc = entry.persistent.alloc;
+        var segments = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (segments.items) |segment| segment_alloc.free(segment);
+            segments.deinit(alloc);
+        }
+        var observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+        errdefer freeOwnedObservedFieldAnalyzers(alloc, &observed);
+
+        if (docs.len == 0) return .{ .alloc = alloc, .segment_alloc = segment_alloc };
+
+        var filtered = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer filtered.deinit(alloc);
+        for (docs) |doc| {
+            if (!self.keyInRange(doc.key)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            try filtered.append(alloc, doc);
+        }
+        if (filtered.items.len == 0) return .{ .alloc = alloc, .segment_alloc = segment_alloc };
+
+        const source_target_bytes = textProjectionSourceBuildTargetBytes();
+        var start: usize = 0;
+        while (start < filtered.items.len) {
+            const end = splitMapperDocsEnd(filtered.items, start, source_target_bytes);
+            {
+                var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const projection_options = try self.textProjectionOptionsForSchema(
+                    arena,
+                    entry.runtime_schema == null and !textIndexSelectsAnyField(entry),
+                );
+                const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
+                    arena,
+                    filtered.items[start..end],
+                    projection_options,
+                );
+                const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_batch.docs);
+                var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+                defer chunk_observed.deinit(arena);
+                const projection_batch = try buildTextProjectionBatchForEntry(
+                    arena,
+                    entry,
+                    source_docs_with_ordinals,
+                    &chunk_observed,
+                    null,
+                );
+                try appendOwnedObservedFieldAnalyzers(alloc, &observed, projection_batch.observed_field_analyzers);
+
+                const runtime_index_sort = if (entry.runtime_schema) |schema| schema.index_sort else &.{};
+                const index_sort = try textIndexSortFieldsForSegmentAlloc(arena, runtime_index_sort);
+                const built = try mapper.buildTextSegmentsFromProjectionBatch(
+                    segment_alloc,
+                    projection_batch,
+                    entry.text_analysis,
+                    .{
+                        .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
+                        .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
+                        .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
+                        .index_sort = index_sort,
+                        .resource_manager = self.resource_manager,
+                        .store_document_source = false,
+                    },
+                );
+                if (built.len > 0) {
+                    segments.ensureUnusedCapacity(alloc, built.len) catch |err| {
+                        for (built) |segment| segment_alloc.free(segment);
+                        segment_alloc.free(built);
+                        return err;
+                    };
+                    for (built) |segment| segments.appendAssumeCapacity(segment);
+                    segment_alloc.free(built);
+                }
+            }
+            start = end;
+        }
+
+        return .{
+            .alloc = alloc,
+            .segment_alloc = segment_alloc,
+            .segments = try segments.toOwnedSlice(alloc),
+            .observed_field_analyzers = try observed.toOwnedSlice(alloc),
+        };
+    }
+
+    fn buildTextProjectionBatchForEntry(
+        arena: Allocator,
+        entry: *TextIndex,
+        source_docs: []const mapper.TextProjectionSourceDoc,
+        observed: ?*std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+        projected_source_indices: ?*std.ArrayListUnmanaged(usize),
+    ) !mapper.TextProjectionBatch {
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(
+            arena,
+            entry.text_analysis,
+            entry.runtime_schema,
+            observed,
+            entry.selected_field,
+        );
+        defer builder.deinit();
+        for (source_docs, 0..) |doc, source_idx| {
+            const before = builder.text_docs.items.len;
+            try builder.appendSourceDocWithSelectedField(doc, textIndexSelectedFieldForKey(entry, doc.key));
+            if (projected_source_indices) |indices| {
+                const appended = builder.text_docs.items.len - before;
+                if (appended > 1) return error.InvalidTextProjection;
+                if (appended == 1) try indices.append(arena, source_idx);
+            }
+        }
+        return .{
+            .docs = try arena.dupe(introducer_mod.TextDocument, builder.text_docs.items),
+            .observed_field_analyzers = if (observed) |items| items.items else &.{},
+        };
+    }
+
+    fn appendProjectedTextPublicationAtomicRanges(
+        docs: []const introducer_mod.TextDocument,
+        original_ends: []const usize,
+        terminal_end: usize,
+        start: usize,
+        end: usize,
+        estimate: TextPublicationEstimate,
+        reservation_limit: usize,
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(TextPublicationAtomicRange),
+    ) !void {
+        if (reservation_limit == std.math.maxInt(usize) or estimate.segment_count <= reservation_limit or end - start <= 1) {
+            try out.append(alloc, .{ .end = terminal_end, .estimate = estimate });
+            return;
+        }
+
+        const mid = start + (end - start) / 2;
+        const left_estimate = estimateProjectedTextPublication(docs[start..mid]);
+        try appendProjectedTextPublicationAtomicRanges(
+            docs,
+            original_ends,
+            original_ends[mid - 1],
+            start,
+            mid,
+            left_estimate,
+            reservation_limit,
+            alloc,
+            out,
+        );
+        const right_estimate = estimateProjectedTextPublication(docs[mid..end]);
+        try appendProjectedTextPublicationAtomicRanges(
+            docs,
+            original_ends,
+            terminal_end,
+            mid,
+            end,
+            right_estimate,
+            reservation_limit,
+            alloc,
+            out,
+        );
+    }
+
     fn estimateTextBatchPublicationRange(
         self: *IndexManager,
         entry: *TextIndex,
@@ -14483,11 +17116,11 @@ pub const IndexManager = struct {
             writes,
             projection_options,
         );
-        const projection_batch = try mapper.buildTextProjectionBatchFromSource(
+        const projection_batch = try buildTextProjectionBatchForEntry(
             projection_arena,
+            entry,
             source_batch.docs,
-            entry.text_analysis,
-            entry.runtime_schema,
+            null,
             null,
         );
         return estimateProjectedTextPublication(projection_batch.docs);
@@ -15131,6 +17764,46 @@ pub const IndexManager = struct {
         return error.IndexNotFound;
     }
 
+    /// Publish a segment set produced by prepareTextMapperDocsPublication.
+    /// The caller owns the managed-index apply guard and has revalidated the
+    /// matching publication context. Preparation allocates segment bytes in the
+    /// persistent index's ownership domain, so publication transfers them
+    /// without copying large immutable buffers under the apply guard.
+    pub fn applyPreparedTextMapperPublicationByNameWithOptions(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        delete_keys: []const []const u8,
+        prepared: *PreparedTextMapperPublication,
+        opts: IndexBatchOptions,
+    ) !void {
+        if (delete_keys.len == 0 and prepared.segments.len == 0 and prepared.observed_field_analyzers.len == 0) return;
+        for (self.text_indexes.items) |*entry| {
+            if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
+
+            var stats = TextBatchMutationStats{};
+            if (delete_keys.len > 0) {
+                stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);
+            }
+            if (prepared.observed_field_analyzers.len > 0) {
+                try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
+            }
+            for (prepared.segments) |*segment| {
+                if (segment.len == 0) continue;
+                const owned = segment.*;
+                // Transfer before entering persistent publication: success and
+                // every error path consume the buffer, while untouched suffix
+                // segments remain owned by PreparedTextMapperPublication.
+                segment.* = &.{};
+                try entry.persistent.indexSegmentOwned(owned);
+                stats.noteIndex(true);
+            }
+            try self.finalizeTextBatchMutations(entry, opts, stats);
+            return;
+        }
+        return error.IndexNotFound;
+    }
+
     pub fn indexDenseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {
         return try self.indexDenseBatchByNameWithOptions(store, index_name, writes, .{});
     }
@@ -15407,6 +18080,8 @@ pub const IndexManager = struct {
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -15418,6 +18093,10 @@ pub const IndexManager = struct {
             for (mapped_docs.items) |doc| {
                 self.alloc.free(@constCast(doc.key));
                 self.alloc.free(@constCast(doc.value));
+                if (doc.root_arena) |arena| {
+                    arena.deinit();
+                    self.alloc.destroy(arena);
+                }
             }
             mapped_docs.deinit(self.alloc);
         }
@@ -15449,6 +18128,10 @@ pub const IndexManager = struct {
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
+                    if (doc.root_arena) |arena| {
+                        arena.deinit();
+                        manager.alloc.destroy(arena);
+                    }
                 }
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
@@ -15482,6 +18165,7 @@ pub const IndexManager = struct {
                 scan_budget: usize,
                 doc_limit: usize,
                 source_target_bytes: usize,
+                schema_views: *SchemaViewSet,
                 source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
@@ -15507,33 +18191,39 @@ pub const IndexManager = struct {
                     }
 
                     state.saw_visible_doc.* = true;
-                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    const doc_id = if (internal_keys.isStoredDocumentRowKey(key))
+                        (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
                     else
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.alloc.dupe(u8, value);
-                    var doc_value_owned = true;
-                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                    var doc = try state.manager.materializeStoredDocumentWithSchemaViewsAlloc(state.manager.alloc, key, value, state.schema_views);
+                    var doc_owned = true;
+                    errdefer if (doc_owned) doc.deinit(state.manager.alloc);
 
-                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    // Relational materialization retains a decoded projection
+                    // tree instead of canonical JSON. Charge the arena's actual
+                    // capacity so the page target remains a real memory bound.
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) +| doc_id.len +| doc.retainedBytes();
                     if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
                         // Do not consume this key. The next page resumes after
                         // page_last_seen_key and visits it again. Including the
                         // crossing document here created a one-document tail
                         // segment for almost every rebuild page.
                         state.manager.alloc.free(doc_id);
-                        state.manager.alloc.free(doc_value);
+                        doc.deinit(state.manager.alloc);
                         doc_id_owned = false;
-                        doc_value_owned = false;
+                        doc_owned = false;
                         state.stopped_early = true;
                         return .stop;
                     }
 
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
-                        .value = doc_value,
+                        .value = doc.value,
+                        .source_bytes = doc.retainedBytes(),
+                        .root = doc.root,
+                        .root_arena = doc.root_arena,
                         // Resolve ordinals as one sorted batch in
                         // textProjectionSourceDocsWithOrdinals. A point lookup
                         // here turns a full rebuild into millions of sparse LSM
@@ -15541,7 +18231,7 @@ pub const IndexManager = struct {
                         .doc_ordinal = null,
                     });
                     doc_id_owned = false;
-                    doc_value_owned = false;
+                    doc_owned = false;
                     state.source_bytes +|= doc_bytes;
                     try state.rememberKey(key);
 
@@ -15570,6 +18260,7 @@ pub const IndexManager = struct {
                 .scan_budget = scan_budget_per_page,
                 .doc_limit = backfill_doc_limit,
                 .source_target_bytes = backfill_source_target_bytes,
+                .schema_views = &schema_views,
             };
             try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -15603,6 +18294,8 @@ pub const IndexManager = struct {
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
 
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -15614,6 +18307,10 @@ pub const IndexManager = struct {
             for (mapped_docs.items) |doc| {
                 self.alloc.free(@constCast(doc.key));
                 self.alloc.free(@constCast(doc.value));
+                if (doc.root_arena) |arena| {
+                    arena.deinit();
+                    self.alloc.destroy(arena);
+                }
             }
             mapped_docs.deinit(self.alloc);
         }
@@ -15657,6 +18354,10 @@ pub const IndexManager = struct {
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
+                    if (doc.root_arena) |arena| {
+                        arena.deinit();
+                        manager.alloc.destroy(arena);
+                    }
                 }
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
@@ -15691,6 +18392,7 @@ pub const IndexManager = struct {
                 scan_budget: usize,
                 doc_limit: usize,
                 source_target_bytes: usize,
+                schema_views: *SchemaViewSet,
                 source_bytes: usize = 0,
                 scanned: usize = 0,
                 stopped_early: bool = false,
@@ -15716,36 +18418,39 @@ pub const IndexManager = struct {
                     }
 
                     state.saw_visible_doc.* = true;
-                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    const doc_id = if (internal_keys.isStoredDocumentRowKey(key))
+                        (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
                     else
                         try state.manager.alloc.dupe(u8, key);
                     var doc_id_owned = true;
                     errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                    const doc_value = try state.manager.alloc.dupe(u8, value);
-                    var doc_value_owned = true;
-                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                    var doc = try state.manager.materializeStoredDocumentWithSchemaViewsAlloc(state.manager.alloc, key, value, state.schema_views);
+                    var doc_owned = true;
+                    errdefer if (doc_owned) doc.deinit(state.manager.alloc);
 
-                    const doc_bytes = @sizeOf(mapper.MapperDoc) + doc_id.len + doc_value.len;
+                    const doc_bytes = @sizeOf(mapper.MapperDoc) +| doc_id.len +| doc.retainedBytes();
                     if (state.mapped_docs.items.len > 0 and state.source_bytes +| doc_bytes > state.source_target_bytes) {
                         state.manager.alloc.free(doc_id);
-                        state.manager.alloc.free(doc_value);
+                        doc.deinit(state.manager.alloc);
                         doc_id_owned = false;
-                        doc_value_owned = false;
+                        doc_owned = false;
                         state.stopped_early = true;
                         return .stop;
                     }
 
                     try state.mapped_docs.append(state.manager.alloc, .{
                         .key = doc_id,
-                        .value = doc_value,
+                        .value = doc.value,
+                        .source_bytes = doc.retainedBytes(),
+                        .root = doc.root,
+                        .root_arena = doc.root_arena,
                         // Resolve the whole page with getManySorted when the
                         // projection batch is built. The identity mapping is
                         // stable for the lifetime of a document ordinal.
                         .doc_ordinal = null,
                     });
                     doc_id_owned = false;
-                    doc_value_owned = false;
+                    doc_owned = false;
                     state.source_bytes +|= doc_bytes;
                     try state.rememberKey(key);
 
@@ -15774,6 +18479,7 @@ pub const IndexManager = struct {
                 .scan_budget = scan_budget_per_page,
                 .doc_limit = backfill_doc_limit,
                 .source_target_bytes = backfill_source_target_bytes,
+                .schema_views = &schema_views,
             };
             try store.scanReadTxnWithContext(read_txn, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
             reached_end = !scan_state.stopped_early or page_last_seen_key == null;
@@ -16779,7 +19485,10 @@ pub const IndexManager = struct {
             },
             .dense_vector => |entry| try self.dense_indexes.append(self.alloc, entry),
             .sparse_vector => |entry| try self.sparse_indexes.append(self.alloc, entry),
-            .graph => |entry| try self.graph_indexes.append(self.alloc, entry),
+            .graph => |entry| {
+                self.waitForGraphMetricSchedulePins();
+                try self.graph_indexes.append(self.alloc, entry);
+            },
             .algebraic => |entry| try self.algebraic_indexes.append(self.alloc, entry),
         }
     }
@@ -16954,6 +19663,7 @@ pub const IndexManager = struct {
                 var entry = TextIndex{
                     .instance_id = self.allocateTextIndexInstanceId(),
                     .apply_mutex = apply_mutex,
+                    .io = self.checkpointIo(),
                     .config = owned_config.config,
                     .chunk_name = owned_config.chunk_name,
                     .source_artifact_names = owned_config.source_artifact_names,
@@ -17488,6 +20198,7 @@ pub const IndexManager = struct {
                 errdefer if (!cloned_cfg_moved) cloned_cfg.deinit(self.alloc);
 
                 var index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, cloned_cfg.name, .{
+                    .managed_ownership_range = true,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
@@ -17496,12 +20207,14 @@ pub const IndexManager = struct {
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .rebuild_root_path = path,
                     .rebuild_owner_generation = coverageGenerationForConfig(cfg),
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
                 });
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
+                index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -17510,6 +20223,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .artifact_sources = graph_cfg.artifact_sources,
                     .max_edges_per_document = graph_cfg.max_edges_per_document,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
@@ -17524,7 +20238,10 @@ pub const IndexManager = struct {
                 const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path, entry.config);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
-                const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
+                // Repair detection concerns physical presence, not the scoped
+                // logical count. A pending retirement is not an empty/corrupt
+                // projection and must not turn reopen into a full rebuild.
+                const reverse_edges = entry.index.edge_count;
 
                 const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                     self.alloc,
@@ -17536,7 +20253,7 @@ pub const IndexManager = struct {
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
                 const has_replay_history = latest_replay_sequence != 0;
-                if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
+                if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or (reverse_edges == 0 and !entry.index.ownershipTransitionPending())) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(
@@ -17639,6 +20356,7 @@ pub const IndexManager = struct {
             },
         };
         try txn.commit();
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     fn persistCatalogExcludingWithAtomicMutation(
@@ -17669,6 +20387,7 @@ pub const IndexManager = struct {
             },
         };
         try txn.commit();
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     fn loadEnrichmentCatalog(self: *IndexManager, store: anytype) !void {
@@ -17700,6 +20419,10 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(enrichment_catalog_key, data);
         try txn.commit();
+        // Enrichment definitions are part of the immutable foreground write
+        // plan just as much as index definitions. Advance only after durable
+        // commit so cached generations never expose uncommitted configuration.
+        _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
     /// Seed a newly-created split destination with the source shard's durable
@@ -18267,7 +20990,7 @@ pub const IndexManager = struct {
         // Replay mutates SegmentShared.deleted while holding this same
         // per-index mutex. Reacquire it only for validation and publication;
         // executeTextMergeTask uses the task-owned clones and runs unlocked.
-        lockAtomicWithBackoff(entry.apply_mutex);
+        self.lockAtomicWithBackoff(entry.apply_mutex);
         var index_apply_locked = true;
         defer if (index_apply_locked) entry.apply_mutex.unlock();
         if (!entry.lockMergeDeletionStateCurrent(task.deletion_state)) {
@@ -18278,7 +21001,7 @@ pub const IndexManager = struct {
             return false;
         }
         var merge_delta_locked = true;
-        defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        defer if (merge_delta_locked) entry.merge_delta_mutex.unlock(entry.io);
         var has_deletion_deltas = false;
         for (task.deletion_state.deltas) |delta| {
             if (delta.count == 0) continue;
@@ -18351,7 +21074,7 @@ pub const IndexManager = struct {
                 },
             };
         };
-        entry.merge_delta_mutex.unlock();
+        entry.merge_delta_mutex.unlock(entry.io);
         merge_delta_locked = false;
         entry.apply_mutex.unlock();
         index_apply_locked = false;
@@ -18921,6 +21644,7 @@ pub const IndexManager = struct {
         }
         for (self.graph_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
+                self.waitForGraphMetricSchedulePins();
                 self.freeGraphIndexEntry(entry);
                 _ = self.graph_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
@@ -18948,7 +21672,10 @@ pub const IndexManager = struct {
             .full_text => try self.text_indexes.ensureUnusedCapacity(self.alloc, 1),
             .dense_vector => try self.dense_indexes.ensureUnusedCapacity(self.alloc, 1),
             .sparse_vector => try self.sparse_indexes.ensureUnusedCapacity(self.alloc, 1),
-            .graph => try self.graph_indexes.ensureUnusedCapacity(self.alloc, 1),
+            .graph => {
+                self.waitForGraphMetricSchedulePins();
+                try self.graph_indexes.ensureUnusedCapacity(self.alloc, 1);
+            },
             .algebraic => try self.algebraic_indexes.ensureUnusedCapacity(self.alloc, 1),
         }
     }
@@ -18992,6 +21719,7 @@ pub const IndexManager = struct {
         }
         for (self.graph_indexes.items, 0..) |entry, i| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            self.waitForGraphMetricSchedulePins();
             const detached = self.graph_indexes.orderedRemove(i);
             self.dropIndexLoadStateNoLock(name);
             return .{ .graph = detached };
@@ -19054,6 +21782,8 @@ pub const IndexManager = struct {
     ) !void {
         if (try store.lastReplaySequenceFromTxn(source_txn, 0) != snapshot_sequence)
             return error.DenseBackfillSnapshotSequenceMismatch;
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
 
@@ -19062,109 +21792,100 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
-        defer {
-            for (items.items) |item| {
-                self.alloc.free(@constCast(item.vector));
-                if (item.metadata.len > 0) self.alloc.free(@constCast(item.metadata));
+        var cursor = try self.alloc.dupe(u8, lower);
+        defer self.alloc.free(cursor);
+        var lower_exclusive = false;
+        while (true) {
+            var page = try store.scanReadTxnPage(
+                self.alloc,
+                source_txn,
+                cursor,
+                lower_exclusive,
+                if (upper) |buf| buf else "",
+                vector_backfill_page_items,
+                vector_backfill_page_bytes,
+            );
+            defer page.deinit(self.alloc);
+            if (page.items.len == 0) break;
+            const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
+            var next_cursor_owned = true;
+            defer if (next_cursor_owned) self.alloc.free(next_cursor);
+
+            var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
+            defer {
+                for (items.items) |item| {
+                    self.alloc.free(@constCast(item.vector));
+                    if (item.metadata.len > 0) self.alloc.free(@constCast(item.metadata));
+                }
+                items.deinit(self.alloc);
             }
-            items.deinit(self.alloc);
-        }
-        var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
-        defer pending_mappings.deinit(self.alloc);
-        var metadata_presence_memo = DenseVectorMetadataPresenceMemo{};
-        defer metadata_presence_memo.deinit(self.alloc);
-        var mapping_batch = try runtime_store.store.beginBatch();
-        errdefer mapping_batch.abort();
+            var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
+            defer pending_mappings.deinit(self.alloc);
+            var metadata_presence_memo = DenseVectorMetadataPresenceMemo{};
+            defer metadata_presence_memo.deinit(self.alloc);
+            var mapping_batch = try runtime_store.store.beginBatch();
+            errdefer mapping_batch.abort();
 
-        const ScanContext = struct {
-            manager: *IndexManager,
-            entry: *DenseIndex,
-            mapping_batch: *backend_erased.Batch,
-            metadata_presence_memo: *DenseVectorMetadataPresenceMemo,
-            items: *std.ArrayListUnmanaged(hbc_mod.BatchInsertItem),
-            pending_mappings: *std.ArrayListUnmanaged(PendingDenseVectorMapping),
+            for (page.items) |doc| {
+                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                defer self.alloc.free(raw_key);
+                if (!self.keyInRange(raw_key)) continue;
+                try items.ensureUnusedCapacity(self.alloc, 1);
+                try pending_mappings.ensureUnusedCapacity(self.alloc, 1);
+                const vector_values = (try self.extractDenseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, entry.dims, &schema_views)) orelse continue;
+                errdefer self.alloc.free(vector_values);
 
-            fn scan(raw_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-                const ctx: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
-                if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
-                const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(ctx.manager.alloc, key)) orelse
-                    return .@"continue";
-                defer ctx.manager.alloc.free(raw_key);
-                if (!ctx.manager.keyInRange(raw_key)) return .@"continue";
-                const vector_values = (try mapper.extractDenseVectorField(
-                    ctx.manager.alloc,
-                    value,
-                    ctx.entry.field_name,
-                    ctx.entry.dims,
-                )) orelse return .@"continue";
-                var vector_owned = true;
-                errdefer if (vector_owned) ctx.manager.alloc.free(vector_values);
-                const metadata = try ctx.manager.alloc.dupe(u8, raw_key);
-                var metadata_owned = true;
-                errdefer if (metadata_owned) ctx.manager.alloc.free(metadata);
-
-                const assignment = try ctx.manager.ensureDenseVectorIdTxnWithMemo(
-                    ctx.mapping_batch,
-                    ctx.entry.config.name,
-                    raw_key,
-                    null,
-                    ctx.metadata_presence_memo,
-                );
-                // Foreground direct-field writes always materialize the exact
-                // source vector as an index-managed artifact. Backfill must use
-                // the same contract: the native vector WAL can then authenticate
-                // this payload and future repair/backup paths have one stable
-                // source key instead of reparsing documents by convention.
-                if (ctx.entry.embedding_names.len == 0) {
-                    try ctx.manager.writeDenseEmbeddingArtifactTxn(
-                        ctx.mapping_batch,
+                if (entry.embedding_names.len == 0) {
+                    try self.writeDenseEmbeddingArtifactTxn(
+                        &mapping_batch,
                         raw_key,
                         raw_key,
-                        denseVectorArtifactNameAt(ctx.entry, 0),
+                        denseVectorArtifactNameAt(entry, 0),
                         "_embeddings",
                         null,
                         vector_values,
                     );
                 }
-                try ctx.items.append(ctx.manager.alloc, .{
+                const assignment = try self.ensureDenseVectorIdTxnWithMemo(
+                    &mapping_batch,
+                    entry.config.name,
+                    raw_key,
+                    null,
+                    &metadata_presence_memo,
+                );
+                const metadata = try self.alloc.dupe(u8, raw_key);
+                errdefer self.alloc.free(metadata);
+                items.appendAssumeCapacity(.{
                     .vector_id = assignment.vector_id,
                     .vector = vector_values,
                     .metadata = metadata,
                 });
-                vector_owned = false;
-                metadata_owned = false;
-                try ctx.pending_mappings.append(ctx.manager.alloc, .{
+                pending_mappings.appendAssumeCapacity(.{
                     .doc_key = metadata,
                     .parent_doc_key = null,
                     .vector_id = assignment.vector_id,
                     .vector_fingerprint = denseVectorFingerprint(vector_values),
                 });
-                return .@"continue";
             }
-        };
-        var scan_context = ScanContext{
-            .manager = self,
-            .entry = entry,
-            .mapping_batch = &mapping_batch,
-            .metadata_presence_memo = &metadata_presence_memo,
-            .items = &items,
-            .pending_mappings = &pending_mappings,
-        };
-        try store.scanReadTxnWithContext(
-            source_txn,
-            lower,
-            if (upper) |buf| buf else "",
-            .{},
-            &scan_context,
-            ScanContext.scan,
-        );
 
-        try self.insertDenseItems(entry, items.items);
-        try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
+            if (items.items.len > 0) {
+                try self.insertDenseItems(entry, items.items);
+                try self.commitDenseVectorMappingsWithRollback(&mapping_batch, &mapping_batch, entry, entry.config.name, pending_mappings.items);
+            } else {
+                mapping_batch.abort();
+            }
+            self.alloc.free(cursor);
+            cursor = next_cursor;
+            next_cursor_owned = false;
+            lower_exclusive = true;
+            if (page.reached_end) break;
+        }
     }
 
     fn backfillSparseIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, resume_from: ?[]const u8) !void {
+        var schema_views = SchemaViewSet{ .manager = self };
+        defer schema_views.deinit();
         const rebuild_state = self.rebuildState(.sparse_vector, entry.rebuild_root_path, entry.config);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -19173,9 +21894,6 @@ pub const IndexManager = struct {
         defer self.alloc.free(lower);
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
-
-        const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
-        defer backend_scan.freeResults(self.alloc, docs);
 
         var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
@@ -19190,7 +21908,8 @@ pub const IndexManager = struct {
         var flushed_batches: usize = 0;
         var backfilled_doc_count: u64 = entry.index.doc_count;
         var saw_visible_doc = false;
-        var max_flushed_key: ?[]const u8 = null;
+        var max_flushed_key: ?[]u8 = null;
+        defer if (max_flushed_key) |key| self.alloc.free(key);
 
         const flush_batch = struct {
             fn run(
@@ -19227,36 +21946,70 @@ pub const IndexManager = struct {
         }.run;
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
-        for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-            if (resume_from) |resume_key| {
-                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
+        var cursor = if (resume_from) |resume_key|
+            try self.alloc.dupe(u8, resume_key)
+        else
+            try self.alloc.dupe(u8, lower);
+        defer self.alloc.free(cursor);
+        var lower_exclusive = resume_from != null;
+        while (true) {
+            var page = try backend_scan.scanRangePage(
+                self.alloc,
+                &runtime_store.store,
+                cursor,
+                lower_exclusive,
+                if (upper) |buf| buf else "",
+                vector_backfill_page_items,
+                vector_backfill_page_bytes,
+            );
+            defer page.deinit(self.alloc);
+            if (page.items.len == 0) break;
+            const next_cursor = try self.alloc.dupe(u8, page.items[page.items.len - 1].key);
+            var next_cursor_owned = true;
+            defer if (next_cursor_owned) self.alloc.free(next_cursor);
+
+            for (page.items) |doc| {
+                if (!visibleBaseDocumentRowKey(self, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+                defer self.alloc.free(raw_key);
+                if (!self.keyInRange(raw_key)) continue;
+                var sparse_vec = (try self.extractSparseVectorFromStoredAlloc(self.alloc, doc.key, doc.value, entry.field_name, &schema_views)) orelse continue;
+                var sparse_vec_owned = true;
+                errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
+                saw_visible_doc = true;
+                if (max_flushed_key) |old| self.alloc.free(old);
+                max_flushed_key = try self.alloc.dupe(u8, doc.key);
+                try writes.ensureUnusedCapacity(self.alloc, 1);
+                const doc_id = try self.alloc.dupe(u8, raw_key);
+                var doc_id_owned = true;
+                errdefer if (doc_id_owned) self.alloc.free(doc_id);
+                writes.appendAssumeCapacity(.{
+                    .doc_id = doc_id,
+                    .vec = .{
+                        .indices = sparse_vec.indices,
+                        .values = sparse_vec.values,
+                    },
+                });
+                doc_id_owned = false;
+                sparse_vec_owned = false;
+                if (writes.items.len >= backfill_batch_size) {
+                    try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+                    self.alloc.free(max_flushed_key.?);
+                    max_flushed_key = null;
+                }
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
-            defer self.alloc.free(raw_key);
-            if (!self.keyInRange(raw_key)) continue;
-            var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
-            var sparse_vec_owned = true;
-            errdefer if (sparse_vec_owned) sparse_vec.deinit(self.alloc);
-            saw_visible_doc = true;
-            if (max_flushed_key == null or std.mem.order(u8, doc.key, max_flushed_key.?) == .gt) {
-                max_flushed_key = doc.key;
-            }
-            try writes.append(self.alloc, .{
-                .doc_id = try self.alloc.dupe(u8, raw_key),
-                .vec = .{
-                    .indices = sparse_vec.indices,
-                    .values = sparse_vec.values,
-                },
-            });
-            sparse_vec_owned = false;
-            if (writes.items.len >= backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
-            }
+
+            self.alloc.free(cursor);
+            cursor = next_cursor;
+            next_cursor_owned = false;
+            lower_exclusive = true;
+            if (page.reached_end) break;
         }
 
         if (writes.items.len > 0) {
             try flush_batch(self, store, entry, rebuild_state, &writes, max_flushed_key.?, &flushed_batches, &backfilled_doc_count);
+            self.alloc.free(max_flushed_key.?);
+            max_flushed_key = null;
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
@@ -20134,7 +22887,7 @@ pub const IndexManager = struct {
     }
 
     fn estimatedMapperDocBytes(doc: mapper.MapperDoc) usize {
-        return @sizeOf(mapper.MapperDoc) + doc.key.len + doc.value.len;
+        return @sizeOf(mapper.MapperDoc) +| doc.key.len +| @max(doc.value.len, doc.source_bytes);
     }
 
     fn estimateProjectedTextPublication(docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
@@ -22757,14 +25510,24 @@ pub const IndexManager = struct {
                 break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
             }
 
-            const doc_store_key = try internal_keys.documentKeyAlloc(alloc, metadata);
+            const doc_store_key = if (manager.relational_base_rows)
+                try relational_store.keyAlloc(alloc, metadata)
+            else
+                try internal_keys.documentKeyAlloc(alloc, metadata);
             defer alloc.free(doc_store_key);
             const raw = manager.loadPrimaryDocumentRawForHbc(store, doc_store_key, load_session, alloc) catch |err| switch (err) {
                 error.NotFound => break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session),
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            break :blk (try mapper.extractDenseVectorField(alloc, raw, entry.field_name, entry.dims)) orelse
+            break :blk (try manager.extractDenseVectorFromStoredAlloc(
+                alloc,
+                doc_store_key,
+                raw,
+                entry.field_name,
+                entry.dims,
+                null,
+            )) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
@@ -25444,13 +28207,21 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
         if (textArtifactSourceMatches(self, key, artifact_name)) return true;
     }
     if (entry.source_artifact_names.len > 0) return false;
-    if (isPrimaryDocumentCandidate(key)) return true;
+    if (visibleBaseDocumentRowKey(self, key)) return true;
+    if (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
 }
 
+fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
+    return if (self.relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
+}
+
 fn isPrimaryDocumentCandidate(key: []const u8) bool {
-    if (internal_keys.isPrimaryDocumentKey(key)) return true;
+    if (internal_keys.isStoredDocumentRowKey(key)) return true;
     if (internal_keys.isInternalUserKey(key)) return false;
     if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
     return true;
@@ -25573,6 +28344,11 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
     if (version != 1 and version != 2) return error.UnsupportedIndexCatalogVersion;
 
     const count = try readU32(data, &pos);
+    // Each entry needs two length prefixes, a kind byte, and (since v2) a
+    // coverage generation. Reject impossible counts before allowing an
+    // untrusted catalog to drive an allocation.
+    const minimum_entry_size: usize = 4 + 1 + 4 + (if (version >= 2) @as(usize, 8) else 0);
+    if (@as(usize, count) > (data.len - pos) / minimum_entry_size) return error.InvalidIndexCatalog;
     var configs = try alloc.alloc(types.IndexConfig, count);
     var initialized: usize = 0;
     errdefer {
@@ -25618,6 +28394,26 @@ fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConfig {
     }
 
     return configs;
+}
+
+/// Validate the durable index catalog without opening index backends or
+/// mutating an IndexManager. Portable restore uses this during isolated
+/// staging so malformed metadata can never fail after publication.
+pub fn validateSerializedCatalog(alloc: Allocator, data: []const u8) !void {
+    const configs = try deserializeCatalog(alloc, data);
+    defer {
+        for (configs) |*cfg| cfg.deinit(alloc);
+        alloc.free(configs);
+    }
+}
+
+test "index catalog rejects impossible entry count before allocation" {
+    var encoded: [12]u8 = undefined;
+    @memcpy(encoded[0..4], "AIDX");
+    std.mem.writeInt(u32, encoded[4..8], 2, .little);
+    std.mem.writeInt(u32, encoded[8..12], std.math.maxInt(u32), .little);
+
+    try std.testing.expectError(error.InvalidIndexCatalog, validateSerializedCatalog(std.testing.allocator, &encoded));
 }
 
 fn appendU32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
@@ -26088,6 +28884,7 @@ pub const GraphArtifactSource = struct {
 
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
+    metric_configs: []graph_mod.GraphMetricConfig,
     artifact_sources: []GraphArtifactSource = &.{},
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     max_edges_per_document: u32 = 0,
@@ -26099,6 +28896,7 @@ const GraphConfig = struct {
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(alloc, self.metric_configs);
         for (self.artifact_sources) |*source| source.deinit(alloc);
         if (self.artifact_sources.len > 0) alloc.free(self.artifact_sources);
         if (self.shorthand_asset) |*asset| asset.deinit(alloc);
@@ -26838,6 +29636,47 @@ fn containsObservedFieldAnalyzer(
     return false;
 }
 
+fn freeOwnedObservedFieldAnalyzers(
+    alloc: Allocator,
+    observed: *std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+) void {
+    for (observed.items) |item| {
+        alloc.free(item.field_name);
+        alloc.free(item.analyzer_name);
+    }
+    observed.deinit(alloc);
+}
+
+fn appendOwnedObservedFieldAnalyzers(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer),
+    additions: []const mapper.ObservedFieldAnalyzer,
+) !void {
+    for (additions) |item| {
+        if (containsObservedFieldAnalyzer(out.items, item)) continue;
+        const field_name = try alloc.dupe(u8, item.field_name);
+        const analyzer_name = alloc.dupe(u8, item.analyzer_name) catch |err| {
+            alloc.free(field_name);
+            return err;
+        };
+        out.append(alloc, .{
+            .field_name = field_name,
+            .analyzer_name = analyzer_name,
+            .field_type = item.field_type,
+            .do_index = item.do_index,
+            .store = item.store,
+            .doc_values = item.doc_values,
+            .sortable = item.sortable,
+            .missing_null_policy = item.missing_null_policy,
+            .include_in_all = item.include_in_all,
+        }) catch |err| {
+            alloc.free(field_name);
+            alloc.free(analyzer_name);
+            return err;
+        };
+    }
+}
+
 fn observedFieldAnalyzerMappingEquals(left: mapper.ObservedFieldAnalyzer, right: mapper.ObservedFieldAnalyzer) bool {
     return left.field_type == right.field_type and
         left.do_index == right.do_index and
@@ -27289,6 +30128,8 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     errdefer if (shorthand_asset) |*asset| {
         asset.deinit(alloc);
     };
+    const metric_configs = try parseGraphMetricConfigs(alloc, root);
+    errdefer graph_mod.freeGraphMetricConfigs(alloc, metric_configs);
     if (shorthand_asset) |asset| {
         if (artifact_sources.len != 1 or
             !std.mem.eql(u8, asset.name, artifact_sources[0].artifact_name))
@@ -27300,6 +30141,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
+            .metric_configs = metric_configs,
             .artifact_sources = artifact_sources,
             .shorthand_asset = shorthand_asset,
             .max_edges_per_document = max_edges_per_document,
@@ -27353,10 +30195,142 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
 
     return .{
         .edge_type_configs = configs,
+        .metric_configs = metric_configs,
         .artifact_sources = artifact_sources,
         .shorthand_asset = shorthand_asset,
         .max_edges_per_document = max_edges_per_document,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
+    };
+}
+
+fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.GraphMetricConfig {
+    const metrics_value = root.object.get("metrics") orelse return try alloc.alloc(graph_mod.GraphMetricConfig, 0);
+    if (metrics_value != .object) return error.InvalidIndexConfig;
+
+    var configs = std.ArrayListUnmanaged(graph_mod.GraphMetricConfig).empty;
+    errdefer {
+        for (configs.items) |*cfg| {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        }
+        configs.deinit(alloc);
+    }
+
+    var it = metrics_value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (entry.value_ptr.* != .object) return error.InvalidIndexConfig;
+        const metric_obj = entry.value_ptr.*.object;
+        const enabled = if (metric_obj.get("enabled")) |value| blk: {
+            if (value != .bool) return error.InvalidIndexConfig;
+            break :blk value.bool;
+        } else true;
+        if (!enabled) continue;
+
+        const kind = if (metric_obj.get("kind")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "pagerank")) break :blk graph_mod.GraphMetricKind.pagerank;
+            if (std.mem.eql(u8, value.string, "degree")) break :blk graph_mod.GraphMetricKind.degree;
+            if (std.mem.eql(u8, value.string, "eigenvector")) break :blk graph_mod.GraphMetricKind.eigenvector;
+            if (std.mem.eql(u8, value.string, "hits_authority")) break :blk graph_mod.GraphMetricKind.hits_authority;
+            if (std.mem.eql(u8, value.string, "hits_hub")) break :blk graph_mod.GraphMetricKind.hits_hub;
+            return error.InvalidIndexConfig;
+        } else if (std.mem.eql(u8, name, "pagerank"))
+            graph_mod.GraphMetricKind.pagerank
+        else if (std.mem.eql(u8, name, "degree"))
+            graph_mod.GraphMetricKind.degree
+        else if (std.mem.eql(u8, name, "eigenvector"))
+            graph_mod.GraphMetricKind.eigenvector
+        else if (std.mem.eql(u8, name, "hits_authority"))
+            graph_mod.GraphMetricKind.hits_authority
+        else if (std.mem.eql(u8, name, "hits_hub"))
+            graph_mod.GraphMetricKind.hits_hub
+        else
+            return error.InvalidIndexConfig;
+
+        const refresh = if (metric_obj.get("refresh")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "background")) break :blk graph_mod.GraphMetricRefreshMode.background;
+            if (std.mem.eql(u8, value.string, "manual")) break :blk graph_mod.GraphMetricRefreshMode.manual;
+            return error.InvalidIndexConfig;
+        } else graph_mod.GraphMetricRefreshMode.background;
+
+        const damping = if (metric_obj.get("damping")) |value| try jsonNumberAsF64(value) else 0.85;
+        if (damping <= 0.0 or damping >= 1.0) return error.InvalidIndexConfig;
+        const tolerance = if (metric_obj.get("tolerance")) |value| try jsonNumberAsF64(value) else 0.000001;
+        if (tolerance <= 0.0) return error.InvalidIndexConfig;
+        const max_iterations = if (metric_obj.get("max_iterations")) |value| blk: {
+            const raw = try jsonNumberAsU32(value);
+            if (raw == 0 or raw > graph_mod.graph_metric_max_iterations) return error.InvalidIndexConfig;
+            break :blk raw;
+        } else 50;
+
+        const owned_name = try alloc.dupe(u8, name);
+        var owned_name_moved = false;
+        errdefer if (!owned_name_moved) alloc.free(owned_name);
+
+        var cfg = graph_mod.GraphMetricConfig{
+            .name = owned_name,
+            .kind = kind,
+            .damping = damping,
+            .tolerance = tolerance,
+            .max_iterations = max_iterations,
+            .refresh = refresh,
+            .edge_filter = try parseGraphMetricEdgeFilter(alloc, metric_obj.get("edge_filter")),
+        };
+        owned_name_moved = true;
+        var cfg_moved = false;
+        errdefer if (!cfg_moved) {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        };
+        try configs.append(alloc, cfg);
+        cfg_moved = true;
+    }
+
+    const owned = try configs.toOwnedSlice(alloc);
+    return owned;
+}
+
+fn parseGraphMetricEdgeFilter(alloc: Allocator, maybe_value: ?std.json.Value) !graph_mod.GraphMetricEdgeFilter {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidIndexConfig;
+    if (value.object.get("types")) |types_value| {
+        if (types_value != .array or types_value.array.items.len == 0) return error.InvalidIndexConfig;
+        const edge_types = try alloc.alloc([]const u8, types_value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (types_value.array.items, 0..) |item, i| {
+            if (item != .string or item.string.len == 0) return error.InvalidIndexConfig;
+            edge_types[i] = try alloc.dupe(u8, item.string);
+            initialized += 1;
+        }
+        return .{ .mode = .types, .types = edge_types };
+    }
+    if (value.object.get("mode")) |mode_value| {
+        if (mode_value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, mode_value.string, "all")) return .{};
+        return error.InvalidIndexConfig;
+    }
+    return .{};
+}
+
+fn jsonNumberAsF64(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .float => |v| v,
+        else => error.InvalidIndexConfig,
+    };
+}
+
+fn jsonNumberAsU32(value: std.json.Value) !u32 {
+    return switch (value) {
+        .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
+        .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        else => error.InvalidIndexConfig,
     };
 }
 
@@ -27654,6 +30628,35 @@ test "graph config declares algebraic provenance semiring traversal law" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
     ));
+}
+
+test "graph config bounds iterative metric work" {
+    const alloc = std.testing.allocator;
+    var bounded = try parseGraphConfig(alloc,
+        \\{"metrics":{"pagerank":{"max_iterations":1000}}}
+    );
+    defer bounded.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.graph_metric_max_iterations, bounded.metric_configs[0].max_iterations);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"metrics":{"pagerank":{"max_iterations":1001}}}
+    ));
+}
+
+test "HITS lifecycle scheduling suppresses only the compatible hub" {
+    const cites = [_][]const u8{"cites"};
+    const mentions = [_][]const u8{"mentions"};
+    const compatible = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &cites } },
+        .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
+    };
+    try std.testing.expect(!IndexManager.graphMetricLifecycleCanonical(&compatible, compatible[1]));
+
+    const unrelated = [_]graph_mod.GraphMetricConfig{
+        .{ .name = "authority", .kind = .hits_authority, .edge_filter = .{ .mode = .types, .types = &mentions } },
+        .{ .name = "hub", .kind = .hits_hub, .edge_filter = .{ .mode = .types, .types = &cites } },
+    };
+    try std.testing.expect(IndexManager.graphMetricLifecycleCanonical(&unrelated, unrelated[1]));
 }
 
 test "graph config validates and retains edge materialization limits" {
@@ -30935,6 +33938,55 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+
+    var write_plan = try manager.acquireWritePlanSnapshot();
+    defer write_plan.release();
+    const extracted_empty = mapper.ExtractedWrite{
+        .cleaned_value = @constCast("{}"),
+        .graph_writes = &.{},
+        .mentioned_graph_indexes = &.{},
+        .dense_embeddings = &.{},
+        .sparse_embeddings = &.{},
+    };
+    const snapshot_generated = try write_plan.plan().planGeneratedEnrichmentsForRow(
+        alloc,
+        "doc:snapshot",
+        extracted_empty,
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, snapshot_generated);
+    try std.testing.expectEqual(generated.len, snapshot_generated.len);
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(snapshot_generated, "doc:snapshot", "title", "", "", "title_dense_v1"));
+    try std.testing.expect(hasGeneratedChunkRequest(snapshot_generated, "doc:snapshot", "body", "", "document_chunks_v1"));
+    try std.testing.expect(hasGeneratedDenseEmbeddingRequest(snapshot_generated, "doc:snapshot", "text", "", "document_chunks_v1", "body_dense_v1"));
+
+    const explicit_vectors = [_]mapper.DenseEmbeddingWrite{.{
+        .index_name = @constCast("document_vectors"),
+        .doc_key = @constCast("doc:explicit"),
+        .vector = @constCast(&[_]f32{ 1, 0, 0 }),
+    }};
+    var extracted_explicit = extracted_empty;
+    extracted_explicit.dense_embeddings = @constCast(&explicit_vectors);
+    const explicit_plan = try write_plan.plan().planGeneratedEnrichmentsForRow(
+        alloc,
+        "doc:explicit",
+        extracted_explicit,
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, explicit_plan);
+    try std.testing.expectEqual(@as(usize, 0), explicit_plan.len);
+
+    try manager.addEnrichment(&store, .{
+        .name = "summary_asset_v1",
+        .kind = .asset,
+        .field = "title",
+    });
+    var refreshed_write_plan = try manager.acquireWritePlanSnapshot();
+    defer refreshed_write_plan.release();
+    try std.testing.expect(refreshed_write_plan.generation() > write_plan.generation());
+    try std.testing.expectEqual(
+        write_plan.plan().generated_templates.len + 1,
+        refreshed_write_plan.plan().generated_templates.len,
+    );
+
     var embedding_request_count: usize = 0;
     for (generated) |request| {
         if (request.kind != .dense_embedding) continue;
@@ -31439,6 +34491,42 @@ test "generated target cache detects sparse and graph artifact consumers indepen
         try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
         try std.testing.expect(!try manager.computeGeneratedEnrichmentTargetCacheExcluding("relations_graph", null));
     }
+}
+
+test "write plan retains base text roots only for document consumers" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "text-root-consumers");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try std.testing.expect(try manager.ensureChunkEnrichment(.{
+        .name = "text_chunks",
+        .kind = .chunk,
+        .source_field = "body",
+        .chunk_size = 64,
+    }));
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "artifact_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"text_chunks\"}]}",
+    }});
+    var artifacts = try manager.acquireWritePlanSnapshot();
+    defer artifacts.release();
+    try std.testing.expect(!artifacts.plan().has_text_consumers);
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "base_text",
+        .kind = .full_text,
+        .config_json = "{}",
+    }});
+    var documents = try manager.acquireWritePlanSnapshot();
+    defer documents.release();
+    try std.testing.expect(documents.plan().has_text_consumers);
+    try std.testing.expect(!artifacts.plan().has_text_consumers);
+    try std.testing.expect(documents.generation() != artifacts.generation());
 }
 
 test "multi-source consumers participate in generation routing and preserve source isolation" {
@@ -37839,8 +40927,12 @@ test "text merge deletion states synchronize recording with per-index detach" {
     defer state_b.destroy();
     state_b.segment_ids[0] = source_b[0].id;
 
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var entry: IndexManager.TextIndex = undefined;
-    entry.merge_delta_mutex = .unlocked;
+    entry.io = io;
+    entry.merge_delta_mutex = .init;
     entry.merge_deletion_states = .empty;
     defer entry.merge_deletion_states.deinit(alloc);
     try entry.attachMergeDeletionState(alloc, state_a);
@@ -37869,9 +40961,6 @@ test "text merge deletion states synchronize recording with per-index detach" {
     };
 
     var context = Context{ .entry = &entry, .iterations = iterations };
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var writer = std.Io.async(io, Context.record, .{&context});
     var writer_awaited = false;
     defer if (!writer_awaited) writer.await(io);
@@ -39750,6 +42839,75 @@ test "stable native finalization certifies an empty dense index" {
     ));
     try std.testing.expectEqual(@as(?u64, 0), entry.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(@as(u64, 0), (try entry.index.postingBacklogStats()).dirty_postings);
+}
+
+test "quiescent vector finalization defers to another index owner without losing debt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "owner",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        },
+        .{
+            .name = "contender",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"other_embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        },
+    });
+    const owner = manager.denseIndex("owner") orelse return error.IndexNotFound;
+    const entry = manager.denseIndex("contender") orelse return error.IndexNotFound;
+    _ = try entry.index.publishExperimentalPostingCheckpoint(0);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    manager.vector_block_candidate_since_ns.store(1, .release);
+
+    // Model a different index holding the table-wide claim. No scheduling or
+    // sleeps are needed to reproduce contention under the contender's lock.
+    manager.vector_block_stable_tip_finalizing.store(true, .release);
+    manager.vector_block_stable_tip_index.store(@intFromPtr(owner), .release);
+    manager.vector_block_stable_tip_sequence.store(17, .release);
+    manager.lockAtomicWithBackoff(entry.apply_mutex);
+    defer entry.apply_mutex.unlock();
+    try std.testing.expectEqual(.pending, try manager.maintainVectorBlockBaseIfQuiescent(entry));
+    try std.testing.expect(manager.vector_block_stable_tip_finalizing.load(.acquire));
+    try std.testing.expectEqual(@intFromPtr(owner), manager.vector_block_stable_tip_index.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 17), manager.vector_block_stable_tip_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), manager.vector_block_candidate_since_ns.load(.acquire));
+
+    manager.vector_block_stable_tip_sequence.store(0, .release);
+    manager.vector_block_stable_tip_index.store(0, .release);
+    manager.vector_block_stable_tip_finalizing.store(false, .release);
+    {
+        // A genuine generation failure after acquiring the claim must still
+        // propagate, release ownership, and leave the candidate retryable.
+        const FailBuild = struct {
+            fn call(_: *anyopaque) anyerror!void {
+                return error.VectorBlockGenerationReservationLost;
+            }
+        };
+        test_before_vector_block_primary_snapshot_build = .{ .ctx = &manager, .call = FailBuild.call };
+        defer test_before_vector_block_primary_snapshot_build = null;
+        try std.testing.expectError(error.VectorBlockGenerationReservationLost, manager.maintainVectorBlockBaseIfQuiescent(entry));
+        try std.testing.expect(!manager.vector_block_stable_tip_finalizing.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), manager.vector_block_stable_tip_index.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), manager.vector_block_stable_tip_sequence.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), manager.vector_block_candidate_since_ns.load(.acquire));
+    }
+    try std.testing.expectEqual(.progressed, try manager.maintainVectorBlockBaseIfQuiescent(entry));
+    try std.testing.expectEqual(@as(u64, 0), manager.vector_block_candidate_since_ns.load(.acquire));
+    try std.testing.expect(!manager.vector_block_stable_tip_finalizing.load(.acquire));
+    try std.testing.expect(manager.vectorBlockReadyAtSequenceAndCount(0, entry, 0));
 }
 
 test "only the stable-tip owner may repair postings from a leading vector generation" {

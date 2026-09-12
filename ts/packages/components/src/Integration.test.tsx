@@ -465,7 +465,12 @@ describe("Integration Tests", () => {
       );
 
       const input = container.querySelector("input") as HTMLInputElement;
-      await userEvent.type(input, longQuery);
+      // This verifies a large query value, not 500 individual keyboard events.
+      // A paste also completes atomically, so timeout cannot leave an ongoing
+      // typing task sending events into the following test's focused input.
+      const user = userEvent.setup();
+      await user.click(input);
+      await user.paste(longQuery);
 
       expect(input.value).toBe(longQuery);
       expect(container).toBeTruthy();

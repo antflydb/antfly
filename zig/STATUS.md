@@ -55,9 +55,11 @@ The current code already has the beginning of a status plane:
   - Those helpers are publisher/background paths. Public status handlers must
     not call them directly because they can inspect live writers, take apply
     locks, or finish pending index work.
-  - Publishers should refresh an existing cached group status by overlaying
-    cheap live counters. Full `DB.stats()` is a cold-start/deep-stats fallback,
-    not the steady-state hot publish mechanism.
+  - Publishers can overlay cheap live counters onto retained group status,
+    but establishing fresh source counts or index inventory requires
+    `DB.runtimeStatusStatsConsistentIfAvailable()`. Contention preserves the
+    cached observation or defers a cold publication; operational `DB.stats()`
+    telemetry does not establish this authority.
 
 - `pkg/antfly/src/data/runtime.zig`
   - `DataServer.runRuntimeStatusRefresh()` is the main background refresh path.
@@ -268,14 +270,30 @@ marked stale by age.
 Split operational status from diagnostics:
 
 - `DB.stats()` is the operational stats API.
+- `DB.runtimeStatusStatsConsistentIfAvailable()` is the nonblocking coherent
+  source-count/index-inventory API for runtime publication.
 - `DB.diagnosticStats()` is the deep inspection API.
 
-`DB.stats()` must be cheap, bounded, and safe for background status publishers.
+`DB.stats()` must be cheap and bounded.
 It should assemble a snapshot from already-maintained in-memory counters,
 published index visibility, replay watermarks, async worker state, resource
 manager snapshots, and lightweight persisted metadata that can be read with a
 point lookup. It is allowed to allocate the returned `DBStats` tree, but it
 must not perform unbounded storage/index work.
+
+When apply-lock admission fails, `DB.stats()` can return partial telemetry
+without index rows or source cardinality. That is a missing observation, not
+an observed empty table. It must not replace the published inventory or be
+labelled as a fresh live-writer observation. A DB lease pins lifetime; it does
+not prove that these facts were observed.
+
+Runtime publishers use `runtimeStatusStatsConsistentIfAvailable()` and preserve
+cached facts or defer publication when it returns `null`. A caller deliberately
+owning a blocking observation boundary can use `runtimeStatusStatsConsistent()`.
+Both coherent APIs retain bounded inventory/counter work; they do not authorize
+scans, maintenance, or cold opens. Public HTTP handlers continue to read the
+immutable status cache. Cached overlays retain their existing authority unless
+a coherent observation establishes new facts.
 
 `DB.stats()` must not:
 
@@ -296,7 +314,8 @@ health, metrics, or normal runtime-status publication.
 The intended caller split is:
 
 - HTTP table/index status: `runtime_status_cache` and metadata heartbeat only.
-- Runtime-status publishers: `DB.stats()`.
+- Runtime-status publishers: coherent runtime snapshots, with cached fallback
+  or deferred publication on contention.
 - Benchmarks that need operational status: `DB.stats()`.
 - Debug/admin tools and tests that need deep validation: `DB.diagnosticStats()`.
 - Embedded/C API status surfaces should prefer `DB.stats()` unless explicitly
