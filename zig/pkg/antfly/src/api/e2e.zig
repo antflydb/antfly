@@ -3985,7 +3985,7 @@ test "public api e2e supports managed sparse embeddings generation" {
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },
@@ -4111,7 +4111,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },
@@ -5532,7 +5532,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },
@@ -6458,7 +6458,7 @@ test "public api e2e supports graph queries" {
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
             const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
             return switch (result) {
-                .graph_nodes_result => |nodes| nodes.*,
+                .graph_nodes_result => |nodes| nodes,
                 else => error.TestUnexpectedResult,
             };
         }
@@ -6678,7 +6678,7 @@ test "public api e2e graph queries respect full_index sync level" {
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
             const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
             return switch (result) {
-                .graph_nodes_result => |nodes| nodes.*,
+                .graph_nodes_result => |nodes| nodes,
                 else => error.TestUnexpectedResult,
             };
         }
@@ -6812,7 +6812,7 @@ test "public api e2e restores graph indexes from table backup" {
             const graph_results = responses[0].graph_results orelse return error.TestUnexpectedResult;
             const result = graph_results.map.get(name) orelse return error.TestUnexpectedResult;
             return switch (result) {
-                .graph_nodes_result => |nodes| nodes.*,
+                .graph_nodes_result => |nodes| nodes,
                 else => error.TestUnexpectedResult,
             };
         }

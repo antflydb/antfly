@@ -23,8 +23,6 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
-const platform_time = @import("antfly_platform").time;
-
 pub const VisibilityWait = runtime_types.VisibilityWait;
 
 const runtime_types = @import("runtime_types.zig");

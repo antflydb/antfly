@@ -367,8 +367,8 @@ def main(argv: list[str]) -> int:
     options, args = parser.parse_known_args(argv)
     if options.depfile is not None:
         target_index = 1 if args[:1] == ["--compare"] else 0
-        if len(args) > target_index:
-            args[target_index] = str(Path(args[target_index]).absolute())
+        if len(args) > target_index and not args[target_index].startswith("--"):
+            args[target_index] = str(Path(args[target_index]).resolve())
     with record_dependencies(options.depfile):
         return generate(args)
 

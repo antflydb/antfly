@@ -142,6 +142,20 @@ pub const FeatureDBReads = struct {
         try self.reads.prepareScanWithConsistency(self.group_id, from_key, to_key, opts, consistency);
         return try db.scan(alloc, from_key, to_key, opts);
     }
+
+    pub fn scanVisitWithConsistency(
+        self: FeatureDBReads,
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        visitor: db_mod.types.ScanVisitor,
+    ) !void {
+        try self.reads.prepareScanWithConsistency(self.group_id, from_key, to_key, opts, consistency);
+        try db.scanVisit(alloc, from_key, to_key, opts, visitor);
+    }
 };
 
 test "feature db reads honor per-read consistency" {

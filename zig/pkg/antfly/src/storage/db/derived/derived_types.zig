@@ -41,6 +41,13 @@ pub const DerivedDocument = struct {
     action: DerivedAction = .upsert,
     cleaned_value: ?[]const u8 = null,
     targets: []const DerivedTargetRef = &.{},
+    /// Request-local prepared projection. It borrows the prepared-row region,
+    /// is omitted from the durable codec below, and is intentionally dropped by
+    /// cloning. Replay rebuilds the typed root directly from schema-bound AROW.
+    prepared_text_root: ?std.json.Value = null,
+    prepared_text_source_bytes: usize = 0,
+    prepared_schema_version: u32 = 0,
+    prepared_write_plan_generation: u64 = 0,
 };
 
 pub const DerivedGraphDocClear = struct {
@@ -872,6 +879,10 @@ test "derived log record binary round trips" {
                 .key = "doc:a",
                 .action = .upsert,
                 .cleaned_value = "{\"body\":\"alpha\"}",
+                .prepared_text_root = .null,
+                .prepared_text_source_bytes = 4096,
+                .prepared_schema_version = 17,
+                .prepared_write_plan_generation = 23,
                 .targets = &.{
                     .{ .kind = .dense_vector, .index_name = "dv_v1" },
                     .{ .kind = .graph, .index_name = "gr_v1" },
@@ -914,6 +925,10 @@ test "derived log record binary round trips" {
     try std.testing.expectEqual(@as(u64, 42), decoded.batch.sequence);
     try std.testing.expectEqualStrings("doc:a", decoded.batch.documents[0].key);
     try std.testing.expectEqualStrings("dv_v1", decoded.batch.documents[0].targets[0].index_name);
+    try std.testing.expect(decoded.batch.documents[0].prepared_text_root == null);
+    try std.testing.expectEqual(@as(usize, 0), decoded.batch.documents[0].prepared_text_source_bytes);
+    try std.testing.expectEqual(@as(u32, 0), decoded.batch.documents[0].prepared_schema_version);
+    try std.testing.expectEqual(@as(u64, 0), decoded.batch.documents[0].prepared_write_plan_generation);
     try std.testing.expectEqualStrings("doc:old", decoded.batch.deleted_keys[0]);
     try std.testing.expectEqualStrings("doc:a", decoded.batch.dense_embeddings[0].parent_doc_key.?);
     try std.testing.expectEqualStrings("chunk:a:0", decoded.batch.dense_embeddings[0].doc_key);

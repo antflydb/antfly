@@ -969,7 +969,7 @@ pub const GraphIndex = struct {
                 .lsm => |*handle| {
                     if (handle.backend.options.backend.read_only) return;
                     if (handle.backend.manifest_backing != null) return;
-                    if (handle.backend.runs.items.len != 0) return;
+                    if (handle.backend.runs.count() != 0) return;
                     try handle.backend.persistManifest();
                 },
             }
@@ -19235,6 +19235,56 @@ test "graph metric edge filter equality and fingerprint treat types as set" {
     try std.testing.expect(fingerprint <= std.math.maxInt(i64));
 }
 
+fn expectPageRankManifestPagesForTest(graph: *GraphIndex, txn: anytype, manifest: GraphIndex.GraphMetricBuildManifest, edge_partitions: usize, node_partitions: usize) !void {
+    // Iterative initialization and reduction each have a scalar root plus
+    // independently leased node-summary leaves, even for a one-page graph.
+    // Verify the durable inventory, not merely the planner's arithmetic.
+    var total_pages: u64 = 0;
+    for (GraphIndex.graph_metric_iterative_build_phases, 0..) |phase, phase_index| {
+        const summary_phase = phase == .initialize_ranks or phase == .reduce_ranks;
+        const expected_pages = switch (phase) {
+            .prepare_generation => 1,
+            .scan_edges_and_out_degree, .iterate_contributions => edge_partitions,
+            .initialize_ranks, .reduce_ranks => 2 * node_partitions + 1,
+            .check_convergence, .publish_generation => node_partitions,
+            .cleanup_old_generations => 3,
+            else => unreachable,
+        };
+        const prefix = try graph.graphMetricBuildPagePrefixAlloc("pagerank", manifest.job_id, phase, 0);
+        defer graph.alloc.free(prefix);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var next = try cursor.seekAtOrAfter(prefix);
+        var actual_pages: usize = 0;
+        while (next) |entry| : (next = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            const page = GraphIndex.decodeGraphMetricBuildPage(entry.value) orelse return error.TestExpectedGraphMetricBuildPage;
+            try std.testing.expectEqual(manifest.job_id, page.job_id);
+            try std.testing.expectEqual(phase, page.phase);
+            actual_pages += 1;
+        }
+        try std.testing.expectEqual(expected_pages, actual_pages);
+        total_pages += actual_pages;
+        if (!summary_phase) continue;
+        const root = try graph.metricBuildPage(txn, "pagerank", manifest.job_id, phase, 0, 0) orelse return error.TestExpectedGraphMetricBuildPage;
+        try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.summary, root.range_kind);
+        try std.testing.expectEqual(manifest.node_count, root.total_units);
+        var leaf_units: u64 = 0;
+        for (0..node_partitions) |partition| {
+            const leaf = try graph.metricBuildPage(txn, "pagerank", manifest.job_id, phase, 0, graph_metric_build_summary_leaf_base + partition) orelse return error.TestExpectedGraphMetricBuildPage;
+            const data = try graph.metricBuildPage(txn, "pagerank", manifest.job_id, phase, 0, phase_index + partition) orelse return error.TestExpectedGraphMetricBuildPage;
+            try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.summary, leaf.range_kind);
+            try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, data.range_kind);
+            try std.testing.expectEqualStrings(data.range_lower, leaf.range_lower);
+            try std.testing.expectEqualStrings(data.range_upper, leaf.range_upper);
+            try std.testing.expectEqual(data.total_units, leaf.total_units);
+            leaf_units += leaf.total_units;
+        }
+        try std.testing.expectEqual(manifest.node_count, leaf_units);
+    }
+    try std.testing.expectEqual(total_pages, manifest.page_count);
+}
+
 test "graph metric build manifest is durable and idempotent across reopen" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -19252,6 +19302,8 @@ test "graph metric build manifest is durable and idempotent across reopen" {
         .refresh = .manual,
     }};
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph_open = true;
+    defer if (graph_open) graph.close();
 
     try graph.addEdge("doc-a", "doc-b", "cites", 1.0, 0, 0, "");
     try graph.addEdge("doc-b", "doc-c", "cites", 1.0, 0, 0, "");
@@ -19272,7 +19324,7 @@ test "graph metric build manifest is durable and idempotent across reopen" {
         try std.testing.expectEqual(@as(u64, 2), manifest.edge_count);
         try std.testing.expectEqual(@as(u64, 3), manifest.node_count);
         try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len, manifest.phase_count);
-        try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len + 2, manifest.page_count);
+        try expectPageRankManifestPagesForTest(&graph, &txn, manifest, 1, 1);
 
         const scan_page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.pending, scan_page.state);
@@ -19285,9 +19337,10 @@ test "graph metric build manifest is durable and idempotent across reopen" {
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.nodes, initialize_page.range_kind);
     }
     graph.close();
+    graph_open = false;
 
     graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
-    defer graph.close();
+    graph_open = true;
     {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
@@ -19320,7 +19373,7 @@ test "graph metric build manifest is durable and idempotent across reopen" {
         var txn = try graph.beginReadReverseTxn();
         defer txn.abort();
         const manifest = try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-        try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len + 2, manifest.page_count);
+        try expectPageRankManifestPagesForTest(&graph, &txn, manifest, 1, 1);
         const scan_page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, scan_page.state);
         try std.testing.expectEqual(@as(u64, 2), scan_page.completed_units);
@@ -19386,15 +19439,16 @@ test "graph metric build pagerank manifest partitions iterative phase pages" {
     try graph.acquireGraphMetricBuildLease("pagerank", try graph.graphMetricCurrentGeneration("pagerank"));
     defer graph.releaseGraphMetricBuildLease("pagerank") catch {};
 
-    var job_txn = try graph.beginReadReverseTxn();
-    const active_job = try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-    job_txn.abort();
+    const active_job = job: {
+        var job_txn = try graph.beginReadReverseTxn();
+        defer job_txn.abort();
+        break :job try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
+    };
 
     var txn = try graph.beginReadReverseTxn();
     defer txn.abort();
     const manifest = try graph.metricBuildManifest(&txn, "pagerank", active_job.job_id) orelse return error.TestExpectedGraphMetricBuildManifest;
-    // Eight data-partition pages plus two dependency-summary pages.
-    try std.testing.expectEqual(GraphIndex.graph_metric_iterative_build_phases.len + 10, manifest.page_count);
+    try expectPageRankManifestPagesForTest(&graph, &txn, manifest, 2, 2);
 
     const first_scan = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
     try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageRangeKind.reverse_edges, first_scan.range_kind);
@@ -21828,9 +21882,11 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
     try graph.acquireGraphMetricBuildLease("pagerank", try graph.graphMetricCurrentGeneration("pagerank"));
     defer graph.releaseGraphMetricBuildLease("pagerank") catch {};
 
-    var job_txn = try graph.beginReadReverseTxn();
-    const active_job = try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
-    job_txn.abort();
+    const active_job = job: {
+        var job_txn = try graph.beginReadReverseTxn();
+        defer job_txn.abort();
+        break :job try graph.metricBuildJob(&job_txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
+    };
 
     _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .prepare_generation, 0, 0, "worker-a", 1000);
     _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .prepare_generation, 0, 0, "worker-a", 1, GraphIndex.graphMetricBuildJobId("pagerank", active_job.target_generation, active_job.started_at_ms));
@@ -26114,6 +26170,15 @@ test "graph metric build publish verification records iterative convergence read
 
     _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .initialize_ranks, 0, 2, "worker-a", 3000);
     _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .initialize_ranks, 0, 2, "worker-a", 2, 33);
+    // Completing node data alone is insufficient: initialization now also
+    // requires the bounded membership leaf and scalar normalization root.
+    try std.testing.expect(!try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .initialize_ranks, 0));
+    try std.testing.expectError(error.GraphMetricBuildPublishNotReady, graph.verifyGraphMetricBuildPublishReady("pagerank", active_job.job_id));
+    _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base, "worker-a", 3100);
+    _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .initialize_ranks, 0, graph_metric_build_summary_leaf_base, "worker-a", 2, 77);
+    try std.testing.expect(!try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .initialize_ranks, 0));
+    _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .initialize_ranks, 0, 0, "worker-a", 3200);
+    _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .initialize_ranks, 0, 0, "worker-a", 2, 88);
     try std.testing.expect(try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .initialize_ranks, 0));
 
     _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .iterate_contributions, 0, 3, "worker-a", 4000);
@@ -26122,6 +26187,13 @@ test "graph metric build publish verification records iterative convergence read
 
     _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 0, 4, "worker-a", 5000);
     _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .reduce_ranks, 0, 4, "worker-a", 2, 55);
+    try std.testing.expect(!try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .reduce_ranks, 0));
+    try std.testing.expectError(error.GraphMetricBuildPublishNotReady, graph.verifyGraphMetricBuildPublishReady("pagerank", active_job.job_id));
+    _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 0, graph_metric_build_summary_leaf_base, "worker-a", 5100);
+    _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .reduce_ranks, 0, graph_metric_build_summary_leaf_base, "worker-a", 2, 99);
+    try std.testing.expect(!try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .reduce_ranks, 0));
+    _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .reduce_ranks, 0, 0, "worker-a", 5200);
+    _ = try graph.completeGraphMetricBuildPage("pagerank", active_job.job_id, .reduce_ranks, 0, 0, "worker-a", 2, 111);
     try std.testing.expect(try graph.advanceGraphMetricBuildPhaseIfReady("pagerank", active_job.job_id, .reduce_ranks, 0));
 
     _ = try graph.claimGraphMetricBuildPageAt("pagerank", active_job.job_id, .check_convergence, 0, 5, "worker-a", 6000);
@@ -26132,9 +26204,11 @@ test "graph metric build publish verification records iterative convergence read
     try std.testing.expectEqual(active_job.job_id, verification.job_id);
     try std.testing.expectEqual(@as(u64, 6), verification.expected_phases);
     try std.testing.expectEqual(@as(u64, 6), verification.completed_phases);
-    try std.testing.expectEqual(@as(u64, 6), verification.expected_pages);
-    try std.testing.expectEqual(@as(u64, 6), verification.completed_pages);
-    try std.testing.expectEqual(@as(u64, 11 ^ 22 ^ 33 ^ 44 ^ 55 ^ 66), verification.output_fingerprint);
+    // Six original data/control pages plus a root and leaf for each of the
+    // two normalization phases; every durable output contributes to the proof.
+    try std.testing.expectEqual(@as(u64, 6 + 2 * 2), verification.expected_pages);
+    try std.testing.expectEqual(@as(u64, 6 + 2 * 2), verification.completed_pages);
+    try std.testing.expectEqual(@as(u64, 11 ^ 22 ^ 33 ^ 44 ^ 55 ^ 66 ^ 77 ^ 88 ^ 99 ^ 111), verification.output_fingerprint);
     try std.testing.expect(!verification.converged);
     try std.testing.expect(verification.fixed_iteration_limit);
     try std.testing.expectApproxEqAbs(@as(f64, 0.125), verification.max_delta, 0.0000001);

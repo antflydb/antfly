@@ -960,13 +960,13 @@ pub const Client = struct {
 
     /// Drop a table
     /// DELETE /db/v1/tables/{tableName}
-    pub fn dropTable(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
+    pub fn dropTable(self: *@This(), table_name: []const u8) !ApiResponse(types.CommittedMutationOutcome) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CommittedMutationOutcome).fromResponse(self.allocator, &resp);
     }
 
     /// List table artifact enrichments

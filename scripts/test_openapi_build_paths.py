@@ -14,11 +14,19 @@
 
 """Build outputs and depfiles share the build runner's working directory."""
 
+from contextlib import nullcontext
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+# The generators are standalone scripts with sibling imports. Support both
+# unittest's repository-root module invocation and discovery in scripts/.
+with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]):
+    import join_openapi
+    import join_public_openapi
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
@@ -51,6 +59,32 @@ class OpenApiBuildPathsTest(unittest.TestCase):
                 self.assertIn("/specs/openapi/", (cwd / depfile).read_text())
                 if not mode:
                     run(["--compare", "--depfile", depfile, output])
+
+    def test_build_outputs_resolve_from_cwd(self):
+        for module, prefix in (
+            (join_openapi, ["--joined-only"]),
+            (join_public_openapi, []),
+            (join_public_openapi, ["--compare"]),
+        ):
+            for output in (".zig-cache/tmp/spec.yaml", "/tmp/absolute-spec.yaml"):
+                with self.subTest(module=module.__name__, output=output):
+                    with patch.object(module, "generate", return_value=0) as generate:
+                        with patch.object(
+                            module, "record_dependencies", return_value=nullcontext()
+                        ):
+                            self.assertEqual(
+                                module.main(["--depfile", "build.d", *prefix, output]),
+                                0,
+                            )
+                    generate.assert_called_once_with(
+                        [*prefix, str(Path(output).resolve())]
+                    )
+
+    def test_interactive_paths_retain_repository_defaults(self):
+        for module in (join_openapi, join_public_openapi):
+            with patch.object(module, "generate", return_value=0) as generate:
+                module.main(["openapi.yaml"])
+            generate.assert_called_once_with(["openapi.yaml"])
 
 
 if __name__ == "__main__":
