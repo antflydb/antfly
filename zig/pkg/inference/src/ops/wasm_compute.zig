@@ -285,9 +285,14 @@ const WasmBuf = struct {
     /// Returns f32 data, dequanting from f16/quantized if needed. Caller must free if allocated is true.
     const F32View = struct { data: []const f32, allocated: bool };
     fn viewF32(self: *WasmBuf, alloc: std.mem.Allocator) !F32View {
+        return self.viewF32WithGpu(alloc, DotGpuBridge{});
+    }
+
+    fn viewF32WithGpu(self: *WasmBuf, alloc: std.mem.Allocator, gpu: anytype) !F32View {
         if (self.quant_type != null) {
             if (self.quant_raw) |raw| {
                 const out = try alloc.alloc(f32, self.len);
+                errdefer alloc.free(out);
                 try quant_codec.dequantizeToFloat32(self.quant_type.?, raw, out);
                 return .{ .data = out, .allocated = true };
             }
@@ -298,17 +303,105 @@ const WasmBuf = struct {
             for (f16d, 0..) |v, i| out[i] = @floatCast(v);
             return .{ .data = out, .allocated = true };
         }
-        try self.ensureHostData();
+        try self.ensureHostDataWithGpu(gpu);
         return .{ .data = self.data, .allocated = false };
     }
 
     fn ensureHostData(self: *WasmBuf) !void {
+        return self.ensureHostDataWithGpu(DotGpuBridge{});
+    }
+
+    fn ensureHostDataWithGpu(self: *WasmBuf, gpu: anytype) !void {
         if (self.host_data_valid) return;
         const gpu_tensor = self.gpu_tensor orelse return error.HostTensorUnavailable;
-        if (self.data.len < self.len) return error.HostTensorUnavailable;
-        const byte_len: usize = self.len * @sizeOf(f32);
-        wasm_extern.download(gpu_tensor, @as([*]u8, @ptrCast(self.data.ptr))[0..byte_len]);
+        if (gpu_tensor == wasm_extern.invalid_buffer or self.data.len < self.len) return error.HostTensorUnavailable;
+        const byte_len = try dotGpuByteLen(self.len);
+        gpu.download(gpu_tensor, std.mem.sliceAsBytes(self.data)[0..byte_len]);
         self.host_data_valid = true;
+    }
+};
+
+// The production bridge is stateless. Keeping this boundary generic lets native
+// tests execute the same residency/ownership code with separate device storage;
+// there is no runtime bridge override on WasmCompute.
+const DotGpuBridge = struct {
+    fn createBuffer(_: DotGpuBridge, bytes: u32) u32 {
+        return wasm_extern.createBuffer(bytes);
+    }
+    fn freeBuffer(_: DotGpuBridge, id: u32) void {
+        wasm_extern.freeBuffer(id);
+    }
+    fn upload(_: DotGpuBridge, id: u32, bytes: []const u8) void {
+        // Worker mode stages transfers through a bounded SharedArrayBuffer.
+        // This existing offset API chunks to its actual payload capacity;
+        // single-shot upload would throw for otherwise valid large operands.
+        if (build_options.enable_webgpu) {
+            wasm_extern.writeBufferAtOffset(id, 0, bytes);
+        } else unreachable;
+    }
+    fn download(_: DotGpuBridge, id: u32, bytes: []u8) void {
+        wasm_extern.download(id, bytes);
+    }
+    fn matmul(_: DotGpuBridge, a: u32, b: u32, output: u32, m: u32, n: u32, k: u32, transpose_rhs: bool) void {
+        if (!build_options.enable_webgpu) unreachable;
+        if (transpose_rhs) {
+            wasm_extern.matmulTransB(a, b, output, m, n, k);
+        } else {
+            wasm_extern.matmul(a, b, output, m, n, k);
+        }
+    }
+};
+
+fn dotGpuByteLen(elements: usize) !u32 {
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.InvalidShape;
+    return std.math.cast(u32, bytes) orelse error.InvalidShape;
+}
+
+const DotGpuInput = struct {
+    id: u32,
+    owned: bool,
+
+    fn acquire(gpu: anytype, buf: *WasmBuf, bytes: u32) !DotGpuInput {
+        if (buf.gpu_tensor) |id| {
+            if (id == wasm_extern.invalid_buffer) return error.HostTensorUnavailable;
+            return .{ .id = id, .owned = false };
+        }
+        if (!buf.host_data_valid or buf.data.len != buf.len) return error.HostTensorUnavailable;
+        const id = gpu.createBuffer(bytes);
+        if (id == wasm_extern.invalid_buffer) return error.OutOfMemory;
+        gpu.upload(id, std.mem.sliceAsBytes(buf.data));
+        return .{ .id = id, .owned = true };
+    }
+
+    fn deinit(self: DotGpuInput, gpu: anytype) void {
+        if (self.owned) gpu.freeBuffer(self.id);
+    }
+};
+
+const Dot2D = struct {
+    m: usize,
+    n: usize,
+    k: usize,
+    lc: u8,
+    rc: u8,
+    lhs_count: usize,
+    rhs_count: usize,
+    output_count: usize,
+
+    fn init(lhs_shape: []const i64, rhs_shape: []const i64, lc: u8, rc: u8, lhs_len: usize, rhs_len: usize) !Dot2D {
+        if (lhs_shape.len != 2 or rhs_shape.len != 2 or lc > 1 or rc > 1) return error.InvalidShape;
+        for (lhs_shape) |dim| if (dim < 0) return error.InvalidShape;
+        for (rhs_shape) |dim| if (dim < 0) return error.InvalidShape;
+        if (lhs_shape[lc] != rhs_shape[rc]) return error.InvalidShape;
+        const m = std.math.cast(usize, lhs_shape[1 - lc]) orelse return error.InvalidShape;
+        const n = std.math.cast(usize, rhs_shape[1 - rc]) orelse return error.InvalidShape;
+        const k = std.math.cast(usize, lhs_shape[lc]) orelse return error.InvalidShape;
+        const lhs_count = std.math.mul(usize, m, k) catch return error.InvalidShape;
+        const rhs_count = std.math.mul(usize, n, k) catch return error.InvalidShape;
+        const output_count = std.math.mul(usize, m, n) catch return error.InvalidShape;
+        _ = std.math.mul(u64, @intCast(output_count), @intCast(k)) catch return error.InvalidShape;
+        if (lhs_count != lhs_len or rhs_count != rhs_len) return error.InvalidShape;
+        return .{ .m = m, .n = n, .k = k, .lc = lc, .rc = rc, .lhs_count = lhs_count, .rhs_count = rhs_count, .output_count = output_count };
     }
 };
 
@@ -4726,41 +4819,83 @@ pub const WasmCompute = struct {
         return fromBuf(out_buf);
     }
 
-    fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
-        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
-        const lhs_data = toBuf(lhs).data;
-        const rhs_data = toBuf(rhs).data;
+    fn dotGeneral2D(self: *WasmCompute, lhs: *WasmBuf, rhs: *WasmBuf, plan: Dot2D, comptime gpu_enabled: bool, gpu: anytype) !CT {
+        if (lhs.i32_data != null or rhs.i32_data != null) return error.UnsupportedDType;
 
-        // Handle common case: 2D matmul (no batch dims, one contracting dim each).
-        if (lhs_batch.len == 0 and lhs_contracting.len == 1 and rhs_contracting.len == 1) {
-            const lhs_rank = lhs_shape.len;
-            const rhs_rank = rhs_shape.len;
+        // Publish output ownership only after every fallible host allocation.
+        // No weight store participates: both operands may be short-lived
+        // contextual activations whose handle addresses are reused next sample.
+        const output = try self.allocator.alloc(f32, plan.output_count);
+        errdefer self.allocator.free(output);
+        const shape = try self.allocator.dupe(i64, &.{ @intCast(plan.m), @intCast(plan.n) });
+        errdefer self.allocator.free(shape);
+        const output_buf = try self.allocator.create(WasmBuf);
+        errdefer self.allocator.destroy(output_buf);
+        output_buf.* = .{ .data = output, .len = output.len, .owned = true, .allocator = self.allocator, .shape = shape };
 
-            if (lhs_rank == 2 and rhs_rank == 2) {
-                const lc = lhs_contracting[0];
-                const rc = rhs_contracting[0];
-                const k = @as(usize, @intCast(lhs_shape[lc]));
-
-                const m = @as(usize, @intCast(lhs_shape[1 - lc]));
-                const n = @as(usize, @intCast(rhs_shape[1 - rc]));
-
-                const output = try self.allocator.alloc(f32, m * n);
-                @memset(output, 0.0);
-
-                for (0..m) |i| {
-                    for (0..n) |j| {
-                        var acc: f64 = 0.0;
-                        for (0..k) |ki| {
-                            const a_idx = if (lc == 1) i * k + ki else ki * m + i;
-                            const b_idx = if (rc == 0) ki * n + j else j * k + ki;
-                            acc += @as(f64, lhs_data[a_idx]) * @as(f64, rhs_data[b_idx]);
-                        }
-                        output[i * n + j] = @floatCast(acc);
-                    }
-                }
-                return fromBuf(WasmBuf.fromSlice(self.allocator, output, true));
+        if (comptime gpu_enabled) {
+            const dense = lhs.quant_type == null and lhs.f16_data == null and rhs.quant_type == null and rhs.f16_data == null;
+            if (self.use_gpu and dense and plan.lc == 1 and plan.m != 0 and plan.n != 0 and plan.k != 0 and
+                (lhs.gpu_tensor != null or rhs.gpu_tensor != null or plan.output_count >= WEBGPU_MATMUL_THRESHOLD))
+            {
+                // The JS ABI uses u32 byte lengths; reject before any device
+                // allocation rather than truncate a geometry or buffer size.
+                const lhs_bytes = try dotGpuByteLen(plan.lhs_count);
+                const rhs_bytes = try dotGpuByteLen(plan.rhs_count);
+                const output_bytes = try dotGpuByteLen(plan.output_count);
+                const a = try DotGpuInput.acquire(gpu, lhs, lhs_bytes);
+                defer a.deinit(gpu);
+                const b = try DotGpuInput.acquire(gpu, rhs, rhs_bytes);
+                defer b.deinit(gpu);
+                const output_gpu = gpu.createBuffer(output_bytes);
+                if (output_gpu == wasm_extern.invalid_buffer) return error.OutOfMemory;
+                gpu.matmul(a.id, b.id, output_gpu, @intCast(plan.m), @intCast(plan.n), @intCast(plan.k), plan.rc == 1);
+                output_buf.gpu_tensor = output_gpu;
+                output_buf.gpu_tensor_owned = true;
+                output_buf.host_data_valid = false;
+                return fromBuf(output_buf);
             }
         }
+
+        const a = try lhs.viewF32WithGpu(self.allocator, gpu);
+        defer if (a.allocated) self.allocator.free(a.data);
+        const b = try rhs.viewF32WithGpu(self.allocator, gpu);
+        defer if (b.allocated) self.allocator.free(b.data);
+        if (a.data.len != plan.lhs_count or b.data.len != plan.rhs_count) return error.InvalidShape;
+        if (plan.lc == 1) {
+            if (plan.rc == 1) {
+                linalg.sgemmTransBSync(plan.m, plan.n, plan.k, 1.0, a.data, b.data, 0.0, output);
+            } else {
+                linalg.sgemmSync(plan.m, plan.n, plan.k, 1.0, a.data, b.data, 0.0, output);
+            }
+        } else {
+            // Preserve the remaining transpose layouts, with valid host views.
+            for (0..plan.m) |i| {
+                for (0..plan.n) |j| {
+                    var acc: f64 = 0;
+                    for (0..plan.k) |ki| {
+                        const b_index = if (plan.rc == 0) ki * plan.n + j else j * plan.k + ki;
+                        acc += @as(f64, a.data[ki * plan.m + i]) * @as(f64, b.data[b_index]);
+                    }
+                    output[i * plan.n + j] = @floatCast(acc);
+                }
+            }
+        }
+        return fromBuf(output_buf);
+    }
+
+    fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+
+        if (lhs_batch.len == 0 and rhs_batch.len == 0 and lhs_contracting.len == 1 and rhs_contracting.len == 1 and lhs_shape.len == 2 and rhs_shape.len == 2) {
+            const a = toBuf(lhs);
+            const b = toBuf(rhs);
+            const plan = try Dot2D.init(lhs_shape, rhs_shape, lhs_contracting[0], rhs_contracting[0], a.len, b.len);
+            return self.dotGeneral2D(a, b, plan, build_options.enable_webgpu, DotGpuBridge{});
+        }
+
+        const lhs_data = toBuf(lhs).data;
+        const rhs_data = toBuf(rhs).data;
 
         // Batched case: lhs_batch.len >= 1, 1 contracting dim.
         if (lhs_batch.len >= 1 and lhs_contracting.len == 1 and rhs_contracting.len == 1) {
@@ -5265,4 +5400,226 @@ test "wasm compute webgpu elementwise shape guards" {
     try std.testing.expect(isGpuBroadcastInDimCompatible(&.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 1, 1, 4 }));
     try std.testing.expect(isGpuBroadcastInDimCompatible(&.{ 2, 3, 4 }, &.{2}, &.{4}));
     try std.testing.expect(!isGpuBroadcastInDimCompatible(&.{ 2, 3, 4 }, &.{ 0, 1, 2 }, &.{ 2, 4, 4 }));
+}
+
+// Separate storage deliberately makes poisoned host mirrors unusable. This is
+// a bridge test, not a claim that a browser/GPU executed the shader.
+const DotTestGpu = struct {
+    const Slot = struct { live: bool = false, len: usize = 0, data: [64]f32 = undefined };
+    slots: [8]Slot = @splat(.{}),
+    creates: usize = 0,
+    uploads: usize = 0,
+    downloads: usize = 0,
+    dispatches: usize = 0,
+    fail_create: ?usize = null,
+
+    fn createBuffer(self: *DotTestGpu, bytes: u32) u32 {
+        const call = self.creates;
+        self.creates += 1;
+        if (self.fail_create == call) return 0;
+        std.debug.assert(bytes % 4 == 0 and bytes <= 64 * 4);
+        for (&self.slots, 0..) |*slot, i| {
+            if (!slot.live) {
+                slot.live = true;
+                slot.len = bytes / 4;
+                @memset(slot.data[0..slot.len], std.math.nan(f32));
+                return @intCast(i + 1);
+            }
+        }
+        return 0;
+    }
+
+    fn values(self: *DotTestGpu, id: u32) []f32 {
+        std.debug.assert(id > 0 and id <= self.slots.len);
+        const slot = &self.slots[id - 1];
+        std.debug.assert(slot.live);
+        return slot.data[0..slot.len];
+    }
+
+    fn upload(self: *DotTestGpu, id: u32, bytes: []const u8) void {
+        @memcpy(std.mem.sliceAsBytes(self.values(id)), bytes);
+        self.uploads += 1;
+    }
+
+    fn download(self: *DotTestGpu, id: u32, bytes: []u8) void {
+        @memcpy(bytes, std.mem.sliceAsBytes(self.values(id)));
+        self.downloads += 1;
+    }
+
+    fn freeBuffer(self: *DotTestGpu, id: u32) void {
+        _ = self.values(id); // Detect double frees and release of invalid IDs.
+        self.slots[id - 1].live = false;
+    }
+
+    fn put(self: *DotTestGpu, data: []const f32) u32 {
+        const id = self.createBuffer(@intCast(data.len * 4));
+        std.debug.assert(id != 0);
+        self.upload(id, std.mem.sliceAsBytes(data));
+        return id;
+    }
+
+    fn matmul(self: *DotTestGpu, a_id: u32, b_id: u32, out_id: u32, m: u32, n: u32, k: u32, transpose_rhs: bool) void {
+        const a = self.values(a_id);
+        const b = self.values(b_id);
+        const output = self.values(out_id);
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var value: f64 = 0;
+                for (0..k) |ki| value += @as(f64, a[i * k + ki]) * @as(f64, b[if (transpose_rhs) j * k + ki else ki * n + j]);
+                output[i * n + j] = @floatCast(value);
+            }
+        }
+        self.dispatches += 1;
+    }
+
+    fn liveCount(self: *const DotTestGpu) usize {
+        var count: usize = 0;
+        for (self.slots) |slot| count += @intFromBool(slot.live);
+        return count;
+    }
+
+    fn freeResult(self: *DotTestGpu, tensor: CT) void {
+        const buf = toBuf(tensor);
+        if (buf.gpu_tensor_owned) {
+            self.freeBuffer(buf.gpu_tensor.?);
+            buf.gpu_tensor_owned = false;
+        }
+        buf.deinit();
+    }
+};
+
+test "wasm_compute: activation dot CPU layouts and checked geometry" {
+    const allocator = std.testing.allocator;
+    var compute = WasmCompute.init(allocator);
+    compute.use_gpu = false;
+    var cb = compute.computeBackend();
+    defer cb.deinit();
+    const lhs_values = [_]f32{ 1, 2, 3, 4, 5, -2, 3, -1, 1, 2 };
+    const rhs_values = [_]f32{ 2, -1, 1, 0, 3, 1, 2, -3, 4, 1, -2, 1, 0, 3, -1 };
+    var expected: [6]f32 = undefined;
+    for (0..2) |i| for (0..3) |j| {
+        var value: f64 = 0;
+        for (0..5) |k| value += @as(f64, lhs_values[i * 5 + k]) * @as(f64, rhs_values[j * 5 + k]);
+        expected[i * 3 + j] = @floatCast(value);
+    };
+    for ([_]u8{ 0, 1 }) |lc| for ([_]u8{ 0, 1 }) |rc| {
+        var a: [10]f32 = undefined;
+        var b: [15]f32 = undefined;
+        for (0..2) |i| for (0..5) |k| {
+            a[if (lc == 1) i * 5 + k else k * 2 + i] = lhs_values[i * 5 + k];
+        };
+        for (0..3) |j| for (0..5) |k| {
+            b[if (rc == 1) j * 5 + k else k * 3 + j] = rhs_values[j * 5 + k];
+        };
+        var lhs = WasmBuf{ .allocator = allocator, .data = &a, .len = a.len, .owned = false };
+        var rhs = WasmBuf{ .allocator = allocator, .data = &b, .len = b.len, .owned = false };
+        const result = try cb.primDotGeneral(fromBuf(&lhs), fromBuf(&rhs), if (lc == 1) &.{ 2, 5 } else &.{ 5, 2 }, if (rc == 1) &.{ 3, 5 } else &.{ 5, 3 }, &.{lc}, &.{rc}, &.{}, &.{});
+        defer cb.free(result);
+        try std.testing.expectEqualSlices(f32, &expected, toBuf(result).data);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, toBuf(result).shape.?);
+    };
+    try std.testing.expectError(error.InvalidShape, Dot2D.init(&.{ 2, 3 }, &.{ 4, 3 }, 2, 1, 6, 12));
+    try std.testing.expectError(error.InvalidShape, Dot2D.init(&.{ 2, -3 }, &.{ 4, -3 }, 1, 1, 6, 12));
+    try std.testing.expectError(error.InvalidShape, Dot2D.init(&.{ 2, 3 }, &.{ 4, 2 }, 1, 1, 6, 8));
+    try std.testing.expectError(error.InvalidShape, Dot2D.init(&.{ 2, 3 }, &.{ 4, 3 }, 1, 1, 5, 12));
+    try std.testing.expectError(error.InvalidShape, Dot2D.init(&.{ std.math.maxInt(i64), 3 }, &.{ 4, 3 }, 1, 1, 0, 12));
+    try std.testing.expectError(error.InvalidShape, dotGpuByteLen(@as(usize, std.math.maxInt(u32) / 4) + 1));
+}
+
+test "wasm_compute: activation dot GPU ignores stale mirrors and reused RHS identity" {
+    const allocator = std.testing.allocator;
+    var compute = WasmCompute.init(allocator);
+    defer WasmCompute.deinitBackendOp(&compute);
+    compute.use_gpu = true;
+    var gpu = DotTestGpu{};
+    const a_id = gpu.put(&.{ 1, 2, 3, 4, 5, 6 });
+    defer gpu.freeBuffer(a_id);
+    const b_id = gpu.put(&.{ 1, 0, -1, 2, 1, 0 });
+    defer gpu.freeBuffer(b_id);
+    var a_mirror = [_]f32{std.math.nan(f32)} ** 6;
+    var b_mirror = [_]f32{std.math.nan(f32)} ** 6;
+    var a = WasmBuf{ .allocator = allocator, .data = &a_mirror, .len = 6, .owned = false, .gpu_tensor = a_id, .host_data_valid = false };
+    var b = WasmBuf{ .allocator = allocator, .data = &b_mirror, .len = 6, .owned = false, .gpu_tensor = b_id, .host_data_valid = false };
+    const plan = try Dot2D.init(&.{ 2, 3 }, &.{ 2, 3 }, 1, 1, 6, 6);
+    {
+        const result = try compute.dotGeneral2D(&a, &b, plan, true, &gpu);
+        defer gpu.freeResult(result);
+        try std.testing.expectEqualSlices(f32, &.{ -2, 4, -2, 13 }, gpu.values(toBuf(result).gpu_tensor.?));
+        try std.testing.expect(!toBuf(result).host_data_valid);
+        try std.testing.expect(!a.host_data_valid and !b.host_data_valid);
+        try std.testing.expectEqual(@as(usize, 0), gpu.downloads);
+        try std.testing.expectEqual(@as(usize, 2), gpu.uploads);
+    }
+    // Identical host and device handle identities now contain another sample.
+    gpu.upload(b_id, std.mem.sliceAsBytes(&[_]f32{ 0, 1, 0, -1, 0, 1 }));
+    const result = try compute.dotGeneral2D(&a, &b, plan, true, &gpu);
+    defer gpu.freeResult(result);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 2, 5, 2 }, gpu.values(toBuf(result).gpu_tensor.?));
+    try std.testing.expectEqual(@as(usize, 0), compute.gpu_weights.buffers.count());
+    try std.testing.expectEqual(@as(usize, 2), gpu.dispatches);
+    // CPU fallback explicitly materializes both operands; it cannot read NaNs.
+    compute.use_gpu = false;
+    const host_result = try compute.dotGeneral2D(&a, &b, plan, true, &gpu);
+    defer gpu.freeResult(host_result);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 2, 5, 2 }, toBuf(host_result).data);
+    try std.testing.expectEqual(@as(usize, 2), gpu.downloads);
+}
+
+test "wasm_compute: activation dot temporary uploads roll back device allocation failures" {
+    const allocator = std.testing.allocator;
+    var compute = WasmCompute.init(allocator);
+    defer WasmCompute.deinitBackendOp(&compute);
+    compute.use_gpu = true;
+    var gpu = DotTestGpu{};
+    const a_id = gpu.put(&.{ 1, 2, 3, 4, 5, 6 });
+    defer gpu.freeBuffer(a_id);
+    var a_mirror = [_]f32{std.math.nan(f32)} ** 6;
+    var rhs_values = [_]f32{ 1, 2, 0, 1, -1, 0 };
+    var a = WasmBuf{ .allocator = allocator, .data = &a_mirror, .len = 6, .owned = false, .gpu_tensor = a_id, .host_data_valid = false };
+    var b = WasmBuf{ .allocator = allocator, .data = &rhs_values, .len = 6, .owned = false };
+    const plan = try Dot2D.init(&.{ 2, 3 }, &.{ 3, 2 }, 1, 0, 6, 6);
+    for (0..2) |failure_offset| {
+        gpu.fail_create = gpu.creates + failure_offset;
+        try std.testing.expectError(error.OutOfMemory, compute.dotGeneral2D(&a, &b, plan, true, &gpu));
+        try std.testing.expectEqual(@as(usize, 1), gpu.liveCount());
+        try std.testing.expectEqual(@as(usize, 0), gpu.dispatches);
+    }
+    gpu.fail_create = null;
+    {
+        const result = try compute.dotGeneral2D(&a, &b, plan, true, &gpu);
+        defer gpu.freeResult(result);
+        try std.testing.expectEqualSlices(f32, &.{ -2, 4, -2, 13 }, gpu.values(toBuf(result).gpu_tensor.?));
+        try std.testing.expectEqual(@as(usize, 2), gpu.liveCount()); // borrowed lhs and owned result only
+    }
+    try std.testing.expectEqual(@as(usize, 1), gpu.liveCount());
+    try std.testing.expectEqual(@as(usize, 0), compute.gpu_weights.buffers.count());
+}
+
+fn exerciseActivationDotAllocationFailures(allocator: std.mem.Allocator, use_gpu: bool) !void {
+    var compute = WasmCompute.init(allocator);
+    defer WasmCompute.deinitBackendOp(&compute);
+    compute.use_gpu = use_gpu;
+    var gpu = DotTestGpu{};
+    const a_id = gpu.put(&.{ 1, 2, 3, 4, 5, 6 });
+    defer gpu.freeBuffer(a_id);
+    var a_values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var b_values = [_]f32{ 1, 0, -1, 2, 1, 0 };
+    var b_f16 = [_]f16{ 1, 0, -1, 2, 1, 0 };
+    var a = WasmBuf{ .allocator = allocator, .data = &a_values, .len = 6, .owned = false, .gpu_tensor = if (use_gpu) a_id else null, .host_data_valid = !use_gpu };
+    var b = WasmBuf{ .allocator = allocator, .data = if (use_gpu) &b_values else &.{}, .len = 6, .owned = false, .f16_data = if (use_gpu) null else &b_f16 };
+    const plan = try Dot2D.init(&.{ 2, 3 }, &.{ 2, 3 }, 1, 1, 6, 6);
+    const result = compute.dotGeneral2D(&a, &b, plan, true, &gpu) catch |err| {
+        // Every fallible metadata allocation precedes the first GPU side effect.
+        try std.testing.expectEqual(@as(usize, 1), gpu.creates);
+        try std.testing.expectEqual(@as(usize, 1), gpu.liveCount());
+        return err;
+    };
+    defer gpu.freeResult(result);
+    const values = if (toBuf(result).gpu_tensor) |id| gpu.values(id) else toBuf(result).data;
+    try std.testing.expectEqualSlices(f32, &.{ -2, 4, -2, 13 }, values);
+}
+
+test "wasm_compute: activation dot allocation failures preserve operands and metadata ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
 }

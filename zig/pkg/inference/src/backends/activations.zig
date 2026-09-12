@@ -64,10 +64,38 @@ pub fn gelu(data: []f32) void {
 /// The erf approximation has a maximum absolute error around 1.5e-7 and is
 /// shared semantically with the device implementation.
 pub fn geluExact(data: []f32) void {
-    for (data) |*v| {
-        const x = v.*;
-        v.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    const half: F32xN = @splat(0.5);
+    const one: F32xN = @splat(1.0);
+    const inv_sqrt_two: F32xN = @splat(0.7071067811865476);
+    var i: usize = 0;
+    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
+        const x: F32xN = data[i..][0..VEC_LEN].*;
+        data[i..][0..VEC_LEN].* = half * x * (one + erfApproxVec(x * inv_sqrt_two));
     }
+    while (i < data.len) : (i += 1) {
+        const x = data[i];
+        data[i] = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+}
+
+inline fn erfApproxVec(x: F32xN) F32xN {
+    const zero: F32xN = @splat(0.0);
+    const one: F32xN = @splat(1.0);
+    const p: F32xN = @splat(0.3275911);
+    const a1: F32xN = @splat(0.254829592);
+    const a2: F32xN = @splat(-0.284496736);
+    const a3: F32xN = @splat(1.421413741);
+    const a4: F32xN = @splat(-1.453152027);
+    const a5: F32xN = @splat(1.061405429);
+    const sign = @select(f32, x < zero, -one, one);
+    const ax = @abs(x);
+    const t = one / (one + p * ax);
+    // Preserve the scalar polynomial and its operation order. expVec also
+    // sanitizes NaN/Inf before integer range reduction, including -Inf from
+    // squaring a large finite input. The outer GELU expression retains +Inf,
+    // negative zero, and the scalar -Inf -> NaN behavior.
+    const poly = (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t;
+    return sign * (one - poly * expVec(-(ax * ax)));
 }
 
 fn erfApproxF32(x: f32) f32 {
@@ -599,6 +627,107 @@ test "exact gelu matches erf reference values" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.8413447), data[1], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, -0.15865526), data[2], tolerance);
     try std.testing.expectApproxEqAbs(@as(f32, 1.9544997), data[3], tolerance);
+}
+
+test "exact gelu SIMD agrees with independent f64 erf across vector and tail boundaries" {
+    // Independent binary64 references, generated with Python math.erf as
+    // 0.5*x*(1+erf(x/sqrt(2))) after rounding each input to binary32. These
+    // values do not use the production erf or exp polynomial.
+    const reference = [_][2]f64{
+        .{ -12.0, -0.0 },
+        .{ -8.0, -4.884981308350689e-15 },
+        .{ -6.0, -5.919525869479969e-09 },
+        .{ -5.0, -1.4332578593401202e-06 },
+        .{ -4.0, -0.00012668496733247991 },
+        .{ -3.0, -0.00404969409489031 },
+        .{ -2.0, -0.04550026389635842 },
+        .{ -1.0, -0.15865525393145707 },
+        .{ -0.5, -0.15426876936299347 },
+        .{ -0.125, -0.05628272189623589 },
+        .{ -9.999999974752427e-07, -4.99999599795343e-07 },
+        .{ 0.0, 0.0 },
+        .{ 9.999999974752427e-07, 5.000003976798997e-07 },
+        .{ 0.125, 0.06871727810376412 },
+        .{ 0.5, 0.3457312306370065 },
+        .{ 1.0, 0.8413447460685429 },
+        .{ 2.0, 1.9544997361036416 },
+        .{ 3.0, 2.99595030590511 },
+        .{ 4.0, 3.9998733150326675 },
+        .{ 5.0, 4.999998566742141 },
+        .{ 6.0, 5.999999994080474 },
+        .{ 8.0, 7.999999999999995 },
+        .{ 12.0, 12.0 },
+    };
+    const eps: f64 = std.math.floatEps(f32);
+    // The established erf approximation contributes ~1.5e-7 before the
+    // GELU multiply; four absolute eps plus two relative eps cover that and
+    // f32 rounding. This is far tighter than the inference confidence gate.
+    for (0..reference.len) |offset| {
+        for (0..2 * VEC_LEN + 2) |len| {
+            var storage = [_]f32{777} ** (2 * VEC_LEN + 3);
+            const values = storage[1..][0..len];
+            for (values, 0..) |*value, i| value.* = @floatCast(reference[(offset + i) % reference.len][0]);
+            geluExact(values);
+            for (values, 0..) |value, i| {
+                const expected = reference[(offset + i) % reference.len][1];
+                try std.testing.expectApproxEqAbs(expected, @as(f64, value), 4 * eps + 2 * eps * @abs(expected));
+            }
+            try std.testing.expectEqual(@as(f32, 777), storage[0]);
+            for (storage[len + 1 ..]) |guard| try std.testing.expectEqual(@as(f32, 777), guard);
+        }
+    }
+}
+
+test "exact gelu SIMD preserves scalar polynomial over a dense activation grid" {
+    const len = 257 * VEC_LEN + 3;
+    var expected: [len]f32 = undefined;
+    var actual: [len]f32 = undefined;
+    for (&actual, &expected, 0..) |*value, *reference, i| {
+        const x = -12.0 + 24.0 * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(len - 1));
+        value.* = x;
+        reference.* = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+    }
+    geluExact(&actual);
+    const eps = std.math.floatEps(f32);
+    for (actual, expected) |value, reference| {
+        // Only exp changes implementation in the vector prefix. Retain a
+        // few f32 rounding units rather than requiring exp/libm bit identity.
+        try std.testing.expectApproxEqAbs(reference, value, 4 * eps + eps * @abs(reference));
+    }
+    for (actual[len - 3 ..], expected[len - 3 ..]) |value, reference| {
+        try std.testing.expectEqual(@as(u32, @bitCast(reference)), @as(u32, @bitCast(value)));
+    }
+}
+
+test "exact gelu SIMD preserves exceptional lanes signed zero and finite saturation" {
+    const tiny: f32 = @bitCast(@as(u32, 1));
+    const inputs = [_]f32{
+        std.math.nan(f32),       std.math.inf(f32),       -std.math.inf(f32),
+        std.math.floatMax(f32),  -std.math.floatMax(f32), 1e30,
+        -1e30,                   1e20,                    -1e20,
+        13.25,                   -13.25,                  std.math.floatMin(f32),
+        -std.math.floatMin(f32), tiny,                    -tiny,
+        0.0,                     -0.0,
+    };
+    // Put every exceptional value in every vector lane and each scalar-tail
+    // position. In particular, a NaN lane must not reach expVec's integer
+    // reduction or poison the independent zero lanes around it.
+    for (inputs) |x| {
+        const expected = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
+        for (0..2 * VEC_LEN + 3) |position| {
+            var values = [_]f32{0} ** (2 * VEC_LEN + 3);
+            values[position] = x;
+            geluExact(&values);
+            if (std.math.isNan(expected)) {
+                try std.testing.expect(std.math.isNan(values[position]));
+            } else {
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(values[position])));
+            }
+            for (values, 0..) |value, i| {
+                if (i != position) try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(value)));
+            }
+        }
+    }
 }
 
 // Vector vs scalar parity for gelu/silu/sigmoid/quickGelu across full activation range,

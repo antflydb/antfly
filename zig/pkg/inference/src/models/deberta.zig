@@ -29,8 +29,8 @@ pub const Config = struct {
     max_position_embeddings: u32 = 512,
     position_buckets: u32 = 256,
     layer_norm_eps: f32 = 1e-7,
-    /// The legacy eager path used tanh GELU. New artifact contracts can select
-    /// Hugging Face's exact-erf `hidden_act=gelu` without changing legacy runs.
+    /// Unspecified legacy configs retain tanh GELU; declared `hidden_act=gelu`
+    /// uses Hugging Face's exact-erf activation.
     use_exact_gelu: bool = false,
     // GLiNER label marker token IDs (from added_tokens.json).
     classification_token_id: i64 = 128004,
@@ -43,6 +43,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidDebertaConfig;
     const obj = parsed.value.object;
     var config = Config{};
 
@@ -54,6 +55,16 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("max_position_embeddings")) |v| config.max_position_embeddings = jsonU32(v) orelse config.max_position_embeddings;
     if (obj.get("position_buckets")) |v| config.position_buckets = jsonU32(v) orelse config.position_buckets;
     if (obj.get("num_labels")) |v| config.num_labels = jsonU32(v) orelse config.num_labels;
+    if (obj.get("hidden_act")) |v| {
+        if (v != .string) return error.UnsupportedDebertaActivation;
+        if (std.mem.eql(u8, v.string, "gelu")) {
+            config.use_exact_gelu = true;
+        } else if (std.mem.eql(u8, v.string, "gelu_new") or
+            std.mem.eql(u8, v.string, "gelu_pytorch_tanh"))
+        {
+            config.use_exact_gelu = false;
+        } else return error.UnsupportedDebertaActivation;
+    }
     if (config.num_labels == 1) {
         if (inferNumLabels(obj)) |n| config.num_labels = n;
     }
@@ -195,6 +206,22 @@ test "parse config carries num_labels" {
     const config = try parseConfig(allocator, json_str);
     try std.testing.expectEqual(@as(u32, 3), config.num_labels);
     try std.testing.expectEqual(@as(u32, 768), config.hidden_size);
+}
+
+test "parse config honors exact and tanh DeBERTa GELU contracts" {
+    const a = std.testing.allocator;
+    const exact = try parseConfig(a, "{\"hidden_act\":\"gelu\"}");
+    try std.testing.expect(exact.use_exact_gelu);
+    for ([_][]const u8{ "{}", "{\"hidden_act\":\"gelu_new\"}", "{\"hidden_act\":\"gelu_pytorch_tanh\"}" }) |json| {
+        const approximate = try parseConfig(a, json);
+        try std.testing.expect(!approximate.use_exact_gelu);
+    }
+    for ([_][]const u8{ "{\"hidden_act\":\"relu\"}", "{\"hidden_act\":\"quick_gelu\"}", "{\"hidden_act\":null}", "{\"hidden_act\":false}" }) |json| {
+        try std.testing.expectError(error.UnsupportedDebertaActivation, parseConfig(a, json));
+    }
+    for ([_][]const u8{ "[]", "null", "1" }) |json| {
+        try std.testing.expectError(error.InvalidDebertaConfig, parseConfig(a, json));
+    }
 }
 
 test "parse config infers num_labels from id2label" {

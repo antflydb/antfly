@@ -472,6 +472,7 @@ pub const DebertaEmbeddingsRequest = struct {
     total: usize,
     hidden_size: usize,
     eps: f32,
+    control: ?InferenceExecutionControl = null,
 };
 
 /// Fused MoE forward: route selection + expert compute + scatter-add,
@@ -2876,8 +2877,14 @@ pub const ComputeBackend = struct {
     }
 
     pub fn debertaEmbeddings(self: *const ComputeBackend, request: DebertaEmbeddingsRequest) !?CT {
+        var controlled = request;
+        controlled.control = self.execution_control orelse request.control;
+        if (controlled.control) |active| try active.check();
         if (self.vtable.debertaEmbeddings) |op| {
-            return op(self.ptr, &request);
+            const output = try op(self.ptr, &controlled);
+            errdefer if (output) |tensor| self.free(tensor);
+            if (controlled.control) |active| try active.check();
+            return output;
         }
         return null;
     }
@@ -5032,4 +5039,99 @@ fn fallbackLinearLoRA(
     _ = rank;
     _ = .{ self, input, base_weight, bias, lora_a, lora_b, alpha, rows, in_dim, out_dim };
     return error.LinearLoRANotImplemented;
+}
+
+test "DeBERTa embeddings forward controls and release cancelled backend outputs" {
+    const Probe = struct {
+        checks: usize = 0,
+        cancelled: bool = false,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.cancelled) return error.Cancelled;
+        }
+
+        fn control(self: *@This()) InferenceExecutionControl {
+            return .{ .ptr = self, .check_fn = check };
+        }
+    };
+    const Fake = struct {
+        expected_control: *Probe,
+        cancel_during: bool,
+        return_null: bool,
+        calls: usize = 0,
+        frees: usize = 0,
+        output_live: bool = false,
+        marker: u8 = 0,
+
+        fn embeddings(raw: *anyopaque, request: *const DebertaEmbeddingsRequest) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const control = request.control orelse return error.MissingForwardedControl;
+            try std.testing.expectEqual(@as(?*anyopaque, self.expected_control), control.ptr);
+            try control.check();
+            if (self.cancel_during) self.expected_control.cancelled = true;
+            if (self.return_null) return null;
+            self.output_live = true;
+            return @ptrCast(&self.marker);
+        }
+
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(tensor == @as(CT, @ptrCast(&self.marker)));
+            std.debug.assert(self.output_live);
+            self.output_live = false;
+            self.frees += 1;
+        }
+    };
+    const Case = enum { success, pre_cancel, post_cancel, null_output, cancelled_null };
+    // A cancelled request-local fallback must not replace an installed backend
+    // control. Repeat the ownership cases with each supported control source.
+    for ([_]bool{ false, true }) |has_backend_control| {
+        for (std.enums.values(Case)) |case| {
+            var request_probe = Probe{ .cancelled = has_backend_control };
+            var backend_probe = Probe{};
+            const selected = if (has_backend_control) &backend_probe else &request_probe;
+            selected.cancelled = case == .pre_cancel;
+            var fake = Fake{
+                .expected_control = selected,
+                .cancel_during = case == .post_cancel or case == .cancelled_null,
+                .return_null = case == .null_output or case == .cancelled_null,
+            };
+            var vtable: ComputeBackend.VTable = undefined;
+            vtable.debertaEmbeddings = Fake.embeddings;
+            vtable.freeTensor = Fake.free;
+            const cb = ComputeBackend{
+                .ptr = &fake,
+                .vtable = &vtable,
+                .execution_control = if (has_backend_control) backend_probe.control() else null,
+            };
+            defer if (fake.output_live) cb.free(@ptrCast(&fake.marker));
+            const request = DebertaEmbeddingsRequest{
+                .word_embeddings = @ptrCast(&fake.marker),
+                .layer_norm_weight = @ptrCast(&fake.marker),
+                .layer_norm_bias = @ptrCast(&fake.marker),
+                .input_ids = &.{0},
+                .attention_mask = &.{1},
+                .total = 1,
+                .hidden_size = 1,
+                .eps = 1e-7,
+                .control = request_probe.control(),
+            };
+            if (case == .pre_cancel or fake.cancel_during) {
+                try std.testing.expectError(error.Cancelled, cb.debertaEmbeddings(request));
+            } else {
+                const output = try cb.debertaEmbeddings(request);
+                try std.testing.expectEqual(!fake.return_null, output != null);
+                try std.testing.expectEqual(@as(usize, 0), fake.frees);
+                if (output) |tensor| cb.free(tensor);
+            }
+            try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 0 else 1), fake.calls);
+            try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 1 else 3), selected.checks);
+            try std.testing.expectEqual(@as(usize, if (case == .success or case == .post_cancel) 1 else 0), fake.frees);
+            try std.testing.expect(!fake.output_live);
+            if (has_backend_control) try std.testing.expectEqual(@as(usize, 0), request_probe.checks);
+        }
+    }
 }

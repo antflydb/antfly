@@ -6,6 +6,7 @@
 //! current tile. Workspace is independent of sequence length, batch and heads.
 const std = @import("std");
 const native = @import("../backends/native.zig");
+const primitives = @import("inference_linalg").primitives;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Shape = struct { batch: usize, sequence: usize, heads: usize, head_dim: usize };
@@ -112,10 +113,41 @@ pub fn plan(shape: Shape, options: Options) !Workspace {
 
 fn finiteInput(values: []const f32, count: usize, options: Options) !void {
     if (values.len < count) return error.InvalidAttentionShape;
-    for (values[0..count], 0..) |value, i| {
-        if (i % 16384 == 0) try options.check();
-        if (!std.math.isFinite(value)) return error.NonFiniteAttentionInput;
+    const width = primitives.vec_len;
+    const Bits = @Vector(width, u32);
+    const exponent: Bits = @splat(0x7f800000);
+    var start: usize = 0;
+    while (start < count) {
+        // Preserve the existing cancellation interval, including the first
+        // logical element. No trailing backing capacity is inspected.
+        try options.check();
+        const end = start + @min(count - start, 16384);
+        var i = start;
+        while (end - i >= width) : (i += width) {
+            const bits: Bits = @bitCast(@as(@Vector(width, f32), values[i..][0..width].*));
+            if (@reduce(.Or, (bits & exponent) == exponent)) return error.NonFiniteAttentionInput;
+        }
+        while (i < end) : (i += 1) {
+            if (!std.math.isFinite(values[i])) return error.NonFiniteAttentionInput;
+        }
+        start = end;
     }
+}
+
+fn expSubtractAndSum(scores: []f32, maximum: f32, minimum: f32) f32 {
+    // The shared SIMD exponential flushes values below this cutoff. Preserve
+    // the previous scalar behavior when a finite score can produce a tiny
+    // probability: arbitrary finite V may amplify it into a visible output.
+    // Masked -inf scores are excluded from minimum and do not force fallback.
+    if (minimum - maximum < -87.34) {
+        var sum: f32 = 0;
+        for (scores) |*score| {
+            score.* = @exp(score.* - maximum);
+            sum += score.*;
+        }
+        return sum;
+    }
+    return primitives.expSubtractAndSum(scores, maximum);
 }
 
 const Scratch = struct {
@@ -219,6 +251,7 @@ pub fn forward(allocator: std.mem.Allocator, shape: Shape, input: Input, options
                     for (0..queries) |query| {
                         const row = scratch.scores[query * keys ..][0..keys];
                         var maximum: f32 = -std.math.inf(f32);
+                        var minimum: f32 = std.math.inf(f32);
                         for (row, 0..) |*value, key| {
                             if (mask[key_start + key] == 0) {
                                 value.* = -std.math.inf(f32);
@@ -228,6 +261,7 @@ pub fn forward(allocator: std.mem.Allocator, shape: Shape, input: Input, options
                             value.* += scratch.c2p[query * relative_count + relative] + scratch.p2c[key * relative_count + relative];
                             if (!std.math.isFinite(value.*)) return error.NonFiniteAttentionScore;
                             maximum = @max(maximum, value.*);
+                            minimum = @min(minimum, value.*);
                         }
                         const old_maximum = scratch.maxima[query];
                         const next_maximum = @max(old_maximum, maximum);
@@ -242,11 +276,9 @@ pub fn forward(allocator: std.mem.Allocator, shape: Shape, input: Input, options
                                 scratch.sums[query] *= rescale;
                             }
                         }
-                        var sum_exp: f32 = 0;
-                        for (row) |*value| {
-                            value.* = @exp(value.* - next_maximum);
-                            sum_exp += value.*;
-                        }
+                        // Use the same SIMD exponential as the materialized
+                        // attention path instead of a scalar expf per score.
+                        const sum_exp = expSubtractAndSum(row, next_maximum, minimum);
                         scratch.maxima[query] = next_maximum;
                         scratch.sums[query] += sum_exp;
                     }
@@ -279,6 +311,150 @@ fn testValues(a: std.mem.Allocator, count: usize, modulus: usize, scale: f32) ![
     const values = try a.alloc(f32, count);
     for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i64, @intCast(i % modulus)) - @as(i64, @intCast(modulus / 2)))) * scale;
     return values;
+}
+
+fn scalarTestReference(a: std.mem.Allocator, shape: Shape, input: Input) ![]f32 {
+    @setFloatMode(.strict);
+    const hidden = shape.heads * shape.head_dim;
+    const output = try a.alloc(f32, shape.batch * shape.sequence * hidden);
+    errdefer a.free(output);
+    const scores = try a.alloc(f32, shape.sequence);
+    defer a.free(scores);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(shape.head_dim)) * 3.0);
+    for (0..shape.batch) |b| {
+        for (0..shape.heads) |h| {
+            for (0..shape.sequence) |q| {
+                const query = (b * shape.sequence + q) * hidden + h * shape.head_dim;
+                var maximum: f32 = -std.math.inf(f32);
+                for (scores, 0..) |*score, k| {
+                    if (input.mask[b * shape.sequence + k] == 0) {
+                        score.* = -std.math.inf(f32);
+                        continue;
+                    }
+                    const key = (b * shape.sequence + k) * hidden + h * shape.head_dim;
+                    const relative = (q + shape.sequence - 1 - k) * hidden + h * shape.head_dim;
+                    var cc: f32 = 0;
+                    var cp: f32 = 0;
+                    var pc: f32 = 0;
+                    for (0..shape.head_dim) |d| {
+                        cc += input.q[query + d] * input.k[key + d];
+                        cp += input.q[query + d] * input.kr[relative + d];
+                        pc += input.k[key + d] * input.qr[relative + d];
+                    }
+                    score.* = cc * scale + (cp * scale + pc * scale);
+                    maximum = @max(maximum, score.*);
+                }
+                const out = output[query..][0..shape.head_dim];
+                @memset(out, 0);
+                if (maximum == -std.math.inf(f32)) continue;
+                var sum: f32 = 0;
+                for (scores) |*score| {
+                    score.* = @exp(score.* - maximum);
+                    sum += score.*;
+                }
+                for (scores, 0..) |score, k| {
+                    const key = (b * shape.sequence + k) * hidden + h * shape.head_dim;
+                    const probability = score / sum;
+                    for (out, 0..) |*value, d| value.* += probability * input.v[key + d];
+                }
+            }
+        }
+    }
+    return output;
+}
+
+test "tiled DeBERTa SIMD softmax matches scalar oracle across score ranges masks and tails" {
+    const a = std.testing.allocator;
+    for ([_]f32{ 0.0625, 2.0 }) |amplitude| {
+        const shape = Shape{ .batch = 3, .sequence = 17, .heads = 2, .head_dim = 64 };
+        const workspace = try plan(shape, .{});
+        const q = try testValues(a, workspace.output_elements, 17, amplitude);
+        defer a.free(q);
+        const k = try testValues(a, workspace.output_elements, 13, amplitude);
+        defer a.free(k);
+        const v = try testValues(a, workspace.output_elements, 11, 0.125);
+        defer a.free(v);
+        const qr = try testValues(a, workspace.relative_elements, 19, amplitude);
+        defer a.free(qr);
+        const kr = try testValues(a, workspace.relative_elements, 23, amplitude);
+        defer a.free(kr);
+        var mask: [3 * 17]i64 = undefined;
+        for (&mask, 0..) |*value, i| value.* = switch (i / shape.sequence) {
+            0 => 1,
+            1 => @intFromBool(i % 3 != 1),
+            else => 0,
+        };
+        const input = Input{ .q = q, .k = k, .v = v, .qr = qr, .kr = kr, .mask = &mask };
+        const expected = try scalarTestReference(a, shape, input);
+        defer a.free(expected);
+        // Both one-key-block and streaming normalization exercise SIMD tails.
+        for ([_]Options{ .{}, .{ .query_tile = 7, .key_tile = 9 } }) |options| {
+            const actual = try forward(a, shape, input, options);
+            defer a.free(actual);
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+        }
+    }
+}
+
+test "tiled DeBERTa SIMD finite scan preserves logical bounds and cancellation chunks" {
+    const a = std.testing.allocator;
+    const count = 16384 + primitives.vec_len + 1;
+    const values = try a.alloc(f32, count + 1);
+    defer a.free(values);
+    @memset(values, 0);
+    // Unused backing capacity may contain arbitrary data.
+    values[count] = std.math.nan(f32);
+    try finiteInput(values, count, .{});
+    for ([_]usize{ 0, primitives.vec_len - 1, 16383, 16384, count - 1 }) |index| {
+        for ([_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |invalid| {
+            values[index] = invalid;
+            try std.testing.expectError(error.NonFiniteAttentionInput, finiteInput(values, count, .{}));
+        }
+        values[index] = 0;
+    }
+    const Probe = struct {
+        checks: usize = 0,
+        cancel: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.cancel and self.checks == 2) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    const options = Options{ .control = .{ .ptr = &probe, .check_fn = Probe.check } };
+    try finiteInput(values, count, options);
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
+    probe = .{ .cancel = true };
+    try std.testing.expectError(error.Cancelled, finiteInput(values, count, options));
+    try std.testing.expectEqual(@as(usize, 2), probe.checks);
+    probe = .{};
+    try finiteInput(values, count, options);
+}
+
+test "tiled DeBERTa SIMD softmax preserves amplified subnormal probabilities" {
+    // Place the tiny probability inside a SIMD block, with a scalar tail too.
+    // Accumulate the oracle in f64 so this tests exponential preservation
+    // independently of the platform BLAS policy for subnormal operands.
+    const width = primitives.vec_len;
+    var scores = [_]f32{-std.math.inf(f32)} ** (width + 1);
+    scores[0] = 0;
+    scores[1] = -90;
+    scores[width] = -92;
+    const total = expSubtractAndSum(&scores, 0, -92);
+    try std.testing.expect(scores[1] > 0);
+    try std.testing.expect(scores[width] > 0);
+    const large_value: f32 = 1e38;
+    const actual = (@as(f64, scores[1]) + @as(f64, scores[width])) * @as(f64, large_value) / @as(f64, total);
+    const expected = (@exp(@as(f64, -90)) + @exp(@as(f64, -92))) * @as(f64, large_value);
+    try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+
+    // Ordinary finite scores retain SIMD even alongside masked -inf values.
+    @memset(&scores, -std.math.inf(f32));
+    scores[0] = 0;
+    try std.testing.expectEqual(@as(f32, 1), expSubtractAndSum(&scores, 0, 0));
+    try std.testing.expectEqual(@as(f32, 1), scores[0]);
+    for (scores[1..]) |score| try std.testing.expectEqual(@as(f32, 0), score);
 }
 
 test "tiled DeBERTa BLAS attention matches portable reference across ragged tiles" {

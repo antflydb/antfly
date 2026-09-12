@@ -27223,6 +27223,34 @@ int termite_metal_decode_runtime_embedding_lookup_direct_device(
     }
 }
 
+// A standalone staging call starts at offset zero. IDs and mask therefore
+// cannot be staged separately through the reusable single-slice buffer before
+// one dispatch. Keep both ranges in a request-owned buffer until its synchronous
+// command completes; active frames retain their existing advancing arena.
+static bool termite_metal_stage_standalone_deberta_embedding_metadata(
+    termite_metal_decode_runtime *runtime,
+    const uint32_t *ids,
+    const uint32_t *mask,
+    size_t ids_bytes,
+    termite_metal_host_staging_slice *ids_slice,
+    termite_metal_host_staging_slice *mask_slice
+) {
+    if (runtime == NULL || runtime->device == nil || ids == NULL || mask == NULL ||
+        ids_bytes == 0 || ids_slice == NULL || mask_slice == NULL) return false;
+    const size_t mask_offset = termite_metal_align_forward_size(ids_bytes, 256);
+    size_t metadata_bytes = 0;
+    if (mask_offset == SIZE_MAX || !termite_metal_size_add(mask_offset, ids_bytes, &metadata_bytes)) return false;
+    id<MTLBuffer> metadata = [runtime->device newBufferWithLength:metadata_bytes options:MTLResourceStorageModeShared];
+    if (metadata == nil || metadata.contents == NULL) return false;
+    memcpy(metadata.contents, ids, ids_bytes);
+    memcpy((uint8_t *)metadata.contents + mask_offset, mask, ids_bytes);
+    ids_slice->buffer = metadata;
+    ids_slice->offset = 0;
+    mask_slice->buffer = metadata;
+    mask_slice->offset = mask_offset;
+    return true;
+}
+
 int termite_metal_decode_runtime_deberta_embeddings_f32_device(
     termite_metal_decode_runtime *runtime,
     void *weight_handle,
@@ -27242,25 +27270,30 @@ int termite_metal_decode_runtime_deberta_embeddings_f32_device(
 ) {
     if (runtime == NULL || weight_handle == NULL || gamma_handle == NULL || beta_handle == NULL || ids == NULL || mask == NULL || output_handle == NULL) return -1;
     if (runtime->deberta_embeddings_f32_pipeline == nil) return -2;
-    if (total == 0 || dim == 0 || rows == 0) return -3;
+    if (total == 0 || dim == 0 || rows == 0 || total > UINT32_MAX || dim > UINT32_MAX || rows > UINT32_MAX) return -3;
+    size_t weight_bytes = 0, scale_bytes = 0, ids_bytes = 0, output_bytes = 0;
+    if (!termite_metal_size_mul3(rows, dim, sizeof(float), &weight_bytes) ||
+        !termite_metal_size_mul(dim, sizeof(float), &scale_bytes) ||
+        !termite_metal_size_mul(total, sizeof(uint32_t), &ids_bytes) ||
+        !termite_metal_size_mul3(total, dim, sizeof(float), &output_bytes)) return -3;
     @autoreleasepool {
         id<MTLBuffer> weight_buffer = (__bridge id<MTLBuffer>)weight_handle;
         id<MTLBuffer> gamma_buffer = (__bridge id<MTLBuffer>)gamma_handle;
         id<MTLBuffer> beta_buffer = (__bridge id<MTLBuffer>)beta_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t weight_bytes = rows * dim * sizeof(float);
-        const size_t scale_bytes = dim * sizeof(float);
-        const size_t ids_bytes = total * sizeof(uint32_t);
-        const size_t output_bytes = total * dim * sizeof(float);
-        if (weight_offset + weight_bytes > weight_buffer.length) return -4;
-        if (gamma_offset + scale_bytes > gamma_buffer.length) return -5;
-        if (beta_offset + scale_bytes > beta_buffer.length) return -6;
-        if (output_offset + output_bytes > output_buffer.length) return -7;
+        if (weight_offset > weight_buffer.length || weight_bytes > weight_buffer.length - weight_offset) return -4;
+        if (gamma_offset > gamma_buffer.length || scale_bytes > gamma_buffer.length - gamma_offset) return -5;
+        if (beta_offset > beta_buffer.length || scale_bytes > beta_buffer.length - beta_offset) return -6;
+        if (output_offset > output_buffer.length || output_bytes > output_buffer.length - output_offset) return -7;
         const bool frame_owned = (runtime->active_frame_cb == nil);
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         termite_metal_host_staging_slice mask_slice = { nil, 0 };
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -8;
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, ids_bytes, frame_owned, &mask_slice) != 0) return -9;
+        if (frame_owned) {
+            if (!termite_metal_stage_standalone_deberta_embedding_metadata(runtime, ids, mask, ids_bytes, &ids_slice, &mask_slice)) return -8;
+        } else {
+            if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, false, &ids_slice) != 0) return -8;
+            if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, ids_bytes, false, &mask_slice) != 0) return -9;
+        }
         termite_metal_deberta_embeddings_f32_params params = {
             .total = (uint32_t)total,
             .rows = (uint32_t)rows,
@@ -27323,19 +27356,20 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
 ) {
     if (runtime == NULL || weight == NULL || gamma == NULL || beta == NULL || ids == NULL || mask == NULL || output_handle == NULL) return -1;
     if (runtime->deberta_embeddings_f32_pipeline == nil) return -2;
-    if (total == 0 || dim == 0 || rows == 0) return -3;
+    if (total == 0 || dim == 0 || rows == 0 || total > UINT32_MAX || dim > UINT32_MAX || rows > UINT32_MAX) return -3;
+    size_t weight_bytes = 0, scale_bytes = 0, ids_bytes = 0, output_bytes = 0;
+    if (!termite_metal_size_mul3(rows, dim, sizeof(float), &weight_bytes) ||
+        !termite_metal_size_mul(dim, sizeof(float), &scale_bytes) ||
+        !termite_metal_size_mul(total, sizeof(uint32_t), &ids_bytes) ||
+        !termite_metal_size_mul3(total, dim, sizeof(float), &output_bytes)) return -3;
     @autoreleasepool {
         const int prep_rc = termite_metal_decode_runtime_prepare_embedding_table(runtime, weight, rows, dim);
         if (prep_rc != 0 || runtime->generic_embedding_table_buffer == nil) return -4;
         id<MTLBuffer> weight_buffer = runtime->generic_embedding_table_buffer;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t weight_bytes = rows * dim * sizeof(float);
-        const size_t scale_bytes = dim * sizeof(float);
-        const size_t ids_bytes = total * sizeof(uint32_t);
-        const size_t output_bytes = total * dim * sizeof(float);
         const size_t weight_offset = runtime->generic_embedding_buffer_offset;
         if (weight_offset > weight_buffer.length || weight_bytes > weight_buffer.length - weight_offset) return -5;
-        if (output_offset + output_bytes > output_buffer.length) return -6;
+        if (output_offset > output_buffer.length || output_bytes > output_buffer.length - output_offset) return -6;
         id<MTLBuffer> gamma_buffer = [runtime->device newBufferWithBytes:gamma length:scale_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> beta_buffer = [runtime->device newBufferWithBytes:beta length:scale_bytes options:MTLResourceStorageModeShared];
         if (gamma_buffer == nil || beta_buffer == nil) return -7;
@@ -27349,8 +27383,12 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
         }
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         termite_metal_host_staging_slice mask_slice = { nil, 0 };
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -9;
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, ids_bytes, frame_owned, &mask_slice) != 0) return -10;
+        if (frame_owned) {
+            if (!termite_metal_stage_standalone_deberta_embedding_metadata(runtime, ids, mask, ids_bytes, &ids_slice, &mask_slice)) return -9;
+        } else {
+            if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, false, &ids_slice) != 0) return -9;
+            if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, ids_bytes, false, &mask_slice) != 0) return -10;
+        }
         termite_metal_deberta_embeddings_f32_params params = {
             .total = (uint32_t)total,
             .rows = (uint32_t)rows,
@@ -29643,6 +29681,38 @@ int termite_metal_decode_runtime_compressed_attention_hybrid_attention_device(
     }
 }
 
+static int termite_metal_decode_runtime_prepare_layer_norm_storage(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    const float *weight,
+    const float *bias,
+    size_t hidden_size,
+    bool owned_shared_if_unified
+) {
+    if (runtime == NULL || weight == NULL || bias == NULL) return -1;
+    if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
+    if (slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY || hidden_size == 0) return -3;
+    size_t bytes = 0;
+    if (!termite_metal_size_mul(hidden_size, sizeof(float), &bytes) || bytes > runtime->device.maxBufferLength) return -3;
+    @autoreleasepool {
+        const bool use_shared = owned_shared_if_unified && runtime->device.hasUnifiedMemory;
+        id<MTLBuffer> weight_buffer = use_shared
+            ? [runtime->device newBufferWithBytes:weight length:bytes options:MTLResourceStorageModeShared]
+            : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, bytes);
+        if (weight_buffer == nil) return -4;
+        id<MTLBuffer> bias_buffer = use_shared
+            ? [runtime->device newBufferWithBytes:bias length:bytes options:MTLResourceStorageModeShared]
+            : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bytes);
+        if (bias_buffer == nil) return -4;
+        // Both owned copies must exist before replacing a live slot.
+        runtime->layer_norm_weight_buffers[slot] = weight_buffer;
+        runtime->layer_norm_bias_buffers[slot] = bias_buffer;
+        runtime->layer_norm_hidden_sizes[slot] = hidden_size;
+        runtime->layer_norm_slot_prepared[slot] = 1;
+        return 0;
+    }
+}
+
 int termite_metal_decode_runtime_prepare_layer_norm(
     termite_metal_decode_runtime *runtime,
     size_t slot,
@@ -29650,20 +29720,17 @@ int termite_metal_decode_runtime_prepare_layer_norm(
     const float *bias,
     size_t hidden_size
 ) {
-    if (runtime == NULL || weight == NULL || bias == NULL) return -1;
-    if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
-    if (slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY || hidden_size == 0) return -3;
-    @autoreleasepool {
-        const size_t bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, bytes);
-        id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bytes);
-        if (weight_buffer == nil || bias_buffer == nil) return -4;
-        runtime->layer_norm_weight_buffers[slot] = weight_buffer;
-        runtime->layer_norm_bias_buffers[slot] = bias_buffer;
-        runtime->layer_norm_hidden_sizes[slot] = hidden_size;
-        runtime->layer_norm_slot_prepared[slot] = 1;
-        return 0;
-    }
+    return termite_metal_decode_runtime_prepare_layer_norm_storage(runtime, slot, weight, bias, hidden_size, false);
+}
+
+int termite_metal_decode_runtime_prepare_layer_norm_owned_shared(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    const float *weight,
+    const float *bias,
+    size_t hidden_size
+) {
+    return termite_metal_decode_runtime_prepare_layer_norm_storage(runtime, slot, weight, bias, hidden_size, true);
 }
 
 int termite_metal_decode_runtime_apply_layer_norm(
@@ -31530,23 +31597,38 @@ int termite_metal_decode_runtime_apply_add_layer_norm_device(
     }
 }
 
-int termite_metal_decode_runtime_prepare_linear(
+static int termite_metal_decode_runtime_prepare_linear_storage(
     termite_metal_decode_runtime *runtime,
     size_t slot,
     const float *weight,
     const float *bias,
     size_t in_dim,
-    size_t out_dim
+    size_t out_dim,
+    bool owned_shared_if_unified
 ) {
     if (runtime == NULL || weight == NULL || bias == NULL) return -1;
     if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
+    size_t weight_bytes = 0;
+    size_t bias_bytes = 0;
+    if (!termite_metal_size_mul3(in_dim, out_dim, sizeof(float), &weight_bytes) ||
+        !termite_metal_size_mul(out_dim, sizeof(float), &bias_bytes) ||
+        weight_bytes > runtime->device.maxBufferLength || bias_bytes > runtime->device.maxBufferLength) return -3;
     @autoreleasepool {
-        const size_t weight_bytes = in_dim * out_dim * sizeof(float);
-        const size_t bias_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, weight_bytes);
-        id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
-        if (weight_buffer == nil || bias_buffer == nil) return -4;
+        const bool use_shared = owned_shared_if_unified && runtime->device.hasUnifiedMemory;
+        // Both representations own a snapshot of the caller's bytes. Shared
+        // storage avoids two upload command buffers for short-lived slots on
+        // unified-memory devices; no source pointer escapes preparation.
+        id<MTLBuffer> weight_buffer = use_shared
+            ? [runtime->device newBufferWithBytes:weight length:weight_bytes options:MTLResourceStorageModeShared]
+            : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, weight_bytes);
+        if (weight_buffer == nil) return -4;
+        id<MTLBuffer> bias_buffer = use_shared
+            ? [runtime->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared]
+            : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
+        if (bias_buffer == nil) return -4;
+        // Publish only after both allocations succeed. Failed replacement
+        // leaves the old slot and its cached matrix views intact.
         runtime->linear_weight_buffers[slot] = weight_buffer;
         runtime->linear_bias_buffers[slot] = bias_buffer;
         runtime->linear_in_dims[slot] = in_dim;
@@ -31562,6 +31644,28 @@ int termite_metal_decode_runtime_prepare_linear(
         termite_metal_decode_runtime_clear_quant_linear_descriptor(runtime, slot);
         return 0;
     }
+}
+
+int termite_metal_decode_runtime_prepare_linear(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    const float *weight,
+    const float *bias,
+    size_t in_dim,
+    size_t out_dim
+) {
+    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, false);
+}
+
+int termite_metal_decode_runtime_prepare_linear_owned_shared(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    const float *weight,
+    const float *bias,
+    size_t in_dim,
+    size_t out_dim
+) {
+    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, true);
 }
 
 int termite_metal_decode_runtime_prefer_linear_mps(

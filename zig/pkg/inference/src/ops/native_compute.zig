@@ -40003,29 +40003,35 @@ fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
 
 fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!ops.SplitLastDim3Result {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const data = getData(input);
-    if (data.len != rows * dim * 3) return error.UnexpectedOutputShape;
+    const total = std.math.mul(usize, rows, dim) catch return error.UnexpectedOutputShape;
+    const input_total = std.math.mul(usize, total, 3) catch return error.UnexpectedOutputShape;
+    const shape = [_]i64{
+        std.math.cast(i64, rows) orelse return error.UnexpectedOutputShape,
+        std.math.cast(i64, dim) orelse return error.UnexpectedOutputShape,
+    };
+    const data = try getDataChecked(input);
+    if (data.len != input_total) return error.UnexpectedOutputShape;
 
-    const total = rows * dim;
-    const first = try self.allocator.alloc(f32, total);
-    errdefer self.allocator.free(first);
-    const second = try self.allocator.alloc(f32, total);
-    errdefer self.allocator.free(second);
-    const third = try self.allocator.alloc(f32, total);
-    errdefer self.allocator.free(third);
-
-    for (0..rows) |row| {
-        const src = row * dim * 3;
-        const dst = row * dim;
-        @memcpy(first[dst..][0..dim], data[src..][0..dim]);
-        @memcpy(second[dst..][0..dim], data[src + dim ..][0..dim]);
-        @memcpy(third[dst..][0..dim], data[src + dim * 2 ..][0..dim]);
+    // Splitting preserves token-major [rows, dim] storage. In particular,
+    // SDPA uses this shape to distinguish it from head-major input.
+    var outputs: [3]CT = undefined;
+    var initialized: usize = 0;
+    errdefer for (outputs[0..initialized]) |output| freeTensor(self, output);
+    for (&outputs, 0..) |*output, part| {
+        const values = try self.allocator.alloc(f32, total);
+        output.* = try self.makeOwnedBuf(values);
+        initialized += 1;
+        output.* = try self.withLogicalShape(output.*, &shape);
+        for (0..rows) |row| {
+            const src = row * dim * 3 + part * dim;
+            @memcpy(values[row * dim ..][0..dim], data[src..][0..dim]);
+        }
     }
 
     return .{
-        .first = try self.makeBuf(first, true),
-        .second = try self.makeBuf(second, true),
-        .third = try self.makeBuf(third, true),
+        .first = outputs[0],
+        .second = outputs[1],
+        .third = outputs[2],
     };
 }
 
@@ -48668,6 +48674,100 @@ test "packTokenMajorHeads reorders per-token head slices" {
     const roundtrip = try unpackHeadMajorTokens(allocator, packed_hm, 1, 2, 2, 2);
     defer allocator.free(roundtrip);
     try std.testing.expectEqualSlices(f32, &tok, roundtrip);
+}
+
+test "native splitLastDim3 preserves token-major layout through multihead sdpa" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const batch = 2;
+    const seq_len = 3;
+    const heads = 2;
+    const head_dim = 3;
+    const hidden = heads * head_dim;
+    const rows = batch * seq_len;
+    const total = rows * hidden;
+    var q: [total]f32 = undefined;
+    var k: [total]f32 = undefined;
+    var v: [total]f32 = undefined;
+    for (0..total) |i| {
+        q[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) * 0.07;
+        k[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 19)) - 9)) * 0.09;
+        v[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 17)) - 8)) * 0.11;
+    }
+    var packed_qkv: [total * 3]f32 = undefined;
+    for (0..rows) |row| {
+        @memcpy(packed_qkv[row * hidden * 3 ..][0..hidden], q[row * hidden ..][0..hidden]);
+        @memcpy(packed_qkv[row * hidden * 3 + hidden ..][0..hidden], k[row * hidden ..][0..hidden]);
+        @memcpy(packed_qkv[row * hidden * 3 + hidden * 2 ..][0..hidden], v[row * hidden ..][0..hidden]);
+    }
+    const input = try cb.fromFloat32Shape(&packed_qkv, &.{ rows, hidden * 3 });
+    defer cb.free(input);
+    const split = try cb.splitLastDim3(allocator, input, rows, hidden);
+    defer cb.free(split.first);
+    defer cb.free(split.second);
+    defer cb.free(split.third);
+    const shape = [_]i64{ rows, hidden };
+    for ([_]CT{ split.first, split.second, split.third }) |output| {
+        try std.testing.expectEqualSlices(i64, &shape, tensorStoredShape(output).?);
+    }
+    try std.testing.expectEqualSlices(f32, &q, getData(split.first));
+    try std.testing.expectEqualSlices(f32, &k, getData(split.second));
+    try std.testing.expectEqualSlices(f32, &v, getData(split.third));
+
+    // Independent scalar token-major attention, with distinct rows, channels,
+    // and batch masks. A head-major interpretation produces different values.
+    const mask = [_]i64{ 1, 0, 1, 0, 1, 1 };
+    const expected = try referenceCrossSeqMajorAttention(allocator, &q, &k, &v, &mask, batch, seq_len, seq_len, heads, head_dim);
+    defer allocator.free(expected);
+    const actual = try cb.scaledDotProductAttention(split.first, split.second, split.third, &mask, null, batch, seq_len, heads, head_dim);
+    defer cb.free(actual);
+    try std.testing.expectEqualSlices(i64, &shape, tensorStoredShape(actual).?);
+    try expectApproxEqSlice(expected, getData(actual), 1e-5);
+}
+
+fn testNativeSplitLastDim3Lifetime(allocator: std.mem.Allocator, view_input: bool) !void {
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var values: [18]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i + 1);
+    const source = try cb.fromFloat32Shape(&values, if (view_input) &.{ 6, 3 } else &.{ 3, 6 });
+    defer cb.free(source);
+    const input = if (view_input) try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 6, 3 }) else source;
+    defer if (view_input) cb.free(input);
+    // Repeated construction must leave the source intact after releasing all
+    // three output owners, including a materialized transpose input.
+    for (0..2) |_| {
+        const split = try cb.splitLastDim3(allocator, input, 3, 2);
+        defer cb.free(split.first);
+        defer cb.free(split.second);
+        defer cb.free(split.third);
+        for ([_]CT{ split.first, split.second, split.third }, 0..) |output, part| {
+            try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, tensorStoredShape(output).?);
+            for (getData(output), 0..) |value, i| {
+                const row = i / 2;
+                const col = part * 2 + i % 2;
+                const original = if (view_input) col * 3 + row else row * 6 + col;
+                try std.testing.expectEqual(values[original], value);
+            }
+        }
+    }
+    try std.testing.expectError(error.UnexpectedOutputShape, cb.splitLastDim3(allocator, input, 4, 2));
+    try std.testing.expectError(error.UnexpectedOutputShape, cb.splitLastDim3(allocator, input, std.math.maxInt(usize), 2));
+    try std.testing.expectEqualSlices(f32, &values, try getDataChecked(source));
+}
+
+test "native splitLastDim3 allocation failures preserve input and release partial outputs" {
+    for ([_]bool{ false, true }) |view_input| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testNativeSplitLastDim3Lifetime, .{view_input});
+        try testNativeSplitLastDim3Lifetime(std.testing.allocator, view_input);
+    }
 }
 
 test "sdpa token-major 2d layout matches head-major reference" {

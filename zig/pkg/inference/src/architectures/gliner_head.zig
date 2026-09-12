@@ -187,11 +187,14 @@ pub fn forwardCtProfiledWithLabelMarkers(
     profile: ?*ForwardProfile,
 ) !ForwardCtResult {
     const H: usize = hidden_size;
+    if (batch == 0 or seq_len == 0 or H == 0) return error.UnexpectedInputShape;
+    const total_tokens = std.math.mul(usize, batch, seq_len) catch return error.UnexpectedInputShape;
+    if (input_ids.len != total_tokens or words_mask.len != total_tokens) return error.UnexpectedInputShape;
 
     const num_words = countWords(words_mask);
-    const label_positions = try collectLabelPositions(allocator, input_ids, seq_len, label_markers);
+    const label_positions = try collectLabelPositions(allocator, input_ids, batch, seq_len, label_markers);
     defer allocator.free(label_positions);
-    const num_labels = label_positions.len;
+    const num_labels = label_positions.len / batch;
 
     const span_info = try getSpanInfo(allocator, span_idx, batch, num_words);
     const num_spans = span_info.num_spans;
@@ -212,25 +215,16 @@ pub fn forwardCtProfiledWithLabelMarkers(
 
     if (try cb.glinerWordEmbeddings(hidden, words_mask, batch, seq_len, H, num_words)) |word_ct| {
         defer cb.free(word_ct);
-        if (try cb.takeRows(hidden, label_positions, num_labels, H)) |label_hidden_ct| {
+        if (try cb.takeRows(hidden, label_positions, label_positions.len, H)) |label_hidden_ct| {
             defer cb.free(label_hidden_ct);
 
-            var timer = profileStart(profile);
+            const timer = profileStart(profile);
             const span_ct = try spanMarkerForwardFromWordCt(cb, allocator, word_ct, span_info.start_indices, span_info.end_indices, batch, num_words, num_spans, H, profile);
             defer cb.free(span_ct);
             try profileSyncTensor(cb, profile, span_ct);
             if (profile) |p| p.span_marker_ns += profileElapsed(timer);
 
-            timer = profileStart(profile);
-            const label_ct = try countLstmForwardFromCt(cb, allocator, label_hidden_ct, num_labels, H);
-            defer cb.free(label_ct);
-            try profileSyncTensor(cb, profile, label_ct);
-            if (profile) |p| p.label_projection_ns += profileElapsed(timer);
-
-            timer = profileStart(profile);
-            const logits_ct = try cb.linearNoBias(span_ct, label_ct, total_spans, H, num_labels);
-            try profileSyncTensor(cb, profile, logits_ct);
-            if (profile) |p| p.logits_ns += profileElapsed(timer);
+            const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, profile);
             return .{
                 .logits = logits_ct,
                 .num_words = num_words,
@@ -262,22 +256,95 @@ pub fn forwardCtProfiledWithLabelMarkers(
     try profileSyncTensor(cb, profile, span_ct);
     if (profile) |p| p.span_marker_ns += profileElapsed(timer);
 
-    timer = profileStart(profile);
-    const label_ct = try countLstmForwardCt(cb, allocator, label_result.embeddings, num_labels, H);
-    defer cb.free(label_ct);
-    try profileSyncTensor(cb, profile, label_ct);
-    if (profile) |p| p.label_projection_ns += profileElapsed(timer);
-
-    timer = profileStart(profile);
-    const logits_ct = try cb.linearNoBias(span_ct, label_ct, total_spans, H, num_labels);
-    try profileSyncTensor(cb, profile, logits_ct);
-    if (profile) |p| p.logits_ns += profileElapsed(timer);
+    const label_shape = [_]i32{ @intCast(batch * num_labels), @intCast(H) };
+    const label_hidden_ct = try cb.fromFloat32Shape(label_result.embeddings, &label_shape);
+    defer cb.free(label_hidden_ct);
+    const logits_ct = try projectAndScoreSamples(cb, allocator, span_ct, label_hidden_ct, batch, num_spans, num_labels, H, profile);
     return .{
         .logits = logits_ct,
         .num_words = num_words,
         .max_width = max_width,
         .num_labels = num_labels,
     };
+}
+
+/// Label markers attend to the sample text in the encoder. A common schema
+/// therefore has different contextual label vectors in different batch rows.
+/// Keep the large span MLP batched, but project and score each sample against
+/// its own labels. In particular, the small label transformer must not attend
+/// across samples when their marker rows are packed together.
+fn projectAndScoreSamples(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    spans: CT,
+    labels: CT,
+    batch: usize,
+    num_spans: usize,
+    num_labels: usize,
+    H: usize,
+    profile: ?*ForwardProfile,
+) !CT {
+    if (batch == 1) return projectAndScoreSample(cb, allocator, spans, labels, num_spans, num_labels, H, profile);
+
+    // CPU and Metal both provide backend row slicing. Metal also supports
+    // copying into one result allocation without downloading activations.
+    var output: ?CT = null;
+    errdefer if (output) |owned| cb.free(owned);
+    if (cb.supportsCopyRows2D()) {
+        const shape = [_]i32{ @intCast(batch * num_spans), @intCast(num_labels) };
+        output = try cb.allocUninitF32Shape(&shape);
+    }
+    const direct_copy = output != null;
+    for (0..batch) |b| {
+        const sample_labels = try cb.sliceRows2D(allocator, labels, b * num_labels, num_labels, H);
+        defer cb.free(sample_labels);
+        const sample_spans = try cb.sliceRows2D(allocator, spans, b * num_spans, num_spans, H);
+        defer cb.free(sample_spans);
+        const scored = try projectAndScoreSample(cb, allocator, sample_spans, sample_labels, num_spans, num_labels, H, profile);
+        if (direct_copy) {
+            defer cb.free(scored);
+            if (!try cb.copyRows2D(allocator, output.?, b * num_spans, scored, 0, num_spans, num_labels))
+                return error.UnsupportedGlinerBatchCopy;
+        } else if (output) |previous| {
+            defer cb.free(scored);
+            const joined = try cb.concatRows2D(allocator, previous, scored, b * num_spans, num_spans, num_labels);
+            cb.free(previous);
+            output = joined;
+        } else output = scored;
+    }
+    return output orelse error.UnexpectedInputShape;
+}
+
+fn projectAndScoreSample(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    spans: CT,
+    labels: CT,
+    num_spans: usize,
+    num_labels: usize,
+    H: usize,
+    profile: ?*ForwardProfile,
+) !CT {
+    var timer = profileStart(profile);
+    const projected = try countLstmForwardFromCt(cb, allocator, labels, num_labels, H);
+    defer cb.free(projected);
+    try profileSyncTensor(cb, profile, projected);
+    if (profile) |p| p.label_projection_ns += profileElapsed(timer);
+    timer = profileStart(profile);
+    // Native linears execute SGEMM directly. GPU scoring uses activation math:
+    // treating contextual label vectors as model weights can cache a prepared
+    // Metal linear after its source has been freed, then reuse it for another
+    // sample at the same device address.
+    const span_shape = [_]i64{ @intCast(num_spans), @intCast(H) };
+    const label_shape = [_]i64{ @intCast(num_labels), @intCast(H) };
+    const logits = if (cb.kind() == .native)
+        try cb.linearNoBias(spans, projected, num_spans, H, num_labels)
+    else
+        try cb.primDotGeneral(spans, projected, &span_shape, &label_shape, &.{1}, &.{1}, &.{}, &.{});
+    errdefer cb.free(logits);
+    try profileSyncTensor(cb, profile, logits);
+    if (profile) |p| p.logits_ns += profileElapsed(timer);
+    return logits;
 }
 
 fn countWords(words_mask: []const i64) usize {
@@ -288,13 +355,27 @@ fn countWords(words_mask: []const i64) usize {
     return @intCast(max_word_id);
 }
 
-fn collectLabelPositions(allocator: std.mem.Allocator, input_ids: []const i64, seq_len: usize, label_markers: LabelMarkerTokens) ![]u32 {
+fn collectLabelPositions(allocator: std.mem.Allocator, input_ids: []const i64, batch: usize, seq_len: usize, label_markers: LabelMarkerTokens) ![]u32 {
+    if (batch == 0 or seq_len == 0) return error.UnexpectedInputShape;
+    const total = std.math.mul(usize, batch, seq_len) catch return error.UnexpectedInputShape;
+    if (input_ids.len != total or total > std.math.maxInt(u32)) return error.UnexpectedInputShape;
     var label_positions = std.ArrayListUnmanaged(u32).empty;
     defer label_positions.deinit(allocator);
-    for (0..@min(seq_len, input_ids.len)) |t| {
-        if (isGlinerLabelMarkerToken(input_ids[t], label_markers)) {
-            try label_positions.append(allocator, @intCast(t));
+    var num_labels: usize = 0;
+    for (0..batch) |b| {
+        const before = label_positions.items.len;
+        for (0..seq_len) |t| {
+            const pos = b * seq_len + t;
+            if (isGlinerLabelMarkerToken(input_ids[pos], label_markers)) {
+                const label = label_positions.items.len - before;
+                if (b != 0 and (label >= num_labels or
+                    input_ids[pos] != input_ids[label_positions.items[label]]))
+                    return error.InconsistentGlinerBatchLabels;
+                try label_positions.append(allocator, @intCast(pos));
+            }
         }
+        const count = label_positions.items.len - before;
+        if (b == 0) num_labels = count else if (count != num_labels) return error.InconsistentGlinerBatchLabels;
     }
     return try label_positions.toOwnedSlice(allocator);
 }
@@ -352,7 +433,7 @@ const WordEmbResult = struct {
     num_words: usize,
 };
 
-/// Extract word embeddings by averaging token embeddings per word using words_mask.
+/// Extract the first token embedding per word using words_mask.
 /// words_mask: [batch, seq_len] with values 0 (non-word) or word_id (1-indexed).
 fn extractWordEmbeddings(
     allocator: std.mem.Allocator,
@@ -370,6 +451,7 @@ fn extractWordEmbeddings(
     const num_words: usize = @intCast(max_word_id);
 
     const output = try allocator.alloc(f32, batch * num_words * H);
+    errdefer allocator.free(output);
     @memset(output, 0.0);
     const counts = try allocator.alloc(f32, batch * num_words);
     defer allocator.free(counts);
@@ -395,22 +477,11 @@ fn extractWordEmbeddings(
 }
 
 const LabelEmbResult = struct {
-    embeddings: []f32, // [num_labels, H]
+    embeddings: []f32, // [batch * num_labels, H]
     num_labels: usize,
 };
 
-/// Extract label embeddings from positions where input_ids correspond to entity tokens.
-/// GLiNER uses special [E] tokens (id >= 128000 typically) to mark labels in the input.
-/// We use a simpler heuristic: labels are tokens after the last [SEP] or in positions
-/// where words_mask == 0 and the token is not padding.
-///
-/// Actually, GLiNER prepends label tokens with special markers. The ONNX model
-/// receives them as part of input_ids with words_mask == 0 for label positions.
-/// We extract the hidden states at positions where words_mask == 0 and
-/// attention_mask == 1 and the token appears to be a label boundary.
-///
-/// For simplicity: we take the first token of each label span (consecutive words_mask==0
-/// tokens between word tokens) as the label embedding.
+/// Gather each sample's contextual [E]/[C]/[R] marker states in schema order.
 fn extractLabelEmbeddings(
     allocator: std.mem.Allocator,
     hidden: []const f32,
@@ -420,28 +491,18 @@ fn extractLabelEmbeddings(
     H: usize,
     label_markers: LabelMarkerTokens,
 ) !LabelEmbResult {
-    _ = batch;
-    // GLiNER2 uses [E]/[C]/[R] tokens to mark label positions in the input.
-    // Extract hidden states at those positions.
-
-    var label_positions = std.ArrayListUnmanaged(usize).empty;
-    defer label_positions.deinit(allocator);
-
-    // Only look at first batch item (labels are same across batch)
-    for (0..seq_len) |t| {
-        if (isGlinerLabelMarkerToken(input_ids[t], label_markers)) {
-            try label_positions.append(allocator, t);
-        }
-    }
-
-    const num_labels = label_positions.items.len;
+    const label_positions = try collectLabelPositions(allocator, input_ids, batch, seq_len, label_markers);
+    defer allocator.free(label_positions);
+    const expected_hidden = std.math.mul(usize, input_ids.len, H) catch return error.UnexpectedInputShape;
+    if (hidden.len != expected_hidden) return error.UnexpectedInputShape;
+    const num_labels = label_positions.len / batch;
     if (num_labels == 0) {
         // Fallback: no labels found, return empty
         return .{ .embeddings = try allocator.alloc(f32, 0), .num_labels = 0 };
     }
 
-    const output = try allocator.alloc(f32, num_labels * H);
-    for (label_positions.items, 0..) |pos, i| {
+    const output = try allocator.alloc(f32, label_positions.len * H);
+    for (label_positions, 0..) |pos, i| {
         @memcpy(output[i * H ..][0..H], hidden[pos * H ..][0..H]);
     }
 
@@ -476,6 +537,7 @@ fn getSpanInfo(
     const max_width = if (num_words > 0) num_spans / num_words else 8;
 
     const starts = try allocator.alloc(u32, batch * num_spans);
+    errdefer allocator.free(starts);
     const ends = try allocator.alloc(u32, batch * num_spans);
 
     for (0..batch) |b| {
@@ -813,14 +875,13 @@ fn countLstmForwardCt(
 
     // 3. Skip connection: combined = gru_out + label_embs
     const combined = try allocator.alloc(f32, num_labels * H);
+    defer allocator.free(combined);
     for (0..num_labels * H) |i| {
         combined[i] = gru_out[i] + label_embs[i];
     }
 
     // 4. DownscaledTransformer
-    const result = try downscaledTransformer(cb, allocator, combined, num_labels, H);
-    allocator.free(combined);
-    return result;
+    return downscaledTransformer(cb, allocator, combined, num_labels, H);
 }
 
 fn countLstmForwardFromCt(
@@ -943,6 +1004,7 @@ fn downscaledTransformerCt(
 
     // 2-layer transformer encoder
     var hidden = projected;
+    defer cb.free(hidden);
     for (0..2) |layer| {
         const new_hidden = try miniTransformerLayer(cb, allocator, hidden, N, D, D_FFN, layer);
         cb.free(hidden);
@@ -954,7 +1016,6 @@ fn downscaledTransformerCt(
     const concat_dim = D + H; // 896
     const cat_ct = try cb.concat(hidden, combined_ct, N, D, H);
     defer cb.free(cat_ct);
-    cb.free(hidden);
 
     // 3-layer MLP: 896→768, ReLU, 768→768, ReLU, 768→768
     const result = try outProjectorMlp(cb, allocator, cat_ct, N, concat_dim, H);
@@ -1051,6 +1112,7 @@ fn miniTransformerLayerCpu(
     const norm1_b = try cb.getWeight(norm1_b_name);
     defer cb.free(norm1_b);
     const normed1 = try cb.layerNorm(res1, norm1_w, norm1_b, D, 1e-5);
+    defer cb.free(normed1);
 
     // FFN: linear1 → relu → linear2
     const ffn1_w_name = std.fmt.bufPrint(&buf, "count_embed.transformer.transformer.layers.{d}.linear1.weight", .{layer}) catch return error.NameTooLong;
@@ -1076,7 +1138,6 @@ fn miniTransformerLayerCpu(
 
     // Residual + norm2 (post-norm)
     const res2 = try cb.add(ffn2, normed1);
-    cb.free(normed1);
     defer cb.free(res2);
 
     const norm2_w_name = std.fmt.bufPrint(&buf, "count_embed.transformer.transformer.layers.{d}.norm2.weight", .{layer}) catch return error.NameTooLong;
@@ -1189,17 +1250,193 @@ test "extractLabelEmbeddings accepts GLiNER classification and relation markers"
     try std.testing.expectEqualSlices(f32, &.{ 1, 10, 3, 30, 5, 50 }, result.embeddings);
 }
 
-test "collectLabelPositions mirrors first-batch label extraction" {
+test "collectLabelPositions gathers every contextual batch row" {
     const allocator = std.testing.allocator;
     const input_ids = [_]i64{
         7,  99, 5,  99,
         99, 8,  99, 9,
     };
 
-    const positions = try collectLabelPositions(allocator, &input_ids, 4, .{ .entity = 99 });
+    const positions = try collectLabelPositions(allocator, &input_ids, 2, 4, .{ .entity = 99 });
     defer allocator.free(positions);
 
-    try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, positions);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 4, 6 }, positions);
+}
+
+test "GLiNER contextual batch labels reject inconsistent schema markers" {
+    const a = std.testing.allocator;
+    const markers = LabelMarkerTokens{ .entity = 51, .classification = 52, .relation = 53 };
+    try std.testing.expectError(error.InconsistentGlinerBatchLabels, collectLabelPositions(a, &.{ 51, 52, 0, 51, 0, 0 }, 2, 3, markers));
+    try std.testing.expectError(error.InconsistentGlinerBatchLabels, collectLabelPositions(a, &.{ 51, 52, 0, 52, 51, 0 }, 2, 3, markers));
+    try std.testing.expectError(error.UnexpectedInputShape, collectLabelPositions(a, &.{ 51, 52, 0 }, 2, 3, markers));
+}
+
+fn exerciseContextualLabelGather(a: std.mem.Allocator) !void {
+    const ids = [_]i64{ 51, 52, 0, 0, 51, 52 };
+    const hidden = [_]f32{ 1, 2, 3, 4, 90, 91, 92, 93, 5, 6, 7, 8 };
+    const result = try extractLabelEmbeddings(a, &hidden, &ids, 2, 3, 2, .{ .entity = 51, .classification = 52 });
+    defer a.free(result.embeddings);
+    try std.testing.expectEqual(@as(usize, 2), result.num_labels);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, result.embeddings);
+}
+
+test "GLiNER contextual batch label gather allocation failure releases ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseContextualLabelGather, .{});
+}
+
+// Small analytic head: the span MLP returns its first word vector, the zero
+// GRU adds one half of each marker state, and the final projector preserves
+// that residual. The downscaled transformer still executes normally. Thus
+// each score is exactly dot(word, 1.5 * this sample's marker), independently
+// of every other sample. No learned checkpoint or external fixture is used.
+const ContextualHeadFixture = struct {
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+
+    // Exercise both public head routes on CPU. These test-only adapters mimic
+    // optional backend gathers; they make no device residency claim.
+    fn gatherWords(ctx: *anyopaque, request: *const ops.GlinerWordEmbeddingsRequest) anyerror!?CT {
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        const cb = compute.computeBackend();
+        const hidden = try cb.toFloat32(request.hidden, compute.allocator);
+        defer compute.allocator.free(hidden);
+        const words = try extractWordEmbeddings(compute.allocator, hidden, request.words_mask, request.batch, request.seq_len, request.hidden_size);
+        defer compute.allocator.free(words.embeddings);
+        const shape = [_]i32{ @intCast(request.batch * request.num_words), @intCast(request.hidden_size) };
+        return try cb.fromFloat32Shape(words.embeddings, &shape);
+    }
+
+    fn gatherRows(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
+        const compute: *native.NativeCompute = @ptrCast(@alignCast(ctx));
+        const cb = compute.computeBackend();
+        const indices = try compute.allocator.alloc(i64, request.rows);
+        defer compute.allocator.free(indices);
+        for (indices, request.row_ids) |*out, index| out.* = index;
+        return try cb.embeddingLookup(request.input, indices, request.rows, request.dim);
+    }
+
+    fn weight(store: *native.WeightStore, name: []const u8, rows: usize, cols: usize, diagonal_offset: ?usize, norm: bool) !void {
+        const a = store.allocator;
+        const data = try a.alloc(f32, rows * cols);
+        defer a.free(data);
+        @memset(data, if (norm) 1 else 0);
+        if (diagonal_offset) |offset| {
+            for (0..@min(rows, cols - offset)) |i| data[i * cols + i + offset] = 1;
+        }
+        const key = try a.dupe(u8, name);
+        errdefer a.free(key);
+        const matrix_shape = [_]i64{ @intCast(rows), @intCast(cols) };
+        const vector_shape = [_]i64{@intCast(rows)};
+        const shape: []const i64 = if (cols == 1) &vector_shape else &matrix_shape;
+        var tensor = try Tensor.initFloat32(a, key, shape, data);
+        errdefer tensor.deinit();
+        try store.resident_weights.put(a, key, .{ .tensor = tensor });
+    }
+
+    fn linear(store: *native.WeightStore, prefix: []const u8, rows: usize, cols: usize, offset: ?usize) !void {
+        var name: [192]u8 = undefined;
+        try weight(store, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), rows, cols, offset, false);
+        try weight(store, try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), rows, 1, null, false);
+    }
+
+    fn init(a: std.mem.Allocator) !native.WeightStore {
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        errdefer store.deinitOwned();
+        inline for (.{ "project_start", "project_end", "out_project" }) |component| {
+            try linear(&store, "span_rep.span_rep_layer." ++ component ++ ".0", 8, if (std.mem.eql(u8, component, "out_project")) 4 else 2, 0);
+            try linear(&store, "span_rep.span_rep_layer." ++ component ++ ".3", 2, 8, 0);
+        }
+        try weight(&store, "count_embed.pos_embedding.weight", 20, 2, null, false);
+        try weight(&store, "count_embed.gru.weight_ih_l0", 6, 2, null, false);
+        try weight(&store, "count_embed.gru.weight_hh_l0", 6, 2, null, false);
+        try weight(&store, "count_embed.gru.bias_ih_l0", 6, 1, null, false);
+        try weight(&store, "count_embed.gru.bias_hh_l0", 6, 1, null, false);
+        try linear(&store, "count_embed.transformer.in_projector", 128, 2, null);
+        inline for (.{ "0", "1" }) |layer| {
+            const prefix = "count_embed.transformer.transformer.layers." ++ layer;
+            try weight(&store, prefix ++ ".self_attn.in_proj_weight", 384, 128, null, false);
+            try weight(&store, prefix ++ ".self_attn.in_proj_bias", 384, 1, null, false);
+            try linear(&store, prefix ++ ".self_attn.out_proj", 128, 128, null);
+            try linear(&store, prefix ++ ".linear1", 256, 128, null);
+            try linear(&store, prefix ++ ".linear2", 128, 256, null);
+            inline for (.{ "norm1", "norm2" }) |normalization| {
+                try weight(&store, prefix ++ "." ++ normalization ++ ".weight", 128, 1, null, true);
+                try weight(&store, prefix ++ "." ++ normalization ++ ".bias", 128, 1, null, false);
+            }
+        }
+        try linear(&store, "count_embed.transformer.out_projector.0", 2, 130, 128);
+        try linear(&store, "count_embed.transformer.out_projector.2", 2, 2, 0);
+        try linear(&store, "count_embed.transformer.out_projector.4", 2, 2, 0);
+        return store;
+    }
+};
+
+test "GLiNER contextual batch projections match distinct ragged samples and permutation" {
+    const a = std.testing.allocator;
+    var store = try ContextualHeadFixture.init(a);
+    defer store.deinitOwned();
+    var compute = ContextualHeadFixture.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const ids = [_]i64{ 51, 52, 53, 11, 12, 13, 0, 0, 9, 51, 52, 53, 21, 0, 0, 0 };
+    const words = [_]i64{ 0, 0, 0, 1, 1, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0 };
+    const hidden = [_]f32{ 1, 0, 0, 1, 1, 1, 1, 2, 91, 92, 3, 4, 99, 99, 99, 99, 99, 99, 2, 0, 0, 3, 2, 3, 1, 2, 99, 99, 99, 99, 99, 99 };
+    const spans = [_]i64{ 0, 0, 1, 1, 0, 0, 1, 1 };
+    const markers = LabelMarkerTokens{ .entity = 51, .classification = 52, .relation = 53 };
+    const expected = [_]f32{ 1.5, 3, 4.5, 4.5, 6, 10.5, 3, 9, 12, 0, 0, 0 };
+    for ([_]bool{ false, true }) |optional_gathers| {
+        var cb = compute.computeBackend();
+        var vtable = cb.vtable.*;
+        if (optional_gathers) {
+            vtable.glinerWordEmbeddings = ContextualHeadFixture.gatherWords;
+            vtable.takeRows = ContextualHeadFixture.gatherRows;
+        }
+        cb.vtable = &vtable;
+        const result = try forwardWithLabelMarkers(&cb, a, &hidden, &ids, &words, &spans, 2, 8, 2, markers);
+        defer a.free(result.logits);
+        try std.testing.expectEqual(@as(usize, 3), result.num_labels);
+        try std.testing.expectEqual(@as(usize, 2), result.num_words);
+        try std.testing.expectEqual(@as(usize, 1), result.max_width);
+        try std.testing.expectEqualSlices(f32, &expected, result.logits);
+
+        for (0..2) |b| {
+            const real_spans: usize = if (b == 0) 2 else 1;
+            const single = try forwardWithLabelMarkers(&cb, a, hidden[b * 16 ..][0..16], ids[b * 8 ..][0..8], words[b * 8 ..][0..8], spans[b * 4 ..][0 .. real_spans * 2], 1, 8, 2, markers);
+            defer a.free(single.logits);
+            try std.testing.expectEqualSlices(f32, expected[b * 6 ..][0 .. real_spans * 3], single.logits);
+        }
+
+        const reversed_ids = ids[8..].* ++ ids[0..8].*;
+        const reversed_words = words[8..].* ++ words[0..8].*;
+        const reversed_hidden = hidden[16..].* ++ hidden[0..16].*;
+        const reversed = try forwardWithLabelMarkers(&cb, a, &reversed_hidden, &reversed_ids, &reversed_words, &spans, 2, 8, 2, markers);
+        defer a.free(reversed.logits);
+        try std.testing.expectEqualSlices(f32, expected[6..], reversed.logits[0..6]);
+        try std.testing.expectEqualSlices(f32, expected[0..6], reversed.logits[6..]);
+    }
+}
+
+fn exerciseHeadAllocationFailures(a: std.mem.Allocator, cb: *const ComputeBackend) !void {
+    const ids = [_]i64{ 51, 11, 12, 51, 21, 0 };
+    const words = [_]i64{ 0, 1, 2, 0, 1, 0 };
+    const hidden = [_]f32{ 1, 0, 1, 2, 3, 4, 2, 0, 5, 6, 99, 99 };
+    const spans = [_]i64{ 0, 0, 1, 1, 0, 0, 1, 1 };
+    const result = try forwardWithLabelMarkers(cb, a, &hidden, &ids, &words, &spans, 2, 3, 2, .{ .entity = 51 });
+    defer a.free(result.logits);
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, 4.5, 15, 0 }, result.logits);
+}
+
+test "GLiNER complete batched head releases host allocations on failure and retries" {
+    const a = std.testing.allocator;
+    var store = try ContextualHeadFixture.init(a);
+    defer store.deinitOwned();
+    var compute = ContextualHeadFixture.native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    // Fail every architecture-owned allocation, including the second word
+    // gather and span-index allocations. The backend uses its own allocator,
+    // so an error must unwind CT ownership as well as these host buffers.
+    try std.testing.checkAllAllocationFailures(a, exerciseHeadAllocationFailures, .{&cb});
+    try exerciseHeadAllocationFailures(a, &cb);
 }
 
 test "getSpanInfo derives width from span_idx layout" {

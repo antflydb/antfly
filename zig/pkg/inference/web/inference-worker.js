@@ -67,14 +67,41 @@ function gpuAsync(msg, transfer) {
   self.postMessage({ type: 'gpu', ...msg }, transfer || []);
 }
 
+function gpuTransferChunkSize(byteLength) {
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength % 4 !== 0) {
+    throw new RangeError('GPU transfer length must be a nonnegative multiple of four bytes');
+  }
+  // copyBufferToBuffer and queue.writeBuffer both require four-byte alignment.
+  const capacity = Math.floor((sab.byteLength - DATA_OFFSET) / 4) * 4;
+  if (byteLength !== 0 && capacity < 4) {
+    throw new RangeError('GPU transfer shared buffer has no aligned data capacity');
+  }
+  return capacity;
+}
+
 function gpuWriteBufferAtOffsetSync(id, offsetBytes, srcBytes) {
-  const maxChunk = sab.byteLength - DATA_OFFSET;
+  const maxChunk = gpuTransferChunkSize(srcBytes.length);
+  if (!Number.isSafeInteger(offsetBytes) || offsetBytes < 0 || offsetBytes % 4 !== 0) {
+    throw new RangeError('GPU upload offset must be a nonnegative multiple of four bytes');
+  }
   let offset = 0;
   while (offset < srcBytes.length) {
     const take = Math.min(maxChunk, srcBytes.length - offset);
     const dst = new Uint8Array(sab, DATA_OFFSET, take);
     dst.set(srcBytes.subarray(offset, offset + take));
     gpuSync({ cmd: 'write_buffer_at_offset', id, offsetBytes: offsetBytes + offset, sizeBytes: take });
+    offset += take;
+  }
+}
+
+function gpuReadBufferSync(id, dstBytes) {
+  const maxChunk = gpuTransferChunkSize(dstBytes.length);
+  let offset = 0;
+  while (offset < dstBytes.length) {
+    const take = Math.min(maxChunk, dstBytes.length - offset);
+    const result = gpuSync({ cmd: 'download', id, offsetBytes: offset, size: take });
+    if (result !== 0) throw new Error(`GPU download failed at byte offset ${offset}`);
+    dstBytes.set(new Uint8Array(sab, DATA_OFFSET, take), offset);
     offset += take;
   }
 }
@@ -133,14 +160,11 @@ function getGpuImports(memoryFn) {
     },
 
     gpu_download: (id, ptr, size) => {
-      // Block until main thread completes async download into SAB data region
-      gpuSync({ cmd: 'download', id, size });
-      // Copy from SAB data region to WASM memory
       const ptrIndex = toJsIndex(ptr, 'WASM pointer');
       const byteSize = toJsIndex(size, 'GPU download size');
-      const src = new Uint8Array(sab, DATA_OFFSET, byteSize);
       const dst = new Uint8Array(memoryFn().buffer, ptrIndex, byteSize);
-      dst.set(src);
+      // Each chunk completes before the shared data region is reused.
+      gpuReadBufferSync(id, dst);
     },
 
     gpu_copy_buffer_to_buffer: (src, srcOffsetBytes, dst, dstOffsetBytes, sizeBytes) => {

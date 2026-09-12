@@ -463,6 +463,18 @@ fn sessionEnablesDebertaRerankerWeightMirrors(
     return model_type == .reranker and arch_type == .deberta and task == .classifier;
 }
 
+fn sessionEnablesImmutableF32WeightBorrow(
+    backend_type: BackendType,
+    arch_type: ArchType,
+    task: SessionTask,
+) bool {
+    // These model-scoped lazy weights are read-only for the session lifetime.
+    // Finetuning's explicit generic sessions and caller-created WeightStores
+    // retain the copying contract; they must never inherit this capability
+    // merely because a parameter name resembles an inference weight.
+    return backend_type == .metal and arch_type == .gliner and task == .recognizer;
+}
+
 /// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
 /// reserve for native DeBERTa and GLiNER sessions. An absent reranker
 /// architecture hint is treated conservatively because GGUF metadata can still
@@ -2166,6 +2178,11 @@ fn createGpuHostedSessionWithTaskOverride(
             .allow_direct_quant = session_direct_quant_enabled,
             .quant_execution_mode = quant_mode,
             .prefer_f32_dense_tensors = prefer_f32_dense_tensors,
+            .allow_immutable_f32_weight_borrow = sessionEnablesImmutableF32WeightBorrow(
+                backend_type,
+                std.meta.activeTag(arch_config),
+                task,
+            ),
             .jina_lora_adapter = gpu_jina_lora_adapter,
         }),
     };
@@ -2240,20 +2257,19 @@ fn detectArchitectureWithGgufFile(
 
         if (try detectModelType(allocator, config_bytes)) |model_type| {
             defer allocator.free(model_type);
+            if (std.mem.eql(u8, model_type, "extractor")) {
+                // Original Fastino checkpoints keep wrapper metadata here and
+                // the actual DeBERTa geometry/activation in a local sidecar.
+                var cfg = try loadLegacyGlinerEncoderConfig(allocator, model_path);
+                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
+                return .{ .gliner = cfg };
+            }
             if (mf.gliner_model_type.len > 0) {
                 // Split GLiNER bundles keep the DeBERTa encoder config in
                 // config.json and use antfly_inference_bundle/gliner_config sidecars
                 // to identify the GLiNER wrapper.
                 var cfg = try deberta_mod.parseConfig(allocator, config_bytes);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
-                return .{ .gliner = cfg };
-            }
-            if (std.mem.eql(u8, model_type, "extractor")) {
-                // GLiNER2: DeBERTa encoder + span classification head
-                var cfg = deberta_mod.Config{};
-
-                try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
-
                 return .{ .gliner = cfg };
             }
             if (modern_bert_arch.isModernBertModel(model_type)) {
@@ -2314,6 +2330,34 @@ fn detectArchitectureWithGgufFile(
 
     // Default: BERT
     return .{ .bert = makeBertConfig(mf) };
+}
+
+const legacy_gliner_encoder_config_max_bytes: usize = 1024 * 1024;
+
+fn loadLegacyGlinerEncoderConfig(allocator: std.mem.Allocator, model_path: []const u8) !deberta_mod.Config {
+    const io = compat.io();
+    const managed_receipt = @import("../registry/managed_receipt.zig");
+    var receipt = try managed_receipt.loadValidated(allocator, io, model_path);
+    defer if (receipt) |*validated| validated.deinit();
+    // Match manifest/ModelManager sidecar resolution: a managed receipt is
+    // authoritative, and unmanaged local aliases must stay inside the model
+    // root. Never resolve the wrapper's encoder-name/remote locator.
+    const config_path: ?[]u8 = if (receipt) |*validated|
+        if (validated.find("encoder_config/config.json")) |artifact|
+            try allocator.dupe(u8, artifact.canonical_path)
+        else
+            null
+    else
+        managed_receipt.resolveContainedArtifactPath(allocator, io, model_path, "encoder_config/config.json") catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    defer if (config_path) |path| allocator.free(path);
+    const path = config_path orelse return .{};
+    const snapshot = @import("../runtime/file_snapshot.zig");
+    const bytes = try snapshot.read(allocator, io, compat.cwd(), path, legacy_gliner_encoder_config_max_bytes, null);
+    defer allocator.free(bytes);
+    return deberta_mod.parseConfig(allocator, bytes);
 }
 
 fn detectArchitectureFromOptionalGgufFile(
@@ -5048,6 +5092,7 @@ const GpuHostedBackendInit = struct {
     allow_direct_quant: bool,
     quant_execution_mode: GpuHostedQuantExecutionMode,
     prefer_f32_dense_tensors: bool,
+    allow_immutable_f32_weight_borrow: bool = false,
     jina_lora_adapter: ?*gpu_hosted_store_mod.JinaLoraAdapter = null,
 };
 
@@ -5072,6 +5117,7 @@ fn makeGpuHostedBackendData(
         .allow_direct_quant = init.allow_direct_quant,
         .quant_execution_mode = init.quant_execution_mode,
         .prefer_f32_dense_tensors = init.prefer_f32_dense_tensors,
+        .allow_immutable_f32_weight_borrow = init.allow_immutable_f32_weight_borrow,
         .mirror_kv_to_manager = false,
         .jina_lora_adapter = init.jina_lora_adapter,
     };
@@ -5542,6 +5588,40 @@ test "sessionTaskForModelType maps classifier and recognizer tasks" {
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
+test "legacy GLiNER immutable F32 borrow policy excludes generic training and other sessions" {
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, null)));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .recognizer)));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .generic)));
+    inline for (std.meta.tags(BackendType)) |backend_type| {
+        inline for (std.meta.tags(ArchType)) |arch_type| {
+            inline for (std.meta.tags(SessionTask)) |task| {
+                const expected = backend_type == .metal and arch_type == .gliner and task == .recognizer;
+                try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, arch_type, task));
+            }
+        }
+    }
+    if (comptime build_options.enable_metal) {
+        for ([_]bool{ false, true }) |enabled| {
+            const backend = makeGpuHostedBackendData(.metal, .{
+                .allocator = std.testing.allocator,
+                .resident_weight_estimate_bytes = 0,
+                .prefix = "",
+                .lazy_weights = .empty,
+                .tensor_store = null,
+                .moe_num_experts = 0,
+                .a4b_inference = null,
+                .residency = null,
+                .tier_cache = null,
+                .allow_direct_quant = true,
+                .quant_execution_mode = .prefer_backend_dense,
+                .prefer_f32_dense_tensors = false,
+                .allow_immutable_f32_weight_borrow = enabled,
+            });
+            try std.testing.expectEqual(enabled, backend.metal.allow_immutable_f32_weight_borrow);
+        }
+    }
+}
+
 test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors" {
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(false, 1, 512));
     try std.testing.expect(!debertaRerankerPrefersWeightMirrors(true, 1, 127));
@@ -5613,6 +5693,127 @@ test "detectArchitecture recognizes generic deberta classifier configs" {
         .deberta => |cfg| try std.testing.expectEqual(@as(u32, 3), cfg.num_labels),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "legacy GLiNER architecture reads local encoder sidecar and preserves label overrides" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\",\"encoder_name\":\"ignored/remote-model\"}" });
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "encoder_config/config.json",
+        .data = "{\"model_type\":\"deberta-v2\",\"hidden_size\":64,\"num_hidden_layers\":2,\"num_attention_heads\":4,\"intermediate_size\":128,\"vocab_size\":99,\"max_position_embeddings\":32,\"position_buckets\":16,\"layer_norm_eps\":0.000001,\"hidden_act\":\"gelu\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "{\"[C]\":88,\"[E]\":89,\"[R]\":90}" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer, .gliner_token_e = 87 };
+    const arch = try detectArchitecture(allocator, model_dir, mf);
+    try std.testing.expect(arch == .gliner);
+    const cfg = arch.gliner;
+    try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size);
+    try std.testing.expectEqual(@as(u32, 2), cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 4), cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 128), cfg.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 99), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 32), cfg.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 16), cfg.position_buckets);
+    try std.testing.expectEqual(@as(f32, 0.000001), cfg.layer_norm_eps);
+    try std.testing.expect(cfg.use_exact_gelu);
+    try std.testing.expectEqual(@as(i64, 88), cfg.classification_token_id);
+    try std.testing.expectEqual(@as(i64, 89), cfg.entity_token_id);
+    try std.testing.expectEqual(@as(i64, 90), cfg.relation_token_id);
+    var wrapped_manifest = mf;
+    wrapped_manifest.gliner_model_type = "gliner2";
+    try std.testing.expectEqual(cfg, (try detectArchitecture(allocator, model_dir, wrapped_manifest)).gliner);
+}
+
+test "legacy GLiNER absent encoder sidecar keeps defaults while malformed present config rejects" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
+    try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{" });
+    try std.testing.expectError(error.UnexpectedEndOfInput, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "[]" });
+    try std.testing.expectError(error.InvalidDebertaConfig, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_act\":\"relu\"}" });
+    try std.testing.expectError(error.UnsupportedDebertaActivation, detectArchitecture(allocator, model_dir, mf));
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_act\":\"gelu_new\"}" });
+    try std.testing.expect(!(try detectArchitecture(allocator, model_dir, mf)).gliner.use_exact_gelu);
+}
+
+test "legacy GLiNER encoder sidecar bounds regular input and recovers after allocation failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "encoder_config", .default_dir);
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    {
+        const oversized = try tmp.dir.createFile(io, "encoder_config/config.json", .{});
+        defer oversized.close(io);
+        try oversized.setLength(io, legacy_gliner_encoder_config_max_bytes + 1);
+    }
+    try std.testing.expectError(error.SnapshotLimitExceeded, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteFile(io, "encoder_config/config.json");
+    try tmp.dir.createDir(io, "encoder_config/config.json", .default_dir);
+    try std.testing.expectError(error.InvalidModelArtifactKind, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteDir(io, "encoder_config/config.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "encoder_config/config.json", .data = "{\"hidden_size\":64,\"hidden_act\":\"gelu\"}" });
+    const Check = struct {
+        fn run(a: std.mem.Allocator, path: []const u8) !void {
+            const cfg = try loadLegacyGlinerEncoderConfig(a, path);
+            try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size);
+            try std.testing.expect(cfg.use_exact_gelu);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try Check.run(allocator, model_dir);
+}
+
+test "legacy GLiNER encoder sidecar obeys managed inventory and root containment" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const managed_receipt = @import("../registry/managed_receipt.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "model/encoder_config");
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.json", .data = "{\"hidden_act\":\"gelu\"}" });
+    try tmp.dir.symLink(io, "../../outside.json", "model/encoder_config/config.json", .{});
+    const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model", .{tmp.sub_path});
+    defer allocator.free(model_dir);
+    try std.testing.expectError(error.ModelArtifactOutsideRoot, loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.deleteFile(io, "model/encoder_config/config.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/encoder.json", .data = "{\"hidden_act\":\"gelu\"}" });
+    try tmp.dir.symLink(io, "../encoder.json", "model/encoder_config/config.json", .{});
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
+
+    // A complete managed publication may omit optional encoder metadata. An
+    // unrelated local sidecar must not silently override that admitted set.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.safetensors", .data = "payload" });
+    const receipt_path = "model/" ++ managed_receipt.complete_filename;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = receipt_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7}]}",
+    });
+    try std.testing.expectEqual(deberta_mod.Config{}, try loadLegacyGlinerEncoderConfig(allocator, model_dir));
+    try tmp.dir.writeFile(io, .{
+        .sub_path = receipt_path,
+        .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.safetensors\",\"size\":7},{\"path\":\"encoder_config/config.json\",\"size\":21}]}",
+    });
+    try std.testing.expect((try loadLegacyGlinerEncoderConfig(allocator, model_dir)).use_exact_gelu);
 }
 
 test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {

@@ -143,6 +143,9 @@ test {
     _ = graph;
     _ = architectures;
     _ = architectures.deberta_graph;
+    _ = @import("architectures/gliner_head.zig");
+    _ = @import("architectures/gliner_head_graph.zig");
+    _ = @import("ops/wasm_compute.zig");
     _ = architectures.gliner_boundary_ops;
     _ = architectures.gliner_boundary_engine;
     _ = @import("architectures/gliner_boundary_parity_test.zig");
