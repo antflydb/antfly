@@ -19,7 +19,8 @@ const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const platform = @import("antfly_platform");
 
-/// Carry the deadline and its clock together across every executor boundary.
+/// Deadline and clock are one contract across manual and borrowed-Io workers.
+/// Never forward the absolute timestamp while discarding its clock domain.
 pub const VisibilityWait = struct {
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,

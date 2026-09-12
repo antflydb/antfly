@@ -848,11 +848,12 @@ test "derived enrichment visibility guard observes cancellation and deadline" {
         error.EnrichmentWaitTimeout,
         (runtime_types.VisibilityWait{ .deadline_ns = platform_time.monotonicNs() }).check(),
     );
-    var clock = @import("antfly_platform").clock.ManualClock{ .now_realtime_ns = 100 };
-    const shifted = runtime_types.VisibilityWait{ .clock = clock.clock(), .deadline_ns = 200 };
-    try shifted.check();
-    clock.advanceNs(100);
-    try std.testing.expectError(error.EnrichmentWaitTimeout, shifted.check());
+    var clock = @import("antfly_platform").clock.ManualClock{};
+    clock.setRealtimeNs(100);
+    const wait = runtime_types.VisibilityWait{ .clock = clock.clock(), .deadline_ns = 200 };
+    try wait.check();
+    clock.setRealtimeNs(200);
+    try std.testing.expectError(error.EnrichmentWaitTimeout, wait.check());
 }
 
 fn workerStep(worker: *Worker) ?u64 {

@@ -138,9 +138,11 @@ zig-checksums-check:
 	python3 scripts/ci/check_zig_checksum_usage.py
 
 zig-generated-check: graph-identifier-check
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
 	$(ZIG_MAKE) generated-check
 
 zig-openapi-check:
+	$(SCRIPTS_PY) -m unittest scripts/test_openapi_build_paths.py
 	$(ZIG_MAKE) openapi-check
 
 zig-snowball-check:

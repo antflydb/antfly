@@ -24,6 +24,11 @@ pub const ResolveRequest = struct {
     namespace: []const u8,
     table_name: []const u8,
     binding: catalog_binding.Binding,
+    /// Borrowed, request-local publication authority. Discovery must not keep
+    /// a shared mutable artifact-store pointer or upload before fencing.
+    artifacts: *@import("../artifacts/store.zig").ArtifactStore,
+    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
 };
 
 pub const Resolver = struct {
@@ -35,14 +40,14 @@ pub const Resolver = struct {
             ptr: *anyopaque,
             alloc: Allocator,
             request: ResolveRequest,
-        ) anyerror!?external_source_manifest.Plan,
+        ) anyerror!external_source_manifest.Plan,
     };
 
     pub fn resolveAlloc(
         self: Resolver,
         alloc: Allocator,
         request: ResolveRequest,
-    ) !?external_source_manifest.Plan {
+    ) !external_source_manifest.Plan {
         return try self.vtable.resolve(self.ptr, alloc, request);
     }
 };

@@ -12,22 +12,59 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build-cache outputs follow the invoking directory, not the repository root."""
+"""Build outputs and depfiles share the build runner's working directory."""
 
 from contextlib import nullcontext
-from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-import join_openapi
-import join_public_openapi
+# The generators are standalone scripts with sibling imports. Support both
+# unittest's repository-root module invocation and discovery in scripts/.
+with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]):
+    import join_openapi
+    import join_public_openapi
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
+    def test_relative_build_outputs_and_comparison(self):
+        scripts = Path(__file__).resolve().parent
+        for script, mode in (
+            ("join_openapi.py", ["--joined-only"]),
+            ("join_public_openapi.py", []),
+        ):
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as tmp:
+                cwd = Path(tmp)
+                (cwd / "cache").mkdir()
+                output = "cache/openapi.yaml"
+                depfile = "cache/openapi.d"
+
+                def run(args):
+                    result = subprocess.run(
+                        [sys.executable, str(scripts / script), *args],
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+
+                run([*mode, "--depfile", depfile, output])
+                self.assertIn("openapi:", (cwd / output).read_text())
+                self.assertIn("/specs/openapi/", (cwd / depfile).read_text())
+                if not mode:
+                    run(["--compare", "--depfile", depfile, output])
+
     def test_build_outputs_resolve_from_cwd(self):
         for module, prefix in (
             (join_openapi, ["--joined-only"]),
             (join_public_openapi, []),
+            (join_public_openapi, ["--compare"]),
         ):
             for output in (".zig-cache/tmp/spec.yaml", "/tmp/absolute-spec.yaml"):
                 with self.subTest(module=module.__name__, output=output):

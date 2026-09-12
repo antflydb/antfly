@@ -1550,6 +1550,9 @@ pub const Backend = struct {
     };
 
     allocator: Allocator,
+    /// Opt-in gate shared by every graph-store view of this backend. Durable
+    /// roots already enforce a single open writer across processes/handles.
+    serialized_write_mutex: std.atomic.Mutex = .unlocked,
     mu: std.atomic.Mutex = .unlocked,
     // Serialize off-lock planner construction without holding the writer lock.
     domain_index_build_mu: std.Io.Mutex = .init,
@@ -13463,6 +13466,43 @@ test "lsm backend probe owns active mutable point values across later writes" {
     const after = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 0), after.point_value_borrows - before.point_value_borrows);
     try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
+}
+
+test "graph metric sorted batch presence avoids value retention and respects overlays" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(alloc, "/graph-presence-batch", .{ .flush_threshold = 1, .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "graph" });
+    defer runtime.deinit();
+    const payload = [_]u8{'x'} ** (64 * 1024);
+    {
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("a", &payload);
+        try write.put("b", &payload);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    var batch = try runtime.beginBatch();
+    defer batch.abort();
+    try std.testing.expect(batch.vtable.contains_many_sorted != null);
+    const before = backend.snapshotReadStats();
+    var present: [4]bool = undefined;
+    try batch.containsManySorted(&.{ "a", "a", "b", "missing" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &present);
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+    try batch.delete("a");
+    try batch.put("c", "overlay");
+    try batch.containsManySorted(&.{ "a", "b", "c", "missing" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, &present);
+    try std.testing.expectError(error.InvalidBatch, batch.containsManySorted(&.{ "b", "a" }, present[0..2]));
+    try std.testing.expectError(error.InvalidBatch, batch.containsManySorted(&.{"a"}, &present));
+    try batch.containsManySorted(&.{}, present[0..0]);
 }
 
 test "lsm backend stable probe batch borrows pinned run values without recopying" {

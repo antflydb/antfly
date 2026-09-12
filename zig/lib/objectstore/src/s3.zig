@@ -769,6 +769,9 @@ pub const Client = struct {
         defer headers.deinit(alloc);
         const owned_if_match = try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
         defer if (owned_if_match) |value| alloc.free(value);
+        if (opts.checksum_sha256_base64) |value| {
+            try headers.append(alloc, .{ "x-amz-checksum-sha256", value });
+        }
 
         var response = try self.performWithResponseLimitAndCancellation(
             .PUT,
@@ -822,7 +825,7 @@ pub const Client = struct {
         if (stat.size <= multipart_threshold) {
             const body = try alloc.alloc(u8, @intCast(stat.size));
             defer alloc.free(body);
-            if (try source.readPositionalAll(io, body, 0) != body.len) return error.SourceFileChanged;
+            try client_mod.readPositionalAllWithCancellation(source, io, body, opts.cancellation);
             var extra: [1]u8 = undefined;
             if (try source.readPositionalAll(io, &extra, stat.size) != 0) return error.SourceFileChanged;
             const current_stat = try source.stat(io);
@@ -2705,6 +2708,7 @@ test "s3 client signs and issues object operations through request fn" {
         checksum_value: ?[]const u8 = null,
         checksum_type: types.ObjectChecksumType = .unknown,
         expect_checksum_mode: bool = false,
+        expect_checksum_sha256: ?[]const u8 = null,
         expect_body: ?[]const u8 = null,
         expect_range: ?[]const u8 = null,
         expect_max_response_size: ?usize = null,
@@ -2735,6 +2739,9 @@ test "s3 client signs and issues object operations through request fn" {
             try expectHeader(headers, "x-amz-content-sha256");
             if (step.expect_checksum_mode) {
                 try expectHeaderValue(headers, "x-amz-checksum-mode", "ENABLED");
+            }
+            if (step.expect_checksum_sha256) |expected| {
+                try expectHeaderValue(headers, "x-amz-checksum-sha256", expected);
             }
             try std.testing.expectEqual(step.expect_max_response_size, max_response_size);
             if (step.expect_body) |expected| {
@@ -2779,7 +2786,7 @@ test "s3 client signs and issues object operations through request fn" {
     const steps = [_]Step{
         .{ .method = .HEAD, .url_contains = "/bucket", .status = 404 },
         .{ .method = .PUT, .url_contains = "/bucket", .status = 200 },
-        .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_body = "hello" },
+        .{ .method = .PUT, .url_contains = "/bucket/docs/a.txt", .status = 200, .etag = "\"etag-put\"", .expect_checksum_sha256 = "checksum-base64", .expect_body = "hello" },
         .{ .method = .HEAD, .url_contains = "versionId=v2", .status = 200, .etag = "\"etag-head\"", .content_type = "text/plain", .content_length = 5, .checksum_algorithm = .crc64nvme_base64, .checksum_value = "crc64-version", .checksum_type = .full_object, .expect_checksum_mode = true },
         .{ .method = .GET, .url_contains = "partNumber=7&versionId=v2", .status = 206, .body = "ell", .etag = "\"etag-get\"", .content_type = "text/plain", .content_length = 3, .version_id = "v2", .checksum_algorithm = .sha256_base64, .checksum_value = "sha256-get", .checksum_type = .composite, .expect_checksum_mode = true, .expect_range = "bytes=1-3" },
         .{ .method = .GET, .url_contains = "/bucket/docs/a.txt", .status = 206, .body = "hell", .etag = "\"etag-direct\"", .content_type = "text/plain", .content_length = 4, .expect_checksum_mode = true, .expect_max_response_size = 4 },
@@ -2808,7 +2815,10 @@ test "s3 client signs and issues object operations through request fn" {
     try std.testing.expect(!(try client.bucketExists("bucket")));
     try client.makeBucket("bucket");
 
-    var put = try client.putObject("bucket", "docs/a.txt", "hello", .{ .content_type = "text/plain" });
+    var put = try client.putObject("bucket", "docs/a.txt", "hello", .{
+        .content_type = "text/plain",
+        .checksum_sha256_base64 = "checksum-base64",
+    });
     defer put.deinit(alloc);
     try std.testing.expectEqualStrings("etag-put", put.etag.?);
 

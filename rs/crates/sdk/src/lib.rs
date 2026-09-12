@@ -724,6 +724,7 @@ impl Default for types::CreateGraphIndexRequest {
             edge_types: Vec::new(),
             enrichments: Vec::new(),
             max_edges_per_document: None,
+            metrics: Default::default(),
             resolvers: Vec::new(),
             source: None,
             sources: None,
@@ -772,6 +773,22 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graph_index_default_and_metric_configuration_round_trip() {
+        let default = super::types::CreateGraphIndexRequest::default();
+        let mut json = serde_json::to_value(default).unwrap();
+        assert!(
+            json.get("metrics").is_none_or(|value| value.is_null()
+                || value.as_object().is_some_and(|object| object.is_empty()))
+        );
+        json["metrics"] = serde_json::json!({"rank": {"kind": "pagerank"}});
+        let configured: super::types::CreateGraphIndexRequest =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(
+            serde_json::to_value(configured).unwrap()["metrics"]["rank"]["kind"],
+            "pagerank"
+        );
+    }
     use super::{
         ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec, ArtifactFullTextIndexOptions,
         FullTextArtifactSourceSpec, GraphArtifactFormat, GraphContextMappingSpec,
