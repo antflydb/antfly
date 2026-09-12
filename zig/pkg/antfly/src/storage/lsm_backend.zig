@@ -46,6 +46,10 @@ const fs_paths = @import("../common/fs_paths.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const native_artifact_sink = @import("native_artifact_sink.zig");
 
+comptime {
+    if (builtin.is_test) _ = @import("lsm_backend/physical_usage_test.zig");
+}
+
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
 const SplitStates = state_mod.SplitStates;
@@ -2305,6 +2309,78 @@ pub const Backend = struct {
     fn openStatsElapsedNs(self: *Backend, start_ns: u64) u64 {
         const end_ns = self.openStatsNowNs();
         return if (end_ns >= start_ns) end_ns - start_ns else 0;
+    }
+
+    /// Files tracked by one captured run/cleanup inventory, not filesystem
+    /// allocated blocks or a globally atomic disk snapshot. Active SSTs are
+    /// pinned; obsolete files may disappear while they are measured. Live
+    /// manifests, unpublished outputs and unrelated files are excluded.
+    pub const PhysicalUsage = struct {
+        active_sst_bytes: u64 = 0,
+        obsolete_file_bytes: u64 = 0,
+        wal_retained_bytes: u64 = 0,
+        missing_obsolete_files: u64 = 0,
+
+        pub fn totalBytes(self: PhysicalUsage) !u64 {
+            return std.math.add(u64, try std.math.add(u64, self.active_sst_bytes, self.obsolete_file_bytes), self.wal_retained_bytes);
+        }
+    };
+
+    /// Explicit filesystem measurement, not a hot-path statistics getter.
+    /// Capture immutable metadata roots under the backend lock without cloning
+    /// the mutable memtable. SST/obsolete stat calls run off-lock, and cleanup
+    /// continues independently. Only missing obsolete files count as zero;
+    /// missing active SSTs and all other I/O errors remain failures.
+    pub fn measurePhysicalUsage(self: *Backend) !PhysicalUsage {
+        const LedgerSnapshot = @import("lsm_backend/ledger_reclamation.zig").Snapshot;
+        const captured = blk: {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            defer runtime_mod.unlockBackend(Backend, self, locked);
+            const storage = self.storage orelse return .{};
+            var wal_bytes: u64 = 0;
+            if (self.options.wal_enabled and self.root_dir != null) {
+                wal_bytes = try std.math.add(u64, (try self.cachedWalRetentionLocked()).bytes, (try self.cachedWalReplayRetentionLocked()).bytes);
+            }
+            const obsolete = try LedgerSnapshot.capture(self, &self.obsolete_paths);
+            errdefer obsolete.retire(self);
+            const version = try self.createReadVersionFromDirectory();
+            _ = version.references.fetchAdd(1, .monotonic);
+            self.read_version_pins +|= 1;
+            self.retainReaderKind(.other);
+            break :blk .{ .storage = storage, .obsolete = obsolete, .version = version, .wal_bytes = wal_bytes };
+        };
+        defer {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            defer runtime_mod.unlockBackend(Backend, self, locked);
+            captured.obsolete.retire(self);
+            captured.version.release(self);
+            self.releaseReaderKind(.other);
+        }
+        var result = PhysicalUsage{ .wal_retained_bytes = captured.wal_bytes };
+        const directory = captured.version.directory.?;
+        var runs = directory.readCursor();
+        while (runs.next()) |handle| if (handle.run.path) |path| {
+            result.active_sst_bytes = try std.math.add(u64, result.active_sst_bytes, try captured.storage.fileSize(path));
+        };
+        var obsolete = captured.obsolete.value.iterator();
+        while (obsolete.next()) |entry| {
+            // A recovery ledger may still mention an active run. Account for
+            // it once, against the captured directory rather than live state.
+            if (parseRunIdFromTableFileName(std.fs.path.basename(entry.path))) |id| {
+                if (directory.byId(id)) |run| if (run.path) |path| {
+                    if (std.mem.eql(u8, path, entry.path)) continue;
+                };
+            }
+            const bytes = captured.storage.fileSize(entry.path) catch |err| switch (err) {
+                error.FileNotFound => {
+                    result.missing_obsolete_files += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            result.obsolete_file_bytes = try std.math.add(u64, result.obsolete_file_bytes, bytes);
+        }
+        return result;
     }
 
     pub fn snapshotMaintenanceStats(self: *const Backend) MaintenanceStats {

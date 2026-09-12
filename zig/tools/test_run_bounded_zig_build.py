@@ -20,6 +20,31 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_ci_unit_watchdog_leaves_runtime_after_cold_compilation(self):
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        job = re.search(
+            r"^  zig-base-tests:\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)",
+            workflow,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(job)
+        defaults = {}
+        for kind in ("IDLE", "HARD"):
+            match = re.search(rf"ANTFLY_UNIT_WATCHDOG_{kind}_SECS:-(\d+)", job.group(1))
+            self.assertIsNotNone(match)
+            defaults[kind] = int(match.group(1))
+        outer = re.search(r"^    timeout-minutes: (\d+)$", job.group(1), re.MULTILINE)
+        self.assertIsNotNone(outer)
+        # The observed cold-build critical path consumed 52 minutes before
+        # DB-core execution. Extend the total budget, not the idle threshold.
+        self.assertEqual(defaults["IDLE"], 30 * 60)
+        self.assertEqual(defaults["HARD"], 90 * 60)
+        self.assertEqual(int(outer.group(1)), 120)
+        self.assertLess(defaults["IDLE"], defaults["HARD"])
+        self.assertLess(defaults["HARD"], int(outer.group(1)) * 60)
+
     def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
         # Production runtime construction owns the reservation. The root build
         # only composes owners; testing it would couple this contract to file
