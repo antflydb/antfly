@@ -18,6 +18,25 @@ There is no legacy-compatibility requirement for the existing many-step
 `zig build <finetune-tool>` surface. The refactor should optimize for the
 long-term shape, not alias preservation.
 
+## Status
+
+The unified dispatcher described in "Target CLI" below is implemented:
+`src/finetune/cli/root.zig` holds a `<domain, action, subject>` command table
+(`command_registry.zig` plus the table in `root.zig`) that routes to the
+existing tool `main()` functions, `src/main.zig` wires the top-level
+`finetune` command to it (`inference.finetune_cli.main`), and legacy
+`zig build <tool-name>` names still work as compatibility wrappers over the
+same table.
+
+The typed `Options`/`Result`/`run()` programmatic contract, the shared
+`RunContext`/`ArtifactWriter` types, and the deeper source reorganization
+into `core/`, `data/`, `adapters/`, `trainers/`, `families/`, and
+`workflows/` directories described below are still a target design, not
+implemented: `src/finetune/` today has only `cli/`, `eval/`, `test/`,
+`tools/`, `train/`, and `assets/` as real subdirectories, and model-family
+code (`gemma4.zig`, `gliner2.zig`, etc.) remains flat rather than split by
+responsibility. See "Open work" at the end.
+
 ## Current Problem
 
 Fine-tuning currently mixes several concerns:
@@ -386,13 +405,14 @@ Use three tiers:
 Tests should call typed `run()` functions where possible. CLI tests should be
 limited to parser and dispatch behavior.
 
-## Migration Order
+## Open work
 
-Because there is no legacy support requirement, migrate toward the target
-surface directly:
+Because there is no legacy support requirement, the remaining migration can
+move toward the target surface directly:
 
-1. Add `src/finetune/core/run_context.zig`.
-2. Add `src/finetune/cli/root.zig` and wire `antfly inference finetune`.
+1. Add `src/finetune/core/run_context.zig` (the typed `RunContext`).
+2. ~~Add `src/finetune/cli/root.zig` and wire `antfly inference finetune`.~~ Done —
+   `src/finetune/cli/root.zig` is wired from `src/main.zig`.
 3. Convert the Gemma4 path first:
    - dataset generation
    - input preparation

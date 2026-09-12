@@ -1,10 +1,10 @@
 # LSM, HBC, and Full-Text Read Performance
 
-## Why Add Read Benchmarks
+## Why These Benchmarks Exist
 
 Write amplification work needs matching query-side guardrails. A lower-write path is not a win if it leaves more L0 runs, colder table indexes, larger HBC node walks, or more rerank vector loads on the first query after ingest.
 
-Read benchmarks should make these costs visible:
+The read benchmarks make these costs visible:
 
 - Point-read latency, miss latency, and run probes.
 - Short-scan and full-scan latency.
@@ -17,7 +17,7 @@ Read benchmarks should make these costs visible:
 
 ### LSM Backend Reads
 
-`zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 3 --keys 20000 --value-size 128 --hit-repeats 5 --miss-repeats 5 --short-scan-len 64 --short-scan-repeats 16 --full-scan-repeats 5 --reopen-repeats 5 --mixed-repeats 3 --storage host --cache both` already covers the core LSM read path.
+`zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 3 --keys 20000 --value-size 128 --hit-repeats 5 --miss-repeats 5 --short-scan-len 64 --short-scan-repeats 16 --full-scan-repeats 5 --reopen-repeats 5 --mixed-repeats 3 --storage host --cache both` covers the core LSM read path.
 
 Workloads:
 
@@ -79,7 +79,23 @@ zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples
 zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples 3 --vectors 100000 --dims 128 --queries 1000 --k 50 --batch-size 5000 --leaf-size 128 --storage host --build online_coalesced
 ```
 
-## Read-Side Questions To Answer
+## Baseline Capture
+
+Baseline files follow this naming convention:
+
+```sh
+bench/baselines/hbc-read-native-100k.jsonl
+bench/baselines/hbc-read-native-100k-noquant.jsonl
+bench/baselines/lsm-backend-read-host-100k.jsonl
+```
+
+The HBC baseline uses native storage because first-query and rerank vector loads need real storage counters. The LSM backend baseline uses host storage with `--cache both` so the same run records cache-off and cache-on behavior with deterministic in-memory persistence plus storage-call counters.
+
+Quantized HBC read capture completes at 100k vectors for both `bulk_build` and `online_coalesced`. The previous 20k+ `error.EndOfStream` failure was stale quantized-node bytes: a bulk-built internal node could be saved as root-style nonquantized while its parent was still `0`, then reparented under a higher-level root without rebuilding that node's payload as RaBit. `updateParent` now refreshes internal quantized payloads when a node crosses the root/non-root representation boundary. The no-quantized baseline remains a comparison point for exact vector scoring and storage read shape without quantized payload loads.
+
+## Open work
+
+### Questions To Answer
 
 - Does the lower-write coalesced HBC path preserve query latency versus bulk-built indexes?
 - Does leaving many L0 runs after bulk ingest measurably hurt point reads or scan reads before maintenance compaction?
@@ -87,7 +103,7 @@ zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples
 - Do metadata filters turn HBC search into a metadata random-read workload?
 - What cache capacity is needed for stable query latency after a 1M-vector load?
 
-## Near-Term Work
+### Near-Term Work
 
 - Capture `antfly-storage-bench` and `lsm-backend-bench` baselines under `bench/baselines/`.
 - Add HBC read counters for namespace-level read calls and bytes, mirroring the write counters for `nodes`, `meta`, `quant`, and `vecs`.
@@ -95,7 +111,7 @@ zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples
 - Add full-text query/segment read benchmarks beside the full-text write benchmark: term lookup, conjunction, top-k, cold reopen, post-merge, and corrupt-segment isolation.
 - Add compare tooling for HBC read JSONL once the first baselines are stable.
 
-## Read Improvement Task List
+### Read Improvement Task List
 
 - LSM read visibility:
   - Keep the existing point-get, run-probe, bloom-negative, table-index, table-block, and cache counters in benchmark output.
@@ -113,17 +129,3 @@ zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-read --samples
   - Add a full-text segment query benchmark for term lookup, conjunction, top-k, stored-doc fetch, cold reopen, post-merge, and corrupt-segment isolation.
   - Add per-segment caches for term dictionaries/FSTs, postings blocks, stored-doc chunks, typed-doc-values chunks, and deleted-doc bitsets.
   - Move toward immutable segment searcher snapshots so readers pin a generation and never force writer or merge shutdown.
-
-## Baseline Capture
-
-Initial read baseline files should mirror the write baseline naming:
-
-```sh
-bench/baselines/hbc-read-native-100k.jsonl
-bench/baselines/hbc-read-native-100k-noquant.jsonl
-bench/baselines/lsm-backend-read-host-100k.jsonl
-```
-
-The HBC baseline should use native storage because first-query and rerank vector loads need real storage counters. The LSM backend baseline should use host storage with `--cache both` so the same run records cache-off and cache-on behavior with deterministic in-memory persistence plus storage-call counters.
-
-Quantized HBC read capture now completes at 100k vectors for both `bulk_build` and `online_coalesced`. The previous 20k+ `error.EndOfStream` failure was stale quantized-node bytes: a bulk-built internal node could be saved as root-style nonquantized while its parent was still `0`, then reparented under a higher-level root without rebuilding that node's payload as RaBit. `updateParent` now refreshes internal quantized payloads when a node crosses the root/non-root representation boundary. Keep the no-quantized baseline as a comparison point for exact vector scoring and storage read shape without quantized payload loads.

@@ -1,7 +1,10 @@
 # Antfly Status Subsystem
 
-This document describes where the runtime status subsystem is today, what the
-production shape should be, and the changes needed to get there.
+This document describes the design of the runtime status subsystem: how it
+keeps status observation off the hot data path, how it represents freshness
+and topology, and how owners publish state as they do work. Most of the shape
+described here is implemented; genuinely open items are listed under
+[Open work](#open-work) at the end.
 
 ## Goals
 
@@ -68,11 +71,14 @@ The current code already has the beginning of a status plane:
   - It avoids opening an actively catching-up group and can reuse cached or
     managed-writer snapshots when opening the DB would be unsafe or expensive.
 
-## Current Problems
+## Design Rationale And Known Constraints
 
-The current shape is close, but the contract is still implicit and incomplete.
+The subsections below record the problems that shaped the current design.
+Most have since been addressed by the phases described later in this
+document; each notes where. The dated E2E observations and the
+request-path-repair rule remain live constraints.
 
-### Current E2E Failure Map
+### Dated E2E Observations
 
 Observed on 2026-05-01:
 
@@ -118,6 +124,10 @@ Distributed status needs to distinguish:
 - group is being opened or catching up
 - group is known failed
 
+This gap is addressed: index status responses report `expected_groups`,
+`fresh_groups`, `stale_groups`, `missing_groups`, and `unknown_remote_groups`
+explicitly (see API Semantics below).
+
 ### Freshness Is Not Explicit
 
 `LocalTableRuntimeStatus` carries `group_id` and `DBStats`, but not status-plane
@@ -135,6 +145,9 @@ metadata such as:
 Without this metadata, consumers cannot tell whether a status is current,
 stale, from a previous owner, or synthesized from index configuration.
 
+This gap is addressed: the runtime status record carries source, freshness,
+generation, and update-time metadata (see Data Model below).
+
 ### Publisher Coverage Is Incomplete
 
 Important runtime transitions can fail to publish promptly into
@@ -149,6 +162,10 @@ Important runtime transitions can fail to publish promptly into
 
 When those transitions are not published, the read-side status path correctly
 avoids the live DB, but it returns stale data.
+
+This gap is addressed: managed enrichment retry/progress, replay debt, and
+startup catch-up phase changes all publish into `runtime_status_cache` (see
+Publisher Coverage below).
 
 ### Request-Path Repair Is the Wrong Direction
 
@@ -175,9 +192,15 @@ do not gather remote shard statuses from the request path, which is good for
 latency, but the public API response does not yet expose that limitation
 cleanly.
 
-## Desired Production Shape
+This gap is largely addressed: owners publish compact runtime summaries into
+the metadata store heartbeat, and API nodes merge local cache with propagated
+remote records without request-time fanout (see Distributed Status
+Propagation below). Live split-process E2E proof of that path is still open
+(see [Open work](#open-work)).
 
-The long-term design is an observability plane.
+## Production Shape
+
+The status subsystem is an observability plane.
 
 Runtime components publish status as they do work. HTTP, metrics, readiness, and
 admin endpoints read cheap snapshots from that plane. Background workers perform
@@ -483,88 +506,55 @@ Expose status-plane health separately from table/index health:
 - remote status propagation lag, once remote propagation exists
 - replay debt counts and backlog from cached status only
 
-## Implementation Plan
+## Delivery Phases
 
-### Phase 1: Stabilize The Current Contract
+The subsections below describe how the current contract was built up. They
+are ordered as delivered; later phases depend on the metadata added by
+earlier ones.
 
-1. Keep HTTP status request handling cheap.
-   - Preserve the read-source-first behavior in `ApiHttpServer`.
-   - Do not merge in live write-source statuses from the request path.
-   - Remove request-path DB drains/catch-up from status code.
+### Stabilizing The Status Contract
 
-2. Add freshness metadata to runtime cache entries.
-   - Extend `LocalTableRuntimeStatus` or wrap it in a new status-plane record.
-   - Include `updated_at_ns`, source, generation, and freshness.
-   - Keep `DBStats` ownership/deinit rules clear.
+HTTP status handling stayed read-source-first throughout (`ApiHttpServer`
+does not merge in live write-source statuses or drain/catch-up a DB from the
+request path; see Current Shape above). The runtime cache record carries
+`updated_at_ns`, source, generation, and freshness metadata (see Data Model
+above). `DB.stats()` and `DB.diagnosticStats()` are split as described in the
+DB Stats Contract above, so operational status stays bounded while deep
+inspection lives behind the diagnostic API. Index status encoding is
+topology-aware: it reports expected groups explicitly and does not let
+missing or stale groups read as ready (see API Semantics above). Absence
+semantics are covered by unit tests in `table_writes.zig`.
 
-3. Split operational and diagnostic DB stats.
-   - Move the current expensive `DB.stats()` implementation to
-     `DB.diagnosticStats()`.
-   - Rebuild `DB.stats()` as a bounded operational snapshot.
-   - Make `DB.stats()` avoid primary scans, snapshot/range opens, rebuild-state
-     walks, cold index loads, replay drains, and bulk-session finishing.
-   - Add or wire maintained counters for any field needed by operational
-     status instead of falling back to a scan.
-   - Move debug/admin callers that need deep validation to
-     `DB.diagnosticStats()`.
+### Publisher Coverage
 
-4. Make the encoder topology-aware.
-   - Teach index status encoding about expected groups from metadata or a
-     precomputed table runtime topology snapshot.
-   - Represent missing expected groups explicitly.
-   - Ensure aggregate readiness does not ignore missing/stale groups.
+Local-owner publishers cover:
 
-5. Add tests for absence semantics.
-   - One fresh group plus one missing expected group must not encode as ready.
-   - Stale status should be visible and should block ready.
-   - Synthetic configured status should report configured indexes but not fake
-     completion.
-
-### Phase 2: Improve Publisher Coverage
-
-Current Phase 2 local-owner coverage:
-
-- Managed enrichment runtime status changes notify the DB visibility hook after
-  retry, failure, progress, and idle status writes.
+- Managed enrichment runtime status changes notify the DB visibility hook
+  after retry, failure, progress, and idle status writes.
 - Managed DB visibility/status hooks publish into `runtime_status_cache` from
-  the owner DB handle already in memory. They do not open DBs or drain work from
-  HTTP status reads.
-- Owner write paths publish best-effort status snapshots after local writes and
-  committed transaction resolution, so replay debt creation is observable in the
-  cache when the owner has a live DB handle.
+  the owner DB handle already in memory. They do not open DBs or drain work
+  from HTTP status reads.
+- Owner write paths publish best-effort status snapshots after local writes
+  and committed transaction resolution, so replay debt creation is observable
+  in the cache when the owner has a live DB handle.
 - Startup catch-up publishes opening, catch-up, artifact rebuild, and idle
-  phases with the runtime status metadata added in Phase 1.
-- Publish failures invalidate the table runtime snapshot rather than preserving
-  stale ready state.
+  phases with the runtime status metadata described above.
+- Publish failures invalidate the table runtime snapshot rather than
+  preserving stale ready state.
 
-1. Publish managed enrichment retry transitions.
-   - When enrichment records retryable errors, publish/update cached runtime
-     status with `backfill_state=retrying` inputs.
-   - Do not require status endpoint polling to open or drain the DB.
+Enrichment retry, replay debt, and startup catch-up transitions each have
+unit test coverage in `table_writes.zig` confirming they update the cache.
 
-2. Publish replay debt transitions.
-   - When replay debt is created or cleared, update the cache.
-   - The replay journal remains the durable source of work; cache is the
-     observable projection.
+### Background Refresh Discipline
 
-3. Publish startup catch-up progress.
-   - Continue using the active catch-up preservation path, but include explicit
-     phase/freshness/source metadata.
+Local refresh coverage:
 
-4. Add unit tests around publishing.
-   - Enrichment retry updates cache.
-   - Replay debt updates cache.
-   - Catch-up active group is preserved during refresh.
-
-### Phase 3: Background Refresh Discipline
-
-Current Phase 3 local refresh coverage:
-
-- `DataServer.runRuntimeStatusRefresh()` now runs through an explicit DB-open
+- `DataServer.runRuntimeStatusRefresh()` runs through an explicit DB-open
   budget. The default refresh worker uses a bounded per-run budget, and tests
   can exercise lower budgets directly.
 - Refresh publishes cached stale status or synthetic configured placeholders
-  when the DB-open budget is exhausted instead of stampeding every local group.
+  when the DB-open budget is exhausted instead of stampeding every local
+  group.
 - Refresh publishes explicit `missing` synthetic status for expected local
   groups whose DB path is absent, instead of silently dropping the group from
   the cache.
@@ -574,32 +564,20 @@ Current Phase 3 local refresh coverage:
   over a shard that is already doing the work that status should observe.
 - Refresh samples DB stats with a direct `DB.open(.status_only)` configured
   with index workers, TTL cleanup, transaction recovery, and text merge
-  disabled. It no longer routes through metadata-driven managed index
+  disabled. It does not route through metadata-driven managed index
   reconciliation for status sampling.
-- Health metrics expose the most recent refresh DB opens, skipped DB opens, and
-  placeholder group count alongside table/group/duration counters.
+- Health metrics expose the most recent refresh DB opens, skipped DB opens,
+  and placeholder group count alongside table/group/duration counters.
 
-1. Budget DB opens in `runRuntimeStatusRefresh()`.
-   - Keep DB opens out of HTTP handlers.
-   - Bound refresh work per interval so large clusters do not stampede local
-     disks.
+Refresh, repair, and observation stay separate: refresh samples and
+publishes; startup/replay/enrichment maintenance repairs; HTTP reads observe.
 
-2. Make refresh topology-aware.
-   - Emit placeholder status for expected groups that are non-local or missing.
-   - Preserve valid cached state when local group ownership is ambiguous.
+### Distributed Status Propagation
 
-3. Separate refresh from repair.
-   - Refresh samples and publishes.
-   - Startup/replay/enrichment maintenance repairs.
-   - HTTP reads observe.
+The distributed status plane uses the existing metadata store heartbeat path.
+Store records carry `runtime_statuses` separately from placement-oriented
+`group_statuses`, keyed by table/group/store/node identity.
 
-### Phase 4: Distributed Status Propagation
-
-Current Phase 4 implementation shape:
-
-- The distributed status plane uses the existing metadata store heartbeat path.
-  Store records now carry `runtime_statuses` separately from placement-oriented
-  `group_statuses`, keyed by table/group/store/node identity.
 - Data owners publish compact runtime summaries from their in-memory
   `runtime_status_cache`. Heartbeats do not open DBs or trigger repair work;
   they serialize already-published owner status.
@@ -607,105 +585,59 @@ Current Phase 4 implementation shape:
   topology/status generations, target-observation authority, compact
   table/enrichment state, and per-index counters needed by index status
   responses.
-- API nodes merge local read-cache status with propagated remote store records.
-  Local status wins for a group; remote records fill groups the API node cannot
-  observe locally. There is still no request-time fanout to data owners.
-- Raft metadata encoding appends the new runtime summary payload after existing
-  store group-status fields, so older persisted store records decode with empty
-  runtime status.
-- Focused in-process API tests cover the intended distributed status contract:
+- API nodes merge local read-cache status with propagated remote store
+  records. Local status wins for a group; remote records fill groups the API
+  node cannot observe locally. There is no request-time fanout to data
+  owners.
+- Raft metadata encoding appends the new runtime summary payload after
+  existing store group-status fields, so older persisted store records decode
+  with empty runtime status.
+- Focused in-process API tests cover the distributed status contract:
   propagated remote status is used by non-owner API paths, status from a
   removed owner is ignored once placement changes, and missing remote shard
   status remains not-ready instead of being treated as success.
-- Live split-process E2E does not currently satisfy that contract. The current
-  failure is an API-only process serving synthetic configured status even after
-  the data owner has published runtime status into the metadata heartbeat.
-  Treat the live heartbeat/metadata-snapshot/API merge path as active work, not
-  as production-complete.
 
-1. Add a cluster-visible status plane.
-   Options:
-   - metadata store records keyed by `(table_id, group_id, store_id)`
-   - store heartbeat payloads containing compact runtime status summaries
-   - lightweight gossip between data servers
+Live, split-process E2E proof of this contract is not yet passing (see
+[Open work](#open-work)): an API-only process has been observed serving
+synthetic configured status even after the data owner published runtime
+status into the metadata heartbeat.
 
-2. Owner nodes publish their shard statuses.
-   - Include topology generation and owner identity.
-   - Expire old-owner statuses by generation/lease.
+## Open work
 
-3. API nodes aggregate local cache plus propagated remote records.
-   - No request-time fanout.
-   - Missing remote records remain explicit.
-
-4. Add distributed tests.
-   - Non-owner API node can report remote shard status from propagated cache.
-   - Removed owner status is ignored after topology generation changes.
-   - Missing remote shard status is reported as unknown, not ready.
-
-## Remaining Production Work
-
-The current implementation has the right shape for the status subsystem:
-request handlers read cheap snapshots, owners publish runtime state as they do
-work, and API nodes consume propagated owner status without request-time fanout.
-The remaining work is production hardening around scale, observability, and
-failure handling.
-
+- Fix the live split-process heartbeat merge path so an API-only node
+  consumes propagated owner runtime status before falling back to synthetic
+  configured status (see Distributed Status Propagation above).
+- Confirm schema migration and versioned full-text rebuild progress publish
+  enough runtime status for the public index detail path to distinguish
+  missing work from unpublished completion.
 - Add live split-process e2e coverage for the real metadata heartbeat path.
-  Existing Zig multi-node tests cover routing and API aggregation behavior, but
-  they do not prove that a separate API-only process can answer index status
-  from a data owner's propagated heartbeat.
-
+  Existing Zig multi-node tests cover routing and API aggregation behavior,
+  but they do not prove that a separate API-only process can answer index
+  status from a data owner's propagated heartbeat.
 - Tune heartbeat payload size if many indexes per table or many groups per
-  store. The current payload is compact enough for normal tables, but very large
-  index counts can make store heartbeats too large or too frequent. The
+  store. The current payload is compact enough for normal tables, but very
+  large index counts can make store heartbeats too large or too frequent. The
   scalable shape is to keep the regular heartbeat summary bounded, then add
   pagination, deltas, or a detail endpoint for rare high-cardinality status
   inspection.
-
-- Add status-plane health metrics for remote propagation. Track heartbeat
+- Add status-plane health metrics for remote propagation: heartbeat
   runtime-status bytes, runtime-status group/index counts, dropped summaries,
-  encode/decode failures, propagation age, and max stale age per store. These
-  metrics should describe status subsystem health without opening table DBs.
-
+  encode/decode failures, propagation age, and max stale age per store.
 - Decide an explicit expiry policy for propagated runtime status. API nodes
-  already ignore status from stores that do not own the current placement, but
-  production should also age out stale owner records by store lease, topology
-  generation, or heartbeat timestamp so old metadata snapshots cannot report a
-  dead shard as healthy.
-
+  already ignore status from stores that do not own the current placement,
+  but production should also age out stale owner records by store lease,
+  topology generation, or heartbeat timestamp so old metadata snapshots
+  cannot report a dead shard as healthy.
 - Split summary from detail if heartbeat size grows. Index list/get readiness
-  only needs per-index counters and freshness. More verbose diagnostic state
+  only needs per-index counters and freshness; more verbose diagnostic state
   should live behind an admin/debug path or be fetched on demand from the
   status plane, not attached to every store heartbeat indefinitely.
-
-- Add integration coverage for degraded cases once cluster process orchestration
-  is stable: owner process stopped, stale heartbeat, table placement moved, and
-  API-only node with no local shard. These should assert explicit missing or
-  stale status, not readiness.
-
-## Near-Term Recommendation For The Current Bug
-
-The managed embedding, schema migration, and distributed-status E2E failures are
-all status-plane gaps until a focused diagnostic proves otherwise. They are not
-a reason to make status calls drive the DB.
-
-The correct fix is:
-
-1. Keep `ApiHttpServer.localTableRuntimeStatuses()` read-source-first.
-2. Ensure the live managed writer/enrichment runtime publishes retry/progress
-   status into `runtime_status_cache` when retry state changes.
-3. Ensure schema migration and versioned full-text rebuild progress publish
-   enough runtime status for the public index detail path to distinguish
-   missing work from unpublished completion.
-4. Fix the live split-process heartbeat merge path so API-only nodes consume
-   propagated owner runtime status before falling back to synthetic configured
-   status.
-5. Ensure background refresh preserves live-published status while the
-   writer is active or retrying.
-6. Make missing/stale runtime data explicit in the status response.
-
-That preserves production performance while making status accurate enough for
-e2e tests and operators.
+- Add integration coverage for degraded cases once cluster process
+  orchestration is stable: owner process stopped, stale heartbeat, table
+  placement moved, and API-only node with no local shard. These should assert
+  explicit missing or stale status, not readiness.
+- Diagnose the dated E2E gaps recorded under Dated E2E Observations above
+  (observed 2026-05-01, not yet confirmed resolved).
 
 ## Non-Goals
 

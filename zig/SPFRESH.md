@@ -1,92 +1,107 @@
-# SPFresh-Style HBC Refactor Plan
+# SPFresh-Style HBC Indexing
 
-## Goal
+## Decision
 
-Evaluate whether Antfly should move toward an SPFresh-style mutable AKNN
-index without prematurely replacing the current HBC implementation.
+Antfly evaluated whether to move toward an SPFresh-style mutable AKNN index
+instead of the current HBC implementation.
 
-The current conclusion is:
+The decision: do not build a separate SPFresh index. Instead, refactor HBC so
+its implicit pieces become explicit:
 
-- Do not build a separate SPFresh index yet.
-- Refactor the current HBC so its implicit pieces become explicit:
-  - a centroid/routing directory
-  - a posting store
-  - a vector-to-posting assignment map
-- Keep the existing HBC as the first centroid directory implementation.
-- Use the refactor to test SPFresh-style maintenance policies: lazy centroid
-  refresh, local split/merge, and targeted boundary reassignment after
-  split/merge if we later choose to enforce a nearest-partition invariant.
+- a centroid/routing directory
+- a posting store
+- a vector-to-posting assignment map
 
-The important distinction is not RaBitQ versus some other quantizer. The
-important distinction is whether routing and posting maintenance are cleanly
-separated enough that posting updates can stay local.
+HBC is the first `CentroidDirectory` implementation. The refactor is also the
+vehicle for SPFresh-style maintenance policies — lazy centroid refresh, local
+split/merge, and targeted boundary reassignment after split/merge if a
+nearest-partition invariant is later enforced.
 
-## Implementation Status
+The distinction that matters is not RaBitQ versus some other quantizer. It is
+whether routing and posting maintenance are cleanly separated enough that
+posting updates can stay local.
 
-Current status:
+Reasoning behind the decision:
 
-- Phase 1 is implemented.
-- `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/posting.zig` defines the initial `PostingId`,
-  `PostingView`, `PostingStore`, `AssignmentMap`, and `CentroidDirectory`
-  names.
-- Existing vector-to-leaf assignment storage now flows through
-  `AssignmentMap`, while preserving the current key format.
-- Existing leaf/member scoring setup now flows through `PostingStore`.
-- Existing online leaf member append/remove paths now flow through
-  `PostingStore` helpers.
-- Existing leaf centroid recompute paths now flow through
-  `PostingStore.recomputeCentroid`.
-- Existing leaf RaBitQ refresh vector materialization now flows through
-  `PostingStore.loadTransformedVectorsForQuantizedRefresh`.
-- Existing leaf RaBitQ payload cache/write mechanics now flow through
-  `PostingStore.refreshQuantizedPayload`; internal-node quantized payloads
-  remain owned by HBC.
-- Leaf postings now carry persisted maintenance state: mutation version,
-  centroid refresh version, payload refresh version, and dirty flags. The state
-  is stored as a backward-compatible node side record.
-- A bounded posting maintenance pass now exists. It scans leaf postings,
-  repairs dirty centroids/payloads, persists clean posting state, refreshes HBC
-  ancestor centroids when needed, and reports repair counters.
-- A disabled-by-default `lazy_posting_maintenance` mode now lets foreground
-  leaf writes persist dirty posting state while deferring leaf centroid,
-  payload, and ancestor refresh work to posting maintenance.
-- Dirty posting backlog visibility now exists via `PostingBacklogStats` and a
-  `std.Io.Writer` debug renderer, so we can inspect how much deferred work is
-  accumulating.
-- A disabled-by-default bounded automatic repair hook now runs before write
-  commit when `auto_posting_maintenance_max_postings` is non-zero. This lets us
-  amortize lazy posting repair without introducing a background thread.
-- Dense-index config parsing and DB/API runtime status now expose the lazy
-  posting knobs and posting backlog/maintenance counters.
-- Existing insert routing now flows through `CentroidDirectory.findPosting`,
-  which still delegates to current HBC leaf routing.
-- Bounded local posting layout maintenance now exists: oversized postings can
-  split, underfull postings can merge with nearby siblings, and sibling
-  boundary reassignment can move vectors that are a better local fit elsewhere.
-- DB idle maintenance now drains dirty dense posting work outside the foreground
-  write hook.
-- An opt-in lazy-versus-eager posting maintenance benchmark exists. Current
-  local samples show lazy centroid deferral is working, but centroid deferral
-  alone is not the dominant write-latency cost in those runs.
-- A first immutable posting segment container now stores opaque packed posting,
-  quantized-checkpoint, centroid-directory, mutation, and tombstone values in a
-  posting-local sorted index. The v2 format checks the footer and index at
-  admission, validates strict key ordering and value bounds, and lazily checks
-  each payload on access so opening a large segment is not O(file size).
-  A concurrent-safe verified reader memoizes both successful and failed
-  per-entry verification, avoiding a full payload CRC on every query.
-- A framed posting WAL codec now makes whole batches query-visible with an
-  explicit commit record. Its CRC covers routing metadata and payload, replay
-  ignores incomplete or uncommitted tails, and a checksummed checkpoint records
-  the exact segment generation and committed WAL prefix. Runtime wiring remains
-  experimental; keeping payloads opaque lets the current packed HBC read path
-  coexist with a small WAL tail instead of forcing base/delta replay on every
-  query.
-- The HBC read benchmark now treats query behavior as an ingest acceptance
-  gate. It reports QPS, p50/p95/p99/max latency, sampled exact recall@k, and
-  storage reads both immediately after ingest and after close/reopen. Its
-  `public_ingest` build arm uses the same external-vector/coalesced/bulk-session
-  options as derived replay so storage experiments share one matched workload.
+1. **Refactor before replacing.** Building seams inside the current HBC
+   avoided duplicating tree/search/quantization behavior before there was
+   measured evidence that a new index was needed.
+2. **HBC stays the first `CentroidDirectory`.** This preserves current
+   behavior while decoupling the API. Later centroid directory implementations
+   can be swapped in behind the same interface.
+3. **Current leaves are the initial postings.** Leaf IDs remain posting IDs,
+   so the existing vector-to-leaf map doubles as the initial
+   vector-to-posting map.
+4. **RaBitQ posting payloads are kept.** The leaf RaBitQ payload was already
+   the right conceptual primitive for a posting list; the refactor moved
+   ownership rather than reinventing quantized scoring.
+5. **Centroid-directory maintenance is not eager.** Eagerly updating a
+   centroid HBC on every vector write would erase the main SPFresh-style
+   advantage and increase write amplification, so writes do not do this.
+6. **The maintenance policy is what gets measured, not just the index shape.**
+   The open question is whether lazy posting maintenance improves
+   write-heavy workloads without unacceptable recall/latency regressions.
+7. **Implementation is split by responsibility, not fanned into many small
+   modules.** The code lives in one base HBC implementation file plus one
+   SPFresh-style maintenance extension file, plus shared posting
+   infrastructure:
+
+   ```text
+   zig/lib/vectorindex/src/
+     hbc_index.zig       # base HBC tree/index mechanics and public facade
+     spfresh_index.zig   # SPFresh-style posting maintenance layer
+     posting.zig         # shared posting data/state helpers
+   ```
+
+   `hbc_index.zig` keeps the base index mechanics: node, vector, metadata, and
+   vector-to-posting load/save helpers; search and rerank integration;
+   insert/update/delete and batch write paths; the fundamental HBC tree
+   split/merge primitives; internal-node quantized payload helpers; and
+   compatibility wrappers for the public API.
+
+   `spfresh_index.zig` owns the SPFresh-style policy layer:
+   `postingBacklogStatsTxn`, `repairDirtyPostingsTxn`,
+   `repairDirtyPostingsTxnWithOptions`, `runAutoPostingMaintenanceTxn`, local
+   maintenance helpers for posting split/merge decisions, sibling boundary
+   reassignment, and lazy posting centroid/payload refresh policy.
+
+   `posting.zig` remains neutral shared infrastructure, not a separate index:
+   `PostingId`, `PostingView`, `PostingState`, `PostingStore`,
+   `AssignmentMap`, and posting maintenance option/result structs.
+
+   `spfresh_index.zig` is an extension over the existing HBC index type, not a
+   second object model. Its functions use the same generic style as the rest
+   of HBC:
+
+   ```zig
+   pub fn repairDirtyPostingsTxnWithOptions(
+       self: anytype,
+       txn: anytype,
+       options: posting.PostingMaintenanceOptions,
+   ) !posting.PostingMaintenanceResult {
+       ...
+   }
+   ```
+
+   `hbc_index.zig` re-exports these as thin wrappers so adapter and DB call
+   sites do not churn:
+
+   ```zig
+   const spfresh_index = @import("spfresh_index.zig");
+
+   pub fn repairDirtyPostingsTxnWithOptions(
+       self: anytype,
+       txn: anytype,
+       options: posting.PostingMaintenanceOptions,
+   ) !posting.PostingMaintenanceResult {
+       return spfresh_index.repairDirtyPostingsTxnWithOptions(self, txn, options);
+   }
+   ```
+
+   This gives clear naming without claiming there is a fully independent
+   SPFresh index implementation. A later, genuinely distinct index type could
+   still reuse `posting.zig` and selected maintenance code behind a cleaner
+   interface.
 
 ## Current HBC Shape
 
@@ -106,7 +121,7 @@ The current persisted key families are effectively:
 - `hbc_vecs`: raw vectors and vector metadata
 - `hbc_meta`: index metadata and vector-to-leaf assignments
 
-In the current implementation, one `Node` abstraction does both jobs:
+One `Node` abstraction does both jobs:
 
 - internal node: `centroid + children`
 - leaf node: `centroid + members`
@@ -134,7 +149,11 @@ This means HBC already resembles:
 hierarchical centroid index -> leaf postings -> RaBitQ member scoring
 ```
 
-## What SPFresh Would Change
+## The SPFresh Alternative
+
+This is the alternative architecture that was evaluated and not adopted as a
+separate index. It is described here because it is the design space HBC's
+posting seams were built to test.
 
 An SPFresh-style layout would make the leaf/posting layer first-class and put a
 separate searchable directory over posting centroids:
@@ -176,15 +195,11 @@ query
   -> exact rerank from raw vectors
 ```
 
-## Key Reasoning
-
 ### HBC as the centroid directory is not by itself a new index
 
-If we use HBC as the centroid directory and synchronously update it whenever a
-posting centroid moves, the result is not meaningfully different from what we
-already have.
-
-It would look like:
+If HBC is used as the centroid directory and synchronously updated whenever a
+posting centroid moves, the result is not meaningfully different from what
+already exists. It would look like:
 
 ```text
 HBC over centroids -> selected posting IDs -> RaBitQ score posting members
@@ -222,35 +237,33 @@ insert/update/delete
   -> maybe split leaves/internal nodes
 ```
 
-If every write deletes and reinserts a posting centroid in a centroid-HBC, then
-the design may be worse than current HBC. The value comes from lazy and batched
-directory maintenance plus local background repair.
+If every write deletes and reinserts a posting centroid in a centroid-HBC, the
+design would likely be worse than current HBC. The value comes from lazy and
+batched directory maintenance plus local background repair — which is what the
+posting maintenance layer below implements.
 
-### The leaf RaBitQ payload can remain conceptually similar
+### The leaf RaBitQ payload stays conceptually similar
 
 The RaBitQ posting list does not need to be replaced to test the SPFresh
-hypothesis. Current leaf payloads already quantize member vectors relative to a
-leaf centroid. That maps naturally to:
+hypothesis. Leaf payloads already quantize member vectors relative to a leaf
+centroid, which maps directly to:
 
 ```text
 posting centroid + member vectors -> RaBitQ posting payload
 ```
 
-The refactor should preserve this machinery where possible.
+### The centroid index stays separate from posting payloads
 
-### The centroid index should be separate from posting payloads
+Even with HBC as the first centroid directory, the abstraction separates:
 
-Even if HBC is used as the first centroid directory, the abstraction should
-separate:
-
-- how we select postings
+- how postings are selected
 - how postings store and score members
 - how vector IDs are assigned to postings
 
-This is the seam that lets us change maintenance policy later without rewriting
+This is the seam that lets maintenance policy change later without rewriting
 search and quantization together.
 
-## Expected Performance Implications
+## Performance Considerations
 
 ### Search/read path
 
@@ -288,236 +301,99 @@ Potential losses:
 - correctness around versions, tombstones, and concurrent search becomes more
   explicit
 
-The strongest reason to pursue this is high mutable-ingest pressure, not static
-search performance alone.
+The strongest reason to pursue this direction is high mutable-ingest pressure,
+not static search performance alone.
 
-## Key Decisions
+## Architecture
 
-1. Refactor before replacing.
+### Boundaries
 
-   Build seams inside current HBC before adding a separate SPFresh index. This
-   avoids duplicating tree/search/quantization behavior before we have measured
-   evidence that a new index is needed.
+`posting.zig` defines the `PostingId`, `PostingView`, `PostingStore`,
+`AssignmentMap`, and `CentroidDirectory` names. Existing vector-to-leaf
+assignment storage flows through `AssignmentMap`, preserving the original key
+format, so introducing the boundary required no new index format and no
+material behavior change.
 
-2. Keep HBC as the first `CentroidDirectory`.
+### PostingStore
 
-   This preserves current behavior while decoupling the API. Later centroid
-   directory implementations can be swapped in behind the same interface.
+Leaf member and RaBitQ operations are posting-owned. Leaf/member scoring,
+online leaf member append/remove, leaf centroid recompute
+(`PostingStore.recomputeCentroid`), RaBitQ refresh vector materialization
+(`PostingStore.loadTransformedVectorsForQuantizedRefresh`), and quantized
+payload cache/write mechanics (`PostingStore.refreshQuantizedPayload`) all flow
+through `PostingStore`. Internal-node quantized payloads remain owned by HBC.
 
-3. Treat current leaves as initial postings.
+Posting-level operations exposed by this layer:
 
-   Leaf IDs can remain posting IDs during the first refactor. This keeps the
-   vector-to-leaf map useful as an initial vector-to-posting map.
+- `loadPosting(posting_id)`
+- `appendMember(posting_id, vector_id, vector)`
+- `removeMember(posting_id, vector_id)`
+- `rebuildPosting(posting_id)`
+- `splitPosting(posting_id)`
 
-4. Keep RaBitQ posting payloads.
+Leaf postings carry persisted maintenance state — mutation version, centroid
+refresh version, payload refresh version, and dirty flags — stored as a
+backward-compatible node side record.
 
-   The leaf RaBitQ payload is already the right conceptual primitive for a
-   posting list. The first pass should move ownership, not reinvent quantized
-   scoring.
+### CentroidDirectory
 
-5. Do not eagerly update a centroid HBC for every vector write.
+Insert routing flows through `CentroidDirectory.findPosting`, which still
+delegates to current HBC leaf routing. Search asks `CentroidDirectory` for
+posting IDs and is implemented using current HBC traversal, preserving the
+existing beam/search-width behavior as the default:
 
-   Eager centroid-directory maintenance would erase the main SPFresh-style
-   advantage and may increase write amplification.
+```text
+directory.search(query) -> posting IDs
+posting_store.score(posting IDs) -> candidates
+rerank(candidates) -> final results
+```
 
-6. Measure the maintenance policy, not just the index shape.
+Current HBC remains the default directory implementation; the interface is
+what would let it be swapped later (see [Open work](#open-work)).
 
-   The question to answer is whether lazy posting maintenance improves
-   write-heavy workloads without unacceptable recall/latency regressions.
+### Posting Maintenance
 
-7. Split implementation files by HBC core versus SPFresh-style maintenance.
+A bounded posting maintenance pass scans leaf postings, repairs dirty
+centroids/payloads, persists clean posting state, refreshes HBC ancestor
+centroids when needed, and reports repair counters.
 
-   The code should not fan out into many small modules yet. The useful split is
-   one base HBC implementation file plus one SPFresh-style maintenance extension
-   file:
+A disabled-by-default `lazy_posting_maintenance` mode lets foreground leaf
+writes persist dirty posting state while deferring leaf centroid, payload, and
+ancestor refresh work to the posting maintenance pass. Dirty posting backlog
+visibility is available via `PostingBacklogStats` and a `std.Io.Writer` debug
+renderer, so accumulated deferred work is inspectable.
 
-   ```text
-   go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/
-     hbc_index.zig       # base HBC tree/index mechanics and public facade
-     spfresh_index.zig   # SPFresh-style posting maintenance layer
-     posting.zig         # shared posting data/state helpers
-   ```
+A disabled-by-default bounded automatic repair hook runs before write commit
+when `auto_posting_maintenance_max_postings` is non-zero, amortizing lazy
+posting repair without a background thread. DB idle maintenance also drains
+dirty dense posting work outside the foreground write hook. Dense-index config
+parsing and DB/API runtime status expose the lazy posting knobs and posting
+backlog/maintenance counters.
 
-   `hbc_index.zig` should keep the base index mechanics:
+Bounded local posting layout maintenance handles split, merge, and boundary
+reassignment: oversized postings can split, underfull postings can merge with
+nearby siblings, and sibling boundary reassignment can move vectors that are a
+better local fit elsewhere.
 
-   - node, vector, metadata, and vector-to-posting load/save helpers
-   - search and rerank integration
-   - insert/update/delete and batch write paths
-   - fundamental HBC tree split/merge primitives
-   - internal-node quantized payload helpers
-   - compatibility wrappers for the current public API
+### Persistence
 
-   `spfresh_index.zig` should own the SPFresh-style policy layer:
+A first immutable posting segment container stores opaque packed posting,
+quantized-checkpoint, centroid-directory, mutation, and tombstone values in a
+posting-local sorted index. The v2 format checks the footer and index at
+admission, validates strict key ordering and value bounds, and lazily checks
+each payload on access, so opening a large segment is not O(file size). A
+concurrent-safe verified reader memoizes both successful and failed per-entry
+verification, avoiding a full payload CRC on every query.
 
-   - `postingBacklogStatsTxn`
-   - `repairDirtyPostingsTxn`
-   - `repairDirtyPostingsTxnWithOptions`
-   - `runAutoPostingMaintenanceTxn`
-   - local maintenance helpers for posting split/merge decisions
-   - sibling boundary reassignment
-   - lazy posting centroid/payload refresh policy, where it can move cleanly
+A framed posting WAL codec makes whole batches query-visible with an explicit
+commit record. Its CRC covers routing metadata and payload, replay ignores
+incomplete or uncommitted tails, and a checksummed checkpoint records the exact
+segment generation and committed WAL prefix. Keeping payloads opaque lets the
+current packed HBC read path coexist with a small WAL tail instead of forcing
+base/delta replay on every query. Runtime wiring for this WAL path remains
+experimental.
 
-   `posting.zig` remains neutral shared infrastructure, not a separate index:
-
-   - `PostingId`
-   - `PostingView`
-   - `PostingState`
-   - `PostingStore`
-   - `AssignmentMap`
-   - posting maintenance option/result structs
-
-   `spfresh_index.zig` should be an extension over the existing HBC index type,
-   not a second object model. Its functions should continue using the current
-   generic style:
-
-   ```zig
-   pub fn repairDirtyPostingsTxnWithOptions(
-       self: anytype,
-       txn: anytype,
-       options: posting.PostingMaintenanceOptions,
-   ) !posting.PostingMaintenanceResult {
-       ...
-   }
-   ```
-
-   During the split, `hbc_index.zig` should re-export wrappers so adapter and
-   DB call sites do not churn:
-
-   ```zig
-   const spfresh_index = @import("spfresh_index.zig");
-
-   pub fn repairDirtyPostingsTxnWithOptions(
-       self: anytype,
-       txn: anytype,
-       options: posting.PostingMaintenanceOptions,
-   ) !posting.PostingMaintenanceResult {
-       return spfresh_index.repairDirtyPostingsTxnWithOptions(self, txn, options);
-   }
-   ```
-
-   This gives us clear naming without claiming there is a fully independent
-   SPFresh index implementation. If we later introduce a distinct index type,
-   it can reuse `posting.zig` and selected maintenance code behind a cleaner
-   interface.
-
-## Refactor Plan
-
-### Phase 1: Name the boundaries
-
-Objective:
-- introduce interfaces/types without changing behavior
-
-Plan:
-- define a `PostingId` alias that initially maps to current leaf node IDs
-- define a `PostingStore` wrapper over current leaf members, centroid, and
-  quantized payload access
-- define a `CentroidDirectory` wrapper over current HBC routing behavior
-- define an `AssignmentMap` wrapper over current vector-to-leaf keys
-- keep existing search and write tests passing
-
-Acceptance:
-- no material behavior change
-- no new index format required
-- current HBC search results remain equivalent within existing tolerances
-
-### Phase 2: Move leaf operations behind `PostingStore`
-
-Objective:
-- make leaf member and RaBitQ operations posting-owned
-
-Plan:
-- route leaf member reads/writes through `PostingStore`
-- move leaf quantized rebuild/update logic behind posting operations
-- expose posting-level operations:
-  - `loadPosting(posting_id)`
-  - `appendMember(posting_id, vector_id, vector)`
-  - `removeMember(posting_id, vector_id)`
-  - `rebuildPosting(posting_id)`
-  - `splitPosting(posting_id)`
-- keep internal-node quantized payloads in HBC for now
-
-Acceptance:
-- leaf mutation logic is no longer spread across generic node operations
-- posting rebuild can be called independently from tree maintenance
-- existing HBC writes still behave the same by default
-
-### Phase 3: Move routing behind `CentroidDirectory`
-
-Objective:
-- make "find postings for query" separate from "score posting members"
-
-Plan:
-- introduce a search path that asks `CentroidDirectory` for posting IDs
-- initially implement it using current HBC traversal
-- preserve current beam/search-width behavior as the default
-- keep exact rerank unchanged
-
-Acceptance:
-- search can be described as:
-
-  ```text
-  directory.search(query) -> posting IDs
-  posting_store.score(posting IDs) -> candidates
-  rerank(candidates) -> final results
-  ```
-
-- current HBC remains the default directory implementation
-
-### Phase 4: Add posting dirtiness and lazy centroid refresh
-
-Objective:
-- create the first real SPFresh-style behavior behind the refactored boundary
-
-Plan:
-- track posting count, tombstone count, centroid version, and dirty score
-- allow small inserts/deletes to update posting state without immediately
-  refreshing the centroid directory
-- enqueue dirty postings for background rebuild/refresh
-- support a foreground fallback for excessively dirty postings
-
-Acceptance:
-- write path can avoid synchronous ancestor/directory refresh for configured
-  workloads
-- search can tolerate stale posting centroids via versioned posting loads
-- metrics expose dirty postings and refresh lag
-
-### Phase 5: Local split/merge and boundary reassignment
-
-Objective:
-- test the real SPFresh maintenance hypothesis
-
-Plan:
-- split oversized postings locally
-- merge underfull or tombstone-heavy postings with nearby postings
-- after split/merge, refresh the centroid directory entries
-- if we enforce SPFresh-style NPA, scan only nearby postings for boundary
-  vectors that should be reassigned after split/merge
-- keep boundary reassignment bounded and background-driven
-
-Acceptance:
-- foreground write amplification drops on continuous update workloads
-- recall remains within an agreed tolerance
-- assignment-map/list mismatches remain treated as consistency bugs, not normal
-  maintenance debt
-- background maintenance debt is bounded
-
-### Phase 6: Alternative centroid directories
-
-Objective:
-- decide whether HBC is still the right centroid directory
-
-Candidate implementations:
-- current HBC over posting centroids
-- exact scan for small centroid counts
-- graph/HNSW-like directory over posting centroids
-- flat IVF-style directory for simpler experiments
-
-Acceptance:
-- choice is based on measured read latency, recall, write amplification, and
-  maintenance debt
-- no posting-store rewrite is required to swap directory implementations
-
-## Metrics To Track
+## Metrics
 
 Search:
 
@@ -547,32 +423,39 @@ Storage/cache:
 - bytes read per query
 - bytes written per vector update
 
+An opt-in lazy-versus-eager posting maintenance benchmark exists to evaluate
+these. Current local samples show lazy centroid deferral is working, but
+centroid deferral alone is not the dominant write-latency cost in those runs
+(see [Open work](#open-work)).
+
 ## Risks
 
-- A refactor that only renames current HBC pieces will not improve performance.
-- A centroid HBC updated eagerly per write may be worse than current HBC.
+- A refactor that only renames current HBC pieces would not improve
+  performance on its own.
+- A centroid HBC updated eagerly per write could be worse than current HBC —
+  this is why eager updates are avoided (see Decision, item 5).
 - Stale posting centroids can hurt recall if maintenance lag is too high.
-- Background split/merge and any boundary reassignment need clear bounds to
-  avoid unbounded maintenance debt.
-- Introducing multiple directory implementations too early will distract from
+- Background split/merge and boundary reassignment need clear bounds to avoid
+  unbounded maintenance debt; assignment-map/posting-list mismatches are
+  treated as consistency bugs, not normal maintenance debt.
+- Introducing multiple directory implementations too early would distract from
   the main maintenance-policy experiment.
 
-## Near-Term Recommendation
+## Open work
 
-Start with the refactor, not a new index.
-
-The first useful engineering milestone is a current-behavior-preserving split
-between:
-
-```text
-CentroidDirectory
-PostingStore
-AssignmentMap
-```
-
-Lazy posting maintenance, dirty backlog stats, and bounded pre-commit repair are
-now in place behind disabled-by-default knobs. The next useful work is measuring
-that policy on write-heavy workloads and then deciding whether split/merge or
-targeted boundary reassignment needs to change. Replacing HBC as the centroid
-directory should remain a separate, well-scoped optimization rather than a full
-index rewrite.
+- **Alternative centroid directories.** Whether HBC should remain the centroid
+  directory is unresolved. Candidates if it is revisited: current HBC over
+  posting centroids, exact scan for small centroid counts, a graph/HNSW-like
+  directory over posting centroids, or a flat IVF-style directory for simpler
+  experiments. Any change here should be chosen from measured read latency,
+  recall, write amplification, and maintenance debt, and should not require a
+  posting-store rewrite to swap implementations. Replacing HBC as the centroid
+  directory should stay a separate, well-scoped optimization rather than a
+  full index rewrite.
+- **Dominant write-latency cost.** The lazy-versus-eager posting maintenance
+  benchmark shows centroid deferral working, but centroid deferral alone is
+  not the dominant write-latency cost in current local samples; that cost has
+  not yet been identified.
+- **Posting WAL runtime wiring.** The framed posting WAL codec exists, but its
+  runtime wiring into the write/read path remains experimental rather than a
+  committed default.

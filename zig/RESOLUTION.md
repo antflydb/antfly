@@ -38,16 +38,19 @@ recovery protocol is introduced.
 - Preserve replay determinism: a recorded resolution decision is re-applied on
   replay, never silently recomputed against moved-on global state.
 
-## Non-Goals For Phase 1
+## Non-Goals
 
-- No human-in-the-loop review workflow. The REVIEW decision band exists in the
-  scoring model, but the review queue / curation UI / label capture is **phase
-  2**.
+- No review queue or curation UI. The REVIEW decision band exists in the
+  scoring model, and a curator can record an override through the resolution
+  API (see "Sync and visibility contract"), but a queue / UI / label-capture
+  surface on top of that is not built.
 - No learned (model-backed) resolver. The deterministic scorer ships first and
-  doubles as the label factory for the learned one.
-- No two-phase-commit coupling of entity writes and edge writes. Phase 1 is
-  decoupled and fails closed on hydration (see "Cross-Shard Placement").
-- No entity merge/split rewrite engine. That is phase 3 in `GRAPH.md`.
+  doubles as the label factory for a future learned one.
+- No two-phase-commit coupling of entity writes and edge writes. Entity and
+  edge writes are decoupled and fail closed on hydration (see "Cross-Shard
+  Placement").
+- No entity merge/split rewrite engine. That belongs to `GRAPH.md`'s
+  merge/split design.
 
 ## Pipeline As Managed Replay Stages
 
@@ -97,8 +100,9 @@ Therefore:
 - The resolver **records its decision in the durable resolution artifact**.
 - Replay **re-applies the recorded decision**; it does not recompute.
 - Recomputation is an **explicit, config-generation-scoped re-resolution pass**
-  (this is also the phase-3 merge/split path: bump the resolver config
-  generation, re-resolve, and let edge replacement rewrite stale edges).
+  (this is also the merge/split path from `GRAPH.md`: bump the resolver
+  config generation, re-resolve, and let edge replacement rewrite stale
+  edges).
 
 Get this right and the scorer can be arbitrarily fancy without corrupting
 recovery. Get it wrong and a learned/fusion resolver quietly makes the graph
@@ -196,8 +200,8 @@ to the `else` level.
 ### 3. Decision
 
 `probability >= match` -> MATCH (link to best candidate).
-`probability >= review` -> REVIEW (phase 2 workflow; treated as no durable link
-in phase 1).
+`probability >= review` -> REVIEW (recorded for curator override; produces no
+durable canonical link until a curator resolves it).
 otherwise -> NO_MATCH (mint a new entity).
 
 `Scorer.explain()` returns the matched level per comparison, which is both the
@@ -206,13 +210,14 @@ review-UI breakdown and the signal for bootstrapping learned-resolver labels.
 ### Deterministic vs learned: same structure
 
 The levels are the features. In deterministic mode the weights are hand-written.
-In learned mode (`weights.mode: "learned"`, phase 2) the **same** levels get
-their weights fit by EM (Fellegi-Sunter) or logistic regression over labelled
-pairs. Blocking, comparators, and the decision interface are unchanged -- only
-the numbers move. Inference scales because blocking already cut candidates to
-~k; the model only scores mention x k. The hard part is labels, which the
-deterministic resolver bootstraps (high-confidence matches/non-matches) plus
-phase-2 human review.
+A learned mode (`weights.mode: "learned"`) is not yet implemented; it would fit
+the **same** levels' weights by EM (Fellegi-Sunter) or logistic regression over
+labelled pairs, leaving blocking, comparators, and the decision interface
+unchanged -- only the numbers would move. Inference would scale because
+blocking already cuts candidates to ~k, so the model would only score
+mention x k. The hard part is labels: the deterministic resolver already
+bootstraps high-confidence matches/non-matches, which is the intended label
+source once human review is added on top.
 
 ### Why not a general scripting language
 
@@ -339,7 +344,7 @@ The promoter turns resolution decisions into durable entity state.
   contention and unbounded array growth on popular entities, and reuses the
   graph machinery we are already building.
 
-### Deterministic resolver makes the promoter optional in phase 1
+### Deterministic resolver makes the promoter optional
 
 A deterministic `key_template` computes a fallback canonical key **purely from
 extracted text** -- no global state. The resolver still records that decision in
@@ -348,12 +353,11 @@ by replaying that artifact. Consequence: canonical `new` or `match` decisions ca
 produce `doc -> entity` edges before the entity document exists, but their target
 is always the resolved DocRef, not a speculative extraction-time render. `review`
 decisions are deliberately not canonical: they remain durable in the resolution
-artifact and review queue, but they do not create entity documents or ordinary
-doc->entity provenance edges until a curator override re-resolves them. So in
-phase 1 the **graph works end-to-end without the promoter** for canonical
-decisions; the promoter's job is to make those canonical docs exist for
-hydration, search, and display. This de-risks the first ship without leaking
-unresolved review state into the canonical graph.
+artifact, but they do not create entity documents or ordinary doc->entity
+provenance edges until a curator override re-resolves them. So the **graph
+works end-to-end without the promoter** for canonical decisions; the
+promoter's job is to make those canonical docs exist for hydration, search,
+and display. This keeps unresolved review state out of the canonical graph.
 
 ### Cross-shard placement
 
@@ -363,13 +367,13 @@ the source document. Two options:
 1. **Transactional**: wrap the entity upsert (entity shard) and the source-shard
    edge artifact in one 2PC `BatchRequest` (predicates + participants). Gives
    read-your-write consistency between entities and edges.
-2. **Decoupled (phase 1)**: promoter upserts the entity in its own write;
+2. **Decoupled (current)**: promoter upserts the entity in its own write;
    materializer writes edges referencing the entity key independently; hydration
    **fails closed** if the entity doc is not yet present (already mandated for
    external nodes in `GRAPH.md`).
 
-Phase 1 uses decoupled + fail-closed. 2PC is a later hardening step when
-read-your-write entity guarantees are actually required.
+Antfly uses decoupled + fail-closed today. 2PC is a later hardening step for
+when read-your-write entity guarantees are actually required (see "Open work").
 
 ### Sync and visibility contract
 
@@ -415,7 +419,7 @@ retry the idempotent removal.
 ### DocRef endpoints
 
 Resolution endpoints and resolved edge endpoints use a document-reference shape
-from the start, even if phase 1 only hydrates same-table:
+from the start, even though today it only hydrates same-table:
 
 ```json
 { "table": "entities", "key": "person/ada_lovelace" }
@@ -507,24 +511,26 @@ Open/index/enrichment validation should reject:
 - A blocking predicate that does not map to an available index.
 - A `cosine` comparator whose embedding dependency is undeclared/unprovisioned.
 - A resolver config that references a missing entity table.
-- A learned-weights config without a trained model artifact (phase 2).
+- A learned-weights config without a trained model artifact (not yet
+  supported; see "Open work").
 - A fusion `prior.from = graph` without a pinned snapshot policy.
 
 ## Status
 
-The phasing plan and test plan (phases 1-3: deterministic resolver,
-learned/reviewed fusion, and merge/split) are implemented. The scorer and
-comparators live in `lib/matcher`; the resolver core, resolution stage, and
-`DocRef` type live in `lib/resolver`; the resolution and promotion managed
-replay stages are `resolution_runtime.zig` and `promotion_runtime.zig`;
+The design in this document -- deterministic resolver, promoter, fusion data
+model, and cross-shard candidate blocking -- is implemented and tested. The
+scorer and comparators live in `lib/matcher`; the resolver core, resolution
+stage, and `DocRef` type live in `lib/resolver`; the resolution and promotion
+managed replay stages are `resolution_runtime.zig` and `promotion_runtime.zig`;
 cross-shard candidate blocking and the promoter's cross-shard entity sink are
 `api/distributed_candidate_source.zig`; and the resolver catalog persists
 through `resolver_catalog.zig` and `table_provisioner`. Test coverage spans
 `lib/matcher`, `lib/resolver`, and the `antfly-storage-db-test` /
-`e2e/antfly/test_resolution.py` suites. Two follow-ups remain open and are
-tracked in "Cross-shard candidate blocking" below: a name-embedding
-enrichment to feed cross-shard ANN blocking, and atomic entity+edge coupling
-via a future graph-edge participant in `TableCommitRequest`.
+`e2e/antfly/test_resolution.py` suites.
+
+Learned-weights resolution, a review queue/curation UI, entity merge/split, and
+transactional entity+edge coupling are not part of this implementation; see
+"Open work" at the end of this document.
 
 ## Cross-shard candidate blocking
 
@@ -534,9 +540,7 @@ Canonical entities normally live in a dedicated `entities` table on a *different
 shard, so meaningful cross-document blocking needs the worker to query that table
 across shards. Sublinear ANN candidate generation has the same requirement (the
 entity table's vector index is on the entity shard). Both are the same blocker,
-and both are now served by the same seam.
-
-**Implemented:**
+and both are served by the same seam:
 
 1. **Seam.** `db_mod.CandidateSource` (storage) exposes `get` / `scan_prefix` /
    `nearest`. The resolution worker takes an optional `CandidateSource`;
@@ -575,15 +579,35 @@ and both are now served by the same seam.
    query can hydrate promoted entity docs across shards. Verified by db-tests and
    the live multi-node e2e.
 
-**Open follow-ups:**
+Embedding generation for ANN blocking and entity+edge atomicity are not yet
+built; see "Open work" below.
 
-6. **Embedding generation.** ANN also needs the mention `name_embedding` to be
-   produced -- a name-embedding enrichment over the extraction entities (an
-   `embedding` artifact the resolver reads), reusing the dense-embedding
-   producer already in the enrichment runtime.
-7. **Entity + edge atomicity.** Entity promotion is transactional across entity
-   shards, but atomically coupling the entity upsert with graph-edge artifacts
-   still needs a graph-edge participant in `TableCommitRequest`.
+## Open work
+
+- **Name-embedding generation for ANN blocking.** ANN candidate search needs
+  the mention `name_embedding` to be produced -- a name-embedding enrichment
+  over the extraction entities (an `embedding` artifact the resolver reads),
+  reusing the dense-embedding producer already in the enrichment runtime. This
+  is the recommended next step, since it unblocks the `ann` candidate source
+  end to end.
+- **Entity + edge atomicity.** Entity promotion is transactional across entity
+  shards, but atomically coupling the entity upsert with graph-edge artifacts
+  needs a graph-edge participant in `TableCommitRequest`. Until then, entity
+  writes and edge writes are decoupled and hydration fails closed (see
+  "Cross-Shard Placement").
+- **Learned resolver.** `weights.mode: "learned"` is not implemented. The
+  comparator/level structure is designed to support it (see "Deterministic vs
+  learned: same structure") once labelled pairs are available.
+- **Review queue / curation UI.** Curators can record an override for a
+  `review` decision through the resolution API (see "Sync and visibility
+  contract"), but there is no queue, UI, or label-capture surface for
+  triaging pending `review` decisions.
+- **Entity merge/split.** Rewriting entities after a merge or split is
+  `GRAPH.md`'s merge/split design, not this document's.
+- **Semantic-wait read mode.** Callers that need semantic readiness inspect
+  resolution/promotion stage status directly today (see "Sync and visibility
+  contract"). A future opt-in wait mode for automatic-only stages would need
+  to return structured blocked status rather than waiting on human review.
 
 Recommended order: (a) the name-embedding enrichment to feed the cross-shard
 `ann` source, (b) graph-edge participation in `TableCommitRequest` for optional

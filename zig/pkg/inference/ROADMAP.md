@@ -1,6 +1,6 @@
 # antfly-inference-zig Roadmap
 
-antfly-inference-zig is a Zig reimplementation of the Go Antfly inference ML inference service targeting full API parity with all 10 endpoints, plus native SafeTensors support for Apple Silicon. The Kubernetes operator and proxy stay in Go — only the inference binary is being rewritten.
+antfly-inference-zig is Antfly's Zig ML inference runtime: embeddings, reranking (cross-encoder, ColBERT, ColQwen), extraction/classification (GLiNER2, LayoutLMv3/LayoutDoc), chunking, and generative text (autoregressive decoding, KV cache, tool-calling, grammar-constrained decoding, SSE streaming) across native CPU, Metal, CUDA, and ONNX Runtime backends, plus LoRA/PEFT training for supported architectures. Most of the 10-endpoint API is already working — see "Shipped" below; "Remaining API Parity" tracks what's left. The Kubernetes operator and proxy stay in Go; only the inference binary itself is Zig.
 
 ## Architecture
 
@@ -8,10 +8,11 @@ antfly-inference-zig is a Zig reimplementation of the Go Antfly inference ML inf
 .onnx files ──────► ONNX Runtime (CPU, CUDA, TensorRT, ROCm)
                          │
 SafeTensors/GGUF ──► Hand-written forward pass ──► Metal (macOS only)
-                         │                    └──► BLAS (CPU everywhere)
+                         ├──► native (CPU everywhere, optional system BLAS)
+                         └──► CUDA (see CUDA.md)
 ```
 
-ONNX Runtime is the universal backend (loads `.onnx` directly). Metal and BLAS need SafeTensors weight loading + hand-written model architectures per model family.
+ONNX Runtime is the universal backend (loads `.onnx` directly). Metal, native, and CUDA need SafeTensors/GGUF weight loading plus hand-written model architectures per model family — see [NATIVE.md](NATIVE.md), [METAL.md](METAL.md), and [CUDA.md](CUDA.md) for each backend's design.
 
 ---
 
@@ -27,18 +28,27 @@ The Go binary continues to work — Zig is a drop-in replacement for the inferen
 
 ## Shipped
 
+Backend and runtime design docs (linked below) describe how these work today; this list is what they add up to at the API/feature level.
+
 - SentencePiece BPE tokenizer (full, tested)
 - SafeTensors parser + MMapReader + ShardedIndex (full, tested)
 - WeightSource abstraction (SafeTensors adapter, f16/bf16→f32)
 - BERT config parsing + weight mapping (bert, roberta, distilbert)
 - Tensor type (multi-dtype, shape, owned/borrowed)
 - Session vtable (run, inputInfo, outputInfo, backend, close)
-- BLAS math primitives (sgemm, l2Normalize, meanPool)
+- Native CPU backend math primitives (sgemm, l2Normalize, meanPool) — see [NATIVE.md](NATIVE.md)
+- Metal backend (packed/resident quantized weights, graph-planned command scopes) — see [METAL.md](METAL.md)
+- CUDA backend — see [CUDA.md](CUDA.md)
+- GGUF/GGML quantization format coverage and graph-execution partitioning — see [GGML.md](GGML.md)
+- Generic graph IR (tracing, compiler passes, execution backends, partitioning, caching, offline artifacts) — see [GRAPH.md](GRAPH.md)
+- TurboQuant KV cache codec — see [TURBOQUANT.md](TURBOQUANT.md)
+- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](GEMMA4.md)
+- Document readers (OCR/layout/extraction pipelines) — see [READERS.md](READERS.md)
 - TTL ResultCache with stats
 - Model registry (local discovery, ModelRef parsing)
 - HTTP server (httpx.zig, route stubs)
 - CLI (run, list, pull, version)
-- Build system (conditional `-Donnx`, `-Dmetal`, `-Dblas`)
+- Build system (conditional `-Donnx`, `-Dmetal`, `-Dcuda`)
 - Working `/api/embed` via ONNX
 - Reranking pipeline and `/api/rerank`
 - Native BERT/RoBERTa cross-encoder path
@@ -188,16 +198,3 @@ Linux arm64:  ONNX + BLAS
 | `src/tokenizer/hf_tokenizer.zig` | `go-huggingface/tokenizers/` |
 | `src/models/manifest.zig` | `lib/modelregistry/manifest.go` |
 | `src/registry/download.zig` | `lib/modelregistry/huggingface.go` |
-```
-
----
-
-Here's a summary of what was done and key decisions made:
-
-**docs/finetuning/FINETUNING.md** — merged TRAINING.md, TRAINING_FEATURES.md, LAYOUTLMV3_FINETUNE.md, and RUN_CONTRACT.md into a single document organized as: autodiff/IR architecture → core training primitives → optimizer features → feature matrix with per-feature explanations → SafeTensors checkpoint format → benchmarking → LayoutLMv3 PEFT surface (commands, runbook, artifact contracts) → CLI reference for all model families → run contract (JSON artifact schemas).
-
-**docs/RERANKING.md** — merged COLBERT_RERANKING.md, COLQWEN_RERANKING.md, and NATIVE_CROSS_ENCODER_MLX.md. Organized as three top-level sections (cross-encoder, ColBERT late-interaction, ColQwen multimodal) with the native cross-encoder section expanded since it has the most concrete performance data and verification scripts. Eliminated the duplicate distributed MLX env var tables (one canonical table per section instead).
-
-**docs/NATIVE_MODELS.md** — merged GLINER2_DISTRIBUTED_MLX.md and LAYOUTDOC_RUNTIME.md. Cut the "as of April 8" datestamp and "phase" language; kept all HTTP API contracts, probe commands, and env vars verbatim.
-
-**ROADMAP.md** — merged ROADMAP.md (the old one was actually the full parity plan from early development) with TODO.md. Restructured as: architecture overview → what stays in Go → shipped items (consolidating the old "What's Done" list with items from TODO's checked boxes) → active work (MLX Gemma, reranker verification, GLiNER, LayoutDoc) → remaining API parity (endpoint status table + per-endpoint notes) → infrastructure gaps (from TODO unchecked items + Phase 6 items) → E2E testing. Removed the numbered Phase 1–6 planning structure and forward-looking phase language throughout.

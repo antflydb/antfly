@@ -1,5 +1,7 @@
 # K-Way K-Means Bulk Build Plan
 
+**Status: partially implemented.** Phases 1-4 below (CPU K-way bulk build, clustered parent levels, Metal FlashAssign backend, sort/segment centroid updates) are implemented and covered by tests. Phase 5 (benchmarking across bulk-build algorithms and gating production rollout) is not complete: `BulkBuildAlgo.kmeans` is an opt-in mode selectable via `HBCConfig.bulk_build_algo`, but the default remains `.hilbert_seeded` — k-means has not been made the primary full-rebuild path. See "Current Status" and "Open work" below for what remains.
+
 ## Goal
 
 Use K-way k-means as the primary full-rebuild path for HBC dense indexes, then accelerate the expensive Lloyd assignment/update loop with a Metal Flash-KMeans-style backend.
@@ -68,3 +70,9 @@ The target rebuild shape is:
 - Phase 4 has a CPU segmented-update path and an initial unit-weight Metal centroid-update path behind `HBCConfig.kmeans_update_strategy`: `auto`, `scatter`, `segmented`, or `metal`. `auto` stays conservative and uses the CPU update strategies; `metal` requires a Metal assignment context unless `kmeans_backend` is explicitly `cpu`, then uses a two-stage Metal partial-sum/finalize update path for leaf-level unit-weight K-means while weighted parent levels fall back to CPU update strategies. Metal update only runs in iterations where assignment also ran on Metal, so auto-mode assignment fallback cannot feed stale GPU assignment buffers into the update step.
 - HBC bench CLIs accept `--kmeans-backend auto|cpu|metal` and `--kmeans-update-strategy auto|scatter|segmented|metal` for comparing backends and update strategies. `storage_bench hbc-write` also reports K-means assignment/update call counts, point totals, and CPU/Metal nanoseconds.
 - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/kmeans.zig` has focused tests for CPU scatter stats, explicit CPU fallback with `update_strategy = .metal`, required Metal context failures under test builds, and forced-Metal dense-vector validation.
+- `HBCConfig.bulk_build_algo` still defaults to `.hilbert_seeded`; `.kmeans` must be selected explicitly.
+
+## Open work
+
+- Phase 5 (benchmarks and rollout) is not finished: recall/latency/rebuild-memory comparisons across `.hilbert_seeded`, `.doc_key_seeded`, `.recursive`, and `.kmeans` have not been published, and there is no recorded decision to gate or flip the default `bulk_build_algo` to `.kmeans`.
+- Weighted parent-level Metal centroid updates are not implemented; those levels always fall back to CPU update strategies (see Phase 4/Current Status above).

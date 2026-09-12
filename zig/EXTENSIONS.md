@@ -2,11 +2,27 @@
 
 ## Context
 
+This document was written as a forward-looking design proposal, and most of
+what follows — the "Full-Blown Target System," both "Implementation Plan"
+phase lists, and the MCP/workflow examples — is still unimplemented future
+work rather than a description of shipped behavior. That said, a real subset
+of the proposal below has since been built: package/extension catalog types,
+install/update/drop/enable/disable/configure lifecycle operations, extension
+object membership, and a WASM-based runtime with capability and resource
+limits live in `zig/pkg/antfly/src/extensions/` (`mod.zig`, `lifecycle.zig`,
+`wasmtime_runtime.zig`, `table_ownership.zig`) and
+`zig/pkg/antfly/src/metadata/extension_operations.zig`, and are exposed over
+the `/extensions/v1/*` HTTP API described in `specs/openapi/extensions/api.yaml`.
+That implementation was not reconciled back into this document, so the
+"Proposed Model" and "Phase" sections below should be read as historical
+design intent, not as an accurate map of what does or does not exist today.
+
 PostgreSQL extensions are not just dynamic libraries. The useful product
 contract is a managed package of database objects with install, update,
 dependency, ownership, dump/restore, and drop semantics.
 
-The closest Antfly equivalents today are split across:
+When this proposal was drafted, the closest Antfly equivalents were split
+across:
 
 - metadata table records in `zig/pkg/antfly/src/metadata/table_manager.zig`
 - per-table index metadata in `TableRecord.indexes_json`
@@ -15,10 +31,11 @@ The closest Antfly equivalents today are split across:
 - provider registries in `zig/pkg/antfly/src/common/provider_registry.zig`
 - embedded DB lifecycle APIs in `zig/pkg/antfly/src/embedded/db.zig`
 
-That gives us many extension-like object types, but not a single extension
-catalog or lifecycle. The metadata note also calls out table/index lifecycle as
-work that should move out of API-local state into metadata, which is the same
-boundary an extension system needs.
+That gave us many extension-like object types, but not a single extension
+catalog or lifecycle — a gap that, per the implementation status note above,
+has since been partially closed in code. The metadata note also calls out
+table/index lifecycle as work that should move out of API-local state into
+metadata, which is the same boundary an extension system needs.
 
 Reference PostgreSQL behavior:
 

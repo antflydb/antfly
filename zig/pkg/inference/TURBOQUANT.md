@@ -1,9 +1,8 @@
-# TurboQuant Plan
+# TurboQuant
 
-This document tracks the plan for adding a TurboQuant-inspired KV cache path to
-termite. The target is not just a smaller cache format. The target is a full
-paged-attention implementation that writes compressed K/V rows and computes
-attention logits directly from compressed keys.
+TurboQuant is a compressed KV cache format for paged attention. It is not just
+a smaller cache dtype: attention logits are computed directly from compressed
+keys, without materializing full f32 key rows in the hot loop.
 
 Primary references:
 
@@ -29,39 +28,37 @@ Primary references:
 - Do not replace GGUF or model-weight quantization.
 - Do not make TurboQuant the default until it has model-level accuracy data.
 - Do not require calibration data or fine-tuning.
-- Do not remove the current `cache_compaction_ratio` path. TurboQuant should
-  compose with compaction once the base cache path is stable.
+- Do not remove the current `cache_compaction_ratio` path. TurboQuant composes
+  with compaction rather than replacing it.
 
-## Current State
+## Substrate
 
-Antfly inference already has the substrate needed for this work:
+TurboQuant builds on the existing paged KV cache substrate:
 
-| Area | Current file | Notes |
+| Area | File | Notes |
 |------|--------------|-------|
 | KV dtype and block storage | `src/runtime/kv/pool.zig` | Existing formats quantize on write and dequantize on read. |
-| Sequence and block table management | `src/runtime/kv/manager.zig` | Existing sequence IDs and block tables should remain the owner of paging. |
-| Native paged attention | `src/ops/native_compute.zig` | `gqaPagedAttentionDirect` currently calls `pool.readToken`, then dots f32 K rows. |
-| WASM/WebGPU cached attention | `web/shaders/gqa_cached_attention.wgsl` | Dense K/V storage and f32 scoring today. |
-| Paged attention benchmark | `src/bench/paged_attention.zig` | Useful starting point, but needs dtype and correctness extensions. |
-| Post-prefill compaction | `src/runtime/kv/compaction.zig` | Token-count compression can stack with KV quantization. |
-| User configuration | `src/pipelines/generation.zig`, `src/native_smoke.zig` | Existing `--cache-dtype` / `cache_dtype` knobs can expose experimental formats. |
+| Sequence and block table management | `src/runtime/kv/manager.zig` | Sequence IDs and block tables remain the owner of paging. |
+| Native paged attention | `src/ops/native_compute.zig` | `gqaPagedAttentionDirect` dispatches to a compressed-key path for TurboQuant dtypes. |
+| WASM/WebGPU cached attention | `web/shaders/gqa_cached_attention.wgsl` | Dense K/V storage and f32 scoring for the non-compressed dtypes. |
+| Paged attention benchmark | `src/bench/paged_attention.zig` | Dtype sweep including `polar4`/`turbo3`. |
+| Post-prefill compaction | `src/runtime/kv/compaction.zig` | Token-count compression stacks with KV quantization. |
+| User configuration | `src/pipelines/generation.zig`, `src/native_smoke.zig` | `--cache-dtype` / `cache_dtype` expose the experimental formats. |
 
-## Proposed Format Family
+## Format Family
 
-Start with two experimental dtypes:
+Two experimental dtypes ship:
 
-| DType | Purpose | Target bits | Required kernel path |
+| DType | Purpose | Target bits | Kernel path |
 |-------|---------|-------------|----------------------|
-| `polar4` | Practical first PolarQuant-style key format with a safer value codec | about 4 bits/key value, V codec configurable | direct compressed-key logits |
+| `polar4` | PolarQuant-style key format with a safer value codec | about 4 bits/key value, V codec configurable | direct compressed-key logits |
 | `turbo3` | PolarQuant primary key stage plus QJL residual | about 3 to 3.5 bits/key value, V codec configurable | direct compressed-key logits plus residual estimator |
 
-`polar4` should land first because it is the smallest complete step that proves
-the cache layout and direct scoring path. `turbo3` should layer QJL residual
-correction on top once `polar4` has correctness and benchmark coverage.
+`polar4` is the first, smallest complete step that proves the cache layout and
+direct scoring path. `turbo3` layers QJL residual correction on top.
 
-The public dtype name is a preset. Internally, TurboQuant-style cache rows should
-support asymmetric K/V storage because key scoring and value accumulation have
-different kernel and quality requirements:
+TurboQuant-style cache rows use asymmetric K/V storage because key scoring and
+value accumulation have different kernel and quality requirements:
 
 ```text
 cache dtype polar4 =
@@ -101,11 +98,9 @@ sizing are stable.
 
 ## Architecture
 
-### 1. Split Codec From Kernel Access
+### Codec module
 
-Add a small codec module:
-
-- `src/runtime/kv/turboquant.zig`
+`src/runtime/kv/turboquant.zig` is a small codec module.
 
 Responsibilities:
 
@@ -116,22 +111,21 @@ Responsibilities:
 - Provide scalar reference decode for tests and fallback paths.
 - Provide direct key-dot estimators used by native paged attention.
 
-Keep `pool.zig` responsible for allocation and layout. Put math and bit packing
-in the codec module.
+`pool.zig` stays responsible for allocation and layout; math and bit packing
+live in the codec module.
 
-### 2. Extend `KvDType`
+### `KvDType` extension
 
-In `src/runtime/kv/pool.zig`:
+`src/runtime/kv/pool.zig` has `.polar4` and `.turbo3` variants:
 
-- Add `.polar4` and `.turbo3`.
-- Extend `bytesPerElement`, `bytesForTokenRow`, and `parseKvDType`.
-- Add internal key/value sizing helpers:
+- `bytesPerElement`, `bytesForTokenRow`, and `parseKvDType` cover both.
+- Internal key/value sizing helpers:
   - `bytesForKeyRow`
   - `bytesForValueRow`
   - `bytesForTokenRow = bytesForKeyRow + bytesForValueRow`
-- Add dtype-specific block row layout helpers.
-- Keep existing `readToken` behavior by implementing a slow f32 decode fallback.
-- Add a new compressed read API for kernel paths:
+- Dtype-specific block row layout helpers.
+- Existing `readToken` behavior stays available as a slow f32 decode fallback.
+- A compressed read API exists for kernel paths:
 
 ```zig
 pub const KvEncodedRow = union(KvDType) {
@@ -153,19 +147,15 @@ pub const EncodedValueRow = union(enum) {
 pub fn readEncodedToken(...) !KvEncodedRow;
 ```
 
-Do not force all callers through this union immediately. Add it for the new
-attention path and leave existing gather/dequant users on `readToken`.
+Not all callers go through this union: the new attention path uses it, while
+existing gather/dequant users stay on `readToken`.
 
-### 3. Add A Compressed Paged-Attention Dispatch
+### Compressed paged-attention dispatch
 
-In `src/ops/native_compute.zig`, split `gqaPagedAttentionDirect` into:
+`src/ops/native_compute.zig`'s `gqaPagedAttentionDirect` dispatches by
+`pool.config.dtype` between an f32 row path and a compressed-key path.
 
-- `gqaPagedAttentionDirectF32Rows`
-- `gqaPagedAttentionDirectCompressedKeys`
-
-Dispatch by `pool.config.dtype`.
-
-The compressed path should:
+The compressed path:
 
 1. Iterate the same block table and causal/sliding-window mask as the f32 path.
 2. Read encoded K row bytes with `readEncodedToken`.
@@ -173,11 +163,11 @@ The compressed path should:
 4. Maintain the same online softmax recurrence.
 5. Accumulate V through the simplest correct value path at first.
 
-Initial value path should decode V to scratch f32 because logits are the
-bandwidth-critical part for long contexts. Later, add direct compressed-V
-weighted accumulation.
+The value path decodes V to scratch f32 because logits are the
+bandwidth-critical part for long contexts; direct compressed-V weighted
+accumulation remains open work.
 
-### 4. Native Kernel Path
+### Native kernel path
 
 Implement the native path in stages:
 
@@ -190,14 +180,14 @@ Implement the native path in stages:
 The SIMD implementation should live next to the codec math or in
 `src/runtime/kv/turboquant.zig`, not buried inside the attention loop.
 
-### 5. WebGPU Kernel Path
+### WebGPU kernel path
 
-Add a dedicated shader instead of overloading `gqa_cached_attention.wgsl`:
+Dedicated shaders exist instead of overloading `gqa_cached_attention.wgsl`:
 
 - `web/shaders/gqa_cached_attention_polar4.wgsl`
-- later: `web/shaders/gqa_cached_attention_turbo3.wgsl`
+- `web/shaders/gqa_cached_attention_turbo3.wgsl`
 
-Update:
+Along with:
 
 - `web/webgpu-ops.js`
 - `web/inference-worker.js`
@@ -212,21 +202,17 @@ Shader requirements:
 - `MAX_KV` limits and workgroup memory use must be re-evaluated because encoded
   K reduces storage bandwidth but may add estimator math.
 
-### 6. Compaction Composition
+### Compaction composition
 
-After the base compressed cache works:
+Compaction changes token count; TurboQuant changes bytes per token and scoring
+bandwidth. They are independent knobs, and `cache_compaction_ratio` composes
+with a TurboQuant dtype without special-casing. Benchmarking
+`cache_compaction_ratio + polar4` against `cache_compaction_ratio + int8`
+remains open work (see Open work).
 
-- Run post-prefill attention matching compaction into a compressed pool.
-- Add tests for compacted sequence decode with `polar4`.
-- Benchmark `cache_compaction_ratio + polar4` against current
-  `cache_compaction_ratio + int8`.
+## Delivery History
 
-Compaction changes token count. TurboQuant changes bytes per token and scoring
-bandwidth. They should remain independent knobs.
-
-## Implementation Phases
-
-### Phase 0: Design Lock
+### Design lock
 
 - Decide exact names: `polar4`, `turbo3`.
 - Define byte layout for asymmetric K and V rows.
@@ -240,7 +226,7 @@ Exit criteria:
   implemented without guessing.
 - The kernel ABI is clear for native and WebGPU.
 
-### Phase 1: Codec And Storage
+### Codec and storage
 
 - Add `src/runtime/kv/turboquant.zig`.
 - Add `.polar4` to `KvDType`.
@@ -259,7 +245,7 @@ Exit criteria:
 - `zig test` coverage proves storage, sizing, and f32 fallback decode.
 - `--cache-dtype polar4` parses but may still dispatch through fallback decode.
 
-### Phase 2: Native Direct-Key Paged Attention
+### Native direct-key paged attention
 
 - Add `readEncodedToken`.
 - Split native paged attention into f32 and compressed-key paths.
@@ -273,7 +259,7 @@ Exit criteria:
 - Attention tests cover causal mask, sliding window, GQA head grouping, and
   paged block boundaries.
 
-### Phase 3: Native SIMD Kernel
+### Native SIMD kernel
 
 - Add vectorized scoring for supported head dimensions.
 - Add benchmark knobs for cache dtype:
@@ -291,7 +277,7 @@ Exit criteria:
   least one representative native benchmark.
 - No regression for existing dtypes.
 
-### Phase 4: QJL Residual And `turbo3`
+### QJL residual and `turbo3`
 
 - Add QJL sketch generation for key residuals.
 - Add direct residual estimator to the compressed-key scoring path.
@@ -304,7 +290,7 @@ Exit criteria:
   comparable memory.
 - Quality is good enough to keep the dtype exposed as experimental.
 
-### Phase 5: WebGPU Kernel
+### WebGPU kernel
 
 - Add `gqa_cached_attention_polar4.wgsl`.
 - Wire WebGPU imports and externs.
@@ -317,7 +303,7 @@ Exit criteria:
 - WebGPU compressed path runs without falling back for `polar4`.
 - Shader output matches native reference within tolerance.
 
-### Phase 6: Metal Kernel
+### Metal kernel
 
 - Add a Metal compressed-key scoring kernel.
 - Wire dispatch behind dtype and shape checks.
@@ -328,32 +314,13 @@ Exit criteria:
 - The Metal path can run a real decode loop with `polar4`.
 - Per-token decode latency and memory are reported against f16 and int8.
 
-### Phase 7: End-To-End Quality Gates
+### End-to-end quality gates (open)
 
-Run model-level checks before considering defaults:
-
-- Short deterministic generation parity for known prompts.
-- Long-context retrieval prompts.
-- Rerank/generation smoke tests where applicable.
-- At least one Gemma-family model and one Mistral/Qwen-style GQA model.
-- Compare against:
-  - f16 cache
-  - int8 cache
-  - int4 cache
-  - compaction plus int8
-  - compaction plus `polar4`
-  - `turbo3`
-
-Exit criteria:
-
-- Kernel-level tests pass numeric tolerances against f32/fallback decode.
-- Short temperature-0 prompts are mostly token-identical, but global token
-  parity is not required.
-- Long-context retrieval has no material drop versus `int8`.
-- Long-context decode latency beats current `int4` fallback-decode behavior for
-  at least one representative native benchmark.
-- Quality deltas are documented by model family.
-- Default dtype recommendations remain conservative.
+Model-level checks before considering either dtype a default remain open work:
+short deterministic generation parity, long-context retrieval prompts,
+rerank/generation smoke tests, at least one Gemma-family and one
+Mistral/Qwen-style GQA model, compared against f16/int8/int4 cache,
+compaction+int8, compaction+`polar4`, and `turbo3`. See Open work.
 
 ## Validation Matrix
 
@@ -394,22 +361,23 @@ Exit criteria:
   token checks, long-context task quality, memory, and latency. Token parity is
   a smoke signal, not the global acceptance criterion.
 
-## First Patch Set
+## History
 
-The first code patch should be deliberately small:
+`polar4` and `turbo3` landed incrementally, in this order: codec module and
+`KvDType` plumbing, native direct-key paged attention, native SIMD scoring,
+QJL residual (`turbo3`), WebGPU shaders, and Metal kernels. The chronological
+log below is kept as evidence for the measurements it contains.
 
-1. Add `src/runtime/kv/turboquant.zig` with a scalar `polar4` codec and tests.
-2. Add `.polar4` to `KvDType` with asymmetric key/value byte sizing and parse
-   support.
-3. Make `pool.writeToken` and `pool.readToken` support `polar4` keys plus the
-   selected V codec through fallback decode.
-4. Add explicit fallback tests for unsupported `head_dim` values.
-5. Add `--cache-dtype polar4` smoke coverage where existing dtype parsing is
-   tested.
-
-Only after that lands should the native direct-key paged-attention path start.
-
-Status:
+Several entries below describe an interim Apple-GPU acceleration path built
+on an "MLX provider" (`mlx_quant_metal.m`, `ANTFLY_INFERENCE_MLX_*` /
+`TERMITE_MLX_*` env vars). That provider and the MLX backend it belonged to
+have since been removed from the codebase — none of those env vars or files
+exist today (`src/backends/backends.zig`'s `BackendType` enum has no `mlx`
+variant). The MLX-era entries are kept as a historical record of how the
+compressed-key scoring path was validated on Apple GPUs at the time; they do
+not describe current runtime behavior. The Metal-native path that exists
+today (`src/ops/metal_compute.zig`, `src/ops/metal/`) was built independently
+of that MLX path.
 
 - Done: `polar4` codec module with supported-shape checks, packing, fallback
   decode, and direct decoded-code dot product.
@@ -492,13 +460,13 @@ Status:
   run generated 64 tokens with `decode=2449 ms`, or about
   `26.13 decode tokens/sec`.
 - Done: dense MLX decode now defaults to a full decoder-stack eval stride,
-  with `ANTFLY_INFERENCE_DENSE_DECODE_EVAL_STRIDE` as a rollback/tuning knob. On local
+  with `TERMITE_DENSE_DECODE_EVAL_STRIDE` as a rollback/tuning knob. On local
   GPT-2 MLX generate, the explicit eval count for 64 tokens dropped from `384`
   to `69`; f32 decode improved from `2449 ms` to `2209 ms`, and `turbo3`
   improved from `2886 ms` to `2081 ms`.
 - Done: dense MLX decode now defaults to no explicit decoder-layer evals,
   letting the final token read force evaluation of the lazy full-stack graph.
-  `ANTFLY_INFERENCE_DENSE_DECODE_EVAL_STRIDE=2` restores the old dense-decode barrier
+  `TERMITE_DENSE_DECODE_EVAL_STRIDE=2` restores the old dense-decode barrier
   cadence, and positive values keep the layer-group tuning path available.
   Local GPT-2 MLX generate with the new default reported `eval_count=6`; f32
   decode was `2222 ms`, while `turbo3` decode improved to `1459 ms`, or about
@@ -576,7 +544,7 @@ Status:
   steps can build an actual GPT-2 greedy `qLen=1` decode loop below
   `mlx_fast_metal_kernel`.
 - Done: threaded the whole-token bring-up flag through the MLX generation loop.
-  `ANTFLY_INFERENCE_MLX_RAW_METAL_WHOLE_TOKEN=1` now prepares that runtime during the
+  `TERMITE_MLX_RAW_METAL_WHOLE_TOKEN=1` now prepares that runtime during the
   narrow decoder-only greedy paged-decode path and then falls back to the
   existing MLX token execution.
 - Done: moved the absolute token-input slice to resident Metal-owned embedding
@@ -587,7 +555,7 @@ Status:
   raw-Metal runtime as a resident layer-norm slot. The whole-token bring-up now
   runs token embedding, absolute position add, and the first decoder pre-norm
   on Metal before falling back to MLX. The latest unsandboxed GPT-2 MLX/turbo3
-  smoke with `ANTFLY_INFERENCE_MLX_RAW_METAL_WHOLE_TOKEN=1` showed
+  smoke with `TERMITE_MLX_RAW_METAL_WHOLE_TOKEN=1` showed
   `raw_whole_token_prepare_layer_norm_calls=1`,
   `raw_whole_token_apply_layer_norm_calls=3`, and
   `gpt_timing_ms.attn_norm=0`, confirming the override is live.
@@ -654,3 +622,18 @@ Status:
   command. So the next blocker is correctness of the raw whole-token math/path,
   not adding still more layers.
 - Pending: model-level quality gates using real model weights.
+
+## Open work
+
+- Batched (`kv_batch > 1`) native compressed-key scoring without falling back
+  per item is not confirmed shipped.
+- Benchmarking `cache_compaction_ratio + polar4` against
+  `cache_compaction_ratio + int8` remains open.
+- Model-level end-to-end quality gates (accuracy, long-context retrieval, and
+  latency comparisons across model families) have not been run against real
+  model weights. Default dtype recommendations should stay conservative until
+  that data exists.
+- A real, non-MLX Metal compressed-key kernel path (see the History note above
+  on the removed MLX provider) should be re-verified against
+  `src/ops/metal_compute.zig` / `src/ops/metal/` rather than assumed from the
+  MLX-era log entries.
