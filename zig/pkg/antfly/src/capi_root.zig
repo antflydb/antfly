@@ -68,3 +68,6 @@ pub const physical_resources = @import("storage/physical_resources.zig");
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_storage.zig");
 pub const test_error_logs = @import("test_error_logs.zig");
+
+pub const kernel_runtime_services = @import("storage/kernel_runtime_services.zig");
+pub const memory_budget = @import("storage/memory_budget.zig");

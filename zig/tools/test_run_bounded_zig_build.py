@@ -30,16 +30,15 @@ class BoundedZigBuildTest(unittest.TestCase):
             encoding="utf-8"
         )
         claim = re.search(
-            r"\.distributed => @as\(usize, if \(target.result.os.tag == .macos\) "
-            r"(?P<macos>\d+) else (?P<linux>\d+)\) \* 1024 \* 1024 \* 1024",
+            r"\.storage_kernel => (?P<gib>\d+) \* 1024 \* 1024 \* 1024",
             build,
         )
         self.assertIsNotNone(
             claim, "update this contract when storage claims change shape"
         )
-        # ARC is Linux. Keep macOS's independently measured reservation out
-        # of this Linux scheduler contract, without losing the target branch.
-        required = int(claim.group("linux")) * 1024**3
+        # Physical storage is its own archive. The distributed reservation no
+        # longer includes DB codegen and cannot establish this admission check.
+        required = int(claim.group("gib")) * 1024**3
         caps = re.findall(r"--max-rss-cap (\d+)", workflow)
         self.assertTrue(caps)
         for cap in caps:

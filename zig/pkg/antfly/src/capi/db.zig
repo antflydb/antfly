@@ -83,7 +83,7 @@ const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
 
-const kernel_runtime_services = @import("../storage/kernel_runtime_services.zig");
+const kernel_runtime_services = antfly.kernel_runtime_services;
 
 const StorageOwnerContext = struct {
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
@@ -2311,7 +2311,7 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
     };
     const alloc = if (context.allocator_bridge) |*value| value.asStd() else std.heap.c_allocator;
     context.alloc = alloc;
-    const memory_budget = @import("../storage/memory_budget.zig");
+    const memory_budget = antfly.memory_budget;
     const memory_limit = std.math.cast(usize, services.memory_limit_bytes) orelse return error.InvalidArgument;
     const budgets = if (services.io != null)
         memory_budget.smartResourceBudgetsResolved(memory_limit, if (memory_limit == 0) .unavailable else .explicit)
@@ -5556,7 +5556,7 @@ pub fn storageOwnerScanStream(
         fn visit(raw: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.line.clearRetainingCapacity();
-            try @import("../api/local_query_contract.zig").appendScanLine(self.alloc, &self.line, entry.id, entry.document_json, entry.content_hash);
+            try antfly.local_query_contract.appendScanLine(self.alloc, &self.line, entry.id, entry.document_json, entry.content_hash);
             if (self.sink.write(self.sink.context, .fromSlice(self.line.items)) == 0) return error.Canceled;
         }
     };
