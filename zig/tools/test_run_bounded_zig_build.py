@@ -29,15 +29,60 @@ class BoundedZigBuildTest(unittest.TestCase):
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
-        claim = re.search(r"\.distributed => (\d+) \* 1024 \* 1024 \* 1024", build)
+        claim = re.search(
+            r"\.distributed => @as\(usize, if \(target.result.os.tag == .macos\) "
+            r"(?P<macos>\d+) else (?P<linux>\d+)\) \* 1024 \* 1024 \* 1024",
+            build,
+        )
         self.assertIsNotNone(
             claim, "update this contract when storage claims change shape"
         )
-        required = int(claim.group(1)) * 1024**3
+        # ARC is Linux. Keep macOS's independently measured reservation out
+        # of this Linux scheduler contract, without losing the target branch.
+        required = int(claim.group("linux")) * 1024**3
         caps = re.findall(r"--max-rss-cap (\d+)", workflow)
         self.assertTrue(caps)
         for cap in caps:
             self.assertGreaterEqual(int(cap), required)
+
+        # A sufficient CLI cap is not enough: ARC injects a smaller default
+        # ANTFLY_ZIG_MAX_RSS, which detect_max_rss respects before applying the
+        # cap. Check each compiling job's explicit override, including the E2E
+        # builders that do not pass --max-rss-cap at all.
+        jobs = dict(
+            re.findall(
+                r"^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:|\Z)",
+                workflow,
+                re.MULTILINE | re.DOTALL,
+            )
+        )
+        for job in (
+            "zig-base-tests",
+            "zig-full-tests",
+            "zig-build-cache-tests",
+            "e2e-base-build",
+            "e2e-full-build",
+        ):
+            with self.subTest(job=job):
+                self.assertIn("    runs-on: arc-antfly-heavy\n", jobs[job])
+                budget = re.search(
+                    r'^      ANTFLY_ZIG_MAX_RSS: "(\d+)"$',
+                    jobs[job],
+                    re.MULTILINE,
+                )
+                self.assertIsNotNone(budget, "override ARC's inherited 20 GiB budget")
+                configured = budget.group(1)
+                # Heavy pods have a 24 GiB limit; reserve at least 2 GiB for
+                # the driver/runner rather than admitting all pod memory.
+                self.assertLessEqual(int(configured), 22 * 1024**3)
+                with mock.patch.dict(
+                    os.environ, {launcher.MAX_RSS_ENV: configured}, clear=True
+                ):
+                    self.assertGreaterEqual(launcher.detect_max_rss(), required)
+                    for cap in caps:
+                        self.assertGreaterEqual(
+                            launcher.detect_max_rss(int(cap)), required
+                        )
 
     def test_environment_override_is_used_as_exact_budget(self):
         with mock.patch.dict(os.environ, {launcher.MAX_RSS_ENV: "123456"}):

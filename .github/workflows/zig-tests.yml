@@ -330,6 +330,10 @@ jobs:
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
     timeout-minutes: 120
     env:
+      # ARC heavy pods have a 24 GiB limit but inject a 20 GiB default.
+      # Admit the 22 GiB storage compile while leaving 2 GiB for the runner
+      # and build driver. Keep this scoped to the heavy build jobs.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -451,10 +455,9 @@ jobs:
       # ARC may expose the shared node's memory total when the runner cgroup is
       # unlimited. Cap the aggregate scheduler budget at 22 GiB so concurrent
       # test runtimes cannot overcommit the runner while still admitting the
-      # largest individual compile step, which reserves 22 GiB. Cgroup detection
-      # still reserves 20% headroom and never raises a smaller host's budget. The patched
-      # 0.16 runner correctly reserves each ready step's max_rss claim as it
-      # wakes it.
+      # largest individual compile step, which reserves 22 GiB. The explicit
+      # heavy-job budget above leaves 2 GiB of pod headroom. The patched 0.16
+      # runner correctly reserves each ready step's max_rss claim as it wakes it.
       - name: Configure bounded parallel unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
@@ -656,6 +659,8 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
+      # Same 22 GiB build budget / 2 GiB runner headroom as zig-base-tests.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -812,6 +817,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -903,6 +909,9 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
+      # pod still has 2 GiB outside the aggregate compiler reservation.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       ANTFLY_CI_TRACE: "1"
@@ -1115,6 +1124,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       # Keep production optimization while preserving runtime-safety checks and
