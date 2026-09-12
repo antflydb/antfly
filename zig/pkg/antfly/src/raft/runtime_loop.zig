@@ -134,9 +134,9 @@ pub const ManagedProgressDriver = struct {
             return error.RaftProgressDriverStalled;
     }
 
-    /// Reports terminal source failures without applying the Raft-specific
-    /// round-duration watchdog. Control-plane users can legitimately spend
-    /// longer than that threshold waiting on bounded storage or HTTP work.
+    /// Reports terminal source failures. A long round makes readiness unhealthy,
+    /// but elapsed time alone cannot prove that durable I/O failed. Supervision
+    /// must let the active owner finish rather than restart during a slow sync.
     pub fn checkFailure(self: *const ManagedProgressDriver) !void {
         if (self.failed.load(.acquire))
             return self.failure orelse error.RaftProgressDriverFailed;
@@ -150,21 +150,20 @@ pub const ManagedProgressDriver = struct {
     /// Sleeps for control-plane cadence while remaining immediately responsive
     /// to a fatal progress-lane failure.
     pub fn waitForFailureOrTimeout(self: *ManagedProgressDriver, timeout_ns: u64) !void {
-        try self.check();
-        const wait_ns = self.nextHealthCheckDelay(timeout_ns, platform_time.monotonicNs());
+        try self.checkFailure();
         self.failure_event.waitTimeout(self.io, .{
             .duration = .{
-                .raw = std.Io.Duration.fromNanoseconds(wait_ns),
+                .raw = std.Io.Duration.fromNanoseconds(timeout_ns),
                 .clock = .awake,
             },
         }) catch |err| switch (err) {
             error.Timeout => {
-                try self.check();
+                try self.checkFailure();
                 return;
             },
             error.Canceled => return error.Canceled,
         };
-        try self.check();
+        try self.checkFailure();
     }
 
     pub fn stop(self: *ManagedProgressDriver) void {
@@ -224,20 +223,6 @@ pub const ManagedProgressDriver = struct {
         const started_ns = self.round_started_ns.load(.acquire);
         if (self.round_generation.load(.acquire) != generation) return false;
         return now_ns -| started_ns >= self.stall_timeout_ns;
-    }
-
-    fn nextHealthCheckDelay(
-        self: *const ManagedProgressDriver,
-        requested_ns: u64,
-        now_ns: u64,
-    ) u64 {
-        const generation = self.round_generation.load(.acquire);
-        if ((generation & 1) == 0) return requested_ns;
-        const started_ns = self.round_started_ns.load(.acquire);
-        if (self.round_generation.load(.acquire) != generation) return requested_ns;
-        const elapsed_ns = now_ns -| started_ns;
-        const remaining_ns = self.stall_timeout_ns -| elapsed_ns;
-        return @min(requested_ns, @max(@as(u64, 1), remaining_ns));
     }
 };
 
@@ -565,6 +550,50 @@ test "managed raft progress driver reports a wedged round unhealthy" {
     try std.testing.expectError(error.RaftProgressDriverStalled, driver.check());
     try driver.checkFailure();
     try std.testing.expect(!driver.isHealthy());
+}
+
+test "managed raft progress driver recovers readiness after a slow successful round" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const SlowSource = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+
+        fn runOnce(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            try self.release.wait(self.io);
+        }
+    };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var source = SlowSource{ .io = io };
+    var driver = ManagedProgressDriver.initWithStallTimeout(io, .{
+        .ptr = &source,
+        .run_once = SlowSource.runOnce,
+    }, std.time.ns_per_hour, std.time.ns_per_ms);
+    defer driver.deinit();
+    try driver.start();
+    defer source.release.set(io);
+    try source.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // Model a durable sync which crosses the watchdog. Supervision must keep
+    // the owner alive and sleep its normal cadence while readiness is false.
+    try io.sleep(.fromMilliseconds(2), .awake);
+    try std.testing.expect(!driver.isHealthy());
+    try driver.checkFailure();
+    const before = platform_time.monotonicNs();
+    try driver.waitForFailureOrTimeout(2 * std.time.ns_per_ms);
+    try std.testing.expect(platform_time.monotonicNs() -| before >= std.time.ns_per_ms);
+    try std.testing.expect(!driver.isHealthy());
+    source.release.set(io);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while ((driver.round_generation.load(.acquire) & 1) != 0) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestExpectedEqual;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(driver.isHealthy());
+    try driver.checkFailure();
 }
 
 test "managed raft progress driver ignores a completed observed generation" {
