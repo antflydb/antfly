@@ -1627,7 +1627,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
     const data_runtime_vopr_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = &.{ "DataServer LSM maintenance", "DataServer store status" },
+        .filters = &.{
+            "DataServer LSM maintenance",
+            "DataServer store status",
+            "data runtime runRound backs off retryable provision metadata failures",
+            "data runtime provisioned root refresh worker backs off retryable metadata failures",
+        },
         .max_rss = production_vopr_compile_max_rss,
     });
     const run_data_runtime_vopr_tests = addFilteredTestRunArtifact(b, data_runtime_vopr_tests);

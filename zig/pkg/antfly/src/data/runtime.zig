@@ -7735,7 +7735,10 @@ pub const DataServer = struct {
         self.next_metadata_bootstrap_retry_at_ms = 0;
     }
 
-    fn deferMetadataBootstrapRetry(self: *DataServer, now_ms: u64) void {
+    fn deferMetadataBootstrapRetry(self: *DataServer) void {
+        // Metadata I/O may suspend longer than the entire backoff interval.
+        // Start the delay when the failure is observed, never at round entry.
+        const now_ms = self.backgroundMonotonicMs();
         lockAtomic(&self.metadata_bootstrap_retry_mutex);
         defer self.metadata_bootstrap_retry_mutex.unlock();
         self.metadata_bootstrap_retry_attempts = self.metadata_bootstrap_retry_attempts +| 1;
@@ -7747,15 +7750,15 @@ pub const DataServer = struct {
         self.next_metadata_bootstrap_retry_at_ms = now_ms +| delay_ms;
     }
 
-    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+    fn recordMetadataBootstrapError(self: *DataServer, err: anyerror) !void {
         if (!isRetryableMetadataBootstrapError(err)) return err;
-        self.deferMetadataBootstrapRetry(now_ms);
+        self.deferMetadataBootstrapRetry();
     }
 
-    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror, now_ms: u64) !void {
+    fn recordProvisionedRootRefreshMetadataError(self: *DataServer, err: anyerror) !void {
         if (!isRetryableMetadataBootstrapError(err)) return err;
         self.provisioned_root_refresh_dirty.store(true, .release);
-        self.deferMetadataBootstrapRetry(now_ms);
+        self.deferMetadataBootstrapRetry();
     }
 
     fn metadataBootstrapRetryAttemptsForTest(self: *DataServer) u32 {
@@ -7821,18 +7824,18 @@ pub const DataServer = struct {
         if (!self.metadataBootstrapRetryDue(now_ms)) return;
         if (!self.store_registration_confirmed) {
             self.registerNodeIfConfigured() catch |err| {
-                try self.recordMetadataBootstrapError(err, now_ms);
+                try self.recordMetadataBootstrapError(err);
                 return;
             };
         }
         self.store_status_ticks.store(0, .release);
-        try self.reportStoreStatusWithRetry(.full, now_ms);
+        try self.reportStoreStatusWithRetry(.full);
     }
 
     // Keep independently scheduled publication and the managed control loop
     // on one error policy. A metadata election must yield to other owners
     // until the shared retry deadline, while permanent failures still escape.
-    fn reportStoreStatusWithRetry(self: *DataServer, report_kind: StoreStatusReportKind, now_ms: u64) !void {
+    fn reportStoreStatusWithRetry(self: *DataServer, report_kind: StoreStatusReportKind) !void {
         const result = switch (report_kind) {
             .full => self.reportStoreStatus(),
             .heartbeat => self.reportStoreStatusHeartbeat(),
@@ -7851,9 +7854,9 @@ pub const DataServer = struct {
             => {},
             error.UnknownStore => {
                 self.store_registration_confirmed = false;
-                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err);
             },
-            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+            else => |retry_err| try self.recordMetadataBootstrapError(retry_err),
         };
     }
 
@@ -7984,7 +7987,7 @@ pub const DataServer = struct {
                 const registration_ready = blk: {
                     if (!self.store_registration_confirmed) {
                         self.registerNodeIfConfigured() catch |err| {
-                            try self.recordMetadataBootstrapError(err, now_ms);
+                            try self.recordMetadataBootstrapError(err);
                             break :blk false;
                         };
                     }
@@ -8013,7 +8016,7 @@ pub const DataServer = struct {
                     );
                     if (report_kind != .none) {
                         self.store_status_ticks.store(0, .release);
-                        try self.reportStoreStatusWithRetry(report_kind, now_ms);
+                        try self.reportStoreStatusWithRetry(report_kind);
                     }
                 }
 
@@ -8032,7 +8035,7 @@ pub const DataServer = struct {
                             error.LmdbUnexpected,
                             error.Corrupted,
                             => {},
-                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err, now_ms),
+                            else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err),
                         };
                     }
                 }
@@ -18301,8 +18304,7 @@ pub const DataServer = struct {
         defer self.provisioned_root_refresh_last_duration_ns.store(self.backgroundMonotonicNs() -| started_ns, .monotonic);
 
         self.refreshProvisionedReplicaRoot() catch |err| {
-            const now_ms = self.backgroundMonotonicMs();
-            self.recordProvisionedRootRefreshMetadataError(err, now_ms) catch {
+            self.recordProvisionedRootRefreshMetadataError(err) catch {
                 self.provisioned_root_refresh_dirty.store(true, .release);
             };
             _ = self.provisioned_root_refresh_failed.fetchAdd(1, .monotonic);
@@ -32737,7 +32739,10 @@ test "DataServer store status retries leadership changes on borrowed VoprIo" {
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
     const Metadata = struct {
+        vopr_io: *@import("vopr").vopr_io.VoprIo,
+        requests: usize = 0,
         reports: usize = 0,
+        delayed_error: ?anyerror = null,
 
         fn executor(self: *@This()) antfly.common.http.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -32745,6 +32750,11 @@ test "DataServer store status retries leadership changes on borrowed VoprIo" {
 
         fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.requests += 1;
+            if (self.delayed_error) |err| {
+                self.vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
+                return err;
+            }
             if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.head)) {
                 try std.testing.expectEqual(antfly.common.http.Method.GET, request.method);
                 return .{
@@ -32762,7 +32772,7 @@ test "DataServer store status retries leadership changes on borrowed VoprIo" {
             return .{ .status = 200 };
         }
     };
-    var metadata_transport = Metadata{};
+    var metadata_transport = Metadata{ .vopr_io = &vopr_io };
     remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
         alloc,
         &metadata_api_urls,
@@ -32779,6 +32789,7 @@ test "DataServer store status retries leadership changes on borrowed VoprIo" {
             .store_id = 19,
             .role = "data",
             .failure_domain = "test",
+            .api_url = "http://store.test",
         },
         .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
@@ -32866,6 +32877,40 @@ test "DataServer store status retries leadership changes on borrowed VoprIo" {
     vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
     try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
     try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
+    // Cover actual transport failures that complete after the old deadline
+    // would already have elapsed, for both publication and registration.
+    server.setRemoteMetadataFetchErrorForTest(null);
+    for ([_]bool{ true, false }) |registered| {
+        server.clearMetadataBootstrapRetry();
+        server.store_registration_confirmed = registered;
+        server.store_status_dirty.store(true, .release);
+        remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+        metadata_transport.delayed_error = error.NotLeader;
+        const started_at_ms = server.backgroundMonotonicMs();
+        const requests_before = metadata_transport.requests;
+        try server.runStoreStatusRoundOnly();
+        const failed_at_ms = server.backgroundMonotonicMs();
+        try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
+        try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+        try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+        const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+        try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
+        try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+        try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+        // No new transport call may start until the delay after completion
+        // expires. A permanent failure at that boundary must still escape.
+        metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
+        try server.runStoreStatusRoundOnly();
+        vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
+        try server.runStoreStatusRoundOnly();
+        try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+        vopr_io.monotonic_ns += std.time.ns_per_ms;
+        try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+        try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
+        try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+        try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+    }
     try vopr_io.ensureNoCapabilityViolation();
 }
 
