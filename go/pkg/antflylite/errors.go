@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package antflylite
 
@@ -19,7 +25,14 @@ const (
 	IntentConflict  ErrorCode = 4
 	TxnNotFound     ErrorCode = 5
 	Busy            ErrorCode = 6
-	Internal        ErrorCode = 255
+	// OutcomeUnknown means publication succeeded in the running process, but
+	// crash durability could not be confirmed. Inspect the destination and do
+	// not retry the operation automatically.
+	OutcomeUnknown ErrorCode = 7
+	// Unsupported means the operation requires a platform or filesystem
+	// capability that is unavailable. Retrying unchanged will not succeed.
+	Unsupported ErrorCode = 8
+	Internal    ErrorCode = 255
 )
 
 var errorCodeNames = map[ErrorCode]string{
@@ -30,6 +43,8 @@ var errorCodeNames = map[ErrorCode]string{
 	IntentConflict:  "ANTFLY_INTENT_CONFLICT",
 	TxnNotFound:     "ANTFLY_TXN_NOT_FOUND",
 	Busy:            "ANTFLY_BUSY",
+	OutcomeUnknown:  "ANTFLY_OUTCOME_UNKNOWN",
+	Unsupported:     "ANTFLY_UNSUPPORTED",
 	Internal:        "ANTFLY_INTERNAL",
 }
 
@@ -40,7 +55,9 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	VersionConflict: "a version predicate did not match the current document version",
 	IntentConflict:  "a transaction intent conflicts with the requested operation",
 	TxnNotFound:     "the requested transaction was not found",
-	Busy:            "the database is temporarily busy or a writer is already active",
+	Busy:            "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
+	OutcomeUnknown:  "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+	Unsupported:     "the operation requires a capability that is not supported by this platform or filesystem",
 	Internal:        "an internal error occurred",
 }
 

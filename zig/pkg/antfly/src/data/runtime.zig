@@ -1469,6 +1469,8 @@ const RaftTableApplyStateMachine = struct {
         version_conflict,
         decision_conflict,
         txn_not_found,
+        transaction_too_large,
+        invalid_batch_request,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             return switch (err) {
@@ -1476,6 +1478,11 @@ const RaftTableApplyStateMachine = struct {
                 error.VersionConflict => .version_conflict,
                 error.DecisionConflict => .decision_conflict,
                 error.TxnNotFound => .txn_not_found,
+                error.TransactionTooLarge => .transaction_too_large,
+                // Public/physical schema validation is a deterministic result
+                // of the replicated command. Retrying it cannot repair input.
+                // Storage corruption and resource pressure remain retryable.
+                error.InvalidBatchRequest => .invalid_batch_request,
                 else => null,
             };
         }
@@ -1486,6 +1493,8 @@ const RaftTableApplyStateMachine = struct {
                 .version_conflict => error.VersionConflict,
                 .decision_conflict => error.DecisionConflict,
                 .txn_not_found => error.TxnNotFound,
+                .transaction_too_large => error.TransactionTooLarge,
+                .invalid_batch_request => error.InvalidBatchRequest,
             };
         }
     };
@@ -3180,6 +3189,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.inference_scratch_working_set,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.relational_preparation_working_set,
         resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
@@ -26188,6 +26198,7 @@ test "data raft apply records transaction conflicts without stopping replica pro
                     .table_id = 7,
                     .name = "docs",
                     .placement_role = "data",
+                    .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"keyword\"},\"embedding\":{\"type\":\"embedding\"}},\"additionalProperties\":false}}}}",
                 }})[0..]),
                 .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
                     .group_id = group_id,
@@ -26375,6 +26386,61 @@ test "data raft apply records transaction conflicts without stopping replica pro
     try std.testing.expectEqual(@as(u64, 9), apply_sm.appliedIndex(group_id));
     const replacement_outcome = apply_sm.takeApplyOutcome(group_id, 9) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(.unknown, replacement_outcome);
+
+    // A durable size rejection must not wedge the shard behind the rejected
+    // entry (or prevent the coordinator's later abort from applying).
+    const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    const oversized_json = try std.json.Stringify.valueAlloc(alloc, .{ .title = payload }, .{});
+    defer alloc.free(oversized_json);
+    const oversized = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:oversized", .value = oversized_json }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
+    });
+    defer alloc.free(oversized);
+    const abort = try data_raft_batch.encode(alloc, "docs", .{
+        .transaction = .{ .resolve = .{ .txn_id = txn_version, .status = .aborted, .commit_version = 200 } },
+    });
+    defer alloc.free(abort);
+    const after_limit = [_]raft_engine.core.Entry{
+        .{ .term = 2, .index = 10, .entry_type = .normal, .data = oversized },
+        .{ .term = 2, .index = 11, .entry_type = .normal, .data = abort },
+        .{ .term = 2, .index = 12, .entry_type = .normal, .data = write_e },
+    };
+    for (10..13) |index| try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_limit, &.{});
+    try std.testing.expectEqual(@as(u64, 12), apply_sm.appliedIndex(group_id));
+    const rejected = apply_sm.takeApplyOutcome(group_id, 10).?;
+    try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
+
+    // Physical validation can reject input after proposal (f64 JSON fits the
+    // public embedding contract but overflows its canonical f32 encoding).
+    // It must report a rejection and let both abort and subsequent work pass.
+    const invalid = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:invalid", .value = "{\"embedding\":[1e100]}" }},
+        .transaction = .{ .prepare = .{ .txn_id = txn_a, .topology_epoch = 1 } },
+    });
+    defer alloc.free(invalid);
+    const abort_invalid = try data_raft_batch.encode(alloc, "docs", .{
+        .transaction = .{ .resolve = .{ .txn_id = txn_a, .status = .aborted, .commit_version = 201 } },
+    });
+    defer alloc.free(abort_invalid);
+    const after_validation = [_]raft_engine.core.Entry{
+        .{ .term = 2, .index = 13, .entry_type = .normal, .data = invalid },
+        .{ .term = 2, .index = 14, .entry_type = .normal, .data = abort_invalid },
+        .{ .term = 2, .index = 15, .entry_type = .normal, .data = write_e },
+    };
+    for (13..16) |index| try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_validation, &.{});
+    try std.testing.expectEqual(@as(u64, 15), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(error.InvalidBatchRequest, apply_sm.takeApplyOutcome(group_id, 13).?.failed.toError());
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 14).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 15).?);
+    try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ResourceBudgetExceeded));
+    try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
 }
 
 test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
@@ -36133,7 +36199,36 @@ test "production DataServer replicated merge actions run on VoprIo" {
         return error.MissingReceiverDocument;
     defer alloc.free(receiver_doc);
     try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", receiver_doc);
-    try receiver.runUntilIdle();
+    // Maintenance can suspend between bounded planning/validation slices. It
+    // must enter through the borrowed runtime, just like production owner work,
+    // while the host drives deterministic scheduler transitions.
+    const Maintenance = struct {
+        db: *antfly.db.DB,
+        done: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            defer self.done = true;
+            self.db.runUntilIdle() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var maintenance = Maintenance{ .db = &receiver };
+    _ = io.async(Maintenance.run, .{&maintenance});
+    while (!maintenance.done) {
+        enabled.items.clearRetainingCapacity();
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprDataServerMergeDeadlock;
+        const selected = for (enabled.items.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) break candidate;
+        } else enabled.items.items[0];
+        try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
+        transitions += 1;
+        if (transitions > 100_000) return error.VoprDataServerMergeTransitionBudgetExceeded;
+    }
+    if (maintenance.failure) |err| return err;
     const edges = try receiver.getEdges(alloc, "gr_v1", "doc:b", "links", .out);
     defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);

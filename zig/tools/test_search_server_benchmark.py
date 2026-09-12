@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -195,6 +196,10 @@ class ServerBenchmarkTest(unittest.TestCase):
                 "level": 0,
                 "size_bytes": 10,
                 "entry_count": 1,
+                "tombstone_count": None,
+                "oldest_tombstone_unix_ns": 0,
+                "visibility_id": 0,
+                "gc_requested": False,
                 "logical_entry_bytes": 0,
                 "physical_entry_bytes": 0,
                 "raw_blocks": 0,
@@ -212,9 +217,91 @@ class ServerBenchmarkTest(unittest.TestCase):
         self.assertEqual({"files": 3, "bytes": 41, "missing": 0}, manifest["physical"])
         self.assertEqual({"files": 1, "bytes": 17, "missing": 0}, manifest["untracked"])
 
+    def test_manifest_inventory_checksums_and_tombstone_counts(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = root / "manifest.bin"
+            for version in (9, 10):
+                raw = lsm_manifest([root / "1.tbl"], [], 11, version=version)
+                path.write_bytes(raw)
+                inventory = benchmark.lsm_manifest_inventory(root, path)
+                self.assertIsNotNone(inventory)
+                self.assertEqual(version, inventory["version"])
+                self.assertEqual(
+                    1 if version == 10 else None,
+                    inventory["active_runs"][0]["tombstone_count"],
+                )
+                damaged = bytearray(raw)
+                damaged[-1] ^= 1
+                path.write_bytes(damaged)
+                self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+
     def test_freshness_requires_marker_in_expectation(self):
         self.assertTrue(benchmark.template_has_marker({"expect_contains": "{marker}"}))
         self.assertFalse(benchmark.template_has_marker({"body": {"query": "constant"}}))
+
+    def test_manifest_journal_inventory_and_torn_tail(self):
+        def frame(sequence, checkpoint, manifest, removed=()):
+            body = struct.pack("<I", len(removed))
+            body += b"".join(struct.pack("<Q", run_id) for run_id in removed)
+            body += struct.pack("<I", 0) + manifest
+            header = struct.pack("<QQI", len(body), sequence, int(checkpoint))
+            return (
+                (b"ALSMJNL1" if checkpoint else b"")
+                + header
+                + struct.pack("<I", zlib.crc32(header))
+                + body
+                + struct.pack("<I", zlib.crc32(body))
+            )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = root / "manifest.bin"
+            base = frame(0, True, lsm_manifest([root / "1.tbl"], [], 11, version=10))
+            edit = frame(1, False, lsm_manifest([], [], 0, version=10), (1,))
+            for size in range(len(edit) + 1):
+                path.write_bytes(base + edit[:size])
+                inventory = benchmark.lsm_manifest_inventory(root, path)
+                self.assertIsNotNone(inventory)
+                self.assertEqual(
+                    0 if size == len(edit) else 1, len(inventory["active_runs"])
+                )
+            damaged = bytearray(base + edit)
+            damaged[-1] ^= 1
+            path.write_bytes(damaged)
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+            path.write_bytes(base + edit + edit)
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
+
+            def checked(body):
+                return body + struct.pack("<I", zlib.crc32(body))
+
+            (root / "manifest-10.checkpoint").write_bytes(base)
+            (root / "manifest-20.journal").write_bytes(
+                checked(b"ALSMSEG1" + struct.pack("<QQ", 20, 1)) + edit
+            )
+            (root / "manifest-20.next").write_bytes(
+                checked(b"ALSMNXT1" + struct.pack("<QQ", 20, 21))
+            )
+            (root / "manifest-21.journal").write_bytes(
+                checked(b"ALSMSEG1" + struct.pack("<QQ", 21, 2))
+            )
+            (root / "manifest-11.checkpoint").write_bytes(
+                frame(1, True, lsm_manifest([], [], 0, version=10))
+            )
+            for checkpoint, segment, sequence in ((10, 20, 0), (11, 21, 1)):
+                path.write_bytes(
+                    checked(
+                        b"ALSMSET1" + struct.pack("<QQQ", checkpoint, segment, sequence)
+                    )
+                )
+                inventory = benchmark.lsm_manifest_inventory(root, path)
+                self.assertIsNotNone(inventory)
+                self.assertEqual([], inventory["active_runs"])
+            (root / "manifest-21.next").write_bytes(
+                checked(b"ALSMNXT1" + struct.pack("<QQ", 21, 20))
+            )
+            self.assertIsNone(benchmark.lsm_manifest_inventory(root, path))
 
     def test_response_hit_count_supports_antfly_and_quickwit(self):
         self.assertEqual(1, benchmark.response_hit_count(b'{"hits":[{"id":"doc:1"}]}'))
@@ -335,9 +422,9 @@ class ServerBenchmarkTest(unittest.TestCase):
         self.assertEqual([b'{"body":"alpha"}\n'], received)
 
 
-def lsm_manifest(active_paths, obsolete_paths, active_size_bytes):
+def lsm_manifest(active_paths, obsolete_paths, active_size_bytes, version=8):
     raw = bytearray(b"ALSMMAN1")
-    raw.extend(struct.pack("<IQII", 8, 4, len(active_paths), len(obsolete_paths)))
+    raw.extend(struct.pack("<IQII", version, 4, len(active_paths), len(obsolete_paths)))
     for index, path in enumerate(active_paths, 1):
         encoded = str(path).encode()
         smallest = b"a"
@@ -347,11 +434,18 @@ def lsm_manifest(active_paths, obsolete_paths, active_size_bytes):
         raw.extend(
             struct.pack("<IIIIII", len(encoded), 0, len(smallest), 0, len(largest), 1)
         )
+        if version >= 10:
+            raw.extend(struct.pack("<Q", 1))
+            raw.extend(struct.pack("<Q", 123))
+            raw.extend(struct.pack("<Q", 0))
+            raw.extend(struct.pack("<I", 0))
         raw.extend(encoded + smallest + largest)
     for path in obsolete_paths:
         encoded = str(path).encode()
         raw.extend(struct.pack("<QI", 0, len(encoded)))
         raw.extend(encoded)
+    if version >= 9:
+        raw.extend(struct.pack("<I", zlib.crc32(raw)))
     return bytes(raw)
 
 

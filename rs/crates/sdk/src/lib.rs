@@ -5,6 +5,70 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_ARTIFACT_SOURCES: usize = 64;
 
+/// A successful metadata mutation. `Committed` is not a failed write: observe
+/// table/schema status instead of replaying the mutation. ResponseValue retains
+/// the HTTP status and headers, including the schema ETag.
+#[derive(Debug, Clone)]
+pub enum MutationOutcome<T> {
+    Completed(T),
+    Committed(types::CommittedMutationOutcome),
+}
+
+async fn decode_mutation_response<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+    response: reqwest::Response,
+    empty: Option<T>,
+) -> Result<ResponseValue<MutationOutcome<T>>, Error<types::Error>> {
+    match response.status() {
+        reqwest::StatusCode::ACCEPTED => {
+            ResponseValue::<types::CommittedMutationOutcome>::from_response(response)
+                .await?
+                .map(MutationOutcome::Committed)
+        }
+        reqwest::StatusCode::NO_CONTENT => {
+            let value =
+                empty.ok_or_else(|| Error::Custom("unexpected empty mutation response".into()))?;
+            ResponseValue::empty(response).map(|()| MutationOutcome::Completed(value))
+        }
+        reqwest::StatusCode::OK => ResponseValue::<T>::from_response(response)
+            .await?
+            .map(MutationOutcome::Completed),
+        _ => Err(Error::UnexpectedResponse(response)),
+    }
+}
+
+#[test]
+fn mutation_success_decoding_preserves_status_and_etag() {
+    fn response(status: u16, body: &str) -> reqwest::Response {
+        http::Response::builder()
+            .status(status)
+            .header("etag", "\"schema-7\"")
+            .body(reqwest::Body::from(body.to_owned()))
+            .unwrap()
+            .into()
+    }
+    tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+        let completed = decode_mutation_response::<types::Table>(
+            response(200, r#"{"name":"items","indexes":{},"shards":{}}"#), None,
+        ).await.unwrap();
+        assert_eq!(completed.headers()["etag"], "\"schema-7\"");
+        assert!(matches!(completed.into_inner(), MutationOutcome::Completed(table) if table.name == "items"));
+        for status in ["committed_visibility_pending", "committed_superseded", "committed_repair_required", "committed_repair_unavailable"] {
+            let json = format!(r#"{{"status":"{status}"}}"#);
+            let accepted = decode_mutation_response::<types::Table>(response(202, &json), None).await.unwrap();
+            assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+            assert_eq!(accepted.headers()["etag"], "\"schema-7\"");
+            assert!(matches!(accepted.into_inner(), MutationOutcome::Committed(_)));
+            let dropped = decode_mutation_response(response(202, &json), Some(())).await.unwrap();
+            assert!(matches!(dropped.into_inner(), MutationOutcome::Committed(_)));
+        }
+        let dropped = decode_mutation_response(response(204, ""), Some(())).await.unwrap();
+        assert_eq!(dropped.status(), reqwest::StatusCode::NO_CONTENT);
+        assert!(matches!(dropped.into_inner(), MutationOutcome::Completed(())));
+        let malformed = decode_mutation_response::<types::Table>(response(202, r#"{"name":"wrong body"}"#), None).await.unwrap_err();
+        assert!(!malformed.is_retryable());
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexConfigError(pub String);
 

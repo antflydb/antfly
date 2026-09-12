@@ -3467,8 +3467,7 @@ pub const ProvisionedTableWriteCache = struct {
         // cache owner so healthy repair does not remain indeterminate until an
         // unrelated reopen. Read-only and short-lived catch-up DBs are gated
         // out by the DB worker itself.
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
@@ -3835,8 +3834,7 @@ pub const ProvisionedTableWriteCache = struct {
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         opened.* = null;
         return .{
             .cache = self,
@@ -3896,8 +3894,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
     }
 
     pub fn getLocked(
@@ -6862,7 +6859,13 @@ pub const BoundTableWriteSource = struct {
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFileWithIo(alloc, restored.core.store, snapshot_root, restore_io);
+                try importPortableBackupFileWithOptions(alloc, restored.core.store, snapshot_root, restore_io, .{
+                    .unpublished_staging = true,
+                    .cancellation = plan.cancellation,
+                    .progress_context = plan.progress_context,
+                    .progress_fn = plan.progress_fn,
+                });
+                try restored.reloadSchemaForInternalRestore();
                 try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
                 try plan.cancellation.check();
@@ -7039,7 +7042,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
 
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
@@ -7311,7 +7314,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         try db.writeTransaction(txn_id, req);
     }
@@ -22090,7 +22093,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, cached.db, apply_req))
+                    try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
                 runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
@@ -22144,13 +22148,15 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                if (local_prepared) {
-                    const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse
-                        return error.MissingLocalTableManifest;
-                    defer alloc.free(schema_json);
-                    try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
-                } else {
-                    try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, &db, apply_req)) {
+                    if (local_prepared) {
+                        const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse
+                            return error.MissingLocalTableManifest;
+                        defer alloc.free(schema_json);
+                        try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                    } else {
+                        try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                    }
                 }
                 runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
@@ -22575,7 +22581,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try cached.db.writeTransaction(txn_id, req);
             lockAtomic(&self.local_db_mutex);
@@ -22585,7 +22591,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try db.writeTransaction(txn_id, req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -25246,7 +25252,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         // epoch check and making the transaction durable.
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
+        if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
+            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
@@ -29446,13 +29453,16 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?storage_schema.TableSchema = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
                 if (schema_json.len == 0) break :blk null;
                 var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
                 defer parsed_schema.deinit(allocator);
-                break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
+                break :blk .{
+                    .runtime_schema = try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema),
+                    .public_schema_json = schema_json,
+                };
             } else null;
-            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
             if (open_options.native_restore_open_plan) |native_plan| {
                 if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
@@ -32683,9 +32693,19 @@ fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docst
     var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
     var file_open = true;
     defer if (file_open) file.close(io);
+    const spool_path = try std.fmt.allocPrint(alloc, "{s}.spool", .{tmp_path});
+    defer alloc.free(spool_path);
+    defer if (std.fs.path.isAbsolute(spool_path))
+        std.Io.Dir.deleteFileAbsolute(io, spool_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var spool_file = try fs_paths.createFilePortable(io, spool_path, .{ .read = true, .truncate = true });
+    defer spool_file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try portable_backup.exportPortableToWriter(alloc, store, &writer.interface);
+    try portable_backup.exportPortableToWriterWithOptions(alloc, store, &writer.interface, .{
+        .spool = .{ .io = io, .file = spool_file },
+    });
     try writer.end();
     try file.sync(io);
     file.close(io);
@@ -32715,13 +32735,23 @@ fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.Do
 }
 
 fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    return importPortableBackupFileWithOptions(alloc, store, path, io, .{});
+}
+
+fn importPortableBackupFileWithOptions(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, options: portable_backup.ImportOptions) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
-    try portable_backup.importPortableFile(alloc, store, io, file, stat.size);
+    try portable_backup.importPortableFileWithOptions(alloc, store, io, file, stat.size, options);
+    try options.cancellation.check();
+    portable_backup.validateCompleteDatabaseImageAlloc(alloc, store) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
+    try options.cancellation.check();
 }
 
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
@@ -32835,6 +32865,12 @@ fn validateTableBatchAgainstLocalSchema(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    // Relational writes are validated authoritatively by DB.batch after its
+    // final transform resolution and while holding the schema generation's
+    // apply lock. Repeating the API-level load/parse/transform pass doubles
+    // CPU and allocation cost without improving error timing: both paths are
+    // synchronous and return InvalidBatchRequest before any durable mutation.
+    if (db.usesRelationalStorage()) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
@@ -32848,13 +32884,36 @@ fn validateTableBatchAgainstLocalSchema(
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, effective_writes);
 }
 
+// API preflight is advisory. Once a participant has a durable epoch/decision,
+// validating a retry against the latest catalog can reject an already accepted
+// write. DB preparation validates the pinned contract with its admission
+// ledger; terminal retries resolve the existing decision instead of its input.
+fn transactionUsesDurableContract(alloc: std.mem.Allocator, db: *db_mod.DB, txn_id: db_mod.types.TxnId) !bool {
+    if (try db.core.transactionSchemaBinding(alloc, txn_id) != null) return true;
+    const status = db.getTransactionStatus(txn_id) catch |err| switch (err) {
+        error.TxnNotFound => return false,
+        else => return err,
+    };
+    return status != .pending;
+}
+
+fn batchUsesDurableTransactionContract(alloc: std.mem.Allocator, db: *db_mod.DB, req: db_mod.types.BatchRequest) !bool {
+    const mutation = req.transaction orelse return false;
+    return switch (mutation) {
+        .prepare => |prepare| try transactionUsesDurableContract(alloc, db, prepare.txn_id),
+        else => false,
+    };
+}
+
 fn validateTransactionAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, deletes, transforms);
@@ -32865,33 +32924,16 @@ pub fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    // An empty schema is still an explicit, durable table contract. Persist
-    // the marker so transition and Raft replay can distinguish a provisioned
-    // schema-less DB from an incomplete local generation without consulting
-    // the catalog.
-    if (schema_json.len == 0) {
-        try db.core.store.put(local_schema_json_key, "");
-        return;
-    }
-
-    const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
-    defer if (previous_schema_json) |value| alloc.free(value);
-    const marker_changed = if (previous_schema_json) |value|
-        !std.mem.eql(u8, value, schema_json)
-    else
-        true;
-
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    try db.setSchema(runtime_schema);
+    // The absent/empty catalog contract has the same canonical schema as
+    // table creation. Never overwrite only the public marker: its validator
+    // and the durable runtime layout must be committed in the same epoch.
+    const effective_schema_json = if (schema_json.len == 0) tables_api.default_schema_json else schema_json;
+    // Install the public and runtime forms together so storage-boundary writes
+    // immediately use the same authoritative validator as API writes.
+    try db.setSchemaJson(alloc, effective_schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
-    try db.reloadAlgebraicSchemaConfigs(schema_json);
-    if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
+    try db.reloadAlgebraicSchemaConfigs(effective_schema_json);
 }
 
 fn loadTableIndexesJson(
@@ -33515,11 +33557,13 @@ fn validateTransactionAgainstCatalogSchema(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     table_name: []const u8,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
@@ -33825,6 +33869,47 @@ test "bound table write source resolves internal group transactions into visible
     var result = (try db.lookup(alloc, "doc:a", .{})).?;
     defer result.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+}
+
+test "relational table API retries use the durable transaction epoch and decision" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-epoch-retries", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer","minimum":0}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    var source = BoundTableWriteSource.init("docs", &db);
+    const prepared_id: db_mod.types.TxnId = @splat(31);
+    const terminal_id: db_mod.types.TxnId = @splat(32);
+    const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7);
+    defer alloc.free(participant);
+    _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", prepared_id, 10_000, 0, false, &.{participant});
+    const writes = [_]db_mod.types.TransactionWrite{.{ .key = "prepared", .value = "{\"amount\":3}" }};
+    _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+    const request = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "terminal", .value = "{\"amount\":4}" }} }};
+    const committed = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+    try std.testing.expect(committed == .committed);
+    try db.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"string"}},"required":["amount"],"additionalProperties":false}}}}
+    );
+    _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+    try std.testing.expectError(error.InvalidBatchRequest, source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{
+        .writes = &.{.{ .key = "invalid", .value = "{\"amount\":-1}" }},
+    }));
+    try std.testing.expect(try batchUsesDurableTransactionContract(alloc, &db, .{
+        .transaction = .{ .prepare = .{ .txn_id = prepared_id, .topology_epoch = 0 } },
+    }));
+    _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", prepared_id, .committed, 10_001, 0, .propose);
+    const retried = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+    try std.testing.expect(retried == .committed);
+    const row = (try db.get(alloc, "prepared")).?;
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"amount\":3}", row);
+    try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
 }
 
 test "bound stable single-group transaction retry does not reapply transforms" {
@@ -34845,12 +34930,38 @@ test "bound table write source backs up and restores a portable local table" {
         .timestamp_ns = 2,
     });
 
-    _ = try source.source().restoreTable(alloc, "docs", .{
+    const Progress = struct {
+        cancelled: std.atomic.Value(bool) = .init(false),
+        cancel_on_rows: bool = true,
+        rows: u64 = 0,
+        fn update(ctx: ?*anyopaque, progress: portable_backup.ImportProgress) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.rows = progress.rows_validated;
+            if (self.cancel_on_rows and self.rows > 0) self.cancelled.store(true, .release);
+        }
+    };
+    var progress = Progress{};
+    const restore_plan = backups_api.TableRestorePlan{
         .backup_root = backup_root,
         .manifest = &manifest,
         .artifact_backup_id = manifest.backup_id,
         .source_location = "file:///bound-portable-test",
-    });
+        .cancellation = .fromAtomic(&progress.cancelled),
+        .progress_context = &progress,
+        .progress_fn = Progress.update,
+    };
+    try std.testing.expectError(error.Canceled, source.source().restoreTable(alloc, "docs", restore_plan));
+    try std.testing.expectEqual(@as(u64, 1), progress.rows);
+    {
+        var unchanged = (try db.lookup(alloc, "doc:a", .{})).?;
+        defer unchanged.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, unchanged.json, "\"beta\"") != null);
+    }
+    progress.cancel_on_rows = false;
+    progress.cancelled.store(false, .release);
+    progress.rows = 0;
+    _ = try source.source().restoreTable(alloc, "docs", restore_plan);
+    try std.testing.expectEqual(@as(u64, 1), progress.rows);
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
@@ -34862,6 +34973,34 @@ test "bound table write source backs up and restores a portable local table" {
     });
     defer search_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), search_result.total_hits);
+}
+
+test "portable file restore rejects documents without identity coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-source", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/identity-incomplete.afb", .{tmp.sub_path});
+    defer alloc.free(archive_path);
+
+    {
+        var source = try db_mod.DB.open(alloc, source_path, .{ .start_optional_runtimes = false });
+        defer source.close();
+        const key = try internal_keys.documentKeyAlloc(alloc, "doc:missing-identity");
+        defer alloc.free(key);
+        try source.core.store.put(key, "{\"title\":\"reject\"}");
+        try exportPortableBackupFile(alloc, source.core.store, archive_path, null);
+    }
+
+    var target = try db_mod.DB.open(alloc, target_path, .{ .start_optional_runtimes = false });
+    defer target.close();
+    try std.testing.expectError(
+        error.InvalidBackupRequest,
+        importPortableBackupFile(alloc, target.core.store, archive_path, null),
+    );
 }
 
 test "provisioned table write source backs up and restores a local table" {
@@ -35650,8 +35789,6 @@ test "provisioned table write source backs up and restores full_text writes from
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -35812,8 +35949,8 @@ test "provisioned table write source backs up and restores full_text writes from
     try std.testing.expectEqual(@as(u16, 200), public_query.status);
     try std.testing.expect(std.mem.indexOf(u8, public_query.body, "\"doc:a\"") != null);
 
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+    defer db.close();
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
@@ -35872,7 +36009,7 @@ test "provisioned native backup restore repeats through shared read and write ow
                     .table_id = 7,
                     .name = "docs",
                     .description = "docs table",
-                    .schema_json = "",
+                    .schema_json = tables_api.default_schema_json,
                     .read_schema_json = "",
                     .indexes_json = tables_api.default_indexes_json,
                     .replication_sources_json = "[]",
@@ -36014,7 +36151,7 @@ test "provisioned native backup restore repeats through shared read and write ow
             .table_id = 7,
             .name = "docs",
             .description = "docs table",
-            .schema_json = "",
+            .schema_json = tables_api.default_schema_json,
             .read_schema_json = "",
             .indexes_json = tables_api.default_indexes_json,
             .replication_sources_json = "[]",
@@ -36725,9 +36862,16 @@ test "auto bulk max-window request waits for idle finish" {
     try std.testing.expect(try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns));
     const primary_after_idle = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
     try std.testing.expectEqual(primary_before_idle.immutable_flushes, primary_after_idle.immutable_flushes);
-    try std.testing.expectEqual(primary_before_idle.manifest_writes, primary_after_idle.manifest_writes);
+    // Idle completion may settle pending manifest/obsolete-file metadata.
+    // Its contract is no forced SST publication, not zero metadata writes.
+    try std.testing.expectEqual(primary_before_idle.flushes, primary_after_idle.flushes);
+    try std.testing.expectEqual(primary_before_idle.table_file_writes, primary_after_idle.table_file_writes);
+    try std.testing.expectEqual(primary_before_idle.compactions, primary_after_idle.compactions);
     try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
+    try std.testing.expect(!try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns + 1));
+    const primary_after_recheck = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
+    try std.testing.expectEqual(primary_after_idle.manifest_writes, primary_after_recheck.manifest_writes);
 }
 
 test "maintenance lease batch releases all pins on every allocation failure" {
@@ -38851,7 +38995,7 @@ test "bound table write source validates transforms against same-batch writes" {
 
     var source = BoundTableWriteSource.init("docs", &db);
     var req = tables_api.CreateTableRequest{
-        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"keyword\"}}}}}}"),
+        .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}}}}}}"),
     };
     defer req.deinit(alloc);
     _ = try source.source().createTable(alloc, "docs", req);
@@ -39642,8 +39786,10 @@ test "provisioned table write source rejects writes that violate enforced docume
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+    }
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -39675,6 +39821,7 @@ test "provisioned table write source rejects writes that violate enforced docume
     };
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
     try std.testing.expectError(error.InvalidBatchRequest, source.source().batch(alloc, "docs", .{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }},
     }));
@@ -48558,6 +48705,7 @@ test "provisioned table write source restore repair completion retires cached ve
     var stale_status = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
         .stats = .{
+            .doc_count = 99,
             .repair_degraded = true,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
@@ -50608,6 +50756,7 @@ test "provisioned owner publication clears ambiguous replay-only backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
@@ -50630,6 +50779,7 @@ test "provisioned owner publication clears ambiguous replay-only backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -50704,6 +50854,7 @@ test "provisioned owner publication replaces stale cached backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
@@ -50727,6 +50878,7 @@ test "provisioned owner publication replaces stale cached backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -56432,6 +56584,7 @@ test "provisioned table write source create table provisions local indexes and s
     Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
     Catalog.schema = updated_schema_json;
     _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
+    Catalog.schema = updated_schema_json;
 
     {
         lockAtomic(&source.local_db_mutex);
@@ -57139,8 +57292,6 @@ test "provisioned table write source restore table does not hold local db mutex 
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -57271,8 +57422,8 @@ test "provisioned table write source restore table does not hold local db mutex 
     if (worker.err) |err| return err;
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+    defer db.close();
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);

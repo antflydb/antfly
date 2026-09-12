@@ -1059,6 +1059,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "parseRemoteSearchResult preserves grouped hierarchy matches",
             "remote query returns the shard-selected identity generation",
             "remote simple vector query uses vector worker route",
+            "remote scan fails closed without streaming and honors cancellation before transport",
+            "remote scan prefers one snapshot-stable streaming request",
             "simple vector shard request lowers to vector worker envelope",
             "api http client forwards internal query controls and maps remote timeout",
             "api http client encodes lookup route and query components",
@@ -1239,6 +1241,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_derived_coverage_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_derived_coverage_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "live repair admission supersedes cached vector serviceability",
             "coverage policy accepts only the public embeddings contract",
@@ -1356,6 +1359,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "opening embeddings observation requires explicit serviceability authority",
             "cached owner observation preserves serving authority without convergence authority",
             "index-local convergence fence does not revoke a completed sibling",
+            "accepted target observation survives late snapshots but not new commit fences",
             "single group synthetic publication preserves owner runtime authority",
             "target-scoped stale full text observation cannot publish old readiness",
             "targeted full text sibling remains authoritative during table catch up",

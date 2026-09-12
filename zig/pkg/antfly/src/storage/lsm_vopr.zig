@@ -281,7 +281,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             try builder.addNamed(allocator, "storage.lsm.writes", @intCast(state.writes));
             try builder.addNamed(allocator, "storage.lsm.deletes", @intCast(state.deletes));
             try builder.addNamed(allocator, "storage.lsm.crashes", @intCast(state.crashes));
-            try builder.addNamed(allocator, "storage.lsm.runs", @intCast(state.lsm.runs.items.len));
+            try builder.addNamed(allocator, "storage.lsm.runs", @intCast(state.lsm.runs.count()));
             try builder.addNamed(allocator, "storage.lsm.immutable_memtables", @intCast(state.lsm.immutable_memtables.items.len));
             try builder.addNamed(allocator, "storage.lsm.compactions", @intCast(state.lsm.compaction_stats.compactions));
             try builder.addNamed(allocator, "storage.lsm.wal_append_records", @intCast(writes.wal_append_records));
