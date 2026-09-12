@@ -110,6 +110,41 @@ change, reads after a cold reopen are honestly cold (45-50 µs at 50K) until
 touched, and RSS grows with demand rather than by corpus size. Both store
 suites pass (`vector-payload-test` 48/48, `vector-block-store-test` 33/33).
 
+### VectorDBBench 50K qualification A/B (2026-09-12)
+
+Three alternating pairs of `scripts/run_vdbbench_qualification.sh` arms
+(Performance1536D50K, `vector_store` tables, native HBC, float32 blocks,
+batch 100, 4 load workers, query concurrency 1/10/20/30 for 30 s, 30 s mixed,
+1,000-query profile, 4 GiB process budget) on the same 4 vCPU host, ordered
+candidate/control, control/candidate, control/candidate. Control is the
+parent commit's store code; candidate is this branch. All six arms qualified.
+The macOS-only footprint sampler was replaced by
+`scripts/footprint_sampler_linux.py`; `scripts/compare_vdbbench_arms.py`
+produced the table.
+
+| Metric (median, range over 3 arms) | Control | Candidate |
+| --- | ---: | ---: |
+| Source inventory after restart (table status `inventory_update_ns`) | 3.97 s (3.84-4.40) | 6.7 ms (6.5-6.9) |
+| Restart to index ready | 2.17 s (2.16-2.18) | 2.16 s (2.16-2.17) |
+| Live ready seconds | 52.0 (50.8-54.3) | 53.2 (43.8-54.3) |
+| Live max QPS | 305 (299-323) | 316 (286-320) |
+| Live recall | 0.985 | 0.986 |
+| Mixed query QPS / p99 | 96.6 / 269 ms | 93.7 / 268 ms |
+| Mixed write rows/s / p99 | 341 / 3.57 s | 345 / 2.91 s |
+| Fixed churn / enrichment time | 30.8 s / 23.4 s | 30.7 s / 23.1 s |
+| Peak RSS live / after restart | 2,428 / 590 MiB | 2,483 / 591 MiB |
+| Disk after restart | 388 MiB | 393 MiB |
+
+The only repeatable difference is the inventory: about 600x less work after
+every restart, in all three pairs. Restart-to-ready is unchanged because the
+DB open profile (0.28-0.30 s in both arms) does not include the source store;
+its inventory runs off the readiness path and previously competed with the
+first post-restart queries. Every other metric moves in both directions
+within pair noise on this host. Three of the six reopened query passes (two
+control, one candidate) hit an unrelated 80-120 ms p99 stall during the cold
+and warm serial passes; it does not correlate with the binary, so those
+passes are reported by range rather than compared.
+
 ## 3. WAL checkpoint and delta-chain compaction run under the writer lock
 
 `prepareBatch` calls `checkpointLocked` when the WAL reaches the admission
