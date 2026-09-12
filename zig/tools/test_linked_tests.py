@@ -150,6 +150,38 @@ test "fixture consumer" {
         )
         self.build("compile", f"-Dtarget={target}")
 
+    def test_concurrent_execution_retains_diagnostics_and_runs_again(self):
+        self.write(
+            "barrier.py",
+            '''import pathlib, sys, time
+root = pathlib.Path(__file__).parent
+name = sys.argv[1]
+own = root / (name + ".count")
+other = root / (("second" if name == "first" else "first") + ".count")
+generation = int(own.read_text()) + 1 if own.exists() else 1
+temporary = own.with_suffix(".tmp")
+temporary.write_text(str(generation))
+temporary.replace(own)
+deadline = time.monotonic() + 10
+while not other.exists() or int(other.read_text()) != generation:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("independent test runs were serialized")
+    time.sleep(.01)
+print("stdout-" + name)
+print("diagnostic-" + name, file=sys.stderr)
+''',
+        )
+        for generation in (1, 2):
+            output = self.build("concurrency")
+            for name in ("first", "second"):
+                self.assertIn("diagnostic-" + name, output)
+                self.assertEqual(
+                    (self.build_dir / (name + ".count")).read_text(), str(generation)
+                )
+        captured = list((self.root / "cache").rglob("stdout"))
+        self.assertTrue(any(p.read_text() == "stdout-first\n" for p in captured))
+        self.assertTrue(any(p.read_text() == "stdout-second\n" for p in captured))
+
 
 if __name__ == "__main__":
     unittest.main()

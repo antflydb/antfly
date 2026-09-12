@@ -15,6 +15,44 @@
 const std = @import("std");
 const build_test_filters = @import("../../../build_test_filters.zig");
 
+/// Keep test diagnostics without holding Zig's global terminal lock for the
+/// lifetime of the child. Explicit side effects preserve execution on every
+/// invocation even though stdout is retained as a captured output file.
+pub fn configureTestRun(run: *std.Build.Step.Run) void {
+    // Preserve explicit output/exit contracts, including expected failures.
+    if (run.stdio == .zig_test or run.stdio == .check) return;
+    if (run.stdio == .inherit) run.stdio = .infer_from_args;
+    run.expectExitCode(0);
+    run.has_side_effects = true;
+    if (run.captured_stdout == null) _ = run.captureStdOut(.{});
+}
+
+/// Apply the same execution policy to simple runners constructed by library
+/// owners. Inventories remain cacheable; server-protocol tests retain Zig's
+/// native execution policy.
+pub fn configureSimpleTestRuns(b: *std.Build, root: *std.Build.Step) void {
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer visited.deinit();
+    configureSimpleTestRunsRecursive(root, &visited);
+}
+
+fn configureSimpleTestRunsRecursive(step: *std.Build.Step, visited: *std.AutoHashMap(*std.Build.Step, void)) void {
+    if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Run)) |run| {
+        if (run.producer) |producer| {
+            if (producer.kind == .@"test") {
+                if (producer.test_runner) |runner| {
+                    const inventory = for (run.argv.items) |arg| {
+                        if (arg == .bytes and std.mem.eql(u8, arg.bytes, "--list-tests")) break true;
+                    } else false;
+                    if (runner.mode == .simple and !inventory) configureTestRun(run);
+                }
+            }
+        }
+    }
+    for (step.dependencies.items) |dependency| configureSimpleTestRunsRecursive(dependency, visited);
+}
+
 pub const Imports = struct {
     runtime: @import("imports.zig").AntflyRootImports,
     vopr: *std.Build.Module,
@@ -259,7 +297,9 @@ pub fn addAntflyTestRunArtifact(
         tests.test_runner = .{ .path = runner_path, .mode = .simple };
         runner_path.addStepDependencies(&tests.step);
     }
-    return b.addRunArtifact(tests);
+    const run = b.addRunArtifact(tests);
+    configureTestRun(run);
+    return run;
 }
 
 /// Zig's compile-time filters can retain imported anonymous tests needed for

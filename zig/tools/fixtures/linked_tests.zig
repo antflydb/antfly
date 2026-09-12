@@ -44,4 +44,12 @@ pub fn build(b: *std.Build) void {
     compile_step.dependOn(&consumer.executable.step);
     const run_step = b.step("test", "Run the audited pair");
     run_step.dependOn(&linked.runPair(b, consumer, implementation).step);
+    const concurrent = b.step("concurrency", "Verify test execution overlaps and is never cached");
+    for ([_][]const u8{ "first", "second" }) |label| {
+        const child = b.addSystemCommand(&.{"python3"});
+        child.addFileArg(b.path("barrier.py"));
+        child.addArg(label);
+        @import("pkg/antfly/build/test_support.zig").configureTestRun(child);
+        concurrent.dependOn(&child.step);
+    }
 }

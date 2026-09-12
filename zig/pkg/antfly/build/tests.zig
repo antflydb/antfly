@@ -1214,7 +1214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Own the complete fast API query module as one stable lane. Exact
         // per-test entries let new admission and ownership regressions compile
         // out of CI until somebody remembered to extend this list.
-        "api.query.test.",
+        "api.query.",
         "graph operation execution order is independent of declaration order",
         "graph operation execution order rejects cycles",
         "graph query dependency sorting enforces request-wide operation bounds",
@@ -5334,6 +5334,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             }
         }
         run_db_core_partitioned_tests.stdio = .inherit;
+        @import("test_support.zig").configureTestRun(run_db_core_partitioned_tests);
         run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
         unit_test_step.dependOn(&run_db_core_partitioned_tests.step);
         unit_storage_sharded_test_step.dependOn(&run_db_core_partitioned_tests.step);

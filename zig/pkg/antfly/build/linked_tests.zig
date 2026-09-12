@@ -11,6 +11,7 @@ pub const Artifact = struct {
 
     pub fn run(self: Artifact, b: *std.Build) *std.Build.Step.Run {
         const step = b.addRunArtifact(self.executable);
+        @import("test_support.zig").configureTestRun(step);
         @import("test_support.zig").addRuntimeTestFilters(b, step, self.object.filters);
         return step;
     }

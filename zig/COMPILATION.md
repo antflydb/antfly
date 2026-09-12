@@ -157,6 +157,16 @@ its target and foreign-execution policy. The test-only owner fixture supplies
 allocator callbacks and borrowed runtime I/O so allocation-failure and VOPR
 checks continue to exercise the real provider.
 
+Simple test runners use piped diagnostics and captured stdout rather than
+inheriting the terminal. In Zig 0.16, inherited output holds a global terminal
+lock for the child's lifetime, serializing otherwise independent tests.
+Explicit side effects force test execution on every invocation; inventories
+remain cacheable and server-protocol runners retain Zig's execution policy.
+Existing memory reservations still bound concurrent tests. A two-process
+barrier regression verifies overlap, repeated execution, and retained output.
+CI requests `--summary all` for unit and E2E builds to report each compilation
+and run step's duration and available peak-memory measurements.
+
 `max_rss` claims govern compilation admission. There are no artificial archive
 ordering dependencies; independent compilations can run concurrently when the
 runner has sufficient memory. Release memory measurements from the earlier

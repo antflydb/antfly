@@ -372,6 +372,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     usermgr_mod.link_libc = link_libc;
+    usermgr_mod.addImport("antfly_source_root", usermgr_mod);
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
     usermgr_mod.addImport("bloom", bloom_mod);
     usermgr_mod.addImport("antfly_platform", platform_mod);
@@ -1551,5 +1552,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, unit_test_step);
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
+    @import("pkg/antfly/build/test_support.zig").configureSimpleTestRuns(b, test_step);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
 }

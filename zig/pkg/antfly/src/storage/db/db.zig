@@ -69138,12 +69138,24 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const Size = struct {
         fn physical(b: *lsm_backend_mod.Backend) !u64 {
             var bytes = b.snapshotMaintenanceStats().wal_retained_bytes;
+            // Maintenance can replace the run and obsolete-ledger roots.
+            // Keep their borrowed cursors valid throughout this measurement.
+            platform.sync.lockYielding(&b.mu);
+            defer b.mu.unlock();
             var cursor = b.runs.cursor();
             while (cursor.next()) |run| if (run.path) |name| {
                 bytes += try b.storage.?.fileSize(name);
             };
             var obsolete_cursor = b.obsolete_paths.iterator();
-            while (obsolete_cursor.next()) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
+            while (obsolete_cursor.next()) |obsolete| {
+                // Reclamation deletes off-lock before removing its durable
+                // ledger entry. A deleted obsolete file occupies zero bytes;
+                // missing active files and other I/O errors still fail above.
+                bytes += b.storage.?.fileSize(obsolete.path) catch |err| switch (err) {
+                    error.FileNotFound => 0,
+                    else => return err,
+                };
+            }
             return bytes;
         }
     };
