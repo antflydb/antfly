@@ -1261,3 +1261,88 @@ Debug retains four messages and ReleaseFast retains one, where two are required.
 With the fix, all 410 Raft tests pass in Debug, ReleaseSafe and ReleaseFast. All six
 unchanged differential traces also match the etcd/raft v3.6.0 reference runner.
 These harness-only changes do not alter the benchmark measurements above.
+
+## Sparse reports and shared reconciliation views
+
+Production source `5206bfe15` implements acknowledged sparse reports, retained
+reconciliation inputs and indexed report collection. Benchmark follow-up
+`1f1670980` makes both snapshot comparison paths consume retained runtime payloads.
+Main `3ea6fcead` is included through merge `2a0e2ee85`.
+[Raw results, settings and provenance](system_catalog_sparse_workloads_2026_09_12.json)
+retain every component case and the application binary hash.
+
+Components use Zig 0.16.0 ReleaseFast and `c_allocator`. Both component binaries
+compiled before timing; task-owned builds, tests and preflight workloads had
+finished. The recorded application workload ran afterward, separately, using
+Debug. Unrelated host activity and thermal state were uncontrolled. The paired
+comparisons below use the same binary and inputs; they compare the full-report,
+linear-scan or deep-clone paths with the new paths, not whole-server throughput.
+
+| Component, p50 | Reference path | New path |
+| --- | --- | --- |
+| HTTP prepare/encode/free, 10,000 groups, one changed group | 30.068 ms full JSON | 1.969 ms sparse prepare/encode/commit |
+| Apply, 10,000 groups, one changed group's Raft facts | 20.752 ms full report | 5.019 ms sparse report |
+| Collection lookups, 10,000 tables/ranges | 64.185 ms repeated scans | 0.164 ms build/use/free indexes |
+| Snapshot capture/read/release, 100 stores × 100 groups | 1.830 ms deep clone | 0.001541 ms retained leaves |
+
+The publisher retains acknowledged per-group leaves, compares against that map
+directly and allocates only changed replacements. Unchanged clocks remain at
+their last transmitted values, preserving periodic refresh. The HTTP fixture
+shrinks from 36,127,753 to 4,262 bytes. It contains no volatile samples and excludes
+network/admission/replication. Its full 10,000-group JSON exceeds the default
+32 MiB HTTP body limit: this demonstrates encoding cost, not successful bootstrap
+of that inventory through the default server configuration.
+
+The applied command shrinks from 8,210,124 to 1,044 bytes. The new bounded binary
+envelope reuses the StoreRecord codec and excludes HTTP-only embedding activity.
+Admission reads affected groups through covering references; apply checks the
+exact cursor again. A full report repairs unknown bases after snapshot install;
+ordinary reopen preserves the cursor and payload atomically. Empty deltas with
+unchanged headers retain their cursor without generating a Raft entry. Exact
+replays acknowledge the prior commit, while stale bases and incarnations cannot
+overwrite it. These semantics are tested through the real HTTP/Raft path.
+
+Sparse apply still scans compact membership records. A changed runtime component
+also rewrites its containing 64-slot page: that case took 5.151 ms and wrote
+59,417 WAL bytes. The group-facts-only sparse case wrote 10,232 bytes versus
+10,111 for the full-report equivalent; the cursor adds 121 bytes. Full/reference
+paths remain in the artifact: at 10,000 groups, cached/fresh-clock/all-group/full
+hydration p50s were 18.695/24.864/25.475/4.618 ms, and reference apply was 10.448 ms.
+This work does not make full refreshes or full hydration cheap.
+
+Snapshot measurements include capture, one runtime payload read per store and
+release. Shared views batch 1,000 iterations per timer reading to resolve small
+durations; both paths validate the payload. These are snapshot costs, excluding
+the reconciliation plan. Production local reconciliation pins catalog generations
+and store leaves; transition readiness pins store leaves. Public owned snapshots
+clone large payloads after releasing publication locks. Smaller workflow progress
+collections still use owned copies.
+
+### Sustained application traffic
+
+The recorded disposable cluster has three metadata and three data nodes, 100
+one-shard relational tables and one desired data replica per shard. Table creation
+and shard readiness p50s were 148.216 and 711.545 ms, measured separately. Qualified
+lookup/query/join p50s were 30.001/51.882/53.861 ms; scoped listing was 79.586 ms.
+
+The new `--mixed-seconds 30` workload runs three clients concurrently and validates
+every response. It completed 68 full-index batches of 100 upserts, 188 qualified
+searches and 153 scoped inventory reads without request failures. Ingestion,
+search and discovery p50/p95 latencies were 463.697/918.570,
+53.716/721.463 and 78.191/719.527 ms. The 100 documents are repeatedly updated;
+this is a bounded working set, not bulk storage growth. Tail latency remains
+material. This unpaired run establishes neither a distributed speedup nor a
+resolution of the earlier wide-schema/three-replica and empty-graph failure cases.
+
+Validation passed: Debug server, 81 storage, 34 catalog, nine catalog transport,
+126 metadata service, 60 catalog API and 20 benchmark test executions. Some
+focused selections overlap. All 21 distributed status/system catalog E2Es passed;
+the expanded telemetry-only distributed case then passed separately. Coverage
+includes duplicate observations, explicit removals, stale bases/incarnations,
+lost-response replay, snapshot/reopen recovery, allocation failures, malformed
+binary/HTTP input and immutable-leaf lifetime. Ruff and whitespace checks passed.
+These are focused checks, not a full repository-suite pass.
+The additional repository-wide license-header check reports pre-existing header
+drift (984 files before normalization, 982 remaining). The two short headers in
+files touched by this follow-up were normalized; all follow-up files now match
+their canonical headers. No runtime behavior changed in that cleanup.
