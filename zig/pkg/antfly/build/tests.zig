@@ -205,7 +205,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const admission_bench_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"store report workload benchmark selected admission"},
+        .filters = &.{ "store report workload benchmark selected admission", "store report workload benchmark reconciliation view" },
     });
     const run_report_bench = b.addRunArtifact(report_bench_tests);
     const run_admission_bench = b.addRunArtifact(admission_bench_tests);

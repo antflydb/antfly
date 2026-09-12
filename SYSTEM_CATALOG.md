@@ -448,6 +448,34 @@ the header. Apply retains runtime pages without decoding, hashing or rewriting
 them. Reference work remains proportional to that store's groups, independent
 of the size of its unchanged runtime/index payloads.
 
+Current reporters negotiate the sparse report endpoint
+`POST /internal/v1/nodes/{store}/status/update`, gated by topology protocol 8.
+The owner retains acknowledged per-group leaves and sends complete replacements
+only for changed groups, with explicit removals for retired groups. Duplicate
+observations keep their order within each group. A cursor identifies the reporter
+incarnation, monotonically increasing request sequence and SHA-256 of the exact
+HTTP request. A delta names its exact acknowledged base; both admission and apply
+check that fence. Responses acknowledge committed state, so an exact retry after a
+lost response is idempotent. Stale bases cause a full-inventory repair, never a
+best-effort patch. Unsupported peers use the existing full/reference endpoints.
+An empty delta with an unchanged header returns the existing applied cursor,
+including for telemetry-only requests; acknowledging a transport sequence alone
+does not require a Raft entry.
+
+The acknowledged baseline retains the last transmitted observation clocks for
+unchanged groups. Local clock coalescing therefore cannot keep delaying the
+periodic freshness update. Preparing a report owns only changed leaves and reserves
+commit capacity before network I/O; errors leave the prior leaves intact.
+Admission reads selected report components through covering group references.
+Raft command 56 carries the durable update and request digest; volatile embedding
+activity travels separately in the HTTP envelope and is checked against committed
+identities before entering the activity cache. It does not enter the Raft command.
+Apply preserves untouched component pages. It still scans compact membership
+records to maintain the page directory; sparse apply is not independent of the
+store's group count. Cursor and component updates commit in the same transaction.
+Ordinary store replacement invalidates the cursor. Reopening preserves it;
+installing a logical snapshot discards it and requires a full report.
+
 Committed projection notifications coalesce changed store IDs and separate group
 and runtime change flags in a bounded, allocation-free queue. Refcounted immutable
 store snapshots own separate group and runtime leaves. Header updates share both;
@@ -467,8 +495,13 @@ prior repair index when preserving committed facts across protocol gating.
 Allocation failure releases candidates without modifying pinned observations.
 
 Other projection collections refresh only when their own kind changes. Overflow,
-snapshot replacement and failed refresh force a full rebuild. General reconciliation
-consumers still receive owned snapshots; their full-inventory cloning remains.
+snapshot replacement and failed refresh force a full rebuild. Local reconciliation
+retains the captured immutable catalog generation and store leaves. Transition
+readiness retains store leaves as well. Public owned snapshots clone their large
+payloads after releasing publication locks. Smaller workflow progress collections
+still use owned copies. Data-owner report collection builds table-ID and group-ID
+indexes over the same captured inventory; group lookup no longer repeatedly scans
+all tables and ranges or resolves a newer catalog generation.
 
 Raft transport batches ready heartbeat and heartbeat-response messages only when
 destination, source identity, protocol, address and endpoint metadata match. Frames

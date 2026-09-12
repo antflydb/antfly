@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("store_report_update.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_operations = @import("../system_catalog/operations.zig");
 const ant_json = @import("antfly-json");
@@ -159,6 +160,7 @@ pub const AdminSource = struct {
         cancel_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         finalize_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         upsert_store: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) anyerror!void = null,
+        report_store_update: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) anyerror!store_report_update.Cursor = null,
         report_store_status: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) anyerror!void = null,
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
@@ -599,6 +601,7 @@ pub const AdminSource = struct {
                 .finalize_node_shutdown = metadataHttpServiceFinalizeNodeShutdown,
                 .upsert_store = metadataHttpServiceUpsertStore,
                 .report_store_status = metadataHttpServiceReportStoreStatus,
+                .report_store_update = metadataHttpServiceReportStoreUpdate,
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
                 .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
@@ -1402,6 +1405,11 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceReportStoreUpdate(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) !store_report_update.Cursor {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.reportStoreUpdate(alloc, context, bytes);
+    }
+
     fn metadataHttpServiceReportStoreStatus(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         defer freeStoreStatusReport(alloc, report);
@@ -1661,6 +1669,7 @@ pub const MetadataHttpServer = struct {
         try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/heartbeat", httpx.Handler.bind(self, metadataReportNodeHeartbeat));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/update", httpx.Handler.bind(self, metadataReportNodeUpdate));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
@@ -2634,7 +2643,7 @@ pub const MetadataHttpServer = struct {
 
     fn nodeMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
-            error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
+            error.InvalidArgument, error.StoreIdentityMismatch, error.InvalidStoreReporterFence, error.InvalidNodeID => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
             error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
@@ -2685,6 +2694,17 @@ pub const MetadataHttpServer = struct {
         self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
         try ctx.setHeader(metadata_table_manager.store_runtime_reference_header, "1");
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReportNodeUpdate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing report update");
+        var parsed = std.json.parseFromSlice(store_report_update.Update, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid report update");
+        defer parsed.deinit();
+        if (parsed.value.report.store_id != node_id) return ctx.status(400).text("store identity mismatch");
+        const apply = self.source.vtable.report_store_update orelse return ctx.status(404).text("unsupported");
+        const cursor = apply(self.source.ptr, ctx.allocator, requestContext(ctx), body) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(200).json(cursor);
     }
 
     fn metadataReportNodeHeartbeat(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

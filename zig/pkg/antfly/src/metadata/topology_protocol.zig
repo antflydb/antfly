@@ -25,7 +25,9 @@ const std = @import("std");
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
 /// Version 7 adds system catalog records and atomic catalog/table publication.
-pub const current_version: u16 = 7;
+/// Version 8 adds acknowledged sparse store reports.
+pub const current_version: u16 = 8;
+pub const store_report_update_version: u16 = 8;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 pub const system_catalog_version: u16 = 7;

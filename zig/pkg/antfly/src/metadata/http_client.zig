@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("store_report_update.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
@@ -595,6 +596,20 @@ pub const MetadataHttpClient = struct {
         defer resp.deinit(self.alloc);
         try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnknownStore, null);
         return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
+    }
+
+    pub fn reportNodeUpdate(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/update", .{store_id});
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        defer resp.deinit(self.alloc);
+        if (resp.status == 405) return error.UnsupportedOperation;
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        var parsed = try std.json.parseFromSlice(store_report_update.Cursor, self.alloc, resp.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     pub fn reportNodeHeartbeat(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {

@@ -265,6 +265,82 @@ def listing_table_config(args):
     return table_config
 
 
+def mixed_catalog_workload(
+    base: str, scope: str, table: str, count: int, seconds: int
+) -> dict:
+    """Sustained ingestion, search, and tenant discovery while owners publish reports."""
+    barrier = threading.Barrier(3, timeout=30)
+    stop = threading.Event()
+
+    def worker(kind):
+        api = Api(base)
+        durations = []
+        try:
+            barrier.wait()
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline and not stop.is_set():
+                start = time.perf_counter_ns()
+                if kind == "ingestion":
+                    api.request(
+                        "POST",
+                        f"{scope}/tables/{table}/batch",
+                        {
+                            "inserts": {
+                                f"mixed:{i}": {"body": f"live event {len(durations)}"}
+                                for i in range(100)
+                            },
+                            "sync_level": "full_index",
+                        },
+                    )
+                elif kind == "qualified_search":
+                    value = api.request(
+                        "POST",
+                        "/query",
+                        json.dumps(
+                            {
+                                "table_target": {
+                                    "database": "benchmark",
+                                    "namespace": "serving",
+                                    "table": table,
+                                },
+                                "full_text_search": {"match_all": {}},
+                                "limit": 10,
+                            }
+                        )
+                        + "\n",
+                        ndjson=True,
+                    )
+                    if not value[0]["responses"][0]["hits"]["hits"]:
+                        raise RuntimeError("mixed workload lost the seeded document")
+                else:
+                    rows = api.request("GET", scope + "/tables?prefix=events_")
+                    if len(rows) != count:
+                        raise RuntimeError(
+                            f"mixed inventory mismatch: {len(rows)} != {count}"
+                        )
+                durations.append((time.perf_counter_ns() - start) / 1e6)
+            return {
+                **summary(durations),
+                "completed_per_second": len(durations) / seconds,
+            }
+        except BaseException:
+            stop.set()
+            raise
+        finally:
+            api.session.close()
+
+    names = ("ingestion", "qualified_search", "scoped_discovery")
+    start = time.perf_counter_ns()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = dict(zip(names, pool.map(worker, names)))
+    return {
+        "requested_seconds": seconds,
+        "elapsed_ms": (time.perf_counter_ns() - start) / 1e6,
+        "documents_per_batch": 100,
+        "operations": results,
+    }
+
+
 def catalog_scenario(args, binary: Path) -> dict:
     with server(binary, args.deployment) as (api, startup, instance):
         scope = "/databases/benchmark/namespaces/serving"
@@ -396,6 +472,13 @@ def catalog_scenario(args, binary: Path) -> dict:
             measured["concurrent_qualified_lookup"] = concurrent_lookups(
                 api.base, path + "/documents/doc", args
             )
+            if args.mixed_seconds:
+                print(
+                    f"catalog: {count} tables, sustained mixed traffic", file=sys.stderr
+                )
+                measured["sustained_mixed_traffic"] = mixed_catalog_workload(
+                    api.base, scope, table, count, args.mixed_seconds
+                )
             identity = api.request("GET", path)["table_id"]
             current = [table]
 
@@ -934,6 +1017,12 @@ def main():
         help="Concurrent detail requests per second per reader (0 saturates); late requests do not accumulate an unbounded backlog",
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
+    parser.add_argument(
+        "--mixed-seconds",
+        type=positive,
+        default=0,
+        help="Sustain ingestion, search and discovery at each catalog checkpoint (0 disables)",
+    )
     parser.add_argument(
         "--resolution-workload",
         choices=["exact", "prefix", "redirects"],

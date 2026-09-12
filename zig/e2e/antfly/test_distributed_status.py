@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import signal
 import subprocess
@@ -306,6 +307,173 @@ def _runtime_report_has_index(
     return False
 
 
+def _exercise_sparse_reports(
+    session: requests.Session, cluster: SplitStatusCluster, raw_store
+) -> None:
+    """Run with the owner paused and a committed legacy heartbeat clearing its cursor."""
+    baseline = raw_store()
+    fields = (
+        "store_id",
+        "reporter_incarnation",
+        "status_generation",
+        "artifact_sources_protocol_version",
+        "dense_native_storage_protocol_version",
+        "live",
+        "health_class",
+        "capacity_bytes",
+        "available_bytes",
+        "lease_pressure",
+        "read_load",
+        "write_load",
+        "active_backfills",
+        "backfill_progress_millis",
+        "group_statuses",
+        "runtime_statuses",
+    )
+    report = {key: copy.deepcopy(baseline[key]) for key in fields if key in baseline}
+    for runtime in report["runtime_statuses"]:
+        for index in runtime.get("indexes", []):
+            index["embedding_activity_observed"] = False
+            index["embedding_activity"] = {}
+    url = f"{cluster.metadata_admin_url}/internal/v1/nodes/2/status/update"
+
+    def send(update, status=200):
+        response = session.post(
+            url, json=update, headers=internal_service_headers(), timeout=15
+        )
+        assert response.status_code == status, response.text
+        return response.json() if status == 200 else None
+
+    initial = {"sequence": 1, "report": report}
+    cursor = send(initial)
+    assert cursor["sequence"] == 1
+    assert cursor["reporter_incarnation"] == report["reporter_incarnation"]
+    assert send(initial) == cursor
+    committed = raw_store()
+    group_id = report["group_statuses"][0]["group_id"]
+    changed = copy.deepcopy(report)
+    changed["group_statuses"] = [
+        group for group in changed["group_statuses"] if group["group_id"] == group_id
+    ]
+    changed["runtime_statuses"] = [
+        runtime
+        for runtime in changed["runtime_statuses"]
+        if runtime["group_id"] == group_id
+    ]
+    changed["available_bytes"] = max(0, int(report["available_bytes"]) - 456)
+    for group in changed["group_statuses"]:
+        group["updated_at_millis"] += 1
+    patch = {"sequence": 2, "base": cursor, "report": changed}
+    next_cursor = send(patch)
+    assert next_cursor["sequence"] == 2
+    assert send(patch) == next_cursor  # A lost response can be retried exactly.
+    assert (
+        send(
+            {
+                "sequence": 3,
+                "base": next_cursor,
+                "report": {**changed, "group_statuses": [], "runtime_statuses": []},
+            }
+        )
+        == next_cursor
+    )  # An unchanged heartbeat keeps its applied base.
+    current = raw_store()
+    assert current["available_bytes"] == changed["available_bytes"]
+    assert current["runtime_statuses"] == committed["runtime_statuses"]
+    assert [g for g in current["group_statuses"] if g["group_id"] != group_id] == [
+        g for g in committed["group_statuses"] if g["group_id"] != group_id
+    ]
+    send({**patch, "sequence": 3}, 409)
+    send(
+        {
+            "sequence": 3,
+            "base": next_cursor,
+            "report": {**changed, "reporter_incarnation": 1},
+        },
+        409,
+    )
+    send(
+        {
+            "sequence": 3,
+            "base": next_cursor,
+            "report": {**changed, "dense_native_storage_protocol_version": 65535},
+        },
+        400,
+    )
+    send(
+        {
+            "sequence": 3,
+            "base": next_cursor,
+            "report": changed,
+            "removed_groups": [group_id],
+        },
+        400,
+    )
+
+    removal = {
+        "sequence": 3,
+        "base": next_cursor,
+        "report": {
+            **changed,
+            "status_generation": int(changed["status_generation"]) + 1,
+            "group_statuses": [],
+            "runtime_statuses": [],
+        },
+        "removed_groups": [group_id],
+    }
+    removed_cursor = send(removal)
+    assert removed_cursor["sequence"] == 3
+    current = raw_store()
+    assert all(g["group_id"] != group_id for g in current["group_statuses"])
+    assert all(g["group_id"] != group_id for g in current["runtime_statuses"])
+    assert len(current["runtime_statuses"]) < len(committed["runtime_statuses"])
+    # Full recovery restores the inventory without trusting a prior cursor.
+    restored = {**report, "status_generation": removal["report"]["status_generation"]}
+    restored_cursor = send({"sequence": 4, "report": restored})
+    assert restored_cursor["sequence"] == 4
+    assert raw_store()["runtime_statuses"] == committed["runtime_statuses"]
+    # Volatile activity can refresh an existing identity without advancing Raft.
+    activity = copy.deepcopy(restored["runtime_statuses"][:1])
+    observed_index = activity[0]["indexes"][0]
+    observed_index["embedding_activity_observed"] = True
+    observed_index["embedding_activity"] = {"epoch": 1, "sample_sequence": 1}
+    telemetry = {
+        "sequence": 5,
+        "base": restored_cursor,
+        "report": {
+            **restored,
+            "group_statuses": [],
+            "runtime_statuses": [],
+            "embedding_activity_protocol_version": 2,
+            "embedding_activity_sequence": 2**52,
+        },
+        "activity": activity,
+    }
+    assert send(telemetry) == restored_cursor
+    observed = next(
+        runtime
+        for runtime in raw_store()["runtime_statuses"]
+        if runtime["group_id"] == activity[0]["group_id"]
+    )
+    assert observed["indexes"][0]["embedding_activity_observed"]
+    assert observed["indexes"][0]["embedding_activity"]["sample_sequence"] == 1
+    invalid_telemetry = copy.deepcopy(telemetry)
+    invalid_telemetry["activity"][0]["indexes"][0]["embedding_activity"]["epoch"] = 0
+    send(invalid_telemetry, 400)
+    # Invalidate the manual cursor so the real publisher can resume immediately.
+    response = session.post(
+        f"{cluster.metadata_admin_url}/internal/v1/nodes/2/status/heartbeat",
+        json={
+            **restored,
+            "runtime_statuses": [],
+            "available_bytes": max(0, int(restored["available_bytes"]) - 789),
+        },
+        headers=internal_service_headers(),
+        timeout=15,
+    )
+    assert response.status_code == 202, response.text
+
+
 def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     split_status_cluster: SplitStatusCluster,
 ) -> None:
@@ -316,7 +484,7 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     _check_response(
         session.post(
             f"{split_status_cluster.data_api_url}/tables/{table_name}",
-            json={"num_shards": 1},
+            json={"num_shards": 2},
             timeout=30,
         )
     )
@@ -368,7 +536,7 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
             return None
         if int(status.get("expected_groups", 0)) < 1:
             return None
-        if int(status.get("reported_groups", 0)) < 1:
+        if int(status.get("reported_groups", 0)) < 2:
             return None
         if int(status.get("missing_groups", 0)) != 0:
             return None
@@ -382,8 +550,8 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     )
 
     status = detail["status"]
-    assert status["expected_groups"] == 1
-    assert status["reported_groups"] == 1
+    assert status["expected_groups"] == 2
+    assert status["reported_groups"] == 2
     assert status["missing_groups"] == 0
     assert status["index_type"] == "full_text"
 
@@ -470,5 +638,6 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
             )
             assert response.status_code == 409, response.text
         assert raw_store()["runtime_statuses"] == baseline["runtime_statuses"]
+        _exercise_sparse_reports(session, split_status_cluster, raw_store)
     finally:
         owner.send_signal(signal.SIGCONT)

@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const store_report_update = @import("../metadata/store_report_update.zig");
+const report_collection = @import("../metadata/report_collection.zig");
 const system_catalog = @import("../system_catalog/domain.zig");
 const runtime_io_abi = @import("../runtime_io_abi.zig");
 const ant_json = @import("antfly-json");
@@ -5633,6 +5635,9 @@ pub const DataServer = struct {
     reporter_incarnation_mutex: std.atomic.Mutex = .unlocked,
     reporter_incarnation: u64 = 0,
     store_status_generation: std.atomic.Value(u64) = .init(1),
+    store_report_publisher: store_report_update.Publisher = .{},
+    store_report_publish_mutex: std.Io.Mutex = .init,
+    store_report_update_retry_at_ms: u64 = 0,
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
     next_metadata_bootstrap_retry_at_ms: u64 = 0,
@@ -8206,6 +8211,7 @@ pub const DataServer = struct {
         self.provisioned_index_repair_terminal_log_groups.deinit(self.alloc);
         self.provisioned_index_repair_cancel_groups.deinit(self.alloc);
         self.provisioned_index_repair_routes.deinit(self.alloc);
+        self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
         self.write_source.deinit();
@@ -14245,6 +14251,8 @@ pub const DataServer = struct {
         split_observations: []const antfly.metadata.transition_state.SplitObservationRecord,
         merge_observations: []const antfly.metadata.transition_state.MergeObservationRecord,
     ) ![]antfly.metadata.table_manager.GroupStatusReport {
+        var collection_index = try report_collection.Index.init(alloc, tables, ranges);
+        defer collection_index.deinit(alloc);
         var reports = std.ArrayListUnmanaged(antfly.metadata.table_manager.GroupStatusReport).empty;
         errdefer {
             for (reports.items) |record| antfly.metadata.table_manager.freeGroupStatus(alloc, record);
@@ -14283,8 +14291,8 @@ pub const DataServer = struct {
                 else => return err,
             };
 
-            if (findRangeByGroupId(ranges, group_id)) |range| {
-                if (findTableById(tables, range.table_id)) |table| {
+            if (collection_index.range(group_id)) |range| {
+                if (collection_index.table(range.table_id)) |table| {
                     if (try self.snapshotCachedActiveStartupLocalGroupStatusReport(alloc, group_id, table.name, active_target)) |cached| {
                         var current = cached;
                         overlayLiveRaftGroupStatus(&current, group_leadership_source, group_membership_source);
@@ -14744,6 +14752,7 @@ pub const DataServer = struct {
             .reporter_incarnation = candidate_report.reporter_incarnation,
             .status_generation = status_generation,
             .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = candidate_report.dense_native_storage_protocol_version,
             .live = candidate_report.live,
             .health_class = candidate_report.health_class,
             .capacity_bytes = candidate_report.capacity_bytes,
@@ -14762,7 +14771,7 @@ pub const DataServer = struct {
         if (self.local_group_status_generation.load(.acquire) != report_generation) {
             return error.StaleLocalGroupStatusGeneration;
         }
-        try remote_metadata.reportNodeStatus(report);
+        if (!try self.publishStoreReportUpdate(report, false)) try remote_metadata.reportNodeStatus(report);
         try self.reportRuntimeSchemaProgress(
             remote_metadata,
             registration.store_id,
@@ -15457,6 +15466,40 @@ pub const DataServer = struct {
         }
     }
 
+    fn publishStoreReportUpdate(self: *DataServer, report: antfly.metadata.table_manager.StoreStatusReport, retain_runtime: bool) !bool {
+        const remote = self.remote_metadata orelse return false;
+        self.store_report_publish_mutex.lockUncancelable(remote.io);
+        defer self.store_report_publish_mutex.unlock(remote.io);
+        if (self.backgroundMonotonicMs() < self.store_report_update_retry_at_ms) return false;
+        if (retain_runtime and self.store_report_publisher.cursor == null) return false;
+        for (0..2) |attempt| {
+            var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
+            defer prepared.deinit(self.alloc);
+            const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
+            const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
+                error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
+                error.UnsupportedOperation => {
+                    self.store_report_publisher.cursor = null;
+                    self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + 60 * std.time.ms_per_s;
+                    return false;
+                },
+                else => return err,
+            };
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+            const retained_base = prepared.update.base != null and
+                std.meta.eql(cursor, prepared.update.base.?) and
+                prepared.update.report.group_statuses.len == 0 and
+                prepared.update.report.runtime_statuses.len == 0 and
+                prepared.update.removed_groups.len == 0;
+            if (!retained_base and (cursor.sequence != prepared.update.sequence or cursor.reporter_incarnation != report.reporter_incarnation or !std.mem.eql(u8, &digest, &cursor.digest))) return error.InvalidStoreReporterFence;
+            self.store_report_publisher.commit(self.alloc, &prepared, cursor);
+            remote.supports_runtime_reference.store(true, .release);
+            return true;
+        }
+        unreachable;
+    }
+
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
@@ -15465,6 +15508,11 @@ pub const DataServer = struct {
         defer freeStoreStatusReportOwned(self.alloc, &report);
         for (report.group_statuses) |*group_status| {
             overlayLiveRaftGroupStatus(group_status, self.group_leadership_source, self.group_membership_source);
+        }
+        if (try self.publishStoreReportUpdate(report, reference)) {
+            self.last_store_status_report_at_ms = self.backgroundMonotonicMs();
+            self.clearMetadataBootstrapRetry();
+            return;
         }
         if (reference) {
             remote_metadata.reportNodeHeartbeat(report) catch |err| switch (err) {
@@ -15578,6 +15626,8 @@ pub const DataServer = struct {
         ranges: []const antfly.metadata.table_manager.RangeRecord,
         registration: StoreRegistrationConfig,
     ) ![]antfly.metadata.table_manager.RuntimeGroupStatusReport {
+        var collection_index = try report_collection.Index.init(alloc, tables, ranges);
+        defer collection_index.deinit(alloc);
         var reports = std.ArrayListUnmanaged(antfly.metadata.table_manager.RuntimeGroupStatusReport).empty;
         errdefer {
             for (reports.items) |record| antfly.metadata.table_manager.freeRuntimeGroupStatusReport(alloc, record);
@@ -15585,8 +15635,8 @@ pub const DataServer = struct {
         }
 
         for (group_ids) |group_id| {
-            const range = findRangeByGroupId(ranges, group_id) orelse continue;
-            const table = findTableById(tables, range.table_id) orelse continue;
+            const range = collection_index.range(group_id) orelse continue;
+            const table = collection_index.table(range.table_id) orelse continue;
             var status = (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(alloc, table.name, group_id)) orelse continue;
             defer status.deinit(alloc);
             self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
@@ -21625,6 +21675,15 @@ const RemoteMetadataSource = struct {
             }
         }.call, body);
         self.supports_runtime_reference.store(supported, .release);
+    }
+
+    fn reportNodeUpdate(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        const Request = struct { store_id: u64, body: []const u8 };
+        return self.withMetadataApiClient(store_report_update.Cursor, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_update.Cursor {
+                return client.reportNodeUpdate(base_uri, req.store_id, req.body);
+            }
+        }.call, Request{ .store_id = store_id, .body = body });
     }
 
     fn reportNodeHeartbeat(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {

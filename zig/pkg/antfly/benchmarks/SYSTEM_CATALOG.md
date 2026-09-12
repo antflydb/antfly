@@ -295,3 +295,31 @@ comparison, and selected-store preparation. Keep the full and reference paths
 in the results, including regressions. Pair component results with the existing
 live tenant-provisioning/restart, scoped discovery and relational-query scenarios;
 small live runs validate application behavior without establishing cluster capacity.
+
+The report target also emits `PUBLISHER_BENCH` (full HTTP encoding versus an
+acknowledged sparse prepare/encode/commit), `SPARSE_REPORT_BENCH` (one changed
+group through command decode, WAL/checkpoint and commit), `COLLECTION_BENCH`
+(linear scans versus building and using captured-inventory indexes), and
+`RECONCILE_VIEW_BENCH` (deep clones versus retaining immutable store leaves).
+The paired component comparisons run in one binary; setup is excluded and
+temporary allocation/free costs are included. The publisher case has no volatile
+embedding samples, so its byte count does not establish telemetry-heavy traffic
+cost. Sparse apply still visits compact membership rows; only affected payload
+components are decoded and rewritten.
+
+For a live application workload, add `--mixed-seconds 30` to the catalog scenario:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario catalog --deployment cluster --table-counts 10 100 \
+  --storage-mode relational --samples 9 --warmup 2 --mixed-seconds 30 \
+  --output /tmp/catalog-mixed.json
+```
+
+At each provisioned table count, this runs three clients concurrently: batches of
+100 upserts with full-index acknowledgement, qualified search, and scoped catalog
+discovery. Every response is validated; a failure aborts the workload. It reports
+per-operation latency distributions and completion rates over the requested
+duration. Provisioning/readiness and the mixed interval remain separate. This is
+a bounded working set with repeated updates, not a storage growth or maximum
+cluster capacity claim.

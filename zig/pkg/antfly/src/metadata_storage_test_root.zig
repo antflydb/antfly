@@ -9,3 +9,7 @@ const storage = @import("metadata/storage/mod.zig");
 test {
     _ = storage.raft_apply_store;
 }
+
+test {
+    _ = @import("metadata/report_collection.zig");
+}

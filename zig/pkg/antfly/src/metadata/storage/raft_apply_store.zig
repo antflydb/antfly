@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const metadata_store_observer = @import("../store_observer.zig");
+const store_report_update = @import("../store_report_update.zig");
 const system_catalog = @import("../../system_catalog/domain.zig");
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const builtin = @import("builtin");
@@ -236,6 +238,7 @@ pub const TransitionCommand = union(enum) {
     },
     upsert_store: metadata.StoreRecord,
     upsert_store_heartbeat: metadata.StoreRecord,
+    apply_store_report_update: []const u8,
     register_store: metadata.StoreRecord,
     remove_store: struct {
         store_id: u64,
@@ -341,7 +344,7 @@ pub const TransitionCommand = union(enum) {
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .apply_system_catalog => |bytes| alloc.free(bytes),
+            .apply_system_catalog, .apply_store_report_update => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -4364,6 +4367,7 @@ pub const RaftApplyStore = struct {
         runtimes: []metadata.RuntimeGroupStatusReport = &.{},
         group_count: usize = 0,
         runtime_count: usize = 0,
+        retained: bool = false,
     };
     fn listingStorePrefix(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
         return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:metadata_store:{d}:", .{group_id});
@@ -4634,10 +4638,117 @@ pub const RaftApplyStore = struct {
         header.runtime_statuses = try runtimes.toOwnedSlice(output);
         return header;
     }
+    fn reportCursorKey(a: std.mem.Allocator, group_id: u64, store_id: u64) ![]u8 {
+        return std.fmt.allocPrint(a, "\x00\x00__metadata__:store_report_cursor_v1:{d}:{d}", .{ group_id, store_id });
+    }
+    fn reportCursorTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64) !?store_report_update.Cursor {
+        const key = try reportCursorKey(a, group_id, store_id);
+        defer a.free(key);
+        const bytes = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (bytes.len != 48) return error.InvalidCatalogRecord;
+        return .{ .reporter_incarnation = std.mem.readInt(u64, bytes[0..8], .little), .sequence = std.mem.readInt(u64, bytes[8..16], .little), .digest = bytes[16..48].* };
+    }
+    pub fn reportCursor(self: *RaftApplyStore, group_id: u64, store_id: u64) !?store_report_update.Cursor {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return reportCursorTxn(self.alloc, &txn, group_id, store_id);
+    }
+
+    /// Read only changed/removal targets for sparse admission. Each report
+    /// lookup addresses an existing covering reference and at most four pages.
+    pub fn readStoreReportTargets(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, update: store_report_update.Update) !?metadata.StoreRecord {
+        if (update.base == null) return self.readStore(alloc, group_id, update.report.store_id, true);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const record = (try self.loadStoreHeaderTxn(&txn, group_id, update.report.store_id)) orelse return null;
+        defer metadata_table_manager.freeStore(self.alloc, record);
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (update.report.group_statuses) |item| try ids.put(a, item.group_id, {});
+        for (update.report.runtime_statuses) |item| try ids.put(a, item.group_id, {});
+        for (update.removed_groups) |id| try ids.put(a, id, {});
+        var groups: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty;
+        var runtimes: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
+        var iterator = ids.keyIterator();
+        while (iterator.next()) |id| {
+            const reference = txn.get(try listingReportKey(a, group_id, record.store_id, id.*)) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (reference.len != 16) return error.InvalidCatalogRecord;
+            if (std.mem.readInt(u64, reference[0..8], .little) != record.store_id) return error.InvalidCatalogRecord;
+            const slot = std.mem.readInt(u64, reference[8..16], .little);
+            for ([_]bool{ false, true }) |runtime| {
+                const component: usize = if (runtime) 0 else 2;
+                const bytes = try txn.get(try reportComponentKey(a, group_id, record.store_id, slot / report_page_slots, component));
+                var decoded = try decodeReportComponent(a, try reportPageEntry(bytes, slot), runtime);
+                for (decoded.group_statuses) |item| if (item.group_id != id.*) return error.InvalidCatalogRecord;
+                for (decoded.runtime_statuses) |item| if (item.group_id != id.*) return error.InvalidCatalogRecord;
+                const clocks = try txn.get(try reportComponentKey(a, group_id, record.store_id, slot / report_page_slots, component + 1));
+                try applyReportClocks(&decoded, try reportPageEntry(clocks, slot));
+                try groups.appendSlice(a, decoded.group_statuses);
+                try runtimes.appendSlice(a, decoded.runtime_statuses);
+            }
+        }
+        // Restore the header's owned slices before its deferred destruction.
+        var selected = record;
+        selected.group_statuses = groups.items;
+        selected.runtime_statuses = runtimes.items;
+        return try metadata_table_manager.cloneStore(alloc, selected);
+    }
+
+    fn applyStoreReportUpdateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const command = try decodeStoreReportUpdate(arena.allocator(), bytes);
+        const update = command.update;
+        try update.validate(self.alloc);
+        const header = (try self.loadStoreHeaderTxn(txn, group_id, update.report.store_id)) orelse return;
+        defer metadata_table_manager.freeStore(self.alloc, header);
+        if (header.reporter_incarnation != update.report.reporter_incarnation or update.report.status_generation < header.status_generation) return;
+        const prior = try reportCursorTxn(self.alloc, txn, group_id, header.store_id);
+        if (update.base) |base| {
+            if (prior == null or !std.meta.eql(prior.?, base)) return;
+        } else if (prior) |cursor| {
+            if (cursor.reporter_incarnation == update.report.reporter_incarnation and cursor.sequence >= update.sequence) return;
+        }
+        var replacement = metadata_store_observer.applyObservation(header, update.report);
+        replacement = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, replacement);
+        if (!try admitDenseNativeStoreTxn(self, txn, group_id, replacement)) return;
+        if (storeRuntimeStatusRecordVersion(replacement)) |version| try activateRuntimeStatusProtocolTxn(txn, group_id, version);
+        var runtime_changed = false;
+        const changed = try self.writeStoreComponentsTxn(txn, group_id, header.store_id, replacement, false, if (update.base != null) update.removed_groups else null, &runtime_changed);
+        var cursor_bytes: [48]u8 = undefined;
+        std.mem.writeInt(u64, cursor_bytes[0..8], update.report.reporter_incarnation, .little);
+        std.mem.writeInt(u64, cursor_bytes[8..16], update.sequence, .little);
+        @memcpy(cursor_bytes[16..48], &command.request_digest);
+        const cursor_key = try reportCursorKey(self.alloc, group_id, header.store_id);
+        defer self.alloc.free(cursor_key);
+        try txn.put(cursor_key, &cursor_bytes);
+        var key_buf: [160]u8 = undefined;
+        const key = try storeKeyForGroup(&key_buf, group_id, header.store_id);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{ .kind = .store, .metadata_group_id = group_id, .store_id = header.store_id, .node_id = header.node_id, .store_reports_changed = changed, .store_runtime_changed = runtime_changed });
+        try self.retryPendingNodeShutdownFinalizeTxn(txn, group_id, header.node_id);
+    }
+
     fn updateListingStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord) !bool {
         return self.updateStoreComponentsTxn(txn, group_id, store_id, replacement, false);
     }
     fn updateStoreComponentsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord, retain_runtime: bool) !bool {
+        const cursor_key = try reportCursorKey(self.alloc, group_id, store_id);
+        defer self.alloc.free(cursor_key);
+        if (txn.get(cursor_key)) |_| {
+            try txn.delete(cursor_key);
+        } else |err| if (err != error.NotFound) return err;
+        return self.writeStoreComponentsTxn(txn, group_id, store_id, replacement, retain_runtime, null, null);
+    }
+    fn writeStoreComponentsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord, retain_runtime: bool, removed_groups: ?[]const u64, runtime_changed: ?*bool) !bool {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -4657,6 +4768,8 @@ pub const RaftApplyStore = struct {
         const Page = struct { groups: [report_page_slots]?u64 = @splat(null), dirty: [4]bool = @splat(false), members_dirty: bool = false };
         var pages: std.AutoHashMapUnmanaged(u64, Page) = .empty;
         var reports: std.AutoHashMapUnmanaged(u64, ListingReport) = .empty;
+        var removed_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        if (removed_groups) |removed| for (removed) |id| try removed_ids.put(a, id, {});
         if (replacement) |record| {
             // Count once and partition two contiguous buffers. Duplicates keep
             // their source order without thousands of tiny growable arrays.
@@ -4700,6 +4813,11 @@ pub const RaftApplyStore = struct {
             const id = std.mem.readInt(u64, row[0..8], .little);
             const slot = std.mem.readInt(u64, row[8..16], .little);
             try old.put(a, id, row);
+            if (removed_groups != null) {
+                if (!reports.contains(id) and !removed_ids.contains(id)) {
+                    try reports.put(a, id, .{ .member = row.*, .retained = true });
+                }
+            }
             if (retain_runtime) {
                 const entry = try reports.getOrPut(a, id);
                 if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -4737,6 +4855,7 @@ pub const RaftApplyStore = struct {
             if (!page.found_existing) page.value_ptr.* = .{};
             page.value_ptr.groups[slot % report_page_slots] = id;
             const report = reports.getPtr(id).?;
+            if (report.retained) continue;
             const group_clocks = try a.alloc(u8, report.groups.len * 8);
             for (report.groups, 0..) |*item, j| {
                 std.mem.writeInt(u64, group_clocks[j * 8 ..][0..8], item.updated_at_millis, .little);
@@ -4791,6 +4910,7 @@ pub const RaftApplyStore = struct {
         while (page_iterator.next()) |entry| {
             const page_id = entry.key_ptr.*;
             const page = entry.value_ptr;
+            if (runtime_changed) |changed| changed.* = changed.* or page.dirty[0] or page.dirty[1];
             for (page.dirty) |dirty| reports_changed = reports_changed or dirty;
             reports_changed = reports_changed or page.members_dirty;
             var live = false;
@@ -5283,7 +5403,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
-            .upsert_store, .upsert_store_heartbeat, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
+            .upsert_store, .upsert_store_heartbeat, .apply_store_report_update, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
             .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
@@ -5515,7 +5635,7 @@ pub const RaftApplyStore = struct {
         // These primary local rows are represented by full StoreRecords in
         // wire snapshots. Remove them atomically with the replaced headers;
         // legacy snapshot rows will normalize on the next index rebuild/apply.
-        for ([_][]const u8{ "store_report_v1", "store_report_clock_page_v1", "store_report_payload_page_v1", "store_report_members_v1", "store_report_member_page_v1", "store_report_group_page_v1", "store_report_group_clock_page_v1" }) |kind| {
+        for ([_][]const u8{ "store_report_cursor_v1", "store_report_v1", "store_report_clock_page_v1", "store_report_payload_page_v1", "store_report_members_v1", "store_report_member_page_v1", "store_report_group_page_v1", "store_report_group_clock_page_v1" }) |kind| {
             var report_buf: [160]u8 = undefined;
             const prefix = try std.fmt.bufPrint(&report_buf, "\x00\x00__metadata__:{s}:{d}:", .{ kind, group_id });
             try appendMetadataPrefixRowsTxn(alloc, txn, &rows, prefix);
@@ -5712,6 +5832,7 @@ pub const RaftApplyStore = struct {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
+            .apply_store_report_update => |bytes| try self.applyStoreReportUpdateTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {
                 if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
                 var key_buf: [160]u8 = undefined;
@@ -8449,6 +8570,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 const TransitionTag = enum(u8) {
     apply_system_catalog = 54,
     upsert_store_heartbeat = 55,
+    apply_store_report_update = 56,
     initialize_metadata_incarnation = 45,
     upsert_node = 1,
     remove_node = 2,
@@ -8509,6 +8631,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .apply_store_report_update => |bytes| {
+            if (bytes.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_store_report_update));
+            try appendRequiredString(alloc, &out, bytes);
+        },
         .apply_system_catalog => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_system_catalog));
@@ -8815,6 +8942,13 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .apply_store_report_update => blk: {
+            if (encoded.len > max_store_report_update_bytes + 16) return error.CatalogCommandTooLarge;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .apply_store_report_update = bytes };
+        },
         .apply_system_catalog => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_system_catalog = try readRequiredString(alloc, encoded, &pos) };
@@ -9182,6 +9316,62 @@ fn encodeNodeRecord(alloc: std.mem.Allocator, record: metadata.NodeRecord) ![]u8
     errdefer out.deinit(alloc);
     try appendNodeRecord(alloc, &out, record);
     return try out.toOwnedSlice(alloc);
+}
+
+const max_store_report_update_bytes = 32 * 1024 * 1024;
+
+/// Durable report envelope: no JSON expansion or volatile activity fields.
+/// The inner StoreRecord uses the existing negotiated runtime-status codec.
+pub fn encodeStoreReportUpdate(alloc: std.mem.Allocator, command: store_report_update.Command) ![]u8 {
+    try command.update.validate(alloc);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try appendInt(alloc, &out, u16, 1);
+    try appendInt(alloc, &out, u64, command.update.sequence);
+    try appendInt(alloc, &out, u8, if (command.update.base != null) 1 else 0);
+    if (command.update.base) |base| {
+        try appendInt(alloc, &out, u64, base.reporter_incarnation);
+        try appendInt(alloc, &out, u64, base.sequence);
+        try out.appendSlice(alloc, &base.digest);
+    }
+    try out.appendSlice(alloc, &command.request_digest);
+    try appendInt(alloc, &out, u32, std.math.cast(u32, command.update.removed_groups.len) orelse return error.CatalogCommandTooLarge);
+    for (command.update.removed_groups) |id| try appendInt(alloc, &out, u64, id);
+    var record: metadata.StoreRecord = .{ .store_id = command.update.report.store_id, .node_id = 0 };
+    inline for (std.meta.fields(metadata.StoreStatusReport)) |field| {
+        if (comptime @hasField(metadata.StoreRecord, field.name)) @field(record, field.name) = @field(command.update.report, field.name);
+    }
+    try appendStoreRecord(alloc, &out, record);
+    if (out.items.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
+    return out.toOwnedSlice(alloc);
+}
+
+/// All returned payloads belong to the caller's scratch arena.
+fn decodeStoreReportUpdate(a: std.mem.Allocator, bytes: []const u8) !store_report_update.Command {
+    if (bytes.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
+    var pos: usize = 0;
+    if (try readInt(bytes, &pos, u16) != 1) return error.InvalidMetadataTransitionEncoding;
+    const sequence = try readInt(bytes, &pos, u64);
+    const has_base = try readInt(bytes, &pos, u8);
+    if (has_base > 1) return error.InvalidMetadataTransitionEncoding;
+    var base: ?store_report_update.Cursor = null;
+    if (has_base == 1) {
+        const incarnation = try readInt(bytes, &pos, u64);
+        const base_sequence = try readInt(bytes, &pos, u64);
+        if (bytes.len - pos < 32) return error.InvalidMetadataTransitionEncoding;
+        base = .{ .reporter_incarnation = incarnation, .sequence = base_sequence, .digest = bytes[pos..][0..32].* };
+        pos += 32;
+    }
+    if (bytes.len - pos < 32) return error.InvalidMetadataTransitionEncoding;
+    const digest = bytes[pos..][0..32].*;
+    pos += 32;
+    const count = try readInt(bytes, &pos, u32);
+    if (count > (bytes.len - pos) / 8) return error.InvalidMetadataTransitionEncoding;
+    const removals = try a.alloc(u64, count);
+    for (removals) |*id| id.* = try readInt(bytes, &pos, u64);
+    const record = try readStoreRecord(a, bytes, &pos);
+    if (pos != bytes.len) return error.InvalidMetadataTransitionEncoding;
+    return .{ .update = .{ .sequence = sequence, .base = base, .removed_groups = removals, .report = store_report_update.asReport(record) }, .request_digest = digest };
 }
 
 fn encodeStoreRecord(alloc: std.mem.Allocator, record: metadata.StoreRecord) ![]u8 {
@@ -18147,6 +18337,38 @@ test "system catalog store report workload benchmark" {
             std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
             std.debug.print("REPORT_BENCH groups={d} scenario={s} apply_p50_ms={d:.3} wal_bytes_per_apply={d} full_record_bytes={d} command_bytes={d}\n", .{ count, scenario, @as(f64, @floatFromInt(elapsed[3])) / 1e6, (store.snapshotWriteStats().wal_append_bytes - before) / elapsed.len, full.len, command_bytes });
         }
+        // Sparse and full measurements use the same logical report inventory.
+        // Establishing a recovery baseline is outside the timed patch applies.
+        const initial_update = try encodeTestReportUpdate(alloc, .{ .sequence = 1, .report = store_report_update.asReport(record) });
+        defer alloc.free(initial_update);
+        try applyTestReportUpdate(&store, initial_update);
+        for ([_]bool{ false, true }) |change_runtime| {
+            var patch_elapsed: [7]u64 = undefined;
+            const before_patch = store.snapshotWriteStats().wal_append_bytes;
+            var patch_command_bytes: usize = 0;
+            for (&patch_elapsed) |*sample| {
+                record.available_bytes += 1;
+                groups[0].raft_term += 1;
+                if (change_runtime) runtimes[0].doc_count += 1;
+                var report = store_report_update.asReport(record);
+                report.group_statuses = groups[0..1];
+                report.runtime_statuses = runtimes[0..1];
+                const cursor = (try store.reportCursor(21, record.store_id)).?;
+                const payload = try encodeTestReportUpdate(alloc, .{ .sequence = cursor.sequence + 1, .base = cursor, .report = report });
+                defer alloc.free(payload);
+                const command = try encodeTransitionCommand(alloc, .{ .apply_store_report_update = payload });
+                defer alloc.free(command);
+                patch_command_bytes = command.len;
+                const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = record.available_bytes, .entry_type = .normal, .data = command }});
+                defer alloc.free(entries);
+                const start = platform_time.monotonicNs();
+                try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = record.available_bytes, .entries_bytes = entries });
+                sample.* = platform_time.monotonicNs() - start;
+                try std.testing.expectEqual(cursor.sequence + 1, (try store.reportCursor(21, record.store_id)).?.sequence);
+            }
+            std.mem.sort(u64, &patch_elapsed, {}, std.sort.asc(u64));
+            std.debug.print("SPARSE_REPORT_BENCH groups={d} runtime_changed={} apply_p50_ms={d:.3} wal_bytes_per_apply={d} command_bytes={d}\n", .{ count, change_runtime, @as(f64, @floatFromInt(patch_elapsed[3])) / 1e6, (store.snapshotWriteStats().wal_append_bytes - before_patch) / patch_elapsed.len, patch_command_bytes });
+        }
         var elapsed: [7]u64 = undefined;
         for (&elapsed) |*sample| {
             const start = platform_time.monotonicNs();
@@ -18511,4 +18733,165 @@ test "system catalog report component decoding owns partial allocations and reje
     const trailing = try std.mem.concat(std.testing.allocator, u8, &.{ bytes, &.{0} });
     defer std.testing.allocator.free(trailing);
     try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.decodeReportComponent(std.testing.allocator, trailing, true));
+}
+
+fn encodeTestReportUpdate(alloc: std.mem.Allocator, update: store_report_update.Update) ![]u8 {
+    const request = try std.json.Stringify.valueAlloc(alloc, update, .{});
+    defer alloc.free(request);
+    var command: store_report_update.Command = .{ .update = update, .request_digest = undefined };
+    std.crypto.hash.sha2.Sha256.hash(request, &command.request_digest, .{});
+    return encodeStoreReportUpdate(alloc, command);
+}
+
+fn applyTestReportUpdate(store: *RaftApplyStore, bytes: []const u8) !void {
+    var txn = try store.store.beginWriteTxn();
+    errdefer txn.abort();
+    try store.applyTransitionCommandTxn(&txn, 21, .{ .apply_store_report_update = bytes });
+    try txn.commit();
+}
+
+test "system catalog sparse command codec bounds decoding and omits volatile telemetry" {
+    const alloc = std.testing.allocator;
+    var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "embeddings", .embedding_activity_observed = true, .embedding_activity = .{ .epoch = 1, .sample_sequence = 9 } }};
+    var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 101, .indexes = &indexes }};
+    const bytes = try encodeStoreReportUpdate(alloc, .{
+        .update = .{ .sequence = 7, .report = .{ .store_id = 20, .reporter_incarnation = 77, .runtime_statuses = &runtimes, .embedding_activity_protocol_version = metadata_table_manager.embedding_activity_protocol_version, .embedding_activity_sequence = 1 }, .activity = &runtimes },
+        .request_digest = @splat(42),
+    });
+    defer alloc.free(bytes);
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator, input: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const command = try decodeStoreReportUpdate(arena.allocator(), input);
+            try std.testing.expectEqual(@as(u64, 7), command.update.sequence);
+            try std.testing.expectEqual(@as(u64, 77), command.update.report.reporter_incarnation);
+            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(42)), &command.request_digest);
+            try std.testing.expectEqual(@as(usize, 0), command.update.activity.len);
+            try std.testing.expectEqual(@as(u16, 0), command.update.report.embedding_activity_protocol_version);
+            const index = command.update.report.runtime_statuses[0].indexes[0];
+            try std.testing.expect(!index.embedding_activity_observed);
+            try std.testing.expectEqual(@as(u64, 0), index.embedding_activity.epoch);
+            try command.update.validate(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Scenario.run, .{bytes});
+    const trailing = try std.mem.concat(alloc, u8, &.{ bytes, &.{0} });
+    defer alloc.free(trailing);
+    for ([_][]const u8{ bytes[0..1], bytes[0..10], bytes[0 .. bytes.len - 1], trailing }) |invalid| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreReportUpdate(arena.allocator(), invalid));
+    }
+}
+
+test "system catalog sparse reports fence stale bases and recover across snapshot replacement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sparse-reports", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    var groups = [_]metadata.GroupStatusReport{ .{ .group_id = 101, .raft_term = 1 }, .{ .group_id = 102, .raft_term = 2 }, .{ .group_id = 102, .raft_term = 3 } };
+    var runtimes = [_]metadata.RuntimeGroupStatusReport{ .{ .group_id = 101, .table_name = "one" }, .{ .group_id = 102, .table_name = "two" } };
+    var report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .group_statuses = &groups, .runtime_statuses = &runtimes };
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77 } });
+        try txn.commit();
+    }
+    const initial = try encodeTestReportUpdate(alloc, .{ .sequence = 1, .report = report });
+    defer alloc.free(initial);
+    try applyTestReportUpdate(&store, initial);
+    const base = (try store.reportCursor(21, 20)).?;
+    const snapshot = try store.snapshotBuilder().buildSnapshot(alloc, 21);
+    defer alloc.free(snapshot);
+    groups[1].raft_term = 4;
+    report.group_statuses = groups[1..];
+    report.runtime_statuses = runtimes[1..];
+    report.status_generation = 2;
+    const patch = try encodeTestReportUpdate(alloc, .{ .sequence = 2, .base = base, .report = report });
+    defer alloc.free(patch);
+    try applyTestReportUpdate(&store, patch);
+    const patched = (try store.reportCursor(21, 20)).?;
+    try std.testing.expectEqual(@as(u64, 2), patched.sequence);
+    const current = (try store.readStore(alloc, 21, 20, true)).?;
+    defer metadata_table_manager.freeStore(alloc, current);
+    try std.testing.expectEqual(@as(usize, 3), current.group_statuses.len);
+    try std.testing.expectEqual(@as(u64, 1), current.group_statuses[0].raft_term);
+    try std.testing.expectEqual(@as(u64, 4), current.group_statuses[1].raft_term);
+    try std.testing.expectEqual(@as(u64, 3), current.group_statuses[2].raft_term);
+    try std.testing.expectEqualStrings("one", current.runtime_statuses[0].table_name);
+    const selected = (try store.readStoreReportTargets(alloc, 21, .{ .sequence = 3, .base = patched, .report = report })).?;
+    defer metadata_table_manager.freeStore(alloc, selected);
+    try std.testing.expectEqual(@as(usize, 2), selected.group_statuses.len);
+    try std.testing.expectEqual(@as(usize, 1), selected.runtime_statuses.len);
+    try std.testing.expectEqual(@as(u64, 102), selected.runtime_statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 4), selected.group_statuses[0].raft_term);
+    // A repeated or out-of-order patch cannot replay onto a later generation.
+    try applyTestReportUpdate(&store, initial);
+    try applyTestReportUpdate(&store, patch);
+    try std.testing.expectEqualDeep(patched, (try store.reportCursor(21, 20)).?);
+    report.group_statuses = &.{};
+    report.runtime_statuses = &.{};
+    const remove = try encodeTestReportUpdate(alloc, .{ .sequence = 3, .base = patched, .report = report, .removed_groups = &.{102} });
+    defer alloc.free(remove);
+    try applyTestReportUpdate(&store, remove);
+    const remaining = (try store.readStore(alloc, 21, 20, true)).?;
+    defer metadata_table_manager.freeStore(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.group_statuses.len);
+    try std.testing.expectEqual(@as(usize, 1), remaining.runtime_statuses.len);
+    try RaftApplyStore.installSnapshotFromRaft(&store, alloc, 21, 10, snapshot);
+    try std.testing.expect(try store.reportCursor(21, 20) == null);
+    try applyTestReportUpdate(&store, patch);
+    try std.testing.expect(try store.reportCursor(21, 20) == null);
+    try store.ensureDerivedCatalogIndexes(21);
+    // A full replacement repairs an unknown base after snapshot installation.
+    try applyTestReportUpdate(&store, initial);
+    try std.testing.expectEqual(@as(u64, 1), (try store.reportCursor(21, 20)).?.sequence);
+    report.reporter_incarnation = 88;
+    const stale_owner = try encodeTestReportUpdate(alloc, .{ .sequence = 99, .report = report });
+    defer alloc.free(stale_owner);
+    try applyTestReportUpdate(&store, stale_owner);
+    try std.testing.expectEqual(@as(u64, 77), (try store.reportCursor(21, 20)).?.reporter_incarnation);
+}
+
+test "system catalog sparse report cursor and payload reopen atomically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sparse-reopen", .{tmp.sub_path});
+    defer alloc.free(root);
+    var expected: store_report_update.Cursor = undefined;
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77 } });
+        try txn.commit();
+        var groups = [_]metadata.GroupStatusReport{.{ .group_id = 101, .raft_term = 8 }};
+        const bytes = try encodeTestReportUpdate(alloc, .{ .sequence = 1, .report = .{ .store_id = 20, .reporter_incarnation = 77, .group_statuses = &groups } });
+        defer alloc.free(bytes);
+        try applyTestReportUpdate(&store, bytes);
+        expected = (try store.reportCursor(21, 20)).?;
+    }
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectEqualDeep(expected, (try store.reportCursor(21, 20)).?);
+    const record = (try store.readStore(alloc, 21, 20, true)).?;
+    defer metadata_table_manager.freeStore(alloc, record);
+    try std.testing.expectEqual(@as(u64, 8), record.group_statuses[0].raft_term);
+    const bytes = try encodeTestReportUpdate(alloc, .{ .sequence = 2, .base = expected, .report = .{ .store_id = 20, .reporter_incarnation = 77, .available_bytes = 900 } });
+    defer alloc.free(bytes);
+    try applyTestReportUpdate(&store, bytes);
+    const current = (try store.readStore(alloc, 21, 20, true)).?;
+    defer metadata_table_manager.freeStore(alloc, current);
+    try std.testing.expectEqual(@as(u64, 900), current.available_bytes);
+    try std.testing.expectEqual(@as(u64, 8), current.group_statuses[0].raft_term);
+    try std.testing.expectEqual(@as(u64, 2), (try store.reportCursor(21, 20)).?.sequence);
 }

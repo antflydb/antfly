@@ -459,7 +459,7 @@ fn groupStatusesEqual(
     return true;
 }
 
-fn groupStatusEqual(
+pub fn groupStatusEqual(
     lhs: table_manager.GroupStatusReport,
     rhs: table_manager.GroupStatusReport,
 ) bool {
@@ -511,6 +511,7 @@ pub fn reportsDurablyEqual(
     return lhs.store_id == rhs.store_id and
         lhs.reporter_incarnation == rhs.reporter_incarnation and
         lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
+        lhs.dense_native_storage_protocol_version == rhs.dense_native_storage_protocol_version and
         lhs.live == rhs.live and
         std.mem.eql(u8, lhs.health_class, rhs.health_class) and
         lhs.capacity_bytes == rhs.capacity_bytes and
@@ -524,7 +525,7 @@ pub fn reportsDurablyEqual(
         runtimeStatusesEqual(lhs.runtime_statuses, rhs.runtime_statuses, true);
 }
 
-fn runtimeStatusEqual(
+pub fn runtimeStatusEqual(
     lhs: table_manager.RuntimeGroupStatusReport,
     rhs: table_manager.RuntimeGroupStatusReport,
     include_repair_status: bool,
