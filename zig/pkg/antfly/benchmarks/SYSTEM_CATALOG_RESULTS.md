@@ -1142,3 +1142,106 @@ unchanged. Selected-store preparation beside 100 stores was 0.015 ms versus
 retain the earlier full-report tradeoffs; they do not establish the cause of
 run-to-run timing variation. Application workloads were not repeated after this
 last main merge.
+
+## Immutable mutation results and report delivery
+
+Implementation `d79e0441a` returns the exact admitted resource projection only
+following verified commit. Resource responses no longer perform a second lookup
+by a reusable name. This fixes the reproduced create/drop/recreate identity race
+and removes the associated read barrier. The graph integration in `45d63e1ff`
+resolves metric actions through the catalog, excludes graph metric work from
+plain document-lookup routing, and supports the generated colon-delimited action
+route in the shared HTTP router. Published main error IDs retain their numbers.
+
+[Raw results, binary hashes and workload scope](system_catalog_delivery_workloads_2026_09_12.json)
+record source `44a94167b`, including graph main `014424f59` (merge `8d242c237`).
+Zig 0.16 ReleaseFast component measurements use `c_allocator`. All task-owned
+builds and tests finished before the final sequential measurements; unrelated
+host activity, including another Antfly swarm, was uncontrolled. Queue/admission
+comparisons below exclude network and proposal/replication work. They are not
+claims about distributed throughput or election stability.
+
+| Component, p50 | Before | After |
+| --- | --- | --- |
+| Reconnect retry drain, 4,096 frames | 9.168 ms | 0.064 ms |
+| HTTP queue drain, 4,096 frames across 16 peers | 9.691 ms | 0.150 ms |
+| Unchanged repair-bearing admission, 10,000 groups | 13.314 ms | 5.910 ms |
+| Header-change admission, 10,000 groups | 14.464 ms | 8.442 ms |
+
+Retry draining compares separately compiled production transports with the same
+harness. Stable survivor compaction removes repeated tail movement while retaining
+ordering, retry deadlines and route re-resolution. HTTP scheduling compares a
+reproduced global FIFO with the production per-peer FIFOs/ready-peer queue in one
+binary, using the same frame release costs. Its reference omits the old in-flight
+hash operations. The scheduler waits on a condition predicate, with one request
+in flight per peer and unchanged global/per-peer retention bounds. No new batching
+timer or wire protocol is required.
+
+Admission compares the former prior-clone/compare/owned-apply preparation against
+one production admission pass with pinned borrowed prior records and a fake
+proposal sink. Incoming report arrays are separately allocated. Unchanged-report
+allocations fall from 70,147 to 75; header-change allocations fall from 140,149
+to 70,078. The counter checks complete allocation/free balance. Duplicate reports
+retain sequential reporter-generation fencing, and failed allocations leave the
+borrowed prior and incoming report intact.
+
+### Storage cost and remaining tradeoffs
+
+A fresh rerun of the pristine `fd4745718` executable and the merged implementation
+produced these observations. This cross-revision comparison also includes the
+main graph integration, so timing differences are not isolated attribution to the
+local codec. The full-record and command byte sizes match between revisions.
+Each apply includes command decoding, projection, checkpoint persistence and
+commit, excluding replication/network and callback fanout.
+
+| 10,000 groups, p50 | Before | After |
+| --- | --- | --- |
+| Cached full report apply | 14.916 ms | 15.223 ms |
+| Fresh observation clocks | 20.231 ms | 20.619 ms |
+| One changed group | 16.879 ms | 16.702 ms |
+| All groups changed | 21.674 ms | 20.737 ms |
+| Referenced runtime apply | 8.412 ms | 8.076 ms |
+| Full-store hydration | 5.190 ms | 3.345 ms |
+
+The local component codec removes repeated StoreRecord envelopes, partitions
+incoming groups into contiguous buffers and decodes directly into caller-owned
+aggregate arrays. Full logical StoreRecord wire/snapshot codecs remain unchanged.
+One-group WAL falls from 14,591 to 10,111 bytes and all-group WAL from 2,233,295
+to 1,533,295 bytes. Cached/reference WAL stays at 304 bytes; fresh-clock WAL stays
+at 347,228 bytes. Full apply time remains essentially unchanged, including small
+regressions for cached/fresh-clock cases. This does not resolve the earlier
+full-report apply tradeoff. Full hydration allocates 40,015 times / 12,609,697
+bytes in caller-owned output and scratch; these counters are collected outside
+the latency loop and have no matched baseline allocation count.
+
+### Live application workloads and validation
+
+A disposable Debug standalone server exercised ten relational tables with two
+warmups and nine samples, checking returned rows and logical table labels.
+Lookup/query/customer-join p50s were 0.456/0.606/1.130 ms. Twenty-line repeated-target
+NDJSON was 4.796 ms, ten-table listing 2.364 ms and identity-preserving rename
+0.574 ms. Eight-client point lookup measured 1.938 ms p50 / 3.366 ms p95 over
+72 requests. This is a small packed-row catalog workload, not bulk ingestion.
+
+A separate ten-tenant management/restart scenario measured point GET 0.545 ms,
+namespace create/drop 1.247 ms and rename round trip 1.493 ms p50. Concurrent
+namespace create/drop was 4.284 ms p50 / 8.809 ms p95. Restart validation preserved
+all database IDs/names and confirmed temporary namespaces stayed deleted. Both
+application runs are unpaired observations; raw artifacts retain the server hash,
+settings, setup and recovery timing separately.
+
+Validation passed: server; 73 storage, 26 catalog durability, 9 catalog transport,
+123 metadata service, 61 standalone, 60 catalog API, 48 HTTP transport, 20 router,
+15 observer, 54 graph fan-in and 14 graph remote-wire tests. The 26 selected E2Es
+passed as 23 in the combined run and three graph/auth reruns after correcting the
+shared router. These include scoped graph maintenance through rename, read-only
+maintenance denial, relational rows, restore/restart, CLI, remote heartbeat status
+and filtered PageRank. Go SDK packages, 16 Rust tests, 14 Python response tests,
+286 TypeScript tests (one skipped), TypeScript typecheck and generated Zig API
+checks passed. The checked-in scheduler benchmark retains module reachability
+anchors so its workload actually executes.
+
+Raft Debug passed all 409 tests. ReleaseFast passed 403, with six joint-consensus
+trace fixtures failing identically on a pristine baseline reproduction. Those
+optimized fixture failures remain unresolved and are not catalog regressions.
+These are focused checks, not a full repository-suite pass.
