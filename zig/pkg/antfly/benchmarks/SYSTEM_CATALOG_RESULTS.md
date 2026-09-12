@@ -1110,3 +1110,35 @@ labels, table/database rename, stable identity and restart persistence. Go SDK
 packages, 15 Rust tests, 283 TypeScript tests (one skipped), SDK/Antfarm type
 checks and the canonical Antfarm rebuild passed. The earlier 396-test Raft library
 run remains recorded above; this merge did not change those library sources.
+
+### Subsequent durability/readiness merge
+
+The final fetch brought in `origin/main` at `2b57462b1` (#694, #713 and #714).
+These changes reserve topology versions 5/6 and restore command tags 52/53.
+The catalog now uses capability version 7 and command tags 54/55; published main
+encodings and runtime error numbers remain stable. The routed catalog callbacks
+also accept the shared mutation driver's expanded error contract. Intermediate
+encodings from this unmerged PR remain outside the compatibility boundary.
+The relational application measurements above precede this subsequent merge and
+retain their original source and binary provenance.
+
+Final merge validation passed: server build, 72 metadata-storage, 58 API,
+121 metadata/observer/routing and 46 HTTP transport tests; all 408 Raft library
+tests; Go SDK packages, 15 Rust tests and generated Zig API checks. The E2E
+selection passed 24 cases on the first run. Its additional stalled-discovery
+restore case passed in 19.83 s after replacing the old name-derived identity
+assertion with a fresh destination ID after drop/restore. The regression retains
+fresh Raft-group, full-replication, every-node row-read and restore-cleanup checks.
+Python response tests (14), TypeScript tests (283 passed, one skipped) and
+SDK/Antfarm type checks passed at the preceding relational merge. These remain
+focused checks rather than a full repository-suite pass.
+
+A final sequential component rerun, recorded under `final_main_integration` in
+[the raw artifact](system_catalog_relational_merge_2026_09_11.json), measured
+10,000-group repair admission at 6.558 ms p50 and reference apply at 9.524 ms.
+Cached full apply was 17.611 ms and full hydration 6.188 ms; WAL sizes remained
+unchanged. Selected-store preparation beside 100 stores was 0.015 ms versus
+1.692 ms for the reproduced full-inventory path. These unpaired observations
+retain the earlier full-report tradeoffs; they do not establish the cause of
+run-to-run timing variation. Application workloads were not repeated after this
+last main merge.

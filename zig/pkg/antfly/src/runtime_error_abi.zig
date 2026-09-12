@@ -356,6 +356,9 @@ pub const Detail = enum(c_int) {
     immutable_table_storage_settings,
     vector_store_lifecycle_unsupported,
     vector_store_reference_format_required,
+    // An ambiguous remote backup cannot authorize rollback at its caller.
+    backup_outcome_ambiguous,
+    metadata_mutation_not_applied,
     // System catalog errors cross the independently compiled runtime boundary.
     database_not_found,
     namespace_not_found,
@@ -623,6 +626,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.BackupStagingUnavailable => status(.unavailable, .backup_staging_unavailable),
         error.BackupArtifactMissing => status(.not_found, .backup_artifact_missing),
         error.BackupIntegrityMissing => status(.corrupt, .backup_integrity_missing),
+        error.BackupOutcomeAmbiguous => status(.conflict, .backup_outcome_ambiguous),
+        error.MetadataMutationNotApplied => status(.retryable, .metadata_mutation_not_applied),
         error.BackupAttemptLeaseLost => status(.conflict, .backup_attempt_lease_lost),
         error.BackgroundOwnerClosed => status(.unavailable, .background_owner_closed),
         error.RestoreSchedulingCapacity => status(.retryable, .restore_scheduling_capacity),
@@ -963,6 +968,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .backup_staging_unavailable => "BackupStagingUnavailable",
         .backup_artifact_missing => "BackupArtifactMissing",
         .backup_integrity_missing => "BackupIntegrityMissing",
+        .backup_outcome_ambiguous => "BackupOutcomeAmbiguous",
+        .metadata_mutation_not_applied => "MetadataMutationNotApplied",
         .backup_attempt_lease_lost => "BackupAttemptLeaseLost",
         .background_owner_closed => "BackgroundOwnerClosed",
         .restore_scheduling_capacity => "RestoreSchedulingCapacity",
@@ -1133,6 +1140,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
+    try std.testing.expectEqual(error.MetadataMutationNotApplied, errorFromStatus(statusFromError(error.MetadataMutationNotApplied)));
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
@@ -1234,4 +1242,10 @@ test "generation capacity retains retryability across the runtime boundary" {
 test "system catalog errors retain their stable runtime boundary classification" {
     const errors = [_]anyerror{ error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "ambiguous backup outcome survives runtime transport without rollback authorization" {
+    const wire = statusFromError(error.BackupOutcomeAmbiguous);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
+    try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
 }

@@ -41,25 +41,6 @@ pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
     return try decode(raw);
 }
 
-pub fn loadOrCountFromTxn(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, byte_range: types.ByteRange) !u64 {
-    if (try loadFromTxn(txn)) |count| return count;
-    const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
-    defer alloc.free(lower);
-    const upper = if (byte_range.end.len == 0) null else try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end);
-    defer if (upper) |key| alloc.free(key);
-    var cursor = try txn.openCursor();
-    defer cursor.close();
-    cursor.setUpperBound(upper);
-    var count: u64 = 0;
-    var next = try cursor.seekAtOrAfter(lower);
-    while (next) |entry| : (next = try cursor.next()) {
-        if (upper) |key| if (std.mem.order(u8, entry.key, key) != .lt) break;
-        if (internal_keys.isStoredDocumentRowKey(entry.key))
-            count = std.math.add(u64, count, 1) catch return error.RangeDocumentCountOverflow;
-    }
-    return count;
-}
-
 /// A new empty store has no range counter until its first primary mutation.
 /// Prove that case with a single bounded user-key probe. Any user record keeps
 /// a missing counter unknown, including legacy documents without identity
@@ -90,6 +71,17 @@ pub fn countPrimaryDocuments(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try countPrimaryDocumentsFromTxn(alloc, store, &txn, byte_range);
+}
+
+fn countPrimaryDocumentsFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
     defer alloc.free(lower);
     const upper = if (byte_range.end.len == 0)
@@ -110,7 +102,7 @@ pub fn countPrimaryDocuments(
     };
 
     var state = CountState{};
-    try store.scanWithContext(lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
+    try store.scanReadTxnWithContext(txn, lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
     return state.count;
 }
 
@@ -119,7 +111,18 @@ pub fn loadOrCount(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
-    return (try load(alloc, store)) orelse try countPrimaryDocuments(alloc, store, byte_range);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try loadOrCountFromTxn(alloc, store, &txn, byte_range);
+}
+
+pub fn loadOrCountFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
+    return (try loadFromTxn(txn)) orelse try countPrimaryDocumentsFromTxn(alloc, store, txn, byte_range);
 }
 
 /// Appends the range-local cardinality transition to the caller's atomic

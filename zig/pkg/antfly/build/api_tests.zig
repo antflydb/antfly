@@ -1266,6 +1266,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "derived coverage ready full text status reports complete progress",
             "readiness observation completion requires convergence and full topology",
+            "late source target notification cannot revoke an already observed target",
+            "late exact index notification preserves completed observation and reduction authority",
+            "late source notification cannot reuse an observation from before a catalog fence",
             "readiness evaluation cannot complete while convergence work remains",
             "readiness completion fences include every observation dimension",
             "chunked dense completion follows the physical publication target",
@@ -1435,6 +1438,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    const api_transaction_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
@@ -1591,7 +1600,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db forced algebraic repair persists an operator generation intent before execution",
             "db algebraic post-commit activation crash recovers through generation repair",
             "table provisioner admits algebraic index on a non-empty table through generation repair",
+            "structural reconcile reconfigures retained writer before managed dense writes",
             "target index reconciliation never mutates sibling indexes",
+            "target index reconciliation does not wait for sibling storage maintenance",
             "target index reconciliation retires orphaned inline enrichments after deletion retry",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
@@ -1809,6 +1820,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
             "restore job ownership failures remain retryable",
+            "restore admission unknown response preserves recovery",
             "restore worker authority is fenced across leadership reacquisition",
             "restore ownership backoff is interruptible without polling",
         },

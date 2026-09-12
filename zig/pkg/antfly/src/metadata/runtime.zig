@@ -1167,7 +1167,7 @@ pub fn runFromIterator(
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
         if (server.adminListenerFailure()) |err| return supervisor.fail("metadata", "admin-http", err);
         if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
-        raft_progress.check() catch |err| return supervisor.fail("metadata", "raft-progress", err);
+        raft_progress.checkFailure() catch |err| return supervisor.fail("metadata", "raft-progress", err);
         if (preferred_bootstrap_campaigner) {
             const now_ns = platform_time.monotonicNs();
             if (last_bootstrap_campaign_retry_ns == 0 or

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -41,7 +40,7 @@ from conftest import (
     wait_for_server,
 )
 from helpers import wait_until
-from native_debug import debuggable_command
+from native_debug import debuggable_command, native_stack_dumps
 from port_reservations import LoopbackPortReservations
 
 MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
@@ -1635,44 +1634,17 @@ class MultiNodeScalingCluster:
         evidence when the wedged thread blocks in memory; a stack snapshot
         taken at failure time is the only way to diagnose them from CI.
         """
-        if shutil.which("gdb") is None:
-            return "<gdb not available>"
-        parts: list[str] = []
-        for label, procs in (
-            ("metadata", self.metadata_procs),
-            ("data", self.data_procs),
-        ):
-            for proc in procs:
-                if proc.poll() is not None:
-                    parts.append(
-                        f"[{label} pid {proc.pid}] exited rc={proc.returncode}"
-                    )
-                    continue
-                try:
-                    result = subprocess.run(
-                        [
-                            "gdb",
-                            "-p",
-                            str(proc.pid),
-                            "-batch",
-                            "-ex",
-                            "set pagination off",
-                            "-ex",
-                            "thread apply all bt 30",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=per_process_timeout_s,
-                    )
-                    body = result.stdout[-250000:]
-                    if result.returncode != 0:
-                        body += (
-                            f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
-                        )
-                    parts.append(f"[{label} pid {proc.pid}]\n{body}")
-                except Exception as exc:
-                    parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
-        return "\n".join(parts)
+        return native_stack_dumps(
+            (
+                (f"{label}-{index}", proc)
+                for label, procs in (
+                    ("metadata", self.metadata_procs),
+                    ("data", self.data_procs),
+                )
+                for index, proc in enumerate(procs, start=1)
+            ),
+            per_process_timeout_s=per_process_timeout_s,
+        )
 
     def preserve_failure_diagnostics(self) -> None:
         diagnostics: dict[str, Any] = {

@@ -5154,6 +5154,7 @@ test "stored create table encoding preserves empty requests" {
     try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
     try std.testing.expect(decoded.description == null);
     try std.testing.expect(decoded.schema_json == null);
+    try std.testing.expectEqual(.primary_lsm, decoded.storage.dense_embeddings);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {

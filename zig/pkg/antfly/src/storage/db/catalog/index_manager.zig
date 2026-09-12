@@ -4817,14 +4817,16 @@ pub const IndexManager = struct {
 
     /// Caller owns entry.apply_mutex. This quiescent maintenance path may build
     /// a missing vector base inline, but it still leaves bounded native delta
-    /// consolidation to the background lane.
-    fn finalizeVectorBlockBaseAtStableTipLocked(
+    /// consolidation to the background lane. False means another finalizer
+    /// owns the table-wide claim, not that this build lost its generation.
+    /// Never wait for that owner while holding an index's apply mutex.
+    fn tryFinalizeVectorBlockBaseAtStableTipLocked(
         self: *IndexManager,
         entry: *DenseIndex,
         applied_sequence: u64,
-    ) !void {
+    ) !bool {
         if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-            return error.VectorBlockGenerationReservationLost;
+            return false;
         self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
         self.vector_block_stable_tip_sequence.store(applied_sequence, .release);
         defer {
@@ -4838,6 +4840,7 @@ pub const IndexManager = struct {
             .validate_payloads = true,
             .flatten = true,
         });
+        return true;
     }
 
     pub const NativePostingStableTipOptions = struct {
@@ -5144,7 +5147,7 @@ pub const IndexManager = struct {
             }
         };
 
-        try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+        if (!try self.tryFinalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence)) return .pending;
         self.vector_block_candidate_sequence.store(0, .release);
         self.vector_block_candidate_since_ns.store(0, .release);
         return .progressed;
@@ -6198,6 +6201,9 @@ pub const IndexManager = struct {
     }
 
     pub fn resetDenseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
+        // The caller must drain catalog readers before replacing inline index
+        // storage. Apply serialization alone does not exclude native publishers.
+        std.debug.assert(self.published_dense_admission.load(.acquire) == @as(u32, 1) << 31);
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
@@ -9469,7 +9475,10 @@ pub const IndexManager = struct {
             ) or (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
                 !entry.index.nativePostingBaseHasVectors()))
             {
-                try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+                // Explicit lifecycle publication must not report success if
+                // another owner prevented the required certification.
+                if (!try self.tryFinalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence))
+                    return error.VectorBlockGenerationReservationLost;
                 changed = self.vectorBlockReadyAtSequenceAndCount(
                     source_sequence,
                     entry,
@@ -41609,6 +41618,75 @@ test "stable native finalization certifies an empty dense index" {
     ));
     try std.testing.expectEqual(@as(?u64, 0), entry.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(@as(u64, 0), (try entry.index.postingBacklogStats()).dirty_postings);
+}
+
+test "quiescent vector finalization defers to another index owner without losing debt" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "owner",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        },
+        .{
+            .name = "contender",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"other_embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        },
+    });
+    const owner = manager.denseIndex("owner") orelse return error.IndexNotFound;
+    const entry = manager.denseIndex("contender") orelse return error.IndexNotFound;
+    _ = try entry.index.publishExperimentalPostingCheckpoint(0);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    manager.vector_block_candidate_since_ns.store(1, .release);
+
+    // Model a different index holding the table-wide claim. No scheduling or
+    // sleeps are needed to reproduce contention under the contender's lock.
+    manager.vector_block_stable_tip_finalizing.store(true, .release);
+    manager.vector_block_stable_tip_index.store(@intFromPtr(owner), .release);
+    manager.vector_block_stable_tip_sequence.store(17, .release);
+    manager.lockAtomicWithBackoff(entry.apply_mutex);
+    defer entry.apply_mutex.unlock();
+    try std.testing.expectEqual(.pending, try manager.maintainVectorBlockBaseIfQuiescent(entry));
+    try std.testing.expect(manager.vector_block_stable_tip_finalizing.load(.acquire));
+    try std.testing.expectEqual(@intFromPtr(owner), manager.vector_block_stable_tip_index.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 17), manager.vector_block_stable_tip_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), manager.vector_block_candidate_since_ns.load(.acquire));
+
+    manager.vector_block_stable_tip_sequence.store(0, .release);
+    manager.vector_block_stable_tip_index.store(0, .release);
+    manager.vector_block_stable_tip_finalizing.store(false, .release);
+    {
+        // A genuine generation failure after acquiring the claim must still
+        // propagate, release ownership, and leave the candidate retryable.
+        const FailBuild = struct {
+            fn call(_: *anyopaque) anyerror!void {
+                return error.VectorBlockGenerationReservationLost;
+            }
+        };
+        test_before_vector_block_primary_snapshot_build = .{ .ctx = &manager, .call = FailBuild.call };
+        defer test_before_vector_block_primary_snapshot_build = null;
+        try std.testing.expectError(error.VectorBlockGenerationReservationLost, manager.maintainVectorBlockBaseIfQuiescent(entry));
+        try std.testing.expect(!manager.vector_block_stable_tip_finalizing.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), manager.vector_block_stable_tip_index.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), manager.vector_block_stable_tip_sequence.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), manager.vector_block_candidate_since_ns.load(.acquire));
+    }
+    try std.testing.expectEqual(.progressed, try manager.maintainVectorBlockBaseIfQuiescent(entry));
+    try std.testing.expectEqual(@as(u64, 0), manager.vector_block_candidate_since_ns.load(.acquire));
+    try std.testing.expect(!manager.vector_block_stable_tip_finalizing.load(.acquire));
+    try std.testing.expect(manager.vectorBlockReadyAtSequenceAndCount(0, entry, 0));
 }
 
 test "only the stable-tip owner may repair postings from a leading vector generation" {

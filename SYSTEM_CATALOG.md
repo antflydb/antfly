@@ -115,7 +115,7 @@ the same transaction as authoritative mutations. Standalone persists table,
 range, and logical-resource rows together with a versioned revision record in one
 storage-engine transaction. Create and restore publish table topology
 and the logical binding together. Reopen and snapshot installation retain the
-catalog. System catalog admission requires topology protocol version 5;
+catalog. System catalog admission requires topology protocol version 7;
 existing atomic table operations retain their version-3 gate.
 
 Catalog failures use the shared JSON `error` field plus a machine-readable `code`.

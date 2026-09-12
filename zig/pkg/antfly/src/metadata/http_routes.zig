@@ -74,6 +74,7 @@ pub const Routes = struct {
     pub const raft_mutation_campaign_allowed_header = "X-Antfly-Raft-Mutation-Campaign-Allowed";
     pub const raft_mutation_outcome_header = "X-Antfly-Raft-Mutation-Outcome";
     pub const raft_mutation_outcome_not_proposed = "not-proposed-v1";
+    pub const raft_mutation_outcome_not_applied = "not-applied-v1";
     pub const raft_mutation_outcome_unknown = "unknown-v1";
     pub const raft_mutation_outcome_committed = "committed-v1";
     pub const raft_mutation_outcome_committed_visibility_pending = "committed-visibility-pending-v1";

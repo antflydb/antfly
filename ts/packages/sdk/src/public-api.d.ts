@@ -16261,6 +16261,22 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Restore admission could not be confirmed. If X-Antfly-Raft-Mutation-Outcome is unknown-v1, the job may still commit. Poll Location or retry the identical request using the returned Idempotency-Key. A missing job does not prove non-admission. Supply a stable key on the first request to recover if the entire response is lost. Without the unknown marker, this is a regular service or validation availability failure. */
+        RestoreAdmissionUnavailable: {
+            headers: {
+                /** @description Recovery job resource, present for an unknown admission outcome. */
+                Location?: string;
+                /** @description Reuse this key with the identical request and authenticated principal. */
+                "Idempotency-Key"?: string;
+                /** @description An unknown-v1 value prohibits replay with a new key. */
+                "X-Antfly-Raft-Mutation-Outcome"?: "unknown-v1";
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"] | components["schemas"]["Error"];
+            };
+        };
         /** @description Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged. */
         IndexMutationServiceUnavailable: {
             headers: {
@@ -17267,7 +17283,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response. */
                 "Idempotency-Key"?: string;
             };
             path?: never;
@@ -17282,6 +17298,8 @@ export interface operations {
             /** @description Restore job durably accepted */
             202: {
                 headers: {
+                    /** @description Recovery key for retries of this request. */
+                    "Idempotency-Key"?: string;
                     /** @description Relative URL of the durable restore job resource. */
                     Location?: string;
                     /** @description Suggested polling delay in seconds. */
@@ -17304,7 +17322,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["RestoreAdmissionUnavailable"];
         };
     };
     listRestoreJobs: {
@@ -17925,7 +17943,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response. */
                 "Idempotency-Key"?: string;
             };
             path: {
@@ -17943,6 +17961,8 @@ export interface operations {
             /** @description Durable restore job accepted */
             202: {
                 headers: {
+                    /** @description Recovery key for retries of this request. */
+                    "Idempotency-Key"?: string;
                     /** @description Relative URL of the durable restore job resource. */
                     Location?: string;
                     /** @description Suggested polling delay in seconds. */
@@ -17965,7 +17985,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["IndexMutationServiceUnavailable"];
+            503: components["responses"]["RestoreAdmissionUnavailable"];
         };
     };
     reauthorizeTableDestinations: {

@@ -967,6 +967,7 @@ var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_create_structural_publish_hook: ?TestExecutionHook = null;
+var test_before_structural_index_reconcile_hook: ?*const fn (*db_mod.DB) anyerror!void = null;
 var test_before_index_activation_enqueue_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
@@ -15084,7 +15085,10 @@ pub const ProvisionedTableWriteSource = struct {
             if (result.index_repair_paused) result.had_debt = true;
             repair_handoff_publication = self.authorizeRepairHandoffOwnerPublicationBestEffort(table_name, group_id);
         }
-        self.retireCachesAfterIndexRepairCompletion(table_name, result, !use_live_owner);
+        // A cold repair can promote its DB into the normal writer cache.
+        // Completion must follow current ownership, not whether that writer
+        // was already resident when this quantum began.
+        self.retireCachesAfterIndexRepairCompletion(table_name, result, !managed_owner_is_live_writer);
         if (result.terminalDegraded()) {
             // The terminal observation was published from the final durable
             // audit above. Do not relabel it as a fresh live-writer snapshot.
@@ -19244,6 +19248,7 @@ pub const ProvisionedTableWriteSource = struct {
                 cached_active = false;
             };
 
+            var enrichment_reconfigured = false;
             if (target_index_name == null) {
                 if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
             }
@@ -19254,7 +19259,7 @@ pub const ProvisionedTableWriteSource = struct {
                     break :matches ProvisionedTableWriteCache.entryManagedConfigMatches(cached.entry.?, indexes_json);
                 };
                 if (!managed_config_matches) {
-                    try reconfigureManagedDbEnrichmentRuntime(
+                    try reconfigureManagedDbEnrichmentRuntimePaused(
                         alloc,
                         cached.db,
                         indexes_json,
@@ -19266,9 +19271,10 @@ pub const ProvisionedTableWriteSource = struct {
                         self.secret_store,
                         self.remote_content,
                     );
-                    lockAtomic(&self.local_db_mutex);
-                    ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
-                    self.local_db_mutex.unlock();
+                    // Keep the replacement paused through durable admission;
+                    // starting it here lets sibling corpus work race the next
+                    // structural barrier and forces a second cancellation/join.
+                    enrichment_reconfigured = true;
                 }
                 if (target_index_name == null) {
                     if (metadata.schema_json) |schema_json| {
@@ -19293,10 +19299,19 @@ pub const ProvisionedTableWriteSource = struct {
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
                 };
+                if (builtin.is_test) {
+                    if (test_before_structural_index_reconcile_hook) |hook| try hook(cached.db);
+                }
                 const reconcile_summary = if (target_index_name) |target|
                     try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, cached.db, indexes_json, target, reconcile_options)
                 else
                     try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, reconcile_options);
+                if (enrichment_reconfigured) {
+                    try cached.db.resumeEnrichmentRuntimeAfterReconfigure("structural reconciliation", target_index_name orelse "*");
+                    lockAtomic(&self.local_db_mutex);
+                    ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
+                    self.local_db_mutex.unlock();
+                }
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                     if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
@@ -30569,7 +30584,10 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
-                .stats = try db.stats(alloc),
+                // A cold startup has no retained serving observation to
+                // overlay. Retry contention instead of publishing partial
+                // operational telemetry as an observed index inventory.
+                .stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
             };
             defer status.deinit(alloc);
             const startup = startupCatchUpStatsForPhase(phase, db);
@@ -40093,6 +40111,22 @@ test "structural reconcile reconfigures retained writer before managed dense wri
     try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
     const resident_db = &write_cache.entries.items[0].db;
 
+    const AdmissionBoundary = struct {
+        var observations: usize = 0;
+        fn check(db: *db_mod.DB) !void {
+            if (observations == 0) {
+                // The replacement producer is installed, but must not begin
+                // source work before the requested catalog admission exists.
+                try std.testing.expect(db.enrichment_runtime != null);
+                try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+            }
+            observations += 1;
+        }
+    };
+    AdmissionBoundary.observations = 0;
+    test_before_structural_index_reconcile_hook = AdmissionBoundary.check;
+    defer test_before_structural_index_reconcile_hook = null;
+
     FakeCatalog.indexes_json_buf = managed_indexes_json;
     var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
     defer {
@@ -40125,6 +40159,8 @@ test "structural reconcile reconfigures retained writer before managed dense wri
         ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.complete,
         reconcile_outcome,
     );
+    try std.testing.expect(AdmissionBoundary.observations > 0);
+    try std.testing.expect(resident_db.enrichment_runtime.?.isStarted());
     try std.testing.expect(resident_db == &write_cache.entries.items[0].db);
     try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
 
@@ -47495,6 +47531,13 @@ test "structural reconcile publishes durable index repair debt once per group" {
 
             fn run(self: *@This()) void {
                 for (0..16) |_| {
+                    // Every quantum must also work after eviction. In
+                    // particular, a cold completion installs a resident
+                    // writer and must keep that same owner serving reads.
+                    self.source.clearWriteCache() catch |err| {
+                        self.err = err;
+                        return;
+                    };
                     const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
                         .indexes_json = self.indexes_json,
                         .identity_namespace = self.namespace,
@@ -47503,6 +47546,24 @@ test "structural reconcile publishes durable index repair debt once per group" {
                         self.err = err;
                         return;
                     };
+                    if (repair.index_repair_repaired or repair.cleared_debt) {
+                        var resident = self.source.residentDbSource().leaseGroup(
+                            std.testing.allocator,
+                            "docs",
+                            7001,
+                            self.source.visibleRootGeneration(7001),
+                            .{},
+                        ) catch |err| {
+                            self.err = err;
+                            return;
+                        };
+                        if (resident) |*lease| {
+                            lease.release(std.testing.allocator);
+                        } else {
+                            self.err = error.TestUnexpectedResult;
+                            return;
+                        }
+                    }
                     if (repair.busy) {
                         self.err = error.TestUnexpectedResult;
                         return;
@@ -49776,6 +49837,14 @@ test "provisioned table write source best effort publish does not advertise lock
 
     try std.testing.expect(!published_while_busy);
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+
+    for ([_]db_mod.types.StartupCatchUpPhase{ .opening_db, .artifact_rebuild, .startup_catch_up }) |phase| {
+        db.core.lockApplyExclusive();
+        const startup_publication = publishRuntimeStatusSnapshotWithStartupPhase(&source, alloc, "docs", 7001, phase, &db);
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.WriterLocked, startup_publication);
+        try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    }
 
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db));
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;

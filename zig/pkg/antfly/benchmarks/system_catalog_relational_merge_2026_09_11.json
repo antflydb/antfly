@@ -451,5 +451,255 @@
         ]
       }
     }
+  },
+  "final_main_integration": {
+    "source_parent_commit": "248d2536cb6f74b301a0c30271eb81a4706f3387",
+    "merged_main": "2b57462b13a74b4df4fe63fc9b2c6359b358f8dd",
+    "source_sha256": {
+      "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig": "54adc1c4b6240ce86171f68bb8948dc4eb331fe72787a019f2610a80a70a8d37",
+      "zig/pkg/antfly/src/metadata/store_observer.zig": "3d0553126253b345cd54fe391cb0e25cda30a0fd440ba68580d7c2251e38c4f2",
+      "zig/pkg/antfly/src/metadata/service.zig": "eb07550bda8632d4315b81b07ab64e6e9719511c7260dac5b8d254558c9f8ec5",
+      "zig/pkg/antfly/src/storage/lsm_backend.zig": "16b9b0c74db945afbf6c397b25bebf14af8d551ee771965e270df840a6627b92",
+      "zig/pkg/antfly/src/storage/lsm_backend/manifest_set.zig": "0ebd5fe2280214af4fd24dbad705b8a7eb537a2617a576e4abe7cf6c74795efd",
+      "zig/tools/benchmark_system_catalog.py": "20e58594e16db1d4a951e3f89f751c21dc229415c55507fc58da3f6ca478a322",
+      "zig/pkg/antfly/src/metadata/topology_protocol.zig": "20d7cc94be074e863d12a5604bd75309cf8d096484d1dc9e9a5c32d05f8c7bb9",
+      "zig/lib/raft/src/core/raft.zig": "adbf27de9db3899e75a1534aebe2dedcaaa951aa346e692a81fc6330cfd80a24",
+      "zig/pkg/antfly/src/raft/transport/http_driver.zig": "a53b71ff15b4f5197045b89444e46deba05f6d8a57a8b8ef17caf5ed122da03e"
+    },
+    "server_sha256": "20fa3ccba16984fc29579676491de2c4e3654eb4f5bbc9085427c7007c391279",
+    "methodology": "Final component rerun only, same sample counts and timing boundaries. Compiled before measurement; no task-owned builds/tests overlapped. Application workload measurements above precede this merge. Unpaired development-host observation; unrelated host activity uncontrolled.",
+    "components": [
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 0.282,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 0.246,
+        "wal_bytes_per_apply": 4280,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 0.242,
+        "wal_bytes_per_apply": 14591,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 0.231,
+        "wal_bytes_per_apply": 22886,
+        "full_record_bytes": 82218,
+        "command_bytes": 82224
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 0.165,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 82218,
+        "command_bytes": 12424
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "full_store_read_p50_ms": 0.063
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 100,
+        "placement_drain_read_p50_ms": 0.00739
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 1.583,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 1.412,
+        "wal_bytes_per_apply": 35324,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 1.337,
+        "wal_bytes_per_apply": 14591,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 1.34,
+        "wal_bytes_per_apply": 223766,
+        "full_record_bytes": 821118,
+        "command_bytes": 821124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 0.591,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 821118,
+        "command_bytes": 123124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "full_store_read_p50_ms": 0.572
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 1000,
+        "placement_drain_read_p50_ms": 0.00673
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "cached_heartbeat",
+        "apply_p50_ms": 17.611,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "fresh_clocks",
+        "apply_p50_ms": 23.13,
+        "wal_bytes_per_apply": 347228,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "one_group_change",
+        "apply_p50_ms": 20.434,
+        "wal_bytes_per_apply": 14591,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "all_groups_change",
+        "apply_p50_ms": 25.757,
+        "wal_bytes_per_apply": 2233295,
+        "full_record_bytes": 8210118,
+        "command_bytes": 8210124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "scenario": "referenced_runtime",
+        "apply_p50_ms": 9.524,
+        "wal_bytes_per_apply": 304,
+        "full_record_bytes": 8210118,
+        "command_bytes": 1230124
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "full_store_read_p50_ms": 6.188
+      },
+      {
+        "kind": "REPORT_BENCH",
+        "groups": 10000,
+        "placement_drain_read_p50_ms": 0.00653
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 1000,
+        "repair": false,
+        "p50_ms": 0.001
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 1000,
+        "repair": true,
+        "p50_ms": 0.662
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 10000,
+        "repair": false,
+        "p50_ms": 0.014
+      },
+      {
+        "kind": "REPAIR_ADMISSION_BENCH",
+        "groups": 10000,
+        "repair": true,
+        "p50_ms": 6.558
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 0.02
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 1,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.019
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 0.178
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 10,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.016
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "selected": false,
+        "p50_ms": 1.692
+      },
+      {
+        "kind": "ADMISSION_CACHE_BENCH",
+        "stores": 100,
+        "groups_per_store": 100,
+        "selected": true,
+        "p50_ms": 0.015
+      }
+    ]
   }
 }
