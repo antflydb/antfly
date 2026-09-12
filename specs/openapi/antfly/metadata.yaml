@@ -9656,6 +9656,32 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    RestoreAdmissionUnavailable:
+      description: >-
+        Restore admission could not be confirmed. If X-Antfly-Raft-Mutation-Outcome
+        is unknown-v1, the job may still commit. Poll Location or retry the identical
+        request using the returned Idempotency-Key. A missing job does not prove
+        non-admission. Supply a stable key on the first request to recover if the
+        entire response is lost. Without the unknown marker, this is a regular
+        service or validation availability failure.
+      headers:
+        Location:
+          description: Recovery job resource, present for an unknown admission outcome.
+          schema: { type: string }
+        Idempotency-Key:
+          description: Reuse this key with the identical request and authenticated principal.
+          schema: { type: string }
+        X-Antfly-Raft-Mutation-Outcome:
+          description: An unknown-v1 value prohibits replay with a new key.
+          schema: { type: string, enum: [unknown-v1] }
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+              - $ref: "#/components/schemas/Error"
     IndexMutationServiceUnavailable:
       description: Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged.
       headers:
@@ -10703,7 +10729,7 @@ paths:
             minLength: 1
             maxLength: 256
             x-go-type-skip-optional-pointer: false
-          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -10714,6 +10740,9 @@ paths:
         "202":
           description: Restore job durably accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema: { type: string }
             Location:
               description: Relative URL of the durable restore job resource.
               schema: { type: string }
@@ -10735,7 +10764,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/RestoreAdmissionUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore/jobs:
@@ -11617,7 +11646,7 @@ paths:
             minLength: 1
             maxLength: 256
             x-go-type-skip-optional-pointer: false
-          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -11628,6 +11657,9 @@ paths:
         "202":
           description: Durable restore job accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema: { type: string }
             Location:
               description: Relative URL of the durable restore job resource.
               schema: { type: string }
@@ -11649,7 +11681,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+          $ref: "#/components/responses/RestoreAdmissionUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/destination-authorization:

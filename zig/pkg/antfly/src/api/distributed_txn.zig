@@ -2010,12 +2010,23 @@ fn executeMultiTableCommitOnce(
                     try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                     return .{ .conflict = participantConflict(participant) };
                 },
-                error.UnknownGroup => {
+                error.UnknownGroup,
+                error.RaftBatchWriteOutcomeUnknown,
+                error.ClientShuttingDown,
+                => {
+                    // No commit decision has been attempted. An uncertain
+                    // prepare can leave intents, but a confirmed coordinator
+                    // abort fences them permanently. Only after that durable
+                    // decision may an ephemeral caller start a fresh attempt.
+                    // Failure to prove abort still propagates unchanged.
                     abort_on_error = false;
                     try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                     return .{ .conflict = participantUnavailableConflict(participant, .prepare) };
                 },
                 else => {
+                    std.log.warn("transaction prepare failed table={s} group_id={} err={s}", .{
+                        participant.table_name, participant.group_id, @errorName(err),
+                    });
                     abort_on_error = false;
                     try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                     return err;
@@ -4286,6 +4297,9 @@ test "distributed txn coordinator aborts only participants that may have begun" 
     const Recorder = struct {
         fail_begin: bool = false,
         definite_begin_miss_group_id: ?u64 = null,
+        prepare_failure: anyerror = error.IntentConflict,
+        abort_failure: bool = false,
+        observed_status: db_mod.types.TxnStatus = .pending,
         resolves: std.ArrayListUnmanaged(db_mod.types.TxnStatus) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -4312,16 +4326,19 @@ test "distributed txn coordinator aborts only participants that may have begun" 
 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnPrepareRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!self.fail_begin and group_id == 7002) return error.IntentConflict;
+            if (!self.fail_begin and group_id == 7002) return self.prepare_failure;
         }
 
         fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.resolves.append(std.testing.allocator, req.status);
+            try std.testing.expectEqual(.write, req.sync_level);
+            if (self.abort_failure) return error.InjectedAbortFailure;
         }
 
-        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
-            return .pending;
+        fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.observed_status;
         }
     };
 
@@ -4403,6 +4420,31 @@ test "distributed txn coordinator aborts only participants that may have begun" 
     // follower's explicit not-proposed result must not create phase-two work.
     try std.testing.expectEqual(@as(usize, 1), recorder.resolves.items.len);
     try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, recorder.resolves.items[0]);
+
+    recorder.definite_begin_miss_group_id = null;
+    const tables = [_]TableCommitRequest{.{ .table_name = "docs", .writes = &.{
+        .{ .key = "doc:a", .value = "{\"count\":0}" },
+        .{ .key = "doc:z", .value = "{\"count\":0}" },
+    } }};
+    for ([_]anyerror{ error.RaftBatchWriteOutcomeUnknown, error.ClientShuttingDown }) |prepare_failure| {
+        recorder.prepare_failure = prepare_failure;
+        for ([_]bool{ false, true }) |abort_failure| {
+            recorder.resolves.clearRetainingCapacity();
+            recorder.abort_failure = abort_failure;
+            recorder.observed_status = .aborted;
+            const outcome = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null);
+            try std.testing.expect(outcome == .conflict);
+            try std.testing.expectEqual(.prepare, outcome.conflict.phase.?);
+            try std.testing.expectEqual(@as(?u64, 7002), outcome.conflict.group_id);
+            for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
+        }
+        // An ambiguous abort or a committed decision can never authorize a
+        // fresh transaction, even when the original failure was in prepare.
+        for ([_]db_mod.types.TxnStatus{ .pending, .committed }) |observed_status| {
+            recorder.observed_status = observed_status;
+            try std.testing.expectError(error.AbortDecisionNotDurable, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &tables, .write, null));
+        }
+    }
 }
 
 test "distributed txn coordinator never restarts a transaction id on topology change" {

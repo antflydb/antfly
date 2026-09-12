@@ -77,6 +77,9 @@ pub const LocalTableRuntimeStatus = struct {
     // deliberately separate from metadata.status_generation, which identifies
     // externally published store snapshots.
     cache_observation_generation: u64 = 0,
+    // A retained observation can outlive a catalog fence. Its durable target
+    // deduplicates notifications only within the epoch that accepted it.
+    cache_publication_epoch: ?TableRuntimeSnapshotCache.TableEpoch = null,
     // Identifies the filesystem observation that produced disk_bytes. Disk
     // usage has a separate causal lifetime from DB/runtime facts: a cached or
     // startup status can still carry a freshly scanned, authoritative size.
@@ -98,6 +101,7 @@ pub const LocalTableRuntimeStatus = struct {
         return .{
             .group_id = self.group_id,
             .cache_observation_generation = self.cache_observation_generation,
+            .cache_publication_epoch = self.cache_publication_epoch,
             .disk_observation_generation = self.disk_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
@@ -1791,6 +1795,7 @@ pub const TableRuntimeSnapshotCache = struct {
             &owned,
             token.target_observation_revision,
         );
+        owned.cache_publication_epoch = state.epoch;
         if (current) |value| {
             retired_status = value.*;
             value.* = owned;
@@ -1812,6 +1817,7 @@ pub const TableRuntimeSnapshotCache = struct {
         if (completed_global_handoff) self.syncReadViewAuthorityLocked(table_name, state);
         if (prepared) |group| {
             group.status.cache_observation_generation = published_status.cache_observation_generation;
+            group.status.cache_publication_epoch = published_status.cache_publication_epoch;
             group.status.metadata = published_status.metadata;
             syncReadGroupAuthorityFromStateLocked(state, group);
             lockAtomic(&self.read_view_mutex);
@@ -2181,6 +2187,7 @@ pub const TableRuntimeSnapshotCache = struct {
         var published = false;
         for (owned, statuses, publishable, merge_workspaces, 0..) |*next, status, should_publish, *workspace, owned_index| {
             if (!should_publish) continue;
+            next.cache_publication_epoch = state.epoch;
             if (state.groups.getPtr(status.group_id)) |previous| {
                 finishMovedIndexObservationDeltaLocked(previous, next, &(workspace.* orelse unreachable));
             } else {
@@ -2300,12 +2307,15 @@ pub const TableRuntimeSnapshotCache = struct {
         state.groups = replacement;
         replacement = .empty;
         replacement_owned = false;
+        var published_groups = state.groups.valueIterator();
+        while (published_groups.next()) |status| status.cache_publication_epoch = state.epoch;
         self.clearIndexAuthoritiesLocked(state);
 
         if (prepared_read_view) |view| {
             for (view.groups) |group| {
                 const current = state.groups.get(group.status.group_id).?;
                 group.status.cache_observation_generation = current.cache_observation_generation;
+                group.status.cache_publication_epoch = current.cache_publication_epoch;
                 group.status.metadata = current.metadata;
                 syncReadGroupAuthorityFromStateLocked(state, group);
             }
@@ -2818,6 +2828,34 @@ pub const TableRuntimeSnapshotCache = struct {
             if (state.required_target_observation_revisions.get(group_id)) |required| {
                 if (sequence <= required.source_target_sequence) return .no_change;
             }
+            // Owner sampling can finish before the corresponding publication
+            // callback reaches this cache. That durable target is already
+            // observed even if no notification watermark was recorded yet.
+            // Do not mint a new causal fence for the delayed duplicate.
+            // Pending, cached, or synthetic observations cannot supply this proof, and
+            // null-sequence structural invalidations must always fence.
+            if (state.groups.get(group_id)) |observed| {
+                if (observed.metadata.target_observation_complete and
+                    observed.metadata.source != .cached_snapshot and
+                    observed.metadata.source != .synthetic_config and
+                    observed.cache_publication_epoch != null and
+                    std.meta.eql(observed.cache_publication_epoch.?, state.epoch) and
+                    sequence <= observed.metadata.target_observation_revision)
+                {
+                    // Retain the accepted proof even when the notification
+                    // needs no new fence. A late snapshot must not erase it.
+                    state.required_target_observation_revisions.put(self.alloc, group_id, .{
+                        .event_revision = self.target_observation_revision,
+                        .source_target_sequence = sequence,
+                        .observed = true,
+                        .observed_source_target_sequence = observed.metadata.target_observation_revision,
+                    }) catch {
+                        self.invalidateTableStateLocked(table_name, state);
+                        return .state_invalidated;
+                    };
+                    return .no_change;
+                }
+            }
         }
         self.advanceTargetObservationRevisionLocked();
         const requirement = TableState.TargetObservationRequirement{
@@ -2830,8 +2868,9 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(table_name, state);
             return .state_invalidated;
         };
-        if (state.groups.getPtr(group_id)) |status|
+        if (state.groups.getPtr(group_id)) |status| {
             status.metadata.target_observation_complete = false;
+        }
         return .group_applied;
     }
 
@@ -2995,7 +3034,9 @@ pub const TableRuntimeSnapshotCache = struct {
                 true;
         var reducing_source_sequence = if (serving_set_may_reduce) source_target_sequence else 0;
         var merged_target_sequence = source_target_sequence;
+        var event_revision: u64 = 0;
         if (authority.?.convergence_requirements.get(group_id)) |required| {
+            event_revision = required.event_revision;
             // Commit notifications run after releasing the source lock. Their
             // delivery order is not commit order: an older delete can carry
             // reduction authority that a newer additive callback did not.
@@ -3005,11 +3046,34 @@ pub const TableRuntimeSnapshotCache = struct {
                 reducing_source_sequence == required.reducing_source_sequence)
                 return .no_change;
         }
-        self.advanceTargetObservationRevisionLocked();
+        // A delayed exact callback can arrive after both source observation
+        // and index replay have covered it. Keep the durable target/reduction
+        // watermarks for future merges, but do not demand a second observation
+        // of an already-applied target in this catalog epoch.
+        const already_observed = observed: {
+            const status = current_status orelse break :observed false;
+            const position = current_position orelse break :observed false;
+            const item = status.stats.indexes[position];
+            break :observed status.metadata.target_observation_complete and
+                status.metadata.source != .cached_snapshot and
+                status.metadata.source != .synthetic_config and
+                status.cache_publication_epoch != null and
+                std.meta.eql(status.cache_publication_epoch.?, state.epoch) and
+                status.metadata.target_observation_revision >= merged_target_sequence and
+                item.runtime_target_observation_complete and
+                item.replay_target_sequence >= merged_target_sequence and
+                item.replay_applied_sequence >= merged_target_sequence;
+        };
+        if (!already_observed) {
+            self.advanceTargetObservationRevisionLocked();
+            event_revision = self.target_observation_revision;
+        }
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
-            .event_revision = self.target_observation_revision,
+            .event_revision = event_revision,
             .source_target_sequence = merged_target_sequence,
             .reducing_source_sequence = reducing_source_sequence,
+            .observed = already_observed,
+            .observed_source_target_sequence = if (already_observed) merged_target_sequence else 0,
         }) catch {
             // Exact-scope bookkeeping failed, so conservatively widen this
             // one event to the established group-wide convergence fence.
@@ -3021,10 +3085,12 @@ pub const TableRuntimeSnapshotCache = struct {
                 source_target_sequence,
             );
         };
+        if (already_observed) return .no_change;
         if (current_status) |status| {
             const item = &status.stats.indexes[current_position orelse return .index_applied];
-            if (indexMatchesTargetIdentity(item.*, identity))
+            if (indexMatchesTargetIdentity(item.*, identity)) {
                 item.runtime_target_observation_complete = false;
+            }
         }
         return .index_applied;
     }
@@ -3328,6 +3394,7 @@ pub const TableRuntimeSnapshotCache = struct {
             );
             self.applyTargetObservationAuthorityLocked(state, owned.group_id, &owned, target_observation_revision);
             self.enforceIndexAuthoritiesInStatusLocked(state, &owned);
+            owned.cache_publication_epoch = expected_epoch;
             if (replacement.getPtr(owned.group_id)) |duplicate| {
                 duplicate.deinit(self.alloc);
                 duplicate.* = owned;
@@ -9641,6 +9708,141 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
     var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer observed.deinit(alloc);
     try std.testing.expect(observed.metadata.target_observation_complete);
+}
+
+test "late source target notification cannot revoke an already observed target" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    const initial = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(initial, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+    });
+    // A publication callback may arrive after the owner has sampled its
+    // durable target. No pending notification has been recorded for it yet.
+    cache.markGroupTargetObservationPending("docs", 7, 6);
+    cache.markGroupTargetObservationPending("docs", 7, 5);
+    {
+        var listed = (try cache.snapshot(alloc, "docs")).?;
+        defer listed.deinit(alloc);
+        try std.testing.expect(listed.items[0].metadata.target_observation_complete);
+        var detail = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer detail.deinit(alloc);
+        try std.testing.expect(detail.metadata.target_observation_complete);
+    }
+    const before_new_target = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    _ = try cache.publishGroup(before_new_target, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+    });
+    {
+        var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.metadata.target_observation_complete);
+    }
+    const completed = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(completed, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 7 },
+    });
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    {
+        var settled = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer settled.deinit(alloc);
+        try std.testing.expect(settled.metadata.target_observation_complete);
+    }
+    // A structural fence retains serving payloads from the old epoch; those
+    // payloads cannot deduplicate a completion notification in the new epoch.
+    cache.fenceTablePublications("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 8);
+    const restored = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(restored, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 8 },
+    });
+    cache.markTableTargetObservationPending("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    var retired = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer retired.deinit(alloc);
+    try std.testing.expect(!retired.metadata.target_observation_complete);
+}
+
+test "late exact index notification preserves completed observation and reduction authority" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 6,
+        .replay_target_sequence = 6,
+    }};
+    const token = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(token, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+    };
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    {
+        var listed = (try cache.snapshot(alloc, "docs")).?;
+        defer listed.deinit(alloc);
+        try std.testing.expect(listed.items[0].stats.indexes[0].runtime_target_observation_complete);
+        var detail = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer detail.deinit(alloc);
+        try std.testing.expect(detail.stats.indexes[0].runtime_target_observation_complete);
+        const requirement = cache.tables.get("docs").?.index_authorities.get("thumbnail").?.convergence_requirements.get(7).?;
+        try std.testing.expectEqual(@as(u64, 6), requirement.source_target_sequence);
+        try std.testing.expectEqual(@as(u64, 6), requirement.reducing_source_sequence);
+    }
+    cache.markIndexTargetObservationPending("docs", 7, identity, 7);
+    var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer pending.deinit(alloc);
+    try std.testing.expect(!pending.stats.indexes[0].runtime_target_observation_complete);
+}
+
+test "late source notification cannot reuse an observation from before a catalog fence" {
+    const alloc = std.testing.allocator;
+    for ([_]?RuntimeStatusSource{ null, .cached_snapshot, .synthetic_config }) |retained_source| {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        const initial = try cache.capturePublicationToken("docs");
+        _ = try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .stats = .{},
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        });
+        cache.fenceTablePublications("docs");
+        // Relabeling retained facts in a new epoch does not sample the owner.
+        if (retained_source) |source| {
+            const current = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(current, "docs", .{
+                .group_id = 7,
+                .stats = .{},
+                .metadata = .{ .source = source, .freshness = .fresh, .target_observation_revision = 6 },
+            });
+        }
+        cache.markGroupTargetObservationPending("docs", 7, 6);
+        var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.metadata.target_observation_complete);
+    }
 }
 
 test "accepted target observation survives late snapshots but not new commit fences" {

@@ -55,23 +55,36 @@ class RuntimeContainerTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-            # Use a native probe: setup-python's interpreter may itself need
-            # LD_LIBRARY_PATH to find libpython. Launching that interpreter
-            # under the isolated container paths tests its packaging instead
-            # of our runtime's driver discovery contract.
+            # Probe the native loader directly. A toolcache Python may itself
+            # need LD_LIBRARY_PATH to find libpython, which is unrelated to the
+            # container's driver paths and must not be part of this contract.
             probe = root / "driver-probe"
             subprocess.run(
                 ["cc", "-x", "c", "-", "-o", str(probe), "-ldl"],
-                input="""#include <dlfcn.h>
+                input=r"""
+#include <dlfcn.h>
 #include <stdio.h>
+
 int main(void) {
-    void *library = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!library) { fprintf(stderr, "%s\\n", dlerror()); return 1; }
-    int (*driver)(void) = (int (*)(void))dlsym(library, "antfly_test_driver");
-    if (!driver) { fprintf(stderr, "%s\\n", dlerror()); dlclose(library); return 2; }
-    int result = driver();
-    dlclose(library);
-    return result == 42 ? 0 : 3;
+    void *driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!driver) {
+        fprintf(stderr, "dlopen: %s\n", dlerror());
+        return 1;
+    }
+    int (*probe)(void) = (int (*)(void))dlsym(driver, "antfly_test_driver");
+    const char *error = dlerror();
+    if (error) {
+        fprintf(stderr, "dlsym: %s\n", error);
+        dlclose(driver);
+        return 2;
+    }
+    int result = probe();
+    dlclose(driver);
+    if (result != 42) {
+        fprintf(stderr, "unexpected driver result: %d\n", result);
+        return 3;
+    }
+    return 0;
 }
 """,
                 text=True,
@@ -84,13 +97,20 @@ int main(void) {
             env["LD_LIBRARY_PATH"] = ":".join(
                 str(root / path.lstrip("/")) for path in runtime_library_paths()
             )
-            subprocess.run(
+            result = subprocess.run(
                 [str(probe)],
                 env=env,
-                check=True,
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Prove the fixture was discovered through the configured paths,
+            # rather than a host library or an embedded absolute filename.
+            env["LD_LIBRARY_PATH"] = str(root / "missing")
+            missing = subprocess.run(
+                [str(probe)], env=env, capture_output=True, text=True
+            )
+            self.assertNotEqual(missing.returncode, 0)
 
 
 if __name__ == "__main__":
