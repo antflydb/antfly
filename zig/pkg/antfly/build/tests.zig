@@ -1625,11 +1625,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"virtual http network"},
     });
     const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
-    const data_maintenance_vopr_tests = b.addTest(.{
+    const data_runtime_vopr_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = &.{"DataServer LSM maintenance"},
+        .filters = &.{ "DataServer LSM maintenance", "DataServer store status" },
+        .max_rss = production_vopr_compile_max_rss,
     });
-    const run_data_maintenance_vopr_tests = addFilteredTestRunArtifact(b, data_maintenance_vopr_tests);
+    const run_data_runtime_vopr_tests = addFilteredTestRunArtifact(b, data_runtime_vopr_tests);
 
     // Snapshot artifact storage has its own root because Zig does not collect
     // tests from the implementation behind the transport compatibility alias.
@@ -2547,11 +2548,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run production DataServer HTTP, ownership, and replicated merge/split actions on VoprIo",
     );
     data_server_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
-    data_server_vopr_test_step.dependOn(&run_data_maintenance_vopr_tests.step);
+    data_server_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_data_server_transition_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);
     data_plane_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
-    data_plane_vopr_test_step.dependOn(&run_data_maintenance_vopr_tests.step);
+    data_plane_vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
 
     const serverless_object_store_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -3503,7 +3504,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_vopr_runtime_adapter_tests = b.addRunArtifact(vopr_runtime_adapter_tests);
     const vopr_runtime_adapter_test_step = b.step("vopr-runtime-test", "Run Antfly background-service adapters on the deterministic VOPR runtime");
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
-    vopr_runtime_adapter_test_step.dependOn(&run_data_maintenance_vopr_tests.step);
+    vopr_runtime_adapter_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
     b.step("vopr-build", "Install the VOPR campaign and replay executable").dependOn(&b.addInstallArtifact(vopr_cli, .{}).step);
@@ -3597,7 +3598,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_supervision_vopr_tests.step);
     vopr_test_step.dependOn(&run_auth_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
-    vopr_test_step.dependOn(&run_data_maintenance_vopr_tests.step);
+    vopr_test_step.dependOn(&run_data_runtime_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_object_store_vopr_tests.step);
     vopr_test_step.dependOn(&run_serverless_workflow_vopr_tests.step);
     vopr_test_step.dependOn(&run_db_index_race_vopr_tests.step);

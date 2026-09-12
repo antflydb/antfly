@@ -7817,10 +7817,44 @@ pub const DataServer = struct {
     /// ownership rules.
     pub fn runStoreStatusRoundOnly(self: *DataServer) !void {
         if (self.remote_metadata == null or self.store_registration == null) return;
-        if (!self.store_registration_confirmed) try self.registerNodeIfConfigured();
-        _ = self.store_status_ticks.fetchAdd(1, .monotonic);
+        const now_ms = self.backgroundMonotonicMs();
+        if (!self.metadataBootstrapRetryDue(now_ms)) return;
+        if (!self.store_registration_confirmed) {
+            self.registerNodeIfConfigured() catch |err| {
+                try self.recordMetadataBootstrapError(err, now_ms);
+                return;
+            };
+        }
         self.store_status_ticks.store(0, .release);
-        try self.reportStoreStatus();
+        try self.reportStoreStatusWithRetry(.full, now_ms);
+    }
+
+    // Keep independently scheduled publication and the managed control loop
+    // on one error policy. A metadata election must yield to other owners
+    // until the shared retry deadline, while permanent failures still escape.
+    fn reportStoreStatusWithRetry(self: *DataServer, report_kind: StoreStatusReportKind, now_ms: u64) !void {
+        const result = switch (report_kind) {
+            .full => self.reportStoreStatus(),
+            .heartbeat => self.reportStoreStatusHeartbeat(),
+            .none => unreachable,
+        };
+        result catch |err| switch (err) {
+            // Split runtime can briefly observe placement before the
+            // local replica root is fully provisioned on disk.
+            error.LsmRootWriterAlreadyOpen,
+            error.PersistentDescriptorAdmissionExhausted,
+            error.FileNotFound,
+            error.UnknownGroup,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            error.StaleLocalGroupStatusGeneration,
+            => {},
+            error.UnknownStore => {
+                self.store_registration_confirmed = false;
+                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
+            },
+            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
+        };
     }
 
     /// Schedules only the production maintenance lanes that can turn newly
@@ -7979,28 +8013,7 @@ pub const DataServer = struct {
                     );
                     if (report_kind != .none) {
                         self.store_status_ticks.store(0, .release);
-                        const result = switch (report_kind) {
-                            .full => self.reportStoreStatus(),
-                            .heartbeat => self.reportStoreStatusHeartbeat(),
-                            .none => unreachable,
-                        };
-                        result catch |err| switch (err) {
-                            // Split runtime can briefly observe placement before the
-                            // local replica root is fully provisioned on disk.
-                            error.LsmRootWriterAlreadyOpen,
-                            error.PersistentDescriptorAdmissionExhausted,
-                            error.FileNotFound,
-                            error.UnknownGroup,
-                            error.LmdbUnexpected,
-                            error.Corrupted,
-                            error.StaleLocalGroupStatusGeneration,
-                            => {},
-                            error.UnknownStore => {
-                                self.store_registration_confirmed = false;
-                                self.registerNodeIfConfigured() catch |register_err| try self.recordMetadataBootstrapError(register_err, now_ms);
-                            },
-                            else => |retry_err| try self.recordMetadataBootstrapError(retry_err, now_ms),
-                        };
+                        try self.reportStoreStatusWithRetry(report_kind, now_ms);
                     }
                 }
 
@@ -32700,6 +32713,160 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), server.last_provision_head_check_at_ms);
+}
+
+test "DataServer store status retries leadership changes on borrowed VoprIo" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-backoff", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = 100 * 365 * 24 * 60 * 60 * std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer backend_runtime.deinit();
+    const remote_metadata = try alloc.create(RemoteMetadataSource);
+    const metadata_api_urls = [_][]const u8{"http://metadata.test"};
+    const Metadata = struct {
+        reports: usize = 0,
+
+        fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.head)) {
+                try std.testing.expectEqual(antfly.common.http.Method.GET, request.method);
+                return .{
+                    .status = 200,
+                    .body = try std.json.Stringify.valueAlloc(response_alloc, antfly.metadata_api.MetadataHead{
+                        .metadata_group_id = 1,
+                        .metadata_incarnation = "11111111111111111111111111111111".*,
+                        .metadata_epoch = 0,
+                    }, .{}),
+                };
+            }
+            try std.testing.expectEqual(antfly.common.http.Method.POST, request.method);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/status"));
+            self.reports += 1;
+            return .{ .status = 200 };
+        }
+    };
+    var metadata_transport = Metadata{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
+    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .remote_metadata = remote_metadata,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = remote_metadata.statusSource(),
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .backend_runtime = backend_runtime.ptr(),
+        .listener_cfg = undefined,
+        .reporter_incarnation = 1,
+    };
+    defer server.deinit();
+    server.store_registration_confirmed = true;
+    server.store_status_dirty.store(true, .release);
+    server.embedding_activity_status_dirty.store(true, .release);
+
+    // A transient election failure must preserve the publication and yield,
+    // even when the borrowed clock is far beyond host uptime.
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expect(server.embedding_activity_status_dirty.load(.acquire));
+    const retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+    try std.testing.expect(retry_at_ms > server.backgroundMonotonicMs());
+
+    // Make an accidental early attempt observable as a permanent error.
+    server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
+    vopr_io.monotonic_ns = @as(i96, retry_at_ms - 1) * std.time.ns_per_ms;
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    vopr_io.monotonic_ns += std.time.ns_per_ms;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+
+    server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(u32, 2), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.reports);
+
+    // Once authority recovers, publish through the real collector and HTTP
+    // client and clear the retry state only after successful publication.
+    vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
+    server.setRemoteMetadataFetchErrorForTest(null);
+    remote_metadata.cached_snapshot = try cloneAdminSnapshotOwned(alloc, .{
+        .status = .{
+            .metadata_group_id = 1,
+            .metadata_incarnation = "11111111111111111111111111111111".*,
+            .metrics = .{},
+        },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    });
+    remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(usize, 1), metadata_transport.reports);
+    try std.testing.expectEqual(@as(u32, 0), server.metadataBootstrapRetryAttemptsForTest());
+    try std.testing.expectEqual(@as(u64, 0), server.nextMetadataBootstrapRetryAtMsForTest());
+    // The manual runtime completes the cold local-status refresh during
+    // collection. Its new wake must survive this successful report.
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
+    try std.testing.expect(!server.embedding_activity_status_dirty.load(.acquire));
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
+    try std.testing.expect(!server.store_status_dirty.load(.acquire));
+    try std.testing.expectEqual(server.backgroundMonotonicMs(), server.last_store_status_report_at_ms);
+
+    // Registration uses the same backoff before the status collector runs.
+    server.store_registration_confirmed = false;
+    server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
+    try server.runStoreStatusRoundOnly();
+    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+    server.setRemoteMetadataFetchErrorForTest(error.MetadataIncarnationMismatch);
+    try server.runStoreStatusRoundOnly();
+    vopr_io.monotonic_ns = @as(i96, server.nextMetadataBootstrapRetryAtMsForTest()) * std.time.ns_per_ms;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+    try std.testing.expectEqual(@as(usize, 2), metadata_transport.reports);
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "data runtime runRound backs off retryable provision metadata failures" {
