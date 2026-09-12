@@ -69006,18 +69006,6 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     const before = backend.snapshotWriteStats();
     var mutation_ns: [16]u64 = undefined;
     var peak_physical: u64 = 0;
-    const Size = struct {
-        fn physical(b: *lsm_backend_mod.Backend) !u64 {
-            var bytes = b.snapshotMaintenanceStats().wal_retained_bytes;
-            var cursor = b.runs.cursor();
-            while (cursor.next()) |run| if (run.path) |name| {
-                bytes += try b.storage.?.fileSize(name);
-            };
-            var obsolete_cursor = b.obsolete_paths.iterator();
-            while (obsolete_cursor.next()) |obsolete| bytes += try b.storage.?.fileSize(obsolete.path);
-            return bytes;
-        }
-    };
     for (&mutation_ns, 0..) |*ns, round| {
         var turn = std.heap.ArenaAllocator.init(alloc);
         defer turn.deinit();
@@ -69033,7 +69021,7 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
         try drainTestRelationalMaintenance(&db);
         // Checkpoint at measurement boundaries, not once per individual write.
         try backend.sync(true);
-        peak_physical = @max(peak_physical, try Size.physical(backend));
+        peak_physical = @max(peak_physical, try (try backend.measurePhysicalUsage()).totalBytes());
     }
     try std.testing.expectEqualSlices(u8, original, try pinned.get(owner_key));
     pinned.abort();
@@ -69051,12 +69039,12 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
     std.mem.sort(u64, &mutation_ns, {}, std.sort.asc(u64));
     const after = backend.snapshotWriteStats();
-    std.debug.print("\nproduction LSM physical churn: GC minimum={d}%, SST/WAL written={d}/{d}, peak/settled SST+WAL={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
+    std.debug.print("\nproduction LSM physical churn: GC minimum={d}%, SST/WAL written={d}/{d}, peak/settled tracked file bytes={d}/{d}, batch median/max ns={d}/{d}, live column payload={d}, projected payload bytes={d}\n", .{
         gc_min_percent,
         after.table_file_bytes - before.table_file_bytes,
         after.wal_append_bytes - before.wal_append_bytes,
         peak_physical,
-        try Size.physical(backend),
+        try (try backend.measurePhysicalUsage()).totalBytes(),
         mutation_ns[8],
         mutation_ns[15],
         try relational_columns.payloadStorageBytesForTest(&db, alloc),
