@@ -8824,7 +8824,12 @@ pub const ApiHttpServer = struct {
             writer_fence.writer_not_after_unix_ns != null and
             admission_now >= initial_writer_lease_expiration)
             return error.BackupAttemptLeaseLost;
-        var operation_control = try backupOperationControl(io, writer_fence, request);
+        // Local execution is always bounded, even when a rolling-upgrade
+        // reservation deliberately has no persisted delivery deadline. Do not
+        // rewrite that legacy fence: cleanup must retain its tombstone.
+        var execution_fence = writer_fence;
+        execution_fence.writer_not_after_unix_ns = initial_writer_lease_expiration;
+        var operation_control = try backupOperationControl(io, execution_fence, request);
         try operation_control.ensureActive();
         if (backups_api.manifestExistsAtLocationWithIoAndCancellation(
             self.alloc,
@@ -10952,6 +10957,9 @@ pub const ApiHttpServer = struct {
             error.EnrichmentWorkerFailed => return error.CommittedRepairRequired,
             error.AbortDecisionNotDurable,
             error.TransactionBeginFailed,
+            error.PortableImportPublicationInProgress,
+            error.PortableImportRecoveryRequired,
+            error.PortableRuntimeActivationPending,
             => return error.WriteUnavailable,
             error.CatalogRoutingSnapshotTimeout,
             error.CatalogRoutingUnavailable,
@@ -11051,6 +11059,9 @@ pub const ApiHttpServer = struct {
             => return error.ReadUnavailable,
             error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
+            error.PortableImportPublicationInProgress,
+            error.PortableImportRecoveryRequired,
+            error.PortableRuntimeActivationPending,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
@@ -35009,8 +35020,19 @@ test "api http server serves internal group transaction routes" {
     };
 
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
+    const service_secret = "0123456789abcdef0123456789abcdef";
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .internal_service_secret = service_secret,
+        .internal_service_issuer = "txn-test",
+    }, source.iface(), null, table_source.source());
     defer server.deinit();
+    const service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = service_secret,
+        .issuer = "txn-test",
+        .subject = "node:test",
+    }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(service_token);
+    const service_headers = [_]http_common.RequestHeader{.{ .name = internal_service_auth.header_name, .value = service_token }};
     const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
     const participant = try distributed_txn.participantIdForGroup(std.testing.allocator, "docs", 7);
     defer std.testing.allocator.free(participant);
@@ -35024,10 +35046,12 @@ test "api http server serves internal group transaction routes" {
     var begin_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-begin",
+        .headers = &service_headers,
         .content_type = "application/json",
         .body = begin_body,
     });
     defer begin_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{}", begin_resp.body);
     try std.testing.expectEqual(@as(u16, 200), begin_resp.status);
 
     const prepare_body = try distributed_txn.encodeTxnPrepareRequest(std.testing.allocator, .{
@@ -35040,6 +35064,7 @@ test "api http server serves internal group transaction routes" {
     var prepare_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-prepare",
+        .headers = &service_headers,
         .content_type = "application/json",
         .body = prepare_body,
     });
@@ -35051,6 +35076,7 @@ test "api http server serves internal group transaction routes" {
     var pending_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
+        .headers = &service_headers,
         .content_type = "application/json",
         .body = status_body,
     });
@@ -35068,6 +35094,7 @@ test "api http server serves internal group transaction routes" {
     var resolve_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-resolve",
+        .headers = &service_headers,
         .content_type = "application/json",
         .body = resolve_body,
     });
@@ -35077,6 +35104,7 @@ test "api http server serves internal group transaction routes" {
     var committed_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
         .uri = "/internal/v1/groups/7/tables/docs/txn-status",
+        .headers = &service_headers,
         .content_type = "application/json",
         .body = status_body,
     });
@@ -41884,10 +41912,20 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/writer-role-lifecycle", .{tmp.sub_path});
     defer alloc.free(root);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    defer alloc.free(cwd);
+    const root_abs = try std.fs.path.resolve(alloc, &.{ cwd, root });
+    defer alloc.free(root_abs);
+    const location_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{root_abs});
+    defer alloc.free(location_uri);
     var location: backups_api.BackupLocation = .{ .file = root };
     var source = FakeSource{};
     var writes = SuccessfulForwardedWrites{};
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var node_config = try testBackupNodeConfig(alloc);
+    defer node_config.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = &runtime, .node_config = &node_config }, source.iface(), null, writes.source());
     defer server.deinit();
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 7,
@@ -41910,15 +41948,18 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "logical",
         "logical-artifact",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .logical_create,
         .{},
     );
+    // Committed writer-state retirement is asynchronous. Exercise its real
+    // owner and repository instead of assuming cleanup ran inline.
+    runtime.durable_jobs.drainOwner(server.backup_maintenance_owner_id);
     try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
         std.testing.io,
@@ -41933,11 +41974,11 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "legacy",
         "legacy",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .legacy_forwarded_create,
         .{},
@@ -41965,11 +42006,11 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         adopt_fence,
         table.name,
         &location,
-        "file:///backups",
+        location_uri,
         "adopt-artifact",
         "adopt-artifact",
         .portable,
-        "backups",
+        "test-backups",
         null,
         .adopt,
         .{},
@@ -43665,7 +43706,7 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
     try std.testing.expectEqualStrings(shards[0].artifact_sha256, spec.ranges[0].restore_artifact_sha256);
 }
 
-test "distributed restore binds Go portable artifact bytes before metadata publication" {
+test "distributed restore verifies Go portable artifact bytes before metadata publication" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43676,7 +43717,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = metadata_path,
         .data =
-        \\{"version":1,"format":"portable","table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
+        \\{"version":2,"format":"portable","artifacts":[{"name":"go-cluster-1.afb","size_bytes":17,"sha256":"2042f5c3b5166c9f5cca6eb5c16a9d84c0df1dc673088ebe971e5f20e0e326a6"}],"table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
         ,
     });
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/go-cluster-1.afb", .{root});
@@ -43694,7 +43735,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
         "go-cluster",
     );
     defer manifest.deinit(alloc);
-    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.derive_after_materialization, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
 
     const Fake = struct {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -43717,6 +43758,17 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
     try std.testing.expectEqual(@as(usize, 64), manifest.shards[0].artifact_sha256.len);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = artifact_path,
+        .data = "corrupt!-artifact",
+    });
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.admitExternalRestoreArtifactIntegrity(
+        std.testing.io,
+        std.testing.io,
+        &location,
+        &manifest,
+        null,
+    ));
 }
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {

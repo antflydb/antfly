@@ -67,9 +67,41 @@ pub const PrimaryBackend = union(enum) {
     lsm: lsm_backend_mod.Options,
 };
 
+/// Compaction domains must be contiguous key ranges, even in a metadata-only
+/// flush: no domain may jump across an absent payload family.
+pub fn primaryRunPartition(key: []const u8) []const u8 {
+    const columns = "\x00\x00__columnar__:blocks:";
+    const family = columns.len + 16;
+    if (std.mem.startsWith(u8, key, columns)) {
+        if (key.len < family + 3) return key;
+        // All generation-local metadata precedes :v:. Keep counts, block
+        // descriptors, directories and cleanup intents together: splitting
+        // each metadata kind would create needless tiny SSTs on every flush.
+        const tag = key[family + 1];
+        const suffix: usize = if (tag < 'v') 1 else if (tag == 'v') 3 else 2;
+        return key[0 .. family + suffix];
+    }
+    if (key.len != 0 and key[0] == 0) return if (std.mem.order(u8, key, columns) == .lt) "\x00before-columns" else "\x00after-columns";
+    return key[0..@min(key.len, 1)];
+}
+
+test "primary LSM isolates relational payload generations from metadata" {
+    const payload = "\x00\x00__columnar__:blocks:0000000000000001:v:digest";
+    const count = "\x00\x00__columnar__:blocks:0000000000000001:q:digest";
+    try std.testing.expectEqualStrings("\x00\x00__columnar__:blocks:0000000000000001:", primaryRunPartition(count));
+    try std.testing.expectEqualStrings("\x00\x00__columnar__:blocks:0000000000000001:v:", primaryRunPartition(payload));
+    try std.testing.expect(!std.mem.eql(u8, primaryRunPartition(payload), primaryRunPartition("\x00\x00__columnar__:blocks:0000000000000002:v:digest")));
+    try std.testing.expectEqualStrings("\x01", primaryRunPartition("\x01row"));
+    try std.testing.expectEqualStrings("", primaryRunPartition(""));
+    for (0..payload.len) |len| _ = primaryRunPartition(payload[0..len]);
+    try std.testing.expect(!std.mem.eql(u8, primaryRunPartition(count), primaryRunPartition("\x00\x00__columnar__:manifest")));
+    try std.testing.expect(!std.mem.eql(u8, primaryRunPartition("\x00\x00__catalog__:count"), primaryRunPartition("\x00\x00__metadata__:schema")));
+}
+
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
-    .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
+    // Immutable ordered roots make snapshot setup independent of table size.
+    .read_snapshot_rotate_mutable_bytes = 0,
     // Public bulk transactions are already coalesced and sorted. Publish them
     // directly at an eighth of the ordinary mutable flush size so concurrent
     // status/catch-up scans do not rotate normal replay windows into thousands
@@ -114,6 +146,7 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .level_target_bytes_multiplier = doc_lsm_level_target_bytes_multiplier,
     .max_compaction_input_bytes = 2 * gib,
     .run_partition_prefix_bytes = 1,
+    .run_partition_key = primaryRunPartition,
     .wal_soft_limit_segments = primary_wal_soft_limit_segments,
     .wal_hard_limit_segments = primary_wal_hard_limit_segments,
     .wal_soft_limit_bytes = primary_wal_soft_limit_bytes,
@@ -637,7 +670,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(@as(@TypeOf(opts.graph_reverse_lsm_options.table_prefix_extractor), .first_separator), opts.graph_reverse_lsm_options.table_prefix_extractor);
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
-    try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
+    try std.testing.expectEqual(@as(u64, 0), primary_opts.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
     try std.testing.expectEqual(@as(usize, 4), primary_opts.bulk_ingest_tiered_l0_fan_in);
     try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_l0_delta_seal_ratio_denominator);

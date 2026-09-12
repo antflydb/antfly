@@ -662,6 +662,14 @@ pub const Job = struct {
     };
 };
 
+/// Allocation-free, owner-scoped maintenance callback. Probes are intended for
+/// lightweight admission/recovery checks; they run on the runtime reaper and
+/// must hand substantial work to an executor instead of blocking that loop.
+pub const OwnerMaintenanceProbe = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque) void,
+};
+
 fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
     if (comptime builtin.os.tag == .freestanding) {
         return error.UnsupportedPlatform;
@@ -702,6 +710,16 @@ const OwnerRegistry = struct {
         closing: bool = false,
         paused: bool = false,
         in_flight: usize = 0,
+        maintenance_probe: ?OwnerMaintenanceProbe = null,
+        maintenance_probe_running: bool = false,
+        maintenance_probe_enqueued: bool = false,
+        maintenance_probe_prev: u64 = 0,
+        maintenance_probe_next: u64 = 0,
+    };
+
+    const ProbeWork = struct {
+        owner_id: u64,
+        probe: OwnerMaintenanceProbe,
     };
 
     alloc: Allocator,
@@ -709,6 +727,9 @@ const OwnerRegistry = struct {
     mutex: Io.Mutex = .init,
     idle: Io.Condition = .init,
     states: std.AutoHashMapUnmanaged(u64, State) = .empty,
+    maintenance_probe_head: u64 = 0,
+    maintenance_probe_tail: u64 = 0,
+    maintenance_probe_queued_count: usize = 0,
 
     fn init(alloc: Allocator) OwnerRegistry {
         return .{ .alloc = alloc };
@@ -745,6 +766,10 @@ const OwnerRegistry = struct {
         const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
         if (state.closing) return error.BackgroundOwnerClosing;
         state.paused = paused;
+        if (paused and state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+        if (!paused and state.maintenance_probe != null and !state.maintenance_probe_running and !state.maintenance_probe_enqueued) {
+            self.enqueueMaintenanceProbeLocked(owner_id, state);
+        }
     }
 
     fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
@@ -758,11 +783,132 @@ const OwnerRegistry = struct {
         if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
     }
 
+    fn armMaintenanceProbe(self: *OwnerRegistry, owner_id: u64, probe: OwnerMaintenanceProbe) !void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return error.BackgroundOwnerClosed;
+        if (state.closing) return error.BackgroundOwnerClosing;
+        state.maintenance_probe = probe;
+        if (!state.paused and !state.maintenance_probe_running and !state.maintenance_probe_enqueued) {
+            self.enqueueMaintenanceProbeLocked(owner_id, state);
+        }
+    }
+
+    fn disarmMaintenanceProbe(self: *OwnerRegistry, owner_id: u64) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return;
+        state.maintenance_probe = null;
+        if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+    }
+
+    fn enqueueMaintenanceProbeLocked(self: *OwnerRegistry, owner_id: u64, state: *State) void {
+        std.debug.assert(owner_id != 0);
+        std.debug.assert(!state.maintenance_probe_enqueued);
+        std.debug.assert(state.maintenance_probe_prev == 0);
+        std.debug.assert(state.maintenance_probe_next == 0);
+
+        state.maintenance_probe_enqueued = true;
+        state.maintenance_probe_prev = self.maintenance_probe_tail;
+        if (self.maintenance_probe_tail != 0) {
+            const tail = self.states.getPtr(self.maintenance_probe_tail) orelse
+                std.debug.panic("maintenance probe tail owner {} is missing", .{self.maintenance_probe_tail});
+            std.debug.assert(tail.maintenance_probe_enqueued);
+            tail.maintenance_probe_next = owner_id;
+        } else {
+            self.maintenance_probe_head = owner_id;
+        }
+        self.maintenance_probe_tail = owner_id;
+        self.maintenance_probe_queued_count += 1;
+    }
+
+    fn unlinkMaintenanceProbeLocked(self: *OwnerRegistry, owner_id: u64, state: *State) void {
+        std.debug.assert(state.maintenance_probe_enqueued);
+        const prev_id = state.maintenance_probe_prev;
+        const next_id = state.maintenance_probe_next;
+        if (prev_id != 0) {
+            const prev = self.states.getPtr(prev_id) orelse
+                std.debug.panic("maintenance probe previous owner {} is missing", .{prev_id});
+            prev.maintenance_probe_next = next_id;
+        } else {
+            std.debug.assert(self.maintenance_probe_head == owner_id);
+            self.maintenance_probe_head = next_id;
+        }
+        if (next_id != 0) {
+            const next = self.states.getPtr(next_id) orelse
+                std.debug.panic("maintenance probe next owner {} is missing", .{next_id});
+            next.maintenance_probe_prev = prev_id;
+        } else {
+            std.debug.assert(self.maintenance_probe_tail == owner_id);
+            self.maintenance_probe_tail = prev_id;
+        }
+        state.maintenance_probe_enqueued = false;
+        state.maintenance_probe_prev = 0;
+        state.maintenance_probe_next = 0;
+        std.debug.assert(self.maintenance_probe_queued_count > 0);
+        self.maintenance_probe_queued_count -= 1;
+    }
+
+    fn beginNextMaintenanceProbe(self: *OwnerRegistry) ?ProbeWork {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+
+        const owner_id = self.maintenance_probe_head;
+        if (owner_id == 0) return null;
+        const state = self.states.getPtr(owner_id) orelse
+            std.debug.panic("maintenance probe owner {} is missing", .{owner_id});
+        std.debug.assert(!state.closing);
+        std.debug.assert(state.maintenance_probe != null);
+        std.debug.assert(!state.maintenance_probe_running);
+        std.debug.assert(state.in_flight < std.math.maxInt(usize));
+        self.unlinkMaintenanceProbeLocked(owner_id, state);
+        state.maintenance_probe_running = true;
+        state.in_flight += 1;
+        return .{ .owner_id = owner_id, .probe = state.maintenance_probe.? };
+    }
+
+    fn finishMaintenanceProbe(self: *OwnerRegistry, owner_id: u64) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse {
+            std.debug.panic("background owner {} retired with a maintenance probe in flight", .{owner_id});
+        };
+        std.debug.assert(state.maintenance_probe_running);
+        std.debug.assert(state.in_flight > 0);
+        state.maintenance_probe_running = false;
+        state.in_flight -= 1;
+        if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
+        if (!state.closing and !state.paused and state.maintenance_probe != null) {
+            self.enqueueMaintenanceProbeLocked(owner_id, state);
+        }
+    }
+
+    /// Runs at most the owners queued at pass entry. Persistent probes are
+    /// appended to the tail after they run, so a bounded pass advances a
+    /// round-robin cursor instead of starving owners beyond `max_probes`.
+    /// Queue links live in registered owner state, keeping selection O(1) and
+    /// allocation-free on the runtime reaper.
+    fn runMaintenanceProbes(self: *OwnerRegistry, max_probes: usize) usize {
+        if (max_probes == 0) return 0;
+        self.mutex.lockUncancelable(self.sync_io);
+        const pass_limit = @min(max_probes, self.maintenance_probe_queued_count);
+        self.mutex.unlock(self.sync_io);
+        var run_count: usize = 0;
+        while (run_count < pass_limit) : (run_count += 1) {
+            const work = self.beginNextMaintenanceProbe() orelse break;
+            work.probe.run(work.probe.ptr);
+            self.finishMaintenanceProbe(work.owner_id);
+        }
+        return run_count;
+    }
+
     fn beginClose(self: *OwnerRegistry, owner_id: u64) bool {
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return false;
         state.closing = true;
+        state.maintenance_probe = null;
+        if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
         return true;
     }
 
@@ -793,6 +939,8 @@ const OwnerRegistry = struct {
         const state = self.states.getPtr(owner_id) orelse return;
         std.debug.assert(state.closing);
         std.debug.assert(state.in_flight == 0);
+        std.debug.assert(!state.maintenance_probe_enqueued);
+        std.debug.assert(!state.maintenance_probe_running);
         _ = self.states.remove(owner_id);
     }
 
@@ -1668,6 +1816,14 @@ pub const BackendRuntime = struct {
             return owner_id;
         }
     }
+
+    pub fn armOwnerMaintenanceProbe(self: *BackendRuntime, owner_id: u64, probe: OwnerMaintenanceProbe) !void {
+        try self.owner_registry.armMaintenanceProbe(owner_id, probe);
+    }
+
+    pub fn disarmOwnerMaintenanceProbe(self: *BackendRuntime, owner_id: u64) void {
+        self.owner_registry.disarmMaintenanceProbe(owner_id);
+    }
 };
 
 pub const BackendRuntimeHandle = struct {
@@ -1758,8 +1914,9 @@ const InlineDurableJobLane = struct {
         try owners.register(owner_id);
     }
 
-    fn poll(_: *anyopaque, _: usize) !usize {
-        return 0;
+    fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return owners.runMaintenanceProbes(max_jobs);
     }
 };
 
@@ -1833,6 +1990,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     const reap_batch_limit: usize = 4096;
     const idle_reap_interval_ms: u64 = 10;
+    const maintenance_probe_interval_ns: u64 = 250 * std.time.ns_per_ms;
 
     alloc: Allocator,
     io_impl: *IoImpl,
@@ -1959,7 +2117,13 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn reaperLoop(self: *ThreadedDurableJobLane) void {
+        var next_maintenance_probe_ns = platform.time.monotonicNs();
         while (!self.shutdown_reaper.load(.acquire)) {
+            const now_ns = platform.time.monotonicNs();
+            if (now_ns >= next_maintenance_probe_ns) {
+                _ = self.owners.runMaintenanceProbes(reap_batch_limit);
+                next_maintenance_probe_ns = now_ns +| maintenance_probe_interval_ns;
+            }
             const reaped = self.reapCompleted(reap_batch_limit);
             // Drain a backlog without an artificial rate cap. At idle, a
             // short sleep avoids scanning the active set continuously.
@@ -2149,6 +2313,102 @@ test "backend runtime durable lane runs inline jobs" {
 
     try std.testing.expect(ctx.ran);
     try std.testing.expect(ctx.deinit_called);
+}
+
+test "backend runtime maintenance probes are allocation free and owner scoped" {
+    const Ctx = struct {
+        runtime: *BackendRuntime,
+        owner_id: u64,
+        run_count: usize = 0,
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.run_count += 1;
+            ctx.runtime.disarmOwnerMaintenanceProbe(ctx.owner_id);
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    const owner_id = try runtime.allocOwnerId();
+    var ctx = Ctx{ .runtime = runtime, .owner_id = owner_id };
+    try runtime.armOwnerMaintenanceProbe(owner_id, .{ .ptr = &ctx, .run = Fns.run });
+
+    try std.testing.expectEqual(@as(usize, 1), try runtime.durable_jobs.poll(8));
+    try std.testing.expectEqual(@as(usize, 1), ctx.run_count);
+    try std.testing.expectEqual(@as(usize, 0), try runtime.durable_jobs.poll(8));
+    runtime.durable_jobs.closeOwner(owner_id);
+    try std.testing.expectError(
+        error.BackgroundOwnerClosed,
+        runtime.armOwnerMaintenanceProbe(owner_id, .{ .ptr = &ctx, .run = Fns.run }),
+    );
+}
+
+test "backend runtime maintenance probes respect owner pause and resume" {
+    const Probe = struct {
+        runs: usize = 0,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runs += 1;
+        }
+    };
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    const owner = try runtime.allocOwnerId();
+    defer runtime.durable_jobs.closeOwner(owner);
+    var probe = Probe{};
+    try runtime.armOwnerMaintenanceProbe(owner, .{ .ptr = &probe, .run = Probe.run });
+    try runtime.durable_jobs.pauseOwner(owner);
+    try std.testing.expectEqual(@as(usize, 0), try runtime.durable_jobs.poll(8));
+    // Re-arming a paused owner must not bypass the admission fence.
+    try runtime.armOwnerMaintenanceProbe(owner, .{ .ptr = &probe, .run = Probe.run });
+    try std.testing.expectEqual(@as(usize, 0), try runtime.durable_jobs.poll(8));
+    try runtime.durable_jobs.resumeOwner(owner);
+    try std.testing.expectEqual(@as(usize, 1), try runtime.durable_jobs.poll(8));
+    try std.testing.expectEqual(@as(usize, 1), probe.runs);
+    try runtime.durable_jobs.pauseOwner(owner);
+    runtime.durable_jobs.drainOwner(owner);
+    try std.testing.expectEqual(@as(usize, 0), try runtime.durable_jobs.poll(8));
+    try runtime.durable_jobs.resumeOwner(owner);
+    try std.testing.expectEqual(@as(usize, 1), try runtime.durable_jobs.poll(8));
+    try std.testing.expectEqual(@as(usize, 2), probe.runs);
+}
+
+test "backend runtime maintenance probes are bounded and fair across owners" {
+    const owner_count = 17;
+    const poll_limit = 5;
+    const Ctx = struct {
+        run_count: usize = 0,
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.run_count += 1;
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    var owner_ids: [owner_count]u64 = undefined;
+    var contexts = [_]Ctx{.{}} ** owner_count;
+    for (&owner_ids, &contexts) |*owner_id, *ctx| {
+        owner_id.* = try runtime.allocOwnerId();
+        try runtime.armOwnerMaintenanceProbe(owner_id.*, .{ .ptr = ctx, .run = Fns.run });
+    }
+    defer for (owner_ids) |owner_id| runtime.durable_jobs.closeOwner(owner_id);
+
+    var total_runs: usize = 0;
+    for (0..4) |_| {
+        const ran = try runtime.durable_jobs.poll(poll_limit);
+        try std.testing.expectEqual(@as(usize, poll_limit), ran);
+        total_runs += ran;
+    }
+    try std.testing.expectEqual(@as(usize, 20), total_runs);
+    for (contexts) |ctx| try std.testing.expect(ctx.run_count >= 1);
 }
 
 test "backend runtime durable lane leaves inline failed jobs owned by caller" {

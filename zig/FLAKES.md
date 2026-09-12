@@ -4,6 +4,29 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: main merge retains observation proofs for delayed notifications (#694)
+
+Merging `aefe3bad4` exposed an interaction between the PR's redundant-notification
+suppression and main's retained target-observation authority. A notification
+for an already-observed source returned without recording a requirement. A
+later snapshot marked pending could then erase the accepted observation.
+Main's `accepted target observation survives late snapshots but not new commit
+fences` regression failed on the initial merge at the settled group assertion.
+
+The redundant-notification path now records the accepted source proof without
+advancing the notification fence. The equivalent exact-index path also retains
+its accepted proof. New targets and catalog fences still invalidate completion;
+allocation failure retains the existing conservative invalidation behavior.
+The merge keeps the PR's batched consistent coverage reads and main's pinned
+snapshot regression, with packed-row-aware cardinality fallback.
+
+Merged native Debug validation passed all 179 derived-coverage API tests,
+92 DB coverage tests, and two packed-row/range-cardinality regressions, with
+zero skips, failures, or leaks. The API suite ran with local listener access;
+the initial sandboxed run also rejected two HTTP listener binds. SDK OAPI tests,
+`make generate` (including `make build-antfarm`), `make fmt`, and whitespace
+checks passed. Evidence uses `/private/tmp/ci694-main-merge-*`.
+
 ## 2026-09-11: last dense bulk-lease fixture races physical publication (#694)
 
 While investigating [the Linux DB-core abort in run 34658598331](https://github.com/antflydb/antfly/actions/runs/34658598331/job/103457081854),

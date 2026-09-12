@@ -550,7 +550,7 @@ test "lsm backend simulation immutable flush write fault keeps wal-backed state 
     const large_value = [_]u8{'v'} ** 256;
     try putBoth(&mem_backend, &lsm_backend, .{ .name = "docs" }, "doc:a", large_value[0..]);
     try std.testing.expectEqual(@as(usize, 1), lsm_backend.immutable_memtables.items.len);
-    try std.testing.expectEqual(@as(usize, 0), lsm_backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lsm_backend.runs.count());
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
     const run_needle = try std.fmt.allocPrint(std.testing.allocator, "runs/{d}.tbl", .{lsm_backend.next_run_id});
@@ -566,6 +566,155 @@ test "lsm backend simulation immutable flush write fault keeps wal-backed state 
     try lsm_backend.sync(true);
     try std.testing.expectEqual(@as(usize, 0), lsm_backend.immutable_memtables.items.len);
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
+}
+
+test "lsm backend simulation journal append and checkpoint faults preserve acknowledged WAL writes" {
+    const Attempt = struct {
+        fn run(backend: *lsm_backend_mod.Backend, checkpoint: bool) !void {
+            if (!checkpoint) return backend.sync(true);
+            const runtime = @import("lsm_backend/runtime.zig");
+            const locked = runtime.lockBackend(lsm_backend_mod.Backend, backend);
+            defer runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            _ = try backend.manifest_journal.runCheckpoint(backend);
+        }
+    };
+    for (0..2) |checkpoint| for (0..2) |sync_fault| for (0..2) |retry| {
+        var device = storage_sim.ModeledDevice.init(std.testing.allocator);
+        defer device.deinit();
+        const root_dir = "/lsm-journal-publication-fault";
+        const options = lsm_backend_mod.Options{ .storage = device.storage(), .flush_threshold = 1000, .compact_threshold_runs = 1000, .wal_sync_on_commit = true };
+        var backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, options);
+        defer backend.close();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "old", "durable");
+            try write.commit();
+        }
+        try backend.sync(true);
+        try std.testing.expectEqual(@as(?u64, 0), backend.manifest_journal.sequence);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "new", "acknowledged");
+            try write.commit();
+        }
+        if (checkpoint != 0) try backend.sync(true);
+        const target = if (checkpoint != 0) ".checkpoint" else ".journal";
+        if (sync_fault != 0) {
+            try device.injectSyncFailureForPathContains(target);
+            try std.testing.expectError(error.InjectedSyncFault, Attempt.run(&backend, checkpoint != 0));
+        } else {
+            try device.injectWriteFailureForPathContains(target);
+            try std.testing.expectError(error.InjectedWriteFault, Attempt.run(&backend, checkpoint != 0));
+        }
+        // Releasing retired metadata can itself retry publication. Whether
+        // that cleanup succeeds or leaves debt, explicit retry/crash is safe.
+        if (retry != 0) {
+            try backend.sync(true);
+            try Attempt.run(&backend, checkpoint != 0);
+            try std.testing.expect(backend.manifest_journal.sequence != null);
+        }
+        try crashReopenLsm(&backend, &device, root_dir, options);
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "old"));
+        try std.testing.expectEqualStrings("acknowledged", try read.get(.{}, "new"));
+    };
+}
+
+test "lsm backend simulation every checkpoint handoff stage survives crash and writable recovery" {
+    const runtime = @import("lsm_backend/runtime.zig");
+    for ([_][]const u8{ ".journal", ".next", ".checkpoint", "manifest.bin" }) |target| for ([_]bool{ false, true }) |sync_fault| {
+        var device = storage_sim.ModeledDevice.init(std.testing.allocator);
+        defer device.deinit();
+        const root = "/checkpoint-handoff-crash";
+        const options = lsm_backend_mod.Options{ .storage = device.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000, .wal_sync_on_commit = true };
+        var backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root, options);
+        defer backend.close();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "before", "durable");
+            try write.commit();
+        }
+        try backend.sync(true);
+        {
+            const locked = runtime.lockBackend(lsm_backend_mod.Backend, &backend);
+            defer runtime.unlockBackend(lsm_backend_mod.Backend, &backend, locked);
+            if (sync_fault) {
+                try device.injectSyncFailureForPathContains(target);
+                try std.testing.expectError(error.InjectedSyncFault, backend.manifest_journal.runCheckpoint(&backend));
+            } else {
+                try device.injectWriteFailureForPathContains(target);
+                try std.testing.expectError(error.InjectedWriteFault, backend.manifest_journal.runCheckpoint(&backend));
+                if (std.mem.eql(u8, target, ".checkpoint")) {
+                    while (backend.manifest_journal.segment_count < backend.manifest_journal.segments.len) {
+                        try device.injectWriteFailureForPathContains(target);
+                        try std.testing.expectError(error.InjectedWriteFault, backend.manifest_journal.runCheckpoint(&backend));
+                    }
+                    // The bounded linked backlog must be recoverable once
+                    // I/O succeeds again, without requiring another mutation.
+                    try std.testing.expect(try backend.manifest_journal.runCheckpoint(&backend));
+                    try std.testing.expectEqual(@as(usize, 1), backend.manifest_journal.segment_count);
+                }
+            }
+        }
+        try crashReopenLsm(&backend, &device, root, options);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "after", "acknowledged");
+            try write.commit();
+        }
+        try backend.sync(true);
+        try crashReopenLsm(&backend, &device, root, options);
+        var read = try backend.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "before"));
+        try std.testing.expectEqualStrings("acknowledged", try read.get(.{}, "after"));
+    };
+}
+
+test "lsm failed bulk SST publication preserves WAL credit and requires replay before further writes" {
+    const root = "/lsm-bulk-wal-credit-fence";
+    var device = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device.deinit();
+    const options = lsm_backend_mod.Options{
+        .storage = device.storage(),
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 100,
+        .wal_sync_on_commit = true,
+    };
+    var backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root, options);
+    defer backend.close();
+    try device.injectWriteFailureForPathContains("runs/");
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        defer txn.abort();
+        try txn.appendPut(.{}, "replay-me", "durable-wal");
+        try std.testing.expectError(error.InjectedWriteFault, txn.commit());
+    }
+    try std.testing.expect(backend.manifest_recovery_required);
+    try std.testing.expect(backend.manifest_unpublished_wire_bytes != 0);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_wire_bytes);
+    try std.testing.expectError(error.RecoveryRequired, backend.sync(true));
+    try std.testing.expectError(error.RecoveryRequired, backend.checkpointWalAfterDurableBoundary());
+    try std.testing.expect(!try backend.runMaintenanceStepBestEffort());
+    try std.testing.expect(backend.nextMaintenanceWakeDelayNsBestEffort() == null);
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{}, "not-admitted", "value");
+        try std.testing.expectError(error.RecoveryRequired, txn.commit());
+    }
+    try crashReopenLsm(&backend, &device, root, options);
+    try std.testing.expect(!backend.manifest_recovery_required);
+    try std.testing.expectEqualStrings("durable-wal", try backend.getMergedWithMutable(&backend.mutable, .{}, "replay-me"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "not-admitted"));
+    try backend.sync(true);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_unpublished_wire_bytes);
 }
 
 test "lsm backend simulation manifest sync fault recovers previous compaction view" {
@@ -593,7 +742,7 @@ test "lsm backend simulation manifest sync fault recovers previous compaction vi
     try crashReopenLsm(&lsm_backend, &modeled_device, root_dir, open_options);
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
-    try modeled_device.injectSyncFailureForPathContains("manifest.bin");
+    try modeled_device.injectSyncFailureForPathContains(".journal");
     try std.testing.expectError(error.InjectedSyncFault, lsm_backend.sync(true));
     try expectNamespaceEqual(&mem_backend, &lsm_backend, .{ .name = "docs" });
 
@@ -796,6 +945,12 @@ test "lsm backend simulation obsolete run cleanup fault recovers previous manife
 
     try modeled_device.injectDeleteFailureForPathContains("runs/1.tbl");
     try lsm_backend.sync(true);
+    // Metadata epochs release file pins through bounded maintenance, not
+    // recursive durability work from the unlocking thread.
+    for (0..32) |_| {
+        if (lsm_backend.snapshotMaintenanceStats().obsolete_delete_failures != 0) break;
+        _ = try lsm_backend.runMaintenanceStep();
+    }
     const cleanup_stats = lsm_backend.snapshotMaintenanceStats();
     try std.testing.expect(cleanup_stats.obsolete_delete_failures > 0);
     try std.testing.expect(cleanup_stats.obsolete_delete_retries > 0);

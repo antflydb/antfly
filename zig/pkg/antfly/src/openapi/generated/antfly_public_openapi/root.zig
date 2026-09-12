@@ -54,6 +54,7 @@ pub const ClusterRestoreRequest = types.ClusterRestoreRequest;
 pub const ClusterRestoreResponse = types.ClusterRestoreResponse;
 pub const ClusterStatus = types.ClusterStatus;
 pub const ClusterTopology = types.ClusterTopology;
+pub const CommittedMutationOutcome = types.CommittedMutationOutcome;
 pub const ConnectedModel = types.ConnectedModel;
 pub const ConnectedModelType = types.ConnectedModelType;
 pub const Connection = types.Connection;
