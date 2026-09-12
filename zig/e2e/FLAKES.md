@@ -9,6 +9,7 @@ entries so later failures can be compared with the original signature.
 
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
+| `test_table_chunker_full_text_index_routes_template_chunks[serverless]`, `test_semantic_query_embedding_template_supports_remote_text[serverless]` | [PR #503, run 34659490727, job 103470234534](https://github.com/antflydb/antfly/actions/runs/34659490727/job/103470234534) | This change | Publication client now honors explicit retryable 503 responses within one shared deadline; see below. |
 | `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions` | [PR #692, run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692) | This change | Filesystem GET keeps metadata and payload on one open descriptor across atomic publication; see [deterministic reproduction and validation](../FLAKES.md#serverless-build-status-preconditionfailed-during-publication-692). |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
 | `test_retrieval.py::test_retrieval_agent_streaming_fallback_progress` | [PR #657, run 34176604388, job 101914807099](https://github.com/antflydb/antfly/actions/runs/34176604388/job/101914807099?pr=657), head [`bc8f8a20d`](https://github.com/antflydb/antfly/commit/bc8f8a20d34534969decc90813fbcb8f390164f1) | [`47106c1fd`](https://github.com/antflydb/antfly/commit/47106c1fd09e9be5f1e3333363fd77d007813632) | Teardown recovery fixed; original reset cause unknown; 30/30 soak runs passed. |
@@ -18,6 +19,45 @@ entries so later failures can be compared with the original signature.
 | Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
 | `test_quickstart.py::test_public_quickstart_query_string_boolean_controls` | [PR #657, run 34296218257, job 102299245250](https://github.com/antflydb/antfly/actions/runs/34296218257/job/102299245250?pr=657), head `292e5ec9c` | This change | Deterministic fixture mismatch reproduced 9/9; fresh stateful restart fixture passed 30/30 final soak runs. |
 | `test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes` | Same #657 job | This change | Live replication startup wait passed 30/30 ordinary and 30/30 delayed-fetch runs. Delayed first fetch reproduces the pending-durability 503 without the wait; original CI delay was not observed locally. |
+
+### Serverless publication retry contract (#503)
+
+Both failures returned HTTP 503 with the publication-authority retry message;
+the runtime logs reported `WorkLeaseLost` while background maintenance was
+enabled. The PR changed this condition from generic 500 `build failed` to
+503 with `Retry-After: 1`. The E2E build helper still retried only 409 or the
+old 500 response, so the new transient response failed immediately.
+
+The helper now retries 409 and 503 with valid `Retry-After` delta-seconds.
+It respects the advertised delay, caps request timeouts by remaining time,
+and shares a single deadline with the outer publication/readiness loop.
+Missing or malformed retry headers and generic 500 responses fail immediately;
+in particular, missing external-source resolution is not silently retried.
+Document mutation POSTs are never replayed by this policy. Runtime lease
+fencing and publication success/readiness assertions are unchanged.
+
+`test_publication_retry.py` exercises the exact CI response deterministically,
+including deadline exhaustion, scheduler sleep overshoot, bounded readiness
+polling, permanent errors, and no replay of batch mutations. These tests verify
+client behavior; they do not claim to identify which background lease holder
+caused the original contention.
+
+Validation after merging `origin/main` at `aefe3bad4`: the final ReleaseFast
+binary passed both affected tests on both backends (4/4), then ten repetitions
+of each serverless case (20/20). Reproduce the soak from the repository root:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=./zig-out/bin/antfly \
+  ANTFLY_E2E_ENV_FILE=/dev/null ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_index_lifecycle.py::test_table_chunker_full_text_index_routes_template_chunks[serverless]' \
+  'e2e/antfly/test_sparse.py::test_semantic_query_embedding_template_supports_remote_text[serverless]'
+```
+
+The retry/create-contract/standalone harness selection passed 97 tests,
+the graph/storage selection passed 219 with no leaks, and the full serverless
+suite passed 1,083 with six skips and no leaks. The initial sandboxed soak
+could not bind local ports; the permitted rerun above completed successfully.
 
 ### Quickstart restart fixture and HA replication startup (#657)
 
