@@ -225,6 +225,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.ProposalDropped;
         }
 
+        fn indexGenerationMismatch(_: *u32) anyerror!void {
+            return error.IndexGenerationMismatch;
+        }
+
         fn ambiguousFail(_: *u32) anyerror!void {
             return error.MetadataMutationOutcomeUnknown;
         }
@@ -275,6 +279,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.ProposalDropped,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.retryableFail, .{&base}),
+    );
+    try std.testing.expectError(
+        error.IndexGenerationMismatch,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.indexGenerationMismatch, .{&base}),
     );
     try std.testing.expectError(
         error.MetadataMutationOutcomeUnknown,

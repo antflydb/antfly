@@ -19,20 +19,57 @@ const artifact_store = @import("store.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const FsStore = struct {
+    const verified_file_cache_limit: usize = 4096;
+
+    const VerifiedFile = struct {
+        inode: std.Io.File.INode,
+        byte_len: u64,
+        mtime_ns: i128,
+        ctime_ns: i128,
+
+        fn fromStat(file_stat: std.Io.File.Stat) VerifiedFile {
+            return .{
+                .inode = file_stat.inode,
+                .byte_len = file_stat.size,
+                .mtime_ns = file_stat.mtime.toNanoseconds(),
+                .ctime_ns = file_stat.ctime.toNanoseconds(),
+            };
+        }
+
+        fn matchesStat(self: VerifiedFile, file_stat: std.Io.File.Stat) bool {
+            return self.inode == file_stat.inode and
+                self.byte_len == file_stat.size and
+                self.mtime_ns == file_stat.mtime.toNanoseconds() and
+                self.ctime_ns == file_stat.ctime.toNanoseconds();
+        }
+    };
+
     alloc: Allocator,
     root_dir: []u8,
+    durable_dirs: @import("objectstore").durable_directory.Cache = .{},
+    verified_mu: std.atomic.Mutex = .unlocked,
+    verified_files: std.StringHashMapUnmanaged(VerifiedFile) = .empty,
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FsStore {
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), root_dir);
+        var durable_dirs: @import("objectstore").durable_directory.Cache = .{};
+        errdefer durable_dirs.deinit(alloc);
+        try durable_dirs.ensure(alloc, io_impl.io(), root_dir);
         return .{
             .alloc = alloc,
             .root_dir = try alloc.dupe(u8, root_dir),
+            .durable_dirs = durable_dirs,
         };
     }
 
     pub fn deinit(self: *FsStore) void {
+        self.durable_dirs.deinit(self.alloc);
+        lockAtomic(&self.verified_mu);
+        var it = self.verified_files.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.verified_files.deinit(self.alloc);
+        self.verified_mu.unlock();
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -46,17 +83,38 @@ pub const FsStore = struct {
     }
 
     pub fn put(self: *FsStore, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
-        const checksum = try sha256StringAlloc(alloc, contents);
+        return try self.putWithCancellation(alloc, contents, .none);
+    }
+
+    pub fn putWithCancellation(self: *FsStore, alloc: Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        return self.putInScope(alloc, null, contents, cancellation);
+    }
+
+    fn putInScope(self: *FsStore, alloc: Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
-        const artifact_id = try makeArtifactIdAlloc(alloc, checksum);
+        const artifact_id = if (scope) |value| scoped: {
+            const id = try value.artifactId(checksum);
+            break :scoped try alloc.dupe(u8, &id);
+        } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
 
-        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
-        if (!fileExists(path)) {
-            try ensureParentDir(path);
-            try writeFileAtomically(path, contents);
+        const existing_valid = if (fileExists(path)) blk: {
+            verifyPathContent(path, @intCast(contents.len), checksum, cancellation) catch |err| switch (err) {
+                error.ArtifactIntegrityMismatch, error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        } else false;
+        if (!existing_valid) {
+            var directory_io = threadedIo();
+            defer directory_io.deinit();
+            try self.durable_dirs.ensure(self.alloc, directory_io.io(), std.fs.path.dirname(path) orelse ".");
+            try writeFileAtomicallyWithCancellation(path, contents, cancellation);
         }
 
         return .{
@@ -77,8 +135,7 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
         return try readFileAllocWithCancellation(alloc, path, cancellation);
     }
@@ -96,10 +153,72 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
         return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
+    }
+
+    pub fn getVerifiedRangeAllocWithCancellation(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, expected_byte_len, expected_checksum, offset, len, cancellation, null);
+    }
+
+    fn getVerifiedRangeWithBudget(
+        self: *FsStore,
+        alloc: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        remaining: ?*u64,
+    ) ![]u8 {
+        try cancellation.check();
+        const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
+        if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
+        if (end > expected_byte_len) return error.InvalidRange;
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
+        defer self.alloc.free(path);
+
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(io, path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const before = try file.stat(io);
+        if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
+        const verified = VerifiedFile.fromStat(before);
+        if (!self.isVerifiedFile(artifact_id, verified)) {
+            if (remaining) |budget| try artifact_store.chargeReadBudget(budget, expected_byte_len);
+            try verifyOpenFileContent(file, io, expected_byte_len, expected_checksum, cancellation);
+            const after = try file.stat(io);
+            if (!verified.matchesStat(after)) {
+                return error.ArtifactIntegrityMismatch;
+            }
+            try self.rememberVerifiedFile(artifact_id, verified);
+        }
+        const payload = try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+        errdefer alloc.free(payload);
+        const after_read = try file.stat(io);
+        if (!verified.matchesStat(after_read)) {
+            self.forgetVerifiedFile(artifact_id);
+            return error.ArtifactIntegrityMismatch;
+        }
+        try cancellation.check();
+        return payload;
     }
 
     pub fn stat(self: *FsStore, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
@@ -113,7 +232,7 @@ pub const FsStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
-        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
 
         var io_impl = threadedIo();
@@ -128,22 +247,167 @@ pub const FsStore = struct {
         };
     }
 
-    pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
+    pub fn verifyContent(
+        self: *FsStore,
+        _: Allocator,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
-        const path = try pathForArtifactAlloc(self.alloc, self.root_dir, checksum);
+        if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
+        defer self.alloc.free(path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const before = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
+        if (before.size != expected_byte_len) return error.ArtifactIntegrityMismatch;
+        const verified = VerifiedFile.fromStat(before);
+        lockAtomic(&self.verified_mu);
+        if (self.verified_files.get(artifact_id)) |cached| {
+            if (std.meta.eql(cached, verified)) {
+                self.verified_mu.unlock();
+                return;
+            }
+        }
+        self.verified_mu.unlock();
+
+        try verifyPathContent(path, expected_byte_len, expected_checksum, cancellation);
+        const after = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
+        if (!verified.matchesStat(after)) return error.ArtifactIntegrityMismatch;
+        try self.rememberVerifiedFile(artifact_id, verified);
+    }
+
+    fn isVerifiedFile(self: *FsStore, artifact_id: []const u8, verified: VerifiedFile) bool {
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        const cached = self.verified_files.get(artifact_id) orelse return false;
+        return std.meta.eql(cached, verified);
+    }
+
+    fn rememberVerifiedFile(self: *FsStore, artifact_id: []const u8, verified: VerifiedFile) !void {
+        const owned_id = try self.alloc.dupe(u8, artifact_id);
+        errdefer self.alloc.free(owned_id);
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        if (!self.verified_files.contains(artifact_id) and self.verified_files.count() >= verified_file_cache_limit) {
+            var iterator = self.verified_files.keyIterator();
+            if (iterator.next()) |victim| {
+                const removed = self.verified_files.fetchRemove(victim.*).?;
+                self.alloc.free(removed.key);
+            }
+        }
+        const gop = try self.verified_files.getOrPut(self.alloc, owned_id);
+        if (gop.found_existing) self.alloc.free(owned_id) else gop.key_ptr.* = owned_id;
+        gop.value_ptr.* = verified;
+    }
+
+    fn forgetVerifiedFile(self: *FsStore, artifact_id: []const u8) void {
+        lockAtomic(&self.verified_mu);
+        defer self.verified_mu.unlock();
+        if (self.verified_files.fetchRemove(artifact_id)) |removed| self.alloc.free(removed.key);
+    }
+
+    pub fn delete(self: *FsStore, artifact_id: []const u8) !void {
+        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
         defer self.alloc.free(path);
         try deleteFile(path);
+        self.forgetVerifiedFile(artifact_id);
+    }
+
+    fn visitScopedUploads(self: *FsStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower) });
+        defer self.alloc.free(path);
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var attempts = dir.iterate();
+        while (try attempts.next(io)) |attempt| {
+            try cancellation.check();
+            if (attempt.kind != .directory or attempt.name.len != 32) continue;
+            var attempt_dir = dir.openDir(io, attempt.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer attempt_dir.close(io);
+            var entries = attempt_dir.iterate();
+            while (try entries.next(io)) |entry| {
+                try cancellation.check();
+                if (entry.kind != .file or entry.name.len != 64) continue;
+                var suffix: [97]u8 = undefined;
+                @memcpy(suffix[0..32], attempt.name);
+                suffix[32] = '/';
+                @memcpy(suffix[33..97], entry.name);
+                try artifact_store.visitScopedSuffix(domain, &suffix, visitor);
+            }
+        }
+    }
+
+    fn cleanupRetiredScopedTemporaries(ptr: *anyopaque, domain: [32]u8, cutoff: u64, cancellation: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&domain, .lower) });
+        defer self.alloc.free(path);
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var attempts = dir.iterate();
+        while (try attempts.next(io)) |entry| {
+            try cancellation.check();
+            if (entry.kind != .directory or entry.name.len != 32) continue;
+            var scope: artifact_store.UploadScope = .{ .domain = domain, .attempt = undefined };
+            _ = std.fmt.hexToBytes(&scope.attempt, entry.name) catch continue;
+            scope.validate() catch continue;
+            if (scope.fencingToken() >= cutoff) continue;
+            var attempt = dir.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            defer attempt.close(io);
+            var files = attempt.iterate();
+            var changed = false;
+            while (try files.next(io)) |file| {
+                try cancellation.check();
+                if (file.kind != .file or file.name.len != 64 + 5 + 32 or !std.mem.eql(u8, file.name[64..69], ".tmp-")) continue;
+                artifact_store.validateSha256Checksum(file.name[0..64]) catch continue;
+                var nonce: [16]u8 = undefined;
+                _ = std.fmt.hexToBytes(&nonce, file.name[69..]) catch continue;
+                attempt.deleteFile(io, file.name) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                changed = true;
+            }
+            if (changed) try fs_paths.syncDirectoryHandlePortable(io, attempt);
+        }
     }
 
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .deinit = erasedDeinit,
         .put = erasedPut,
+        .put_with_cancellation = erasedPutWithCancellation,
+        .put_scoped = erasedPutScoped,
+        .visit_scoped_uploads = erasedVisitScopedUploads,
+        .cleanup_retired_scoped_temporaries = cleanupRetiredScopedTemporaries,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
+        .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
+        .get_verified_range_alloc_with_budget = erasedGetVerifiedRangeWithBudget,
         .stat = erasedStat,
         .stat_with_cancellation = erasedStatWithCancellation,
+        .verify_content = erasedVerifyContent,
         .delete = erasedDelete,
     };
 
@@ -155,6 +419,21 @@ pub const FsStore = struct {
     fn erasedPut(ptr: *anyopaque, alloc: Allocator, contents: []const u8) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.put(alloc, contents);
+    }
+
+    fn erasedPutWithCancellation(ptr: *anyopaque, alloc: Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.putWithCancellation(alloc, contents, cancellation);
+    }
+
+    fn erasedPutScoped(ptr: *anyopaque, alloc: Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.putInScope(alloc, scope, contents, cancellation);
+    }
+
+    fn erasedVisitScopedUploads(ptr: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.visitScopedUploads(domain, visitor, cancellation);
     }
 
     fn erasedGetAlloc(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) ![]u8 {
@@ -177,6 +456,11 @@ pub const FsStore = struct {
         return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, cancellation);
     }
 
+    fn erasedGetVerifiedRangeAllocWithCancellation(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, offset: u64, len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return try self.getVerifiedRangeAllocWithCancellation(alloc, artifact_id, expected_byte_len, expected_checksum, offset, len, cancellation);
+    }
+
     fn erasedStat(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8) !artifact_store.ArtifactMetadata {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         return try self.stat(alloc, artifact_id);
@@ -187,14 +471,61 @@ pub const FsStore = struct {
         return try self.statWithCancellation(alloc, artifact_id, cancellation);
     }
 
+    fn erasedVerifyContent(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        try self.verifyContent(alloc, artifact_id, expected_byte_len, expected_checksum, cancellation);
+    }
+
+    fn erasedGetVerifiedRangeWithBudget(ptr: *anyopaque, alloc: Allocator, artifact_id: []const u8, byte_len: u64, checksum: []const u8, offset: u64, len: usize, cancellation: CancellationToken, remaining: *u64) ![]u8 {
+        const self: *FsStore = @ptrCast(@alignCast(ptr));
+        return self.getVerifiedRangeWithBudget(alloc, artifact_id, byte_len, checksum, offset, len, cancellation, remaining);
+    }
+
     fn erasedDelete(ptr: *anyopaque, artifact_id: []const u8) !void {
         const self: *FsStore = @ptrCast(@alignCast(ptr));
         try self.delete(artifact_id);
     }
 };
 
+fn verifyPathContent(path: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
+    try cancellation.check();
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io_impl.io(), path, .{});
+    defer file.close(io_impl.io());
+    return try verifyOpenFileContent(file, io_impl.io(), expected_byte_len, expected_checksum, cancellation);
+}
+
+fn verifyOpenFileContent(file: std.Io.File, io: std.Io, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken) !void {
+    var reader = file.reader(io, &.{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [1024 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        try cancellation.check();
+        const read = try reader.interface.readSliceShort(&buffer);
+        if (read == 0) break;
+        total = std.math.add(u64, total, read) catch return error.ArtifactIntegrityMismatch;
+        if (total > expected_byte_len) return error.ArtifactIntegrityMismatch;
+        hasher.update(buffer[0..read]);
+    }
+    if (total != expected_byte_len) return error.ArtifactIntegrityMismatch;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, expected_checksum)) return error.ArtifactIntegrityMismatch;
+    try cancellation.check();
+}
+
 fn threadedIo() std.Io.Threaded {
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
+}
+
+fn lockAtomic(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn fileExists(path: []const u8) bool {
@@ -247,6 +578,17 @@ fn readFileRangeAllocWithCancellation(
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
+    return try readOpenFileRangeAllocWithCancellation(alloc, file, io, offset, len, cancellation);
+}
+
+fn readOpenFileRangeAllocWithCancellation(
+    alloc: Allocator,
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64,
+    len: usize,
+    cancellation: CancellationToken,
+) ![]u8 {
     const stat = try file.stat(io);
     if (offset > stat.size) return error.InvalidRange;
     const available = stat.size - offset;
@@ -271,32 +613,47 @@ fn deleteFile(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), path);
-}
-
-fn ensureParentDir(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), parent);
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(path) orelse ".");
 }
 
 fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{d}", .{ path, test_nonce.fetchAdd(1, .monotonic) });
-    defer std.heap.page_allocator.free(tmp_path);
+    return writeFileAtomicallyWithCancellation(path, contents, .none);
+}
 
+fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
+    try cancellation.check();
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(&nonce, .lower) });
+    defer std.heap.page_allocator.free(tmp_path);
+    var owns_temp = false;
+    errdefer if (owns_temp) {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    };
 
     {
-        var file = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
+        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .exclusive = true });
+        owns_temp = true;
         defer file.close(io);
 
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
-        try writer.interface.writeAll(contents);
+        const cancellation_chunk_bytes = 1024 * 1024;
+        var offset: usize = 0;
+        while (offset < contents.len) {
+            try cancellation.check();
+            const len = @min(cancellation_chunk_bytes, contents.len - offset);
+            try writer.interface.writeAll(contents[offset..][0..len]);
+            offset += len;
+        }
         try writer.end();
+        try file.sync(io);
     }
+
+    try cancellation.check();
 
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.renameAbsolute(tmp_path, path, io) catch |err| {
@@ -309,11 +666,25 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
             return err;
         };
     }
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
 }
 
 fn sha256StringAlloc(alloc: Allocator, contents: []const u8) ![]u8 {
+    return sha256StringWithCancellationAlloc(alloc, contents, .none);
+}
+
+fn sha256StringWithCancellationAlloc(alloc: Allocator, contents: []const u8, cancellation: CancellationToken) ![]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(contents, &digest, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const chunk_bytes = 1024 * 1024;
+    var offset: usize = 0;
+    while (offset < contents.len) {
+        try cancellation.check();
+        const len = @min(chunk_bytes, contents.len - offset);
+        hasher.update(contents[offset..][0..len]);
+        offset += len;
+    }
+    hasher.final(&digest);
 
     const out = try alloc.alloc(u8, 64);
     for (digest, 0..) |byte, idx| {
@@ -330,6 +701,12 @@ fn makeArtifactIdAlloc(alloc: Allocator, checksum: []const u8) ![]u8 {
 fn pathForArtifactAlloc(alloc: Allocator, root_dir: []const u8, checksum: []const u8) ![]u8 {
     try artifact_store.validateSha256Checksum(checksum);
     return try std.fs.path.join(alloc, &.{ root_dir, "sha256", checksum[0..2], checksum[2..] });
+}
+
+fn pathForArtifactIdAlloc(alloc: Allocator, root_dir: []const u8, id: []const u8) ![]u8 {
+    const checksum = try artifact_store.sha256ChecksumFromArtifactId(id);
+    if (id.len == 71) return pathForArtifactAlloc(alloc, root_dir, checksum);
+    return std.fs.path.join(alloc, &.{ root_dir, "graph", id[78..142], id[143..175], checksum });
 }
 
 fn hexNibble(v: u8) u8 {
@@ -359,6 +736,57 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless filesystem retired attempt cleanup removes only owned canonical temporary files" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "retired-temporaries");
+    defer cleanupTmp(path);
+    var impl = try FsStore.init(a, std.mem.span(path));
+    var store = impl.artifactStore();
+    defer store.deinit();
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const old_scope = try artifact_store.UploadScope.forPublication(@splat(1), 1, io);
+    const new_scope = try artifact_store.UploadScope.forPublication(@splat(1), 2, io);
+    var old = try store.putScoped(old_scope, "old committed page", .none);
+    defer old.deinit(a);
+    var fresh = try store.putScoped(new_scope, "new committed page", .none);
+    defer fresh.deinit(a);
+    const old_path = try pathForArtifactIdAlloc(a, std.mem.span(path), old.artifact_id);
+    defer a.free(old_path);
+    const fresh_path = try pathForArtifactIdAlloc(a, std.mem.span(path), fresh.artifact_id);
+    defer a.free(fresh_path);
+    const old_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ old_path, "ab" ** 16 });
+    defer a.free(old_temp);
+    const fresh_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ fresh_path, "cd" ** 16 });
+    defer a.free(fresh_temp);
+    const unrelated = try std.fmt.allocPrint(a, "{s}.tmp-not-a-canonical-nonce", .{old_path});
+    defer a.free(unrelated);
+    try writeFileAtomically(old_temp, "partial");
+    try writeFileAtomically(fresh_temp, "partial");
+    try writeFileAtomically(unrelated, "unrelated");
+    try store.cleanupRetiredScopedTemporaries(old_scope.domain, 2, .none);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, old_temp, .{}));
+    for ([_][]const u8{ fresh_temp, unrelated, old_path, fresh_path }) |kept| {
+        const file = try std.Io.Dir.cwd().openFile(io, kept, .{});
+        file.close(io);
+    }
+    try writeFileAtomically(old_temp, "late partial upload");
+    try store.cleanupRetiredScopedTemporaries(old_scope.domain, 2, .none);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, old_temp, .{}));
+}
+
+test "serverless filesystem artifacts inventory abandoned and late scoped uploads" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "scoped-uploads");
+    defer cleanupTmp(path);
+    var store = try FsStore.init(std.testing.allocator, std.mem.span(path));
+    defer store.deinit();
+    var capability = store.artifactStore();
+    try @import("scoped_upload_test.zig").exercise(&capability);
 }
 
 test "fs artifact store put/get/stat are content-addressed" {
@@ -401,6 +829,121 @@ test "fs artifact store getRangeAlloc returns requested slice" {
     const mid = try store.getRangeAlloc(std.testing.allocator, meta.artifact_id, 2, 3);
     defer std.testing.allocator.free(mid);
     try std.testing.expectEqualStrings("cde", mid);
+}
+
+test "serverless fs artifact store detects and repairs same-length content corruption" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "repair-corruption");
+    defer cleanupTmp(root);
+
+    var store = try FsStore.init(alloc, std.mem.span(root));
+    defer store.deinit();
+    var meta = try store.put(alloc, "alpha");
+    defer meta.deinit(alloc);
+    const path = try pathForArtifactAlloc(alloc, store.root_dir, meta.checksum);
+    defer alloc.free(path);
+    try writeFileAtomically(path, "omega");
+
+    var iface = store.artifactStore();
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, iface.verifyContentWithCancellationUsingAllocator(
+        alloc,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        .none,
+    ));
+    var repaired = try store.put(alloc, "alpha");
+    defer repaired.deinit(alloc);
+    try iface.verifyContentWithCancellationUsingAllocator(alloc, repaired.artifact_id, repaired.byte_len, repaired.checksum, .none);
+    const payload = try store.getAlloc(alloc, repaired.artifact_id);
+    defer alloc.free(payload);
+    try std.testing.expectEqualStrings("alpha", payload);
+}
+
+test "serverless fs artifact verified range budgets cold authentication and amortizes warm reads" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "budgeted-verified-range");
+    defer cleanupTmp(root);
+    var store = try FsStore.init(alloc, std.mem.span(root));
+    defer store.deinit();
+    var meta = try store.put(alloc, "alpha");
+    defer meta.deinit(alloc);
+    store.forgetVerifiedFile(meta.artifact_id);
+    var iface = store.artifactStore();
+    var remaining: u64 = 2;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining));
+    try std.testing.expectEqual(@as(u64, 1), remaining);
+    remaining = 6;
+    const cold = try iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining);
+    defer alloc.free(cold);
+    try std.testing.expectEqualStrings("a", cold);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    remaining = 1;
+    const warm = try iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining);
+    defer alloc.free(warm);
+    try std.testing.expectEqualStrings("a", warm);
+    try std.testing.expectEqual(@as(u64, 0), remaining);
+    const path = try pathForArtifactAlloc(alloc, store.root_dir, meta.checksum);
+    defer alloc.free(path);
+    try writeFileAtomically(path, "omega");
+    remaining = 6;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, iface.getVerifiedRangeAllocWithBudget(alloc, meta.artifact_id, meta.byte_len, meta.checksum, 0, 1, .none, &remaining));
+}
+
+test "serverless fs artifact verification cache detects in-place mutation with restored mtime" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const root = tmpPath(&path_buf, "cached-in-place-corruption");
+    defer cleanupTmp(root);
+
+    var store = try FsStore.init(alloc, std.mem.span(root));
+    defer store.deinit();
+    var meta = try store.put(alloc, "alpha");
+    defer meta.deinit(alloc);
+    const path = try pathForArtifactAlloc(alloc, store.root_dir, meta.checksum);
+    defer alloc.free(path);
+
+    var iface = store.artifactStore();
+    try iface.verifyContentWithCancellationUsingAllocator(alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const before = try std.Io.Dir.cwd().statFile(io, path, .{});
+    // Some CI filesystems expose ctime at a coarser resolution than their
+    // write path. Wait for that observable clock to advance so this test
+    // exercises cache invalidation instead of assuming nanosecond precision.
+    var after = before;
+    for (0..200) |attempt| {
+        if (attempt > 0) try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+        {
+            var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+            defer file.close(io);
+            var buffer: [32]u8 = undefined;
+            var writer = file.writer(io, &buffer);
+            try writer.interface.writeAll(if (attempt % 2 == 0) "omega" else "sigma");
+            try writer.end();
+        }
+        try std.Io.Dir.cwd().setTimestamps(io, path, .{ .modify_timestamp = .{ .new = before.mtime } });
+        after = try std.Io.Dir.cwd().statFile(io, path, .{});
+        if (!std.meta.eql(before.ctime, after.ctime)) break;
+    }
+    try std.testing.expectEqual(before.inode, after.inode);
+    try std.testing.expectEqual(before.size, after.size);
+    try std.testing.expect(std.meta.eql(before.mtime, after.mtime));
+    try std.testing.expect(!std.meta.eql(before.ctime, after.ctime));
+
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, iface.getVerifiedRangeAllocWithCancellationUsingAllocator(
+        alloc,
+        meta.artifact_id,
+        meta.byte_len,
+        meta.checksum,
+        0,
+        5,
+        .none,
+    ));
 }
 
 test "fs artifact store rejects malformed content addresses before lookup" {

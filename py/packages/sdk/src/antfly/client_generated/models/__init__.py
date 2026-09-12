@@ -60,6 +60,7 @@ from .backup_outcome_ambiguous_conflict_code import BackupOutcomeAmbiguousConfli
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
+from .batch_committed_failure import BatchCommittedFailure
 from .batch_request import BatchRequest
 from .batch_request_inserts import BatchRequestInserts
 from .batch_request_inserts_additional_property import BatchRequestInsertsAdditionalProperty
@@ -153,6 +154,7 @@ from .created_graph_artifact_source_config import CreatedGraphArtifactSourceConf
 from .created_graph_artifact_source_config_format import CreatedGraphArtifactSourceConfigFormat
 from .created_graph_index import CreatedGraphIndex
 from .created_graph_index_config import CreatedGraphIndexConfig
+from .created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
 from .created_graph_index_type import CreatedGraphIndexType
 from .created_index_common import CreatedIndexCommon
 from .created_provider_config import CreatedProviderConfig
@@ -248,6 +250,7 @@ from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
 from .exact_sort_error_status import ExactSortErrorStatus
+from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
 from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
@@ -385,6 +388,7 @@ from .graph_edge_weight_range import GraphEdgeWeightRange
 from .graph_exact_result_stats import GraphExactResultStats
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
+from .graph_index_config_metrics import GraphIndexConfigMetrics
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -406,8 +410,39 @@ from .graph_match_operation_limit_exceeded_error import GraphMatchOperationLimit
 from .graph_match_operation_limit_exceeded_error_error import GraphMatchOperationLimitExceededErrorError
 from .graph_match_operation_limit_exceeded_error_status import GraphMatchOperationLimitExceededErrorStatus
 from .graph_match_query import GraphMatchQuery
+from .graph_metric_action_response import GraphMetricActionResponse
+from .graph_metric_build_page_status import GraphMetricBuildPageStatus
+from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
+from .graph_metric_build_page_status_state import GraphMetricBuildPageStatusState
+from .graph_metric_config import GraphMetricConfig
+from .graph_metric_config_kind import GraphMetricConfigKind
+from .graph_metric_config_refresh import GraphMetricConfigRefresh
+from .graph_metric_edge_filter import GraphMetricEdgeFilter
+from .graph_metric_edge_filter_mode import GraphMetricEdgeFilterMode
+from .graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
+from .graph_metric_edge_filter_status_mode import GraphMetricEdgeFilterStatusMode
+from .graph_metric_event import GraphMetricEvent
+from .graph_metric_event_kind import GraphMetricEventKind
+from .graph_metric_filter import GraphMetricFilter
+from .graph_metric_filter_op import GraphMetricFilterOp
+from .graph_metric_order import GraphMetricOrder
+from .graph_metric_order_direction import GraphMetricOrderDirection
+from .graph_metric_order_nulls import GraphMetricOrderNulls
+from .graph_metric_profile import GraphMetricProfile
+from .graph_metric_query import GraphMetricQuery
+from .graph_metric_query_metric_freshness import GraphMetricQueryMetricFreshness
+from .graph_metric_rerank import GraphMetricRerank
+from .graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
+from .graph_metric_rerank_score_details import GraphMetricRerankScoreDetails
+from .graph_metric_result import GraphMetricResult
+from .graph_metric_runtime_stats import GraphMetricRuntimeStats
+from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
+from .graph_metric_score import GraphMetricScore
+from .graph_metric_status import GraphMetricStatus
+from .graph_metric_status_phase import GraphMetricStatusPhase
 from .graph_nodes_result import GraphNodesResult
 from .graph_nodes_result_kind import GraphNodesResultKind
+from .graph_nodes_result_metric_status import GraphNodesResultMetricStatus
 from .graph_not_equal_predicate import GraphNotEqualPredicate
 from .graph_not_exists_pattern import GraphNotExistsPattern
 from .graph_optional_match import GraphOptionalMatch
@@ -442,6 +477,7 @@ from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourc
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_node_metrics import GraphResultNodeMetrics
 from .graph_result_ref_node_selector import GraphResultRefNodeSelector
 from .graph_result_row import GraphResultRow
 from .graph_result_stats import GraphResultStats
@@ -450,6 +486,7 @@ from .graph_row_count_target import GraphRowCountTarget
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
+from .graph_traversal_metric_freshness import GraphTraversalMetricFreshness
 from .graph_traverse_query import GraphTraverseQuery
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
@@ -682,11 +719,13 @@ from .key_range import KeyRange
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
+from .legacy_graph_query_metric_freshness import LegacyGraphQueryMetricFreshness
 from .legacy_graph_result_node import LegacyGraphResultNode
 from .legacy_graph_result_node_document import LegacyGraphResultNodeDocument
 from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
 from .legacy_graph_search_result import LegacyGraphSearchResult
 from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
+from .legacy_graph_search_result_metric_status import LegacyGraphSearchResultMetricStatus
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -804,6 +843,8 @@ from .query_result import QueryResult
 from .query_result_base import QueryResultBase
 from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
+from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
+from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
@@ -1076,6 +1117,7 @@ __all__ = (
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
+    "BatchCommittedFailure",
     "BatchRequest",
     "BatchRequestInserts",
     "BatchRequestInsertsAdditionalProperty",
@@ -1158,6 +1200,7 @@ __all__ = (
     "CreatedGraphArtifactSourceConfigFormat",
     "CreatedGraphIndex",
     "CreatedGraphIndexConfig",
+    "CreatedGraphIndexConfigMetrics",
     "CreatedGraphIndexType",
     "CreatedIndexCommon",
     "CreatedProviderConfig",
@@ -1262,6 +1305,7 @@ __all__ = (
     "ExactSortErrorStatus",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecuteGraphMetricActionAction",
     "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
@@ -1399,6 +1443,7 @@ __all__ = (
     "GraphExactResultStats",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
+    "GraphIndexConfigMetrics",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
@@ -1420,8 +1465,39 @@ __all__ = (
     "GraphMatchOperationLimitExceededErrorError",
     "GraphMatchOperationLimitExceededErrorStatus",
     "GraphMatchQuery",
+    "GraphMetricActionResponse",
+    "GraphMetricBuildPageStatus",
+    "GraphMetricBuildPageStatusRangeKind",
+    "GraphMetricBuildPageStatusState",
+    "GraphMetricConfig",
+    "GraphMetricConfigKind",
+    "GraphMetricConfigRefresh",
+    "GraphMetricEdgeFilter",
+    "GraphMetricEdgeFilterMode",
+    "GraphMetricEdgeFilterStatus",
+    "GraphMetricEdgeFilterStatusMode",
+    "GraphMetricEvent",
+    "GraphMetricEventKind",
+    "GraphMetricFilter",
+    "GraphMetricFilterOp",
+    "GraphMetricOrder",
+    "GraphMetricOrderDirection",
+    "GraphMetricOrderNulls",
+    "GraphMetricProfile",
+    "GraphMetricQuery",
+    "GraphMetricQueryMetricFreshness",
+    "GraphMetricRerank",
+    "GraphMetricRerankMetricFreshness",
+    "GraphMetricRerankScoreDetails",
+    "GraphMetricResult",
+    "GraphMetricRuntimeStats",
+    "GraphMetricRuntimeStatsRole",
+    "GraphMetricScore",
+    "GraphMetricStatus",
+    "GraphMetricStatusPhase",
     "GraphNodesResult",
     "GraphNodesResultKind",
+    "GraphNodesResultMetricStatus",
     "GraphNotEqualPredicate",
     "GraphNotExistsPattern",
     "GraphOptionalMatch",
@@ -1456,6 +1532,7 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultNodeMetrics",
     "GraphResultRefNodeSelector",
     "GraphResultRow",
     "GraphResultStats",
@@ -1464,6 +1541,7 @@ __all__ = (
     "GraphShortestPath",
     "GraphShortestPathQuery",
     "GraphTraversal",
+    "GraphTraversalMetricFreshness",
     "GraphTraverseQuery",
     "GraphWhereAnd",
     "GraphWhereNotEqual",
@@ -1694,11 +1772,13 @@ __all__ = (
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
+    "LegacyGraphQueryMetricFreshness",
     "LegacyGraphResultNode",
     "LegacyGraphResultNodeDocument",
     "LegacyGraphResultNodeEvidence",
     "LegacyGraphSearchResult",
     "LegacyGraphSearchResultKind",
+    "LegacyGraphSearchResultMetricStatus",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -1814,6 +1894,8 @@ __all__ = (
     "QueryResultBase",
     "QueryResultBaseAggregations",
     "QueryResultBaseAnalyses",
+    "QueryResultBaseGraphMetricResults",
+    "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",

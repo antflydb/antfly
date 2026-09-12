@@ -149,6 +149,7 @@ pub const PendingWorkStats = struct {
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
     repair_metadata_rebuild_pending: bool = false,
+    graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},
 };
 
 pub const MaintenanceDriver = struct {
@@ -679,6 +680,7 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
+        try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
         const end = try self.alloc.dupe(u8, byte_range.end);
@@ -1610,7 +1612,7 @@ pub const DBCore = struct {
         try self.index_manager.pruneTextSplitRange(split_key);
         try self.index_manager.pruneDenseSplitRange(self.store, split_key);
         try self.index_manager.pruneSparseSplitRange(split_key, original_range_end);
-        try self.index_manager.pruneGraphSplitRange(split_key, original_range_end);
+        try self.index_manager.fenceGraphSplitRange(split_key, original_range_end);
     }
 
     pub fn splitRightStoreToDir(self: *DBCore, split_lower: []const u8, dest_dir: []const u8) !bool {

@@ -38,6 +38,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -62,6 +63,27 @@ pytest_plugins = ("e2e_scheduler",)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
+
+
+def publication_retry_delay(
+    response: requests.Response | None, interval_s: float
+) -> float | None:
+    """Retry only explicit publication contention, never arbitrary server errors.
+
+    The current runtime emits Retry-After delta-seconds for temporary authority
+    failures. A 503 without that signal (e.g. missing source resolution) needs
+    intervention. This policy must not be applied to document mutation POSTs.
+    """
+    if response is None:
+        return None
+    if response.status_code == 409:
+        return interval_s
+    if response.status_code != 503:
+        return None
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if not re.fullmatch(r"[0-9]+", retry_after):
+        return None
+    return max(interval_s, float(retry_after))
 
 
 def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30.0):
@@ -2437,12 +2459,12 @@ def serverless_api(serverless_runtime):
                 raise requests.HTTPError(message, response=response)
             return response.json()
 
-        def get(self, path: str) -> dict:
-            return self._check(self.s.get(f"{self.url}{path}", timeout=10))
+        def get(self, path: str, *, timeout_s: float = 10.0) -> dict:
+            return self._check(self.s.get(f"{self.url}{path}", timeout=timeout_s))
 
-        def post(self, path: str, payload: dict) -> dict:
+        def post(self, path: str, payload: dict, *, timeout_s: float = 10.0) -> dict:
             return self._check(
-                self.s.post(f"{self.url}{path}", json=payload, timeout=10)
+                self.s.post(f"{self.url}{path}", json=payload, timeout=timeout_s)
             )
 
         def put(self, path: str, payload: dict) -> dict:
@@ -2540,28 +2562,37 @@ def serverless_api(serverless_runtime):
         def build_table(
             self, table_name: str, *, timeout_s: float = 10.0, interval_s: float = 0.1
         ) -> dict:
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise ValueError("publication timeout must be finite and positive")
+            if not math.isfinite(interval_s) or interval_s <= 0:
+                raise ValueError("publication interval must be finite and positive")
             deadline = time.monotonic() + timeout_s
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Publication deadline expired: {table_name}")
                 try:
                     return self.post(
-                        antfly_internal_api_path(f"/tables/{table_name}/build"), {}
+                        antfly_internal_api_path(f"/tables/{table_name}/build"),
+                        {},
+                        timeout_s=min(10.0, remaining),
                     )
                 except requests.HTTPError as exc:
-                    response = exc.response
-                    retryable_build_race = response is not None and (
-                        response.status_code == 409
-                        or (
-                            response.status_code == 500
-                            and response.text.strip() == "build failed"
-                        )
-                    )
-                    if not retryable_build_race or time.monotonic() >= deadline:
+                    delay = publication_retry_delay(exc.response, interval_s)
+                    # Never retry earlier than requested or give each attempt
+                    # a fresh timeout. Preserve the last HTTP error on expiry.
+                    if delay is None or delay >= deadline - time.monotonic():
                         raise
-                    time.sleep(interval_s)
+                    time.sleep(delay)
+                    if time.monotonic() >= deadline:
+                        raise
 
-        def table_build_status(self, table_name: str) -> dict:
+        def table_build_status(
+            self, table_name: str, *, timeout_s: float = 10.0
+        ) -> dict:
             return self.get(
-                antfly_internal_api_path(f"/tables/{table_name}/build-status")
+                antfly_internal_api_path(f"/tables/{table_name}/build-status"),
+                timeout_s=timeout_s,
             )
 
         def batch_table(
@@ -3864,20 +3895,30 @@ def table_api(request):
             if self.backend == "stateful":
                 return None
             deadline = time.monotonic() + timeout_s
-            while True:
+            while (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    self.raw.build_table(table_name)
+                    self.raw.build_table(
+                        table_name, timeout_s=remaining, interval_s=interval_s
+                    )
                 except requests.HTTPError as exc:
-                    assert exc.response is not None
-                    if exc.response.status_code != 409:
+                    if publication_retry_delay(exc.response, interval_s) is None:
                         raise
-                status = self.raw.table_build_status(table_name)
+                    # The inner retry loop has exhausted this same deadline
+                    # (or Retry-After exceeds it). Do not restart its budget.
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                status = self.raw.table_build_status(
+                    table_name, timeout_s=min(10.0, remaining)
+                )
                 ready = ready_serverless_build_status(status)
                 if ready is not None:
                     return ready
                 if time.monotonic() >= deadline:
                     return None
-                time.sleep(interval_s)
+                time.sleep(max(0.0, min(interval_s, deadline - time.monotonic())))
+            return None
 
         def query_table(self, table_name: str, payload: dict) -> dict:
             if self.backend == "serverless":

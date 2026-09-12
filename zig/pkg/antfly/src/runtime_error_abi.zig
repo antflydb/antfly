@@ -359,6 +359,10 @@ pub const Detail = enum(c_int) {
     // An ambiguous remote backup cannot authorize rollback at its caller.
     backup_outcome_ambiguous,
     metadata_mutation_not_applied,
+    // Append unpublished branch details after all main wire identities.
+    graph_metric_action_partial_outcome,
+    index_generation_mismatch,
+    generation_transition_active,
 };
 
 pub const Status = extern struct {
@@ -433,6 +437,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
+        error.GraphMetricActionPartialOutcome => status(.retryable, .graph_metric_action_partial_outcome),
         error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
@@ -445,10 +450,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
         error.TopologyChanged => status(.retryable, .topology_changed),
+        error.IndexGenerationMismatch => status(.retryable, .index_generation_mismatch),
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
         error.TableGenerationChanged => status(.conflict, .table_generation_changed),
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
+        error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
@@ -802,10 +809,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .internal_failure => "InternalFailure",
         .not_leader => "NotLeader",
         .topology_changed => "TopologyChanged",
+        .index_generation_mismatch => "IndexGenerationMismatch",
         .identity_read_generation_changed => "IdentityReadGenerationChanged",
         .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
         .table_generation_changed => "TableGenerationChanged",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
+        .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
@@ -1017,6 +1026,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
+        .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
@@ -1056,6 +1066,9 @@ test "schema epoch conflicts retain a retryable public status" {
     // main published this value before the relational-only tail. Preserve it
     // when both branches append details independently.
     try std.testing.expectEqual(@as(c_int, 297), @intFromEnum(Detail.unsupported_tensor_type));
+    try std.testing.expectEqual(@as(c_int, 306), @intFromEnum(Detail.vector_store_reference_format_required));
+    try std.testing.expectEqual(@as(c_int, 307), @intFromEnum(Detail.backup_outcome_ambiguous));
+    try std.testing.expectEqual(@as(c_int, 308), @intFromEnum(Detail.metadata_mutation_not_applied));
     const value = statusFromError(error.SchemaInUse);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
     try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
@@ -1068,6 +1081,10 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
+    try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
+    try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));

@@ -1,0 +1,1070 @@
+# Graph metric execution and query benchmarks
+
+## Streaming page-tree bootstrap (2026-09-11)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-bootstrap-only
+```
+
+Apple M4 Max, Zig 0.16.0, five measured samples after one warmup, generated
+sorted 8-byte keys and 64-byte values. Memory below includes the builder's
+owned records, routing entries and serialized page buffers, but excludes the
+in-memory storage transport. There is no pre-materialized input array.
+
+| Records | Peak builder bytes | PUTs | GETs | Output bytes | Median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 120,200 | 4 | 0 | 82,375 | 0.089 ms |
+| 131,072 | 158,768 | 323 | 0 | 10,528,642 | 8.356 ms |
+| 1,048,576 | 182,984 | 2,579 | 0 | 84,229,010 | 67.661 ms |
+
+The builder retains one pending page per height rather than graph-wide arrays
+of leaf and routing entries. Each successful build writes only final reachable
+pages. Tests cover borrowed source buffers, page boundaries, failed allocations,
+invalid ordering and interrupted writes. These results exclude document parsing,
+external sorting, metric preparation and manifest publication. The measurements
+include the attempt-scoped v3 page reference format. They are not an end-to-end
+build speedup; the complete publication benchmark below covers that path.
+
+## Committed status and immutable memory-run pins (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-disk-reads-only
+```
+
+Apple M4 Max, Zig 0.16.0, median of five samples after one warmup. These
+measure empty incoming adjacency reads behind an ownership fence, including
+snapshot/cursor setup and cleanup. First/last target probes verify the same
+empty result. Fixture ingestion and fence installation are excluded.
+
+| Edges | Memory LSM before (first / last) | Memory LSM pinned (first / last) | Durable LSM warm (first / last) |
+| --- | ---: | ---: | ---: |
+| 4,096 | 300.458 / 264.750 µs | 1.458 / 2.166 µs | 2.125 / 2.167 µs |
+| 16,384 | 1,023.500 / 1,010.333 µs | 1.042 / 1.209 µs | 1.750 / 1.750 µs |
+| 65,536 | 4,337.333 / 4,053.083 µs | 1.125 / 1.042 µs | 1.875 / 1.583 µs |
+
+The memory-backed improvement removes whole-run cloning from snapshot setup.
+The durable column is a separate absolute measurement, **not** a before/after
+disk speedup. These are local warm microbenchmarks, not network latency or
+ingestion throughput. Ten thousand operational-status samples take 22–29 µs
+per batch, with zero extra allocations. Status publication now happens only
+after the counter transaction commits; failure-injection tests verify that
+aborted/staged counts cannot escape through operational status.
+
+## Ownership fences and lazy type runs (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --filtered-prefix-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+```
+
+Apple M4 Max, Zig 0.16.0, five measured samples after one warmup. The filtered
+benchmark uses a 100,000-edge hub with 64 edge types, a fresh reader per query,
+in-memory artifact transport and no shared cache. Every variant returns the same
+first edge; timings include authentication, string ownership and cleanup.
+
+| Requested types | Median | GETs | Fetched bytes | Inspected edges |
+| --- | ---: | ---: | ---: | ---: |
+| Wildcard | 0.214 ms | 7 | 299,988 | 1 |
+| First type only | 0.320 ms | 10 | 496,596 | 18 |
+| All 64 explicitly | 0.216 ms | 7 | 299,988 | 1 |
+
+The pre-change diagnostic on the same fixture used 36 GETs, 2,200,532 fetched
+bytes and 2,148 edge inspections for all 64 types. Canonical adjacent type runs
+now share endpoint seeks, and unconsumed runs perform no edge I/O. Selecting
+the whole dictionary requires no endpoint probes. This removes 81% of GETs
+and 86% of fetched bytes for that query without changing its result or budget.
+These are physical-work reductions, not a network-latency prediction. A narrow
+interior filter still requires logarithmic endpoint searches.
+
+Stateful split acknowledgment no longer drains physical topology. The durable
+ownership task fences metrics and, once activated by the primary range commit,
+filters outgoing and reverse reads by source ownership. Retirement runs in
+1,024-record / 4 MiB identity pages through the existing maintenance scheduler.
+Each completed page atomically advances its durable key cursor with reverse
+accounting, avoiding scans through earlier pages' tombstones after a yield or
+restart. A separate raw-LSM diagnostic with 65,535 tombstones measured an
+original-lower-bound seek at 2.56 ms versus 0.37 µs for the surviving key;
+this isolates seek CPU and excludes persistence and page mutation.
+
+| Retired edges | Fence median | Complete retirement | Largest page | Scoped empty incoming lookup |
+| --- | ---: | ---: | ---: | ---: |
+| 4,096 | 1.558 ms | 101.870 ms | 31.227 ms | 0.551 ms |
+| 16,384 | 16.506 ms | 476.265 ms | 50.049 ms | 0.923 ms |
+| 65,536 | 1.757 ms | 3,316.889 ms | 159.168 ms | 1.330 ms |
+
+The default durable LSM benchmark excludes insertion and includes all retirement
+durability barriers. Fence timing covers private graph metadata and its sync,
+not end-to-end Raft apply or primary coverage rebasing. It does not configure
+metrics; fencing cost also depends on the configured metric count. Storage
+maintenance and fsync can dominate even a small transaction (as the 16K sample
+illustrates); page bounds are work/memory bounds, not hard wall-clock deadlines.
+The architectural improvement is removing the complete edge drain from split
+acknowledgment and allowing apply ownership to be released between pages.
+
+## Retained native cursors and durable lifecycle ownership (2026-09-10)
+
+In-process adjacency streams retain their native read snapshots and physical
+cursor across bounded batches. Logical resume cursors remain the RPC paging
+contract. Both paths share allocation-free encoded-key inspection and admit the
+complete decoded edge size before allocating identifiers or metadata. Native
+scans close their resources on exhaustion, errors, or explicit early stopping;
+they do not advance into the unrequested tail just to manufacture a resume key.
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --native-scans-only
+```
+
+Apple M4 Max / Zig 0.16.0; warm default durable LSM, 65,536 outgoing hub edges
+inserted in sixteen 4,096-edge batches. Five samples after one warmup per mode,
+with each comparison repeated. Both paths decode identical results in batches
+of 64 using the current admission implementation; setup is excluded, scan and
+result cleanup included.
+
+| Workload | Logical pages | Retained cursor |
+| --- | ---: | ---: |
+| Full scan median, repeated runs | 23.19–24.28 ms | 18.70–18.81 ms |
+| Full scan query allocation count | 209,918 | 203,778 |
+| Full scan peak query-owned bytes | 10,848 | 10,786 |
+| First-edge median, repeated runs | 4.38–4.75 µs | 4.38–4.42 µs |
+
+Retaining the cursor reduced full-scan time by approximately 19–23% without
+increasing the batch size. First-edge timings are too small/noisy to establish
+a latency improvement. Query allocation statistics exclude storage-owned
+snapshots/cursors; this is a local scan benchmark, not an end-to-end cloud or
+ingestion throughput claim.
+
+Repair now treats metric score epochs, cleanup cursors, and operator intent as
+durable lifecycle state rather than rebuildable counters. Starting a repair
+atomically fences numerical leases and advances the topology epoch, retaining
+interrupted jobs for normal bounded retirement before lease takeover replaces
+them. A full retirement queue therefore cannot prevent repair/reopen. Bounded
+reconstruction preserves the lifecycle namespaces and topology task incarnation
+sequence. Regression coverage includes unpublished score isolation,
+restart between counter-rebuild pages, snapshot stability across intervening
+LSM writes, escaped identities, all directions, duplicate types, oversized
+payload admission, and allocation-failure cleanup.
+
+## Demand-driven queries and recoverable pruning (2026-09-10)
+
+The `--paged-only` harness now also runs complete dedicated limit-1 neighbor
+and traversal queries with a one-edge scan budget. Apple M4 Max, Zig 0.16.0,
+ReleaseSafe, five samples after one warmup; each query has a fresh session and
+no shared cache. Timings include authentication, result ownership, and cleanup.
+
+| 100,000-edge hub | Median | Fetched bytes | GETs |
+| --- | ---: | ---: | ---: |
+| Eager row materialization | 11.566 ms | 4,070,765 | 64 |
+| Limit-1 neighbors | 0.212 ms | 335,213 | 7 |
+| Limit-1 traversal | 0.198 ms | 335,213 | 7 |
+
+This compares a materialization baseline with complete prefix queries, not
+identical result workloads or measured network latency. Both queries inspect
+one edge; the old complete-row consumption could fail that budget before
+returning an otherwise available first result.
+
+`--prune-only` exercises the default durable stateful LSM with six insert/prune
+cycles, excluding insertion from timing and discarding the first sample.
+Pruning 4,096 edges measured 145.619 ms; 16,384 edges measured 676.200 ms. These
+are absolute durability-inclusive costs, not a claimed speedup over the old
+unsafe pruning path. Every page includes intent persistence, forward sync,
+reverse accounting, and intent retirement, with a 1,024-record / 4 MiB identity
+input bound. Tests separately interrupt pruning after the forward commit and
+counter reconstruction between pages, then verify recovery on reopen.
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+```
+
+## Streaming cursors, paged control, and tree batches (2026-09-10)
+
+Current graph wire v9 / manifest v24 / materializer epoch 25 uses a 112-byte
+trailer, a bounded authenticated root, and 64 KiB directory leaves. A directory
+larger than 1 MiB stays addressable. Queries load type names and node fences
+lazily, and request sessions share authenticated blocks with single-flight fills.
+
+Reproduce the updated `--paged-only` benchmark and tree validation comparison:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --tree-only
+```
+
+Apple M4 Max / Zig 0.16.0, ReleaseFast; five timed samples after one warmup.
+Hub comparisons use the same reader, immutable in-memory transport, and fresh
+request-local caches. They differ only in consuming the entire hub versus
+stopping at its first edge. Transport overfetch is included in byte counts.
+
+| Workload | Eager/reference | Incremental/grouped |
+| --- | ---: | ---: |
+| 16,384-edge hub: local median | 1.335 ms | 0.124 ms |
+| 16,384-edge hub: fetched bytes | 743,205 | 218,917 |
+| 100,000-edge hub: local median | 7.600 ms | 0.216 ms |
+| 100,000-edge hub: fetched bytes | 4,070,765 | 400,749 |
+| 100,000-edge hub: origin GETs | 64 | 8 |
+| 100,000-edge hub: inspected edges | 100,000 | 1 |
+| 2,048 distinct tree writes: validation | 3.815 ms | 0.470 ms |
+| 8,192 distinct tree writes: validation | 55.355 ms | 2.318 ms |
+| 16,384 distinct tree writes: validation | 217.887 ms | 5.037 ms |
+
+Tree measurements exercise read-only production validation against an empty
+native graph, excluding fixture setup and commits. These are not end-to-end
+ingestion speedups. The previous quadratic prior-write walk is retained only as
+a benchmark oracle. Grouped validation also sorts source/type probes for storage
+locality (included in these timings). Final-identity semantics, duplicate deletes/reinsertions,
+and rejection before writes have separate regression coverage.
+
+The 20,000-type fixture now remains paged (2,441,556 encoded bytes); preparation
+uses seven GETs / 1,654,404 fetched bytes. Query tests verify that a fresh second
+request sharing the authenticated cache performs zero origin reads. These are
+CPU/I/O-work measurements, not claims about real cloud latency or throughput.
+
+A four-million-node isolated-node fixture produces a 129,250,850-byte artifact
+with a 1,250,060-byte directory. A cold point lookup succeeds with 792,076 fetched
+bytes / 15 GETs and 726,428 retained control/data-cache bytes (0.576 ms locally).
+This fixture uses production `finishEncoding` to build/authenticate its routing
+structures; fixture construction is excluded from query timings. It validates
+that node cardinality cannot trigger the former 1 MiB full-decode fallback.
+
+## Addressed adjacency and existence-only mutation probes (2026-09-10)
+
+The preceding baseline used graph wire v7, manifest wire v22, materializer epoch
+23. Node-ordinal row offsets cost eight bytes per
+dictionary node; dictionary fences add 68 bytes per 256-node page. Both are
+authenticated by the manifest-bound control structure. The control directory
+remains capped at 1 MiB; oversized controls explicitly omit the accelerator.
+
+Reproduce with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --presence-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only
+```
+
+Apple M4 Max / Zig 0.16.0; medians of five measurements after one discarded
+warmup. These are local microbenchmarks, not cloud end-to-end latency claims.
+
+| Cold one-edge lookup | Whole graph | Addressed row |
+| --- | ---: | ---: |
+| 16,384 nodes: fetched bytes | 1,627,870 | 333,504 |
+| 16,384 nodes: local median | 1.341 ms | 0.160 ms |
+| 100,000 nodes: fetched bytes | 9,934,770 | 296,884 |
+| 100,000 nodes: local median | 10.893 ms | 0.177 ms |
+| GETs per fixture | 1 | 6 |
+
+Every sample creates a fresh reader. The transport serves immutable memory and
+counts exact GET bytes. Both paths assert the same neighbor. The full-decode
+reference omits transport SHA verification, while the addressed path verifies
+the footer, directory, and touched blocks. Network RTT can dominate six small
+GETs; measure actual object-store latency before interpreting these CPU timings
+as deployment speedups. Authenticated first-key fence prefixes avoid an object
+GET for every dictionary binary-search comparison; common prefixes longer than
+64 bytes fall back to a bounded search of the ambiguous pages.
+
+The many-type preparation fixture has two nodes and one relationship per type.
+64/1,024/10,000 types require 3/3/6 range reads and 7,580/117,020/812,860 bytes.
+Before boundary-block reuse, the 10,000-type probe exhausted its 512 MiB read
+allowance after 8,184 calls for a roughly 1.14 MiB source. The regression now
+requires completion within 2 MiB, at most eight calls, and no source-size read
+amplification. Block retention is one 64 KiB block, or less for small sources.
+Point and traversal readers instead retain up to eight blocks (512 KiB) per
+source under the request's admitted allocator; a warm-hop regression verifies
+that dictionary, routing, and row reads share that working set without extra GETs.
+
+| 1,024 existing-key presence probes | Scalar value reads | Sorted existence reads |
+| --- | ---: | ---: |
+| 256-byte values: local median | 5.771 ms | 0.526 ms |
+| 256-byte values: extra peak allocation | 298,778 B | 160 B |
+| 16-KiB values: local median | 1.287 ms | 0.693 ms |
+| 16-KiB values: extra peak allocation | 16,810,398 B | 20,360 B |
+| Retained value copies | 1,024 | 0 |
+
+This isolates presence checks on warm immutable LSM runs and block cache using
+modeled storage. It measures batch lifetime, excluding fixture creation and
+disk latency. Different value sizes create different run/block layouts, so
+cross-row timing comparisons are not a payload-size scaling curve. The native
+batch probes sorted keys in 256-key pages, releases temporary pins and decode
+scratch per page, and returns only booleans. Tombstones and batch-local writes
+override persisted data. Non-LSM backends use their existing get semantics.
+
+The separate default durable-LSM benchmark preserves identical topology over
+65,536-edge insert/delete cycles: scalar presence plus per-edge global counters
+takes 2.091 s, versus 1.277 s for sorted presence plus coalesced counters. That
+comparison includes WAL and both directional commits and combines the two
+optimizations; it is not an isolated estimate of the presence-check gain.
+
+## Block-authenticated preparation and committed counters (2026-09-09)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+At that measurement, graph wire was v6, manifest wire v21. Both ingestion paths emitted the same
+authenticated block table, and the published manifest binds its control root.
+Selected preparation retains authenticated semantic digests instead of hashing
+the selected graph again. Each cold sample uses a fresh verifier, not a cold OS
+page cache. Local filesystem timings are not cloud request-latency measurements.
+
+Apple M4 Max / Zig 0.16.0 ReleaseFast, shared host, after merging main
+`9f192f9be`; six samples with the first discarded. Each reference prepares the same current-wire artifact and checks
+the same selected semantic identity. Preparation excludes the numerical kernel.
+
+| Phase | Reference | Current | Tracked peak / reads |
+| --- | ---: | ---: | --- |
+| Stateful committed insert + delete | 1,719.468 ms | 980.983 ms | Endpoint counter reads 262,144 → 2,048 |
+| Serverless narrow, warm identity | 12.781 ms | 0.107 ms | Peak 16,140,777 → 99,141 B; reads 11,780,488 → 115,080 B |
+| Serverless narrow, cold identity | 12.759 ms | 0.105 ms | Same peak and reads as warm |
+| Serverless all types, warm identity | 12.437 ms | 2.710 ms | Peak 16,140,777 → 5,854,947 B; reads 11,780,488 → 3,434,931 B |
+| Serverless all types, cold identity | 12.625 ms | 2.480 ms | Same peak and reads as warm |
+
+Two pre-merge runs had identical counted bytes and allocation peaks. Committed
+cycles measured 2,150.950 → 1,198.386 ms and 2,158.953 → 1,185.736 ms; cold narrow
+preparation measured 14.511 → 0.115 ms and 14.483 → 0.133 ms. All three complete
+runs checked semantic/encoded parity across all 24 benchmark records.
+
+Compared with the historical v5 run below, warm narrow reads rise from 19,677
+to 115,080 bytes because of block alignment; cold narrow reads fall from
+11,794,405 to 115,080 bytes. The source grows by 5,760 bytes for its block table.
+Cross-run timing comparisons are approximate on this shared host; within-run
+reference parity and counted bytes are the stronger evidence.
+
+The committed-counter fixture uses 65,536 edges and 1,024 nodes on the default
+durable LSM. Both paths execute six complete insert/delete cycles, discarding the
+first, and check edge/node counts after both commits. Only global incidence
+maintenance differs; topology invalidation, directional writes and WAL/commit
+remain in the timer. Coalescing reduces endpoint counter reads per cycle from
+262,144 to 2,048. This does not imply fewer WAL records: repeated mutable-key
+updates were already coalesced by the LSM. Forced compaction, reopening and
+fixture construction are excluded.
+
+The block table costs 32 bytes per 64 KiB covered, at most 128 KiB for a 256 MiB
+artifact, plus 32 bytes in each graph manifest reference. The existing eight-byte
+ordinal edge index and dictionary/type directory are still present. Directory
+control remains capped at 1 MiB, with an explicit full-preparation fallback.
+Aligned reads can overfetch compared with v5's warm range path, but no longer
+require cold full-object authentication. Actual overfetched bytes count against
+publication's shared read allowance; separate filter groups share one control
+object and retain only their own selected topology.
+
+## Earlier v5 addressed plans and topology preparation (2026-09-09)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Apple M4 Max / Zig 0.16.0, shared host; six samples, first discarded. This run
+includes the merge of main `aa44bddd1`. That run used wire v5. The following are
+local phase measurements, not cloud/HTTP latency.
+
+| Phase | Reference | Addressed | Tracked peak / reads |
+| --- | ---: | ---: | --- |
+| Stateful plan validation | 129.812 µs | 9.546 µs | Fixed 76-byte control; no boundary allocations on control path |
+| Serverless narrow filter, warm identity | 12.296 ms | 0.074 ms | Peak 16,135,017 → 64,884 B; reads 11,774,728 → 19,677 B |
+| Serverless narrow filter, cold identity | 12.538 ms | 4.107 ms | Same phase peak; reads 11,774,728 → 11,794,405 B |
+| Serverless all types, warm identity | 12.509 ms | 7.490 ms | Peak 16,135,017 → 5,849,203 B; reads 11,774,728 → 3,181,277 B |
+| Serverless all types, cold identity | 12.775 ms | 11.519 ms | Same phase peak; reads 11,774,728 → 14,956,005 B |
+
+The stateful reference reads and validates the addressed boundary set as well
+as the header; it models the old dependency on all boundary data, not the exact
+old monolithic encoding. Both return the same plan identity. Each sample averages
+128 read transactions on the default durable LSM. Production lease checks,
+topology identity and iterative planning use only the control; initial planning
+still materializes boundaries once. The generation-fenced census seals its
+existing boundary slots rather than writing a second large final blob.
+
+Serverless fixtures contain 16,384 nodes, 262,144 unrelated edges and 256 selected
+edges. Both paths prepare the same authenticated v5 artifact and calculate the
+same selected semantic identity; timers include that hashing but no numerical
+kernel. The narrow path retains 256 node IDs instead of 16,384. All-types reads
+use the same ordinal type runs, a dense endpoint map and coalesced dictionary
+pages. Sparse selection instead sorts only its selected endpoints.
+
+Warm cases verify source identity before timing; cold cases create a new local
+verifier per sample, not a cold OS page cache. Cold authentication bytes remain
+charged. Narrow reads still avoid full decode and retained topology, but cold
+all-types reads increase I/O and show only a modest timing improvement. These
+local measurements do not establish a cold cloud latency win. Provider/cache
+allocations are outside the phase allocator. v5 adds eight bytes per local edge
+plus a page/type directory to the existing traversal body (about 2.10 MB for
+this fixture). This is an explicit secondary-index storage tradeoff, not free
+compression. Page reads merge nearby ranges into at most 1 MiB windows, except
+that one oversized dictionary page can be admitted on its own.
+
+Ingestion parity remains exact between reference and ordinal encoders. For
+65,536 edges, ordinal JSON-to-artifact medians were 16.791 ms with 16-byte IDs
+and 28.507 ms with 256-byte IDs (reference: 21.682 and 61.939 ms). The streaming directory builder uses compact
+node offsets and a bounded 65,536-entry digest cache, not an adjacency view or
+graph-wide digest array. A million-node graph no longer loses its directory
+because of the former 64 MiB scratch estimate.
+
+The unchanged-topology republish measured 34 µs versus 2.871 ms recomputation,
+with exact score/artifact identity checks. Stateful coalesced membership
+maintenance measured 114.003 ms versus 528.457 ms per-edge maintenance; this
+remains an abort-based maintenance benchmark, excluding WAL/commit. These
+results do not establish the benefit of migrating stateful graph strings to
+persistent numeric IDs: that separate indexing decision needs committed-write,
+compaction and traversal measurements including dictionary maintenance.
+
+The same run measured stateful filtered discovery at 0.573 ms using type
+postings versus 12.636 ms scanning all 65,536 edges (4,096 selected), with
+identical selected-edge checksums. Cold selected census planning took 66.969 ms
+and three durable checkpoints versus 212.916 ms and seventeen checkpoints for
+the global census. Census timings include plan reset and committed checkpoints,
+but exclude fixture writes and the numerical kernel.
+
+## Earlier v4 transactional indexing and directory-first reuse (2026-09-09)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Apple M4 Max / Zig 0.16.0, shared development host, six samples with the first
+discarded. These are phase measurements, not HTTP or cloud latency guarantees.
+
+| Phase | Reference | Current | Checked work / memory |
+| --- | ---: | ---: | --- |
+| Stateful membership maintenance, 65,536 edges / 16 types | 547.572 ms | 118.944 ms | 131,072 → 16,384 endpoint reads |
+| Weight-only PageRank republish, 65,536 edges | 4.071 ms | 0.035 ms | Exact scores and prior artifact ID; 2,755,143 → 1,270 tracked peak bytes |
+| JSON → graph artifact, 16-byte IDs | 27.550 ms | 16.489 ms | Exact current-wire SHA-256; 11,367,906 → 3,723,374 peak bytes |
+| JSON → graph artifact, 256-byte IDs | 71.197 ms | 30.294 ms | Exact current-wire SHA-256; 43,562,466 → 4,214,894 peak bytes |
+
+Membership maintenance uses the default durable LSM and aborts each all-edge
+removal to restore the identical fixture. Timing includes posting maintenance,
+but excludes fixture construction and WAL/commit. The reference is immediate
+per-edge incidence maintenance; the current path coalesces endpoint deltas,
+bulk-reads counts, caches encoded type prefixes, and uses already-known edge
+existence only when the covering index is ready in the same transaction.
+Scratch allocations fall 589,824 → 147,554; scratch peak rises 361 → 1,870,804
+bytes. Backend-owned allocations are not included in that scratch measurement.
+This is not an 8× reduction in WAL records: the LSM already coalesces repeated
+updates to the same mutable key before commit.
+
+Type postings and endpoint memberships are now demand-driven. Ordinary graphs
+and unfiltered metrics do not create them. The first filtered plan activates a
+bounded backfill; a durable activation marker keeps concurrent ingestion covered
+across pauses, filter removal and reopen. Existing partial indexes are detected
+before an inactive marker is written. A regression checks zero auxiliary posting
+and membership records before demand, then exact edge/node parity after activation,
+interleaved mutations and reopen. The timed membership fixture explicitly enables
+a filtered metric; these timings measure active-index maintenance.
+
+Private graph stores now serialize complete write transactions, including their
+initial reads, across foreground ingestion, backfill, leases and checkpoint CAS.
+Snapshots and numerical work remain outside that gate. Concurrent tests cover
+memory, in-memory LSM and durable LSM; native LMDB retains its native single
+writer. Commit failures retain the gate until abort, and failed opens release it.
+
+Census progress is a checksummed `GPC2` control record plus generation-bound,
+addressed boundary slots. A resume reads and writes no previous boundary bytes;
+only the new page's boundaries are persisted. Slots are reused after a generation
+restart and reclaimed on completion or filter removal. The long-key regression
+uses 256 boundaries of 128 KiB: control size falls from 33,686,596 to 131,140
+bytes, with zero saved-boundary reads/writes during an ordinary resume. Final
+plan assembly still materializes the bounded boundary set once, outside the
+write gate. Ordinary source/node scans also stop at their byte allowance.
+
+Graph wire v4 adds a bounded semantic type directory and an authenticated-range
+trailer. Both ingestion encoders produce identical bytes. Publication checks
+this directory before source-wide preparation; unchanged selected connectivity
+can reuse an authenticated metric even when weights, unrelated types, isolated
+documents or qualified endpoints change. Source cardinality limits, policy
+identity, cancellation and shared read/hash budgets still apply. Directory size
+is capped at 1 MiB and construction scratch at 64 MiB; an explicitly unavailable
+accelerator uses the same current wire, not a legacy decoder. Large dictionaries
+and incomplete local topology use the normal preparation path.
+
+The republish fixture uses a warm, content-verified local artifact store. Its
+timer includes range reads, identity selection, prior control authentication and
+publication; graph construction and score checking are outside it. Cold stores
+may need full-content authentication, charged to the shared reuse-read budget.
+Artifact-store-owned cache memory is outside the allocation tracker. First builds
+and changed selected topology still prepare the source graph; the 116× ratio is
+for this unchanged-connectivity republish, not all materializations. The ingestion
+rows include constructing the new directory, making its extra encoding cost
+visible rather than excluding it from the benchmark.
+
+## Earlier benchmark series
+
+Measured 2026-09-07 on Apple M4 Max, 36 GiB RAM, macOS 26.3.1,
+Zig 0.16.0, ReleaseFast, using the system SMP allocator. One warmup and five
+measured samples per case; tables report medians. This was a shared development
+host, not an isolated benchmark machine.
+The compact-query comparison below uses 21 measured samples instead of five.
+
+## Ordinal-only numerical cursors
+
+Measured 2026-09-08 on the same host/toolchain with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --ordinal-cursors-only
+```
+
+Each fixture is a 256-node cycle in the default durable storage backend. Both
+paths read the same sealed initialization and verify identical ordinal checksums.
+The reference decodes membership IDs and validates their dictionary mappings;
+the numerical path reads checksummed coverage and sealed leaf bounds, then
+enumerates dense slots. Initialization and final publication retain dictionary
+validation. Six samples per case, first discarded, 64 repetitions per sample:
+
+| Node ID bytes | String/dictionary traversal | Ordinal traversal | Improvement |
+| --- | ---: | ---: | ---: |
+| 16 | 211.796 µs | 101.843 µs | 2.08× |
+| 4,096 | 1,180.156 µs | 207.796 µs | 5.68× |
+
+These are cursor traversal medians, including read transactions, control-record
+validation and allocation. They exclude graph setup, numerical kernels, writes
+and publication; they are not whole-build speedups. The 4 KiB IDs exercise a
+long-ID workload rather than representing typical IDs. Other development work
+was running on this shared host.
+
+## Durable cross-job topology reuse
+
+After increasing default scheduling spans to 4,096 records, the same fixture
+and command measured the following on 2026-09-08, before the ordinal-only cursor
+change above:
+
+| Complete numerical job | Physical edge records read | Checkpoints | Median time (range) |
+| --- | ---: | ---: | ---: |
+| Independent topology | 32,768 | 36 | 1.612 s (1.415–1.887 s) |
+| Shared topology | 0 | 22 | 0.834 s (0.811–0.892 s) |
+
+The shared case in that measurement is 1.93× faster. Against the earlier
+small-page run below, independent/shared checkpoint counts fall 638 → 36 and
+110 → 22. Those work counts are directly checked. The historical wall times
+were not collected in a controlled same-run comparison: storage compaction and
+other activity on this shared host can materially change elapsed time. This
+benchmark calls the low-level numerical runner; it does not measure concurrent
+task admission or HTTP latency.
+
+### Historical small-page baseline
+
+Measured 2026-09-08 with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --topology-only
+```
+
+The real default-storage fixture has 1,024 nodes and 16,384 directed edges,
+with 16 neighbors per node. A first PageRank job prepares topology; a differently
+configured PageRank job then executes one numerical iteration. The independent
+reference forces a reuse-directory miss; the shared case adopts the sealed
+owner. Both use the same implementation, numerical seed, and graph, and verify
+every published score equals `1/1024`. Six samples per case, first discarded:
+
+| Complete numerical job | Physical edge records read | Worker/coordinator checkpoints | Median time |
+| --- | ---: | ---: | ---: |
+| Independent topology | 32,768 | 638 | 79.346 s |
+| Shared topology | 0 | 110 | 18.573 s |
+
+This is a 4.27× median improvement on this fixture, with 82.8% fewer checkpoints.
+Times include planning, initialization, numerical reduction, publication and
+job cleanup. They exclude fixture writes, score verification, and maintenance
+of retired score generations and topology owners between samples. The reference
+also includes the constant-size transaction forcing a directory miss. Sample
+ranges were 58.172–105.075 s and 17.436–19.115 s. Compilers were running on the
+shared development host; a profile of an independent build showed substantial
+native LSM compaction work. These times are not an isolated-host throughput
+claim, and longer numerical runs amortize preparation over more iterations.
+
+Lifecycle tests additionally cover HITS-to-PageRank/eigenvector adoption,
+producer cleanup and reopen, filter-set canonicalization, independent concurrent
+producers, generation pins, deleted filters/metrics, bounded crash-resumable
+reclamation, and rejection of retirement tasks targeting winning packed tiles.
+
+## Adaptive decoded-score joins
+
+Measured 2026-09-08 with
+`zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --score-join-only`.
+The fixture borrows one decoded 1,024-row block and verifies exact results for
+each candidate count. Six samples, first discarded, 4,096 repetitions per sample:
+
+| Candidate rows | Binary reference | Adaptive join | Improvement |
+| --- | ---: | ---: | ---: |
+| 1 | 75 ns | 75 ns | unchanged |
+| 16 | 431 ns | 434 ns | within 1% |
+| 256 | 16.425 µs | 10.959 µs | 1.50× |
+| 1,024 | 84.884 µs | 21.394 µs | 3.97× |
+
+Sparse requests retain binary search; dense candidates merge against sorted
+scores. These timings exclude decoding, allocation, authentication and I/O.
+Separate parity tests include duplicate, missing and invalid row ordinals.
+
+## Shared admission, sparse work, and publication checkpoints
+
+Measured 2026-09-08 on the same host/toolchain with
+`zig build -Doptimize=ReleaseFast graph-metric-preparation-bench --summary all`.
+One warmup and five measured samples; medians below. Development tests were
+running on this shared host. These are bounded phase measurements, not promises
+about whole-build, HTTP, or cloud-network latency.
+
+| Fixture | Reference | Current | Durable work / admission |
+| --- | ---: | ---: | --- |
+| Publish 8,192 scores, real default storage | 423.880 ms | 96.506 ms | 128 → 2 score/staging/cursor commits |
+| 100 sequential 80-entry routing working sets | 0.968 ms | 0.226 ms | 8,000 → 80 cache fills |
+
+Publication compares 64-node and 4,096-node batches using the same current
+producer helper. IDs are short, so the 1 MiB node-ID budget does not truncate
+either case. Each sample opens fresh storage. Timing includes ordered staging,
+primary scores, checkpoint cursor commits, and full primary-score verification;
+it excludes numerical computation, worker page fencing, and final top-K merging.
+Ranges were 419.238–430.928 ms and 95.571–97.751 ms. Actual production batches
+also stop at their partition boundary or byte allowance; the fixture is not an
+end-to-end 64× speedup claim.
+
+The routing fixture uses the production cache and equal-size 4 KiB payloads.
+A 64-entry-equivalent byte limit models the previous residency ceiling; the
+current case allows 1 MiB. Leases are released sequentially. It allocates/fills
+owned cache entries but excludes codec decoding, network I/O, and query planning.
+Allocation count falls from 16,000 to 160, cumulative allocated bytes from
+34,688,000 to 346,880. Tracked peak rises from 281,840 to 346,880 bytes because the
+whole working set is retained, still below the allowance. Fixed inline cache
+buckets are not heap allocations and are excluded from those byte figures.
+Ranges were 0.944–0.987 ms and 0.222–0.227 ms. Separate regression tests retain all
+80 leases simultaneously and exercise page-vs-metadata eviction under pressure.
+
+The sparse stateful regression has 4,097 dictionary nodes but only three metric
+members in two original leaves. Each later node phase now schedules two data
+pages instead of 65; normalization schedules two leaves instead of 65. Empty
+iteration-zero node pages receive no worker attempt. The test reopens at iteration
+one and compares PageRank, eigenvector, and paired HITS output against the numeric
+oracle. These are asserted work counts, not a timing benchmark. Original ordinal
+identities remain unchanged.
+
+The sealed-vector gather fixture still fetches only 128 storage chunks across
+256 checkpoints (reference: 32,768). Its median is 16.888 ms, with 604,180 tracked
+peak bytes. Cache entries and bucket allocations now draw from a shared 64 MiB
+process pool, rather than multiplying a full allowance by every populated index.
+Failure-injection and retirement tests verify that optional admission failures
+and retired metrics release their charged bytes.
+
+## Shared point planning and checkpoint-local folds
+
+Same host/toolchain, one warmup and five samples, using the production helpers:
+
+| Phase / scenario | Allocating reference median | Current median | Tracked heap peak, before → after |
+| --- | ---: | ---: | ---: |
+| Warm ordinal fold, 4,096 tiles / 1,048,576 edge visits | 7.496 ms | 6.230 ms | 12,288 → 0 bytes |
+| Point row planning, 100,000 common-prefix IDs / 1 column | 17.537 ms | 3.622 ms | 1,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 common-prefix IDs / 16 columns | 290.126 ms | 8.552 ms | 25,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 hashed IDs / 1 column | 4.178 ms | 2.517 ms | 1,600,000 → 1,200,000 bytes |
+| Point row planning, 100,000 hashed IDs / 16 columns | 70.889 ms | 4.672 ms | 25,600,000 → 1,200,000 bytes |
+
+The fold fixture repeats a 256-edge tile with a warm source-vector chunk and
+one target accumulator. Both paths perform the same compensated addition order
+and return exactly equal sums. The reference owns decoded edges, source slots,
+gathered ranks and contribution rows, using the same topology validation as the
+borrowed path. Current execution also replaces per-edge target hash lookups with
+a bounded chunk-local slot table. Across these edge visits, 16,384 allocations
+and 50,331,648 cumulative allocated bytes become zero. Fixed stack scratch and
+fixture/cache residency are **not** zero memory: fixture allocations are excluded
+from tracking, while constant fixture setup is included in wall time. Storage
+reads, cold cache fills, checkpoint commits and whole-build execution are excluded.
+Measured ranges were 7.360–8.155 ms versus 6.011–6.528 ms.
+
+Point fixtures use 391 routing blocks, deterministic permuted row order, and
+either 30-byte collection-prefixed IDs or 16-byte hashed hexadecimal IDs. Each
+path verifies the same row/block checksum. The reference retains every column's
+16-byte row map. The new path admits 8-byte transient comparison keys plus one
+4-byte shared permutation; the keys are freed before column preparation, leaving
+only 400,000 bytes of row-mapping ownership regardless of column count. It uses
+two allocations versus one per reference column. Integer prefix keys improve
+both tested single-column cases; sorting full strings alone regressed hashed
+single-column IDs and was not retained.
+
+These are **sequential row-planning phase** measurements, not parallel column
+execution or end-to-end query latency. They exclude output cells, control/routing
+ownership, materialized block spans, score decoding, cache and network work.
+Common-prefix single-column ranges were 17.273–18.224 ms versus 3.580–4.352 ms;
+16-column ranges were 282.258–295.582 ms versus 8.319–8.814 ms. Hashed-ID ranges
+were 4.078–4.624 ms versus 2.495–2.569 ms and 70.246–73.654 ms versus
+4.133–4.898 ms. Sparse candidates, duplicate IDs, key lengths and shared-prefix
+collisions change the balance; no universal speedup is claimed.
+
+## Initialization and query ownership follow-up
+
+Same host/toolchain, one warmup and five measured samples:
+
+| Phase / scenario | Reference or cold median | New or warm median | Allocations, before → after |
+| --- | ---: | ---: | ---: |
+| Membership discovery, 64 nodes / 16,384 producer partials | 2.063 ms | 0.069 ms | 16,398 → 90 |
+| 64 authenticated 64-KiB disk hits versus warm memory leases | 5.838 ms | 0.009 ms | 64 → 0 request-payload allocations |
+| Top-K response conversion, 10,000 IDs of 4,096 bytes | 3.169 ms | 0.021 ms | 10,001 → 1 |
+
+The membership reader is now used by vector initialization as well as iterations,
+convergence and publication. This measures discovery and dictionary validation,
+not a whole initializer, vector writes or a complete build. Maximum fan-in is a
+deliberate stress case; fewer producer duplicates reduce the benefit.
+
+Cache measurements use warm filesystem data in both cases. The cold-memory case
+includes verification and promotion; clearing memory between lookups is excluded.
+It is a cache-state comparison, **not an exact pre-change implementation**.
+Allocation tracking covers request payloads, excluding cache-owned allocations.
+Disk-hit times ranged 5.817–5.887 ms; warm leases ranged 0.006–0.010 ms across 64
+lookups. Network and score decoding are excluded. A regression also verifies that
+a warm leased hit succeeds with an allocator that rejects every allocation.
+
+Response-conversion peak includes the still-resident input: 82,400,000 bytes for
+copying versus 41,440,000 for ownership transfer. New cumulative allocation falls
+from 41,200,000 to 240,000 bytes. Copy times ranged 1.227–3.237 ms, transfer times
+0.019–0.022 ms. Input construction, cleanup, fetching and JSON serialization are
+excluded. Long IDs stress the ownership boundary; ordinary shorter IDs benefit
+less. These are phase measurements, not end-to-end latency guarantees.
+
+## Sealed membership and output admission (initial measurements)
+
+Additional measurements on the same host/toolchain (one warmup, five samples):
+
+| Phase | Former path median | Current median | Allocations, before → after |
+| --- | ---: | ---: | ---: |
+| Canonical membership read, 64 nodes / 16,384 producer partials | 1.962 ms | 0.061 ms | 16,398 → 90 |
+| Exhausted output quota, 50,000 nodes / 400,000 edges | 10.302 ms | 6.448 ms | 34 → 20 |
+
+Membership uses real default storage and the same ordered dictionary validation
+in both paths. It includes transaction and output ownership, but excludes fixture
+writes and numerical folds. The fixture deliberately exercises maximum producer
+fan-in: speedups will be smaller with fewer duplicate producer rows. Cumulative
+allocation fell from 216,797 to 6,259 bytes; tracked peak increased slightly from
+2,774 to 3,192 bytes. Times ranged 1.958–2.031 ms versus 0.060–0.063 ms.
+
+Output rejection includes one source and projection preparation in both paths.
+The reference computes and encodes PageRank before rejecting an exhausted output
+quota; production rejects before numerical allocation or encoding. The symmetric
+degree-eight ring can converge early (maximum three iterations); this does not
+claim savings for three complete iterations. Cumulative allocation fell from
+19,553,871 to 16,306,596 bytes, while peak remained 12,906,304 bytes because shared
+preparation dominates. Times ranged 10.264–10.342 ms versus 6.437–6.481 ms.
+Fetch, upload, rejection-sidecar encoding and cloud latency are excluded.
+
+Metadata-tail skipping is checked as an operation-count regression: encountering
+the metadata namespace issues one range seek regardless of the number of metric
+records. No wall-clock speedup is claimed for that regression.
+
+Run from `zig/`:
+
+```sh
+zig build -Doptimize=ReleaseFast graph-metric-preparation-bench --summary all > /tmp/graph-metric-bench.jsonl 2> /tmp/graph-metric-bench-build.log
+```
+
+The executable emits JSONL including min/max time, allocation count, cumulative
+allocated bytes, tracked peak bytes, and workload dimensions. Separate stdout
+and stderr preserve the machine-readable measurements.
+
+## Serverless topology preparation
+
+Fixtures are directed degree-eight rings with 48-byte document IDs and one edge
+type. Both paths consume the **same current v3 payload**. The reference decodes
+owned adjacency strings, discards inbound edges, then compiles through string
+hash maps. Production reads borrowed ordinal views directly. Fixture memory,
+input payload residency, fetch, encoding, projection and numerical kernels are
+excluded from this timed/tracked phase.
+
+| Nodes / outbound edges | Reference median | Packed median | Reference peak | Packed peak |
+| --- | ---: | ---: | ---: | ---: |
+| 2,000 / 16,000 | 1.580 ms | 0.163 ms | 3,668,016 B | 380,051 B |
+| 20,000 / 160,000 | 41.258 ms | 1.484 ms | 36,680,016 B | 3,800,051 B |
+| 50,000 / 400,000 | 121.782 ms | 3.498 ms | 91,700,016 B | 9,500,051 B |
+
+At the largest size, preparation was about 35x faster and tracked peak
+allocation was 9.65x smaller. Allocations fell from 1,750,046 to 11. Reference
+time ranged 98.056–133.335 ms, packed time 3.474–3.617 ms.
+
+The v3 payload was 16,100,033 bytes versus 61,500,014 bytes for the exact size of
+the former string-repeating v2 layout: 73.8% smaller on this fixture. The
+benchmark computes the old size formula; it does not retain a legacy codec.
+Short identifiers, low-degree graphs, or many distinct edge types will have
+different compression ratios.
+
+## Non-serverless snapshot score reader
+
+Fixtures request four distinct metrics over 20,000 rows. The reference recreates
+the former bounded sorted-key reader with a per-batch key arena and complete
+key construction per logical score. Production reuses encoded prefixes and a
+key slab, and deduplicates physical rows. A synchronous mock transaction checks
+key ordering and hashes keys; it does **not** model LSM/LMDB latency. Every output
+cell is checked outside timing. Input fixtures and output arrays are excluded
+from allocation tracking.
+
+| Rows | Reference median | Physical reader median | Storage keys, before → after | Allocations, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| All unique | 6.593 ms | 5.358 ms | 80,000 → 80,000 | 4,625 → 6 |
+| Each node repeated twice | 7.180 ms | 3.916 ms | 80,000 → 40,000 | 4,625 → 7 |
+
+The unique-row case reduced median reader CPU time by 18.7%, cumulative allocations
+from 13,421,150 to 715,200 bytes, and tracked peak from 838,608 to 715,200 bytes.
+The repeated-row case reduced median time by 45.5%, halved storage keys, and used
+795,200 peak bytes. Distinct logical aliases also share physical reads, covered
+by regression tests rather than included in this timing comparison.
+The unique-row production run included a 26.419 ms outlier (minimum 5.300 ms);
+the duplicate-row production range was 3.898–3.948 ms. Use repeated runs on an
+isolated host for latency guarantees, not these development-host samples.
+
+These are phase microbenchmarks, **not end-to-end query or PageRank speedups**.
+Production additionally pays for I/O, authentication, snapshot/status handling,
+output ownership and numerical work. Tests cover default non-serverless storage,
+durable ordinal jobs, serverless publication/query integration, cancellation,
+malformed input, allocation failures and alias ownership.
+
+## Admitted preparation and ordinal execution
+
+The following measurements were added with the bounded census, admission and
+compact-query changes, on the same host and toolchain. They exercise production
+functions against explicit former-path oracles, not alternate numerical kernels.
+
+| Phase | Former path median | Current path median | Scope |
+| --- | ---: | ---: | --- |
+| Exhausted serverless projection preparation | 26.469 ms | 3.204 ms | 50,000 nodes, 400,000 edges; 16 rejected group attempts |
+| Durable vector writer | 3.637 ms | 0.101 ms | 20,000 rows; synchronous mock storage |
+| One-node score snapshot during rebuild | 194 µs | 103 µs | Real default storage; 256 active scan pages |
+| 64-node score snapshot during rebuild | 638 µs | 553 µs | Same real-storage fixture |
+
+The rejected-preparation case includes one packed source preparation, then 16
+independent projection attempts against an exhausted work budget. The former
+oracle constructs each projection before rejecting; production rejects before
+projection allocations or census scans. This isolates admission ordering and
+does not include the publication grouping/cache, fetch, rejection encoding, or
+numerical kernel. Median time fell 87.9%; allocations fell from 123 to 11 and
+cumulative allocated bytes from 35,600,691 to 9,900,323. Peak stayed 9,500,051 bytes
+because the shared source preparation dominates it. This is not a claim that
+rejection can avoid preparing the source itself.
+
+The vector writer compares node-ID rows with rows already carrying their
+job-local ordinals. Both execute the production writer and validate output
+scores. Storage reads fell from 20,079 to 79, eliminating 20,000 dictionary point
+lookups; writes remained 79. Allocations fell from 137 to 8 and tracked peak from
+4,775,772 to 806,756 bytes. The roughly 36x writer CPU improvement excludes ordinal
+discovery, real storage latency, adjacency reads, and numerical iteration. The
+production reducer discovers ordinals with a canonical-node/dictionary range
+join; the benchmark does not claim an equivalent whole-PageRank speedup.
+
+The query fixture publishes degree scores over 4,096 nodes and 16,384 edges,
+then opens a real 256-page rebuild. Both paths include a read transaction and the
+same score reader; the reference builds operator status, while production reads
+only publication/freshness metadata. Validation and result freeing are outside
+timing. One-node median latency fell 46.9% (p95: 198 → 117 µs); 64-node median
+fell 13.3% (p95: 662 → 640 µs). These are storage-level snapshots, not HTTP latency.
+Runs overlapped development/test activity; rerun on an isolated host before
+setting latency guarantees.
+
+See [execution and resource ownership](../../docs/GRAPH_METRICS_EXECUTION.md)
+for the associated admission, checkpoint, and integrity contracts.
+
+## Staged stateful metric queries
+
+Run just this case with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -- --staged-only
+```
+
+The fixture seeds 16 published score columns in the default storage backend,
+with 100,000 distinct node IDs. One metric orders the top ten rows; all sixteen
+are projected. The eager reference loads every dependency before selection.
+The staged path uses the production snapshot reader and stage workspace. Both
+must return exactly the same selected ordinals and every projected score.
+
+Final local ReleaseFast rerun (six samples, first discarded):
+
+| Metric | Eager reference | Staged reads |
+| --- | ---: | ---: |
+| Logical score keys | 1,600,000 | 100,150 |
+| Median execution | 17.575 s | 1.101 s |
+| Tracked peak allocations | 29,233,056 B | 5,232,576 B |
+
+The timer includes snapshot acquisition, score reads, selection, validation and
+scratch cleanup. Fixture writes, traversal, response encoding and backend-owned
+allocations are excluded. These are warm-cache results on a shared development
+host with concurrent builds, not end-to-end latency guarantees. The reference
+and current paths use the same byte-bounded physical score reader. The measured
+work-count reduction is independent of host contention.
+
+The preceding full benchmark run measured 21.108 s and 1.085 s respectively;
+the difference between runs illustrates why the timing is a local measurement,
+not a service-level guarantee. Both runs reported the same key counts and peak
+allocation sizes.
+
+## Sparse projection and resource-bounded iterations
+
+ReleaseFast measurements on the same host/toolchain, with a prepared
+1,000,000-entry dictionary and two selected edges (two active endpoints).
+Each sample contains 256 repetitions; one warmup sample is discarded and the
+median of five samples is reported. The inactive dictionary entries are fixture
+placeholders; preparation, storage I/O, kernels and upload are excluded.
+
+| Projection | Source-wide scratch reference | Active-endpoint path | Peak scratch, reference → current |
+| --- | ---: | ---: | ---: |
+| Degree | 795.582 µs | 0.179 µs | 8,125,065 → 73 bytes |
+| PageRank | 830.437 µs | 0.218 µs | 4,125,097 → 89 bytes |
+
+Node-ID and CSR checksums must match in every repetition. The dense degree
+reference is the previous direct-count path; PageRank's reference retains the
+former projected-edge copy (only 16 bytes in this fixture). These are deliberately
+sparse phase measurements, not end-to-end speedups. Dense projections continue
+to use linear-time maps/counts rather than sorting every edge endpoint.
+Concurrent development builds were active; use isolated runs for latency
+guarantees. The allocation and output-parity checks do not depend on timing.
+
+Stateful iteration planning now eliminates later adjacency-producer pages
+entirely. With 256 edge partitions and 100 iterations this removes 25,344
+PageRank/eigenvector no-op page executions and at least 50,688 claim/completion
+commits; HITS removes twice those counts. This is a deterministic work-count
+comparison, not a measured storage-latency claim. Regression tests verify
+absence of later producer pages, immutable adjacency reuse, recovery, retries,
+publication barriers and numerical parity.
+
+Serverless regressions also enforce two resource oracles: an 8,192-score prior
+larger than 64 KiB can seed a sparse selection within a 64 KiB read/memory budget,
+while dense seeds read less than the whole artifact by omitting ranked payloads;
+and two concurrent requests for two cold routing pages perform exactly two
+decoded fills even with 63 of the 64 fill slots occupied. The latter checks
+shared lease identity and completion under fill-table saturation.
+
+## Ordinal ingestion and selected-type discovery
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+On Apple M4 Max / Zig 0.16.0, the following medians discard one warmup and
+retain five samples. Each ingestion fixture has 1,024 nodes and 65,536 edges;
+JSON parsing, construction and encoding are timed, input residency is excluded.
+Every output has identical encoded SHA-256 to the old string-expansion oracle.
+
+| Node ID bytes | String builder → ordinal builder | Peak allocated bytes | Allocation calls |
+| --- | ---: | ---: | ---: |
+| 16 | 23.250 → 17.474 ms | 11,276,518 → 6,228,850 | 438,315 → 162,863 |
+| 256 | 73.502 → 30.934 ms | 43,471,078 → 6,720,370 | 442,411 → 166,959 |
+
+The stateful fixture uses the default durable LSM, 65,536 edges and 16
+relationship types. Selecting one type visits 4,096 postings instead of 65,536
+reverse edges: 0.640 ms versus 14.110 ms. Selected identity checksums match.
+This measures discovery only, excluding writes, migration, and numerical work.
+The covering index adds one empty-value identity key per edge and its write/
+storage cost; existing indexes pay one bounded backfill. These are local phase
+measurements on a shared development host, not end-to-end latency guarantees.
+
+### Direct packing, filter-local census and semantic metric reuse
+
+The same `--indexing-only` command now also measures cold durable partition
+planning and a weight-only PageRank republish. The following ReleaseFast rerun
+uses Apple M4 Max / Zig 0.16.0, six samples with the first discarded. Other
+development builds were active; timings are observations, not latency guarantees.
+
+| Case | Reference | Current | Deterministic check |
+| --- | ---: | ---: | --- |
+| Parse/build/encode, 16-byte IDs | 24.675 ms | 15.639 ms | Identical encoded SHA-256 |
+| Parse/build/encode, 256-byte IDs | 81.795 ms | 28.786 ms | Identical encoded SHA-256 |
+| Selected edge discovery | 14.362 ms | 0.642 ms | Same 4,096 edge identities; 65,536 → 4,096 visits |
+| Cold partition census | 254.022 ms | 87.298 ms | 17 → 3 checkpoint steps; exact selected edge/node totals |
+| Weight-only PageRank republish | 4.418 ms | 3.067 ms | Exactly equal scores; 2,362,369 → 0 projection/kernel work units |
+
+Packing uses the old string builder as the reference. Current peak allocations
+are 3,631,986 and 4,123,506 bytes, versus the reference's 11,276,518 and
+43,471,078 bytes. Compared with the preceding ordinal builder's measured
+6,228,850 and 6,720,370 bytes, direct count/scatter packing removes 2,596,864
+bytes in either fixture. That allocation comparison is deterministic; the
+preceding run's CPU timings are not a controlled incremental comparison.
+
+The census reference is the former whole-graph planning prerequisite, not a
+different algorithm computing a selected plan. Both use the default durable LSM;
+timing includes clearing the old plan and committing all counts, boundaries and
+checkpoints, but excludes fixture ingestion and numerical execution. The selected
+plan has 4,096 edges and 1,024 distinct endpoints, independent of unrelated types.
+The v2 index adds one reference-counted membership record per (type, endpoint),
+with two incidence updates per changed edge in addition to the edge posting.
+This fixture has 16,384 such records. Write/storage amplification is a deliberate
+tradeoff, shared across all metric filters; this benchmark does not measure its
+ingestion cost or the initial backfill.
+
+The republish fixture has 1,024 nodes, 65,536 edges, a high-degree hub and repeated
+edges, with a 30-iteration PageRank cap. Only weights change. Its timer includes
+authenticated cached-source reads, topology preparation, semantic hashing and
+publication; graph construction and post-run score validation are outside it.
+Peak tracked allocations remain 2,755,027 bytes in both cases because source
+preparation dominates the peak. Artifact-store-owned memory is outside that
+tracker. Semantic reuse removes projection/kernel/output work, but still reads
+and prepares a changed source graph; it does not claim a cold object-store I/O
+reduction. The reuse assertion also requires the exact prior metric artifact ID.
+
+## Ownership reads and adaptive type routing (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --filtered-prefix-only
+```
+
+Apple M4 Max, Zig 0.16.0, five samples after one warmup. Diagnostic before/after
+probes used ReleaseSafe, identical fixtures, and fresh readers without shared
+cache. The checked-in harness also validates exact result identities and work.
+
+| 100,000-edge hub / 64 types | Before GETs / bytes / inspected edges | After GETs / bytes / inspected edges |
+| --- | --- | --- |
+| Wildcard | 7 / 299,988 / 1 | 8 / 364,565 / 1 |
+| kind00 | 10 / 496,596 / 18 | 7 / 299,029 / 1 |
+| kind31 | 15 / 824,276 / 34 | 8 / 364,565 / 1 |
+| kind62 | 11 / 562,132 / 34 | 8 / 364,565 / 1 |
+| All 64 types | 7 / 299,988 / 1 | 8 / 364,565 / 1 |
+
+The sparse directory adds 528 payload bytes plus block-authentication overhead
+to this roughly 7.6 MB artifact. The kind31 probe's local median changed from
+0.392 to 0.229 ms. Cold wildcard/all-type queries pay one extra authenticated
+block read to resolve the indexed row descriptor; this is a deliberate tradeoff,
+not an across-the-board latency claim. No network RTT is modeled. Both
+directions, high-entropy fallback, eager reads, output admission, allocation
+failure, canonical round trips and directory corruption have regression tests.
+Reservation is at most 8 bytes per 16 row edges plus a 16-byte descriptor per
+qualifying row. Encoding fills that reservation during its existing validation
+pass; there is no additional graph-wide edge array or payload copy.
+
+For stateful ownership exclusion, an empty incoming query at the first of
+65,536 target rows changed from 24.053 to 6.624 ms, matching the last target's
+6.693 ms. At 4,096 and 16,384 rows it changed from 1.724/5.637 ms to
+0.442/1.630 ms. The LSM-memory fixture still incurs graph-size-dependent
+snapshot/cursor setup; the graph visibility layer now stops at its physical
+prefix rather than seeking through every later excluded target.
+
+Operational counts now use maintained counters and a pending flag, with zero
+allocation and no traversal. The previous exact status scan took 1.206/4.861/
+19.212 ms at 4,096/16,384/65,536 retained edges and exhausted an 8 KiB allocator
+during retirement. Exact diagnostic scans remain available, but are no longer
+used by operational status, live replay snapshots or cached status refresh.
+## Shared graph-impact planning (2026-09-11)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --graph-impact-only`.
+M4 Max, Zig 0.16; median of five samples after one warmup. This compares repeated
+per-alias calls with one shared result using the **same bounded comparator**;
+it is not an end-to-end before/after publisher benchmark. The source document's
+text changes while its 16,384 graph edges remain unchanged. Document loading,
+WAL IO, encoding and object publication are excluded.
+
+| Aliases | Repeated comparisons | Shared comparison | Total allocation traffic, repeated / shared |
+|---:|---:|---:|---:|
+| 1 | 7.254 ms | 7.233 ms | 22.8 / 22.8 MB |
+| 8 | 57.368 ms | 7.627 ms | 182.1 / 22.8 MB |
+| 32 | 237.413 ms | 7.351 ms | 728.4 / 22.8 MB |
+
+Peak scratch remains 11.0 MB in both modes; sharing removes repeated work and
+allocation traffic, not the peak of one comparison. The companion cardinality
+regression verifies every retry deadline survives three polling passes at 65,
+128 and 4,096 rejected namespaces and that deleted entries are reclaimed.
+
+## Immutable page-tree update prototype
+
+Run the normalized graph-plan and copy-on-write storage benchmark with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --page-updates-only
+```
+
+The initial fixture is a chain with one outgoing edge per source document.
+One middle source is redirected to the first node. Each sample starts from the
+same pinned root with a cold operation-local cache; the first of six samples is
+discarded. Stored object payloads and fixture inputs are outside operation memory
+accounting. These are in-memory artifact transport measurements, not remote
+storage latency or complete serverless publication timings. Document parsing,
+numerical metric recomputation and manifest HEAD CAS are excluded.
+
+| Source edges | Initial tree bytes written | Update bytes written | GETs / PUTs | Peak operation bytes | Median update |
+|---:|---:|---:|---:|---:|---:|
+| 1,024 | 206,732 | 173,950 | 9 / 7 | 392,370 | 0.613 ms |
+| 16,384 | 3,278,554 | 141,306 | 7 / 6 | 355,665 | 0.386 ms |
+| 131,072 | 25,756,046 | 225,740 | 11 / 9 | 415,355 | 0.489 ms |
+
+The update grows with touched paths rather than total source edges. At the
+largest fixture it writes about 0.88% of initial tree construction bytes. This
+is not a comparison against the packed artifact's size or an end-to-end speedup.
+The small fixture also exposes fixed page-write overhead; page sizing and
+compression still need evaluation before the production cutover. This benchmark
+does not yet include supernode replacement, remote latency, or initial-build
+peak admission. The rerun includes namespace-domain page headers and overlapped
+local builds; latency is not an isolated-host guarantee. See
+`docs/GRAPH_METRICS_EXECUTION.md` for integration status.

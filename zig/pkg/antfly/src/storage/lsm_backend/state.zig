@@ -397,8 +397,7 @@ pub const State = struct {
         self.frozen_memory_bytes = null;
         try self.ensureFlat(allocator);
         if (self.entries.items.len == 0) {
-            try self.entries.ensureUnusedCapacity(allocator, 1);
-            self.entries.appendAssumeCapacity(try initEntry(allocator, namespace, key, value, tombstone));
+            try self.appendNew(allocator, namespace, key, value, tombstone);
             return;
         }
 
@@ -406,14 +405,18 @@ pub const State = struct {
         const last = self.entries.items[last_idx];
         switch (compareEntryTo(last, namespace, key)) {
             .lt => {
-                try self.entries.ensureUnusedCapacity(allocator, 1);
-                self.entries.appendAssumeCapacity(try initEntry(allocator, namespace, key, value, tombstone));
+                try self.appendNew(allocator, namespace, key, value, tombstone);
             },
             .eq => {
                 try replaceEntryValueCopy(&self.entries.items[last_idx], allocator, value, tombstone, false);
             },
             .gt => try self.upsert(allocator, namespace, key, value, tombstone),
         }
+    }
+
+    fn appendNew(self: *State, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8, tombstone: bool) !void {
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        self.entries.appendAssumeCapacity(try initEntry(allocator, namespace, key, value, tombstone));
     }
 
     pub fn upsertMove(self: *State, allocator: Allocator, entry: OwnedEntry) !void {
@@ -843,6 +846,22 @@ pub fn initEntry(
         .value_from_arena = false,
         .tombstone = tombstone,
     };
+}
+
+test "lsm state entry construction insertion and cloning unwind allocation failures" {
+    const Runner = struct {
+        fn run(allocator: Allocator) !void {
+            var state = State{};
+            defer state.deinit(allocator);
+            try state.appendUpsert(allocator, .{ .name = "docs" }, "a", "A", false);
+            try state.appendUpsert(allocator, .{ .name = "docs" }, "c", "C", false);
+            try state.upsert(allocator, .{ .name = "docs" }, "b", "B", false);
+            var cloned = try state.clone(allocator);
+            defer cloned.deinit(allocator);
+            try std.testing.expectEqualStrings("B", try cloned.get(.{ .name = "docs" }, "b"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 pub fn initArenaEntry(
