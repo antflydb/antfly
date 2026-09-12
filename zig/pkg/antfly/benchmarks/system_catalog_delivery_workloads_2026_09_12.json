@@ -1090,7 +1090,7 @@
   },
   "validation_limitations": [
     "Focused checks, not a full repository suite.",
-    "Raft Debug passes all 409 tests. ReleaseFast has six joint-consensus trace fixture failures also reproduced on pristine baseline; 403 other tests pass."
+    "At the benchmark revision, Raft Debug passed all 409 tests and ReleaseFast passed 403, with six joint-consensus trace failures also reproduced on pristine baseline. Resolved by the harness-only validation follow-up recorded below."
   ],
   "validation": {
     "catalog_store": 73,
@@ -1115,5 +1115,23 @@
     "retry": "zig build retry-bench -Doptimize=ReleaseFast -j1 (from zig/lib/raft; baseline compiled with same bench/retries.zig and pristine fd4745718 library sources)",
     "relational": "uv run --project e2e/antfly python tools/benchmark_system_catalog.py --scenario catalog --deployment standalone --storage-mode relational --table-counts 10 --samples 9 --warmup 2 --output /tmp/catalog-relational.json",
     "management": "uv run --project e2e/antfly python tools/benchmark_system_catalog.py --scenario management --deployment standalone --tenant-counts 10 --restart-after-ddl --samples 9 --warmup 2 --output /tmp/catalog-management.json"
+  },
+  "validation_follow_up": {
+    "source_commit": "c5a91d4af95f933e3d0c9fb37df541aafdc807a1",
+    "scope": "Simulation harness membership ownership and Ready message publication ordering; production code and benchmark measurements unchanged.",
+    "resolved_trace_failures": 6,
+    "raft_tests_passed": {
+      "Debug": 410,
+      "ReleaseSafe": 410,
+      "ReleaseFast": 410
+    },
+    "unchanged_traces_matched_etcd_raft_v3_6_0": 6,
+    "regression": "Both configuration-change formats retain exactly two messages. Old Debug retained four; old ReleaseFast retained one.",
+    "commands": [
+      "zig build test -Doptimize=Debug --summary all (from zig/lib/raft)",
+      "zig build test -Doptimize=ReleaseSafe --summary all (from zig/lib/raft)",
+      "zig build test -Doptimize=ReleaseFast --summary all (from zig/lib/raft)",
+      "go run . -trace ../../src/testing/testdata/<fixture>.json (from zig/lib/raft/tools/tracecmp, for each of the six affected fixtures)"
+    ]
   }
 }

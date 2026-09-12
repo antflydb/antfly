@@ -1241,7 +1241,23 @@ and filtered PageRank. Go SDK packages, 16 Rust tests, 14 Python response tests,
 checks passed. The checked-in scheduler benchmark retains module reachability
 anchors so its workload actually executes.
 
-Raft Debug passed all 409 tests. ReleaseFast passed 403, with six joint-consensus
-trace fixtures failing identically on a pristine baseline reproduction. Those
-optimized fixture failures remain unresolved and are not catalog regressions.
-These are focused checks, not a full repository-suite pass.
+At the benchmark revision, Raft Debug passed all 409 tests and ReleaseFast passed
+403, with six joint-consensus trace failures also reproduced on a pristine
+baseline. The follow-up below resolves those failures. These are focused checks,
+not a full repository-suite pass.
+
+### Raft simulation fixture resolution
+
+Follow-up commit `c5a91d4af` fixes two interacting simulation harness bugs. Applying
+a membership change freed the borrowed previous membership before routing cleanup
+used it. The harness now owns that membership until cleanup finishes. It also
+clones the current Ready message batch before applying membership changes, then
+publishes it after cleanup, matching the etcd/raft reference replay. This preserves
+the final commit notification to a removed peer while dropping older queued
+traffic. Production consensus and transport code are unchanged.
+
+A regression covers both configuration-change formats. Against the old harness,
+Debug retains four messages and ReleaseFast retains one, where two are required.
+With the fix, all 410 Raft tests pass in Debug, ReleaseSafe and ReleaseFast. All six
+unchanged differential traces also match the etcd/raft v3.6.0 reference runner.
+These harness-only changes do not alter the benchmark measurements above.
