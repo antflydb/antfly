@@ -52,15 +52,15 @@ jobs:
       shard_artifact: ${{ inputs.diagnostic_shard }}
       trace_name: ${{ inputs.diagnostic_trace }}
 
-  build:
+  # Cold qualification and runner compilation have independent job budgets.
+  # Dedicated cache variables keep setup actions from replacing these paths.
+  qualify:
     if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
-    outputs:
-      binary_sha256: ${{ steps.binary.outputs.sha256 }}
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-qualify
+      VOPR_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,7 +78,33 @@ jobs:
         run: python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
-        run: zig build antfly-raft-transport-test vopr-runtime-test vopr-determinism-audit -Doptimize=ReleaseSafe -j1 --summary all
+        run: |
+          zig build antfly-raft-transport-test vopr-runtime-test vopr-determinism-audit \
+            -Doptimize=ReleaseSafe -j1 --summary all \
+            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+
+  build:
+    if: inputs.diagnostic_run == ''
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    outputs:
+      binary_sha256: ${{ steps.binary.outputs.sha256 }}
+    env:
+      VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-build
+      VOPR_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -88,7 +114,9 @@ jobs:
       - name: Build campaign runner
         if: steps.runner_cache.outputs.cache-hit != 'true'
         working-directory: zig
-        run: zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all
+        run: |
+          zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all \
+            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Restore executable
         if: steps.runner_cache.outputs.cache-hit == 'true'
         run: |
@@ -132,7 +160,7 @@ jobs:
           overwrite: true
 
   campaign:
-    needs: build
+    needs: [build, qualify]
     if: inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 300
@@ -226,8 +254,8 @@ jobs:
           if-no-files-found: error
 
   corpus:
-    needs: [build, campaign]
-    if: always() && needs.build.result == 'success' && inputs.qualification_only != true
+    needs: [build, qualify, campaign]
+    if: always() && needs.build.result == 'success' && needs.qualify.result == 'success' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 180
     strategy:
