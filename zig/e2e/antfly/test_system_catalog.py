@@ -585,3 +585,28 @@ def test_catalog_relational_rows_keep_scope_and_identity_after_rename(stateful_a
     api.delete(destination)
     api.delete(f"/databases/{renamed}")
     api.delete(f"/tables/{literal}")
+
+
+def test_catalog_mutation_results_keep_resource_and_binding_identities(stateful_api):
+    api = stateful_api
+    suffix = uuid.uuid4().hex[:12]
+    database, space = "receipt_" + suffix, "space_" + suffix
+    first = api.post(f"/databases/{database}", {})
+    namespace = api.post(f"/databases/{database}/namespaces/reports", {})
+    tablespace = api.post(f"/tablespaces/{space}", {})
+    bound = api.put(
+        f"/databases/{database}/namespaces/reports/tablespace",
+        {"tablespace_name": space},
+    )
+    assert bound["namespace_id"] == namespace["namespace_id"]
+    assert bound["database_id"] == first["database_id"]
+    assert bound["database_name"] == database
+    assert bound["tablespace_name"] == tablespace["name"]
+    api.delete(f"/databases/{database}/namespaces/reports")
+    replacement_namespace = api.post(f"/databases/{database}/namespaces/reports", {})
+    assert replacement_namespace["namespace_id"] != namespace["namespace_id"]
+    api.delete(f"/databases/{database}")
+    replacement = api.post(f"/databases/{database}", {})
+    assert replacement["database_id"] != first["database_id"]
+    api.delete(f"/databases/{database}")
+    api.delete(f"/tablespaces/{space}")

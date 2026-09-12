@@ -7726,18 +7726,11 @@ pub const MetadataHttpService = struct {
         }
         self.unlockRuntime();
         runtime_locked = false;
-        // Only reporting stores need mutable observations. Retained immutable
-        // leaves keep the captured records alive while the lock is released.
+        // Immutable leaves remain pinned across admission. Only accepted
+        // replacements allocate report payloads.
         const projected = try self.alloc.alloc(metadata_table_manager.StoreRecord, leases.items.len);
-        var initialized: usize = 0;
-        defer {
-            for (projected[0..initialized]) |record| metadata_table_manager.freeStore(self.alloc, record);
-            self.alloc.free(projected);
-        }
-        for (leases.items, 0..) |lease, i| {
-            projected[i] = try metadata_table_manager.cloneStore(self.alloc, lease.record);
-            initialized += 1;
-        }
+        defer self.alloc.free(projected);
+        for (leases.items, projected) |lease, *record| record.* = lease.record;
         return try reportStoreStatusesWithCapabilities(self, projected, reports, capabilities);
     }
 
@@ -11197,9 +11190,10 @@ test "metadata service projects optional activity without freezing older status"
         metadata_table_manager.native_generation_restore_protocol_version,
         service.proposed_native_restore_version,
     );
-    // Durable projection is scrubbed; the real services retain activity only
-    // in their TTL-bound heartbeat cache.
-    try std.testing.expect(!storeHasRuntimeEmbeddingActivity(projected[0]));
+    // Admission scrubs the owned proposal while leaving its borrowed input
+    // untouched. Real services retain activity in the TTL-bound cache.
+    try std.testing.expect(storeHasRuntimeEmbeddingActivity(projected[0]));
+    try std.testing.expectEqual(@as(u64, 100), projected[0].capacity_bytes);
 }
 
 test "metadata service activity cache is versioned TTL-bound and incarnation scoped" {
@@ -12624,6 +12618,17 @@ fn reportStoreStatusesWithCapabilities(
     reports: []const metadata_table_manager.StoreStatusReport,
     capabilities: StoreCapabilities,
 ) !usize {
+    const candidates = try service.alloc.dupe(metadata_table_manager.StoreRecord, projected);
+    defer service.alloc.free(candidates);
+    const changed = try service.alloc.alloc(bool, projected.len);
+    @memset(changed, false);
+    defer {
+        for (candidates, changed) |record, owned| if (owned) metadata_table_manager.freeStore(service.alloc, record);
+        service.alloc.free(changed);
+    }
+    var positions: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer positions.deinit(service.alloc);
+    for (candidates, 0..) |record, i| try positions.put(service.alloc, record.store_id, i);
     // Durable admission facts use the positional V15 profile; native vector
     // projection and authority use framed V17 and may never be stripped.
     // Runtime embedding activity remains a volatile heartbeat overlay.
@@ -12662,8 +12667,6 @@ fn reportStoreStatusesWithCapabilities(
             supported_version,
             metadata_runtime_status_protocol.positional_record_version,
         );
-    var changed_indices = std.ArrayListUnmanaged(usize).empty;
-    defer changed_indices.deinit(service.alloc);
     for (reports) |report| {
         if (!metadata_table_manager.reporterFenceValid(
             report.reporter_incarnation,
@@ -12678,24 +12681,16 @@ fn reportStoreStatusesWithCapabilities(
             report.embedding_activity_protocol_version,
             report.runtime_statuses,
         )) return error.InvalidStoreReporterFence;
-        const index = metadata_store_observer.findStoreIndex(projected, report.store_id) orelse return error.UnknownStore;
-        if (!try metadata_store_observer.observationChangesRecordWithRepairStatus(
-            service.alloc,
-            projected[index],
-            report,
-            include_repair_status,
-        )) continue;
-        try changed_indices.append(service.alloc, index);
+        const index = positions.get(report.store_id) orelse return error.UnknownStore;
+        if (try metadata_store_observer.admitObservation(service.alloc, candidates[index], report, include_repair_status)) |replacement| {
+            if (changed[index]) metadata_table_manager.freeStore(service.alloc, candidates[index]);
+            candidates[index] = replacement;
+            changed[index] = true;
+        }
     }
 
-    const applied = try metadata_store_observer.applyObservationsOwnedWithRepairStatus(
-        service.alloc,
-        projected,
-        reports,
-        include_repair_status,
-    );
-    for (changed_indices.items) |index| {
-        const record = projected[index];
+    for (candidates, changed) |record, was_changed| {
+        if (!was_changed) continue;
         // Never feed a preserved committed fact through a lower-version
         // proposal boundary. The heartbeat is retried after the background
         // capability probe or durable activation marker becomes visible.
@@ -12716,7 +12711,7 @@ fn reportStoreStatusesWithCapabilities(
     if (comptime @hasField(@TypeOf(service.*), "embedding_activity_cache")) {
         service.embedding_activity_cache.update(
             service.alloc,
-            projected,
+            candidates,
             reports,
             platform_time.monotonicNs(),
         ) catch |err| {
@@ -12726,7 +12721,7 @@ fn reportStoreStatusesWithCapabilities(
             std.log.warn("embedding activity cache update skipped err={s}", .{@errorName(err)});
         };
     }
-    return applied;
+    return reports.len;
 }
 
 fn collectExplicitLocalStoreStatusReports(
@@ -19655,4 +19650,85 @@ test "metadata service store report workload benchmark selected admission" {
             std.debug.print("ADMISSION_CACHE_BENCH stores={d} groups_per_store=100 selected={} p50_ms={d:.6}\n", .{ count, selected, @as(f64, @floatFromInt(elapsed[4])) / 1e6 });
         }
     }
+}
+
+test "metadata service store report workload benchmark selected admission end to end" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const Fake = struct {
+        alloc: std.mem.Allocator,
+        upserts: usize = 0,
+        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+            return true;
+        }
+        fn upsertStore(self: *@This(), _: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+        }
+    };
+    const backing = std.heap.c_allocator;
+    for ([_]usize{ 100, 1000, 10000 }) |count| {
+        var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "text", .kind = "full_text", .lifecycle_work_class = .repair, .repair_status = .waiting }};
+        const runtimes = try backing.alloc(metadata_table_manager.RuntimeGroupStatusReport, count);
+        defer backing.free(runtimes);
+        for (runtimes, 0..) |*runtime, i| runtime.* = .{ .table_id = 1, .table_name = "tenant_events", .group_id = i + 1, .store_id = 20, .node_id = 30, .indexes = &indexes };
+        const observed = try backing.dupe(metadata_table_manager.RuntimeGroupStatusReport, runtimes);
+        defer backing.free(observed);
+        const prior: metadata_table_manager.StoreRecord = .{ .store_id = 20, .node_id = 30, .runtime_statuses = runtimes };
+        var projected = [_]metadata_table_manager.StoreRecord{prior};
+        const capabilities = StoreCapabilities.fromStores(&projected);
+        for ([_]bool{ false, true }) |changed_header| {
+            const report: metadata_table_manager.StoreStatusReport = .{ .store_id = 20, .runtime_statuses = observed, .capacity_bytes = if (changed_header) 99 else 0 };
+            for ([_]bool{ false, true }) |single_pass| {
+                var elapsed: [9]u64 = undefined;
+                var allocations: usize = 0;
+                for (&elapsed) |*sample| {
+                    var counter = std.testing.FailingAllocator.init(backing, .{});
+                    const alloc = counter.allocator();
+                    const start = platform_time.monotonicNs();
+                    if (single_pass) {
+                        var service: Fake = .{ .alloc = alloc };
+                        _ = try reportStoreStatusesWithCapabilities(&service, &projected, &.{report}, capabilities);
+                        try std.testing.expectEqual(@as(usize, @intFromBool(changed_header)), service.upserts);
+                    } else {
+                        var owned = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, prior)};
+                        defer metadata_table_manager.freeStore(alloc, owned[0]);
+                        _ = try metadata_store_observer.observationChangesRecordWithRepairStatus(alloc, owned[0], report, true);
+                        _ = try metadata_store_observer.applyObservationsOwnedWithRepairStatus(alloc, &owned, &.{report}, true);
+                    }
+                    sample.* = platform_time.monotonicNs() - start;
+                    allocations = counter.allocations;
+                    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+                }
+                std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+                std.debug.print("ADMISSION_PLAN_BENCH groups={d} header_change={} single_pass={} p50_ms={d:.6} allocations={d}\n", .{ count, changed_header, single_pass, @as(f64, @floatFromInt(elapsed[4])) / 1e6, allocations });
+            }
+        }
+    }
+}
+
+test "metadata service repeated store reports fence sequential candidates and propose once" {
+    const Fake = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        upserts: usize = 0,
+        generation: u64 = 0,
+        capacity: u64 = 0,
+        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+            return true;
+        }
+        fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+            self.generation = record.status_generation;
+            self.capacity = record.capacity_bytes;
+        }
+    };
+    var service: Fake = .{};
+    var projected = [_]metadata_table_manager.StoreRecord{.{ .store_id = 20, .node_id = 30, .reporter_incarnation = 1, .status_generation = 1 }};
+    const reports = [_]metadata_table_manager.StoreStatusReport{
+        .{ .store_id = 20, .reporter_incarnation = 1, .status_generation = 3, .capacity_bytes = 30 },
+        .{ .store_id = 20, .reporter_incarnation = 1, .status_generation = 2, .capacity_bytes = 20 },
+    };
+    try std.testing.expectEqual(@as(usize, 2), try reportStoreStatusesWithProjected(&service, &projected, &reports));
+    try std.testing.expectEqual(@as(usize, 1), service.upserts);
+    try std.testing.expectEqual(@as(u64, 3), service.generation);
+    try std.testing.expectEqual(@as(u64, 30), service.capacity);
+    try std.testing.expectEqual(@as(u64, 1), projected[0].status_generation);
 }

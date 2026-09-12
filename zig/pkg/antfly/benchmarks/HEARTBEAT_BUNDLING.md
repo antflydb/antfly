@@ -101,3 +101,13 @@ endpoint metadata isolation, encoded byte limits, group caps, message ordering,
 and read-context preservation. A request
 count reduction is insufficient if it increases hot-group tail latency or
 changes election behavior.
+
+Retry recovery and HTTP scheduling have separate reproducible targets:
+`zig build retry-bench -Doptimize=ReleaseFast` in `lib/raft`, and
+`ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=ReleaseFast`
+from `zig`. Retry draining compacts survivors in order in one pass. HTTP scheduling
+uses per-peer FIFO queues and a ready-peer list, with one in-flight request per peer
+and condition-variable wakeups. These tests retain byte/frame reservations across
+queued, in-flight and failed-completion states and cover route invalidation under
+backlog. Their timings exclude network latency; use the production capacity
+scenarios above to assess hot-group tails under real slow-peer behavior.

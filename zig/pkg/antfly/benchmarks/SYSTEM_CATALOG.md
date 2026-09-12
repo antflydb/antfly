@@ -265,3 +265,33 @@ same binary, including clone destruction. These component scenarios model a
 repair backlog and steady reporting beside growing unrelated tenant inventory;
 they exclude protocol negotiation, proposals and network I/O. Compile once with
 the environment flag unset, then run with it set after other builds finish.
+
+### Admission, hydration and node recovery
+
+Use these component workloads for the costs paid by large multi-tenant clusters:
+
+```sh
+# From zig/: compile both report executables before timing, then run serially.
+env ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=ReleaseFast -j1
+# A node becomes reachable with a full retry backlog (100/1,000/4,096 frames).
+(cd lib/raft && zig build retry-bench -Doptimize=ReleaseFast -j1)
+# Drain 256/1,024/4,096 queued requests across 16 peers, excluding network/setup.
+env ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=ReleaseFast -j1
+```
+
+`ADMISSION_PLAN_BENCH` compares the previous clone/compare/apply preparation
+with production admission using borrowed pinned records. It covers unchanged
+repair inventories and header changes at 100/1,000/10,000 groups, records successful
+allocations, and checks allocation/free balance. Incoming arrays are distinct
+from the prior snapshot. The fake proposal sink excludes encoding, replication
+and commit latency. `HTTP_SCHEDULER_BENCH` compares ready-peer scheduling against
+a reproduced global array FIFO using the same frame ownership/freeing costs;
+its reference omits the old in-flight hash operations, making that comparison
+conservative. Neither queue benchmark measures network throughput or elections.
+
+Run these after task-owned builds and tests finish. The report target includes
+cached/fresh/sparse/full/reference updates, WAL bytes, full hydration, repair
+comparison, and selected-store preparation. Keep the full and reference paths
+in the results, including regressions. Pair component results with the existing
+live tenant-provisioning/restart, scoped discovery and relational-query scenarios;
+small live runs validate application behavior without establishing cluster capacity.

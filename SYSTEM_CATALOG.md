@@ -119,7 +119,7 @@ catalog. System catalog admission requires topology protocol version 7;
 existing atomic table operations retain their version-3 gate.
 
 Catalog failures use the shared JSON `error` field plus a machine-readable `code`.
-Resource mutations that have committed but are not yet visible return typed HTTP
+Resource mutations whose committed projection cannot be rendered return typed HTTP
 202 with `status: "committed_visibility_pending"`; clients observe the resource
 with GET rather than replaying the mutation. The OpenAPI contract and generated
 clients preserve this outcome.
@@ -397,11 +397,15 @@ group, slot, runtime digest and group/runtime observation counts. Group fact and
 clock changes leave runtime payloads and their membership digest untouched.
 Reporter indexes map selected groups
 to actual stores and slots; fixed page directories locate only the selected
-binary record without decoding adjacent reports. Deleted slots are reused, so
+component record without decoding adjacent reports. Component entries have a
+local codec version and contain group facts or runtime observations directly;
+they do not repeat store headers. Grouping partitions contiguous report buffers
+while preserving duplicate order. Hydration decodes into caller-owned memory
+with separate scratch storage, without a second deep copy. Deleted slots are reused, so
 ordinary group churn does not renumber or rewrite unrelated pages. Structural
 SHA-256 runtime digests exclude observation clocks and include the reporter incarnation.
 Cached reports update only changed headers; fresh observations update clock pages
-without re-encoding unchanged payloads. Sparse changes rebuild only affected
+without re-encoding unchanged runtime payloads. Sparse changes rebuild only affected
 pages, copying the unchanged encoded members. Full status changes still require work
 proportional to the incoming report. Duplicate observations remain distinct so
 reconciliation can reject ambiguous evidence. Whole-store consumers deduplicate
@@ -449,14 +453,18 @@ and runtime change flags in a bounded, allocation-free queue. Refcounted immutab
 store snapshots own separate group and runtime leaves. Header updates share both;
 reference heartbeats replace group facts and share runtime observations. Retained
 admission leases survive publication, deletion and snapshot replacement. A store-ID
-index selects reporting stores under the runtime lock; only those records are
-cloned for mutable full-report admission after releasing the lock. Capability
+index selects reporting stores under the runtime lock. After releasing the lock,
+admission borrows their pinned records and compares each observation once.
+Only accepted replacements allocate owned report payloads. Repeated reports for
+one store see the preceding accepted candidate and produce one final proposal;
+stale generations cannot overwrite that candidate. Capability
 counts update when a store is replaced or removed; unchanged runtime capabilities
 are retained with the runtime leaf. Protocol admission therefore retains global
 requirements without scanning every store's indexes. Repair identity comparisons
 use temporary hash indexes over borrowed reports, preserving first-match and
-causal fencing semantics in linear expected time. Allocation failure leaves the
-owned observation unchanged.
+causal fencing semantics in linear expected time. The admission plan reuses its
+prior repair index when preserving committed facts across protocol gating.
+Allocation failure releases candidates without modifying pinned observations.
 
 Other projection collections refresh only when their own kind changes. Overflow,
 snapshot replacement and failed refresh force a full rebuild. General reconciliation
@@ -476,7 +484,12 @@ routing overhead (128.25 MiB globally and 32.0625 MiB per peer). Frame caps also
 include in-flight and failed completions. Failed completion ownership transfers
 back to the codec; its budget releases on delivery or transfer. Retained byte/frame
 gauges expose HTTP pressure. Raft retransmits work dropped on budget/attempt
-exhaustion. Append, vote and snapshot scheduling retain their existing path.
+exhaustion. Retry draining stably compacts survivors in one linear pass. The HTTP
+sender keeps per-peer FIFO queues and an intrusive ready-peer list. One request
+per peer is in flight; completion returns that peer to the end of the ready list.
+Workers wait on the ready predicate with a condition variable. Route invalidation
+scans only that peer and requires no allocation to remove its queued frames.
+Append, vote and snapshot scheduling retain their existing path.
 
 Metadata apply commits a versioned 26-byte checkpoint in the same transaction
 as projected records. It contains the applied index, input kind (committed entries
@@ -519,3 +532,11 @@ The Rust SDK generator adapts operations with heterogeneous JSON success bodies
 to private typed unions. A completed resource and `committed_visibility_pending`
 remain distinct variants, and `ResponseValue` retains the HTTP status. This is a
 Progenitor input adapter; the public per-status OpenAPI contract is unchanged.
+
+Resource mutation results carry a typed projection captured during admission:
+revision, resource ID, and its database/tablespace labels. Both standalone and
+Raft paths serialize that projection before committing/proposing, then return it
+only after commit or exact receipt verification. HTTP renders that result without
+a second name lookup or read barrier. Concurrent rename, drop, and name reuse
+therefore cannot substitute another identity in an admitted mutation response.
+An unknown receipt still returns the existing ambiguous outcome contract.

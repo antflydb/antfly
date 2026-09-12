@@ -26,7 +26,7 @@ const table_manager = @import("../metadata/table_manager.zig");
 
 pub const Request = domain.Request;
 
-pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) !void {
+pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
@@ -72,7 +72,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         replacement.min_ranges = policy.min_ranges orelse 1;
         command.placement_update = .{ .expected = current, .replacement = replacement };
     }
-    try store.validateSystemCatalog(svc.metadata_group_id, command);
+    const result = try store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command);
+    errdefer alloc.free(result);
     const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
@@ -83,6 +84,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
     if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
     if (command.topology) |topology| svc.verifyTableCreateProjection(a, topology.create.table, topology.create.ranges) catch return error.MetadataMutationOutcomeUnknown;
+    return result;
 }
 
 pub fn snapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext) ![]u8 {
@@ -144,10 +146,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             defer result.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
         },
-        .mutate => |request| blk: {
-            try mutate(svc, alloc, context, request);
-            break :blk alloc.dupe(u8, "{}");
-        },
+        .mutate => |request| mutate(svc, alloc, context, request),
     };
 }
 

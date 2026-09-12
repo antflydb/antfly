@@ -115,6 +115,22 @@ pub fn applyObservationsOwnedWithRepairStatus(
     return applied;
 }
 
+/// Admission borrows the pinned prior record and owns only an accepted
+/// replacement. Comparison and reporter fencing happen exactly once.
+pub fn admitObservation(alloc: std.mem.Allocator, prior: table_manager.StoreRecord, observation: StoreObservation, include_repair_status: bool) !?table_manager.StoreRecord {
+    var lookup: ?RepairLookup = null;
+    defer if (lookup) |*value| value.deinit(alloc);
+    if (!try observationChangesRecordWithLookup(alloc, prior, observation, include_repair_status, &lookup)) return null;
+    const replacement = try table_manager.cloneStore(alloc, applyObservation(prior, observation));
+    errdefer table_manager.freeStore(alloc, replacement);
+    stripVolatileEmbeddingActivity(@constCast(replacement.runtime_statuses));
+    if (!include_repair_status) {
+        if (lookup == null) lookup = try RepairLookup.init(alloc, prior.runtime_statuses);
+        preserveCommittedRuntimeRepairStatusWithLookup(&lookup.?, @constCast(replacement.runtime_statuses));
+    }
+    return replacement;
+}
+
 /// A capability probe that is pending or temporarily unavailable must not turn
 /// an ordinary heartbeat into deletion of repair facts that were already
 /// committed with the newer codec. New repair facts remain suppressed until
@@ -126,6 +142,10 @@ fn preserveCommittedRuntimeRepairStatus(
 ) !void {
     var lookup = try RepairLookup.init(alloc, existing);
     defer lookup.deinit(alloc);
+    preserveCommittedRuntimeRepairStatusWithLookup(&lookup, next);
+}
+
+fn preserveCommittedRuntimeRepairStatusWithLookup(lookup: *const RepairLookup, next: []table_manager.RuntimeGroupStatusReport) void {
     for (next) |*next_runtime| {
         const prior_runtime = lookup.group(next_runtime.*);
         for (next_runtime.indexes) |*next_index| {
@@ -251,15 +271,28 @@ pub fn observationChangesRecordWithRepairStatus(
     observation: StoreObservation,
     include_repair_status: bool,
 ) !bool {
+    var prior: ?RepairLookup = null;
+    defer if (prior) |*lookup| lookup.deinit(alloc);
+    return observationChangesRecordWithLookup(alloc, existing, observation, include_repair_status, &prior);
+}
+
+fn observationChangesRecordWithLookup(
+    alloc: std.mem.Allocator,
+    existing: table_manager.StoreRecord,
+    observation: StoreObservation,
+    include_repair_status: bool,
+    retained_prior: *?RepairLookup,
+) !bool {
     if (existing.reporter_incarnation != 0 and (observation.reporter_incarnation != existing.reporter_incarnation or observation.status_generation < existing.status_generation)) return false;
     const same_runtime = existing.runtime_statuses.ptr == observation.runtime_statuses.ptr and existing.runtime_statuses.len == observation.runtime_statuses.len;
     const repair_checks = !same_runtime and (hasRepairFacts(existing.runtime_statuses) or hasRepairFacts(observation.runtime_statuses));
-    var prior = if (repair_checks) try RepairLookup.init(alloc, existing.runtime_statuses) else RepairLookup{};
-    defer prior.deinit(alloc);
+    if (repair_checks and retained_prior.* == null) retained_prior.* = try RepairLookup.init(alloc, existing.runtime_statuses);
+    const empty: RepairLookup = .{};
+    const prior = if (retained_prior.*) |*lookup| lookup else &empty;
     var next = if (repair_checks) try RepairLookup.init(alloc, observation.runtime_statuses) else RepairLookup{};
     defer next.deinit(alloc);
     const repair_facts_equal = !include_repair_status or !repair_checks or
-        (runtimeRepairFactsContained(existing.runtime_statuses, &next) and runtimeRepairFactsContained(observation.runtime_statuses, &prior));
+        (runtimeRepairFactsContained(existing.runtime_statuses, &next) and runtimeRepairFactsContained(observation.runtime_statuses, prior));
     // Once registration establishes an incarnation, reports from a prior
     // process can never mutate the store projection. Generations order full
     // snapshots within the active process; equal generations remain useful

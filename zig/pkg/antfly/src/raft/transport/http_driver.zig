@@ -65,6 +65,16 @@ pub const SendBatch = struct {
 
 pub const HttpFrameDriver = struct {
     const Retention = struct { bytes: usize = 0, frames: usize = 0 };
+    const PeerState = struct {
+        bytes: usize = 0,
+        frames: usize = 0,
+        queue: std.ArrayListUnmanaged(QueuedFrame) = .empty,
+        head: usize = 0,
+        in_flight: bool = false,
+        ready: bool = false,
+        previous: ?u64 = null,
+        next: ?u64 = null,
+    };
     const QueuedFrame = struct {
         source_id: ?u64 = null,
         peer_id: u64,
@@ -94,13 +104,13 @@ pub const HttpFrameDriver = struct {
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     closing: bool = false,
-    queue: std.ArrayListUnmanaged(QueuedFrame) = .empty,
-    queue_head: usize = 0,
+    ready_head: ?u64 = null,
+    ready_tail: ?u64 = null,
+    pending: usize = 0,
     failed: std.ArrayListUnmanaged(QueuedFrame) = .empty,
     failed_head: usize = 0,
     retained: Retention = .{},
-    peer_retention: std.AutoHashMapUnmanaged(u64, Retention) = .empty,
-    in_flight_peers: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    peers: std.AutoHashMapUnmanaged(u64, PeerState) = .empty,
     metrics: AsyncSendMetrics = .{},
 
     pub fn init(alloc: std.mem.Allocator, cfg: HttpDriverConfig, executor: common.RequestExecutor, io: std.Io) HttpFrameDriver {
@@ -122,10 +132,8 @@ pub const HttpFrameDriver = struct {
         self.stopAsyncSender();
         self.mutex.lockUncancelable(self.io);
         self.clearQueueLocked();
-        self.queue.deinit(self.alloc);
         self.failed.deinit(self.alloc);
-        self.peer_retention.deinit(self.alloc);
-        self.in_flight_peers.deinit(self.alloc);
+        self.peers.deinit(self.alloc);
         self.mutex.unlock(self.io);
         self.* = undefined;
     }
@@ -211,7 +219,6 @@ pub const HttpFrameDriver = struct {
         // must finish (and may itself yield through borrowed Io) before the
         // next modeled round begins.
         if (self.cfg.async_send_worker_count == 0) return;
-        try self.in_flight_peers.ensureTotalCapacity(self.alloc, self.cfg.async_send_worker_count);
         if (self.cfg.isolated_worker_executors) {
             self.isolated_executors = try self.alloc.alloc(common_http.StdHttpExecutor, self.cfg.async_send_worker_count);
             for (self.isolated_executors) |*executor| {
@@ -278,7 +285,7 @@ pub const HttpFrameDriver = struct {
             }, executor) catch |err| {
                 _ = self.metrics.failed.fetchAdd(1, .monotonic);
                 self.mutex.lockUncancelable(self.io);
-                std.debug.assert(self.in_flight_peers.remove(frame.peer_id));
+                self.completePeerLocked(frame.peer_id);
                 if (err == error.BatchTooLarge or self.closing) {
                     _ = self.metrics.dropped.fetchAdd(1, .monotonic);
                     self.releaseRetentionLocked(owned);
@@ -289,7 +296,7 @@ pub const HttpFrameDriver = struct {
                 continue;
             };
             self.mutex.lockUncancelable(self.io);
-            std.debug.assert(self.in_flight_peers.remove(frame.peer_id));
+            self.completePeerLocked(frame.peer_id);
             self.releaseRetentionLocked(owned);
             self.cond.broadcast(self.io);
             self.mutex.unlock(self.io);
@@ -301,10 +308,14 @@ pub const HttpFrameDriver = struct {
         const size = frame.body.len + frame.base_uri.len + frame.content_type.len + frame.group_ids.len * @sizeOf(u64);
         self.retained.bytes -= size;
         self.retained.frames -= 1;
-        const peer = self.peer_retention.getPtr(frame.peer_id).?;
+        const peer = self.peers.getPtr(frame.peer_id).?;
         peer.bytes -= size;
         peer.frames -= 1;
-        if (peer.frames == 0) _ = self.peer_retention.remove(frame.peer_id);
+        if (peer.frames == 0) {
+            std.debug.assert(!peer.ready and !peer.in_flight and peer.head == peer.queue.items.len);
+            peer.queue.deinit(self.alloc);
+            _ = self.peers.remove(frame.peer_id);
+        }
     }
 
     fn publishFailureLocked(self: *HttpFrameDriver, frame: QueuedFrame) void {
@@ -339,16 +350,30 @@ pub const HttpFrameDriver = struct {
         const self: *HttpFrameDriver = @ptrCast(@alignCast(ptr));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        var i = self.queue_head;
-        while (i < self.queue.items.len) {
-            const frame = self.queue.items[i];
-            if (frame.peer_id != peer_id or std.mem.indexOfScalar(u64, frame.group_ids, group_id) == null) {
-                i += 1;
-                continue;
+        const peer = self.peers.getPtr(peer_id) orelse return;
+        var kept: usize = 0;
+        self.removeReadyLocked(peer_id);
+        // Pin this map entry while OOM in failure publication may release its
+        // last real frame. No allocation is required to invalidate a route.
+        peer.frames += 1;
+        self.retained.frames += 1;
+        for (peer.queue.items[peer.head..]) |frame| {
+            if (std.mem.indexOfScalar(u64, frame.group_ids, group_id) != null) {
+                self.pending -= 1;
+                self.publishFailureLocked(frame);
+            } else {
+                peer.queue.items[kept] = frame;
+                kept += 1;
             }
-            _ = self.queue.orderedRemove(i);
-            self.publishFailureLocked(frame);
         }
+        peer.queue.items.len = kept;
+        peer.head = 0;
+        peer.frames -= 1;
+        self.retained.frames -= 1;
+        if (peer.frames == 0) {
+            peer.queue.deinit(self.alloc);
+            _ = self.peers.remove(peer_id);
+        } else self.makeReadyLocked(peer_id);
         // In-flight requests were admitted under the previous route. Their
         // eventual failure returns here through the normal completion path.
         self.cond.broadcast(self.io);
@@ -372,7 +397,7 @@ pub const HttpFrameDriver = struct {
         const size = std.math.add(usize, req.frame.bytes.len, req.endpoint.address.len) catch return error.BatchTooLarge;
         const metadata_size = std.math.add(usize, req.frame.media_type.len, std.math.mul(usize, req.group_ids.len, @sizeOf(u64)) catch return error.BatchTooLarge) catch return error.BatchTooLarge;
         const bytes = std.math.add(usize, size, metadata_size) catch return error.BatchTooLarge;
-        const peer = self.peer_retention.get(req.peer_id) orelse Retention{};
+        const peer = self.peers.get(req.peer_id) orelse PeerState{};
         if (self.retained.frames >= self.cfg.async_send_queue_max or bytes > self.cfg.async_send_retained_bytes_max -| self.retained.bytes) {
             _ = self.metrics.queue_full.fetchAdd(1, .monotonic);
             return error.AsyncSendQueueFull;
@@ -383,7 +408,7 @@ pub const HttpFrameDriver = struct {
         }
         // Reserve before copying bytes. Queued, in-flight and failed completions
         // all retain the same reservation until delivery or ownership transfer.
-        const entry = try self.peer_retention.getOrPut(self.alloc, req.peer_id);
+        const entry = try self.peers.getOrPut(self.alloc, req.peer_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         entry.value_ptr.bytes += bytes;
         entry.value_ptr.frames += 1;
@@ -394,7 +419,10 @@ pub const HttpFrameDriver = struct {
             self.retained.frames -= 1;
             entry.value_ptr.bytes -= bytes;
             entry.value_ptr.frames -= 1;
-            if (entry.value_ptr.frames == 0) _ = self.peer_retention.remove(req.peer_id);
+            if (entry.value_ptr.frames == 0) {
+                entry.value_ptr.queue.deinit(self.alloc);
+                _ = self.peers.remove(req.peer_id);
+            }
         }
         const address = try self.alloc.dupe(u8, req.endpoint.address);
         errdefer self.alloc.free(address);
@@ -404,91 +432,95 @@ pub const HttpFrameDriver = struct {
         errdefer self.alloc.free(content_type);
         const group_ids = try self.alloc.dupe(u64, req.group_ids);
         errdefer self.alloc.free(group_ids);
-        try self.queue.append(self.alloc, .{ .source_id = req.source_id, .peer_id = req.peer_id, .base_uri = address, .body = body, .content_type = content_type, .group_ids = group_ids, .attempt = req.attempt });
+        const queue = &entry.value_ptr.queue;
+        if (entry.value_ptr.head > 0 and entry.value_ptr.head * 2 >= queue.items.len) {
+            const remaining = queue.items.len - entry.value_ptr.head;
+            std.mem.copyForwards(QueuedFrame, queue.items[0..remaining], queue.items[entry.value_ptr.head..]);
+            queue.items.len = remaining;
+            entry.value_ptr.head = 0;
+        }
+        try queue.append(self.alloc, .{ .source_id = req.source_id, .peer_id = req.peer_id, .base_uri = address, .body = body, .content_type = content_type, .group_ids = group_ids, .attempt = req.attempt });
+        self.pending += 1;
+        self.makeReadyLocked(req.peer_id);
         _ = self.metrics.enqueued.fetchAdd(1, .monotonic);
         if (req.attempt > 1) _ = self.metrics.retried.fetchAdd(1, .monotonic);
         self.cond.signal(self.io);
     }
 
     fn popQueuedFrame(self: *HttpFrameDriver) ?QueuedFrame {
-        while (true) {
-            self.mutex.lockUncancelable(self.io);
-            if (self.closing) {
-                self.mutex.unlock(self.io);
-                return null;
-            }
-            if (self.popReadyFrameLocked()) |frame| {
-                self.mutex.unlock(self.io);
-                return frame;
-            }
-            const pending = self.pendingQueueCountLocked();
-            self.mutex.unlock(self.io);
-
-            if (pending == 0) {
-                self.mutex.lockUncancelable(self.io);
-                if (!self.closing and self.pendingQueueCountLocked() == 0) {
-                    self.cond.waitUncancelable(self.io, &self.mutex);
-                }
-                self.mutex.unlock(self.io);
-            } else {
-                self.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-            }
-        }
-    }
-
-    fn popReadyFrameLocked(self: *HttpFrameDriver) ?QueuedFrame {
-        self.compactQueueIfNeededLocked();
-        for (self.queue.items, 0..) |frame, index| {
-            if (self.in_flight_peers.contains(frame.peer_id)) continue;
-            const out = frame;
-            if (index + 1 < self.queue.items.len) {
-                std.mem.copyForwards(
-                    QueuedFrame,
-                    self.queue.items[index .. self.queue.items.len - 1],
-                    self.queue.items[index + 1 ..],
-                );
-            }
-            self.queue.items.len -= 1;
-            self.in_flight_peers.putAssumeCapacity(frame.peer_id, {});
-            return out;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (!self.closing) {
+            if (self.popReadyFrameLocked()) |frame| return frame;
+            self.cond.waitUncancelable(self.io, &self.mutex);
         }
         return null;
     }
 
+    fn makeReadyLocked(self: *HttpFrameDriver, id: u64) void {
+        const peer = self.peers.getPtr(id).?;
+        if (peer.ready or peer.in_flight or peer.head == peer.queue.items.len) return;
+        peer.ready = true;
+        peer.previous = self.ready_tail;
+        peer.next = null;
+        if (self.ready_tail) |tail| self.peers.getPtr(tail).?.next = id else self.ready_head = id;
+        self.ready_tail = id;
+    }
+
+    fn removeReadyLocked(self: *HttpFrameDriver, id: u64) void {
+        const peer = self.peers.getPtr(id).?;
+        if (!peer.ready) return;
+        if (peer.previous) |previous| self.peers.getPtr(previous).?.next = peer.next else self.ready_head = peer.next;
+        if (peer.next) |next| self.peers.getPtr(next).?.previous = peer.previous else self.ready_tail = peer.previous;
+        peer.ready = false;
+        peer.previous = null;
+        peer.next = null;
+    }
+
+    fn completePeerLocked(self: *HttpFrameDriver, id: u64) void {
+        const peer = self.peers.getPtr(id).?;
+        std.debug.assert(peer.in_flight);
+        peer.in_flight = false;
+        self.makeReadyLocked(id);
+    }
+
+    fn popReadyFrameLocked(self: *HttpFrameDriver) ?QueuedFrame {
+        const id = self.ready_head orelse return null;
+        self.removeReadyLocked(id);
+        const peer = self.peers.getPtr(id).?;
+        const frame = peer.queue.items[peer.head];
+        peer.head += 1;
+        peer.in_flight = true;
+        self.pending -= 1;
+        return frame;
+    }
+
     fn pendingQueueCountLocked(self: *const HttpFrameDriver) usize {
-        return self.queue.items.len - self.queue_head;
+        return self.pending;
     }
 
     fn pendingQueueCountForPeerLocked(self: *const HttpFrameDriver, peer_id: u64) usize {
-        var count: usize = 0;
-        for (self.queue.items[self.queue_head..]) |frame| {
-            if (frame.peer_id == peer_id) count += 1;
-        }
-        return count;
-    }
-
-    fn compactQueueIfNeededLocked(self: *HttpFrameDriver) void {
-        if (self.queue_head == 0) return;
-        if (self.queue_head < 64 and self.queue_head * 2 < self.queue.items.len) return;
-        const remaining = self.queue.items.len - self.queue_head;
-        std.mem.copyForwards(QueuedFrame, self.queue.items[0..remaining], self.queue.items[self.queue_head..]);
-        self.queue.items.len = remaining;
-        self.queue_head = 0;
+        const peer = self.peers.get(peer_id) orelse return 0;
+        return peer.queue.items.len - peer.head;
     }
 
     fn clearQueueLocked(self: *HttpFrameDriver) void {
-        for (self.queue.items[self.queue_head..]) |*frame| {
-            self.releaseRetentionLocked(frame.*);
-            frame.deinit(self.alloc);
+        // Workers have joined. No map mutation while walking peer queues.
+        var peers = self.peers.valueIterator();
+        while (peers.next()) |peer| {
+            for (peer.queue.items[peer.head..]) |*frame| frame.deinit(self.alloc);
+            peer.queue.deinit(self.alloc);
         }
         for (self.failed.items[self.failed_head..]) |*frame| {
-            self.releaseRetentionLocked(frame.*);
             frame.deinit(self.alloc);
         }
         self.failed.clearRetainingCapacity();
         self.failed_head = 0;
-        self.queue.clearRetainingCapacity();
-        self.queue_head = 0;
+        self.peers.clearRetainingCapacity();
+        self.retained = .{};
+        self.pending = 0;
+        self.ready_head = null;
+        self.ready_tail = null;
     }
 
     fn sendFrame(ptr: *anyopaque, req: raft_engine.runtime.frame_driver_iface.SendFrameRequest) !void {
@@ -881,4 +913,81 @@ test "http frame driver budgets in flight and failed frames and invalidates queu
     driver.cfg.async_send_retained_bytes_max = size - 1;
     try std.testing.expectError(error.AsyncSendQueueFull, driver.frameDriver().sendFrame(req));
     try std.testing.expectEqual(@as(u64, 1), driver.metricsSnapshot().queue_full);
+}
+
+test "http frame driver ready peers drain fairly and retain FIFO across backlog" {
+    const Fake = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedSend;
+        }
+    };
+    var context: u8 = 0;
+    var driver = HttpFrameDriver.init(std.testing.allocator, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, std.testing.io);
+    defer driver.deinit();
+    var workers: [1]std.Io.Future(void) = undefined;
+    driver.workers = &workers; // Exercise queue ownership without starting I/O.
+    defer driver.workers = &.{};
+    for (0..3) |sequence| for (1..5) |peer| {
+        var body = [_]u8{@intCast(sequence)};
+        try driver.enqueueFrame(.{ .peer_id = peer, .endpoint = .{ .protocol = .http1, .address = "http://peer" }, .frame = .{ .bytes = &body, .media_type = "raft" } });
+    };
+    for (0..3) |sequence| for (1..5) |peer| {
+        var frame = driver.popReadyFrameLocked().?;
+        try std.testing.expectEqual(peer, frame.peer_id);
+        try std.testing.expectEqual(@as(u8, @intCast(sequence)), frame.body[0]);
+        driver.completePeerLocked(peer);
+        driver.releaseRetentionLocked(frame);
+        frame.deinit(std.testing.allocator);
+    };
+    try std.testing.expect(driver.popReadyFrameLocked() == null);
+    try std.testing.expectEqual(@as(usize, 0), driver.retained.frames);
+}
+
+test "http frame driver scheduler workload benchmark" {
+    if (std.c.getenv("ANTFLY_HTTP_SCHEDULER_BENCH") == null) return;
+    const Fake = struct {
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedSend;
+        }
+    };
+    const alloc = std.heap.c_allocator;
+    for ([_]usize{ 256, 1024, 4096 }) |count| {
+        for ([_]bool{ false, true }) |ready_peers| {
+            var samples: [9]u64 = undefined;
+            for (&samples) |*sample| {
+                var context: u8 = 0;
+                var driver = HttpFrameDriver.init(alloc, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, std.testing.io);
+                defer driver.deinit();
+                var workers: [1]std.Io.Future(void) = undefined;
+                driver.workers = &workers;
+                defer driver.workers = &.{};
+                for (0..count) |i| {
+                    var body = [_]u8{@truncate(i)};
+                    try driver.enqueueFrame(.{ .peer_id = i % 16, .endpoint = .{ .protocol = .http1, .address = "http://peer" }, .frame = .{ .bytes = &body, .media_type = "raft" } });
+                }
+                // Old global FIFO reproduced with the same owned frames. No
+                // network, allocator setup or payload copies are timed.
+                var old = std.ArrayListUnmanaged(HttpFrameDriver.QueuedFrame).empty;
+                defer old.deinit(alloc);
+                if (!ready_peers) {
+                    while (driver.popReadyFrameLocked()) |frame| {
+                        try old.append(alloc, frame);
+                        driver.completePeerLocked(frame.peer_id);
+                    }
+                }
+                const start = platform_time.monotonicNs();
+                var drained: usize = 0;
+                while (drained < count) : (drained += 1) {
+                    var frame = if (ready_peers) driver.popReadyFrameLocked().? else old.orderedRemove(0);
+                    if (ready_peers) driver.completePeerLocked(frame.peer_id);
+                    driver.releaseRetentionLocked(frame);
+                    frame.deinit(alloc);
+                }
+                sample.* = platform_time.monotonicNs() - start;
+                try std.testing.expectEqual(@as(usize, 0), driver.retained.frames);
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.debug.print("HTTP_SCHEDULER_BENCH frames={d} ready_peers={} p50_ms={d:.6}\n", .{ count, ready_peers, @as(f64, @floatFromInt(samples[4])) / 1e6 });
+        }
+    }
 }

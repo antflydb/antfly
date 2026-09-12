@@ -73,18 +73,24 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
             .drop => {},
         }
         const result = source.systemCatalog(alloc, request, .{ .mutate = .{ .mutation = mutation } }) catch |err| return failure(alloc, err);
-        alloc.free(result);
+        defer alloc.free(result);
         if (mutation_action == .drop or mutation_action == .rename or route.kind == .table) return .{ .status = 204, .body = &.{} };
+        return projectMutation(alloc, a, route.kind, mutation_action, result) catch return visibilityPending(alloc);
     }
-    const bytes = source.systemCatalog(a, request, .{ .read = .{ .kind = route.kind, .database = route.database, .name = route.name } }) catch |err| {
-        if (action != null) return visibilityPending(alloc);
-        return failure(alloc, err);
-    };
-    return projectSnapshot(alloc, a, route, action, bytes) catch |err| {
-        // Admission has already committed. A stale/malformed projection or a
-        // concurrent rename/drop must not turn that result into a rejection.
-        if (action != null) return visibilityPending(alloc);
-        return failure(alloc, err);
+    const bytes = source.systemCatalog(a, request, .{ .read = .{ .kind = route.kind, .database = route.database, .name = route.name } }) catch |err| return failure(alloc, err);
+    return projectSnapshot(alloc, a, route, bytes) catch |err| return failure(alloc, err);
+}
+
+fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.Kind, action: domain.Action, bytes: []const u8) !Response {
+    const result = try std.json.parseFromSliceLeaky(domain.MutationResult, a, bytes, .{});
+    const resource = result.resource orelse return error.InvalidCatalogRecord;
+    if (resource.kind != kind) return error.InvalidCatalogRecord;
+    const status: u16 = if (action == .create) 201 else 200;
+    return switch (kind) {
+        .database => response(alloc, status, Database{ .database_id = resource.id, .name = resource.name, .tablespace_name = result.tablespace_name }),
+        .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
+        .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
+        .table => error.InvalidCatalogMutation,
     };
 }
 
@@ -92,7 +98,7 @@ fn visibilityPending(alloc: std.mem.Allocator) !Response {
     return response(alloc, 202, .{ .status = "committed_visibility_pending" });
 }
 
-fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes.Route, action: ?domain.Action, bytes: []const u8) !Response {
+fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes.Route, bytes: []const u8) !Response {
     var state = std.json.parseFromSliceLeaky(domain.State, a, bytes, .{ .allocate = .alloc_always }) catch return error.InvalidCatalogRecord;
     var inventory = std.ArrayListUnmanaged(domain.Resource).empty;
     try inventory.appendSlice(a, state.resources);
@@ -104,7 +110,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
     var index = try domain.StateIndex.init(a, state);
     defer index.deinit(a);
     const parent_id: u64 = if (route.kind == .namespace) (state.find(.database, 0, route.database) orelse return error.DatabaseNotFound).id else 0;
-    const status: u16 = if (action == .create) 201 else 200;
+    const status: u16 = 200;
     if (route.name) |name| {
         const resource = state.find(route.kind, parent_id, name) orelse return error.CatalogNotFound;
         return switch (route.kind) {
@@ -193,4 +199,19 @@ test "system catalog failures use the shared public error envelope" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("CatalogNotFound", parsed.value.@"error");
     try std.testing.expectEqualStrings("CatalogNotFound", parsed.value.code);
+}
+
+test "system catalog mutation response uses admitted identity without a name readback" {
+    const Source = struct {
+        fn systemCatalog(_: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
+            if (call != .mutate) return error.UnexpectedReadback;
+            return std.json.Stringify.valueAlloc(alloc, domain.MutationResult{ .revision = 9, .resource = .{ .kind = .database, .id = 7, .name = "created" } }, .{});
+        }
+    };
+    var result = try execute(Source{}, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, .create, "{}");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), result.status);
+    const parsed = try std.json.parseFromSlice(Database, std.testing.allocator, result.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.database_id);
 }

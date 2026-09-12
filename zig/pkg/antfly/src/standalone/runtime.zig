@@ -1551,6 +1551,10 @@ const LocalStandaloneMetadata = struct {
                     command.storage_name = name;
                 } else if (request.create_table_json != null or request.physical_name != null) return error.InvalidCatalogMutation;
                 const delta = try self.planCatalogLocked(a, command);
+                const empty: system_catalog.StateIndex = .{};
+                const reader: CatalogReader = .{ .owner = self, .alloc = a, .index = if (self.system_catalog_state) |*catalog| &catalog.index else &empty };
+                const result = try std.json.Stringify.valueAlloc(alloc, try system_catalog.mutationResult(reader, state.revision + 1, delta), .{});
+                errdefer alloc.free(result);
                 var mutation = try self.beginCatalogMutationLocked();
                 defer mutation.deinit(self);
                 if (table) |created| {
@@ -1569,7 +1573,7 @@ const LocalStandaloneMetadata = struct {
                 self.epoch +|= 1;
                 try context.ensureActive();
                 try mutation.commit(self);
-                return alloc.dupe(u8, "{}");
+                return result;
             },
         }
     }

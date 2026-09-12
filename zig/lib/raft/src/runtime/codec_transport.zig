@@ -431,10 +431,12 @@ pub const CodecTransportHost = struct {
             }
         }
         var i: usize = 0;
-        while (i < self.pending_retries.items.len) {
+        var kept: usize = 0;
+        while (i < self.pending_retries.items.len) : (i += 1) {
             var pending = &self.pending_retries.items[i];
             if (pending.retry_round > self.current_round) {
-                i += 1;
+                self.pending_retries.items[kept] = pending.*;
+                kept += 1;
                 continue;
             }
 
@@ -445,7 +447,6 @@ pub const CodecTransportHost = struct {
                 self.metrics.retries_exhausted += 1;
                 self.pending_retry_bytes -= pending.frame.bytes.len;
                 pending.deinit(self.alloc);
-                _ = self.pending_retries.orderedRemove(i);
                 continue;
             };
             const req: frame_driver_iface.SendFrameRequest = .{
@@ -461,12 +462,12 @@ pub const CodecTransportHost = struct {
                     self.metrics.retries_exhausted += 1;
                     self.pending_retry_bytes -= pending.frame.bytes.len;
                     pending.deinit(self.alloc);
-                    _ = self.pending_retries.orderedRemove(i);
                     continue;
                 }
                 pending.attempts += 1;
                 pending.retry_round = self.current_round + computeBackoffRounds(self.retry_policy, pending.attempts);
-                i += 1;
+                self.pending_retries.items[kept] = pending.*;
+                kept += 1;
                 continue;
             };
 
@@ -474,8 +475,8 @@ pub const CodecTransportHost = struct {
             self.metrics.sent_frames += 1;
             self.pending_retry_bytes -= pending.frame.bytes.len;
             pending.deinit(self.alloc);
-            _ = self.pending_retries.orderedRemove(i);
         }
+        self.pending_retries.items.len = kept;
     }
 };
 

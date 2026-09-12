@@ -654,6 +654,26 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
     return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id };
 }
 
+/// Projection captured during admission and returned only after exact receipt
+/// verification. Names here belong to this committed identity, never a later
+/// lookup of a reusable name. Borrowed until serialized before proposal.
+pub const MutationResult = struct {
+    revision: u64,
+    resource: ?Resource = null,
+    database_name: ?[]const u8 = null,
+    tablespace_name: ?[]const u8 = null,
+};
+
+pub fn mutationResult(reader: anytype, revision: u64, delta: Delta) !MutationResult {
+    var result: MutationResult = .{ .revision = revision };
+    if (delta.upserts.len == 0) return result;
+    const resource = delta.upserts[0];
+    result.resource = resource;
+    if (resource.kind == .namespace) result.database_name = (try reader.byId(.database, resource.parent_id) orelse return error.InvalidCatalogRecord).name;
+    if (resource.tablespace_id != 0) result.tablespace_name = (try reader.byId(.tablespace, resource.tablespace_id) orelse return error.InvalidCatalogRecord).name;
+    return result;
+}
+
 /// In-memory adapter for pure planning tests and algorithm benchmarks.
 /// Production readers use indexed physical identities and scoped children.
 pub const MemoryReader = struct {

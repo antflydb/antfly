@@ -450,3 +450,31 @@ test "codec transport asynchronous failures re-resolve routes and exhaust actual
     try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().retries_exhausted);
 }
+
+test "codec transport retry compaction preserves delayed and failed survivor order" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator, .failures_remaining = 1 };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    const message = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    var groups: [4]runtime.transport_iface.GroupMessageBatch = undefined;
+    for (&groups, 41..) |*group, id| {
+        group.* = .{ .group_id = id, .messages = &message };
+        try host.transport().addPeer(id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://peer" }} });
+    }
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &groups }});
+    host.pending_retries.items[1].retry_round = 10;
+    host.pending_retries.items[3].retry_round = 10;
+    driver.failures_remaining = 1;
+    try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 3), host.pendingRetryCount());
+    for (host.pending_retries.items, [_]u64{ 41, 42, 44 }) |pending, id| try std.testing.expectEqual(id, pending.group_id);
+    var bytes: usize = 0;
+    for (host.pending_retries.items) |pending| bytes += pending.frame.bytes.len;
+    try std.testing.expectEqual(bytes, host.pending_retry_bytes);
+    host.current_round = 10;
+    try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
+    try std.testing.expectEqual(@as(usize, 0), host.pending_retry_bytes);
+    try std.testing.expectEqual(@as(usize, 4), driver.sent.items.len);
+}
