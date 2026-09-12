@@ -287,6 +287,9 @@ const EmbeddingActivityCache = struct {
         reports: []const metadata_table_manager.StoreStatusReport,
         now_ns: u64,
     ) !void {
+        return self.updateWithSequence(alloc, projected, reports, now_ns, false);
+    }
+    fn updateWithSequence(self: *@This(), alloc: std.mem.Allocator, projected: []const metadata_table_manager.StoreRecord, reports: []const metadata_table_manager.StoreStatusReport, now_ns: u64, allow_same_sequence: bool) !void {
         var expired_shards = [_]bool{false} ** shard_count;
         for (reports) |report| {
             if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
@@ -327,7 +330,7 @@ const EmbeddingActivityCache = struct {
                     if (report.status_generation > fence.status_generation) {
                         fence.status_generation = report.status_generation;
                     }
-                    if (report.embedding_activity_sequence <= fence.activity_sequence) continue;
+                    if (report.embedding_activity_sequence < fence.activity_sequence or (!allow_same_sequence and report.embedding_activity_sequence == fence.activity_sequence)) continue;
                 } else removeStoreAssumeLocked(shard, alloc, report.store_id);
             }
             fence_entry.value_ptr.* = .{
@@ -3161,16 +3164,92 @@ const LocalProjectionInputs = struct {
 // runtime inventory. Admission leases remain valid across replacement/removal.
 fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
     return struct {
+        const Leaf = struct {
+            refs: std.atomic.Value(usize) = .init(1),
+            owned: bool = false,
+            items: []T,
+            capabilities: StoreCapabilities = .{},
+            fn release(self: *Leaf, alloc: std.mem.Allocator) void {
+                if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+                if (self.owned) free(alloc, self.items) else alloc.free(self.items);
+                alloc.destroy(self);
+            }
+        };
         refs: std.atomic.Value(usize) = .init(1),
         items: []T,
+        leaves: std.AutoHashMapUnmanaged(u64, *Leaf) = .empty,
+
+        // Payload ownership transfers only at commit, after both components
+        // and the enclosing lease have been allocated successfully.
+        fn init(alloc: std.mem.Allocator, incoming: []T, prior: ?*@This(), changed: ?[]const u64) !@This() {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var grouped: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(T)) = .empty;
+            for (incoming) |item| {
+                const entry = try grouped.getOrPut(a, item.group_id);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(a, item);
+            }
+            var out: @This() = .{ .items = &.{} };
+            errdefer out.deinit(alloc);
+            if (changed) |ids| {
+                var removed: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                for (ids) |id| try removed.put(a, id, {});
+                var it = prior.?.leaves.iterator();
+                while (it.next()) |entry| {
+                    if (removed.contains(entry.key_ptr.*)) continue;
+                    try out.leaves.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+                    _ = entry.value_ptr.*.refs.fetchAdd(1, .monotonic);
+                }
+            }
+            var it = grouped.iterator();
+            while (it.next()) |entry| {
+                const leaf = try alloc.create(Leaf);
+                errdefer alloc.destroy(leaf);
+                const items = try alloc.dupe(T, entry.value_ptr.items);
+                errdefer alloc.free(items);
+                leaf.* = .{ .items = items };
+                if (comptime @hasField(T, "indexes")) leaf.capabilities = StoreCapabilities.fromStores(&.{.{ .store_id = 0, .node_id = 0, .runtime_statuses = items }});
+                try out.leaves.put(alloc, entry.key_ptr.*, leaf);
+            }
+            const ids = try a.alloc(u64, out.leaves.count());
+            var keys = out.leaves.keyIterator();
+            var count: usize = 0;
+            for (ids) |*id| {
+                id.* = keys.next().?.*;
+                count += out.leaves.get(id.*).?.items.len;
+            }
+            std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+            out.items = try alloc.alloc(T, count);
+            var offset: usize = 0;
+            for (ids) |id| {
+                const items = out.leaves.get(id).?.items;
+                @memcpy(out.items[offset..][0..items.len], items);
+                offset += items.len;
+            }
+            return out;
+        }
+        fn commit(self: *@This(), alloc: std.mem.Allocator, incoming: []T) void {
+            var it = self.leaves.valueIterator();
+            while (it.next()) |leaf| if (!leaf.*.owned) {
+                leaf.*.owned = true;
+            };
+            alloc.free(incoming);
+        }
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var it = self.leaves.valueIterator();
+            while (it.next()) |leaf| leaf.*.release(alloc);
+            self.leaves.deinit(alloc);
+            alloc.free(self.items);
+        }
         fn retain(self: *@This()) void {
             _ = self.refs.fetchAdd(1, .monotonic);
         }
         fn release(self: *@This(), alloc: std.mem.Allocator) void {
-            if (self.refs.fetchSub(1, .acq_rel) == 1) {
-                free(alloc, self.items);
-                alloc.destroy(self);
-            }
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            self.deinit(alloc);
+            alloc.destroy(self);
         }
     };
 }
@@ -3202,20 +3281,31 @@ const StoreProjectionLease = struct {
     // Takes ownership of record only on success. Shared components must be
     // absent from the incoming record; no report arrays are copied here.
     fn create(alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord, prior: ?*StoreProjectionLease, share_groups: bool, share_runtime: bool) !*StoreProjectionLease {
+        return createWithChanges(alloc, record, prior, share_groups, share_runtime, null);
+    }
+    fn createWithChanges(alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord, prior: ?*StoreProjectionLease, share_groups: bool, share_runtime: bool, changed: ?[]const u64) !*StoreProjectionLease {
         const self = try alloc.create(StoreProjectionLease);
         errdefer alloc.destroy(self);
         const groups = if (share_groups) prior.?.groups else try alloc.create(Groups);
         errdefer if (!share_groups) alloc.destroy(groups);
+        if (!share_groups) groups.* = try Groups.init(alloc, record.group_statuses, if (prior) |p| p.groups else null, changed);
+        errdefer if (!share_groups) groups.deinit(alloc);
         const runtime = if (share_runtime) prior.?.runtime else try alloc.create(Runtime);
+        errdefer if (!share_runtime) alloc.destroy(runtime);
+        if (!share_runtime) runtime.* = try Runtime.init(alloc, record.runtime_statuses, if (prior) |p| p.runtime else null, changed);
         if (share_groups) {
             std.debug.assert(record.group_statuses.len == 0);
             groups.retain();
-        } else groups.* = .{ .items = record.group_statuses };
+        } else groups.commit(alloc, record.group_statuses);
         if (share_runtime) {
             std.debug.assert(record.runtime_statuses.len == 0);
             runtime.retain();
-        } else runtime.* = .{ .items = record.runtime_statuses };
-        const runtime_capabilities = if (share_runtime) prior.?.runtime_capabilities else StoreCapabilities.fromStores(&.{.{ .store_id = record.store_id, .node_id = record.node_id, .runtime_statuses = runtime.items }});
+        } else runtime.commit(alloc, record.runtime_statuses);
+        var runtime_capabilities: StoreCapabilities = .{};
+        if (share_runtime) runtime_capabilities = prior.?.runtime_capabilities else {
+            var it = runtime.leaves.valueIterator();
+            while (it.next()) |leaf| runtime_capabilities.flags.setUnion(leaf.*.capabilities.flags);
+        }
         var capabilities = runtime_capabilities;
         if (record.artifact_sources_protocol_version != 0) capabilities.flags.insert(.artifact_source);
         if (record.reporter_incarnation != 0) capabilities.flags.insert(.reporter_fence);
@@ -3273,6 +3363,7 @@ const ProjectedCoreSnapshot = struct {
         try self.store_positions.ensureTotalCapacity(alloc, @intCast(self.stores.len));
         for (self.stores, 0..) |record, i| {
             const lease = try StoreProjectionLease.create(alloc, record, null, false, false);
+            self.stores[i] = lease.record;
             self.store_leases.appendAssumeCapacity(lease);
             self.store_positions.putAssumeCapacity(record.store_id, i);
             self.adjustCapabilities(lease.capabilities, true);
@@ -3379,7 +3470,29 @@ const ProjectedCoreSnapshot = struct {
 // Notifications must not allocate or fail after a durable commit. Bound the
 // per-store change set and fall back to a complete store refresh on overflow.
 const CoreProjectionChanges = struct {
-    const StoreChange = struct { id: u64, reports: bool, runtime: bool = true };
+    const StoreChange = struct {
+        id: u64,
+        reports: bool,
+        runtime: bool = true,
+        group_ids: [32]u64 = undefined,
+        group_count: ?usize = 0,
+        fn mergeGroups(self: *StoreChange, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
+            if (!signal.store_reports_changed or self.group_count == null) return;
+            const ids = signal.store_group_ids orelse {
+                self.group_count = null;
+                return;
+            };
+            for (ids) |id| {
+                if (std.mem.indexOfScalar(u64, self.group_ids[0..self.group_count.?], id) != null) continue;
+                if (self.group_count.? == self.group_ids.len) {
+                    self.group_count = null;
+                    return;
+                }
+                self.group_ids[self.group_count.?] = id;
+                self.group_count.? += 1;
+            }
+        }
+    };
     const Pending = struct {
         all: bool = true,
         kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initEmpty(),
@@ -3402,6 +3515,7 @@ const CoreProjectionChanges = struct {
         }
         for (self.pending.stores[0..self.pending.store_count]) |*store| {
             if (store.id != signal.store_id) continue;
+            store.mergeGroups(signal);
             store.reports = store.reports or signal.store_reports_changed;
             store.runtime = store.runtime or (signal.store_reports_changed and signal.store_runtime_changed);
             return;
@@ -3411,6 +3525,7 @@ const CoreProjectionChanges = struct {
             return;
         }
         self.pending.stores[self.pending.store_count] = .{ .id = signal.store_id, .reports = signal.store_reports_changed, .runtime = signal.store_reports_changed and signal.store_runtime_changed };
+        self.pending.stores[self.pending.store_count].mergeGroups(signal);
         self.pending.store_count += 1;
     }
     fn take(self: *@This()) Pending {
@@ -6657,6 +6772,7 @@ pub const MetadataHttpService = struct {
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
+    store_report_lanes: [64]std.Io.Mutex = @splat(.init),
     table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     placement_reconcile_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
@@ -7732,13 +7848,18 @@ pub const MetadataHttpService = struct {
             error.TableTopologyProtocolUpgradeRequired => return error.UnsupportedOperation,
             else => return err,
         };
-        self.lockCatalogMutation();
-        defer self.unlockCatalogMutation();
+        const lane = &self.store_report_lanes[update.report.store_id % self.store_report_lanes.len];
+        lane.lockUncancelable(std.Options.debug_io);
+        defer lane.unlock(std.Options.debug_io);
         try self.ensureLinearizableReadWithContext(context);
+        self.catalog_mutation_mutex.lockSharedUncancelable(std.Options.debug_io);
+        var catalog_locked = true;
+        defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var expected: store_report_update.Cursor = .{ .reporter_incarnation = update.report.reporter_incarnation, .sequence = update.sequence, .digest = undefined };
         std.crypto.hash.sha2.Sha256.hash(bytes, &expected.digest, .{});
-        if (try store.reportCursor(self.metadata_group_id, update.report.store_id)) |cursor| {
+        const admission_cursor = try store.reportCursor(self.metadata_group_id, update.report.store_id);
+        if (admission_cursor) |cursor| {
             if (std.meta.eql(cursor, expected)) return cursor;
             if (update.base) |base| {
                 if (!std.meta.eql(cursor, base)) return error.StoreReportBaseMismatch;
@@ -7758,6 +7879,8 @@ pub const MetadataHttpService = struct {
                 // No durable change: retain the applied base, including for
                 // telemetry-only requests. Do not create a Raft entry merely
                 // to acknowledge a new transport sequence.
+                self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+                catalog_locked = false;
                 self.observeSparseReportActivity(alloc, update) catch |err| std.log.warn("store report activity update skipped err={s}", .{@errorName(err)});
                 return update.base.?;
             }
@@ -7769,9 +7892,11 @@ pub const MetadataHttpService = struct {
             index.embedding_activity_observed = false;
             index.embedding_activity = .{};
         };
-        const command_bytes = try metadata_storage.raft_apply_store.encodeStoreReportUpdate(alloc, .{ .update = durable, .request_digest = expected.digest });
+        const command_bytes = try metadata_storage.raft_apply_store.encodeStoreReportUpdate(alloc, .{ .update = durable, .request_digest = expected.digest, .expected_header = try metadata_storage.raft_apply_store.RaftApplyStore.reportHeaderDigest(alloc, prior), .admission_cursor = admission_cursor });
         defer alloc.free(command_bytes);
         const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_store_report_update = command_bytes });
+        self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+        catalog_locked = false;
         try self.waitForTransitionAppliedWithContext(receipt, context);
         const observed = (try store.reportCursor(self.metadata_group_id, update.report.store_id)) orelse return error.StoreReportBaseMismatch;
         if (!std.meta.eql(observed, expected)) return error.StoreReportBaseMismatch;
@@ -7783,15 +7908,43 @@ pub const MetadataHttpService = struct {
 
     fn observeSparseReportActivity(self: *MetadataHttpService, alloc: std.mem.Allocator, update: store_report_update.Update) !void {
         if (update.activity.len == 0) return;
-        var selected = update;
-        selected.base = .{ .reporter_incarnation = update.report.reporter_incarnation, .sequence = 0, .digest = @splat(0) };
-        selected.report.group_statuses = &.{};
-        selected.report.runtime_statuses = @constCast(update.activity);
-        selected.removed_groups = &.{};
-        const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const committed = (try store.readStoreReportTargets(alloc, self.metadata_group_id, selected)) orelse return;
-        defer metadata_table_manager.freeStore(alloc, committed);
-        try self.embedding_activity_cache.update(alloc, &.{committed}, &.{selected.report}, platform_time.monotonicNs());
+        // Pin immutable group identities under the publication lock, then do
+        // telemetry validation and cache work without catalog/runtime locks.
+        self.lockRuntime();
+        const lease = blk: {
+            defer self.unlockRuntime();
+            const snapshot = try self.projectedCoreSnapshotLocked();
+            const position = snapshot.store_positions.get(update.report.store_id) orelse return;
+            const pinned = snapshot.store_leases.items[position];
+            pinned.retain();
+            break :blk pinned;
+        };
+        defer lease.release(self.alloc);
+        if (lease.record.reporter_incarnation != update.report.reporter_incarnation or update.report.status_generation < lease.record.status_generation) return;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var admitted: std.ArrayListUnmanaged(metadata_table_manager.RuntimeGroupStatusReport) = .empty;
+        for (update.activity) |sample| {
+            const leaf = lease.runtime.leaves.get(sample.group_id) orelse continue;
+            const known = blk: {
+                for (leaf.items) |runtime| for (runtime.indexes) |index| {
+                    if (std.mem.eql(u8, index.name, sample.index_name) and std.mem.eql(u8, index.kind, sample.index_kind) and index.coverage_generation == sample.coverage_generation and index.coverage_config_hash == sample.coverage_config_hash) break :blk true;
+                };
+                break :blk false;
+            };
+            if (!known) continue;
+            const indexes = try a.alloc(metadata_table_manager.RuntimeIndexStatusReport, 1);
+            indexes[0] = .{ .name = sample.index_name, .kind = sample.index_kind, .coverage_generation = sample.coverage_generation, .coverage_config_hash = sample.coverage_config_hash, .embedding_activity_observed = true, .embedding_activity = sample.activity };
+            try admitted.append(a, .{ .group_id = sample.group_id, .indexes = indexes });
+        }
+        var report = update.report;
+        report.runtime_statuses = admitted.items;
+        var committed = lease.record;
+        committed.runtime_statuses = admitted.items;
+        // Batches from one collection share the owner sequence. Index-local
+        // epochs/sample sequences still fence reordered observations.
+        try self.embedding_activity_cache.updateWithSequence(self.alloc, &.{committed}, &.{report}, platform_time.monotonicNs(), true);
     }
 
     pub fn reportStoreStatus(self: *MetadataHttpService, report: metadata_table_manager.StoreStatusReport) !void {
@@ -9796,7 +9949,10 @@ pub const MetadataHttpService = struct {
         const position = snapshot.store_positions.get(change.id);
         const reports = change.reports or position == null;
         const runtime = change.runtime or position == null;
-        const replacement = if (reports and !runtime)
+        const changed_ids: ?[]const u64 = if (position != null and change.group_count != null) change.group_ids[0..change.group_count.?] else null;
+        const replacement = if (reports and changed_ids != null)
+            try store.readStoreReportTargetsWithRuntime(self.alloc, self.metadata_group_id, .{ .sequence = 1, .base = .{ .reporter_incarnation = 0, .sequence = 0, .digest = @splat(0) }, .report = .{ .store_id = change.id }, .removed_groups = changed_ids.? }, runtime)
+        else if (reports and !runtime)
             try store.readStoreGroupFacts(self.alloc, self.metadata_group_id, change.id)
         else
             try store.readStore(self.alloc, self.metadata_group_id, change.id, reports);
@@ -9807,7 +9963,7 @@ pub const MetadataHttpService = struct {
         if (position) |i| {
             const prior = snapshot.store_leases.items[i];
             if (replacement) |record| {
-                const lease = try StoreProjectionLease.create(self.alloc, record, prior, !reports, !reports or !runtime);
+                const lease = try StoreProjectionLease.createWithChanges(self.alloc, record, prior, !reports, !reports or !runtime, changed_ids);
                 record_owned = false;
                 snapshot.adjustCapabilities(prior.capabilities, false);
                 snapshot.adjustCapabilities(lease.capabilities, true);
@@ -19896,6 +20052,85 @@ test "metadata service store report workload benchmark reconciliation view" {
             }
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("RECONCILE_VIEW_BENCH stores={d} groups_per_store=100 shared={} p50_ms={d:.6}\n", .{ count, shared, @as(f64, @floatFromInt(samples[4])) / 1e6 });
+        }
+    }
+}
+
+test "metadata service sparse leases preserve pinned groups through allocation failure" {
+    const Case = struct {
+        fn make(a: std.mem.Allocator, input: metadata_table_manager.StoreRecord, prior: ?*StoreProjectionLease, ids: ?[]const u64) !*StoreProjectionLease {
+            const owned = try metadata_table_manager.cloneStore(a, input);
+            errdefer metadata_table_manager.freeStore(a, owned);
+            return StoreProjectionLease.createWithChanges(a, owned, prior, false, false, ids);
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "embeddings", .repair_status = .waiting }};
+            var groups = [_]metadata_table_manager.GroupStatusReport{ .{ .group_id = 1, .raft_term = 1 }, .{ .group_id = 2, .raft_term = 2 } };
+            var runtimes = [_]metadata_table_manager.RuntimeGroupStatusReport{ .{ .group_id = 1, .table_name = "retained", .indexes = &indexes }, .{ .group_id = 2, .table_name = "replaced" } };
+            const old = try make(a, .{ .store_id = 20, .node_id = 30, .group_statuses = &groups, .runtime_statuses = &runtimes }, null, null);
+            defer old.release(a);
+            runtimes[1].table_name = "new";
+            groups[1].raft_term = 3;
+            const next = try make(a, .{ .store_id = 20, .node_id = 30, .group_statuses = groups[1..], .runtime_statuses = runtimes[1..] }, old, &.{2});
+            defer next.release(a);
+            try std.testing.expectEqual(old.runtime.leaves.get(1).?, next.runtime.leaves.get(1).?);
+            try std.testing.expectEqualStrings("replaced", old.record.runtime_statuses[1].table_name);
+            try std.testing.expectEqualStrings("new", next.record.runtime_statuses[1].table_name);
+            try std.testing.expect(next.capabilities.flags.contains(.repair));
+            const removed = try make(a, .{ .store_id = 20, .node_id = 30 }, next, &.{1});
+            defer removed.release(a);
+            try std.testing.expectEqual(@as(usize, 1), removed.record.runtime_statuses.len);
+            try std.testing.expect(!removed.capabilities.flags.contains(.repair));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "metadata service sparse invalidations retain IDs and fall back at capacity" {
+    var changes: CoreProjectionChanges = .{};
+    _ = changes.take();
+    changes.mark(.{ .kind = .store, .metadata_group_id = 1, .store_id = 20, .store_group_ids = &.{ 1, 2 } });
+    changes.mark(.{ .kind = .store, .metadata_group_id = 1, .store_id = 20, .store_group_ids = &.{ 2, 3 } });
+    const pending = changes.take();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, pending.stores[0].group_ids[0..pending.stores[0].group_count.?]);
+    var ids: [33]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i;
+    changes.mark(.{ .kind = .store, .metadata_group_id = 1, .store_id = 20, .store_group_ids = &ids });
+    try std.testing.expect(changes.take().stores[0].group_count == null);
+}
+
+test "metadata service store report workload benchmark reconciliation view sparse refresh" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const alloc = std.heap.c_allocator;
+    for ([_]usize{ 100, 1000, 10000 }) |count| {
+        var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "embeddings", .repair_status = .waiting }};
+        const runtimes = try alloc.alloc(metadata_table_manager.RuntimeGroupStatusReport, count);
+        defer alloc.free(runtimes);
+        for (runtimes, 0..) |*runtime, i| runtime.* = .{ .group_id = i + 1, .table_name = "tenant_events", .indexes = &indexes };
+        const record: metadata_table_manager.StoreRecord = .{ .store_id = 20, .node_id = 30, .runtime_statuses = runtimes };
+        const original = try StoreProjectionLease.create(alloc, try metadata_table_manager.cloneStore(alloc, record), null, false, false);
+        defer original.release(alloc);
+        for ([_]bool{ false, true }) |sparse| {
+            var elapsed: [9]u64 = undefined;
+            var allocations: usize = 0;
+            for (&elapsed) |*sample| {
+                runtimes[0].doc_count += 1;
+                var counter = std.testing.FailingAllocator.init(alloc, .{});
+                const a = counter.allocator();
+                var input = record;
+                if (sparse) input.runtime_statuses = runtimes[0..1];
+                const start = platform_time.monotonicNs();
+                const owned = try metadata_table_manager.cloneStore(a, input);
+                const next = try StoreProjectionLease.createWithChanges(a, owned, original, false, false, if (sparse) &.{1} else null);
+                try std.testing.expectEqual(count, next.record.runtime_statuses.len);
+                try std.testing.expectEqual(runtimes[0].doc_count, next.record.runtime_statuses[0].doc_count);
+                next.release(a);
+                sample.* = platform_time.monotonicNs() - start;
+                allocations = counter.allocations;
+                try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+            }
+            std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+            std.debug.print("GROUP_CACHE_BENCH groups={d} sparse={} refresh_p50_ms={d:.3} allocations={d}\n", .{ count, sparse, @as(f64, @floatFromInt(elapsed[4])) / 1e6, allocations });
         }
     }
 }

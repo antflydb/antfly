@@ -467,19 +467,40 @@ unchanged groups. Local clock coalescing therefore cannot keep delaying the
 periodic freshness update. Preparing a report owns only changed leaves and reserves
 commit capacity before network I/O; errors leave the prior leaves intact.
 Admission reads selected report components through covering group references.
-Raft command 56 carries the durable update and request digest; volatile embedding
-activity travels separately in the HTTP envelope and is checked against committed
-identities before entering the activity cache. It does not enter the Raft command.
-Apply preserves untouched component pages. It still scans compact membership
-records to maintain the page directory; sparse apply is not independent of the
-store's group count. Cursor and component updates commit in the same transaction.
-Ordinary store replacement invalidates the cursor. Reopening preserves it;
-installing a logical snapshot discards it and requires a full report.
+Raft command 56 carries the durable update, request digest and the admitted
+header/cursor precondition. Apply compares both before writing, including for full
+repairs, so concurrent registration, header changes or report publication cannot
+silently overwrite the observed state. Reporters use bounded per-store admission
+lanes. A shared catalog gate protects admission/proposal ordering; it is released
+before waiting for Raft apply. Different stores and unrelated table DDL can make
+progress concurrently. Membership and protocol changes retain exclusive ordering.
 
-Committed projection notifications coalesce changed store IDs and separate group
-and runtime change flags in a bounded, allocation-free queue. Refcounted immutable
-store snapshots own separate group and runtime leaves. Header updates share both;
-reference heartbeats replace group facts and share runtime observations. Retained
+Volatile embedding activity uses compact identity/counter samples in the HTTP
+envelope. A collection is delivered in batches of at most 512 samples; names and
+kinds are bounded to 1,024 bytes each. All batches retain owner and index sample
+fences. Batches from one collection may share an owner sequence; per-index sample
+ordering rejects older samples. Validation pins immutable group leaves, checks
+index identities and coverage generations, and updates the telemetry cache outside
+the catalog/runtime locks. Activity never enters Raft. Full inventory JSON still
+has the normal HTTP body limit; bounded telemetry does not change that contract.
+
+Sparse apply locates affected pages through group references. It reads/rebuilds
+only those membership and component pages. A free-space bitmap per page supports
+insertions and reuse after removal; allocation metadata changes only with the
+inventory. The small live-page directory changes only when a page becomes empty
+or live. Full repairs still walk the inventory. Cursor and component updates
+commit together. Cursors are logical replicated snapshot state, preserved through
+snapshot installation and normalization as well as reopen. Ordinary store
+replacement invalidates the cursor. Snapshot-plus-log-replay must produce the same
+state as uninterrupted application, without requiring a new full report.
+
+Committed notifications retain affected group IDs through commit and coalesce up
+to 32 IDs per store before falling back to a full refresh. Refcounted immutable
+report payloads are owned per group; a sparse cache publication loads changed
+components and retains untouched leaves. Header updates share both components;
+reference heartbeats replace group facts and share runtime observations. Flat
+StoreRecord views still copy report structs and group maps when a component
+changes, but do not clone unchanged nested payloads. Retained
 admission leases survive publication, deletion and snapshot replacement. A store-ID
 index selects reporting stores under the runtime lock. After releasing the lock,
 admission borrows their pinned records and compares each observation once.

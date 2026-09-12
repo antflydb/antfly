@@ -323,3 +323,31 @@ per-operation latency distributions and completion rates over the requested
 duration. Provisioning/readiness and the mixed interval remain separate. This is
 a bounded working set with repeated updates, not a storage growth or maximum
 cluster capacity claim.
+
+### Concurrent reporting and tenant DDL
+
+Use the report-ingestion workload to measure many independent owners alongside
+namespace create/drop operations on a real three-member metadata Raft cluster:
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_report_ingestion.py \
+  --reporters 8 --groups 100 --samples 30 \
+  --output /tmp/catalog-report-ingestion.json
+```
+
+The workload registers synthetic non-live stores outside data placement, waits for
+registration to become visible, then measures single-group runtime changes and
+activity-only reports separately. It records report throughput/latency and tenant
+DDL latency. Setup is untimed. Every HTTP failure aborts the run; successful
+responses are required. The client includes metadata-leader discovery overhead.
+`--wire previous` supports comparison against the pre-change binary's telemetry
+shape; production has one compact activity shape. `--groups 1000` or `10000`
+exercises large per-owner inventories independently of reporter concurrency.
+
+The report component target also prints `GROUP_CACHE_BENCH` for full versus sparse
+immutable cache publication, and `ACTIVITY_BENCH` for whole-runtime versus compact
+bounded telemetry encoding. The activity workload uses one embedding index per
+group and delivers all 1,000/10,000 samples in batches of at most 512. It reports
+both aggregate bytes and the maximum request size, rather than treating a smaller
+single batch as the full workload. Component times exclude HTTP and Raft network
+latency; the cluster workload includes them.

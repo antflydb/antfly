@@ -22,6 +22,18 @@ pub const Cursor = struct {
     digest: [32]u8,
 };
 
+/// Bounded HTTP telemetry carries identity and counters, never durable index
+/// payloads. A collected observation may be delivered in multiple batches.
+pub const max_activity_samples = 512;
+pub const ActivitySample = struct {
+    group_id: u64,
+    index_name: []const u8,
+    index_kind: []const u8,
+    coverage_generation: u64 = 0,
+    coverage_config_hash: u64 = 0,
+    activity: metadata.RuntimeEmbeddingActivityStatusReport,
+};
+
 /// The report contains complete replacements for changed groups, including all
 /// duplicate observations in their original order. Absence is never deletion.
 /// A null base establishes a full inventory. Cursors acknowledge applied state.
@@ -32,7 +44,7 @@ pub const Update = struct {
     report: metadata.StoreStatusReport,
     removed_groups: []const u64 = &.{},
     /// HTTP-only owner telemetry; never replicated in the durable command.
-    activity: []const metadata.RuntimeGroupStatusReport = &.{},
+    activity: []const ActivitySample = &.{},
 
     pub fn validate(self: Update, alloc: std.mem.Allocator) !void {
         if (self.version != 1 or self.sequence == 0 or self.report.reporter_incarnation == 0 or self.report.runtime_reference) return error.InvalidStoreReporterFence;
@@ -40,9 +52,15 @@ pub const Update = struct {
         if (!metadata.reporterFenceValid(self.report.reporter_incarnation, self.report.status_generation) or
             !metadata.embeddingActivityReportValid(self.report.reporter_incarnation, self.report.embedding_activity_protocol_version, self.report.embedding_activity_sequence) or
             !metadata.embeddingActivitySamplesValid(self.report.embedding_activity_protocol_version, self.report.runtime_statuses) or
-            !metadata.embeddingActivitySamplesValid(self.report.embedding_activity_protocol_version, self.activity) or
             !metadata.artifactSourcesProtocolValid(self.report.reporter_incarnation, self.report.artifact_sources_protocol_version) or
             !metadata.denseNativeStorageProtocolValid(self.report.reporter_incarnation, self.report.dense_native_storage_protocol_version)) return error.InvalidStoreReporterFence;
+        if (self.activity.len > max_activity_samples) return error.InvalidStoreReporterFence;
+        for (self.activity) |sample| {
+            if (sample.group_id == 0 or sample.index_name.len > 1024 or sample.index_kind.len > 1024) return error.InvalidStoreReporterFence;
+            var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .embedding_activity_observed = true, .embedding_activity = sample.activity }};
+            const runtime = [_]metadata.RuntimeGroupStatusReport{.{ .indexes = &indexes }};
+            if (!metadata.embeddingActivitySamplesValid(self.report.embedding_activity_protocol_version, &runtime)) return error.InvalidStoreReporterFence;
+        }
         if (self.base) |base| {
             if (base.reporter_incarnation != self.report.reporter_incarnation or base.sequence >= self.sequence) return error.StoreReportBaseMismatch;
         } else if (self.removed_groups.len != 0) return error.InvalidStoreReporterFence;
@@ -57,7 +75,13 @@ pub const Update = struct {
     }
 };
 
-pub const Command = struct { update: Update, request_digest: [32]u8 };
+pub const Command = struct {
+    update: Update,
+    request_digest: [32]u8,
+    // Admission observes a header and cursor; apply atomically compares both.
+    expected_header: [32]u8,
+    admission_cursor: ?Cursor = null,
+};
 
 const Positions = struct {
     groups: std.ArrayListUnmanaged(usize) = .empty,
@@ -165,11 +189,10 @@ pub const Publisher = struct {
         const full = force_full or self.cursor == null or self.cursor.?.reporter_incarnation != report.reporter_incarnation;
         self.sequence = try std.math.add(u64, self.sequence, 1);
         var update = if (full) Update{ .sequence = self.sequence, .report = next } else try diff(a, self, next, self.cursor.?, self.sequence);
-        var activity: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
+        var activity: std.ArrayListUnmanaged(ActivitySample) = .empty;
         if (!retain_runtime) for (report.runtime_statuses) |runtime| {
             for (runtime.indexes) |item| if (item.embedding_activity_observed) {
-                try activity.append(a, runtime);
-                break;
+                try activity.append(a, .{ .group_id = runtime.group_id, .index_name = item.name, .index_kind = item.kind, .coverage_generation = item.coverage_generation, .coverage_config_hash = item.coverage_config_hash, .activity = item.embedding_activity });
             };
         };
         update.activity = activity.items;
@@ -229,13 +252,14 @@ test "system catalog sparse reports validate capabilities telemetry and removal 
     try std.testing.expectError(error.InvalidStoreReporterFence, update.validate(alloc));
     update.report.artifact_sources_protocol_version = 0;
     var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "embeddings", .embedding_activity_observed = true }};
-    var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 101, .indexes = &indexes }};
-    update.activity = &runtimes;
+    var activity = [_]ActivitySample{.{ .group_id = 101, .index_name = "dense", .index_kind = "embeddings", .activity = .{} }};
+    update.activity = &activity;
     try std.testing.expectError(error.InvalidStoreReporterFence, update.validate(alloc));
     update.report.embedding_activity_protocol_version = metadata.embedding_activity_protocol_version;
     update.report.embedding_activity_sequence = 1;
     indexes[0].embedding_activity.epoch = 1;
     indexes[0].embedding_activity.sample_sequence = 1;
+    activity[0].activity = indexes[0].embedding_activity;
     try update.validate(alloc);
     update.activity = &.{};
     update.removed_groups = &.{101};
@@ -246,6 +270,7 @@ test "system catalog sparse reports validate capabilities telemetry and removal 
     update.removed_groups = &.{ 101, 101 };
     try std.testing.expectError(error.InvalidStoreReporterFence, update.validate(alloc));
     update.removed_groups = &.{101};
+    var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = 101, .indexes = &indexes }};
     update.report.runtime_statuses = &runtimes;
     try std.testing.expectError(error.InvalidStoreReporterFence, update.validate(alloc));
 }
@@ -360,6 +385,61 @@ test "store report workload benchmark publisher sparse encoding" {
             }
             std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
             std.debug.print("PUBLISHER_BENCH groups={d} sparse={} p50_ms={d:.3} http_bytes={d}\n", .{ count, sparse, @as(f64, @floatFromInt(samples[4])) / 1e6, body_size });
+        }
+    }
+}
+
+test "store report workload benchmark compact activity batches" {
+    if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
+    const alloc = std.heap.c_allocator;
+    for ([_]usize{ 1000, 10000 }) |count| {
+        const runtimes = try alloc.alloc(metadata.RuntimeGroupStatusReport, count);
+        defer alloc.free(runtimes);
+        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "embeddings", .embedding_activity_observed = true, .embedding_activity = .{ .epoch = 1, .sample_sequence = 1 } }};
+        for (runtimes, 0..) |*runtime, i| runtime.* = .{ .group_id = i + 1, .table_name = "tenant_events", .indexes = &indexes };
+        const report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .runtime_statuses = runtimes, .embedding_activity_protocol_version = metadata.embedding_activity_protocol_version, .embedding_activity_sequence = 1 };
+        var publisher: Publisher = .{};
+        defer publisher.deinit(alloc);
+        var initial = try publisher.prepare(alloc, report, false, false);
+        defer initial.deinit(alloc);
+        publisher.commit(alloc, &initial, testCursor(initial.update));
+        for ([_]bool{ false, true }) |compact| {
+            var elapsed: [9]u64 = undefined;
+            var total_bytes: usize = 0;
+            var max_bytes: usize = 0;
+            var requests: usize = 0;
+            for (&elapsed) |*sample| {
+                total_bytes = 0;
+                max_bytes = 0;
+                requests = 0;
+                const start = @import("antfly_platform").time.monotonicNs();
+                if (compact) {
+                    var prepared = try publisher.prepare(alloc, report, false, false);
+                    defer prepared.deinit(alloc);
+                    const activity = prepared.update.activity;
+                    var offset: usize = 0;
+                    while (offset < activity.len) {
+                        const end = @min(activity.len, offset + max_activity_samples);
+                        prepared.update.activity = activity[offset..end];
+                        try prepared.update.validate(alloc);
+                        const body = try std.json.Stringify.valueAlloc(alloc, prepared.update, .{});
+                        defer alloc.free(body);
+                        total_bytes += body.len;
+                        max_bytes = @max(max_bytes, body.len);
+                        requests += 1;
+                        offset = end;
+                    }
+                } else {
+                    const body = try std.json.Stringify.valueAlloc(alloc, .{ .activity = runtimes }, .{});
+                    defer alloc.free(body);
+                    total_bytes = body.len;
+                    max_bytes = body.len;
+                    requests = 1;
+                }
+                sample.* = @import("antfly_platform").time.monotonicNs() - start;
+            }
+            std.mem.sort(u64, &elapsed, {}, std.sort.asc(u64));
+            std.debug.print("ACTIVITY_BENCH groups={d} compact={} p50_ms={d:.3} total_http_bytes={d} max_request_bytes={d} requests={d}\n", .{ count, compact, @as(f64, @floatFromInt(elapsed[4])) / 1e6, total_bytes, max_bytes, requests });
         }
     }
 }

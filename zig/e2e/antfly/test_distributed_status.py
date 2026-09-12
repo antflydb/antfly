@@ -433,10 +433,18 @@ def _exercise_sparse_reports(
     assert restored_cursor["sequence"] == 4
     assert raw_store()["runtime_statuses"] == committed["runtime_statuses"]
     # Volatile activity can refresh an existing identity without advancing Raft.
-    activity = copy.deepcopy(restored["runtime_statuses"][:1])
-    observed_index = activity[0]["indexes"][0]
-    observed_index["embedding_activity_observed"] = True
-    observed_index["embedding_activity"] = {"epoch": 1, "sample_sequence": 1}
+    runtime = restored["runtime_statuses"][0]
+    observed_index = runtime["indexes"][0]
+    activity = [
+        {
+            "group_id": runtime["group_id"],
+            "index_name": observed_index["name"],
+            "index_kind": observed_index["kind"],
+            "coverage_generation": observed_index.get("coverage_generation", 0),
+            "coverage_config_hash": observed_index.get("coverage_config_hash", 0),
+            "activity": {"epoch": 1, "sample_sequence": 1},
+        }
+    ]
     telemetry = {
         "sequence": 5,
         "base": restored_cursor,
@@ -457,8 +465,27 @@ def _exercise_sparse_reports(
     )
     assert observed["indexes"][0]["embedding_activity_observed"]
     assert observed["indexes"][0]["embedding_activity"]["sample_sequence"] == 1
+    # Another bounded batch from the same collection sequence is admitted.
+    next_batch = copy.deepcopy(telemetry)
+    next_batch["sequence"] += 1
+    next_batch["activity"][0]["activity"]["sample_sequence"] = 2
+    assert send(next_batch) == restored_cursor
+    oversized = copy.deepcopy(next_batch)
+    oversized["activity"] *= 513
+    send(oversized, 400)
+    unknown = copy.deepcopy(next_batch)
+    unknown["sequence"] += 1
+    unknown["activity"][0]["index_name"] = "unknown_index"
+    unknown["activity"][0]["activity"]["sample_sequence"] = 99
+    assert send(unknown) == restored_cursor
+    observed = next(
+        r
+        for r in raw_store()["runtime_statuses"]
+        if r["group_id"] == activity[0]["group_id"]
+    )
+    assert observed["indexes"][0]["embedding_activity"]["sample_sequence"] == 2
     invalid_telemetry = copy.deepcopy(telemetry)
-    invalid_telemetry["activity"][0]["indexes"][0]["embedding_activity"]["epoch"] = 0
+    invalid_telemetry["activity"][0]["activity"]["epoch"] = 0
     send(invalid_telemetry, 400)
     # Invalidate the manual cursor so the real publisher can resume immediately.
     response = session.post(

@@ -15475,6 +15475,8 @@ pub const DataServer = struct {
         for (0..2) |attempt| {
             var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
             defer prepared.deinit(self.alloc);
+            const activity = prepared.update.activity;
+            prepared.update.activity = activity[0..@min(activity.len, store_report_update.max_activity_samples)];
             const body = try stringifyJsonAlloc(prepared.arena.allocator(), prepared.update);
             const cursor = remote.reportNodeUpdate(report.store_id, body) catch |err| switch (err) {
                 error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
@@ -15494,6 +15496,19 @@ pub const DataServer = struct {
                 prepared.update.removed_groups.len == 0;
             if (!retained_base and (cursor.sequence != prepared.update.sequence or cursor.reporter_incarnation != report.reporter_incarnation or !std.mem.eql(u8, &digest, &cursor.digest))) return error.InvalidStoreReporterFence;
             self.store_report_publisher.commit(self.alloc, &prepared, cursor);
+            var offset = prepared.update.activity.len;
+            while (offset < activity.len) {
+                const end = @min(activity.len, offset + store_report_update.max_activity_samples);
+                self.store_report_publisher.sequence = try std.math.add(u64, self.store_report_publisher.sequence, 1);
+                var batch: store_report_update.Update = .{ .sequence = self.store_report_publisher.sequence, .base = cursor, .report = prepared.update.report, .activity = activity[offset..end] };
+                batch.report.group_statuses = &.{};
+                batch.report.runtime_statuses = &.{};
+                const batch_body = try stringifyJsonAlloc(self.alloc, batch);
+                defer self.alloc.free(batch_body);
+                const observed = try remote.reportNodeUpdate(report.store_id, batch_body);
+                if (!std.meta.eql(cursor, observed)) return error.StoreReportBaseMismatch;
+                offset = end;
+            }
             remote.supports_runtime_reference.store(true, .release);
             return true;
         }
