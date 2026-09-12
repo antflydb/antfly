@@ -873,7 +873,7 @@ pub fn mergeObservedDynamicFieldCapabilitySet(
     for (merged.items) |*existing| {
         if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
         for (incoming.field_capabilities) |capability| {
-            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
+            if (try mergeObservedFieldCapabilityIntoSet(alloc, existing.field_capabilities, capability)) continue;
             const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
             const old_len = existing.field_capabilities.len;
             const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
@@ -898,12 +898,13 @@ pub fn mergeObservedDynamicFieldCapabilitySet(
 }
 
 pub fn mergeObservedFieldCapabilityIntoSet(
+    alloc: std.mem.Allocator,
     capabilities: []storage_schema.FieldCapability,
     needle: storage_schema.FieldCapability,
-) bool {
+) !bool {
     for (capabilities) |*capability| {
         if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
-        mergeObservedFieldCapability(capability, needle);
+        try mergeObservedFieldCapability(alloc, capability, needle);
         return true;
     }
     return false;
@@ -923,19 +924,20 @@ pub fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, 
 }
 
 pub fn mergeObservedFieldCapability(
+    alloc: std.mem.Allocator,
     existing: *storage_schema.FieldCapability,
     incoming: storage_schema.FieldCapability,
-) void {
+) !void {
     existing.searchable = existing.searchable and incoming.searchable;
     existing.filterable = existing.filterable and incoming.filterable;
     existing.aggregatable = existing.aggregatable and incoming.aggregatable;
     existing.doc_values = existing.doc_values and incoming.doc_values;
     existing.sortable = existing.sortable and incoming.sortable;
-    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
-    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
-    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
+    try replaceOwnedCapabilityState(alloc, &existing.doc_value_coverage, storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedCapabilityState(alloc, &existing.queryability_state, storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedCapabilityState(alloc, &existing.sort_lifecycle_state, storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
-        existing.missing_null_policy = "mixed";
+        try replaceOwnedCapabilityState(alloc, &existing.missing_null_policy, "mixed");
     }
     if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
         existing.index_sort = null;
@@ -3358,6 +3360,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
             allow_legacy_graph,
         );
     }
+    if (req.graph_metric_queries.len > 0) {
+        try appendGraphMetricQueryField(alloc, &out, &first, req.graph_metric_queries);
+    }
+    if (req.graph_metric_rerank) |rerank| {
+        try appendGraphMetricRerankField(alloc, &out, &first, rerank);
+    }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
             .@"union" => "union",
@@ -4522,6 +4530,7 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         var hit: db_mod.types.SearchHit = .{ .id = try alloc.dupe(u8, item._id) };
         errdefer hit.deinit(alloc);
         hit.score = item._score;
+        hit.score_details = try parseRemoteGraphMetricRerankScoreDetails(alloc, item._score_details);
         hit.distance = item._distance;
         hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
         hit.sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{});
@@ -4538,6 +4547,20 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         try parseRemoteGraphResults(alloc, graph_results_value)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
+    errdefer {
+        for (graph_results) |*graph_result| graph_result.deinit(alloc);
+        if (graph_results.len > 0) alloc.free(graph_results);
+    }
+    const graph_metric_results: []db_mod.types.GraphMetricResult = if (response.graph_metric_results) |graph_metric_results_value|
+        try parseRemoteGraphMetricResults(alloc, graph_metric_results_value)
+    else
+        @constCast((&[_]db_mod.types.GraphMetricResult{})[0..]);
+    errdefer {
+        for (graph_metric_results) |*metric_result| metric_result.deinit(alloc);
+        if (graph_metric_results.len > 0) alloc.free(graph_metric_results);
+    }
+    var graph_metric_rerank_status = try parseRemoteGraphMetricRerankStatus(alloc, response.profile);
+    errdefer if (graph_metric_rerank_status) |*status| status.deinit(alloc);
 
     // The hit errdefer above already owns its cleanup until we return.
     errdefer {
@@ -4550,6 +4573,8 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
         .total_hits = total_hits,
         .total_hits_relation = total_hits_relation,
         .graph_results = graph_results,
+        .graph_metric_results = graph_metric_results,
+        .graph_metric_rerank_status = graph_metric_rerank_status,
     };
     if (response.profile) |profile| {
         if (profile != .object) return error.InvalidRemoteResponse;
@@ -4744,6 +4769,7 @@ pub fn parseRemoteGraphResults(
             canonical_path_results: ?[]const indexes_openapi.GraphPathResult = null,
             rows: ?[]const indexes_openapi.GraphResultRow = null,
             aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
+            metric_status: ?std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus) = null,
             truncated: bool = false,
         };
         const view: ResultView = switch (result_value) {
@@ -4754,6 +4780,7 @@ pub fn parseRemoteGraphResults(
                     return error.InvalidRemoteResponse;
                 break :blk .{
                     .canonical_nodes = result.nodes,
+                    .metric_status = result.metric_status,
                     .truncated = result.stats.truncated,
                 };
             },
@@ -4811,6 +4838,8 @@ pub fn parseRemoteGraphResults(
             for (aggregates) |*aggregate| aggregate.deinit(alloc);
             if (aggregates.len > 0) alloc.free(aggregates);
         }
+        const metric_status = try parseRemoteGraphMetricStatusMap(alloc, view.metric_status);
+        errdefer db_mod.types.freeGraphMetricStatuses(alloc, metric_status);
 
         const joined_hits = try concatGraphResultHits(alloc, parsed_nodes.hits, parsed_matches.hits);
         errdefer {
@@ -4832,6 +4861,7 @@ pub fn parseRemoteGraphResults(
             .aggregates = aggregates,
             .hits = joined_hits,
             .total_hits = @intCast(@max(parsed_nodes.nodes.len, @max(paths.len, parsed_matches.matches.len))),
+            .metric_status = metric_status,
             .truncated = view.truncated,
         };
         initialized += 1;
@@ -5033,6 +5063,11 @@ pub fn parseRemoteGraphNodeWithKey(
     errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
     const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
     errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
+    const metrics = try parseRemoteGraphMetricValues(alloc, item.metrics);
+    errdefer {
+        for (metrics) |*metric| metric.deinit(alloc);
+        if (metrics.len > 0) alloc.free(metrics);
+    }
     return .{
         .key = owned_key,
         .table = owned_table,
@@ -5042,6 +5077,7 @@ pub fn parseRemoteGraphNodeWithKey(
         .path_tables = if (owned_path) |value| value.tables else null,
         .path_edges = path_edges,
         .provenance = provenance,
+        .metrics = metrics,
     };
 }
 
@@ -5606,4 +5642,484 @@ pub fn civilFromDays(days_since_epoch: i64) CivilDate {
     const month = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
     const year = y + (if (month <= 2) @as(i64, 1) else @as(i64, 0));
     return .{ .year = year, .month = month, .day = day };
+}
+
+pub fn parseRemoteGraphMetricValues(
+    alloc: std.mem.Allocator,
+    maybe_metrics: ?std.json.ArrayHashMap(std.json.Value),
+) ![]graph_query_mod.GraphMetricValue {
+    const values = maybe_metrics orelse return &.{};
+    if (values.map.count() > graph_query_mod.graph_metric_projection_limit)
+        return error.InvalidRemoteResponse;
+    const metrics = try alloc.alloc(graph_query_mod.GraphMetricValue, values.map.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (metrics[0..initialized]) |*metric| metric.deinit(alloc);
+        if (metrics.len > 0) alloc.free(metrics);
+    }
+    var it = values.map.iterator();
+    while (it.next()) |entry| {
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*))
+            return error.InvalidRemoteResponse;
+        const score: ?f64 = switch (entry.value_ptr.*) {
+            .null => null,
+            .integer => |value| @floatFromInt(value),
+            .float => |value| value,
+            else => return error.InvalidRemoteResponse,
+        };
+        if (score) |value| if (!std.math.isFinite(value))
+            return error.InvalidRemoteResponse;
+        metrics[initialized] = .{
+            .name = try alloc.dupe(u8, entry.key_ptr.*),
+            .score = score,
+        };
+        initialized += 1;
+    }
+    return metrics;
+}
+
+pub fn parseRemoteGraphMetricStatusMap(
+    alloc: std.mem.Allocator,
+    value: ?std.json.ArrayHashMap(indexes_openapi.GraphMetricStatus),
+) ![]db_mod.types.GraphMetricStatus {
+    const statuses = value orelse return &.{};
+    const out = try alloc.alloc(db_mod.types.GraphMetricStatus, statuses.map.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+    var it = statuses.map.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.*.len == 0) return error.InvalidQueryResponse;
+        out[initialized] = try parseRemoteGraphMetricStatusValue(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn parseRemoteGraphMetricStatusValue(
+    alloc: std.mem.Allocator,
+    metric_name: []const u8,
+    status: indexes_openapi.GraphMetricStatus,
+) !db_mod.types.GraphMetricStatus {
+    if (metric_name.len == 0 or
+        !std.math.isFinite(status.progress) or status.progress < 0 or status.progress > 1 or
+        !std.math.isFinite(status.delta))
+    {
+        return error.InvalidQueryResponse;
+    }
+    const name = try alloc.dupe(u8, metric_name);
+    errdefer alloc.free(name);
+    var edge_filter = try parseRemoteGraphMetricEdgeFilterStatus(alloc, status.edge_filter);
+    errdefer edge_filter.deinit(alloc);
+    const build_worker_id = if (status.build_worker_id) |worker_id| try alloc.dupe(u8, worker_id) else "";
+    errdefer if (build_worker_id.len > 0) alloc.free(build_worker_id);
+    const build_cursor = if (status.build_cursor) |cursor| try alloc.dupe(u8, cursor) else "";
+    errdefer if (build_cursor.len > 0) alloc.free(build_cursor);
+    const build_pages = try parseRemoteGraphMetricBuildPages(alloc, status.build_pages);
+    errdefer {
+        for (build_pages) |*page| page.deinit(alloc);
+        if (build_pages.len > 0) alloc.free(build_pages);
+    }
+    const last_error = if (status.last_error) |message| try alloc.dupe(u8, message) else "";
+    errdefer if (last_error.len > 0) alloc.free(last_error);
+    const recent_events = try parseRemoteGraphMetricEvents(alloc, status.recent_events);
+    errdefer if (recent_events.len > 0) alloc.free(recent_events);
+
+    return .{
+        .name = name,
+        .state = graphMetricStateFromName(status.state) orelse return error.InvalidQueryResponse,
+        .phase = graphMetricPhaseFromName(status.phase) orelse return error.InvalidQueryResponse,
+        .edge_filter = edge_filter,
+        .metadata_version = try remoteOptionalU32(status.metadata_version),
+        .config_fingerprint = try remoteOptionalConfigFingerprint(status.config_fingerprint),
+        .maintenance_paused = status.maintenance_paused orelse false,
+        .build_queued = status.build_queued,
+        .published_generation = try remoteU64(status.published_generation),
+        .edge_generation = try remoteU64(status.edge_generation),
+        .target_edge_generation = try remoteU64(status.target_edge_generation),
+        .queued_generation = try remoteOptionalU64(status.queued_generation),
+        .building_generation = try remoteOptionalU64(status.building_generation),
+        .build_job_id = try remoteOptionalU64(status.build_job_id),
+        .build_started_at_ms = try remoteOptionalU64(status.build_started_at_ms),
+        .build_iteration = try remoteOptionalU32(status.build_iteration),
+        .build_lease_expires_at_ms = try remoteOptionalU64(status.build_lease_expires_at_ms),
+        .build_worker_id = build_worker_id,
+        .build_cursor = build_cursor,
+        .build_completed_units = try remoteOptionalU64(status.build_completed_units),
+        .build_total_units = try remoteOptionalU64(status.build_total_units),
+        .build_pages = build_pages,
+        .build_pages_truncated = status.build_pages_truncated orelse false,
+        .retry_count = try remoteOptionalU64(status.retry_count),
+        .last_error = last_error,
+        .progress = status.progress,
+        .converged = status.converged,
+        .iterations_completed = try remoteU32(status.iterations_completed),
+        .delta = status.delta,
+        .computed_at_ms = try remoteU64(status.computed_at_ms),
+        .last_event = try parseRemoteGraphMetricEvent(status.last_event),
+        .recent_events = recent_events,
+    };
+}
+
+pub fn parseRemoteGraphMetricEvent(
+    maybe_event: ?indexes_openapi.GraphMetricEvent,
+) !?graph_mod.GraphIndex.GraphMetricEvent {
+    const event = maybe_event orelse return null;
+    return try parseRemoteGraphMetricEventValue(event);
+}
+
+pub fn parseRemoteGraphMetricEventValue(
+    event: indexes_openapi.GraphMetricEvent,
+) !graph_mod.GraphIndex.GraphMetricEvent {
+    return .{
+        .sequence = try remoteU64(event.sequence),
+        .kind = graphMetricEventKindFromName(event.kind) orelse return error.InvalidQueryResponse,
+        .at_ms = try remoteU64(event.at_ms),
+        .target_edge_generation = try remoteU64(event.target_edge_generation),
+        .published_generation = try remoteU64(event.published_generation),
+        .score_count = try remoteU64(event.score_count),
+    };
+}
+
+pub fn remoteU64(value: i64) !u64 {
+    if (value < 0) return error.InvalidQueryResponse;
+    return @intCast(value);
+}
+
+pub fn graphMetricEventKindFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricEventKind {
+    if (std.mem.eql(u8, name, "publish")) return .publish;
+    if (std.mem.eql(u8, name, "delete")) return .delete;
+    if (std.mem.eql(u8, name, "pause")) return .pause;
+    if (std.mem.eql(u8, name, "resume")) return .@"resume";
+    if (std.mem.eql(u8, name, "failed")) return .failed;
+    return null;
+}
+
+pub fn remoteU32(value: i64) !u32 {
+    if (value < 0 or value > std.math.maxInt(u32)) return error.InvalidQueryResponse;
+    return @intCast(value);
+}
+
+pub fn remoteOptionalU64(value: ?i64) !u64 {
+    return remoteU64(value orelse 0);
+}
+
+pub fn remoteOptionalU32(value: ?i64) !u32 {
+    return remoteU32(value orelse 0);
+}
+
+pub fn remoteOptionalConfigFingerprint(value: ?[]const u8) !u64 {
+    const encoded = value orelse return 0;
+    if (encoded.len != 16) return error.InvalidQueryResponse;
+    for (encoded) |char| {
+        if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return error.InvalidQueryResponse;
+    }
+    return std.fmt.parseInt(u64, encoded, 16) catch error.InvalidQueryResponse;
+}
+
+pub fn graphMetricPhaseFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPhase {
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+pub fn graphMetricStateFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricState {
+    if (std.mem.eql(u8, name, "disabled")) return .disabled;
+    if (std.mem.eql(u8, name, "not_ready")) return .not_ready;
+    if (std.mem.eql(u8, name, "fresh")) return .fresh;
+    if (std.mem.eql(u8, name, "stale")) return .stale;
+    if (std.mem.eql(u8, name, "building")) return .building;
+    if (std.mem.eql(u8, name, "failed")) return .failed;
+    return null;
+}
+
+pub fn parseRemoteGraphMetricEvents(
+    alloc: std.mem.Allocator,
+    maybe_events: ?[]const indexes_openapi.GraphMetricEvent,
+) ![]graph_mod.GraphIndex.GraphMetricEvent {
+    const events = maybe_events orelse return &.{};
+    const out = try alloc.alloc(graph_mod.GraphIndex.GraphMetricEvent, events.len);
+    errdefer alloc.free(out);
+    for (events, 0..) |event, i| out[i] = try parseRemoteGraphMetricEventValue(event);
+    return out;
+}
+
+pub fn parseRemoteGraphMetricBuildPages(
+    alloc: std.mem.Allocator,
+    maybe_pages: ?[]const indexes_openapi.GraphMetricBuildPageStatus,
+) ![]db_mod.types.GraphMetricBuildPageStatus {
+    const pages = maybe_pages orelse return &.{};
+    const out = try alloc.alloc(db_mod.types.GraphMetricBuildPageStatus, pages.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*page| page.deinit(alloc);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (pages, 0..) |page, i| {
+        const worker_id = if (page.worker_id) |value| try alloc.dupe(u8, value) else "";
+        errdefer if (worker_id.len > 0) alloc.free(worker_id);
+        const cursor = if (page.cursor) |value| try alloc.dupe(u8, value) else "";
+        errdefer if (cursor.len > 0) alloc.free(cursor);
+        const last_error = if (page.last_error) |value| try alloc.dupe(u8, value) else "";
+        errdefer if (last_error.len > 0) alloc.free(last_error);
+        out[i] = .{
+            .phase = graphMetricPhaseFromName(page.phase) orelse return error.InvalidQueryResponse,
+            .iteration = try remoteU32(page.iteration),
+            .page_id = try remoteU64(page.page_id),
+            .state = graphMetricBuildPageStateFromName(page.state) orelse return error.InvalidQueryResponse,
+            .range_kind = graphMetricBuildPageRangeKindFromName(page.range_kind) orelse return error.InvalidQueryResponse,
+            .worker_id = worker_id,
+            .lease_expires_at_ms = try remoteOptionalU64(page.lease_expires_at_ms),
+            .attempt = try remoteOptionalU64(page.attempt),
+            .cursor = cursor,
+            .completed_units = try remoteOptionalU64(page.completed_units),
+            .total_units = try remoteOptionalU64(page.total_units),
+            .last_error = last_error,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn graphMetricBuildPageRangeKindFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageRangeKind {
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+pub fn graphMetricBuildPageStateFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageState {
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".fields) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+pub fn parseRemoteGraphMetricEdgeFilterStatus(
+    alloc: std.mem.Allocator,
+    maybe_filter: ?indexes_openapi.GraphMetricEdgeFilterStatus,
+) !graph_mod.GraphMetricEdgeFilter {
+    const filter = maybe_filter orelse return .{};
+    if (std.mem.eql(u8, filter.mode, "all")) {
+        if (filter.types != null and filter.types.?.len > 0) return error.InvalidQueryResponse;
+        return .{};
+    }
+    if (!std.mem.eql(u8, filter.mode, "types")) return error.InvalidQueryResponse;
+    const raw_types = filter.types orelse return error.InvalidQueryResponse;
+    if (raw_types.len == 0) return error.InvalidQueryResponse;
+    const types = try alloc.alloc([]const u8, raw_types.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (types[0..initialized]) |edge_type| alloc.free(edge_type);
+        alloc.free(types);
+    }
+    for (raw_types, 0..) |edge_type, i| {
+        if (edge_type.len == 0) return error.InvalidQueryResponse;
+        types[i] = try alloc.dupe(u8, edge_type);
+        initialized += 1;
+    }
+    return .{ .mode = .types, .types = types };
+}
+
+pub fn parseRemoteGraphMetricRerankStatus(
+    alloc: std.mem.Allocator,
+    maybe_profile: ?std.json.Value,
+) !?db_mod.types.GraphMetricStatus {
+    const profile = maybe_profile orelse return null;
+    if (profile != .object) return error.InvalidQueryResponse;
+    const graph_metrics_value = profile.object.get("graph_metrics") orelse return null;
+    // `graph_metrics` is optional in the public profile contract. The typed
+    // encoder currently preserves absent optional fields as JSON null, so a
+    // profiled non-metric shard response must be treated exactly like an
+    // omitted field rather than poisoning the whole fan-in response.
+    if (graph_metrics_value == .null) return null;
+    if (graph_metrics_value != .array) return error.InvalidQueryResponse;
+
+    var result: ?db_mod.types.GraphMetricStatus = null;
+    errdefer if (result) |*status| status.deinit(alloc);
+    for (graph_metrics_value.array.items) |item| {
+        if (item != .object) return error.InvalidQueryResponse;
+        const source_value = item.object.get("source") orelse return error.InvalidQueryResponse;
+        if (source_value != .string) return error.InvalidQueryResponse;
+        if (!std.mem.eql(u8, source_value.string, "graph_metric_rerank")) continue;
+        if (result != null) return error.InvalidQueryResponse;
+
+        const metric_name_value = item.object.get("metric_name") orelse return error.InvalidQueryResponse;
+        if (metric_name_value != .string or metric_name_value.string.len == 0) return error.InvalidQueryResponse;
+        const status_value = item.object.get("status") orelse return error.InvalidQueryResponse;
+        const encoded = try std.json.Stringify.valueAlloc(alloc, status_value, .{});
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(indexes_openapi.GraphMetricStatus, alloc, encoded, .{});
+        defer parsed.deinit();
+        result = try parseRemoteGraphMetricStatusValue(alloc, metric_name_value.string, parsed.value);
+    }
+    return result;
+}
+
+pub fn parseRemoteGraphMetricResults(
+    alloc: std.mem.Allocator,
+    value: std.json.ArrayHashMap(indexes_openapi.GraphMetricResult),
+) ![]db_mod.types.GraphMetricResult {
+    const results = try alloc.alloc(db_mod.types.GraphMetricResult, value.map.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (results[0..initialized]) |*metric_result| metric_result.deinit(alloc);
+        alloc.free(results);
+    }
+
+    var it = value.map.iterator();
+    while (it.next()) |entry| {
+        const result_value = entry.value_ptr.*;
+        if (entry.key_ptr.*.len == 0 or result_value.index_name.len == 0 or result_value.metric.len == 0) {
+            return error.InvalidQueryResponse;
+        }
+        const scores = try alloc.alloc(db_mod.types.GraphMetricScore, result_value.scores.len);
+        var initialized_scores: usize = 0;
+        errdefer {
+            for (scores[0..initialized_scores]) |*score| score.deinit(alloc);
+            alloc.free(scores);
+        }
+        for (result_value.scores, 0..) |score, i| {
+            if (score.node.len == 0 or !std.math.isFinite(score.score)) return error.InvalidQueryResponse;
+            scores[i] = .{
+                .node = try alloc.dupe(u8, score.node),
+                .score = score.score,
+            };
+            initialized_scores += 1;
+        }
+        const name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(name);
+        const index_name = try alloc.dupe(u8, result_value.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, result_value.metric);
+        errdefer alloc.free(metric_name);
+        var status = try parseRemoteGraphMetricStatusValue(alloc, result_value.metric, result_value.status);
+        errdefer status.deinit(alloc);
+        results[initialized] = .{
+            .name = name,
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .scores = scores,
+            .status = status,
+        };
+        initialized += 1;
+    }
+
+    return results;
+}
+
+pub fn parseRemoteGraphMetricRerankScoreDetails(
+    alloc: std.mem.Allocator,
+    maybe_details: ?metadata_openapi.QueryScoreDetails,
+) !?db_mod.types.GraphMetricRerankScoreDetails {
+    const details = (maybe_details orelse return null).graph_metric_rerank orelse return null;
+    const metric_score = details.metric_score.valueOrNull();
+    if (!std.math.isFinite(details.base_score) or
+        !std.math.isFinite(details.base_weight) or
+        (metric_score != null and !std.math.isFinite(metric_score.?)) or
+        !std.math.isFinite(details.metric_score_used) or
+        !std.math.isFinite(details.metric_weight) or
+        !std.math.isFinite(details.final_score) or
+        details.published_generation < 0)
+    {
+        return error.InvalidQueryResponse;
+    }
+    const index_name = try alloc.dupe(u8, details.index_name);
+    errdefer alloc.free(index_name);
+    const metric_name = try alloc.dupe(u8, details.metric_name);
+    errdefer alloc.free(metric_name);
+    return .{
+        .index_name = index_name,
+        .metric_name = metric_name,
+        .base_score = details.base_score,
+        .base_weight = details.base_weight,
+        .metric_score = metric_score,
+        .metric_score_used = details.metric_score_used,
+        .metric_weight = details.metric_weight,
+        .missing_score_used = details.missing_score_used,
+        .final_score = details.final_score,
+        .published_generation = @intCast(details.published_generation),
+    };
+}
+
+pub fn appendGraphMetricRerankField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    rerank: db_mod.types.GraphMetricRerank,
+) !void {
+    try appendJsonFieldName(alloc, out, first, "graph_metric_rerank");
+    try out.append(alloc, '{');
+    var rerank_first = true;
+    try appendJsonFieldString(alloc, out, &rerank_first, "index", rerank.index_name);
+    try appendJsonFieldString(alloc, out, &rerank_first, "metric", rerank.metric_name);
+    if (rerank.candidate_count) |candidate_count| {
+        try appendJsonFieldU32(alloc, out, &rerank_first, "candidate_count", candidate_count);
+    }
+    try appendJsonFieldF64(alloc, out, &rerank_first, "base_weight", rerank.base_weight);
+    try appendJsonFieldF64(alloc, out, &rerank_first, "weight", rerank.weight);
+    try appendJsonFieldF64(alloc, out, &rerank_first, "missing_score", rerank.missing_score);
+    try appendJsonFieldString(alloc, out, &rerank_first, "metric_freshness", switch (rerank.freshness) {
+        .published => "published",
+        .fresh => "fresh",
+    });
+    try out.append(alloc, '}');
+}
+
+pub fn appendGraphMetricQueryField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    queries: []const db_mod.types.NamedGraphMetricQuery,
+) !void {
+    if (queries.len > 1) {
+        // The public contract remains the ergonomic singular graph_metric
+        // request. Internal fan-out needs a lossless envelope for coupled
+        // metrics such as HITS authority/hub, so encode the bounded admitted
+        // list explicitly instead of dropping one member.
+        try appendJsonFieldName(alloc, out, first, "_graph_metric_queries");
+        try out.append(alloc, '[');
+        for (queries, 0..) |named, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.append(alloc, '{');
+            var metric_first = true;
+            try appendJsonFieldString(alloc, out, &metric_first, "name", named.name);
+            try appendJsonFieldString(alloc, out, &metric_first, "index", named.query.index_name);
+            try appendJsonFieldString(alloc, out, &metric_first, "metric", named.query.metric_name);
+            try appendJsonFieldU32(alloc, out, &metric_first, "top_k", named.query.top_k);
+            try appendJsonFieldString(alloc, out, &metric_first, "metric_freshness", switch (named.query.freshness) {
+                .published => "published",
+                .fresh => "fresh",
+            });
+            try out.append(alloc, '}');
+        }
+        try out.append(alloc, ']');
+        return;
+    }
+    const named = queries[0];
+
+    try appendJsonFieldName(alloc, out, first, "graph_metric");
+    try out.append(alloc, '{');
+    var metric_first = true;
+    try appendJsonFieldString(alloc, out, &metric_first, "name", named.name);
+    try appendJsonFieldString(alloc, out, &metric_first, "index", named.query.index_name);
+    try appendJsonFieldString(alloc, out, &metric_first, "metric", named.query.metric_name);
+    try appendJsonFieldU32(alloc, out, &metric_first, "top_k", named.query.top_k);
+    try appendJsonFieldString(alloc, out, &metric_first, "metric_freshness", switch (named.query.freshness) {
+        .published => "published",
+        .fresh => "fresh",
+    });
+    try out.append(alloc, '}');
+}
+
+pub fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8, replacement: []const u8) !void {
+    if (std.mem.eql(u8, state.*, replacement)) return;
+    // Conservative-state helpers return borrowed strings. Preserve the owned
+    // aggregate's contract, including when allocation fails or aliases input.
+    const owned = try alloc.dupe(u8, replacement);
+    alloc.free(state.*);
+    state.* = owned;
 }

@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-09-11
+Last updated: 2026-09-12
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -135,6 +135,28 @@ the distributed runtime. Storage never links back to a server entry point.
 Storage owner tests link the same production archives and are included in the
 storage and integration aggregates, using module-name test filters.
 
+Consumer unit tests use interfaces and fakes. Consumer integration tests use
+real opaque storage owners; they do not import the physical DB to set up a
+fixture. Tests of physical DB, index, WAL, cache, recovery, and lease internals
+remain in implementation suites. API read/write/lifecycle and Data selections
+can span both kinds of tests without moving physical assertions into the ABI.
+
+Consumer tests compile to Zig test objects. A separate source-less executable
+links each object with the provider archives, native C objects, and stable test
+metadata. A DB edit rebuilds storage and relinks these executables while reusing
+their test objects. C sources remain separate from Zig test objects so native
+stack traces survive the final link. Implementation suites continue to compile
+against their physical owners.
+
+Ownership factories expose consumer and implementation namespaces from mixed
+source files. Public selections remain patterns. Before running a partitioned
+selection, Zig inventories both binaries and the audit checks their union for
+unmatched patterns and duplicate ownership. One partition may be empty; the
+whole selection may not silently be empty. Zig runs the binaries, preserving
+its target and foreign-execution policy. The test-only owner fixture supplies
+allocator callbacks and borrowed runtime I/O so allocation-failure and VOPR
+checks continue to exercise the real provider.
+
 `max_rss` claims govern compilation admission. There are no artificial archive
 ordering dependencies; independent compilations can run concurrently when the
 runner has sufficient memory. Release memory measurements from the earlier
@@ -146,28 +168,38 @@ warm builds, then verifies these source changes:
 
 | Changed source | Required rebuild | Required reuse |
 |---|---|---|
-| Read/write coordination | Distributed runtime and source integration tests | Every other runtime archive and the other owner tests |
-| Physical DB/local query | Storage archive and its linked storage tests | Every other runtime archive |
-| Owner integration test | Its test binary | Every runtime archive |
+| Read/write coordination | Distributed runtime and affected consumer objects/links | Every other runtime archive and unrelated test objects |
+| Physical DB/local query | Storage archive and final test links | Other runtime archives and consumer/owner test objects |
+| Owner or consumer test root | Its test object and final link | Every runtime archive and unrelated test objects |
 | Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
 
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.
 
-A native Darwin Debug run on 2026-09-11 completed the seven-archive and
-three-test-binary matrix. Cold compilation took 244 seconds and the warm build
-1.4 seconds. Read/write coordination edits took 54/59 seconds; DB/local-query
-edits took 91/83 seconds; an owner-test edit took 16 seconds. These are local
-wall times under concurrent development load, not release-runner benchmarks.
-The regression asserts artifact cache states, not timing thresholds. It keeps
-prior mutations in its private overlay: restoring a file also invalidates
-Zig's latest manifest and would confound the next measurement.
+A matched native Darwin Debug experiment compared the test ownership split
+(`c50cc4b0c`) with its parent (`60ff56514`), before the subsequent main merge.
+It compiled four consumer families, their physical partitions, three owner
+suites, and all seven production archives, with `-j2`, separate local caches,
+and a shared dependency cache. Whole-build RSS is the sampled sum of descendant
+process RSS, which can double-count shared pages; CPU time includes children.
+
+| Case | Wall seconds before / after | CPU seconds before / after | Peak build RSS GiB before / after |
+|---|---:|---:|---:|
+| Cold local cache | 431 / 399 | 625 / 569 | 7.58 / 8.13 |
+| Physical DB edit | 332 / 218 | 427 / 225 | 4.35 / 6.79 |
+| Consumer test root edit | 64 / 17 | 63 / 19 | 3.75 / 1.75 |
+
+This single local trial demonstrates cheaper incremental consumer compilation.
+It does not establish lower whole-suite peak memory: the physical Data test
+executable remains large and raised the peak in this trial. These are Debug
+measurements, not release-runner results. Cache regressions assert artifact
+reuse rather than timing thresholds. Mutations stay in private source overlays.
 
 Explicit entry roots and source profiles prevent inactive literal imports of
 the principal implementations. The self-module `antfly_source_root` alias
 selects those sources without giving overlapping files a second Zig module
 identity. Some shared storage leaf files remain lexically reachable by control;
-the measured six-case matrix does not prove independence for every leaf file.
+the source-mutation matrix does not prove independence for every leaf file.
 
 ### Boundary runtime cost
 

@@ -251,3 +251,26 @@ pub const StorageKernelReconcileResult = struct {
     restore_repair_progressed: usize = 0,
     restore_repair_pending: usize = 0,
 };
+
+pub const GraphMetricGroupActionRequest = struct {
+    operation: ?[]const u8 = null,
+    index_name: []const u8 = "",
+    metric_name: []const u8 = "",
+    action: []const u8 = "",
+};
+
+pub const graph_metric_group_action_operation = "metric_action_v1";
+
+pub fn graphMetricGroupActionBodyAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, GraphMetricGroupActionRequest{
+        .operation = graph_metric_group_action_operation,
+        .index_name = index_name,
+        .metric_name = metric_name,
+        .action = action,
+    }, .{ .emit_null_optional_fields = false });
+}

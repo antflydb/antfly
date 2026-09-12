@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const db_core = @import("core.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
+const relational_store = @import("relational_store.zig");
 const graph_exec = @import("query/graph_exec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const planning_stats = @import("planning_stats.zig");
@@ -59,7 +60,7 @@ fn scanPrimaryDocCount(core: *db_core.DBCore) !u64 {
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isPrimaryDocumentKey(key)) state.doc_count.* += 1;
+            if (internal_keys.isStoredDocumentRowKey(key)) state.doc_count.* += 1;
             return .@"continue";
         }
     };
@@ -106,8 +107,9 @@ pub fn resolveGraphIndexEstimate(
     index_name: []const u8,
 ) !?query_search.GraphIndexEstimate {
     const entry = core.graphIndex(index_name) orelse return null;
-    var graph_index = entry.index;
-    const graph_stats = try graph_index.stats(alloc);
+    // Planning uses conservative maintained counts; an estimate must not
+    // scan the graph under the request's apply lock during ownership cleanup.
+    const graph_stats = entry.index.operationalStats();
     return .{
         .name = try alloc.dupe(u8, entry.config.name),
         .edge_count = graph_stats.edge_count,
@@ -178,11 +180,13 @@ pub fn estimateStructuredFilterSample(
     var sampled: u32 = 0;
     var matched: u64 = 0;
     for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+        if (!internal_keys.isStoredDocumentRowKey(doc.key)) continue;
+        const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         defer alloc.free(raw_key);
         sampled += 1;
-        if (try prepared_filter.matchesStored(alloc, raw_key, doc.value)) {
+        const logical_value = try core.index_manager.materializeStoredValueAlloc(alloc, doc.key, doc.value);
+        defer alloc.free(logical_value);
+        if (try prepared_filter.matchesStored(alloc, raw_key, logical_value)) {
             matched += 1;
         }
         if (sampled >= sample_size) break;

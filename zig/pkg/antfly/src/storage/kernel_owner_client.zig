@@ -621,6 +621,37 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink) !void {
+        const Bridge = struct {
+            sink: @import("../runtime_scan_sink.zig").ScanStreamSink,
+            failure: ?anyerror = null,
+            fn start(ptr: ?*anyopaque) callconv(.c) u8 {
+                const bridge: *@This() = @ptrCast(@alignCast(ptr.?));
+                bridge.sink.start() catch |err| {
+                    bridge.failure = err;
+                    return 0;
+                };
+                return 1;
+            }
+            fn write(ptr: ?*anyopaque, bytes: abi.BorrowedBytes) callconv(.c) u8 {
+                const bridge: *@This() = @ptrCast(@alignCast(ptr.?));
+                bridge.sink.write(bytes.slice()) catch |err| {
+                    bridge.failure = err;
+                    return 0;
+                };
+                return 1;
+            }
+        };
+        var bridge = Bridge{ .sink = sink };
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_scan_stream(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+        }, &.{ .context = &bridge, .start = Bridge.start, .write = Bridge.write }, &failure);
+        if (bridge.failure) |err| return err;
+        try acceptStorageOwnerFailure(status, failure, "storage-owner scan");
+    }
+
     pub fn scanNdjson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_scan_ndjson(
@@ -631,6 +662,22 @@ pub const Owner = struct {
             },
             &response.buffer,
         ));
+        return response;
+    }
+
+    pub fn graphMetricMaintenanceJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_graph_metric_maintenance_json(
+            self.handle,
+            &.{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(request_json),
+            },
+            &response.buffer,
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner graph metric maintenance");
         return response;
     }
 

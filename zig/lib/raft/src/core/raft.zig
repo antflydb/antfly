@@ -693,7 +693,10 @@ pub const Raft = struct {
             if (self.pending_snapshot) |*snapshot| snapshot.deinit(self.alloc);
             self.pending_snapshot = null;
         }
-        if (rd.entries.len > 0) self.log.stableTo(rd.entries[rd.entries.len - 1].index);
+        if (rd.entries.len > 0) {
+            const persisted = rd.entries[rd.entries.len - 1];
+            self.log.stableTo(persisted.index, persisted.term);
+        }
         if (rd.committed_entries.len > 0) {
             self.log.appliedTo(rd.committed_entries[rd.committed_entries.len - 1].index);
             self.reduceUncommittedSizeEntries(rd.committed_entries);
@@ -822,7 +825,7 @@ pub const Raft = struct {
 
     fn handleStorageAppendResponse(self: *Raft, msg: message.Message) void {
         if (msg.term != 0 and msg.term != self.hard_state.current_term) return;
-        if (msg.log_index > 0) self.log.stableTo(msg.log_index);
+        if (msg.log_index > 0) self.log.stableTo(msg.log_index, msg.log_term);
         if (msg.snapshot != null) {
             if (self.pending_snapshot) |*snapshot| snapshot.deinit(self.alloc);
             self.pending_snapshot = null;
@@ -1004,7 +1007,7 @@ pub const Raft = struct {
 
     fn handleAppendEntries(self: *Raft, msg: message.Message) !void {
         if (msg.term < self.hard_state.current_term) {
-            try self.sendAppendResponse(msg.from, true, self.log.lastIndex());
+            try self.sendAppendResponse(msg.from, true, msg.log_index);
             return;
         }
 
@@ -1015,12 +1018,13 @@ pub const Raft = struct {
             self.hard_state.commit_index = self.log.committed;
             try self.sendAppendResponse(msg.from, false, last_new_index);
         } else {
-            try self.sendAppendResponse(msg.from, true, self.log.lastIndex());
+            try self.sendAppendResponse(msg.from, true, msg.log_index);
         }
     }
 
     fn handleAppendEntriesResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
+        if (msg.term != self.hard_state.current_term) return;
         const idx = peerIndex(self.peers, msg.from) orelse return;
 
         if (self.progress[idx].pending_snapshot_attempt) |pending| {
@@ -1034,24 +1038,56 @@ pub const Raft = struct {
         }
 
         if (msg.reject) {
+            // A rejection identifies the previous index of the append that
+            // failed, not the follower's last index (which is only a hint).
+            // Delayed failures must not discard a newer successful prefix or
+            // reopen the window for an already superseded probe.
+            if (msg.log_index == msg.reject_hint) {
+                // Older binaries put follower lastIndex in both fields. This
+                // feedback cannot identify an obsolete request. During a
+                // pipeline, coalesce it until a heartbeat; intervening forward
+                // progress cancels it. Never amplify every delayed rejection
+                // into another payload batch or regress the matched prefix.
+                if (self.progress[idx].state == .replicate) {
+                    self.progress[idx].legacy_rejection_pending = true;
+                    return;
+                }
+                const next = @max(self.progress[idx].match_index + 1, @min(
+                    self.progress[idx].next_index - 1,
+                    msg.reject_hint +| 1,
+                ));
+                if (next >= self.progress[idx].next_index and next >= self.log.firstIndex()) return;
+                self.progress[idx].next_index = next;
+            } else if (self.progress[idx].state == .replicate) {
+                if (msg.log_index <= self.progress[idx].match_index) return;
+                self.progress[idx].next_index = self.progress[idx].match_index + 1;
+            } else {
+                if (msg.log_index != self.progress[idx].next_index - 1) return;
+                self.progress[idx].next_index = @max(
+                    self.progress[idx].match_index + 1,
+                    @min(msg.log_index, msg.reject_hint +| 1),
+                );
+            }
             self.progress[idx].state = .probe;
             self.progress[idx].probe_sent = false;
             self.clearInflights(idx);
-            const next_index = if (msg.reject_hint > 0) msg.reject_hint else self.progress[idx].next_index -| 1;
-            self.progress[idx].next_index = @max(@as(types.Index, 1), next_index);
             try self.sendAppend(msg.from);
             return;
         }
 
         const was_probe = self.progress[idx].state == .probe;
+        if (msg.log_index < self.progress[idx].match_index or
+            (msg.log_index == self.progress[idx].match_index and
+                (!was_probe or msg.log_index != self.progress[idx].next_index - 1))) return;
         self.progress[idx].state = .replicate;
+        self.progress[idx].legacy_rejection_pending = false;
         self.freeInflightsTo(idx, msg.log_index);
         self.progress[idx].match_index = msg.log_index;
-        self.progress[idx].next_index = msg.log_index + 1;
+        self.progress[idx].next_index = if (was_probe) msg.log_index + 1 else @max(self.progress[idx].next_index, msg.log_index + 1);
         self.progress[idx].probe_sent = false;
         if (self.maybeCommit()) {
             try self.bcastAppend();
-        } else if (was_probe) {
+        } else if (was_probe or self.progress[idx].next_index <= self.log.lastIndex()) {
             try self.sendAppend(msg.from);
         }
         if (self.lead_transferee == msg.from and self.progress[idx].match_index == self.log.lastIndex()) {
@@ -1086,7 +1122,23 @@ pub const Raft = struct {
 
     fn handleHeartbeatResponse(self: *Raft, msg: message.Message) !void {
         if (self.soft_state.role != .leader) return;
+        if (msg.term != self.hard_state.current_term) return;
         if (peerIndex(self.peers, msg.from)) |idx| {
+            if (self.progress[idx].legacy_rejection_pending and
+                self.progress[idx].pending_snapshot_attempt == null)
+            {
+                self.progress[idx].legacy_rejection_pending = false;
+                if (self.progress[idx].state == .replicate and
+                    self.progress[idx].match_index < self.log.lastIndex())
+                {
+                    // Legacy wire feedback cannot fence a particular append.
+                    // Retry once per heartbeat from the proven prefix, keeping
+                    // the normal message/byte bounds and future pipelining.
+                    self.progress[idx].state = .probe;
+                    self.progress[idx].next_index = self.progress[idx].match_index + 1;
+                    self.clearInflights(idx);
+                }
+            }
             // A dedicated snapshot attempt remains authoritative until its
             // transport completion fails or the follower acknowledges it.
             // Heartbeats must not mint duplicate multi-gigabyte attempts.
@@ -1097,6 +1149,14 @@ pub const Raft = struct {
                 self.isReplicationTarget(msg.from))
             {
                 try self.sendAppend(msg.from);
+            } else if (self.progress[idx].state == .replicate and
+                self.progress[idx].match_index < self.log.lastIndex())
+            {
+                // A lost append/ack must not leave a full inflight window
+                // permanently paused. Probe its prefix without cloning any
+                // payload; a success frees the window and a rejection resumes
+                // ordinary catch-up from the last acknowledged prefix.
+                try self.sendAppendWithProbe(msg.from, true);
             }
         }
         if (msg.context.len > 0) {
@@ -1334,6 +1394,10 @@ pub const Raft = struct {
     }
 
     fn sendAppend(self: *Raft, to: types.NodeId) !void {
+        try self.sendAppendWithProbe(to, false);
+    }
+
+    fn sendAppendWithProbe(self: *Raft, to: types.NodeId, probe_full_window: bool) !void {
         if (!self.isReplicationTarget(to)) return;
         const idx = peerIndex(self.peers, to) orelse return;
         const next_index = self.progress[idx].next_index;
@@ -1346,14 +1410,14 @@ pub const Raft = struct {
         const prev_index = next_index -| 1;
         const prev_term = self.log.term(prev_index) orelse 0;
         const msg_size_limit = if (self.cfg.max_size_per_msg == 0) @as(usize, 1) else self.cfg.max_size_per_msg;
-        const entries = self.log.entriesFromMax(next_index, msg_size_limit);
-        const inflight_bytes = types.entriesApproxEncodedSize(entries);
+        var entries = self.log.entriesFromMax(next_index, msg_size_limit);
         if (to != self.cfg.id and
             entries.len > 0 and
             self.progress[idx].state == .replicate and
             (self.inflights[idx].items.len >= self.cfg.max_inflight_msgs or self.inflightBytesFull(idx)))
         {
-            return;
+            if (!probe_full_window) return;
+            entries = &.{};
         }
         if (to != self.cfg.id and
             entries.len > 0 and
@@ -1363,6 +1427,7 @@ pub const Raft = struct {
             return;
         }
         const sent_last_index = if (entries.len > 0) entries[entries.len - 1].index else prev_index;
+        const inflight_bytes = types.entriesApproxEncodedSize(entries);
 
         try self.send(.{
             .msg_type = .append_entries,
@@ -1511,6 +1576,10 @@ pub const Raft = struct {
             quorum_idx = @min(incoming_idx, outgoing_idx);
         }
         const prev_committed = self.log.committed;
+        // Counting replicas may commit only an entry from this leader's term.
+        // Its preceding entries become committed indirectly; an older term's
+        // majority alone can still be overwritten after another election.
+        if (quorum_idx <= prev_committed or !self.log.matchTerm(quorum_idx, self.hard_state.current_term)) return false;
         self.log.commitTo(quorum_idx);
         self.hard_state.commit_index = self.log.committed;
         if (self.log.committed != prev_committed) self.trace(.commit, null);

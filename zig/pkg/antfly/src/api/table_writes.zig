@@ -400,6 +400,21 @@ fn pinWriteCacheLsmOwnerEntriesBestEffort(
     return .{ .cache = cache, .storage = storage, .count = entry_count };
 }
 
+const GraphMetricGroupActionRequest = @import("local_write_contract.zig").GraphMetricGroupActionRequest;
+const graph_metric_group_action_operation = @import("local_write_contract.zig").graph_metric_group_action_operation;
+const graphMetricGroupActionBodyAlloc = @import("local_write_contract.zig").graphMetricGroupActionBodyAlloc;
+const applyGraphMetricActionToDb = physical_local_write.applyGraphMetricActionToDb;
+const runGraphMetricMaintenanceOrActionJsonAlloc = physical_local_write.runGraphMetricMaintenanceOrActionJsonAlloc;
+
+fn parseGraphMetricGroupActionStatusAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !db_mod.types.GraphMetricStatus {
+    var parsed = try std.json.parseFromSlice(db_mod.types.GraphMetricStatus, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return try query_api.cloneGraphMetricStatus(alloc, parsed.value);
+}
+
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
     table_name: []const u8,
@@ -456,6 +471,7 @@ const startup_catch_up_no_progress_threshold: u8 = 3;
 const startup_catch_up_quarantine_base_ms: u64 = 30 * std.time.ms_per_s;
 const startup_catch_up_quarantine_max_ms: u64 = 10 * std.time.s_per_min * std.time.ms_per_s;
 const artifact_repair_max_groups_per_request: usize = 64;
+const graph_metric_action_fanout_max: usize = 16;
 const restore_trash_dir_name = ".antfly-restore-trash";
 // Explicit cache bulk sessions are reserved for rebuild/import paths. Normal
 // API uploads no longer start these windows automatically; DB/storage owns
@@ -626,6 +642,7 @@ var test_after_runtime_status_publish_hook: ?local_write_test_hooks.TestExecutio
 var test_before_create_structural_publish_hook: ?local_write_test_hooks.TestExecutionHook = null;
 var test_before_index_activation_enqueue_hook: ?local_write_test_hooks.TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?local_write_test_hooks.TestExecutionHook = null;
+var test_before_structural_index_reconcile_hook: ?*const fn (*db_mod.DB) anyerror!void = null;
 var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
@@ -3146,8 +3163,7 @@ pub const ProvisionedTableWriteCache = struct {
         // cache owner so healthy repair does not remain indeterminate until an
         // unrelated reopen. Read-only and short-lived catch-up DBs are gated
         // out by the DB worker itself.
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
@@ -3514,8 +3530,7 @@ pub const ProvisionedTableWriteCache = struct {
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
         opened.* = null;
         return .{
             .cache = self,
@@ -3575,8 +3590,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
         try self.entries.append(self.alloc, owned_entry);
-        owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
-        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
+        owned_entry.db.startResidentBackgroundWorkersIfNeeded();
     }
 
     pub fn getLocked(
@@ -6042,6 +6056,9 @@ pub const BoundTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
@@ -6528,7 +6545,13 @@ pub const BoundTableWriteSource = struct {
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFileWithIo(alloc, restored.core.store, snapshot_root, restore_io);
+                try importPortableBackupFileWithOptions(alloc, restored.core.store, snapshot_root, restore_io, .{
+                    .unpublished_staging = true,
+                    .cancellation = plan.cancellation,
+                    .progress_context = plan.progress_context,
+                    .progress_fn = plan.progress_fn,
+                });
+                try restored.reloadSchemaForInternalRestore();
                 try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
                 try plan.cancellation.check();
@@ -6705,7 +6728,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
 
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, table.writes, table.deletes, table.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
@@ -6902,6 +6925,44 @@ pub const BoundTableWriteSource = struct {
         _ = try (try self.activeDb()).deleteIndex(index_name);
     }
 
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (cancellation.isCancelled()) return error.Canceled;
+        return try applyGraphMetricActionToDb(alloc, try self.activeDb(), index_name, metric_name, action);
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, try self.activeDb(), body);
+    }
+
     fn batchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6977,7 +7038,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
-        try validateTransactionAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         try db.writeTransaction(txn_id, req);
     }
@@ -15167,7 +15228,10 @@ pub const ProvisionedTableWriteSource = struct {
             if (result.index_repair_paused) result.had_debt = true;
             repair_handoff_publication = self.authorizeRepairHandoffOwnerPublicationBestEffort(table_name, group_id);
         }
-        self.retireCachesAfterIndexRepairCompletion(table_name, result, !use_live_owner);
+        // A cold repair can promote its DB into the normal writer cache.
+        // Completion must follow current ownership, not whether that writer
+        // was already resident when this quantum began.
+        self.retireCachesAfterIndexRepairCompletion(table_name, result, !managed_owner_is_live_writer);
         if (result.terminalDegraded()) {
             // The terminal observation was published from the final durable
             // audit above. Do not relabel it as a fresh live-writer snapshot.
@@ -19577,6 +19641,7 @@ pub const ProvisionedTableWriteSource = struct {
                 cached_active = false;
             };
 
+            var enrichment_reconfigured = false;
             if (target_index_name == null) {
                 if (metadata.schema_json) |schema_json| try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
             }
@@ -19587,7 +19652,7 @@ pub const ProvisionedTableWriteSource = struct {
                     break :matches ProvisionedTableWriteCache.entryManagedConfigMatches(cached.entry.?, indexes_json);
                 };
                 if (!managed_config_matches) {
-                    try reconfigureManagedDbEnrichmentRuntime(
+                    try reconfigureManagedDbEnrichmentRuntimePaused(
                         alloc,
                         cached.db,
                         indexes_json,
@@ -19599,9 +19664,10 @@ pub const ProvisionedTableWriteSource = struct {
                         self.secret_store,
                         self.remote_content,
                     );
-                    lockAtomic(&self.local_db_mutex);
-                    ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
-                    self.local_db_mutex.unlock();
+                    // Keep the replacement paused through durable admission;
+                    // starting it here lets sibling corpus work race the next
+                    // structural barrier and forces a second cancellation/join.
+                    enrichment_reconfigured = true;
                 }
                 if (target_index_name == null) {
                     if (metadata.schema_json) |schema_json| {
@@ -19626,10 +19692,19 @@ pub const ProvisionedTableWriteSource = struct {
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
                 };
+                if (builtin.is_test) {
+                    if (test_before_structural_index_reconcile_hook) |hook| try hook(cached.db);
+                }
                 const reconcile_summary = if (target_index_name) |target|
                     try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, cached.db, indexes_json, target, reconcile_options)
                 else
                     try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, reconcile_options);
+                if (enrichment_reconfigured) {
+                    try cached.db.resumeEnrichmentRuntimeAfterReconfigure("structural reconciliation", target_index_name orelse "*");
+                    lockAtomic(&self.local_db_mutex);
+                    ProvisionedTableWriteCache.publishEntryManagedConfig(cached.entry.?, indexes_json);
+                    self.local_db_mutex.unlock();
+                }
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                     if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
@@ -20485,7 +20560,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .drop_table = dropTable,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
@@ -20535,6 +20613,100 @@ pub const ProvisionedTableWriteSource = struct {
                 .request_table_index_structural_reconcile = requestTableIndexStructuralReconcile,
             },
         };
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.graphMetricMaintenanceGroupLocal(alloc, group_id, table_name, body);
+        }
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+            defer cached.deinit(alloc);
+            return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
+        }
+
+        var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror) catch |err| switch (err) {
+            error.FileNotFound => return error.UnknownGroup,
+            else => return err,
+        };
+        defer db.close();
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, &db, body);
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.graphMetricActionWithCancellation(alloc, table_name, index_name, metric_name, action, cancellation);
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const group_ids = try resolveCatalogGroupsEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10);
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var aggregate: ?db_mod.types.GraphMetricStatus = null;
+        errdefer if (aggregate) |*status| status.deinit(alloc);
+        for (group_ids) |group_id| {
+            if (cancellation.isCancelled()) return error.Canceled;
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            self.beginGroupOperation(table_name, group_id);
+            defer self.endGroupOperation(table_name, group_id);
+            var shard_status = if (comptime control_only_storage_sources) blk: {
+                const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+                const body = try graphMetricGroupActionBodyAlloc(alloc, index_name, metric_name, action);
+                defer alloc.free(body);
+                const response = (try local_source.graphMetricMaintenanceGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup;
+                defer alloc.free(response);
+                break :blk try parseGraphMetricGroupActionStatusAlloc(alloc, response);
+            } else if (self.write_cache) |cache| blk: {
+                var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null);
+                defer cached.deinit(alloc);
+                break :blk try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
+            } else blk: {
+                var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+                defer db.close();
+                break :blk try applyGraphMetricActionToDb(alloc, &db, index_name, metric_name, action);
+            };
+            if (aggregate) |*status| {
+                query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                    shard_status.deinit(alloc);
+                    return err;
+                };
+                shard_status.deinit(alloc);
+            } else aggregate = shard_status;
+        }
+        return aggregate;
     }
 
     fn putArtifactEnrichment(
@@ -22792,7 +22964,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, cached.db, apply_req))
+                    try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
                 local_write_test_hooks.runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
                 if (apply_req.transaction != null) {
@@ -22846,13 +23019,15 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 false;
             if (!already_applied) {
-                if (local_prepared) {
-                    const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse
-                        return error.MissingLocalTableManifest;
-                    defer alloc.free(schema_json);
-                    try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
-                } else {
-                    try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                if (!try batchUsesDurableTransactionContract(alloc, &db, apply_req)) {
+                    if (local_prepared) {
+                        const schema_json = (try loadLocalTableSchemaJson(alloc, &db)) orelse
+                            return error.MissingLocalTableManifest;
+                        defer alloc.free(schema_json);
+                        try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                    } else {
+                        try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                    }
                 }
                 local_write_test_hooks.runTestBeforeBatchExecutionHook();
                 try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
@@ -23438,7 +23613,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try cached.db.writeTransaction(txn_id, req);
             lockAtomic(&self.local_db_mutex);
@@ -23448,7 +23623,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
+            try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, txn_id, table_name, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(context);
             try db.writeTransaction(txn_id, req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
@@ -25510,6 +25685,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .drop_index = dropIndex,
+                .graph_metric_action = graphMetricAction,
+                .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .accept_committed_index_mutation = acceptCommittedIndexMutation,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
@@ -25549,6 +25727,228 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.graphMetricMaintenanceGroupLocal(alloc, group_id, table_name, body);
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
+    }
+
+    fn graphMetricActionForRoute(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        route: table_router.GroupRoute,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !db_mod.types.GraphMetricStatus {
+        if (cancellation.isCancelled()) return error.Canceled;
+        return switch (route) {
+            .local => blk: {
+                const response_body = (try graphMetricMaintenanceGroupLocal(self, alloc, group_id, table_name, body)) orelse
+                    return error.UnknownGroup;
+                defer alloc.free(response_body);
+                break :blk try parseGraphMetricGroupActionStatusAlloc(alloc, response_body);
+            },
+            .remote => |remote| blk: {
+                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var request_cancellation = http_common.RequestCancellation.fromToken(cancellation);
+                var response = try client.fetchGroupGraphMetricMaintenanceWithCancellation(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    if (cancellation.ptr != null) &request_cancellation else null,
+                );
+                defer response.deinit(alloc);
+                break :blk try parseGraphMetricGroupActionStatusAlloc(alloc, response.body);
+            },
+        };
+    }
+
+    fn graphMetricAction(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) !?db_mod.types.GraphMetricStatus {
+        return try graphMetricActionWithCancellation(ptr, alloc, table_name, index_name, metric_name, action, .none);
+    }
+
+    fn graphMetricActionWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?db_mod.types.GraphMetricStatus {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try resolveCatalogGroupsEventually(alloc, self.catalog, table_name, "", "", 5 * std.time.ns_per_s, 10);
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        const body = try graphMetricGroupActionBodyAlloc(alloc, index_name, metric_name, action);
+        defer alloc.free(body);
+
+        // Resolve the complete route set before mutating any shard. This avoids
+        // an avoidable partial action when topology is already incomplete.
+        const routes = try alloc.alloc(table_router.GroupRoute, group_ids.len);
+        var routes_initialized: usize = 0;
+        defer {
+            for (routes[0..routes_initialized]) |*route| route.deinit(alloc);
+            alloc.free(routes);
+        }
+        for (group_ids, 0..) |group_id, i| {
+            routes[i] = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse
+                return error.LeaderUnavailable;
+            routes_initialized += 1;
+        }
+
+        var aggregate: ?db_mod.types.GraphMetricStatus = null;
+        errdefer if (aggregate) |*status| status.deinit(alloc);
+
+        var api_lane: ?db_mod.background_runtime.BackendRuntime.ApiLaneLease = if (self.backend_runtime) |runtime|
+            runtime.acquireApiLane() catch |err| switch (err) {
+                error.BackendRuntimeUnavailable => null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (api_lane) |*lane| lane.release();
+        if (api_lane == null or group_ids.len == 1) {
+            var accepted_groups: usize = 0;
+            for (group_ids, routes) |group_id, route| {
+                var shard_status = self.graphMetricActionForRoute(alloc, route, group_id, table_name, body, cancellation) catch |err| {
+                    if (accepted_groups == 0) return err;
+                    std.log.warn(
+                        "graph metric action partially accepted table={s} index={s} metric={s} action={s} accepted_groups={} failed_group_id={} err={s}; retry is safe",
+                        .{ table_name, index_name, metric_name, action, accepted_groups, group_id, @errorName(err) },
+                    );
+                    return error.GraphMetricActionPartialOutcome;
+                };
+                accepted_groups += 1;
+                if (aggregate) |*status| {
+                    query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                        shard_status.deinit(alloc);
+                        std.log.warn(
+                            "graph metric action accepted but shard status aggregation failed table={s} index={s} metric={s} action={s} accepted_groups={} err={s}; retry is safe",
+                            .{ table_name, index_name, metric_name, action, accepted_groups, @errorName(err) },
+                        );
+                        return error.GraphMetricActionPartialOutcome;
+                    };
+                    shard_status.deinit(alloc);
+                } else aggregate = shard_status;
+            }
+            return aggregate;
+        }
+
+        const Slot = struct {
+            arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            status: ?db_mod.types.GraphMetricStatus = null,
+            err: ?anyerror = null,
+        };
+        const slots = try alloc.alloc(Slot, group_ids.len);
+        defer {
+            for (slots) |*slot| slot.arena.deinit();
+            alloc.free(slots);
+        }
+        for (slots) |*slot| slot.* = .{};
+
+        const Fiber = struct {
+            fn run(
+                hosted_source: *HostedProvisionedTableWriteSource,
+                slot: *Slot,
+                route: table_router.GroupRoute,
+                group_id: u64,
+                table_name_inner: []const u8,
+                body_inner: []const u8,
+                cancellation_inner: db_mod.types.CancellationToken,
+            ) void {
+                slot.status = hosted_source.graphMetricActionForRoute(
+                    slot.arena.allocator(),
+                    route,
+                    group_id,
+                    table_name_inner,
+                    body_inner,
+                    cancellation_inner,
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+            }
+        };
+        const io = api_lane.?.io();
+        const width = @max(@as(usize, 1), @min(
+            group_ids.len,
+            @min(graph_metric_action_fanout_max, @as(usize, @intCast(api_lane.?.concurrentCapacity()))),
+        ));
+        var start: usize = 0;
+        while (start < group_ids.len) : (start += width) {
+            const end = @min(start + width, group_ids.len);
+            var group: Io.Group = .init;
+            for (group_ids[start..end], routes[start..end], start..end) |group_id, route, i| {
+                group.async(io, Fiber.run, .{ self, &slots[i], route, group_id, table_name, body, cancellation });
+            }
+            group.await(io) catch {};
+        }
+        var accepted_groups: usize = 0;
+        var first_failed_group: ?u64 = null;
+        var first_error: ?anyerror = null;
+        for (slots, group_ids) |slot, group_id| {
+            if (slot.err) |err| {
+                if (first_error == null) {
+                    first_error = err;
+                    first_failed_group = group_id;
+                }
+            } else if (slot.status != null) {
+                accepted_groups += 1;
+            } else if (first_error == null) {
+                first_error = error.UnknownGroup;
+                first_failed_group = group_id;
+            }
+        }
+        if (first_error) |err| {
+            if (accepted_groups == 0) return err;
+            std.log.warn(
+                "graph metric action partially accepted table={s} index={s} metric={s} action={s} accepted_groups={} total_groups={} first_failed_group_id={} err={s}; retry is safe",
+                .{ table_name, index_name, metric_name, action, accepted_groups, group_ids.len, first_failed_group.?, @errorName(err) },
+            );
+            return error.GraphMetricActionPartialOutcome;
+        }
+        for (slots) |slot| {
+            const shard_status = slot.status orelse return error.UnknownGroup;
+            if (aggregate) |*status| {
+                query_api.mergeCompatibleGraphMetricStatusInto(alloc, status, shard_status) catch |err| {
+                    std.log.warn(
+                        "graph metric action accepted by all shards but status aggregation failed table={s} index={s} metric={s} action={s} total_groups={} err={s}; retry is safe",
+                        .{ table_name, index_name, metric_name, action, group_ids.len, @errorName(err) },
+                    );
+                    return error.GraphMetricActionPartialOutcome;
+                };
+            } else {
+                aggregate = try query_api.cloneGraphMetricStatus(alloc, shard_status);
+            }
+        }
+        return aggregate;
     }
 
     fn persistentDropCleanupSource(
@@ -26270,7 +26670,8 @@ pub const HostedProvisionedTableWriteSource = struct {
         // epoch check and making the transaction durable.
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
-        try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
+        if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
+            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
         try ensurePreDecisionContextActive(context);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
@@ -28980,32 +29381,7 @@ fn reconfigureManagedDbEnrichments(
 
 const reconfigureManagedDbEnrichmentRuntime = physical_local_write.reconfigureManagedDbEnrichmentRuntime;
 
-fn reconfigureManagedDbEnrichmentRuntimePaused(
-    _: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    antfly_provider: ?managed_embedder.AntflyProvider,
-    remote_capability_cache: ?*remote_capabilities.Cache,
-    inference_api_url: ?[]const u8,
-    source_table: []const u8,
-    secret_store: ?*common_secrets.FileStore,
-    remote_content: ?*const scraping.RemoteContentConfig,
-) !void {
-    var enrichments = try createManagedDbEnrichments(
-        db.runtime_alloc,
-        indexes_json,
-        backend_runtime,
-        antfly_provider,
-        remote_capability_cache,
-        inference_api_url,
-        source_table,
-        secret_store,
-        remote_content,
-    );
-    defer enrichments.deinit(db.runtime_alloc);
-    try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
-}
+const reconfigureManagedDbEnrichmentRuntimePaused = physical_local_write.reconfigureManagedDbEnrichmentRuntimePaused;
 
 pub const StartupCatchUpMetadata = local_write_contract.StartupCatchUpMetadata;
 
@@ -29553,7 +29929,10 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
-                .stats = try db.stats(alloc),
+                // A cold startup has no retained serving observation to
+                // overlay. Retry contention instead of publishing partial
+                // operational telemetry as an observed index inventory.
+                .stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
             };
             defer status.deinit(alloc);
             const startup = startupCatchUpStatsForPhase(phase, db);
@@ -31439,13 +31818,23 @@ fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.Do
 }
 
 fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
+    return importPortableBackupFileWithOptions(alloc, store, path, io, .{});
+}
+
+fn importPortableBackupFileWithOptions(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, options: portable_backup.ImportOptions) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
-    try portable_backup.importPortableFile(alloc, store, io, file, stat.size);
+    try portable_backup.importPortableFileWithOptions(alloc, store, io, file, stat.size, options);
+    try options.cancellation.check();
+    portable_backup.validateCompleteDatabaseImageAlloc(alloc, store) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidBackupRequest,
+    };
+    try options.cancellation.check();
 }
 
 const freeBackupShards = local_write_contract.freeBackupShards;
@@ -31514,13 +31903,23 @@ fn transactionWritesAsBatchWrites(
 
 const validateTableBatchAgainstLocalSchema = physical_local_write.validateTableBatchAgainstLocalSchema;
 
+// API preflight is advisory. Once a participant has a durable epoch/decision,
+// validating a retry against the latest catalog can reject an already accepted
+// write. DB preparation validates the pinned contract with its admission
+// ledger; terminal retries resolve the existing decision instead of its input.
+pub const transactionUsesDurableContract = physical_local_write.transactionUsesDurableContract;
+
+pub const batchUsesDurableTransactionContract = physical_local_write.batchUsesDurableTransactionContract;
+
 fn validateTransactionAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstLocalSchema(alloc, db, batch_writes, deletes, transforms);
@@ -32107,11 +32506,13 @@ fn validateTransactionAgainstCatalogSchema(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     db: *db_mod.DB,
+    txn_id: db_mod.types.TxnId,
     table_name: []const u8,
     writes: []const db_mod.types.TransactionWrite,
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
@@ -32642,6 +33043,18 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "graph metric group action envelope is typed and versioned" {
+            const alloc = std.testing.allocator;
+            const body = try graphMetricGroupActionBodyAlloc(alloc, "graph_idx", "pagerank", "refresh");
+            defer alloc.free(body);
+            var parsed = try std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(graph_metric_group_action_operation, parsed.value.operation.?);
+            try std.testing.expectEqualStrings("graph_idx", parsed.value.index_name);
+            try std.testing.expectEqualStrings("pagerank", parsed.value.metric_name);
+            try std.testing.expectEqualStrings("refresh", parsed.value.action);
+        }
+
         test "activation progress preserves every terminal failure class" {
             const cases = [_]struct {
                 code: metadata_mod.IndexActivationProgress.FailureCode,
@@ -39577,6 +39990,7 @@ fn implementationTests() type {
                 return error.TestExpectedHostedCache;
             try std.testing.expect(cache.drop_cleanup_source != null);
         }
+
         test "unrelated repair visibility edge invalidates during targeted reconciliation" {
             const alloc = std.testing.allocator;
             var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
@@ -39828,6 +40242,7 @@ fn implementationTests() type {
             try std.testing.expect(preserved.items[0].stats.indexes[0].serving_snapshot_ready);
             try std.testing.expect(!preserved.items[0].metadata.target_observation_complete);
         }
+
         test "targeted repair visibility edge preserves exact sibling cache authority" {
             const alloc = std.testing.allocator;
             var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
@@ -40220,6 +40635,7 @@ fn implementationTests() type {
             var iterator = repair_dir.iterate();
             try std.testing.expect((try iterator.next(io_impl.io())) == null);
         }
+
         test "managed structural catch-up does not delegate an empty producer handoff" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
@@ -40847,6 +41263,14 @@ fn implementationTests() type {
 
             try std.testing.expect(!published_while_busy);
             try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+
+            for ([_]db_mod.types.StartupCatchUpPhase{ .opening_db, .artifact_rebuild, .startup_catch_up }) |phase| {
+                db.core.lockApplyExclusive();
+                const startup_publication = publishRuntimeStatusSnapshotWithStartupPhase(&source, alloc, "docs", 7001, phase, &db);
+                db.core.unlockApplyExclusive();
+                try std.testing.expectError(error.WriterLocked, startup_publication);
+                try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+            }
 
             try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db));
             var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -41561,6 +41985,7 @@ fn implementationTests() type {
             defer result.deinit(alloc);
             try std.testing.expectEqualStrings("{\"name\":\"alpha\"}", result.json);
         }
+
         test "provisioned single-group commit batch uses atomic shard fast path" {
             const alloc = std.testing.allocator;
             var path_tmp = try TestDirectory.init("antfly-api-provisioned-single-group-commit-fast-path");
@@ -43409,12 +43834,38 @@ fn implementationTests() type {
                 .timestamp_ns = 2,
             });
 
-            _ = try source.source().restoreTable(alloc, "docs", .{
+            const Progress = struct {
+                cancelled: std.atomic.Value(bool) = .init(false),
+                cancel_on_rows: bool = true,
+                rows: u64 = 0,
+                fn update(ctx: ?*anyopaque, progress: portable_backup.ImportProgress) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    self.rows = progress.rows_validated;
+                    if (self.cancel_on_rows and self.rows > 0) self.cancelled.store(true, .release);
+                }
+            };
+            var progress = Progress{};
+            const restore_plan = backups_api.TableRestorePlan{
                 .backup_root = backup_root,
                 .manifest = &manifest,
                 .artifact_backup_id = manifest.backup_id,
                 .source_location = "file:///bound-portable-test",
-            });
+                .cancellation = .fromAtomic(&progress.cancelled),
+                .progress_context = &progress,
+                .progress_fn = Progress.update,
+            };
+            try std.testing.expectError(error.Canceled, source.source().restoreTable(alloc, "docs", restore_plan));
+            try std.testing.expectEqual(@as(u64, 1), progress.rows);
+            {
+                var unchanged = (try db.lookup(alloc, "doc:a", .{})).?;
+                defer unchanged.deinit(alloc);
+                try std.testing.expect(std.mem.indexOf(u8, unchanged.json, "\"beta\"") != null);
+            }
+            progress.cancel_on_rows = false;
+            progress.cancelled.store(false, .release);
+            progress.rows = 0;
+            _ = try source.source().restoreTable(alloc, "docs", restore_plan);
+            try std.testing.expectEqual(@as(u64, 1), progress.rows);
 
             var restored = (try db.lookup(alloc, "doc:a", .{})).?;
             defer restored.deinit(alloc);
@@ -44183,8 +44634,6 @@ fn implementationTests() type {
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
-            var db = try db_mod.DB.open(alloc, db_path, .{});
-            defer db.close();
 
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
@@ -44345,8 +44794,8 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u16, 200), public_query.status);
             try std.testing.expect(std.mem.indexOf(u8, public_query.body, "\"doc:a\"") != null);
 
-            db.close();
-            db = try db_mod.DB.open(alloc, db_path, .{});
+            var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+            defer db.close();
 
             var restored = (try db.lookup(alloc, "doc:a", .{})).?;
             defer restored.deinit(alloc);
@@ -44405,7 +44854,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .description = "docs table",
-                            .schema_json = "",
+                            .schema_json = tables_api.default_schema_json,
                             .read_schema_json = "",
                             .indexes_json = tables_api.default_indexes_json,
                             .replication_sources_json = "[]",
@@ -44547,7 +44996,7 @@ fn implementationTests() type {
                     .table_id = 7,
                     .name = "docs",
                     .description = "docs table",
-                    .schema_json = "",
+                    .schema_json = tables_api.default_schema_json,
                     .read_schema_json = "",
                     .indexes_json = tables_api.default_indexes_json,
                     .replication_sources_json = "[]",
@@ -45243,9 +45692,16 @@ fn implementationTests() type {
             try std.testing.expect(try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns));
             const primary_after_idle = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
             try std.testing.expectEqual(primary_before_idle.immutable_flushes, primary_after_idle.immutable_flushes);
-            try std.testing.expectEqual(primary_before_idle.manifest_writes, primary_after_idle.manifest_writes);
+            // Idle completion may settle pending manifest/obsolete-file metadata.
+            // Its contract is no forced SST publication, not zero metadata writes.
+            try std.testing.expectEqual(primary_before_idle.flushes, primary_after_idle.flushes);
+            try std.testing.expectEqual(primary_before_idle.table_file_writes, primary_after_idle.table_file_writes);
+            try std.testing.expectEqual(primary_before_idle.compactions, primary_after_idle.compactions);
             try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
             try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
+            try std.testing.expect(!try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns + 1));
+            const primary_after_recheck = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
+            try std.testing.expectEqual(primary_after_idle.manifest_writes, primary_after_recheck.manifest_writes);
         }
 
         test "maintenance lease batch releases all pins on every allocation failure" {
@@ -47324,7 +47780,7 @@ fn implementationTests() type {
 
             var source = BoundTableWriteSource.init("docs", &db);
             var req = tables_api.CreateTableRequest{
-                .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"keyword\"}}}}}}"),
+                .schema_json = try alloc.dupe(u8, "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"aliases\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}}}}}}"),
             };
             defer req.deinit(alloc);
             _ = try source.source().createTable(alloc, "docs", req);
@@ -48021,8 +48477,10 @@ fn implementationTests() type {
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
-            var db = try db_mod.DB.open(alloc, db_path, .{});
-            defer db.close();
+            {
+                var db = try db_mod.DB.open(alloc, db_path, .{});
+                defer db.close();
+            }
 
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
@@ -48054,6 +48512,7 @@ fn implementationTests() type {
             };
 
             var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+            defer source.deinit();
             try std.testing.expectError(error.InvalidBatchRequest, source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }},
             }));
@@ -48326,6 +48785,22 @@ fn implementationTests() type {
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
             const resident_db = &write_cache.entries.items[0].db;
 
+            const AdmissionBoundary = struct {
+                var observations: usize = 0;
+                fn check(db: *db_mod.DB) !void {
+                    if (observations == 0) {
+                        // The replacement producer is installed, but must not begin
+                        // source work before the requested catalog admission exists.
+                        try std.testing.expect(db.enrichment_runtime != null);
+                        try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+                    }
+                    observations += 1;
+                }
+            };
+            AdmissionBoundary.observations = 0;
+            test_before_structural_index_reconcile_hook = AdmissionBoundary.check;
+            defer test_before_structural_index_reconcile_hook = null;
+
             FakeCatalog.indexes_json_buf = managed_indexes_json;
             var observations = std.ArrayListUnmanaged(ProvisionedTableWriteSource.StructuralRuntimeObservation).empty;
             defer {
@@ -48358,6 +48833,8 @@ fn implementationTests() type {
                 ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.complete,
                 reconcile_outcome,
             );
+            try std.testing.expect(AdmissionBoundary.observations > 0);
+            try std.testing.expect(resident_db.enrichment_runtime.?.isStarted());
             try std.testing.expect(resident_db == &write_cache.entries.items[0].db);
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
 
@@ -51744,6 +52221,13 @@ fn implementationTests() type {
 
                     fn run(self: *@This()) void {
                         for (0..16) |_| {
+                            // Every quantum must also work after eviction. In
+                            // particular, a cold completion installs a resident
+                            // writer and must keep that same owner serving reads.
+                            self.source.clearWriteCache() catch |err| {
+                                self.err = err;
+                                return;
+                            };
                             const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
                                 .indexes_json = self.indexes_json,
                                 .identity_namespace = self.namespace,
@@ -51752,6 +52236,24 @@ fn implementationTests() type {
                                 self.err = err;
                                 return;
                             };
+                            if (repair.index_repair_repaired or repair.cleared_debt) {
+                                var resident = self.source.residentDbSource().leaseGroup(
+                                    std.testing.allocator,
+                                    "docs",
+                                    7001,
+                                    self.source.visibleRootGeneration(7001),
+                                    .{},
+                                ) catch |err| {
+                                    self.err = err;
+                                    return;
+                                };
+                                if (resident) |*lease| {
+                                    lease.release(std.testing.allocator);
+                                } else {
+                                    self.err = error.TestUnexpectedResult;
+                                    return;
+                                }
+                            }
                             if (repair.busy) {
                                 self.err = error.TestUnexpectedResult;
                                 return;
@@ -53406,6 +53908,7 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try cached.db.runUntilIdle();
+            _ = try cached.db.publishVectorBlockBasesAtStableTip();
             {
                 // This test measures publication of completed work, so wait
                 // for native projection certification too, then verify it.
@@ -53435,6 +53938,7 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try cached.db.runUntilIdle();
+            _ = try cached.db.publishVectorBlockBasesAtStableTip();
             {
                 // This test measures publication of completed work, so wait
                 // for native projection certification too, then verify it.
@@ -53516,6 +54020,7 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try cached.db.runUntilIdle();
+            _ = try cached.db.publishVectorBlockBasesAtStableTip();
             {
                 // This test measures publication of completed work, so wait
                 // for native projection certification too, then verify it.
@@ -53546,6 +54051,7 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
             try cached.db.runUntilIdle();
+            _ = try cached.db.publishVectorBlockBasesAtStableTip();
             {
                 // This test measures publication of completed work, so wait
                 // for native projection certification too, then verify it.
@@ -57501,6 +58007,7 @@ fn implementationTests() type {
             Catalog.indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}";
             Catalog.schema = updated_schema_json;
             _ = try source.source().updateSchema(alloc, "docs", updated_schema_json);
+            Catalog.schema = updated_schema_json;
 
             {
                 lockAtomic(&source.local_db_mutex);
@@ -58082,8 +58589,6 @@ fn implementationTests() type {
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
-            var db = try db_mod.DB.open(alloc, db_path, .{});
-            defer db.close();
 
             const Catalog = struct {
                 fn iface() table_catalog.CatalogSource {
@@ -58214,8 +58719,8 @@ fn implementationTests() type {
             if (worker.err) |err| return err;
             try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
-            db.close();
-            db = try db_mod.DB.open(alloc, db_path, .{});
+            var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+            defer db.close();
             var restored = (try db.lookup(alloc, "doc:a", .{})).?;
             defer restored.deinit(alloc);
             try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
@@ -61137,6 +61642,75 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 0), statuses.items[0].source_vectors.?.retained_payloads);
             // Unavailable LSM counters are not fabricated as zero-valued samples.
             try std.testing.expect(statuses.items[0].lsm_storage_stats == null);
+        }
+
+        test "relational table API retries use the durable transaction epoch and decision" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-epoch-retries", .{tmp.sub_path});
+            defer alloc.free(path);
+            var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false });
+            defer db.close();
+            try db.setSchemaJson(alloc,
+                \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer","minimum":0}},"required":["amount"],"additionalProperties":false}}}}
+            );
+            var source = BoundTableWriteSource.init("docs", &db);
+            const prepared_id: db_mod.types.TxnId = @splat(31);
+            const terminal_id: db_mod.types.TxnId = @splat(32);
+            const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7);
+            defer alloc.free(participant);
+            _ = try source.source().txnBeginGroupLocal(alloc, 7, "docs", prepared_id, 10_000, 0, false, &.{participant});
+            const writes = [_]db_mod.types.TransactionWrite{.{ .key = "prepared", .value = "{\"amount\":3}" }};
+            _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+            const request = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "terminal", .value = "{\"amount\":4}" }} }};
+            const committed = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+            try std.testing.expect(committed == .committed);
+            try db.setSchemaJson(alloc,
+                \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"string"}},"required":["amount"],"additionalProperties":false}}}}
+            );
+            _ = try source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{ .writes = &writes });
+            try std.testing.expectError(error.InvalidBatchRequest, source.source().txnPrepareGroupLocal(alloc, 7, "docs", prepared_id, 0, .{
+                .writes = &.{.{ .key = "invalid", .value = "{\"amount\":-1}" }},
+            }));
+            try std.testing.expect(try batchUsesDurableTransactionContract(alloc, &db, .{
+                .transaction = .{ .prepare = .{ .txn_id = prepared_id, .topology_epoch = 0 } },
+            }));
+            _ = try source.source().txnResolveGroupLocal(alloc, 7, "docs", prepared_id, .committed, 10_001, 0, .propose);
+            const retried = (try source.source().commitTransactionWithId(alloc, terminal_id, 20_000, &request, .write)).?;
+            try std.testing.expect(retried == .committed);
+            const row = (try db.get(alloc, "prepared")).?;
+            defer alloc.free(row);
+            try std.testing.expectEqualStrings("{\"amount\":3}", row);
+            try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+        }
+
+        test "portable file restore rejects documents without identity coverage" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-source", .{tmp.sub_path});
+            defer alloc.free(source_path);
+            const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-target", .{tmp.sub_path});
+            defer alloc.free(target_path);
+            const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/identity-incomplete.afb", .{tmp.sub_path});
+            defer alloc.free(archive_path);
+
+            {
+                var source = try db_mod.DB.open(alloc, source_path, .{ .start_optional_runtimes = false });
+                defer source.close();
+                const key = try internal_keys.documentKeyAlloc(alloc, "doc:missing-identity");
+                defer alloc.free(key);
+                try source.core.store.put(key, "{\"title\":\"reject\"}");
+                try exportPortableBackupFile(alloc, source.core.store, archive_path, null);
+            }
+
+            var target = try db_mod.DB.open(alloc, target_path, .{ .start_optional_runtimes = false });
+            defer target.close();
+            try std.testing.expectError(
+                error.InvalidBackupRequest,
+                importPortableBackupFile(alloc, target.core.store, archive_path, null),
+            );
         }
     };
     return Suite;

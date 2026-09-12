@@ -4123,6 +4123,74 @@ test "page-level delete borrows from right leaf sibling" {
     }
 }
 
+test "page-level delete preflights oversized sibling donations before mutation" {
+    for ([_]bool{ false, true }) |donor_left| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const page_size = 4096;
+        var bytes: [page_size * 5]u8 = undefined;
+        const large = [_]u8{'x'} ** 3900;
+        const small = [_]u8{'y'} ** 200;
+        const empty_free_db = format.Db{
+            .md_pad = page_size,
+            .md_flags = format.DbFlags.integer_key,
+            .md_depth = 0,
+            .md_branch_pages = 0,
+            .md_leaf_pages = 0,
+            .md_overflow_pages = 0,
+            .md_entries = 0,
+            .md_root = format.invalid_pgno,
+        };
+        const main_db = format.Db{
+            .md_pad = 0,
+            .md_flags = 0,
+            .md_depth = 2,
+            .md_branch_pages = 1,
+            .md_leaf_pages = 2,
+            .md_overflow_pages = 0,
+            .md_entries = 4,
+            .md_root = 2,
+        };
+        writeMetaPage(bytes[0..page_size], 0, empty_free_db, main_db, bytes.len * 8, 4, 1);
+        writeMetaPage(bytes[page_size .. page_size * 2], 1, empty_free_db, main_db, bytes.len * 8, 4, 2);
+        try rebalance_branch.writePage(bytes[page_size * 2 .. page_size * 3], 2, &.{
+            .{ .key = "", .child_pgno = 3 }, .{ .key = "m", .child_pgno = 4 },
+        });
+        const values = if (donor_left) [_][]const u8{ "v", &large, &small, &small } else [_][]const u8{ &small, &small, &large, "v" };
+        const row_keys = [_][]const u8{ "a", "d", "m", "z" };
+        for (0..2) |leaf| {
+            var entries: [2]SerializedLeafEntry = undefined;
+            for (&entries, 0..) |*entry, i| entry.* = .{ .key = row_keys[leaf * 2 + i], .value = values[leaf * 2 + i], .data_size = @intCast(values[leaf * 2 + i].len) };
+            try mutate_leaf.writePage(bytes[page_size * (leaf + 3) ..][0..page_size], @intCast(leaf + 3), &entries);
+        }
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "oversized_donation.mdb", .data = &bytes });
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/oversized_donation.mdb", .{tmp.sub_path});
+        const deleted: usize = if (donor_left) 3 else 0;
+        {
+            var env = try env_mod.Environment.open(path, .{ .no_subdir = true, .read_only = false });
+            defer env.close();
+            var txn = try Transaction.begin(&env, .{ .read_only = false });
+            errdefer txn.abort();
+            const main = try txn.openDb(null, .{});
+            try txn.delete(main, row_keys[deleted]);
+            try std.testing.expect(!txn.write_state.?.main_db.rebuild_required);
+            try std.testing.expect(!txn.write_state.?.main_db.entries_loaded);
+            try txn.commit();
+        }
+        {
+            var env = try env_mod.Environment.open(path, .{ .no_subdir = true });
+            defer env.close();
+            var txn = try Transaction.begin(&env, .{});
+            defer txn.abort();
+            const main = try txn.openDb(null, .{});
+            for (row_keys, values, 0..) |key, value, i| {
+                if (i == deleted) try std.testing.expectError(error.NotFound, txn.get(main, key)) else try std.testing.expectEqualStrings(value, try txn.get(main, key));
+            }
+        }
+    }
+}
+
 test "page-level delete removes an overflow-valued entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

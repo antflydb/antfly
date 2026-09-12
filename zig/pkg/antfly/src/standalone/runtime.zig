@@ -1049,14 +1049,24 @@ const LocalStandaloneMetadata = struct {
         probe_interval_ns: u64,
     ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        return self.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, StandaloneWaitClock{});
+    }
+
+    fn catalogWaitForRoutingChangeWithClock(
+        self: *LocalStandaloneMetadata,
+        observed_token: antfly.metadata_api.CatalogRoutingChangeToken,
+        deadline_ns: u64,
+        probe_interval_ns: u64,
+        clock: anytype,
+    ) !antfly.public_api.table_catalog.CatalogChangeWaitResult {
+        if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
         if (standaloneCatalogTokenChanged(self, observed_token)) {
             self.mutex.unlock();
             return .changed;
         }
         self.mutex.unlock();
 
-        var now_ns = platform_time.monotonicNs();
+        var now_ns = clock.nowNs();
         if (now_ns < deadline_ns) {
             // Finish the passive watch before the outer deadline and reserve
             // bounded time for the authoritative mutex confirmation. Waiting
@@ -1073,15 +1083,15 @@ const LocalStandaloneMetadata = struct {
                     watch_deadline_ns - now_ns,
                     @max(probe_interval_ns, std.time.ns_per_ms),
                 );
-                platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
-                if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+                clock.sleepMs(@max(@as(u64, 1), wait_ns / std.time.ns_per_ms));
+                if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
                 const changed = standaloneCatalogTokenChanged(self, observed_token);
                 self.mutex.unlock();
                 if (changed) return .changed;
-                now_ns = platform_time.monotonicNs();
+                now_ns = clock.nowNs();
             }
         }
-        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return .retry;
+        if (!lockAtomicUntilWithClock(&self.mutex, deadline_ns, clock)) return .retry;
         defer self.mutex.unlock();
         if (standaloneCatalogTokenChanged(self, observed_token)) return .changed;
         return .authoritative_absence;
@@ -3910,15 +3920,36 @@ fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_byt
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
 }
 
+// Keep watch sleeps and deadline-aware locking on the same monotonic clock.
+// Tests supply a manual clock to exercise confirmation and expiry without
+// depending on the host scheduler.
+const StandaloneWaitClock = struct {
+    fn nowNs(_: @This()) u64 {
+        return platform_time.monotonicNs();
+    }
+
+    fn sleepMs(_: @This(), ms: u64) void {
+        platform_clock.Clock.real().sleepMs(ms);
+    }
+
+    fn yieldNow(_: @This()) void {
+        platform_time.yieldNow();
+    }
+};
+
 fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
+    return lockAtomicUntilWithClock(mutex, deadline_ns, StandaloneWaitClock{});
+}
+
+fn lockAtomicUntilWithClock(mutex: *std.atomic.Mutex, deadline_ns: ?u64, clock: anytype) bool {
     const deadline = deadline_ns orelse {
         lockAtomic(mutex);
         return true;
     };
     while (true) {
-        if (platform_time.monotonicNs() >= deadline) return false;
+        if (clock.nowNs() >= deadline) return false;
         if (mutex.tryLock()) return true;
-        @import("antfly_platform").time.yieldNow();
+        clock.yieldNow();
     }
 }
 
@@ -8467,18 +8498,109 @@ test "standalone routing watch does not report absence after one probe" {
     metadata.epoch = 9;
 
     const start_ns = platform_time.monotonicNs();
+    const deadline_ns = start_ns + 60 * std.time.ns_per_ms;
     const result = try (try metadata.catalogSource().routingSource()).waitForChange(
         .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = 9 },
-        start_ns + 60 * std.time.ns_per_ms,
+        deadline_ns,
         2 * std.time.ns_per_ms,
     );
-    try std.testing.expectEqual(
-        antfly.public_api.table_catalog.CatalogChangeWaitResult.authoritative_absence,
-        result,
-    );
+    const end_ns = platform_time.monotonicNs();
+    switch (result) {
+        .authoritative_absence => {},
+        // Scheduler delays can exhaust the confirmation budget. In that case
+        // the deadline-aware mutex correctly refuses the final read and the
+        // watch must retry instead of claiming authoritative absence.
+        .retry => try std.testing.expect(end_ns >= deadline_ns),
+        .changed => return error.TestUnexpectedResult,
+    }
     // The old one-probe implementation returned in roughly 2 ms. Keep a
-    // generous lower bound so scheduler jitter can only make the test safer.
-    try std.testing.expect(platform_time.monotonicNs() -| start_ns >= 30 * std.time.ns_per_ms);
+    // generous lower bound that still rejects premature absence or retry.
+    try std.testing.expect(end_ns -| start_ns >= 30 * std.time.ns_per_ms);
+}
+
+test "standalone routing watch confirms absence before deadline and retries after expiry" {
+    const ManualClock = struct {
+        now_ns: u64 = 0,
+        sleep_delay_ms: u64 = 0,
+        sleep_count: usize = 0,
+
+        fn nowNs(self: *@This()) u64 {
+            return self.now_ns;
+        }
+
+        fn sleepMs(self: *@This(), ms: u64) void {
+            self.sleep_count += 1;
+            self.now_ns += (ms + self.sleep_delay_ms) * std.time.ns_per_ms;
+        }
+
+        fn yieldNow(self: *@This()) void {
+            self.now_ns += std.time.ns_per_ms;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, ".zig-cache/unused-routing-watch-catalog"),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+    metadata.epoch = 9;
+
+    const observed_token = antfly.metadata_api.CatalogRoutingChangeToken{
+        .metadata_group_id = group_ids.main_metadata_group_id,
+        .revision = 9,
+    };
+    const deadline_ns = 60 * std.time.ns_per_ms;
+    const probe_interval_ns = 2 * std.time.ns_per_ms;
+
+    // A stable, uncontended watch must reserve time for confirmation. Merely
+    // waiting until expiry and always returning retry is a regression.
+    var clock = ManualClock{};
+    try std.testing.expectEqual(
+        .authoritative_absence,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expect(clock.now_ns >= 30 * std.time.ns_per_ms);
+    try std.testing.expect(clock.now_ns < deadline_ns);
+    try std.testing.expect(clock.sleep_count > 1);
+
+    // Simulate a scheduler pause that overshoots the outer deadline.
+    clock = .{ .sleep_delay_ms = 150 };
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expect(clock.now_ns >= deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), clock.sleep_count);
+
+    // An expired caller budget must not start a watch or confirm absence.
+    clock = .{ .now_ns = deadline_ns };
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expectEqual(@as(usize, 0), clock.sleep_count);
+
+    // Mutex contention consumes the same deadline budget as watch sleeps.
+    clock = .{};
+    try std.testing.expect(metadata.mutex.tryLock());
+    defer metadata.mutex.unlock();
+    try std.testing.expectEqual(
+        .retry,
+        try metadata.catalogWaitForRoutingChangeWithClock(observed_token, deadline_ns, probe_interval_ns, &clock),
+    );
+    try std.testing.expectEqual(deadline_ns, clock.now_ns);
+    try std.testing.expectEqual(@as(usize, 0), clock.sleep_count);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {

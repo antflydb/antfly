@@ -81,6 +81,8 @@ pub const NamedArtifactAction = struct {
 };
 
 pub const MetadataRepublishReasons = struct {
+    /// Persist external selector/schema intent even without any local indexes.
+    external_schema_changed: bool = false,
     read_schema_migration: bool = false,
     index_definitions_changed: bool = false,
     published_search_sources_changed: bool = false,
@@ -88,15 +90,21 @@ pub const MetadataRepublishReasons = struct {
     chunk_preview_policy_changed: bool = false,
     chunk_embeddings_policy_changed: bool = false,
     rerank_terms_policy_changed: bool = false,
+    graph_metric_policy_changed: bool = false,
+    /// Refresh maintained work indexes before workers consume a new pipeline.
+    document_facts_policy_changed: bool = false,
 
     pub fn any(self: MetadataRepublishReasons) bool {
-        return self.read_schema_migration or
+        return self.external_schema_changed or
+            self.read_schema_migration or
             self.index_definitions_changed or
             self.published_search_sources_changed or
             self.artifact_families_changed or
             self.chunk_preview_policy_changed or
             self.chunk_embeddings_policy_changed or
-            self.rerank_terms_policy_changed;
+            self.rerank_terms_policy_changed or
+            self.graph_metric_policy_changed or
+            self.document_facts_policy_changed;
     }
 };
 
@@ -170,6 +178,11 @@ pub const TablePublicationPlan = struct {
     sparse_index_actions: []NamedArtifactAction = &.{},
     graph_index_actions: []NamedArtifactAction = &.{},
     derived_output_actions: DerivedOutputActions = .{},
+    /// External sidecar readiness is computed from the same source/configuration
+    /// bindings as metadata publication, including families without public
+    /// aggregate actions (algebraic indexes and graph metrics). Null uses the
+    /// managed document/WAL action planner instead.
+    external_materialization: ?ExternalMaterializationReadiness = null,
 
     pub fn deinit(self: *TablePublicationPlan, alloc: Allocator) void {
         search_sources.deinitPublishedSearchSources(alloc, &self.targets.published_search_sources);
@@ -193,6 +206,13 @@ pub const TablePublicationPlan = struct {
     pub fn effectiveFullTextAction(self: TablePublicationPlan, text_artifact_present: bool) ArtifactAction {
         return collapseFullTextArtifactAction(self.full_text_index_actions, text_artifact_present, self.artifact_actions.full_text);
     }
+};
+
+pub const ExternalMaterializationReadiness = struct {
+    pending: bool,
+    graph_metrics_configured: usize,
+    graph_metrics_pending: usize,
+    graph_metrics_rejected: usize,
 };
 
 pub fn collapseFullTextArtifactAction(
@@ -253,8 +273,10 @@ pub fn externalBindingFromSchemaJsonAlloc(
 ) !?OwnedExternalTableBinding {
     if (schema_json.len == 0) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch
-        return error.InvalidExternalTableBinding;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidExternalTableBinding,
+    };
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,

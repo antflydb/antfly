@@ -124,7 +124,10 @@ fn searchResolvedAllocWithStats(
     stats: *SearchExecutionStats,
 ) ![]query_request.SearchHit {
     try session.checkCancellation();
-    const docs = try loadPublishedDocumentsAlloc(alloc, session);
+    var read_remaining: u64 = 512 * 1024 * 1024;
+    const facts_reader = try @import("document_facts_reader.zig").Reader.create(alloc, session, &read_remaining);
+    defer if (facts_reader) |reader| reader.destroy();
+    const docs = if (facts_reader == null) try loadPublishedDocumentsAlloc(alloc, session) else try alloc.alloc(materializer_mod.Document, 0);
     defer materializer_mod.freeDocuments(alloc, docs);
 
     const scored_docs = switch (lanes.mode) {
@@ -144,11 +147,24 @@ fn searchResolvedAllocWithStats(
 
     const hits = try alloc.alloc(query_request.SearchHit, final_scored_docs.len);
     var initialized_hits: usize = 0;
-    errdefer query_request.freeHits(alloc, hits[0..initialized_hits]);
+    errdefer {
+        for (hits[0..initialized_hits]) |hit| {
+            alloc.free(hit.doc_id);
+            alloc.free(hit.body);
+        }
+        alloc.free(hits);
+    }
     for (final_scored_docs, 0..) |scored, idx| {
         if (idx % 64 == 0) try session.checkCancellation();
-        const body = findBody(docs, scored.doc_id) orelse return error.DocumentBodyNotFound;
-        hits[idx] = try cloneSearchHitAlloc(alloc, scored, body);
+        if (facts_reader) |reader| {
+            const fact = try reader.lookup(scored.doc_id) orelse return error.DocumentBodyNotFound;
+            const id = try alloc.dupe(u8, scored.doc_id);
+            errdefer alloc.free(id);
+            hits[idx] = .{ .doc_id = id, .body = try reader.readBodyAlloc(fact), .score = scored.score, .distance = scored.distance };
+        } else {
+            const body = findBody(docs, scored.doc_id) orelse return error.DocumentBodyNotFound;
+            hits[idx] = try cloneSearchHitAlloc(alloc, scored, body);
+        }
         initialized_hits += 1;
     }
     return hits;

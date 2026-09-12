@@ -619,6 +619,7 @@ fn implementationTests() type {
                 resource_manager_mod.Slice.lite_native_link_cache,
                 resource_manager_mod.Slice.dense_repair_working_set,
                 resource_manager_mod.Slice.shard_transition_working_set,
+                resource_manager_mod.Slice.relational_preparation_working_set,
                 resource_manager_mod.Slice.dense_vector_block_build_working_set,
             }) |slice| {
                 const stats = storage.resource_manager.sliceStats(slice);

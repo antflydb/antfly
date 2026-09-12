@@ -732,10 +732,9 @@ const MetadataAdminHttpRuntime = struct {
             if (!metadata_authority.isRetryableError(err)) return err;
             return self.metadataNotLeader(ctx);
         };
-        const is_collection_get = ctx.request.method == .GET and
-            MetadataAdminMux.isRestoreJobCollectionRequest(ctx.request.uri.raw);
-        if (!local_leader and (ctx.request.method != .GET or is_collection_get))
-            return self.metadataNotLeader(ctx);
+        // A present follower row can be arbitrarily stale after leadership
+        // handoff. Job detail polls need the same authority as list/mutations.
+        if (!local_leader) return self.metadataNotLeader(ctx);
         return next.call(ctx);
     }
 
@@ -782,15 +781,12 @@ const MetadataAdminMux = struct {
             std.mem.startsWith(u8, path, "/db/v1/restore/jobs/")) return true;
         return std.mem.startsWith(u8, path, "/db/v1/tables/") and std.mem.endsWith(u8, path, "/restore");
     }
-
-    fn isRestoreJobCollectionRequest(uri: []const u8) bool {
-        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |query| uri[0..query] else uri;
-        return std.mem.eql(u8, path, "/db/v1/restore/jobs");
-    }
 };
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
     return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
+        .delete_matching = metadataRestoreJobDeleteMatching,
+        .create = metadataRestoreJobCreate,
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
@@ -801,18 +797,10 @@ fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs
 
 fn metadataRestoreJobGet(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const local_leader = svc.localMetadataLeadershipTerm() != null;
-    if (local_leader) try svc.ensureLinearizableRead();
-    const store = svc.projectedStore() orelse {
-        if (!local_leader) return error.NotLeader;
-        return error.MissingMetadataStore;
-    };
-    const value = try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
-    // A follower cannot distinguish "not committed here yet" from "does not
-    // exist". Fail retryably until the record is visible instead of leaking a
-    // load-balancer-dependent 404 for a durable job accepted by the leader.
-    if (value == null and !local_leader) return error.NotLeader;
-    return value;
+    if (svc.localMetadataLeadershipTerm() == null) return error.NotLeader;
+    try svc.ensureLinearizableRead();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return try store.getRestoreJobValue(alloc, svc.metadata_group_id, key);
 }
 
 fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
@@ -847,6 +835,41 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
         return error.RestoreJobCommitNotApplied;
     defer svc.alloc.free(committed);
     if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
+    // Absence is not an admission proof: an earlier proposal can still apply.
+    // Both proposals use the same key and the Raft transaction claims it once.
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .create_restore_job = .{ .key = key, .value = value } },
+        leadership_term,
+    );
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_expiry_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = value_hash } },
+        leadership_term,
+    );
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const current = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse return true;
+    defer svc.alloc.free(current);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+    if (std.mem.eql(u8, &digest, value_hash)) return error.RestoreJobCommitNotApplied;
+    return false;
 }
 
 fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {
@@ -1815,4 +1838,25 @@ test "metadata public api server carries auth and restore configuration" {
         error.NotLeader,
         metadataRestoreJobGet(server.svc, std.testing.allocator, "\x00\x00__api_restore_jobs__:0000000000000001"),
     );
+
+    // The old coordinator can retain a queued/running row after the new
+    // leader finishes the job. Presence is not a freshness proof: both absent
+    // and present follower observations must route back to the leader.
+    const job_root = try std.fmt.allocPrint(std.testing.allocator, "{s}-job-state", .{replica_root});
+    defer std.testing.allocator.free(job_root);
+    var follower_store = try metadata_storage.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = job_root });
+    defer follower_store.deinit();
+    const previous_store = server.svc.raft.host.owned_metadata_store;
+    server.svc.raft.host.owned_metadata_store = &follower_store;
+    defer server.svc.raft.host.owned_metadata_store = previous_store;
+    const logical_key = "\x00\x00__api_restore_jobs__:0000000000000001";
+    var prefix_buf: [256]u8 = undefined;
+    const prefix = try metadata_storage.raft_apply_store.restoreJobPrefixForGroup(&prefix_buf, server.svc.metadata_group_id);
+    const storage_key = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, logical_key });
+    defer std.testing.allocator.free(storage_key);
+    try follower_store.store.put(storage_key, "{\"phase\":\"running\"}");
+    const persisted = (try follower_store.getRestoreJobValue(std.testing.allocator, server.svc.metadata_group_id, logical_key)).?;
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expectEqualStrings("{\"phase\":\"running\"}", persisted);
+    try std.testing.expectError(error.NotLeader, metadataRestoreJobGet(server.svc, std.testing.allocator, logical_key));
 }

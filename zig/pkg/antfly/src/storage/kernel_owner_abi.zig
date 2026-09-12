@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 51;
+pub const abi_version: u32 = 52;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -234,6 +234,8 @@ pub const LocalQueryOperation = enum(u32) {
     execute_aggregation = 21,
     encode_aggregation = 22,
     preflight = 23,
+    graph_metric_maintenance = 24,
+    scan_stream = 25,
 };
 
 pub const LocalQueryReturnMode = enum(u32) {
@@ -1730,10 +1732,32 @@ pub extern fn antfly_storage_owner_lookup_json(
     out_response: *VersionedOwnedBytes,
 ) callconv(.c) Status;
 
+/// Borrowed for one synchronous scan. Returning zero stops the scan before
+/// another row is read. The caller retains its exact callback error locally.
+pub const ScanSink = extern struct {
+    context: ?*anyopaque,
+    start: *const fn (?*anyopaque) callconv(.c) u8,
+    write: *const fn (?*anyopaque, BorrowedBytes) callconv(.c) u8,
+};
+
+pub extern fn antfly_storage_owner_scan_stream(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    sink: *const ScanSink,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_scan_ndjson(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_graph_metric_maintenance_json(
+    owner: ?*anyopaque,
+    request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_preflight_json(

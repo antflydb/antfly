@@ -1,0 +1,3320 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Table-owned immutable column blocks and a transactionally maintained dirty
+//! key directory. Scans merge typed blocks with authoritative row deltas in
+//! one read snapshot. Bounded range compaction publishes replacements
+//! atomically and compare-clears only the dirty images covered by its snapshot.
+const std = @import("std");
+const store_mod = @import("../docstore.zig");
+const backend_erased = @import("../backend_erased.zig");
+const keys = @import("../internal_keys.zig");
+const codec = @import("algebraic/relational_row_codec.zig");
+const schema = @import("../schema.zig");
+const registry = @import("schema_registry.zig");
+const dv = @import("../../section/typed_doc_values.zig");
+const payloads = @import("column_payloads.zig");
+const read_cache = @import("column_read_cache.zig");
+const scan_plan = @import("column_scan_plan.zig");
+const graph = @import("query/graph_exec.zig");
+const JsonView = @import("query/json_view.zig").View;
+const ProjectionPlan = @import("query/relational_projection.zig").Plan;
+const types = @import("types.zig");
+const platform_time = @import("antfly_platform").time;
+const alloc_type = std.mem.Allocator;
+const prefix = "\x00\x00__columnar__:blocks:";
+const directory_prefix_len = prefix.len + 16 + 3;
+const counter_key = "\x00\x00__columnar__:next";
+const manifest_key = keys.relational_columnar_manifest_key;
+const building_key = "\x00\x00__columnar__:building";
+const maintenance_cursor_key = "\x00\x00__columnar__:maintenance_cursor";
+const maintenance_turn_key = "\x00\x00__columnar__:maintenance_turn";
+const merge_cursor_key = "\x00\x00__columnar__:merge_cursor";
+const cleanup_key = "\x00\x00__columnar__:cleanup";
+const garbage_key = "\x00\x00__columnar__:garbage";
+const bootstrap_key = "\x00\x00__columnar__:bootstrap";
+const discovery_key = "\x00\x00__columnar__:discovery";
+const dirty_prefix = keys.relational_columnar_dirty_prefix;
+pub var test_before_publish: ?struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void } = null;
+pub var test_compaction_block_limit: ?u64 = null;
+pub var test_owner_limit: ?usize = null;
+pub var test_disable_deadline: bool = false;
+pub var test_cleanup_page_limit: ?usize = null;
+pub var test_now_ns: ?u64 = null;
+pub var test_scalar_reads: bool = false;
+const maintenance_records = 256;
+const maintenance_bytes = 256 * 1024;
+const max_rows = read_cache.max_rows;
+const null_bytes = max_rows / 8;
+
+/// Process-local observations, sampled without taking the maintenance lock.
+/// The fairness cursor itself is durable and advances even when a build fails.
+pub const Maintenance = struct {
+    cell_slots_examined: std.atomic.Value(u64) = .init(0),
+    payloads_reused: std.atomic.Value(u64) = .init(0),
+    payload_bytes_written: std.atomic.Value(u64) = .init(0),
+    payload_encoding_bytes: std.atomic.Value(u64) = .init(0),
+    payload_slices_repacked: std.atomic.Value(u64) = .init(0),
+    pending: std.atomic.Value(bool) = .init(false),
+    backing_off: std.atomic.Value(bool) = .init(false),
+    retry_after_ns: std.atomic.Value(u64) = .init(0),
+    observed_since_ns: std.atomic.Value(u64) = .init(0),
+    passes: std.atomic.Value(u64) = .init(0),
+    ranges_compacted: std.atomic.Value(u64) = .init(0),
+    blocks_written: std.atomic.Value(u64) = .init(0),
+    rows_written: std.atomic.Value(u64) = .init(0),
+    ranges_merged: std.atomic.Value(u64) = .init(0),
+    dirty_markers_cleared: std.atomic.Value(u64) = .init(0),
+    gc_records_deleted: std.atomic.Value(u64) = .init(0),
+    failures: std.atomic.Value(u64) = .init(0),
+    last_pass_ns: std.atomic.Value(u64) = .init(0),
+    ranges_deferred: std.atomic.Value(u64) = .init(0),
+    bootstrap_quanta: std.atomic.Value(u64) = .init(0),
+    bytes_written: std.atomic.Value(u64) = .init(0),
+    owners_examined: std.atomic.Value(u64) = .init(0),
+    covered_rows_read: std.atomic.Value(u64) = .init(0),
+    primary_rows_read: std.atomic.Value(u64) = .init(0),
+    scheduler_candidates: std.atomic.Value(u64) = .init(0),
+    scheduler_commits: std.atomic.Value(u64) = .init(0),
+    admission_root_reads: std.atomic.Value(u64) = .init(0),
+    admission_dirty_probes: std.atomic.Value(u64) = .init(0),
+    waiting_until_ns: std.atomic.Value(u64) = .init(0),
+    read_revision: std.atomic.Value(u64) = .init(0),
+    // Worker-owned hints. Durable timers/cursor remain authoritative on restart.
+    waiting_since_ns: u64 = 0,
+    waiting_version: u64 = 0,
+    waiting_generation: u64 = 0,
+    waiting_reads: u64 = 0,
+    waiting_store_revision: u64 = 0,
+    waiting_namespace: u64 = 0,
+    /// Bounded, lossy read-cost hints, never correctness state. Hash collisions
+    /// can admit a cold range early but cannot delay a hot range past its age cap.
+    read_debt: [256]std.atomic.Value(u64) = @splat(.init(0)),
+
+    fn debtSlot(self: *@This(), generation: u64, block: u64) *std.atomic.Value(u64) {
+        const hash = std.hash.Wyhash.hash(generation, std.mem.asBytes(&block));
+        return &self.read_debt[hash % self.read_debt.len];
+    }
+
+    fn noteRead(self: *@This(), generation: u64, block: u64, bytes: u64) void {
+        if (bytes == 0) return;
+        const slot = self.debtSlot(generation, block);
+        var old = slot.load(.monotonic);
+        while (slot.cmpxchgWeak(old, old +| bytes, .monotonic, .monotonic)) |actual| old = actual;
+        _ = self.read_revision.fetchAdd(1, .monotonic);
+    }
+
+    pub fn notePending(self: *@This(), pending: bool) void {
+        self.pending.store(pending, .release);
+        if (pending) {
+            _ = self.observed_since_ns.cmpxchgStrong(0, platform_time.monotonicNs(), .monotonic, .monotonic);
+        } else self.observed_since_ns.store(0, .monotonic);
+    }
+
+    pub fn snapshot(self: *const @This()) types.ColumnarMaintenanceStats {
+        const since = self.observed_since_ns.load(.monotonic);
+        return .{
+            .pending = self.pending.load(.acquire),
+            .backing_off = self.backing_off.load(.acquire),
+            .pending_age_ns = if (since == 0) 0 else platform_time.monotonicNs() -| since,
+            .passes = self.passes.load(.monotonic),
+            .ranges_compacted = self.ranges_compacted.load(.monotonic),
+            .blocks_written = self.blocks_written.load(.monotonic),
+            .rows_written = self.rows_written.load(.monotonic),
+            .ranges_merged = self.ranges_merged.load(.monotonic),
+            .dirty_markers_cleared = self.dirty_markers_cleared.load(.monotonic),
+            .gc_records_deleted = self.gc_records_deleted.load(.monotonic),
+            .failures = self.failures.load(.monotonic),
+            .last_pass_ns = self.last_pass_ns.load(.monotonic),
+            .ranges_deferred = self.ranges_deferred.load(.monotonic),
+            .bootstrap_quanta = self.bootstrap_quanta.load(.monotonic),
+            .bytes_written = self.bytes_written.load(.monotonic),
+            .owners_examined = self.owners_examined.load(.monotonic),
+            .covered_rows_read = self.covered_rows_read.load(.monotonic),
+            .cell_slots_examined = self.cell_slots_examined.load(.monotonic),
+            .payloads_reused = self.payloads_reused.load(.monotonic),
+            .payload_bytes_written = self.payload_bytes_written.load(.monotonic),
+            .payload_encoding_bytes = self.payload_encoding_bytes.load(.monotonic),
+            .payload_slices_repacked = self.payload_slices_repacked.load(.monotonic),
+            .primary_rows_read = self.primary_rows_read.load(.monotonic),
+            .scheduler_candidates = self.scheduler_candidates.load(.monotonic),
+            .scheduler_commits = self.scheduler_commits.load(.monotonic),
+            .admission_root_reads = self.admission_root_reads.load(.monotonic),
+            .admission_dirty_probes = self.admission_dirty_probes.load(.monotonic),
+            .waiting_until_ns = self.waiting_until_ns.load(.monotonic),
+        };
+    }
+};
+const Manifest = struct {
+    ready: bool,
+    initializing: bool = false,
+    generation: u64,
+    sequence: u64,
+    blocks: u64,
+    ranges: u64 = 0,
+
+    fn encode(self: @This()) [41]u8 {
+        var out: [41]u8 = undefined;
+        @memcpy(out[0..4], "ACL3");
+        out[4] = @as(u8, @intFromBool(self.ready)) | (@as(u8, @intFromBool(self.initializing)) << 1);
+        std.mem.writeInt(u64, out[5..13], self.generation, .little);
+        std.mem.writeInt(u64, out[13..21], self.sequence, .little);
+        std.mem.writeInt(u64, out[21..29], self.blocks, .little);
+        std.mem.writeInt(u64, out[29..37], self.ranges, .little);
+        std.mem.writeInt(u32, out[37..41], @import("antfly_hash").Crc32.hash(out[0..37]), .little);
+        return out;
+    }
+
+    fn decode(encoded: []const u8) !@This() {
+        const bytes = try verified(encoded);
+        if (bytes.len != 37 or !std.mem.eql(u8, bytes[0..4], "ACL3") or bytes[4] > 3 or bytes[4] == 2) return error.InvalidColumnSegment;
+        return .{ .ready = bytes[4] & 1 != 0, .initializing = bytes[4] & 2 != 0, .generation = std.mem.readInt(u64, bytes[5..13], .little), .sequence = std.mem.readInt(u64, bytes[13..21], .little), .blocks = std.mem.readInt(u64, bytes[21..29], .little), .ranges = std.mem.readInt(u64, bytes[29..37], .little) };
+    }
+};
+
+fn checked(alloc: alloc_type, bytes: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, bytes.len + 4);
+    @memcpy(out[0..bytes.len], bytes);
+    std.mem.writeInt(u32, out[bytes.len..][0..4], @import("antfly_hash").Crc32.hash(bytes), .little);
+    return out;
+}
+
+fn verified(bytes: []const u8) ![]const u8 {
+    if (bytes.len < 4) return error.InvalidColumnSegment;
+    const body = bytes[0 .. bytes.len - 4];
+    if (@import("antfly_hash").Crc32.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.InvalidColumnSegment;
+    return body;
+}
+
+fn blockKey(alloc: alloc_type, generation: u64, block: u64, ordinal: ?u32) ![]u8 {
+    return if (ordinal) |column|
+        try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:c{x:0>8}", .{ prefix, generation, block, column })
+    else
+        try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:m", .{ prefix, generation, block });
+}
+
+fn columnMetaKey(alloc: alloc_type, generation: u64, block: u64, ordinal: u32) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:p{x:0>8}", .{ prefix, generation, block, ordinal });
+}
+
+pub fn payloadKeyForTest(db: anytype, alloc: alloc_type, generation: u64, block: u64, ordinal: u32) ![]u8 {
+    const key = try columnMetaKey(alloc, generation, block, ordinal);
+    defer alloc.free(key);
+    const encoded = try db.core.store.get(alloc, key);
+    defer alloc.free(encoded);
+    const meta = try verified(encoded);
+    if (meta.len < 25 + 2 * null_bytes + 46) return error.InvalidColumnSegment;
+    const pages = try ColumnPages.init(meta, std.mem.readInt(u16, meta[meta.len - 46 ..][0..2], .little));
+    for (0..pages.count()) |page| if (pages.size(page) != 0) return payloads.key(alloc, generation, pages.reference(page).digest, false);
+    return error.NotFound;
+}
+
+pub fn payloadStorageBytesForTest(db: anytype, alloc: alloc_type) !u64 {
+    const raw = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(raw);
+    const manifest = try Manifest.decode(raw);
+    const lower = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:v:", .{ prefix, manifest.generation });
+    defer alloc.free(lower);
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)).?;
+    defer alloc.free(upper);
+    const Counter = struct {
+        bytes: u64 = 0,
+        fn visit(ptr: ?*anyopaque, _: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.bytes += value.len;
+            return .@"continue";
+        }
+    };
+    var counter: Counter = .{};
+    try db.core.store.scanWithContext(lower, upper, .{}, &counter, Counter.visit);
+    return counter.bytes;
+}
+
+fn appendInt(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, comptime T: type, value: T) !void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    try list.appendSlice(alloc, &bytes);
+}
+
+const Row = struct { key: []const u8, hash: [32]u8, timestamp: u64, physical_bytes: u64 = 0 };
+const Bounds = struct { present: bool = false, minimum: f64 = 0, maximum: f64 = 0 };
+const Fragment = struct { first: usize, end: usize, ref: payloads.Ref };
+const Column = struct { writer: dv.TypedDocValuesWriter, presence: [null_bytes]u8 = @splat(0), nulls: [null_bytes]u8 = @splat(0), bounds: Bounds = .{}, fragments: std.ArrayListUnmanaged(Fragment) = .empty, partial_fragments: usize = 0 };
+
+/// Exact uncompressed cell bytes in typed doc values, including its doc ID.
+/// Byte utilization (rather than row density) preserves useful skewed pages.
+fn payloadCellBytes(value: dv.TypedValue) u64 {
+    return read_cache.cellBytes(value);
+}
+
+const max_partial_fragments = 8;
+
+fn reusePartialPayload(total_bytes: u64, retained_bytes: u64, partial_fragments: usize) bool {
+    return retained_bytes != 0 and retained_bytes <= total_bytes and
+        retained_bytes >= total_bytes - retained_bytes and partial_fragments < max_partial_fragments;
+}
+
+test "relational columnar partial reuse bounds byte amplification and fragments" {
+    // A single large surviving value may justify reuse; many tiny surviving
+    // values may not. These bounds deliberately do not use row cardinality.
+    try std.testing.expect(reusePartialPayload(10_000, 7_500, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 128, 0));
+    try std.testing.expect(reusePartialPayload(10_000, 5_000, 7));
+    try std.testing.expect(!reusePartialPayload(10_000, 4_999, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 9_999, 8));
+    try std.testing.expect(!reusePartialPayload(0, 0, 0));
+    try std.testing.expect(!reusePartialPayload(10_000, 10_001, 0));
+}
+
+fn appendPage(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, end: usize, ref: ?payloads.Ref) !void {
+    try appendInt(list, alloc, u16, @intCast(end));
+    try appendInt(list, alloc, u64, if (ref) |r| r.bytes else 0);
+    try list.appendSlice(alloc, if (ref) |r| &r.digest else &([_]u8{0} ** 32));
+    try appendInt(list, alloc, u16, if (ref) |r| r.source_first else 0);
+    try appendInt(list, alloc, u16, if (ref) |r| r.source_rows else 0);
+}
+
+const ColumnPages = struct {
+    directory: []const u8,
+
+    fn init(meta: []const u8, rows: usize) !@This() {
+        const offset = 25 + 2 * null_bytes;
+        if (meta.len < offset or (meta.len - offset) % 46 != 0 or rows > max_rows) return error.InvalidColumnSegment;
+        const result = @This(){ .directory = meta[offset..] };
+        if (result.count() > rows or (rows != 0 and result.count() == 0)) return error.InvalidColumnSegment;
+        var total: u64 = 0;
+        for (0..result.count()) |page| {
+            if (result.end(page) <= result.first(page) or result.end(page) > rows) return error.InvalidColumnSegment;
+            const bytes = result.size(page);
+            const ref = result.reference(page);
+            if (bytes != 0) {
+                if (ref.source_rows == 0 or ref.source_rows > max_rows or @as(usize, ref.source_first) + result.end(page) - result.first(page) > ref.source_rows) return error.InvalidColumnSegment;
+            } else if (ref.source_first != 0 or ref.source_rows != 0 or !std.mem.allEqual(u8, &ref.digest, 0)) return error.InvalidColumnSegment;
+            total = std.math.add(u64, total, bytes) catch return error.InvalidColumnSegment;
+            var present = false;
+            for (result.first(page)..result.end(page)) |row| {
+                const bit = @as(u8, 1) << @intCast(row % 8);
+                present = present or (meta[25 + row / 8] & ~meta[25 + null_bytes + row / 8] & bit != 0);
+            }
+            if ((bytes != 0) != present) return error.InvalidColumnSegment;
+        }
+        if (result.count() != 0 and result.end(result.count() - 1) != rows) return error.InvalidColumnSegment;
+        if (total != std.mem.readInt(u64, meta[17..25], .little)) return error.InvalidColumnSegment;
+        return result;
+    }
+
+    fn size(self: @This(), page: usize) u64 {
+        return std.mem.readInt(u64, self.directory[page * 46 + 2 ..][0..8], .little);
+    }
+    fn count(self: @This()) usize {
+        return self.directory.len / 46;
+    }
+    fn end(self: @This(), page: usize) usize {
+        return std.mem.readInt(u16, self.directory[page * 46 ..][0..2], .little);
+    }
+    fn first(self: @This(), page: usize) usize {
+        return if (page == 0) 0 else self.end(page - 1);
+    }
+    fn reference(self: @This(), page: usize) payloads.Ref {
+        const entry = self.directory[page * 46 ..][0..46];
+        return .{ .digest = entry[10..42].*, .bytes = self.size(page), .source_first = std.mem.readInt(u16, entry[42..44], .little), .source_rows = std.mem.readInt(u16, entry[44..46], .little) };
+    }
+    fn containing(self: @This(), row: usize) usize {
+        var low: usize = 0;
+        var high = self.count();
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.end(mid) <= row) low = mid + 1 else high = mid;
+        }
+        return low;
+    }
+};
+
+test "relational columnar page directory validates exact coverage and payload ownership" {
+    var meta: [25 + 2 * null_bytes + 92]u8 = @splat(0);
+    const offset = 25 + 2 * null_bytes;
+    std.mem.writeInt(u64, meta[17..25], 10, .little);
+    meta[25] = 8; // Only row three has a non-null value.
+    std.mem.writeInt(u16, meta[offset..][0..2], 1, .little);
+    std.mem.writeInt(u16, meta[offset + 46 ..][0..2], 4, .little);
+    std.mem.writeInt(u64, meta[offset + 48 ..][0..8], 10, .little);
+    std.mem.writeInt(u16, meta[offset + 90 ..][0..2], 4, .little);
+    const pages = try ColumnPages.init(&meta, 4);
+    try std.testing.expectEqual(@as(usize, 0), pages.containing(0));
+    try std.testing.expectEqual(@as(usize, 1), pages.containing(1));
+    try std.testing.expectEqual(@as(usize, 1), pages.containing(3));
+    for ([_]u16{ 0, 1, 3, 5 }) |bad_end| {
+        var invalid = meta;
+        std.mem.writeInt(u16, invalid[offset + 46 ..][0..2], bad_end, .little);
+        try std.testing.expectError(error.InvalidColumnSegment, ColumnPages.init(&invalid, 4));
+    }
+    var invalid = meta;
+    invalid[25] = 1; // Payload in a page declared empty.
+    try std.testing.expectError(error.InvalidColumnSegment, ColumnPages.init(&invalid, 4));
+    try std.testing.expectError(error.InvalidColumnSegment, ColumnPages.init(meta[0 .. meta.len - 1], 4));
+    for ([_]u16{ 0, 2, 257 }) |bad_rows| {
+        invalid = meta;
+        std.mem.writeInt(u16, invalid[offset + 90 ..][0..2], bad_rows, .little);
+        try std.testing.expectError(error.InvalidColumnSegment, ColumnPages.init(&invalid, 4));
+    }
+    invalid = meta;
+    std.mem.writeInt(u16, invalid[offset + 88 ..][0..2], 2, .little);
+    try std.testing.expectError(error.InvalidColumnSegment, ColumnPages.init(&invalid, 4));
+}
+
+test "relational columnar payload identity binds type ordinal and bytes" {
+    const one = [_]?dv.TypedValue{.{ .i64_val = 1 }};
+    const shifted = [_]?dv.TypedValue{ null, .{ .i64_val = 1 } };
+    const unsigned = [_]?dv.TypedValue{.{ .u64_val = 1 }};
+    const same_with_absent_tail = [_]?dv.TypedValue{ .{ .i64_val = 1 }, null };
+    const original = payloads.identity(.i64_val, &one);
+    try std.testing.expect(!std.mem.eql(u8, &original, &payloads.identity(.i64_val, &shifted)));
+    try std.testing.expect(!std.mem.eql(u8, &original, &payloads.identity(.u64_val, &unsigned)));
+    try std.testing.expectEqual(original, payloads.identity(.i64_val, &same_with_absent_tail));
+    var count: [20]u8 = @splat(0);
+    std.mem.writeInt(u64, count[0..8], 2, .little);
+    std.mem.writeInt(u64, count[8..16], 100, .little);
+    std.mem.writeInt(u32, count[16..20], @import("antfly_hash").Crc32.hash(count[0..16]), .little);
+    try std.testing.expectEqual(@as(u64, 2), (try payloads.decodeCount(&count)).references);
+    count[0] ^= 1;
+    try std.testing.expectError(error.InvalidColumnSegment, payloads.decodeCount(&count));
+}
+
+fn ColumnBuilder(comptime DBType: type) type {
+    return struct {
+        db: DBType,
+        alloc: alloc_type,
+        arena: std.heap.ArenaAllocator,
+        generation: u64,
+        namespace: u64,
+        blocks: u64 = 0,
+        expected_manifest: [41]u8,
+        build_token: [16]u8,
+        directory: std.ArrayListUnmanaged(store_mod.KVPair) = .empty,
+        candidates: std.ArrayListUnmanaged(store_mod.KVPair) = .empty,
+        boundary: ?[]const u8 = "",
+        stop_after_block: ?u64 = null,
+        continuation: ?[]u8 = null,
+        deadline_ns: u64 = std.math.maxInt(u64),
+        bytes: usize = 0,
+        prepared_bytes: usize = 0,
+        owners: usize = 0,
+        view: ?registry.SchemaView = null,
+        rows: std.ArrayListUnmanaged(Row) = .empty,
+        columns: std.AutoHashMapUnmanaged(u32, Column) = .empty,
+        payload_read: *store_mod.DocStore.Txn,
+        known_payloads: std.AutoHashMapUnmanaged([32]u8, payloads.Ref) = .empty,
+
+        fn flush(self: *@This()) !void {
+            if (self.rows.items.len == 0) return;
+            const scratch = self.arena.allocator();
+            // Reuse the build's immutable snapshot. A build-local registry
+            // covers payloads staged after it, without cloning the LSM mutable
+            // generation after every block commit.
+            const payload_read = self.payload_read;
+            var meta = std.ArrayListUnmanaged(u8).empty;
+            try meta.appendSlice(scratch, "ACB8");
+            try appendInt(&meta, scratch, u32, self.view.?.version());
+            try appendInt(&meta, scratch, u32, @intCast(self.rows.items.len));
+            const ordinals = try scratch.alloc(u32, self.columns.count());
+            var ordinal_it = self.columns.keyIterator();
+            for (ordinals) |*ordinal| ordinal.* = (ordinal_it.next()).?.*;
+            std.mem.sort(u32, ordinals, {}, std.sort.asc(u32));
+            var pages: u32 = 0;
+            for (ordinals, 0..) |ordinal, i| if (i == 0 or ordinal / 64 != ordinals[i - 1] / 64) {
+                pages += 1;
+            };
+            try appendInt(&meta, scratch, u32, pages);
+            try appendInt(&meta, scratch, u64, self.bytes);
+            var pos: usize = 0;
+            while (pos < ordinals.len) {
+                const page = ordinals[pos] / 64;
+                var mask: u64 = 0;
+                while (pos < ordinals.len and ordinals[pos] / 64 == page) : (pos += 1) mask |= @as(u64, 1) << @intCast(ordinals[pos] % 64);
+                try appendInt(&meta, scratch, u32, page);
+                try appendInt(&meta, scratch, u64, mask);
+            }
+            var writes = std.ArrayListUnmanaged(store_mod.KVPair).empty;
+            var references = std.ArrayListUnmanaged(payloads.Delta).empty;
+            var columns = self.columns.iterator();
+            while (columns.next()) |entry| {
+                const ordinal = entry.key_ptr.*;
+                var column_meta = std.ArrayListUnmanaged(u8).empty;
+                const bounds = entry.value_ptr.bounds;
+                try column_meta.append(scratch, @intFromBool(bounds.present));
+                try appendInt(&column_meta, scratch, u64, @bitCast(bounds.minimum));
+                try appendInt(&column_meta, scratch, u64, @bitCast(bounds.maximum));
+                // Bound pages by actual value bytes, not average row width.
+                // Oversized values own a singleton page so neighboring small
+                // values never pay their I/O/decompression cost.
+                const entries = entry.value_ptr.writer.entries.items;
+                const Entry = @typeInfo(@TypeOf(entries)).pointer.child;
+                std.mem.sort(Entry, entries, {}, struct {
+                    fn less(_: void, a: Entry, b: Entry) bool {
+                        return a.doc_id < b.doc_id;
+                    }
+                }.less);
+                const fragments = entry.value_ptr.fragments.items;
+                std.mem.sort(Fragment, fragments, {}, struct {
+                    fn less(_: void, a: Fragment, b: Fragment) bool {
+                        return a.first < b.first;
+                    }
+                }.less);
+                var fragment: usize = 0;
+                var directory = std.ArrayListUnmanaged(u8).empty;
+                var page: usize = 0;
+                var row_first: usize = 0;
+                var first: usize = 0;
+                var payload_bytes: u64 = 0;
+                while (row_first < self.rows.items.len) : (page += 1) {
+                    if (fragment < fragments.len and fragments[fragment].first == row_first) {
+                        const reused = fragments[fragment];
+                        try appendPage(&directory, scratch, reused.end, reused.ref);
+                        try references.append(scratch, .{ .digest = reused.ref.digest, .bytes = reused.ref.bytes, .retains = 1 });
+                        payload_bytes += reused.ref.bytes;
+                        row_first = reused.end;
+                        fragment += 1;
+                        continue;
+                    }
+                    const inline_end = if (fragment < fragments.len) fragments[fragment].first else self.rows.items.len;
+                    var last = first;
+                    var row_end = row_first;
+                    var raw_bytes: usize = 0;
+                    while (row_end < inline_end) : (row_end += 1) {
+                        if (last == entries.len or entries[last].doc_id != row_end) continue;
+                        const cell = entries[last];
+                        const cell_bytes = 12 + if (cell.owned_bytes) |bytes| bytes.len else @as(usize, 8);
+                        if (cell_bytes > 16 * 1024 and row_end > row_first) break;
+                        if (last != first and raw_bytes +| cell_bytes > 16 * 1024) break;
+                        raw_bytes +|= cell_bytes;
+                        last += 1;
+                        if (cell_bytes > 16 * 1024) {
+                            row_end += 1;
+                            break;
+                        }
+                    }
+                    var reference: ?payloads.Ref = null;
+                    if (last != first) {
+                        var writer = entry.value_ptr.writer;
+                        const local = try scratch.dupe(Entry, entries[first..last]);
+                        for (local) |*cell| cell.doc_id -= @intCast(row_first);
+                        var logical_cells: [max_rows]?dv.TypedValue = @splat(null);
+                        for (local) |cell| logical_cells[cell.doc_id] = cell.value;
+                        const digest = payloads.identity(writer.value_type, logical_cells[0 .. row_end - row_first]);
+                        reference = self.known_payloads.get(digest) orelse try payloads.lookup(payload_read, scratch, self.generation, digest, row_end - row_first);
+                        if (reference) |*existing| {
+                            existing.source_rows = @intCast(row_end - row_first);
+                            try references.append(scratch, .{ .digest = digest, .bytes = existing.bytes, .retains = 1 });
+                        } else {
+                            writer.entries = .{ .items = local, .capacity = local.len };
+                            _ = self.db.relational_column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
+                            const values = try writer.build();
+                            const encoded = try checked(scratch, values);
+                            reference = .{ .digest = digest, .bytes = encoded.len, .source_rows = @intCast(row_end - row_first) };
+                            try references.append(scratch, .{ .digest = digest, .bytes = encoded.len, .retains = 1, .encoded = encoded });
+                        }
+                        try self.known_payloads.put(self.alloc, digest, reference.?);
+                        payload_bytes += reference.?.bytes;
+                    }
+                    try appendPage(&directory, scratch, row_end, reference);
+                    first = last;
+                    row_first = row_end;
+                }
+                try appendInt(&column_meta, scratch, u64, payload_bytes);
+                try column_meta.appendSlice(scratch, &entry.value_ptr.presence);
+                try column_meta.appendSlice(scratch, &entry.value_ptr.nulls);
+                try column_meta.appendSlice(scratch, directory.items);
+                try writes.append(scratch, .{ .key = try columnMetaKey(scratch, self.generation, self.blocks, ordinal), .value = try checked(scratch, column_meta.items) });
+            }
+            for (self.rows.items) |row| {
+                try appendInt(&meta, scratch, u32, std.math.cast(u32, row.key.len) orelse return error.InvalidColumnSegment);
+                try meta.appendSlice(scratch, row.key);
+                try meta.appendSlice(scratch, &row.hash);
+                try appendInt(&meta, scratch, u64, row.timestamp);
+                try appendInt(&meta, scratch, u64, row.physical_bytes);
+            }
+            try writes.append(scratch, .{ .key = try blockKey(scratch, self.generation, self.blocks, null), .value = try checked(scratch, meta.items) });
+            // Sparse row-key directory keeps resumed/bounded scans logarithmic
+            // instead of walking every earlier block's metadata.
+            const directory_key = try std.fmt.allocPrint(scratch, "{s}{x:0>16}:r:{s}", .{ prefix, self.generation, self.boundary orelse self.rows.items[0].key });
+            self.boundary = null;
+            const directory_value = try directoryValue(scratch, self.blocks, "");
+            if (self.directory.items.len != 0) try self.finishDirectory(directory_key[directory_prefix_len..]);
+            {
+                const owned_key = try self.alloc.dupe(u8, directory_key);
+                errdefer self.alloc.free(owned_key);
+                const owned_value = try self.alloc.dupe(u8, directory_value);
+                errdefer self.alloc.free(owned_value);
+                try self.directory.append(self.alloc, .{ .key = owned_key, .value = owned_value });
+            }
+            if (self.rows.items.len < max_rows / 2 and self.bytes < 512 * 1024) {
+                const candidate_key = try candidateKey(self.alloc, self.generation, directory_key[directory_prefix_len..]);
+                errdefer self.alloc.free(candidate_key);
+                const candidate_value = try self.alloc.dupe(u8, directory_value);
+                errdefer self.alloc.free(candidate_value);
+                try self.candidates.append(self.alloc, .{ .key = candidate_key, .value = candidate_value });
+            }
+            const prepared = try payloads.prepare(self.db.core.store, scratch, self.generation, references.items);
+            const shared_count = prepared.shared;
+            const new_payload_bytes = prepared.new_bytes;
+            {
+                self.db.core.lockApplyShared();
+                defer self.db.core.unlockApplyShared();
+                if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+                var txn = try self.db.core.store.beginWriteTxn();
+                var live = true;
+                defer if (live) txn.abort();
+                if (!try sameValue(&txn, manifest_key, &self.expected_manifest) or !try sameValue(&txn, building_key, &self.build_token)) return error.PreparedGenerationChanged;
+                try prepared.apply(&txn);
+                for (writes.items) |write| try txn.put(write.key, write.value);
+                try txn.commit();
+                live = false;
+            }
+            self.blocks += 1;
+            _ = self.db.relational_column_maintenance.payloads_reused.fetchAdd(shared_count, .monotonic);
+            _ = self.db.relational_column_maintenance.payload_bytes_written.fetchAdd(new_payload_bytes, .monotonic);
+            _ = self.db.relational_column_maintenance.blocks_written.fetchAdd(1, .monotonic);
+            _ = self.db.relational_column_maintenance.rows_written.fetchAdd(self.rows.items.len, .monotonic);
+            var written: u64 = new_payload_bytes;
+            for (writes.items) |write| written +|= write.key.len + write.value.len;
+            _ = self.db.relational_column_maintenance.bytes_written.fetchAdd(written, .monotonic);
+            self.rows = .empty;
+            self.columns = .empty;
+            self.bytes = 0;
+            _ = self.arena.reset(.free_all);
+        }
+
+        fn yieldBeforeRow(self: *@This(), key: []const u8) !bool {
+            const full = if (self.stop_after_block) |limit| self.blocks >= limit else false;
+            if (full or (self.directory.items.len != 0 and
+                (self.prepared_bytes >= 8 * 1024 * 1024 or platform_time.monotonicNs() >= self.deadline_ns)))
+            {
+                self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
+                return true;
+            }
+            return false;
+        }
+
+        fn checkpoint(ptr: ?*anyopaque, key: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+            const owner_limit = if (@import("builtin").is_test) test_owner_limit orelse 1024 else 1024;
+            if (self.owners >= owner_limit or (self.owners != 0 and platform_time.monotonicNs() >= self.deadline_ns)) {
+                self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
+                return .stop;
+            }
+            if (try self.yieldBeforeRow(key)) return .stop;
+            self.owners += 1;
+            _ = self.db.relational_column_maintenance.owners_examined.fetchAdd(1, .monotonic);
+            return .@"continue";
+        }
+
+        /// Merge immutable typed coverage with its snapshot's dirty journal.
+        /// Only live deltas fetch AROW; unchanged rows are transposed directly
+        /// from columns. Tombstones still checkpoint progress and mask the base.
+        fn visitCovered(self: *@This(), read: *store_mod.DocStore.Txn, range: Range, end: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var scope = try read.openReadScope(scratch);
+            defer scope.close();
+            var decoder = Decoder{ .bytes = try verified(try scope.get(try blockKey(scratch, self.generation, range.block, null))) };
+            if (!std.mem.eql(u8, try decoder.take(4), "ACB8")) return error.InvalidColumnSegment;
+            const version = try decoder.int(u32);
+            const count = try decoder.int(u32);
+            if (count > max_rows) return error.InvalidColumnSegment;
+            const pages = try decoder.int(u32);
+            _ = try decoder.int(u64);
+            if (pages > decoder.bytes.len / 12) return error.InvalidColumnSegment;
+            const ordinal_pages = try decoder.take(@as(usize, pages) * 12);
+            const rows = try scratch.alloc(Row, count);
+            var previous: ?[]const u8 = null;
+            for (rows) |*row| {
+                row.key = try decoder.take(try decoder.int(u32));
+                @memcpy(&row.hash, try decoder.take(32));
+                row.timestamp = try decoder.int(u64);
+                row.physical_bytes = try decoder.int(u64);
+                if (previous) |last| if (std.mem.order(u8, last, row.key) != .lt) return error.InvalidColumnSegment;
+                previous = row.key;
+            }
+            if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
+            var view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            defer view.release();
+            try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
+            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.artifact_repair_metadata_stop };
+            defer block.deinit();
+            var dirty = try read.openCursor();
+            defer dirty.close();
+            var pending = try dirty.seekAtOrAfter(try std.mem.concat(scratch, u8, &.{ dirty_prefix, range.start }));
+            var source_id: usize = 0;
+            var selected: [max_rows]bool = @splat(false);
+            var remap: [max_rows]u32 = undefined;
+            while (true) {
+                while (source_id < rows.len and std.mem.order(u8, rows[source_id].key, range.start) == .lt) : (source_id += 1) {}
+                if (source_id < rows.len and end.len != 0 and std.mem.order(u8, rows[source_id].key, end) != .lt) source_id = rows.len;
+                const delta: @TypeOf(pending) = if (pending) |entry| if (std.mem.startsWith(u8, entry.key, dirty_prefix) and (end.len == 0 or std.mem.order(u8, entry.key[dirty_prefix.len..], end) == .lt)) entry else null else null;
+                const take_delta = if (delta) |entry| source_id == rows.len or std.mem.order(u8, entry.key[dirty_prefix.len..], rows[source_id].key) != .gt else false;
+                if (!take_delta and source_id == rows.len) break;
+                var row_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer row_arena.deinit();
+                const row_alloc = row_arena.allocator();
+                const id = if (take_delta) delta.?.key[dirty_prefix.len..] else rows[source_id].key;
+                const key = try keys.relationalRowKeyAlloc(row_alloc, id);
+                if (try checkpoint(self, key) == .stop) break;
+                if (take_delta) {
+                    const entry = delta.?;
+                    if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+                    if (std.mem.readInt(u64, entry.value[8..16], .little) != 0) {
+                        var row_scope = try read.openReadScope(row_alloc);
+                        defer row_scope.close();
+                        const bytes = try row_scope.get(key);
+                        const incoming_version = try codec.rowSchemaVersion(bytes);
+                        if (self.view != null and self.view.?.version() != incoming_version) try self.transposeSelected(&block, &selected, &remap);
+                        if (!try self.prepareVersion(incoming_version, key)) break;
+                        try self.appendPrimary(key, bytes);
+                    }
+                    if (source_id < rows.len and std.mem.eql(u8, id, rows[source_id].key)) source_id += 1;
+                    pending = try dirty.next();
+                } else {
+                    if (self.view != null and self.view.?.version() != version) try self.transposeSelected(&block, &selected, &remap);
+                    if (!try self.prepareVersion(version, key)) break;
+                    const dest = self.arena.allocator();
+                    remap[source_id] = @intCast(self.rows.items.len);
+                    selected[source_id] = true;
+                    var owned = rows[source_id];
+                    owned.key = try dest.dupe(u8, owned.key);
+                    try self.rows.append(dest, owned);
+                    self.bytes +|= @intCast(owned.physical_bytes);
+                    self.prepared_bytes +|= @intCast(owned.physical_bytes);
+                    _ = self.db.relational_column_maintenance.covered_rows_read.fetchAdd(1, .monotonic);
+                    source_id += 1;
+                }
+                if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) {
+                    try self.transposeSelected(&block, &selected, &remap);
+                    try self.flush();
+                }
+            }
+            // One source selection per destination block/epoch, independent of
+            // the number of dirty/clean alternations in the merge stream.
+            try self.transposeSelected(&block, &selected, &remap);
+        }
+
+        fn transposeSelected(self: *@This(), block: *Block, selected: *[max_rows]bool, remap: *const [max_rows]u32) !void {
+            if (std.mem.indexOfScalar(bool, selected, true) == null) return;
+            const dest = self.arena.allocator();
+            for (0..block.ordinal_pages.len / 12) |page_index| {
+                const encoded = block.ordinal_pages[page_index * 12 ..][0..12];
+                const base = std.mem.readInt(u32, encoded[0..4], .little) * 64;
+                var mask = std.mem.readInt(u64, encoded[4..12], .little);
+                while (mask != 0) {
+                    const ordinal = base + @as(u32, @intCast(@ctz(mask)));
+                    mask &= mask - 1;
+                    const source = try block.column(ordinal);
+                    var materialize = selected.*;
+                    const pages = source.pages.?;
+                    for (0..pages.count()) |page| {
+                        if (pages.size(page) == 0) continue;
+                        var complete = true;
+                        for (pages.first(page)..pages.end(page)) |i| {
+                            if (!selected[i] or (i > pages.first(page) and remap[i] != remap[i - 1] + 1)) {
+                                complete = false;
+                                break;
+                            }
+                        }
+                        // Reuse whole pages, or wide-value slices. Small,
+                        // fragmented scalar pages are transposed once instead
+                        // of amplifying their metadata into tiny fragments.
+                        if (!complete and pages.size(page) / (pages.end(page) - pages.first(page)) < 128) continue;
+                        var i = pages.first(page);
+                        while (i < pages.end(page)) {
+                            if (!selected[i]) {
+                                i += 1;
+                                continue;
+                            }
+                            const first = i;
+                            i += 1;
+                            while (i < pages.end(page) and selected[i] and remap[i] == remap[i - 1] + 1) : (i += 1) {}
+                            var has_payload = false;
+                            var has_presence = false;
+                            for (first..i) |row| {
+                                const present = source.present(row);
+                                has_presence = has_presence or present;
+                                has_payload = has_payload or (present and source.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) == 0);
+                            }
+                            if (!has_presence) {
+                                @memset(materialize[first..i], false);
+                                continue;
+                            }
+                            const entry = try self.columns.getOrPut(dest, ordinal);
+                            if (!entry.found_existing) entry.value_ptr.* = .{ .writer = dv.TypedDocValuesWriter.init(dest, block.valueType(ordinal), max_rows) };
+                            var ref = pages.reference(page);
+                            ref.source_first += @intCast(first - pages.first(page));
+                            const partial = ref.source_first != 0 or i - first != ref.source_rows;
+                            if (partial and has_payload) {
+                                // Ordinary pages are byte-bounded; oversized
+                                // singleton pages always take the zero-copy full
+                                // path. Inspect partial payloads once, including
+                                // mappings inherited from earlier compactions.
+                                try block.loadPage(ordinal, page);
+                                const decoded = block.decoded_payloads.get(ref.digest).?;
+                                var retained_bytes: u64 = 0;
+                                const source_end = @min(decoded.values.len, @as(usize, ref.source_first) + i - first);
+                                for (decoded.values[@min(ref.source_first, source_end)..source_end]) |value| if (value) |cell| {
+                                    retained_bytes += payloadCellBytes(cell);
+                                };
+                                if (!reusePartialPayload(decoded.logical_bytes, retained_bytes, entry.value_ptr.partial_fragments)) {
+                                    _ = self.db.relational_column_maintenance.payload_slices_repacked.fetchAdd(1, .monotonic);
+                                    continue; // Materialize selected cells below.
+                                }
+                            }
+                            for (first..i) |row| {
+                                materialize[row] = false;
+                                const bit = @as(u8, 1) << @intCast(row % 8);
+                                const target = remap[row];
+                                if (source.bitmaps[row / 8] & bit != 0) {
+                                    entry.value_ptr.presence[target / 8] |= @as(u8, 1) << @intCast(target % 8);
+                                    if (source.bitmaps[null_bytes + row / 8] & bit != 0) entry.value_ptr.nulls[target / 8] |= @as(u8, 1) << @intCast(target % 8) else has_payload = true;
+                                }
+                            }
+                            if (has_payload) {
+                                try entry.value_ptr.fragments.append(dest, .{ .first = remap[first], .end = remap[i - 1] + 1, .ref = ref });
+                                if (partial) entry.value_ptr.partial_fragments += 1;
+                                if (source.bounds.present) {
+                                    const bounds = &entry.value_ptr.bounds;
+                                    bounds.minimum = if (bounds.present) @min(bounds.minimum, source.bounds.minimum) else source.bounds.minimum;
+                                    bounds.maximum = if (bounds.present) @max(bounds.maximum, source.bounds.maximum) else source.bounds.maximum;
+                                    bounds.present = true;
+                                }
+                            }
+                        }
+                    }
+                    if (std.mem.indexOfScalar(bool, materialize[0..block.rows.len], true) != null) {
+                        const cells = try block.cells(ordinal, materialize[0..block.rows.len]);
+                        for (cells, materialize[0..block.rows.len], 0..) |maybe_cell, keep, i| {
+                            if (keep) if (maybe_cell) |cell| try self.addCell(remap[i], cell);
+                        }
+                    }
+                    _ = self.db.relational_column_maintenance.cell_slots_examined.fetchAdd(block.rows.len, .monotonic);
+                }
+            }
+            @memset(selected, false);
+        }
+
+        fn prepareVersion(self: *@This(), version: u32, key: []const u8) !bool {
+            if (self.view == null or self.view.?.version() != version) {
+                try self.flush();
+                // Epoch changes can flush a partial block and exhaust the
+                // quantum before the incoming row is added.
+                if (try self.yieldBeforeRow(key)) return false;
+                if (self.view) |*view| view.release();
+                self.view = null;
+                self.view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            }
+            return true;
+        }
+
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (!try self.prepareVersion(try codec.rowSchemaVersion(value), key)) return .stop;
+            try self.appendPrimary(key, value);
+            if (self.rows.items.len == max_rows or self.bytes >= 1024 * 1024) try self.flush();
+            return .@"continue";
+        }
+
+        fn appendPrimary(self: *@This(), key: []const u8, value: []const u8) !void {
+            const view = self.view.?;
+            const row = try codec.ordinalRowView(value, view.tableSchema().*, view.physicalLayout());
+            const scratch = self.arena.allocator();
+            const id: u32 = @intCast(self.rows.items.len);
+            try self.rows.append(scratch, .{ .key = (try keys.decodeStoredDocumentRowKeyAlloc(scratch, key)) orelse return error.InvalidColumnSegment, .hash = row.semanticHash(), .timestamp = row.writeTimestampNs(), .physical_bytes = value.len });
+            var cells = try row.cellIterator();
+            while (try cells.next()) |cell| try self.addCell(id, cell);
+            self.bytes +|= value.len;
+            self.prepared_bytes +|= value.len;
+            _ = self.db.relational_column_maintenance.primary_rows_read.fetchAdd(1, .monotonic);
+        }
+
+        fn addCell(self: *@This(), id: u32, cell: codec.Cell) !void {
+            const scratch = self.arena.allocator();
+            const entry = try self.columns.getOrPut(scratch, cell.ordinal);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .writer = dv.TypedDocValuesWriter.init(scratch, cell.value_type, max_rows) };
+            entry.value_ptr.presence[id / 8] |= @as(u8, 1) << @intCast(id % 8);
+            if (cell.is_null) entry.value_ptr.nulls[id / 8] |= @as(u8, 1) << @intCast(id % 8) else {
+                // The output row plan guarantees unique ordinals, but base
+                // transposition follows delta preparation. Sort once at flush.
+                entry.value_ptr.writer.last_doc_id = null;
+                try entry.value_ptr.writer.add(id, cell.value);
+            }
+            if (!cell.is_null) {
+                const number: ?f64 = switch (cell.value) {
+                    .u64_val => |n| @floatFromInt(n),
+                    .i64_val => |n| @floatFromInt(n),
+                    .f64_val => |n| n,
+                    else => null,
+                };
+                if (number) |n| {
+                    const bounds = &entry.value_ptr.bounds;
+                    bounds.minimum = if (bounds.present) @min(bounds.minimum, n) else n;
+                    bounds.maximum = if (bounds.present) @max(bounds.maximum, n) else n;
+                    bounds.present = true;
+                }
+            }
+        }
+
+        fn deinit(self: *@This()) void {
+            self.known_payloads.deinit(self.alloc);
+            if (self.view) |*view| view.release();
+            self.arena.deinit();
+            for (self.directory.items) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.value);
+            }
+            self.directory.deinit(self.alloc);
+            for (self.candidates.items) |entry| {
+                self.alloc.free(entry.key);
+                self.alloc.free(entry.value);
+            }
+            self.candidates.deinit(self.alloc);
+            if (self.continuation) |value| self.alloc.free(value);
+        }
+
+        fn finishDirectory(self: *@This(), end: []const u8) !void {
+            if (self.directory.items.len == 0) return;
+            const last = &self.directory.items[self.directory.items.len - 1];
+            const body = try verified(last.value);
+            const replacement = try directoryValue(self.alloc, std.mem.readInt(u64, body[0..8], .little), end);
+            self.alloc.free(last.value);
+            last.value = replacement;
+        }
+    };
+}
+
+fn sameValue(txn: *store_mod.DocStore.Txn, key: []const u8, expected: []const u8) !bool {
+    const value = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, value, expected);
+}
+
+/// Exhaustive ownership check for regression tests; never a foreground scan.
+pub fn validatePayloadOwnershipForTest(db: anytype, alloc: alloc_type) !void {
+    const manifest_bytes = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest_bytes);
+    const manifest = try Manifest.decode(manifest_bytes);
+    const lower = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:", .{ prefix, manifest.generation });
+    defer alloc.free(lower);
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)).?;
+    defer alloc.free(upper);
+    const Probe = struct {
+        alloc: alloc_type,
+        counts: std.AutoHashMapUnmanaged([32]u8, u64) = .empty,
+        stored: std.AutoHashMapUnmanaged([32]u8, u64) = .empty,
+        values: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const tag = prefix.len + 17;
+            if (key.len == tag + 34 and key[tag + 1] == ':') {
+                const digest = key[tag + 2 ..][0..32].*;
+                if (key[tag] == 'q') {
+                    try self.stored.put(self.alloc, digest, (try payloads.decodeCount(value)).references);
+                } else if (key[tag] == 'v') {
+                    try (payloads.Ref{ .digest = digest, .bytes = value.len, .source_rows = 0 }).validate(value);
+                    _ = try verified(value);
+                    try self.values.put(self.alloc, digest, {});
+                }
+            } else if (key.len == tag + 26 and key[tag + 17] == 'p') {
+                const meta = try verified(value);
+                if (meta.len < 25 + 2 * null_bytes + 46) return error.InvalidColumnSegment;
+                const pages = try ColumnPages.init(meta, std.mem.readInt(u16, meta[meta.len - 46 ..][0..2], .little));
+                for (0..pages.count()) |page| if (pages.size(page) != 0) {
+                    const entry = try self.counts.getOrPut(self.alloc, pages.reference(page).digest);
+                    if (!entry.found_existing) entry.value_ptr.* = 0;
+                    entry.value_ptr.* += 1;
+                };
+            }
+            return .@"continue";
+        }
+    };
+    var probe = Probe{ .alloc = alloc };
+    defer probe.counts.deinit(alloc);
+    defer probe.stored.deinit(alloc);
+    defer probe.values.deinit(alloc);
+    try db.core.store.scanWithContext(lower, upper, .{}, &probe, Probe.visit);
+    try std.testing.expectEqual(probe.counts.count(), probe.stored.count());
+    try std.testing.expectEqual(probe.counts.count(), probe.values.count());
+    var it = probe.counts.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expectEqual(entry.value_ptr.*, probe.stored.get(entry.key_ptr.*) orelse return error.InvalidColumnSegment);
+        try std.testing.expect(probe.values.contains(entry.key_ptr.*));
+    }
+}
+
+fn deleteIfPresent(txn: *store_mod.DocStore.Txn, key: []const u8) !void {
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
+
+fn buildToken(generation: u64, first_block: u64) [16]u8 {
+    var value: [16]u8 = undefined;
+    std.mem.writeInt(u64, value[0..8], generation, .little);
+    std.mem.writeInt(u64, value[8..16], first_block, .little);
+    return value;
+}
+
+/// Each quantum owns a fresh primary snapshot. The durable bootstrap boundary
+/// advances with coverage publication, never with staging. Uncovered suffixes
+/// stay on primary scans, including rows predating the dirty directory.
+pub fn rebuild(db: anytype, alloc: alloc_type, force: bool, adaptive: bool) !bool {
+    const maintenance = &db.relational_column_maintenance;
+    const now = maintenanceNow();
+    // Called under the DB's single-maintainer guard. These cheap wake hints
+    // avoid even opening a transaction while every known range is deferred.
+    if (adaptive and !force and now >= maintenance.waiting_since_ns and now < maintenance.waiting_until_ns.load(.acquire) and
+        maintenance.waiting_namespace == db.core.schemaNamespaceGeneration() and
+        maintenance.waiting_store_revision == db.core.store.columnar_revision.load(.acquire) and
+        maintenance.waiting_reads == maintenance.read_revision.load(.monotonic)) return false;
+    db.core.lockApplyShared();
+    var initial_locked = true;
+    defer if (initial_locked) db.core.unlockApplyShared();
+    const namespace = db.core.schemaNamespaceGeneration();
+    var start = try db.core.store.beginWriteTxn();
+    var start_live = true;
+    defer if (start_live) start.abort();
+    const current = start.get(manifest_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (current) |bytes| {
+        const manifest = Manifest.decode(bytes) catch Manifest{ .ready = false, .generation = 0, .sequence = 0, .blocks = 0 };
+        if (manifest.ready and !force) {
+            const bootstrapping = (try bootstrapBoundary(&start, manifest)) != null;
+            const abandoned = start.get(building_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (abandoned) |token| {
+                // Revoke the abandoned builder before incrementally reclaiming
+                // its prefix. The durable job survives another cancellation.
+                try start.put(garbage_key, token);
+                try start.delete(building_key);
+                try start.commit();
+                start_live = false;
+                return true;
+            }
+            start.abort();
+            start_live = false;
+            db.core.unlockApplyShared();
+            initial_locked = false;
+            if (try drainCleanup(db, alloc, manifest.generation, namespace)) return true;
+            if (try drainGarbage(db, alloc, namespace)) return true;
+            // Drain retired roots before producing more. Publication retires
+            // at most eight roots, so the durable backlog cannot grow without
+            // bound under churn, even for extremely wide schemas.
+            if (try drainRetired(db, alloc, manifest.generation, namespace)) return true;
+            // Old-generation reclamation must not hold new coverage hostage
+            // to a table-sized GC backlog. Abandoned current staging is still
+            // reclaimed before another quantum can reuse its build namespace.
+            if (bootstrapping) return try compact(db, alloc, namespace, adaptive);
+            if (try prune(db, alloc, manifest.generation, namespace)) return true;
+            return try compact(db, alloc, namespace, adaptive);
+        }
+    }
+    const old = start.get(counter_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const previous = if (old) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnSegment;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const generation = std.math.add(u64, previous, 1) catch return error.InvalidColumnSegment;
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter, generation, .little);
+    const pending = (Manifest{ .ready = true, .initializing = true, .generation = generation, .sequence = 0, .blocks = 1, .ranges = 1 }).encode();
+    var view = db.core.acquireSchemaView() orelse return error.UnknownSchemaVersion;
+    defer view.release();
+    var meta: [24]u8 = @splat(0);
+    @memcpy(meta[0..4], "ACB8");
+    std.mem.writeInt(u32, meta[4..8], view.version(), .little);
+    const root_key = try blockKey(alloc, generation, 0, null);
+    defer alloc.free(root_key);
+    const root_value = try checked(alloc, &meta);
+    defer alloc.free(root_value);
+    const directory_key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:r:", .{ prefix, generation });
+    defer alloc.free(directory_key);
+    const directory_value = try directoryValue(alloc, 0, "");
+    defer alloc.free(directory_value);
+    const checkpoint = try directoryValue(alloc, generation, "");
+    defer alloc.free(checkpoint);
+    try start.put(counter_key, &counter);
+    try start.put(manifest_key, &pending);
+    try start.put(root_key, root_value);
+    try start.put(directory_key, directory_value);
+    try start.put(bootstrap_key, checkpoint);
+    try deleteIfPresent(&start, building_key);
+    try deleteIfPresent(&start, cleanup_key);
+    try deleteIfPresent(&start, garbage_key);
+    try start.commit();
+    start_live = false;
+
+    db.core.unlockApplyShared();
+    initial_locked = false;
+    _ = try compact(db, alloc, namespace, adaptive);
+    return true;
+}
+
+fn bootstrapBoundary(txn: *store_mod.DocStore.Txn, manifest: Manifest) !?[]const u8 {
+    const encoded = txn.get(bootstrap_key) catch |err| switch (err) {
+        error.NotFound => return if (manifest.initializing) error.InvalidColumnSegment else null,
+        else => return err,
+    };
+    const body = try verified(encoded);
+    if (!manifest.initializing or body.len < 12 or std.mem.readInt(u64, body[0..8], .little) != manifest.generation or
+        std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
+    return body[12..];
+}
+
+fn cleanupPrefix(alloc: alloc_type, token: []const u8) ![]u8 {
+    if (token.len != 16) return error.InvalidColumnSegment;
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:q", .{ prefix, std.mem.readInt(u64, token[0..8], .little), std.mem.readInt(u64, token[8..16], .little) });
+}
+
+/// Journal exact dirty images before publication. Pages are unpublished until
+/// cleanup_key is committed with the directory. They require no live snapshot
+/// during cleanup/restart and cannot clear a newer primary image.
+const Cleanup = struct {
+    pages: usize = 0,
+    inline_page: ?[]u8 = null,
+
+    fn deinit(self: @This(), alloc: alloc_type) void {
+        if (self.inline_page) |page| alloc.free(page);
+    }
+
+    fn publish(self: @This(), txn: *store_mod.DocStore.Txn, token: []const u8) !u64 {
+        if (self.pages != 0) try txn.put(cleanup_key, token);
+        // The common one-page case compare-clears in the publication itself:
+        // no journal write, extra commit, or post-publication cleanup work.
+        return if (self.inline_page) |page| clearPage(txn, page) else 0;
+    }
+};
+
+fn clearPage(txn: *store_mod.DocStore.Txn, page: []const u8) !u64 {
+    var decoder = Decoder{ .bytes = page };
+    var cleared: u64 = 0;
+    while (decoder.bytes.len != 0) {
+        const key = try decoder.take(try decoder.int(u32));
+        const expected = try decoder.take(@sizeOf(keys.ColumnarDirtyRecord));
+        if (!std.mem.startsWith(u8, key, dirty_prefix)) return error.InvalidColumnSegment;
+        if (try sameValue(txn, key, expected)) {
+            try txn.delete(key);
+            cleared += 1;
+        }
+    }
+    return cleared;
+}
+
+fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, from: []const u8, to: []const u8, manifest: []const u8, token: [16]u8, namespace: u64) !Cleanup {
+    const lower = try std.mem.concat(alloc, u8, &.{ dirty_prefix, from });
+    defer alloc.free(lower);
+    const page_prefix = try cleanupPrefix(alloc, &token);
+    defer alloc.free(page_prefix);
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(lower);
+    var pages: usize = 0;
+    while (entry) |first| {
+        if (!std.mem.startsWith(u8, first.key, dirty_prefix)) break;
+        if (to.len != 0 and std.mem.order(u8, first.key[dirty_prefix.len..], to) != .lt) break;
+        if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var page = std.ArrayListUnmanaged(u8).empty;
+        var count: usize = 0;
+        const limit = if (@import("builtin").is_test) test_cleanup_page_limit orelse maintenance_records else maintenance_records;
+        while (entry) |item| {
+            if (!std.mem.startsWith(u8, item.key, dirty_prefix) or (to.len != 0 and std.mem.order(u8, item.key[dirty_prefix.len..], to) != .lt)) break;
+            if (item.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+            try appendInt(&page, scratch, u32, std.math.cast(u32, item.key.len) orelse return error.InvalidColumnSegment);
+            try page.appendSlice(scratch, item.key);
+            try page.appendSlice(scratch, item.value);
+            count += 1;
+            entry = try cursor.next();
+            if (count >= limit or page.items.len >= maintenance_bytes) break;
+        }
+        const more = if (entry) |item| std.mem.startsWith(u8, item.key, dirty_prefix) and
+            (to.len == 0 or std.mem.order(u8, item.key[dirty_prefix.len..], to) == .lt) else false;
+        if (pages == 0 and !more) return .{ .inline_page = try alloc.dupe(u8, page.items) };
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        var txn = try db.core.store.beginWriteTxn();
+        var live = true;
+        defer if (live) txn.abort();
+        if (!try sameValue(&txn, manifest_key, manifest) or !try sameValue(&txn, building_key, &token)) return error.PreparedGenerationChanged;
+        try txn.put(try std.fmt.allocPrint(scratch, "{s}{x:0>16}", .{ page_prefix, pages }), try checked(scratch, page.items));
+        try txn.commit();
+        live = false;
+        pages += 1;
+    }
+    return .{ .pages = pages };
+}
+
+/// One bounded, atomic cleanup page per quantum. Deleting the page is the
+/// durable continuation; cleanup never scans/rebuilds already published rows.
+fn drainCleanup(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
+    return drainCleanupWithLimit(db, alloc, generation, namespace, 1);
+}
+
+fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namespace: u64, limit: usize) !bool {
+    // Most maintenance turns have no cleanup job. Do not clone a busy LSM
+    // mutable generation merely to prove that this single key is absent.
+    {
+        var probe = try db.core.store.beginProbeTxn();
+        defer probe.abort();
+        _ = probe.get(cleanup_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+    }
+    const started = platform_time.monotonicNs();
+    db.core.lockApplyShared();
+    var locked = true;
+    defer if (locked) db.core.unlockApplyShared();
+    if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+    if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const token = read.get(cleanup_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const page_prefix = try cleanupPrefix(alloc, token);
+    defer alloc.free(page_prefix);
+    if (std.mem.readInt(u64, token[0..8], .little) != generation) return error.InvalidColumnSegment;
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(page_prefix);
+    for (0..limit) |_| {
+        if (!locked) {
+            db.core.lockApplyShared();
+            locked = true;
+        }
+        if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        var txn = try db.core.store.beginWriteTxn();
+        var live = true;
+        defer if (live) txn.abort();
+        if (!try sameValue(&txn, cleanup_key, token)) return error.PreparedGenerationChanged;
+        const current = txn.get(manifest_key) catch |err| switch (err) {
+            error.NotFound => return error.PreparedGenerationChanged,
+            else => return err,
+        };
+        const manifest = try Manifest.decode(current);
+        if (!manifest.ready or manifest.generation != generation) return error.PreparedGenerationChanged;
+        var cleared: u64 = 0;
+        if (entry) |page| {
+            if (std.mem.startsWith(u8, page.key, page_prefix)) {
+                cleared = try clearPage(&txn, try verified(page.value));
+                try txn.delete(page.key);
+                entry = try cursor.next();
+            } else entry = null;
+        }
+        const done = entry == null or !std.mem.startsWith(u8, entry.?.key, page_prefix);
+        if (done) try txn.delete(cleanup_key);
+        try txn.commit();
+        live = false;
+        _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(cleared, .monotonic);
+        db.core.unlockApplyShared();
+        locked = false;
+        if (done or platform_time.monotonicNs() -| started >= 50 * std.time.ns_per_ms) break;
+    }
+    return true;
+}
+
+fn finishCleanupQuantum(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !void {
+    const pages: usize = if (@import("builtin").is_test and test_cleanup_page_limit != null) 1 else 8;
+    _ = try drainCleanupWithLimit(db, alloc, generation, namespace, pages);
+}
+
+const Range = struct { key: []const u8, value: []const u8, start: []const u8, end: []const u8, block: u64 };
+fn candidateKey(alloc: alloc_type, generation: u64, start: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:s:{s}", .{ prefix, generation, start });
+}
+
+fn mergeQueueKey(alloc: alloc_type, generation: u64, start: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:t:{s}", .{ prefix, generation, start });
+}
+
+fn mergeCandidate(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, range: Range) !bool {
+    const key = try candidateKey(alloc, generation, range.start);
+    const value = read.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const body = try verified(value);
+    return body.len >= 12 and std.mem.readInt(u64, body[0..8], .little) == range.block;
+}
+
+fn blockVersion(read: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !u32 {
+    const meta = try verified(try read.get(try blockKey(alloc, generation, block, null)));
+    if (meta.len < 24 or !std.mem.eql(u8, meta[0..4], "ACB8")) return error.InvalidColumnSegment;
+    return std.mem.readInt(u32, meta[4..8], .little);
+}
+
+fn retireBlock(txn: *store_mod.DocStore.Txn, alloc: alloc_type, generation: u64, block: u64) !void {
+    // Directory removal and this intent commit atomically. Payload ownership
+    // remains intact until bounded GC deletes each column's metadata and
+    // releases its references in the same transaction. Readers use MVCC.
+    const key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:retired:{x:0>16}", .{ prefix, generation, block });
+    var identity: [8]u8 = undefined;
+    std.mem.writeInt(u64, &identity, block, .little);
+    try txn.put(key, try checked(alloc, &identity));
+    const defer_key = try deferredKey(alloc, generation, block);
+    const encoded = txn.get(defer_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (encoded) |bytes| {
+        const state = try Deferred.decode(bytes);
+        try deleteIfPresent(txn, try timerKey(alloc, generation, state.due(), block));
+        try txn.delete(defer_key);
+    }
+}
+
+fn maintenanceNow() u64 {
+    if (comptime @import("builtin").is_test) if (test_now_ns) |now| return now;
+    return platform_time.realtimeNs();
+}
+
+const Deferred = struct {
+    first_ns: u64,
+    /// Highest mutation token in this range, not the table-wide wake revision.
+    version: u64,
+    source_bytes: u64,
+    rows: u32,
+
+    fn decode(encoded: []const u8) !@This() {
+        const body = try verified(encoded);
+        if (body.len != 28) return error.InvalidColumnSegment;
+        const rows = std.mem.readInt(u32, body[24..28], .little);
+        if (rows > max_rows) return error.InvalidColumnSegment;
+        return .{ .first_ns = std.mem.readInt(u64, body[0..8], .little), .version = std.mem.readInt(u64, body[8..16], .little), .source_bytes = std.mem.readInt(u64, body[16..24], .little), .rows = rows };
+    }
+    fn encode(self: @This(), alloc: alloc_type) ![]u8 {
+        var body: [28]u8 = undefined;
+        std.mem.writeInt(u64, body[0..8], self.first_ns, .little);
+        std.mem.writeInt(u64, body[8..16], self.version, .little);
+        std.mem.writeInt(u64, body[16..24], self.source_bytes, .little);
+        std.mem.writeInt(u32, body[24..28], self.rows, .little);
+        return checked(alloc, &body);
+    }
+    fn due(self: @This()) u64 {
+        return self.first_ns +| 10 * std.time.ns_per_s;
+    }
+};
+
+fn deferredKey(alloc: alloc_type, generation: u64, block: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>16}:defer", .{ prefix, generation, block });
+}
+
+fn timerPrefix(alloc: alloc_type, generation: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:due:", .{ prefix, generation });
+}
+
+fn timerKey(alloc: alloc_type, generation: u64, due: u64, block: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}{x:0>16}:due:{x:0>16}:{x:0>16}", .{ prefix, generation, due, block });
+}
+
+const Selection = struct { id: ?[]const u8 = null, progress: bool = false, timed: bool = false };
+
+/// Discover ready ranges in bounded batches, independently of actual builds.
+/// Deferred ranges have a durable time index; unchanged waiting work needs no
+/// cursor rewrite. One commit checkpoints all admission decisions in a batch.
+fn selectReady(db: anytype, read: *store_mod.DocStore.Txn, alloc: alloc_type, manifest: Manifest, manifest_bytes: []const u8, store_revision: u64) !Selection {
+    const maintenance = &db.relational_column_maintenance;
+    const now = maintenanceNow();
+    const mutation = read.get(keys.relational_columnar_mutation_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const version = if (mutation) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnSegment;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const reads = maintenance.read_revision.load(.monotonic);
+    if (maintenance.waiting_generation == manifest.generation and maintenance.waiting_version == version and
+        maintenance.waiting_namespace == db.core.schemaNamespaceGeneration() and maintenance.waiting_store_revision == store_revision and
+        maintenance.waiting_reads == reads and now >= maintenance.waiting_since_ns and now < maintenance.waiting_until_ns.load(.monotonic)) return .{};
+    maintenance.waiting_until_ns.store(0, .release);
+    var writes = std.ArrayListUnmanaged(store_mod.KVPair).empty;
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    var chosen: ?[]const u8 = null;
+    var from_timer = false;
+    var earliest: u64 = std.math.maxInt(u64);
+    var examined: usize = 0;
+    const deadline = platform_time.monotonicNs() +| 50 * std.time.ns_per_ms;
+    const timers = try timerPrefix(alloc, manifest.generation);
+    var timer = try read.openCursor();
+    defer timer.close();
+    var timed = try timer.seekAtOrAfter(timers);
+    while (timed) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, timers)) break;
+        if (entry.key.len != timers.len + 33 or entry.key[timers.len + 16] != ':') return error.InvalidColumnSegment;
+        const due = std.fmt.parseInt(u64, entry.key[timers.len..][0..16], 16) catch return error.InvalidColumnSegment;
+        earliest = @min(earliest, due);
+        if (due > now or examined == 128 or platform_time.monotonicNs() >= deadline) break;
+        const body = try verified(entry.value);
+        if (body.len < 12 or std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
+        const block = std.mem.readInt(u64, body[0..8], .little);
+        var directory = try Directory.init(alloc, read, manifest.generation, body[12..]);
+        defer directory.deinit();
+        const range = try directory.next(alloc);
+        examined += 1;
+        if (range) |item| if (item.block == block and !try rangeClean(read, alloc, item)) {
+            chosen = try alloc.dupe(u8, item.start);
+            from_timer = true;
+            break;
+        };
+        try deletes.append(alloc, try alloc.dupe(u8, entry.key));
+        timed = try timer.next();
+        earliest = std.math.maxInt(u64);
+    }
+    var dirty = try read.openCursor();
+    defer dirty.close();
+    const saved = read.get(discovery_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const discovery_resume = if (saved) |encoded| blk: {
+        const body = try verified(encoded);
+        if (body.len < 12 or std.mem.readInt(u32, body[8..12], .little) != body.len - 12) return error.InvalidColumnSegment;
+        if (std.mem.readInt(u64, body[0..8], .little) != manifest.generation) break :blk "";
+        break :blk body[12..];
+    } else "";
+    var next_id: []const u8 = discovery_resume;
+    var exhausted = false;
+    var entry = try dirty.seekAtOrAfter(try std.mem.concat(alloc, u8, &.{ dirty_prefix, discovery_resume }));
+    while (chosen == null and examined < 128 and platform_time.monotonicNs() < deadline) {
+        const item = entry orelse {
+            exhausted = true;
+            next_id = "";
+            break;
+        };
+        if (!std.mem.startsWith(u8, item.key, dirty_prefix)) {
+            exhausted = true;
+            next_id = "";
+            break;
+        }
+        var directory = try Directory.init(alloc, read, manifest.generation, item.key[dirty_prefix.len..]);
+        defer directory.deinit();
+        const range = (try directory.next(alloc)) orelse return error.InvalidColumnSegment;
+        examined += 1;
+        next_id = range.end;
+        const defer_key = try deferredKey(alloc, manifest.generation, range.block);
+        const encoded = read.get(defer_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const previous = if (encoded) |bytes| try Deferred.decode(bytes) else null;
+        const debt = maintenance.debtSlot(manifest.generation, range.block).load(.monotonic);
+        {
+            // Roots are immutable for a block ID. Cache their admission facts
+            // durably and probe only the small dirty records on later wakes.
+            // This adds no range-summary lookup/write to foreground ingestion.
+            const facts: struct { rows: u32, source: u64 } = if (previous) |state| .{ .rows = state.rows, .source = state.source_bytes } else blk: {
+                const meta = try verified(try read.get(try blockKey(alloc, manifest.generation, range.block, null)));
+                if (meta.len < 24 or !std.mem.eql(u8, meta[0..4], "ACB8")) return error.InvalidColumnSegment;
+                _ = maintenance.admission_root_reads.fetchAdd(1, .monotonic);
+                const rows = std.mem.readInt(u32, meta[8..12], .little);
+                if (rows > max_rows) return error.InvalidColumnSegment;
+                break :blk .{ .rows = rows, .source = std.mem.readInt(u64, meta[16..24], .little) };
+            };
+            const rows = facts.rows;
+            const source = facts.source;
+            var count: usize = 0;
+            var delta: u64 = 0;
+            var range_version: u64 = 0;
+            // Use the same cursor to count the range and jump to the next one.
+            while (entry) |marker| {
+                if (!std.mem.startsWith(u8, marker.key, dirty_prefix) or (range.end.len != 0 and std.mem.order(u8, marker.key[dirty_prefix.len..], range.end) != .lt)) break;
+                if (marker.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+                count += 1;
+                _ = maintenance.admission_dirty_probes.fetchAdd(1, .monotonic);
+                range_version = @max(range_version, std.mem.readInt(u64, marker.value[0..8], .little));
+                delta +|= std.mem.readInt(u64, marker.value[8..16], .little);
+                if (count >= 1024 or count >= (rows + 3) / 4 or delta >= source / 8) break;
+                entry = try dirty.next();
+            }
+            const aged = if (previous) |state| now < state.first_ns or now >= state.due() else false;
+            if (rows == 0 or count >= (rows + 3) / 4 or delta >= source / 8 or debt >= @max(source, 64 * 1024) or aged) {
+                chosen = range.start;
+                next_id = range.start;
+                break;
+            }
+            const state = Deferred{ .first_ns = if (previous) |old| old.first_ns else now, .version = range_version, .source_bytes = source, .rows = rows };
+            if (previous == null or previous.?.version != range_version) {
+                try writes.append(alloc, .{ .key = defer_key, .value = try state.encode(alloc) });
+                _ = maintenance.ranges_deferred.fetchAdd(1, .monotonic);
+            }
+            if (previous == null) try writes.append(alloc, .{ .key = try timerKey(alloc, manifest.generation, state.due(), range.block), .value = try directoryValue(alloc, range.block, range.start) });
+            earliest = @min(earliest, state.due());
+        }
+        if (range.end.len == 0) {
+            exhausted = true;
+            next_id = "";
+            break;
+        }
+        entry = try dirty.seekAtOrAfter(try std.mem.concat(alloc, u8, &.{ dirty_prefix, range.end }));
+    }
+    _ = maintenance.scheduler_candidates.fetchAdd(examined, .monotonic);
+    if (!std.mem.eql(u8, next_id, discovery_resume)) try writes.append(alloc, .{ .key = discovery_key, .value = try directoryValue(alloc, manifest.generation, next_id) });
+    if (writes.items.len != 0 or deletes.items.len != 0) {
+        var txn = try db.core.store.beginWriteTxn();
+        var live = true;
+        defer if (live) txn.abort();
+        if (!try sameValue(&txn, manifest_key, manifest_bytes)) return .{};
+        for (writes.items) |write| try txn.put(write.key, write.value);
+        for (deletes.items) |key| try deleteIfPresent(&txn, key);
+        try txn.commit();
+        live = false;
+        _ = maintenance.scheduler_commits.fetchAdd(1, .monotonic);
+    }
+    if (chosen == null and exhausted and earliest != std.math.maxInt(u64)) {
+        maintenance.waiting_since_ns = now;
+        maintenance.waiting_version = version;
+        maintenance.waiting_generation = manifest.generation;
+        maintenance.waiting_reads = reads;
+        maintenance.waiting_store_revision = store_revision;
+        maintenance.waiting_namespace = db.core.schemaNamespaceGeneration();
+        // A resumed sweep rechecks its prefix before entering a long sleep:
+        // new writes/read pressure may have arrived behind its saved cursor.
+        maintenance.waiting_until_ns.store(if (discovery_resume.len == 0) earliest else @min(earliest, now +| 100 * std.time.ns_per_ms), .release);
+    }
+    return .{ .id = chosen, .progress = writes.items.len != 0 or deletes.items.len != 0 or (!exhausted and chosen == null), .timed = from_timer };
+}
+
+fn directoryValue(alloc: alloc_type, block: u64, end: []const u8) ![]u8 {
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    defer bytes.deinit(alloc);
+    try appendInt(&bytes, alloc, u64, block);
+    try appendInt(&bytes, alloc, u32, std.math.cast(u32, end.len) orelse return error.InvalidColumnSegment);
+    try bytes.appendSlice(alloc, end);
+    return checked(alloc, bytes.items);
+}
+const Directory = struct {
+    alloc: alloc_type,
+    cursor: store_mod.DocStore.Txn.CursorAdapter,
+    prefix: []u8,
+    pending: ?store_mod.KVPair,
+
+    fn init(alloc: alloc_type, txn: *store_mod.DocStore.Txn, generation: u64, from: []const u8) !Directory {
+        const dir = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:r:", .{ prefix, generation });
+        errdefer alloc.free(dir);
+        const lower = try std.mem.concat(alloc, u8, &.{ dir, from });
+        defer alloc.free(lower);
+        var cursor = try txn.openCursor();
+        errdefer cursor.close();
+        var entry = try cursor.seekAtOrBefore(lower);
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, dir)) {
+            entry = try cursor.seekAtOrAfter(dir);
+            if (entry) |kv| if (std.mem.startsWith(u8, kv.key, dir) and kv.key.len != dir.len) return error.InvalidColumnSegment;
+        }
+        return .{ .alloc = alloc, .cursor = cursor, .prefix = dir, .pending = if (entry) |kv| .{ .key = kv.key, .value = kv.value } else null };
+    }
+    fn deinit(self: *@This()) void {
+        self.cursor.close();
+        self.alloc.free(self.prefix);
+    }
+    fn next(self: *@This(), alloc: alloc_type) !?Range {
+        const entry = self.pending orelse return null;
+        if (!std.mem.startsWith(u8, entry.key, self.prefix)) return null;
+        const key = try alloc.dupe(u8, entry.key);
+        const value = try alloc.dupe(u8, entry.value);
+        const index = try verified(value);
+        if (index.len < 12 or std.mem.readInt(u32, index[8..12], .little) != index.len - 12) return error.InvalidColumnSegment;
+        const following = try self.cursor.next();
+        self.pending = if (following) |kv| .{ .key = kv.key, .value = kv.value } else null;
+        const end = if (self.pending) |kv| if (std.mem.startsWith(u8, kv.key, self.prefix)) try alloc.dupe(u8, kv.key[self.prefix.len..]) else "" else "";
+        if (!std.mem.eql(u8, index[12..], end)) return error.InvalidColumnSegment;
+        return .{ .key = key, .value = value, .start = key[self.prefix.len..], .end = end, .block = std.mem.readInt(u64, index[0..8], .little) };
+    }
+};
+
+const DirtyRanges = struct {
+    read_cost: u64 = 0,
+    plans: scan_plan.Cursor = .{},
+    cursor: store_mod.DocStore.Txn.CursorAdapter,
+    pending: ?[]const u8,
+    pending_bytes: ?u64 = 0,
+    fn deinit(self: *@This()) void {
+        self.plans.deinit();
+        self.cursor.close();
+    }
+    fn setPending(self: *@This(), entry: anytype) void {
+        self.pending = if (entry) |kv| kv.key else null;
+        self.pending_bytes = 0;
+        if (entry) |kv| if (std.mem.startsWith(u8, kv.key, dirty_prefix)) {
+            self.pending_bytes = if (kv.value.len == @sizeOf(keys.ColumnarDirtyRecord)) std.mem.readInt(u64, kv.value[8..16], .little) else null;
+        };
+    }
+    fn init(txn: *store_mod.DocStore.Txn, alloc: alloc_type, from: []const u8) !DirtyRanges {
+        const lower = try std.mem.concat(alloc, u8, &.{ dirty_prefix, from });
+        defer alloc.free(lower);
+        var cursor = try txn.openCursor();
+        errdefer cursor.close();
+        const entry = try cursor.seekAtOrAfter(lower);
+        var result = @This(){ .cursor = cursor, .pending = null };
+        result.setPending(entry);
+        return result;
+    }
+    fn overlaps(self: *@This(), alloc: alloc_type, from: []const u8, to: []const u8) !bool {
+        var key = self.pending orelse return false;
+        if (!std.mem.startsWith(u8, key, dirty_prefix)) return false;
+        if (std.mem.order(u8, key[dirty_prefix.len..], from) == .lt) {
+            const lower = try std.mem.concat(alloc, u8, &.{ dirty_prefix, from });
+            defer alloc.free(lower);
+            const entry = try self.cursor.seekAtOrAfter(lower);
+            self.setPending(entry);
+            key = self.pending orelse return false;
+            if (!std.mem.startsWith(u8, key, dirty_prefix)) return false;
+        }
+        return to.len == 0 or std.mem.order(u8, key[dirty_prefix.len..], to) == .lt;
+    }
+
+    /// Merge authoritative mutations up to a base-row key (inclusive), or to a
+    /// range end (exclusive). The cursor streams arbitrarily large deltas with
+    /// one row arena/read scope; no dirty-range materialization is needed.
+    fn emitThrough(self: *@This(), db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, end: []const u8, inclusive: bool, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, materializer: Materializer) !bool {
+        var replaced = false;
+        while (self.pending) |key| {
+            if (!std.mem.startsWith(u8, key, dirty_prefix)) break;
+            const raw = key[dirty_prefix.len..];
+            if ((to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, raw, to) != .lt else std.mem.order(u8, raw, to) == .gt)) or
+                (byte_range.end.len != 0 and std.mem.order(u8, raw, byte_range.end) != .lt))
+            {
+                self.pending = null;
+                break;
+            }
+            if (end.len != 0 or inclusive) {
+                const order = std.mem.order(u8, raw, end);
+                if (order == .gt or (order == .eq and !inclusive)) break;
+                replaced = order == .eq;
+            }
+            if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return replaced;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const id = try scratch.dupe(u8, raw);
+            const physical_bytes = self.pending_bytes;
+            const next = try self.cursor.next();
+            self.setPending(next);
+            if (!eligibleRow(.{ .key = id, .hash = undefined, .timestamp = 0 }, from, to, byte_range, opts, 0, now_ns)) continue;
+            if (opts.columnar_stats) |stats| stats.overlay_rows_read += 1;
+            if ((physical_bytes orelse return error.InvalidColumnSegment) == 0) {
+                if (opts.columnar_stats) |stats| stats.overlay_tombstones_skipped += 1;
+                continue;
+            }
+            var scope = try txn.openReadScope(scratch);
+            defer scope.close();
+            self.read_cost +|= 4096;
+            const packed_key = try keys.relationalRowKeyAlloc(scratch, id);
+            const bytes = scope.get(packed_key) catch |err| switch (err) {
+                error.NotFound => continue, // Tombstone still masks the base row.
+                else => return err,
+            };
+            if (opts.columnar_stats) |stats| stats.primary_rows_read += 1;
+            self.read_cost +|= bytes.len;
+            const version = try codec.rowSchemaVersion(bytes);
+            const plan = try self.plans.get(plans, db, version);
+            const view = plan.view;
+            const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+            const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
+            if (!eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns)) continue;
+            if (plan.filter != null) {
+                if (opts.columnar_stats) |stats| stats.primary_predicate_rows += 1;
+            }
+            if (!try plan.matches(scratch, id, typed)) continue;
+            const projected = if (opts.include_documents) try projectPrimary(plan, materializer, scratch, id, typed) else null;
+            try deliver(alloc, row, projected, opts, visitor, progress);
+        }
+        return replaced;
+    }
+};
+
+fn rangeClean(read: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range) !bool {
+    var dirty = try DirtyRanges.init(read, alloc, range.start);
+    defer dirty.deinit();
+    return !try dirty.overlaps(alloc, range.start, range.end);
+}
+
+fn scheduleMaintenance(txn: *store_mod.DocStore.Txn, alloc: alloc_type, turn: u64, selected: ?[]const u8) !void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, turn +% 1, .little);
+    try txn.put(maintenance_turn_key, &encoded);
+    if (selected) |key| try txn.put(merge_cursor_key, try checked(alloc, key));
+}
+
+/// Compare bytes plus a conservative 4 KiB random-read charge. Unchanged wide
+/// rows count only against primary scans; replaced base rows are subtracted.
+/// The bounded probe never fetches primary values. Small LIMIT queries retain
+/// streaming early exit. An incomplete probe uses an overlay lower bound:
+/// unseen deltas add common row bytes, favor sequential access, and can only
+/// remove more unchanged base bytes from the primary estimate.
+const RangeScanPlan = struct {
+    primary: bool = false,
+    visibility_complete: bool = false,
+};
+
+fn planRange(txn: *store_mod.DocStore.Txn, alloc: alloc_type, range: Range, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, block: *Block, candidates: []bool, filter: ?scan_plan.Filter) !RangeScanPlan {
+    if (opts.limit > 0 and opts.limit <= 16) return .{};
+    var lower = range.start;
+    if (std.mem.order(u8, lower, from) == .lt) lower = from;
+    if (std.mem.order(u8, lower, byte_range.start) == .lt) lower = byte_range.start;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const key = try std.mem.concat(alloc, u8, &.{ dirty_prefix, lower });
+    defer alloc.free(key);
+    var entry = try cursor.seekAtOrAfter(key);
+    var count: usize = 0;
+    var base_bytes: u64 = 0;
+    var base_count: u64 = 0;
+    var cost_eligible: [max_rows]bool = @splat(false);
+    for (block.rows, 0..) |row, i| {
+        // Primary scans must read expired rows before evaluating their TTL.
+        cost_eligible[i] = std.mem.order(u8, row.key, range.start) != .lt and
+            (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and
+            eligibleRow(row, from, to, byte_range, opts, 0, 0);
+        if (cost_eligible[i]) {
+            base_bytes +|= row.physical_bytes;
+            base_count += 1;
+        }
+    }
+    var delta_bytes: u64 = 0;
+    var delta_live: u64 = 0;
+    var surviving: [max_rows]bool = @splat(false);
+    @memcpy(surviving[0..block.rows.len], candidates);
+    var row_index: usize = 0;
+    var probe_bytes: usize = 0;
+    var complete = true;
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, dirty_prefix)) break;
+        const id = item.key[dirty_prefix.len..];
+        if ((range.end.len != 0 and std.mem.order(u8, id, range.end) != .lt) or
+            (byte_range.end.len != 0 and std.mem.order(u8, id, byte_range.end) != .lt) or
+            (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, id, to) != .lt else std.mem.order(u8, id, to) == .gt))) break;
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+        if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (count == 4 * maintenance_records or probe_bytes >= maintenance_bytes) {
+            complete = false;
+            break;
+        }
+        if (item.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+        if (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, id, from)) {
+            entry = try cursor.next();
+            continue;
+        }
+        const bytes = std.mem.readInt(u64, item.value[8..16], .little);
+        delta_bytes +|= bytes;
+        if (bytes != 0) delta_live += 1;
+        while (row_index < block.rows.len and std.mem.order(u8, block.rows[row_index].key, id) == .lt) : (row_index += 1) {}
+        if (row_index < block.rows.len and std.mem.eql(u8, block.rows[row_index].key, id)) {
+            surviving[row_index] = false;
+            candidates[row_index] = false;
+            if (cost_eligible[row_index]) {
+                base_bytes -|= block.rows[row_index].physical_bytes;
+                base_count -|= 1;
+            }
+        }
+        count += 1;
+        probe_bytes +|= item.key.len + item.value.len;
+        if (opts.columnar_stats) |stats| stats.costed_dirty_records += 1;
+        entry = try cursor.next();
+    }
+    var projected_bytes: u64 = 0;
+    const late_materialization = opts.include_documents and block.plan.?.projected == null;
+    if (complete and std.mem.indexOfScalar(bool, surviving[0..block.rows.len], true) != null) {
+        var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+        defer seen.deinit(alloc);
+        if (block.plan.?.projected) |projected| for (projected.base.ordinals) |ordinal| {
+            try seen.put(alloc, ordinal, {});
+        };
+        if (filter) |value| try block.predicateColumns(value, &seen);
+        var ordinals = seen.keyIterator();
+        while (ordinals.next()) |ordinal| projected_bytes +|= try block.payloadCost(ordinal.*, surviving[0..block.rows.len]);
+        if (late_materialization) for (block.rows, surviving[0..block.rows.len]) |row, selected| {
+            if (selected) projected_bytes +|= row.physical_bytes +| 4096;
+        };
+    }
+    // Predicate/projection pages are charged once, before any payload is read.
+    // CPU ranking weights belong to leaf ordering, not this byte estimate.
+    // Tombstones cost sequential journal traversal, never primary-row lookups.
+    const overlay = delta_bytes +| delta_live *| 4096 +| probe_bytes +| projected_bytes;
+    const primary = delta_bytes +| base_bytes +| (base_count +| delta_live) *| 64;
+    if (opts.columnar_stats) |stats| {
+        stats.estimated_overlay_bytes +|= overlay;
+        stats.estimated_primary_bytes +|= primary;
+    }
+    // Require a margin before discarding the column plan for a row scan.
+    return .{ .primary = (count >= 16 or late_materialization) and primary +| primary / 4 < overlay, .visibility_complete = complete };
+}
+
+/// Compact one dirty key range per maintenance pass. Large insertion bursts
+/// split at 64 blocks; the old base retains the uncovered suffix and its dirty
+/// markers until another pass. Neither preparation memory nor writer work
+/// scales with the total table size.
+fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    db.core.lockApplyShared();
+    var locked = true;
+    defer if (locked) db.core.unlockApplyShared();
+    if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+    // Capture before the snapshot so a commit racing discovery cannot be
+    // mistaken for work already accounted for by the idle wake hint.
+    const store_revision = db.core.store.columnar_revision.load(.acquire);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const manifest_bytes = try read.get(manifest_key);
+    const manifest = try Manifest.decode(manifest_bytes);
+    if (!manifest.ready) return false;
+    const bootstrap = try bootstrapBoundary(&read, manifest);
+    // An empty completed generation has no directory entry to resolve a new
+    // dirty row against. Re-bootstrap it before adaptive admission; explicit
+    // drains already handled this via the later missing-range fallback.
+    if (manifest.ranges == 0 and bootstrap == null) {
+        var probe = try read.openCursor();
+        defer probe.close();
+        const entry = try probe.seekAtOrAfter(dirty_prefix);
+        if (entry == null or !std.mem.startsWith(u8, entry.?.key, dirty_prefix)) return false;
+        db.core.unlockApplyShared();
+        locked = false;
+        return rebuild(db, alloc, true, adaptive);
+    }
+    const selection = if (adaptive and bootstrap == null) try selectReady(db, &read, scratch, manifest, manifest_bytes, store_revision) else Selection{};
+    var dirty = try read.openCursor();
+    defer dirty.close();
+    const saved_cursor = read.get(maintenance_cursor_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const resume_id = if (saved_cursor) |encoded| blk: {
+        const body = verified(encoded) catch break :blk "";
+        if (body.len < 12 or std.mem.readInt(u64, body[0..8], .little) != manifest.generation or
+            std.mem.readInt(u32, body[8..12], .little) != body.len - 12) break :blk "";
+        break :blk body[12..];
+    } else "";
+    const resume_key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, resume_id });
+    var pending_entry = try dirty.seekAtOrAfter(resume_key);
+    if (pending_entry == null or !std.mem.startsWith(u8, pending_entry.?.key, dirty_prefix)) pending_entry = try dirty.seekAtOrAfter(dirty_prefix);
+    if (adaptive and bootstrap == null) pending_entry = if (selection.id) |id| .{ .key = try std.mem.concat(scratch, u8, &.{ dirty_prefix, id }), .value = "" } else null;
+    const any_dirty = if (pending_entry) |entry| std.mem.startsWith(u8, entry.key, dirty_prefix) else false;
+    const candidate_prefix = try mergeQueueKey(scratch, manifest.generation, "");
+    const turn_bytes = read.get(maintenance_turn_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const turn: u64 = if (turn_bytes) |bytes| if (bytes.len == 8) std.mem.readInt(u64, bytes[0..8], .little) else 0 else 0;
+    var candidate_cursor = try read.openCursor();
+    defer candidate_cursor.close();
+    const saved_merge = read.get(merge_cursor_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const merge_resume = if (saved_merge) |bytes| verified(bytes) catch "" else "";
+    const candidate_lower = if (std.mem.startsWith(u8, merge_resume, candidate_prefix)) try std.mem.concat(scratch, u8, &.{ merge_resume, "\x00" }) else candidate_prefix;
+    var queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_lower);
+    if (queued_candidate == null or !std.mem.startsWith(u8, queued_candidate.?.key, candidate_prefix)) queued_candidate = try candidate_cursor.seekAtOrAfter(candidate_prefix);
+    const has_candidate = if (queued_candidate) |entry| std.mem.startsWith(u8, entry.key, candidate_prefix) else false;
+    // Deferred dirty rows must not put ready merge/queue-cleanup work to sleep.
+    if (has_candidate) db.relational_column_maintenance.waiting_until_ns.store(0, .release);
+    const merge_turn = bootstrap == null and has_candidate and (!any_dirty or turn % 4 == 3);
+    const has_dirty = bootstrap != null or (any_dirty and !merge_turn);
+    if (merge_turn) pending_entry = queued_candidate;
+    if (bootstrap == null and !any_dirty and !has_candidate) return selection.progress;
+    const selected_candidate = if (!has_dirty) try scratch.dupe(u8, pending_entry.?.key) else null;
+    const dirty_id = try scratch.dupe(u8, bootstrap orelse pending_entry.?.key[if (has_dirty) dirty_prefix.len else candidate_prefix.len..]);
+    var directory = try Directory.init(alloc, &read, manifest.generation, dirty_id);
+    defer directory.deinit();
+    const selected = (try directory.next(scratch)) orelse {
+        db.core.unlockApplyShared();
+        locked = false;
+        return rebuild(db, alloc, true, adaptive);
+    };
+    var ranges = std.ArrayListUnmanaged(Range).empty;
+    const version = try blockVersion(&read, scratch, manifest.generation, selected.block);
+    // Dirty ranges must reach their own rows before spending a quantum on a
+    // predecessor: otherwise a partial build at an epoch boundary can keep
+    // rewriting the same clean prefix. The clean merge queue handles neighbors
+    // after dirty compaction has made their occupancy/schema metadata current.
+    if (!has_dirty and selected.start.len != 0) {
+        var previous_cursor = try read.openCursor();
+        defer previous_cursor.close();
+        _ = try previous_cursor.seekAtOrBefore(selected.key);
+        if (try previous_cursor.prev()) |previous| if (std.mem.startsWith(u8, previous.key, directory.prefix)) {
+            const previous_id = try scratch.dupe(u8, previous.key[directory.prefix.len..]);
+            var previous_directory = try Directory.init(alloc, &read, manifest.generation, previous_id);
+            defer previous_directory.deinit();
+            const previous_range = (try previous_directory.next(scratch)).?;
+            if (try mergeCandidate(&read, scratch, manifest.generation, previous_range) and
+                try rangeClean(&read, scratch, previous_range) and
+                try blockVersion(&read, scratch, manifest.generation, previous_range.block) == version)
+                try ranges.append(scratch, previous_range);
+        };
+    }
+    try ranges.append(scratch, selected);
+    while (bootstrap == null and ranges.items.len < 8) {
+        const next = (try directory.next(scratch)) orelse break;
+        if (!try mergeCandidate(&read, scratch, manifest.generation, next) or
+            (!has_dirty and !try rangeClean(&read, scratch, next)) or
+            try blockVersion(&read, scratch, manifest.generation, next.block) != version) break;
+        try ranges.append(scratch, next);
+    }
+    if (selected_candidate) |candidate| {
+        if (!std.mem.eql(u8, selected.start, dirty_id) or !try mergeCandidate(&read, scratch, manifest.generation, selected) or ranges.items.len == 1 or !try rangeClean(&read, scratch, selected)) {
+            var discard = try db.core.store.beginWriteTxn();
+            var discard_live = true;
+            defer if (discard_live) discard.abort();
+            try scheduleMaintenance(&discard, scratch, turn, selected_candidate);
+            try discard.delete(candidate);
+            try discard.commit();
+            discard_live = false;
+            return true;
+        }
+    }
+    const range = Range{ .key = ranges.items[0].key, .value = ranges.items[0].value, .start = ranges.items[0].start, .end = ranges.items[ranges.items.len - 1].end, .block = ranges.items[0].block };
+    // Bound dirty journal work independently of live/output rows. A large
+    // deleted insertion burst must not produce an unbounded cleanup journal.
+    var dirty_limit: ?[]const u8 = null;
+    var captured_dirty = try read.openCursor();
+    defer captured_dirty.close();
+    var captured = try captured_dirty.seekAtOrAfter(try std.mem.concat(scratch, u8, &.{ dirty_prefix, range.start }));
+    var dirty_count: usize = 0;
+    var dirty_bytes: usize = 0;
+    while (captured) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, dirty_prefix)) break;
+        const id = entry.key[dirty_prefix.len..];
+        if (range.end.len != 0 and std.mem.order(u8, id, range.end) != .lt) break;
+        if (dirty_count >= 4 * maintenance_records or dirty_bytes >= maintenance_bytes) {
+            dirty_limit = try scratch.dupe(u8, id);
+            break;
+        }
+        dirty_count += 1;
+        if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+        dirty_bytes +|= entry.key.len + entry.value.len;
+        captured = try captured_dirty.next();
+    }
+    var start = try db.core.store.beginWriteTxn();
+    var start_live = true;
+    defer if (start_live) start.abort();
+    if (!try sameValue(&start, manifest_key, manifest_bytes)) return false;
+    try scheduleMaintenance(&start, scratch, turn, selected_candidate);
+    const old_counter = try start.get(counter_key);
+    if (old_counter.len != 8) return error.InvalidColumnSegment;
+    const build_id = std.math.add(u64, std.mem.readInt(u64, old_counter[0..8], .little), 1) catch return error.InvalidColumnSegment;
+    if (build_id > std.math.maxInt(u32)) return error.InvalidColumnSegment;
+    const first_block = build_id << 32;
+    const token = buildToken(manifest.generation, first_block);
+    var counter: [8]u8 = undefined;
+    std.mem.writeInt(u64, &counter, build_id, .little);
+    try start.put(counter_key, &counter);
+    try start.put(building_key, &token);
+    // Publish the next range before staging. Crashes, cancellation and a hot
+    // first key must not force every subsequent pass back onto the same range.
+    try start.put(maintenance_cursor_key, try directoryValue(scratch, manifest.generation, range.end));
+    try start.commit();
+    start_live = false;
+    db.core.unlockApplyShared();
+    locked = false;
+    var builder = ColumnBuilder(@TypeOf(db)){
+        .db = db,
+        .payload_read = &read,
+        .alloc = alloc,
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .generation = manifest.generation,
+        .namespace = namespace,
+        .blocks = first_block,
+        .expected_manifest = manifest.encode(),
+        .build_token = token,
+        .boundary = range.start,
+        .stop_after_block = first_block + (if (@import("builtin").is_test) test_compaction_block_limit orelse 64 else 64),
+        .deadline_ns = if (@import("builtin").is_test and test_disable_deadline) std.math.maxInt(u64) else platform_time.monotonicNs() +| 50 * std.time.ns_per_ms,
+    };
+    defer builder.deinit();
+    for (ranges.items) |part| {
+        if (dirty_limit) |limit| if (std.mem.order(u8, part.start, limit) != .lt) break;
+        const scan_end = if (dirty_limit) |limit| if (part.end.len == 0 or std.mem.order(u8, limit, part.end) == .lt) limit else part.end else part.end;
+        if (bootstrap == null) {
+            try builder.visitCovered(&read, part, scan_end);
+        } else {
+            const lower = try keys.documentRangeLowerAlloc(scratch, part.start);
+            const upper = if (scan_end.len == 0) (try keys.documentRangeUpperAlloc(scratch, "")) orelse return error.InvalidColumnSegment else try keys.documentRangeLowerAlloc(scratch, scan_end);
+            try db.core.store.scanRelationalRowsReadTxnWithContext(&read, lower, upper, &builder, ColumnBuilder(@TypeOf(db)).checkpoint, ColumnBuilder(@TypeOf(db)).visit);
+        }
+        if (builder.continuation != null) break;
+    }
+    try builder.flush();
+    if (builder.continuation == null) if (dirty_limit) |limit| {
+        builder.continuation = try alloc.dupe(u8, limit);
+    };
+    try builder.finishDirectory(builder.continuation orelse range.end);
+    const cleanup = try stageCleanup(db, alloc, &read, range.start, builder.continuation orelse range.end, manifest_bytes, token, namespace);
+    defer cleanup.deinit(alloc);
+    if (comptime @import("builtin").is_test) if (test_before_publish) |hook| try hook.run(hook.context);
+    if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+    db.core.lockApplyShared();
+    locked = true;
+    if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+    var publish = try db.core.store.beginWriteTxn();
+    var live = true;
+    defer if (live) publish.abort();
+    if (!try sameValue(&publish, manifest_key, manifest_bytes) or !try sameValue(&publish, building_key, &token)) return false;
+    var removed_ranges: u64 = 0;
+    var retained_suffix: u64 = 0;
+    for (ranges.items) |old_range| {
+        if (builder.continuation) |continuation| if (std.mem.order(u8, old_range.start, continuation) != .lt) break;
+        try publish.delete(old_range.key);
+        try deleteIfPresent(&publish, try candidateKey(scratch, manifest.generation, old_range.start));
+        try deleteIfPresent(&publish, try mergeQueueKey(scratch, manifest.generation, old_range.start));
+        removed_ranges += 1;
+        if (builder.continuation) |continuation| {
+            if (old_range.end.len == 0 or std.mem.order(u8, continuation, old_range.end) == .lt) {
+                const continuation_key = try std.mem.concat(scratch, u8, &.{ directory.prefix, continuation });
+                try publish.put(continuation_key, old_range.value);
+                // The retained root still owns its original admission age,
+                // but its directory start moved. Repoint the due index in the
+                // same publication so a partial build cannot orphan its timer.
+                const deferred = publish.get(try deferredKey(scratch, manifest.generation, old_range.block)) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (deferred) |encoded| {
+                    const state = try Deferred.decode(encoded);
+                    try publish.put(try timerKey(scratch, manifest.generation, state.due(), old_range.block), try directoryValue(scratch, old_range.block, continuation));
+                }
+                retained_suffix = 1;
+                break;
+            }
+        }
+        try retireBlock(&publish, scratch, manifest.generation, old_range.block);
+    }
+    for (builder.directory.items) |entry| try publish.put(entry.key, entry.value);
+    for (builder.candidates.items) |entry| {
+        try publish.put(entry.key, entry.value);
+        try publish.put(try mergeQueueKey(scratch, manifest.generation, entry.key[directory_prefix_len..]), "");
+    }
+    var empty_range: u64 = 0;
+    if (builder.directory.items.len == 0) {
+        // Keep empty coverage explicit. A neighboring block may contain
+        // physically retained rows outside its current directory bounds;
+        // widening either neighbor would resurrect those retired rows.
+        var meta: [24]u8 = @splat(0);
+        @memcpy(meta[0..4], "ACB8");
+        std.mem.writeInt(u32, meta[4..8], version, .little);
+        try publish.put(try blockKey(scratch, manifest.generation, builder.blocks, null), try checked(scratch, &meta));
+        try publish.put(range.key, try directoryValue(scratch, builder.blocks, builder.continuation orelse range.end));
+        try publish.put(try candidateKey(scratch, manifest.generation, range.start), try directoryValue(scratch, builder.blocks, ""));
+        try publish.put(try mergeQueueKey(scratch, manifest.generation, range.start), "");
+        builder.blocks += 1;
+        empty_range = 1;
+    }
+    var next_manifest = manifest;
+    if (bootstrap != null) next_manifest.initializing = builder.continuation != null;
+    next_manifest.blocks = builder.blocks;
+    next_manifest.ranges = manifest.ranges - removed_ranges + builder.directory.items.len + retained_suffix + empty_range;
+    const ready = next_manifest.encode();
+    try publish.put(manifest_key, &ready);
+    if (adaptive and bootstrap == null and has_dirty and !selection.timed) try publish.put(discovery_key, try directoryValue(scratch, manifest.generation, range.end));
+    if (bootstrap != null) {
+        if (builder.continuation) |continuation| {
+            try publish.put(bootstrap_key, try directoryValue(scratch, manifest.generation, continuation));
+        } else try publish.delete(bootstrap_key);
+    }
+    try publish.delete(building_key);
+    const inline_cleared = try cleanup.publish(&publish, &token);
+    try publish.commit();
+    live = false;
+    for (ranges.items) |old_range| _ = db.relational_column_maintenance.debtSlot(manifest.generation, old_range.block).swap(0, .monotonic);
+    if (bootstrap != null) _ = db.relational_column_maintenance.bootstrap_quanta.fetchAdd(1, .monotonic);
+    db.relational_column_maintenance.waiting_until_ns.store(0, .release);
+    _ = db.relational_column_maintenance.dirty_markers_cleared.fetchAdd(inline_cleared, .monotonic);
+    db.core.unlockApplyShared();
+    locked = false;
+    try finishCleanupQuantum(db, alloc, manifest.generation, namespace);
+    if (empty_range != 0) _ = db.relational_column_maintenance.blocks_written.fetchAdd(empty_range, .monotonic);
+    _ = db.relational_column_maintenance.ranges_compacted.fetchAdd(1, .monotonic);
+    if (removed_ranges > builder.directory.items.len + retained_suffix + empty_range)
+        _ = db.relational_column_maintenance.ranges_merged.fetchAdd(removed_ranges - builder.directory.items.len - retained_suffix - empty_range, .monotonic);
+    return true;
+}
+
+fn prunePrefix(db: anytype, alloc: alloc_type, lower: []const u8, namespace: u64, generation: u64) !bool {
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)) orelse return error.InvalidColumnSegment;
+    defer alloc.free(upper);
+    return pruneRange(db, alloc, lower, upper, namespace, generation, null);
+}
+
+fn prune(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
+    const upper = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:", .{ prefix, generation });
+    defer alloc.free(upper);
+    return pruneRange(db, alloc, prefix, upper, namespace, null, null);
+}
+
+fn drainGarbage(db: anytype, alloc: alloc_type, namespace: u64) !bool {
+    const token = db.core.store.get(alloc, garbage_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    defer alloc.free(token);
+    if (token.len != 16) return error.InvalidColumnSegment;
+    const orphan_prefix = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:{x:0>8}", .{ prefix, std.mem.readInt(u64, token[0..8], .little), std.mem.readInt(u64, token[8..16], .little) >> 32 });
+    defer alloc.free(orphan_prefix);
+    if (try prunePrefix(db, alloc, orphan_prefix, namespace, std.mem.readInt(u64, token[0..8], .little))) return true;
+    db.core.lockApplyShared();
+    defer db.core.unlockApplyShared();
+    if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+    var txn = try db.core.store.beginWriteTxn();
+    var live = true;
+    defer if (live) txn.abort();
+    if (try sameValue(&txn, garbage_key, token)) try txn.delete(garbage_key);
+    try txn.commit();
+    live = false;
+    return true;
+}
+
+fn drainRetired(db: anytype, alloc: alloc_type, generation: u64, namespace: u64) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const lower = try std.fmt.allocPrint(scratch, "{s}{x:0>16}:retired:", .{ prefix, generation });
+    const upper = (try keys.nextPrefixAlloc(scratch, lower)).?;
+    const First = struct {
+        alloc: alloc_type,
+        key: ?[]const u8 = null,
+        value: []const u8 = "",
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.key = try self.alloc.dupe(u8, key);
+            self.value = try self.alloc.dupe(u8, value);
+            return .stop;
+        }
+    };
+    var first = First{ .alloc = scratch };
+    try db.core.store.scanWithContext(lower, upper, .{}, &first, First.visit);
+    const key = first.key orelse return false;
+    const body = try verified(first.value);
+    if (body.len != 8) return error.InvalidColumnSegment;
+    const block = std.mem.readInt(u64, body[0..8], .little);
+    const expected = try std.fmt.allocPrint(scratch, "{s}{x:0>16}", .{ lower, block });
+    if (!std.mem.eql(u8, key, expected)) return error.InvalidColumnSegment;
+    const retired_prefix = try std.fmt.allocPrint(scratch, "{s}{x:0>16}:{x:0>16}:", .{ prefix, generation, block });
+    const retired_upper = (try keys.nextPrefixAlloc(scratch, retired_prefix)).?;
+    // Complete the durable intent with the final metadata page, not in a
+    // separate empty maintenance turn for every small retired root.
+    return pruneRange(db, alloc, retired_prefix, retired_upper, namespace, generation, .{ .key = key, .value = first.value });
+}
+
+pub fn retiredRootsForTest(db: anytype, alloc: alloc_type) !usize {
+    const raw = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(raw);
+    const manifest = try Manifest.decode(raw);
+    const lower = try std.fmt.allocPrint(alloc, "{s}{x:0>16}:retired:", .{ prefix, manifest.generation });
+    defer alloc.free(lower);
+    const upper = (try keys.nextPrefixAlloc(alloc, lower)).?;
+    defer alloc.free(upper);
+    const Counter = struct {
+        count: usize = 0,
+        fn visit(ptr: ?*anyopaque, _: []const u8, _: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.count += 1;
+            return .@"continue";
+        }
+    };
+    var counter = Counter{};
+    try db.core.store.scanWithContext(lower, upper, .{}, &counter, Counter.visit);
+    return counter.count;
+}
+
+/// Deletion itself is the durable GC cursor. At most one page is collected and
+/// committed; the next turn seeks directly to the first remaining record.
+fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const u8, namespace: u64, release_generation: ?u64, completion: ?store_mod.KVPair) !bool {
+    const Pruner = struct {
+        db: @TypeOf(db),
+        namespace: u64,
+        arena: std.heap.ArenaAllocator,
+        deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+        references: std.ArrayListUnmanaged([32]u8) = .empty,
+        release_generation: ?u64,
+        completion: ?store_mod.KVPair,
+        exhausted: bool = true,
+        bytes: usize = 0,
+        deleted: usize = 0,
+        fn flush(self: *@This()) !void {
+            if (self.deletes.items.len == 0 and self.completion == null) return;
+            const scratch = self.arena.allocator();
+            var deltas = std.ArrayListUnmanaged(payloads.Delta).empty;
+            for (self.references.items) |digest| try deltas.append(scratch, .{ .digest = digest, .releases = 1 });
+            const prepared = if (self.release_generation) |generation|
+                try payloads.prepare(self.db.core.store, scratch, generation, deltas.items)
+            else
+                payloads.Prepared{};
+            self.db.core.lockApplyShared();
+            defer self.db.core.unlockApplyShared();
+            if (self.namespace != self.db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+            var txn = try self.db.core.store.beginWriteTxn();
+            var live = true;
+            defer if (live) txn.abort();
+            try prepared.apply(&txn);
+            for (self.deletes.items) |key| try txn.delete(key);
+            if (self.exhausted) if (self.completion) |intent| {
+                if (try sameValue(&txn, intent.key, intent.value)) try txn.delete(intent.key);
+            };
+            try txn.commit();
+            live = false;
+            self.deleted += self.deletes.items.len;
+            self.deletes = .empty;
+            self.references = .empty;
+            _ = self.arena.reset(.free_all);
+        }
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+            const scratch = self.arena.allocator();
+            if (self.deletes.items.len != 0 and self.bytes +| key.len +| value.len > maintenance_bytes) {
+                self.exhausted = false;
+                return .stop;
+            }
+            const tag = prefix.len + 16 + 1 + 16 + 1;
+            if (self.release_generation != null and key.len == tag + 9 and key[tag] == 'p') {
+                const meta = try verified(value);
+                const offset = 25 + 2 * null_bytes;
+                if (meta.len < offset + 46 or (meta.len - offset) % 46 != 0) return error.InvalidColumnSegment;
+                const rows = std.mem.readInt(u16, meta[meta.len - 46 ..][0..2], .little);
+                const pages = try ColumnPages.init(meta, rows);
+                var references: usize = 0;
+                for (0..pages.count()) |page| if (pages.size(page) != 0) {
+                    references += 1;
+                };
+                // One column's ownership is indivisible. Allow that single
+                // record (at most max_rows references), but never add another
+                // record that would push the quantum beyond its operation cap.
+                if (self.deletes.items.len != 0 and self.deletes.items.len + 1 + 2 * (self.references.items.len + references) > maintenance_records) {
+                    self.exhausted = false;
+                    return .stop;
+                }
+                for (0..pages.count()) |page| if (pages.size(page) != 0) try self.references.append(scratch, pages.reference(page).digest);
+            }
+            try self.deletes.append(scratch, try scratch.dupe(u8, key));
+            self.bytes +|= key.len +| value.len;
+            if (self.deletes.items.len + 2 * self.references.items.len >= maintenance_records or self.bytes >= maintenance_bytes) {
+                self.exhausted = false;
+                return .stop;
+            }
+            return .@"continue";
+        }
+    };
+    var pruner = Pruner{ .db = db, .arena = std.heap.ArenaAllocator.init(alloc), .namespace = namespace, .release_generation = release_generation, .completion = completion };
+    defer pruner.arena.deinit();
+    try db.core.store.scanWithContext(lower, upper, .{}, &pruner, Pruner.visit);
+    try pruner.flush();
+    _ = db.relational_column_maintenance.gc_records_deleted.fetchAdd(pruner.deleted, .monotonic);
+    return pruner.deleted != 0 or completion != null;
+}
+
+const Decoder = struct {
+    bytes: []const u8,
+    fn take(self: *@This(), n: usize) ![]const u8 {
+        if (n > self.bytes.len) return error.InvalidColumnSegment;
+        const result = self.bytes[0..n];
+        self.bytes = self.bytes[n..];
+        return result;
+    }
+    fn int(self: *@This(), comptime T: type) !T {
+        return std.mem.readInt(T, (try self.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
+    }
+};
+
+fn supports(filter: graph.CompiledPatternFilter) bool {
+    return switch (filter) {
+        .match_all, .match_none, .doc_id => true,
+        .field_matcher => |matcher| switch (matcher.path) {
+            .single => true,
+            .dotted, .json_pointer => |parts| parts.len != 0,
+        },
+        .conjuncts, .disjuncts => |items| blk: {
+            for (items) |item| if (!supports(item)) break :blk false;
+            break :blk true;
+        },
+        .bool_query => |query| blk: {
+            for (query.must) |item| if (!supports(item)) break :blk false;
+            for (query.should) |item| if (!supports(item)) break :blk false;
+            for (query.must_not) |item| if (!supports(item)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
+fn validateOrdinalPages(pages: []const u8, rows: usize, columns: usize) !void {
+    if (pages.len % 12 != 0 or (rows == 0 and pages.len != 0)) return error.InvalidColumnSegment;
+    for (0..pages.len / 12) |i| {
+        const page = pages[i * 12 ..][0..12];
+        const id = std.mem.readInt(u32, page[0..4], .little);
+        const mask = std.mem.readInt(u64, page[4..12], .little);
+        if (mask == 0 or @as(u64, id) * 64 + 63 - @clz(mask) >= columns) return error.InvalidColumnSegment;
+        if (i > 0 and id <= std.mem.readInt(u32, pages[(i - 1) * 12 ..][0..4], .little)) return error.InvalidColumnSegment;
+    }
+}
+
+test "relational columnar metadata state is compact and logical slots are lazy" {
+    try std.testing.expect(@sizeOf(Block.ColumnView) <= 256);
+    var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var value: Block.ColumnView = .{};
+    try std.testing.expect(value.logical == null);
+    try std.testing.expectEqual(@as(usize, 0), measured.allocated_bytes);
+    const slots = try value.logicalSlots(measured.allocator(), 1);
+    defer measured.allocator().free(slots);
+    try std.testing.expectEqual(@as(usize, 1), slots.len);
+    try std.testing.expect(slots[0] == null);
+    try std.testing.expectEqual(@sizeOf(?std.json.Value), measured.allocated_bytes);
+    try std.testing.expectEqual(slots.ptr, (try value.logicalSlots(measured.allocator(), 1)).ptr);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var fresh: Block.ColumnView = .{};
+    try std.testing.expectError(error.OutOfMemory, fresh.logicalSlots(failing.allocator(), 1));
+    try std.testing.expect(fresh.logical == null);
+}
+
+const Block = struct {
+    alloc: alloc_type,
+    scope: *backend_erased.ReadScope,
+    generation: u64,
+    index: u64,
+    table: schema.TableSchema,
+    layout: *const codec.PhysicalLayout,
+    rows: []Row,
+    ordinal_pages: []const u8,
+    values: std.AutoHashMapUnmanaged(u32, *ColumnView) = .empty,
+    prefetched_metadata: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    orders: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
+    decoded_payloads: std.AutoHashMapUnmanaged([32]u8, *read_cache.Payload) = .empty,
+    payload_cache: ?*read_cache.Cache = null,
+    plan: ?*scan_plan.Plan = null,
+    stats: ?*types.ColumnarScanStats = null,
+    scan_options: ?types.ScanOptions = null,
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn deinit(self: *@This()) void {
+        var it = self.decoded_payloads.valueIterator();
+        while (it.next()) |payload| payload.*.release();
+        self.decoded_payloads.deinit(self.alloc);
+    }
+
+    fn checkWork(self: *@This()) !void {
+        if (self.stop) |stop| if (stop.load(.acquire)) return error.Canceled;
+        if (self.scan_options) |opts| {
+            if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+    }
+
+    const ColumnView = struct {
+        payload_bytes: u64 = 0,
+        bounds: Bounds = .{},
+        bitmaps: []const u8 = &.{},
+        cells: ?[]?codec.Cell = null,
+        pages: ?ColumnPages = null,
+        loaded_pages: std.StaticBitSet(max_rows) = .initEmpty(),
+        read_payload: bool = false,
+        logical: ?[]?std.json.Value = null,
+        json_views: ?[]?*JsonView = null,
+
+        fn logicalSlots(self: *@This(), alloc: alloc_type, rows: usize) ![]?std.json.Value {
+            if (self.logical == null) {
+                const slots = try alloc.alloc(?std.json.Value, rows);
+                @memset(slots, null);
+                self.logical = slots;
+            }
+            return self.logical.?;
+        }
+        fn present(self: @This(), row: usize) bool {
+            return self.bitmaps.len != 0 and self.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0;
+        }
+    };
+
+    fn hasColumn(self: *@This(), ordinal: u32) bool {
+        var low: usize = 0;
+        var high = self.ordinal_pages.len / 12;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const page = self.ordinal_pages[mid * 12 ..][0..12];
+            const id = std.mem.readInt(u32, page[0..4], .little);
+            if (id < ordinal / 64) low = mid + 1 else high = mid;
+        }
+        if (low < self.ordinal_pages.len / 12) {
+            const page = self.ordinal_pages[low * 12 ..][0..12];
+            return std.mem.readInt(u32, page[0..4], .little) == ordinal / 64 and
+                std.mem.readInt(u64, page[4..12], .little) & (@as(u64, 1) << @intCast(ordinal % 64)) != 0;
+        }
+        return false;
+    }
+
+    fn prefetchMetadata(self: *@This(), ordinals: []const u32) !void {
+        var pending: [32]u32 = undefined;
+        var count: usize = 0;
+        for (ordinals) |ordinal| {
+            if (!self.hasColumn(ordinal) or self.values.contains(ordinal) or self.prefetched_metadata.contains(ordinal)) continue;
+            if (std.mem.indexOfScalar(u32, pending[0..count], ordinal) != null) continue;
+            pending[count] = ordinal;
+            count += 1;
+            if (count == pending.len) {
+                try self.fetchMetadata(pending[0..count]);
+                count = 0;
+            }
+        }
+        try self.fetchMetadata(pending[0..count]);
+    }
+
+    fn prefetchFilterMetadata(self: *@This(), filter: scan_plan.Filter) !void {
+        const Collector = struct {
+            block: *Block,
+            pending: [32]u32 = undefined,
+            count: usize = 0,
+            fn visit(c: *@This(), value: scan_plan.Filter) anyerror!void {
+                switch (value) {
+                    .field_matcher => |matcher| if (matcher.ordinal) |ordinal| {
+                        c.pending[c.count] = ordinal;
+                        c.count += 1;
+                        if (c.count == c.pending.len) {
+                            try c.block.prefetchMetadata(c.pending[0..c.count]);
+                            c.count = 0;
+                        }
+                    },
+                    .conjuncts, .disjuncts => |items| for (items) |item| try c.visit(item),
+                    .bool_query => |query| {
+                        for (query.must) |item| try c.visit(item);
+                        if (query.min_should > 0) for (query.should) |item| try c.visit(item);
+                        for (query.must_not) |item| try c.visit(item);
+                    },
+                    else => {},
+                }
+            }
+        };
+        var collector = Collector{ .block = self };
+        try collector.visit(filter);
+        try self.prefetchMetadata(collector.pending[0..collector.count]);
+    }
+
+    fn fetchMetadata(self: *@This(), ordinals: []u32) !void {
+        if (ordinals.len == 0) return;
+        try self.checkWork();
+        std.mem.sort(u32, ordinals, {}, std.sort.asc(u32));
+        var names: [32][]const u8 = undefined;
+        var encoded: [32]?[]const u8 = undefined;
+        for (ordinals, 0..) |ordinal, i| names[i] = try columnMetaKey(self.alloc, self.generation, self.index, ordinal);
+        try self.readMany(names[0..ordinals.len], encoded[0..ordinals.len]);
+        for (ordinals, encoded[0..ordinals.len]) |ordinal, bytes| try self.prefetched_metadata.put(self.alloc, ordinal, bytes orelse return error.InvalidColumnSegment);
+    }
+
+    fn column(self: *@This(), ordinal: u32) !*ColumnView {
+        if (self.values.get(ordinal)) |value| return value;
+        const value = try self.alloc.create(ColumnView);
+        value.* = .{};
+        if (self.stats) |stats| stats.column_view_bytes += @sizeOf(ColumnView);
+        if (self.hasColumn(ordinal)) {
+            const meta = try verified(self.prefetched_metadata.get(ordinal) orelse try self.scope.get(try columnMetaKey(self.alloc, self.generation, self.index, ordinal)));
+            value.pages = try ColumnPages.init(meta, self.rows.len);
+            if (meta[0] > 1) return error.InvalidColumnSegment;
+            value.bounds = .{ .present = meta[0] == 1, .minimum = @bitCast(std.mem.readInt(u64, meta[1..9], .little)), .maximum = @bitCast(std.mem.readInt(u64, meta[9..17], .little)) };
+            if (!std.math.isFinite(value.bounds.minimum) or !std.math.isFinite(value.bounds.maximum) or value.bounds.minimum > value.bounds.maximum) return error.InvalidColumnSegment;
+            value.payload_bytes = std.mem.readInt(u64, meta[17..25], .little);
+            value.bitmaps = meta[25 .. 25 + 2 * null_bytes];
+            for (value.bitmaps[0..null_bytes], value.bitmaps[null_bytes..]) |presence, nulls| if (nulls & ~presence != 0) return error.InvalidColumnSegment;
+            for (self.rows.len..max_rows) |row| if (value.bitmaps[row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return error.InvalidColumnSegment;
+            if (self.stats) |stats| {
+                stats.metadata_bytes_read += meta.len + 4;
+                stats.encoded_bytes_read += meta.len + 4;
+                stats.column_metadata_reads += 1;
+            }
+        }
+        try self.values.put(self.alloc, ordinal, value);
+        return value;
+    }
+
+    fn valueType(self: *@This(), ordinal: u32) dv.ValueType {
+        return switch (self.table.relational_columns[ordinal].column_type) {
+            .datetime => .u64_val,
+            .integer => .i64_val,
+            .number => .f64_val,
+            .boolean => .bool_val,
+            .geopoint => .geo_point,
+            .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
+        };
+    }
+
+    fn initCells(self: *@This(), ordinal: u32) ![]?codec.Cell {
+        const column_view = try self.column(ordinal);
+        if (column_view.cells == null) {
+            const values = try self.alloc.alloc(?codec.Cell, self.rows.len);
+            @memset(values, null);
+            if (column_view.bitmaps.len != 0) for (values, 0..) |*value, i| {
+                if (column_view.bitmaps[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) value.* = .{ .ordinal = ordinal, .path = self.table.relational_columns[ordinal].path, .value_type = self.valueType(ordinal), .is_null = true, .value = undefined };
+            };
+            column_view.cells = values;
+            if (self.stats) |stats| stats.cell_slots_initialized += values.len;
+        }
+        return column_view.cells.?;
+    }
+
+    fn cells(self: *@This(), ordinal: u32, candidates: []const bool) ![]?codec.Cell {
+        const values = try self.initCells(ordinal);
+        const column_view = try self.column(ordinal);
+        if (column_view.pages) |pages| {
+            var pending: [32]PageRead = undefined;
+            var count: usize = 0;
+            var bytes: u64 = 0;
+            for (0..pages.count()) |page| {
+                if (column_view.loaded_pages.isSet(page) or pages.size(page) == 0) continue;
+                for (pages.first(page)..pages.end(page)) |i| {
+                    if (candidates[i] and column_view.present(i) and values[i] == null) {
+                        const ref = pages.reference(page);
+                        if (count != 0 and (count == pending.len or bytes +| ref.bytes > 256 * 1024)) {
+                            try self.fetchPages(pending[0..count]);
+                            count = 0;
+                            bytes = 0;
+                        }
+                        pending[count] = .{ .ordinal = ordinal, .page = page, .ref = ref };
+                        count += 1;
+                        bytes +|= ref.bytes;
+                        break;
+                    }
+                }
+            }
+            try self.fetchPages(pending[0..count]);
+        }
+        return values;
+    }
+
+    fn loadPage(self: *@This(), ordinal: u32, page: usize) !void {
+        return self.loadPageEncoded(ordinal, page, null);
+    }
+
+    const PageRead = struct { ordinal: u32, page: usize, ref: payloads.Ref };
+
+    fn readMany(self: *@This(), names: []const []const u8, values: []?[]const u8) !void {
+        if (@import("builtin").is_test and test_scalar_reads) {
+            for (names, values) |name, *value| value.* = self.scope.get(name) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            return;
+        }
+        return self.scope.getManySorted(names, values);
+    }
+
+    /// Sort/deduplicate the physical reads, while retaining the caller's
+    /// predicate/projection selection. At most 32 pages / 256 KiB are queued
+    /// (one indivisible oversized value is allowed). No speculative columns.
+    fn fetchPages(self: *@This(), pending: []PageRead) !void {
+        if (pending.len == 0) return;
+        try self.checkWork();
+        std.mem.sort(PageRead, pending, {}, struct {
+            fn less(_: void, a: PageRead, b: PageRead) bool {
+                return std.mem.order(u8, &a.ref.digest, &b.ref.digest) == .lt;
+            }
+        }.less);
+        var names: [32][]const u8 = undefined;
+        var encoded: [32]?[]const u8 = undefined;
+        var slots: [32]?usize = @splat(null);
+        var count: usize = 0;
+        for (pending, 0..) |request, i| {
+            if (self.decoded_payloads.contains(request.ref.digest) or (if (self.payload_cache) |cache| cache.contains(request.ref.digest) else false)) continue;
+            if (i != 0 and std.mem.eql(u8, &pending[i - 1].ref.digest, &request.ref.digest)) {
+                slots[i] = slots[i - 1];
+                continue;
+            }
+            slots[i] = count;
+            names[count] = try payloads.key(self.alloc, self.generation, request.ref.digest, false);
+            count += 1;
+        }
+        if (count != 0) try self.readMany(names[0..count], encoded[0..count]);
+        for (pending, slots[0..pending.len]) |request, slot| {
+            try self.loadPageEncoded(request.ordinal, request.page, if (slot) |i| encoded[i] orelse return error.InvalidColumnSegment else null);
+        }
+    }
+
+    fn prefetchProjection(self: *@This(), ordinals: []const u32, row: usize) !void {
+        try self.prefetchMetadata(ordinals);
+        var pending: [32]PageRead = undefined;
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        for (ordinals) |ordinal| {
+            const value = try self.column(ordinal);
+            if (!value.present(row) or value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) continue;
+            const pages = value.pages.?;
+            const page = pages.containing(row);
+            if (value.loaded_pages.isSet(page)) continue;
+            const ref = pages.reference(page);
+            if (count != 0 and (count == pending.len or bytes +| ref.bytes > 256 * 1024)) {
+                try self.fetchPages(pending[0..count]);
+                count = 0;
+                bytes = 0;
+            }
+            pending[count] = .{ .ordinal = ordinal, .page = page, .ref = ref };
+            count += 1;
+            bytes +|= ref.bytes;
+        }
+        try self.fetchPages(pending[0..count]);
+    }
+
+    fn loadPageEncoded(self: *@This(), ordinal: u32, page: usize, prefetched: ?[]const u8) !void {
+        try self.checkWork();
+        const values = try self.initCells(ordinal);
+        const column_view = try self.column(ordinal);
+        if (column_view.loaded_pages.isSet(page)) return;
+        const pages = column_view.pages.?;
+        const first = pages.first(page);
+        const end = pages.end(page);
+        const ref = pages.reference(page);
+        const decoded = self.decoded_payloads.get(ref.digest) orelse blk: {
+            const result = (if (self.payload_cache) |cache| cache.get(ref.digest) else null) orelse decode: {
+                const encoded = prefetched orelse try self.scope.get(try payloads.key(self.alloc, self.generation, ref.digest, false));
+                if (self.stats) |stats| {
+                    stats.payload_pages_read += 1;
+                    stats.encoded_bytes_read += encoded.len;
+                    stats.payload_bytes_read += encoded.len;
+                }
+                const result = try read_cache.Payload.decode(if (self.payload_cache) |cache| cache.alloc else self.alloc, encoded, ref);
+                if (self.payload_cache) |cache| cache.admit(ref.digest, result);
+                break :decode result;
+            };
+            errdefer result.release();
+            try self.decoded_payloads.put(self.alloc, ref.digest, result);
+            break :blk result;
+        };
+        if (decoded.value_type != self.valueType(ordinal) or decoded.values.len > ref.source_rows or decoded.encoded_bytes != ref.bytes) return error.InvalidColumnSegment;
+        if (!column_view.read_payload) if (self.stats) |stats| {
+            stats.columns_read += 1;
+        };
+        column_view.read_payload = true;
+        const col = self.table.relational_columns[ordinal];
+        for (first..end) |row| {
+            const source = ref.source_first + row - first;
+            if (source >= decoded.values.len) continue;
+            const cell_value = decoded.values[source] orelse continue;
+            if (values[row] != null or !column_view.present(row)) return error.InvalidColumnSegment;
+            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .value = cell_value };
+        }
+        for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
+        column_view.loaded_pages.set(page);
+    }
+
+    fn jsonView(self: *@This(), ordinal: u32, row: usize) !?*JsonView {
+        const column_view = try self.column(ordinal);
+        if (!column_view.present(row) or column_view.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return null;
+        if (column_view.json_views == null) {
+            const slots = try self.alloc.alloc(?*JsonView, self.rows.len);
+            @memset(slots, null);
+            column_view.json_views = slots;
+        }
+        const slot = &column_view.json_views.?[row];
+        if (slot.*) |cached| return cached;
+        const cells_view = try self.initCells(ordinal);
+        if (cells_view[row] == null) try self.loadPage(ordinal, column_view.pages.?.containing(row));
+        const cell = cells_view[row] orelse return error.InvalidColumnSegment;
+        const view = try self.alloc.create(JsonView);
+        view.* = .init(self.alloc, cell.value.bytes_val);
+        slot.* = view;
+        return view;
+    }
+
+    fn logicalValue(self: *@This(), ordinal: u32, row: usize) !?std.json.Value {
+        const value = try self.column(ordinal);
+        if (!value.present(row)) return null;
+        // Nulls are already represented in metadata; even a projected null
+        // needs no decoded cells or materialized-value cache.
+        if (value.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) != 0) return .null;
+        if (self.table.relational_columns[ordinal].is_json) {
+            const view = (try self.jsonView(ordinal, row)).?;
+            const before = view.materialized_values;
+            const logical = try view.materialize(&view.root);
+            if (self.stats) |stats| stats.values_materialized += view.materialized_values - before;
+            return logical;
+        }
+        const had_slots = value.logical != null;
+        const logical_slots = try value.logicalSlots(self.alloc, self.rows.len);
+        if (!had_slots) if (self.stats) |stats| {
+            stats.logical_slots_initialized += logical_slots.len;
+        };
+        if (logical_slots[row]) |logical| return logical;
+        const cells_view = try self.initCells(ordinal);
+        if (cells_view[row] != null) {
+            if (self.stats) |stats| stats.cell_cache_hits += 1;
+        } else try self.loadPage(ordinal, value.pages.?.containing(row));
+        const cell = cells_view[row] orelse return error.InvalidColumnSegment;
+        // Decoded payloads stay pinned until block teardown; only containers
+        // and escaped JSON tokens need new storage, never stable cell bytes.
+        const logical = try codec.borrowedJsonValueFromCellAlloc(self.alloc, self.table.relational_columns[ordinal], cell);
+        logical_slots[row] = logical;
+        if (self.stats) |stats| stats.values_materialized += 1;
+        return logical;
+    }
+
+    fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
+        try self.checkWork();
+        @memset(out, false);
+        if (std.mem.indexOfScalar(bool, candidates, true) == null) return;
+        switch (filter) {
+            .match_all => @memcpy(out, candidates),
+            .match_none => @memset(out, false),
+            .doc_id => |ids| for (self.rows, candidates, out) |row, candidate, *matched| {
+                matched.* = false;
+                if (!candidate) continue;
+                for (ids) |id| if (std.mem.eql(u8, id, row.key)) {
+                    matched.* = true;
+                    break;
+                };
+            },
+            .field_matcher => |matcher| {
+                const ordinal = matcher.ordinal orelse {
+                    const missing = try matcher.predicate.matches(self.alloc, &.{});
+                    for (out, candidates) |*matched, candidate| matched.* = candidate and missing;
+                    return;
+                };
+                if (matcher.remaining) |path| {
+                    const typed = if (self.table.relational_columns[ordinal].column_type == .dense_vector) try self.cells(ordinal, candidates) else null;
+                    for (out, candidates, 0..) |*matched, candidate, i| {
+                        if (!candidate) continue;
+                        if (typed) |cells_view| if (cells_view[i]) |cell| if (!cell.is_null) {
+                            const parts = switch (path) {
+                                .dotted, .json_pointer => |parts| parts,
+                                .single => unreachable,
+                            };
+                            const index = if (parts.len == 1 and (path != .json_pointer or graph.isCanonicalJsonPointerArrayIndex(parts[0]))) std.fmt.parseInt(usize, parts[0], 10) catch null else null;
+                            const bytes = cell.value.bytes_val;
+                            matched.* = if (index != null and index.? < bytes.len / 4) try matcher.predicate.matches(self.alloc, &.{.{ .float = @as(f32, @bitCast(std.mem.readInt(u32, bytes[index.? * 4 ..][0..4], .little))) }}) else try matcher.predicate.matches(self.alloc, &.{});
+                            continue;
+                        };
+                        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                        defer scratch.deinit();
+                        var values = std.ArrayListUnmanaged(std.json.Value).empty;
+                        if (self.table.relational_columns[ordinal].is_json) {
+                            if (try self.jsonView(ordinal, i)) |view| {
+                                const before = view.materialized_values;
+                                try view.collect(switch (path) {
+                                    .dotted, .json_pointer => |parts| parts,
+                                    .single => unreachable,
+                                }, path == .json_pointer, &values);
+                                if (self.stats) |stats| stats.values_materialized += view.materialized_values - before;
+                            }
+                        } else if (try self.logicalValue(ordinal, i)) |logical| try path.collectValues(scratch.allocator(), logical, &values);
+                        matched.* = try matcher.predicate.matches(scratch.allocator(), values.items);
+                    }
+                    return;
+                }
+                const column_view = try self.column(ordinal);
+                const bounds = column_view.bounds;
+                if (bounds.present and !try matcher.predicate.mayMatchNumericBounds(bounds.minimum, bounds.maximum)) return;
+                const values = if (matcher.predicate.* == .exists) null else try self.cells(ordinal, candidates);
+                for (out, 0..) |*matched, i| {
+                    if (!candidates[i]) continue;
+                    matched.* = if (values) |typed| blk: {
+                        if (typed[i]) |cell| if (!cell.is_null and (cell.is_json or cell.value_type == .geo_point or (cell.is_dense_vector and matcher.predicate.* != .term and matcher.predicate.* != .terms))) {
+                            const logical = (try self.logicalValue(ordinal, i)).?;
+                            break :blk try matcher.predicate.matches(self.alloc, &.{logical});
+                        };
+                        break :blk try matcher.predicate.matchesCell(self.alloc, self.table.relational_columns[ordinal], typed[i]);
+                    } else column_view.present(i);
+                }
+            },
+            .conjuncts, .disjuncts => |items| {
+                const conjunction = filter == .conjuncts;
+                if (conjunction) @memcpy(out, candidates);
+                var buffer: [max_rows]bool = undefined;
+                var eligible: [max_rows]bool = undefined;
+                for (try self.orderedFilters(items, candidates)) |item_index| {
+                    const item = items[item_index];
+                    for (out, candidates, eligible[0..out.len]) |matched, candidate, *value| value.* = candidate and (if (conjunction) matched else !matched);
+                    if (std.mem.indexOfScalar(bool, eligible[0..out.len], true) == null) return;
+                    try self.evaluate(item, eligible[0..out.len], buffer[0..out.len]);
+                    for (out, buffer[0..out.len]) |*value, matched| value.* = if (conjunction) matched else value.* or matched;
+                }
+            },
+            .bool_query => |query| {
+                @memcpy(out, candidates);
+                var buffer: [max_rows]bool = undefined;
+                for (try self.orderedFilters(query.must, candidates)) |item_index| {
+                    const item = query.must[item_index];
+                    try self.evaluate(item, out, buffer[0..out.len]);
+                    @memcpy(out, buffer[0..out.len]);
+                    if (std.mem.indexOfScalar(bool, out, true) == null) return;
+                }
+                if (query.min_should > 0) {
+                    var counts: [max_rows]usize = @splat(0);
+                    var unresolved: [max_rows]bool = undefined;
+                    for (try self.orderedFilters(query.should, candidates), 0..) |item_index, position| {
+                        for (out, unresolved[0..out.len], 0..) |candidate, *eligible, i| eligible.* = candidate and counts[i] < query.min_should and counts[i] + query.should.len - position >= query.min_should;
+                        try self.evaluate(query.should[item_index], unresolved[0..out.len], buffer[0..out.len]);
+                        for (buffer[0..out.len], 0..) |matched, i| counts[i] += @intFromBool(matched);
+                    }
+                    for (out, 0..) |*value, i| value.* = value.* and counts[i] >= query.min_should;
+                }
+                for (try self.orderedFilters(query.must_not, candidates)) |item_index| {
+                    try self.evaluate(query.must_not[item_index], out, buffer[0..out.len]);
+                    for (out, buffer[0..out.len]) |*value, matched| value.* = value.* and !matched;
+                }
+            },
+        }
+    }
+
+    /// Metadata-only estimates. Cache one ordering per immutable expression and
+    /// block, not per row window; payload decoding never happens in planning.
+    fn orderedFilters(self: *@This(), items: []const scan_plan.Filter, candidates: []const bool) ![]const usize {
+        if (items.len == 0) return &.{};
+        const key = @intFromPtr(items.ptr);
+        if (self.orders.get(key)) |order| return order;
+        const Ranked = struct {
+            index: usize,
+            cost: u64,
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.cost < b.cost or (a.cost == b.cost and a.index < b.index);
+            }
+        };
+        const ranked = try self.alloc.alloc(Ranked, items.len);
+        defer self.alloc.free(ranked);
+        for (items, ranked, 0..) |item, *rank, i| rank.* = .{ .index = i, .cost = try self.predicateCost(item, candidates) };
+        std.mem.sort(Ranked, ranked, {}, Ranked.less);
+        const order = try self.alloc.alloc(usize, items.len);
+        for (ranked, order) |rank, *i| i.* = rank.index;
+        try self.orders.put(self.alloc, key, order);
+        return order;
+    }
+
+    fn payloadCost(self: *@This(), ordinal: u32, candidates: []const bool) !u64 {
+        const column_view = try self.column(ordinal);
+        var cost: u64 = 0;
+        var seen = std.AutoHashMapUnmanaged([32]u8, void).empty;
+        defer seen.deinit(self.alloc);
+        if (column_view.pages) |pages| {
+            for (0..pages.count()) |page| {
+                if (column_view.loaded_pages.isSet(page)) continue;
+                const ref = pages.reference(page);
+                if (ref.bytes == 0 or self.decoded_payloads.contains(ref.digest) or seen.contains(ref.digest)) continue;
+                if (self.payload_cache) |cache| if (cache.contains(ref.digest)) continue;
+                for (pages.first(page)..pages.end(page)) |row| {
+                    if (candidates[row] and column_view.present(row) and column_view.bitmaps[null_bytes + row / 8] & (@as(u8, 1) << @intCast(row % 8)) == 0) {
+                        cost +|= pages.size(page);
+                        try seen.put(self.alloc, ref.digest, {});
+                        break;
+                    }
+                }
+            }
+        }
+        return cost;
+    }
+
+    fn predicateColumns(self: *@This(), filter: scan_plan.Filter, out: *std.AutoHashMapUnmanaged(u32, void)) anyerror!void {
+        try self.checkWork();
+        switch (filter) {
+            .field_matcher => |matcher| {
+                if (matcher.predicate.* == .exists and matcher.remaining == null) return;
+                const ordinal = matcher.ordinal orelse return;
+                const column_view = try self.column(ordinal);
+                if (matcher.remaining == null and column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)) return;
+                try out.put(self.alloc, ordinal, {});
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| {
+                try self.predicateColumns(item, out);
+            },
+            .bool_query => |query| {
+                for (query.must) |item| try self.predicateColumns(item, out);
+                if (query.min_should > 0) for (query.should) |item| {
+                    try self.predicateColumns(item, out);
+                };
+                for (query.must_not) |item| try self.predicateColumns(item, out);
+            },
+            else => {},
+        }
+    }
+
+    fn predicateCost(self: *@This(), filter: scan_plan.Filter, candidates: []const bool) anyerror!u64 {
+        try self.checkWork();
+        return switch (filter) {
+            .match_all, .match_none, .doc_id => 0,
+            .field_matcher => |matcher| blk: {
+                const ordinal = matcher.ordinal orelse break :blk 0;
+                const column_view = try self.column(ordinal);
+                if (matcher.remaining == null and (matcher.predicate.* == .exists or (column_view.bounds.present and !try matcher.predicate.mayMatchNumericBounds(column_view.bounds.minimum, column_view.bounds.maximum)))) break :blk 0;
+                const cost = try self.payloadCost(ordinal, candidates);
+                const weight: u64 = switch (self.table.relational_columns[ordinal].column_type) {
+                    .json, .dense_vector, .geoshape => 64,
+                    .string, .blob => 8,
+                    else => 1,
+                };
+                break :blk cost *| weight +| @as(u64, @intCast(std.mem.count(bool, candidates, &.{true}))) *| weight;
+            },
+            .conjuncts, .disjuncts => |items| blk: {
+                var cost: u64 = 0;
+                for (items) |item| cost +|= try self.predicateCost(item, candidates);
+                break :blk cost;
+            },
+            .bool_query => |query| blk: {
+                var cost: u64 = 0;
+                for (query.must) |item| cost +|= try self.predicateCost(item, candidates);
+                if (query.min_should > 0) for (query.should) |item| {
+                    cost +|= try self.predicateCost(item, candidates);
+                };
+                for (query.must_not) |item| cost +|= try self.predicateCost(item, candidates);
+                break :blk cost;
+            },
+        };
+    }
+
+    /// A limited scan evaluates at most one physical page of each predicate
+    /// column before delivering rows. Scalar-only scans keep vectorized blocks.
+    fn windowEnd(self: *@This(), filter: scan_plan.Filter, first: usize) anyerror!usize {
+        try self.checkWork();
+        var end = self.rows.len;
+        switch (filter) {
+            .field_matcher => |matcher| {
+                if (matcher.predicate.* == .exists and matcher.remaining == null) return end;
+                const ordinal = matcher.ordinal orelse return end;
+                if ((try self.column(ordinal)).pages) |pages| {
+                    end = pages.end(pages.containing(first));
+                }
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| {
+                end = @min(end, try self.windowEnd(item, first));
+            },
+            .bool_query => |query| {
+                for (query.must) |item| end = @min(end, try self.windowEnd(item, first));
+                if (query.min_should > 0) for (query.should) |item| {
+                    end = @min(end, try self.windowEnd(item, first));
+                };
+                for (query.must_not) |item| end = @min(end, try self.windowEnd(item, first));
+            },
+            else => {},
+        }
+        return end;
+    }
+};
+
+pub const Progress = struct {
+    delivered: u32 = 0,
+    last_key: std.ArrayListUnmanaged(u8) = .empty,
+    callback_failed: bool = false,
+};
+
+/// Complex/special projections use the DB's existing transaction-aware loader.
+/// This callback runs only after selection and borrows the same scan snapshot.
+pub const Materializer = struct {
+    context: *anyopaque,
+    project: *const fn (*anyopaque, alloc_type, []const u8, codec.OrdinalRowView) anyerror![]u8,
+};
+
+fn projectPrimary(plan: *const scan_plan.Plan, materializer: Materializer, alloc: alloc_type, key: []const u8, row: codec.OrdinalRowView) ![]u8 {
+    if (plan.projected) |projected| return projected.project(alloc, row);
+    return materializer.project(materializer.context, alloc, key, row);
+}
+
+pub fn scan(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, filter: ?*const graph.PreparedPatternFilter, materializer: Materializer) !bool {
+    if (opts.disable_columnar_scan) return false;
+    if (filter) |value| if (!supports(value.compiled)) return false;
+    const raw = txn.get(manifest_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const manifest = try Manifest.decode(raw);
+    if (!manifest.ready) return false;
+    var plans = scan_plan.Cache{ .alloc = alloc, .source = filter, .opts = opts };
+    defer plans.deinit();
+    var column_plans: scan_plan.Cursor = .{};
+    defer column_plans.deinit();
+    var primary_plans: scan_plan.Cursor = .{};
+    defer primary_plans.deinit();
+    const bootstrap = try bootstrapBoundary(txn, manifest);
+    if (opts.columnar_stats) |stats| stats.used = true;
+    const lower_key = if (std.mem.order(u8, from, byte_range.start) == .gt) from else byte_range.start;
+    var directory = try Directory.init(alloc, txn, manifest.generation, lower_key);
+    defer directory.deinit();
+    var dirty_ranges = try DirtyRanges.init(txn, alloc, lower_key);
+    defer dirty_ranges.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var payload_cache = read_cache.Cache.init(alloc, opts.columnar_decoded_cache_bytes);
+    defer {
+        if (opts.columnar_stats) |stats| {
+            stats.decoded_cache_hits += payload_cache.stats.hits;
+            stats.decoded_cache_misses += payload_cache.stats.misses;
+            stats.decoded_cache_admissions += payload_cache.stats.admissions;
+            stats.decoded_cache_evictions += payload_cache.stats.evictions;
+            stats.decoded_cache_bypasses += payload_cache.stats.bypasses;
+            stats.decoded_cache_peak_bytes = @max(stats.decoded_cache_peak_bytes, payload_cache.stats.peak_bytes);
+        }
+        payload_cache.deinit();
+    }
+    var had_range = false;
+    while (try directory.next(arena.allocator())) |range| {
+        defer _ = arena.reset(.free_all);
+        had_range = true;
+        const index = range.block;
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+        if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, range.start, to) != .lt else std.mem.order(u8, range.start, to) == .gt)) return true;
+        if (byte_range.end.len != 0 and std.mem.order(u8, range.start, byte_range.end) != .lt) return true;
+        if (bootstrap) |boundary| if (std.mem.order(u8, range.start, boundary) != .lt) {
+            if (opts.columnar_stats) |stats| stats.uncovered_ranges_read += 1;
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, null, materializer);
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            continue;
+        };
+        const dirty_range = try dirty_ranges.overlaps(alloc, range.start, range.end);
+        const read_cost_before = dirty_ranges.read_cost;
+        defer db.relational_column_maintenance.noteRead(manifest.generation, index, dirty_ranges.read_cost -| read_cost_before);
+        if (dirty_range) {
+            if (opts.columnar_stats) |stats| stats.dirty_ranges_read += 1;
+        }
+        const scratch = arena.allocator();
+        var scope = try txn.openReadScope(scratch);
+        defer scope.close();
+        const key = try blockKey(scratch, manifest.generation, index, null);
+        const meta = try verified(try scope.get(key));
+        if (opts.columnar_stats) |stats| {
+            stats.blocks_read += 1;
+            stats.encoded_bytes_read += meta.len + 4;
+            stats.metadata_bytes_read += meta.len + 4;
+        }
+        var decoder = Decoder{ .bytes = meta };
+        if (!std.mem.eql(u8, try decoder.take(4), "ACB8")) return error.InvalidColumnSegment;
+        const version = try decoder.int(u32);
+        const rows_len = try decoder.int(u32);
+        if (rows_len > max_rows) return error.InvalidColumnSegment;
+        const pages_len = try decoder.int(u32);
+        const source_bytes = try decoder.int(u64);
+        if (pages_len > decoder.bytes.len / 12 or (rows_len == 0 and pages_len != 0)) return error.InvalidColumnSegment;
+        const ordinal_pages = try decoder.take(@as(usize, pages_len) * 12);
+        const rows = try scratch.alloc(Row, rows_len);
+        for (rows) |*row| {
+            row.key = try decoder.take(try decoder.int(u32));
+            @memcpy(&row.hash, try decoder.take(32));
+            row.timestamp = try decoder.int(u64);
+            row.physical_bytes = try decoder.int(u64);
+        }
+        if (decoder.bytes.len != 0) return error.InvalidColumnSegment;
+        const schema_plan = try column_plans.get(&plans, db, version);
+        const view = schema_plan.view;
+        try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
+        var block = Block{ .alloc = scratch, .scope = &scope, .generation = manifest.generation, .index = index, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stats = opts.columnar_stats, .scan_options = opts, .payload_cache = &payload_cache, .plan = schema_plan };
+        defer block.deinit();
+        var matched: [max_rows]bool = @splat(true);
+        var candidates: [max_rows]bool = @splat(false);
+        var known: [max_rows]bool = @splat(false);
+        for (rows, 0..) |row, i| candidates[i] = std.mem.order(u8, row.key, range.start) != .lt and (range.end.len == 0 or std.mem.order(u8, row.key, range.end) == .lt) and eligibleRow(row, from, to, byte_range, opts, ttl_ns, now_ns);
+        if (std.mem.indexOfScalar(bool, candidates[0..rows.len], true) != null) if (schema_plan.filter) |bound_filter| try block.prefetchFilterMetadata(bound_filter);
+        // Full/special output pays primary I/O only for survivors. For an
+        // scan with at least a block of remaining output budget, measure the
+        // actual selection before choosing random materialization versus a
+        // sequential owner scan. Small limits retain page-window evaluation.
+        const selected_for_cost = (opts.limit == 0 or opts.limit -| progress.delivered >= rows.len) and opts.include_documents and schema_plan.projected == null;
+        if (selected_for_cost) {
+            if (dirty_range) try excludeReplaced(txn, scratch, rows, candidates[0..rows.len]);
+            @memcpy(known[0..rows.len], candidates[0..rows.len]);
+            if (schema_plan.filter) |value| {
+                try block.evaluate(value, candidates[0..rows.len], matched[0..rows.len]);
+                @memcpy(candidates[0..rows.len], matched[0..rows.len]);
+            }
+        }
+        const plan = if (dirty_range or selected_for_cost) try planRange(txn, scratch, range, from, to, byte_range, opts, &block, candidates[0..rows.len], schema_plan.filter) else RangeScanPlan{ .visibility_complete = true };
+        if (plan.primary) {
+            if (opts.columnar_stats) |stats| stats.dense_delta_scans += 1;
+            db.relational_column_maintenance.noteRead(manifest.generation, index, source_bytes);
+            var selection = RowSelection{ .plan = schema_plan, .rows = rows, .known = known[0..rows.len], .matched = candidates[0..rows.len], .evaluated = selected_for_cost and schema_plan.filter != null };
+            // Even an unadmitted historical plan is owned by the active block.
+            // Share it with sequential execution instead of recompiling it.
+            primary_plans.use(schema_plan);
+            try scanPrimaryRange(db, alloc, txn, range.start, range.end, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, &selection, materializer);
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            continue;
+        }
+        var window_first: usize = 0;
+        var any_matched = false;
+        while (window_first < rows.len) {
+            if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            // Advance the ordered mutation frontier before touching base
+            // predicate pages. Earlier deltas may satisfy LIMIT by themselves.
+            _ = try dirty_ranges.emitThrough(db, alloc, txn, rows[window_first].key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+            if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            const window_end = if (opts.limit > 0 and schema_plan.filter != null) try block.windowEnd(schema_plan.filter.?, window_first) else rows.len;
+            var window_candidates: [max_rows]bool = @splat(false);
+            @memcpy(window_candidates[window_first..window_end], candidates[window_first..window_end]);
+            // Cost probes can stop early and small LIMITs skip them altogether.
+            // Complete visibility only for this execution window, using bounded
+            // seeks rather than walking arbitrarily large insertion gaps.
+            if (!plan.visibility_complete) try excludeReplaced(txn, scratch, rows[window_first..window_end], window_candidates[window_first..window_end]);
+            @memcpy(matched[0..rows.len], window_candidates[0..rows.len]);
+            if (!selected_for_cost) if (schema_plan.filter) |value| try block.evaluate(value, window_candidates[0..rows.len], matched[0..rows.len]);
+            any_matched = any_matched or std.mem.indexOfScalar(bool, matched[window_first..window_end], true) != null;
+            for (rows[window_first..window_end], window_first..) |row, i| {
+                if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+                if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                // A retained suffix block may contain retired prefix rows. Never
+                // merge across the current directory range's boundary.
+                if (std.mem.order(u8, row.key, range.start) == .lt or (range.end.len != 0 and std.mem.order(u8, row.key, range.end) != .lt)) continue;
+                const replaced = try dirty_ranges.emitThrough(db, alloc, txn, row.key, true, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+                if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+                if (replaced) continue;
+                if (!matched[i] or !byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or
+                    (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, row.key, from))) continue;
+                if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) continue;
+                if (ttl_ns != 0 and row.timestamp != 0 and @import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns)) continue;
+                var projected: ?[]u8 = null;
+                var row_arena = std.heap.ArenaAllocator.init(alloc);
+                defer row_arena.deinit();
+                const row_alloc = row_arena.allocator();
+                if (opts.include_documents) {
+                    if (schema_plan.projected) |projection| {
+                        try block.prefetchProjection(projection.base.ordinals, i);
+                        var object = ProjectionPlan.Sources.empty;
+                        for (projection.base.ordinals) |ordinal| {
+                            const name = block.table.relational_columns[ordinal].name;
+                            if (block.table.relational_columns[ordinal].is_json) {
+                                if (try block.jsonView(ordinal, i)) |json_view| {
+                                    try object.put(row_alloc, name, .{ .json = json_view });
+                                    continue;
+                                }
+                            }
+                            if (try block.logicalValue(ordinal, i)) |value| try object.put(row_alloc, name, .{ .logical = value });
+                        }
+                        projected = try projection.projectSources(row_alloc, row_alloc, object);
+                    } else {
+                        var primary_scope = try txn.openReadScope(row_alloc);
+                        defer primary_scope.close();
+                        const bytes = try primary_scope.get(try keys.relationalRowKeyAlloc(row_alloc, row.key));
+                        if (try codec.rowSchemaVersion(bytes) != view.version()) return error.InvalidColumnSegment;
+                        if (opts.columnar_stats) |stats| {
+                            stats.primary_rows_read += 1;
+                            stats.late_materialized_rows += 1;
+                            stats.late_materialized_bytes += bytes.len;
+                        }
+                        const typed = if (db.core.store.valuesAreAuthenticated()) try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()) else try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+                        // A clean covered row must still name the exact primary
+                        // image. Never emit stale selection after derived damage.
+                        if (!std.mem.eql(u8, &row.hash, &typed.semanticHash()) or row.timestamp != typed.writeTimestampNs()) return error.InvalidColumnSegment;
+                        projected = try projectPrimary(schema_plan, materializer, row_alloc, row.key, typed);
+                    }
+                }
+                try deliver(alloc, row, projected, opts, visitor, progress);
+                if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+            }
+            window_first = window_end;
+        }
+        if (!any_matched) if (opts.columnar_stats) |stats| {
+            stats.blocks_pruned += 1;
+        };
+        _ = try dirty_ranges.emitThrough(db, alloc, txn, range.end, false, from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, materializer);
+        if (opts.limit > 0 and progress.delivered >= opts.limit) return true;
+    }
+    if (!had_range) {
+        if (manifest.ranges != 0) return error.InvalidColumnSegment;
+        try scanPrimaryRange(db, alloc, txn, "", "", from, to, byte_range, opts, visitor, ttl_ns, now_ns, progress, &plans, &primary_plans, null, materializer);
+    }
+    return true;
+}
+
+fn excludeReplaced(txn: *store_mod.DocStore.Txn, alloc: alloc_type, rows: []const Row, candidates: []bool) !void {
+    if (rows.len == 0 or std.mem.indexOfScalar(bool, candidates, true) == null) return;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+    try key.appendSlice(alloc, dirty_prefix);
+    try key.appendSlice(alloc, rows[0].key);
+    var current = try cursor.seekAtOrAfter(key.items);
+    for (rows, candidates) |row, *candidate| {
+        if (!candidate.*) continue;
+        key.clearRetainingCapacity();
+        try key.appendSlice(alloc, dirty_prefix);
+        try key.appendSlice(alloc, row.key);
+        if (current == null) return;
+        if (std.mem.order(u8, current.?.key, key.items) == .lt) current = try cursor.seekAtOrAfter(key.items);
+        if (current) |entry| if (std.mem.eql(u8, entry.key, key.items)) {
+            if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
+            candidate.* = false;
+        };
+    }
+}
+
+fn eligibleRow(row: Row, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, ttl_ns: u64, now_ns: u64) bool {
+    if (!byte_range.contains(row.key) or std.mem.order(u8, row.key, from) == .lt or (from.len != 0 and !opts.inclusive_from and std.mem.eql(u8, row.key, from))) return false;
+    if (to.len != 0 and (if (opts.exclusive_to) std.mem.order(u8, row.key, to) != .lt else std.mem.order(u8, row.key, to) == .gt)) return false;
+    return ttl_ns == 0 or row.timestamp == 0 or !@import("../ttl.zig").isExpired(row.timestamp, ttl_ns, now_ns);
+}
+
+fn deliver(alloc: alloc_type, row: Row, projected: ?[]const u8, opts: types.ScanOptions, visitor: types.ScanVisitor, progress: *Progress) !void {
+    try progress.last_key.ensureTotalCapacity(alloc, row.key.len);
+    visitor.visit(visitor.context, .{ .id = row.key, .hash = std.mem.readInt(u64, row.hash[0..8], .little), .content_hash = if (opts.include_content_hashes) row.hash else null, .document_json = projected }) catch |err| {
+        progress.callback_failed = true;
+        return err;
+    };
+    progress.last_key.clearRetainingCapacity();
+    progress.last_key.appendSliceAssumeCapacity(row.key);
+    progress.delivered += 1;
+    if (opts.columnar_stats) |stats| stats.rows_selected += 1;
+}
+
+/// Snapshot-bound predicate decisions, consumed by an ordered primary cursor.
+/// Unknown (including every dirty owner) is distinct from a negative result.
+/// The identity witness prevents derived metadata from overriding a changed
+/// authoritative row, even if its key and schema version were reused.
+const RowSelection = struct {
+    plan: *scan_plan.Plan,
+    rows: []const Row,
+    known: []const bool,
+    matched: []const bool,
+    evaluated: bool = true,
+    next: usize = 0,
+
+    fn decision(self: *RowSelection, row: Row, version: u32) ?bool {
+        if (!self.evaluated) return null;
+        while (self.next < self.rows.len and std.mem.order(u8, self.rows[self.next].key, row.key) == .lt) self.next += 1;
+        if (self.next == self.rows.len or !self.known[self.next] or version != self.plan.view.version()) return null;
+        const base = self.rows[self.next];
+        if (!std.mem.eql(u8, base.key, row.key) or base.timestamp != row.timestamp or !std.mem.eql(u8, &base.hash, &row.hash)) return null;
+        return self.matched[self.next];
+    }
+};
+
+test "relational columnar selection distinguishes unknown owners from rejected rows" {
+    const alloc = std.testing.allocator;
+    const epoch = try registry.Epoch.createCloned(alloc, .{ .version = 7 });
+    defer epoch.release();
+    var plan = scan_plan.Plan{ .alloc = alloc, .view = .{ .epoch = epoch }, .arena = std.heap.ArenaAllocator.init(alloc), .primary_filter = null, .filter = null, .projected = null };
+    defer plan.arena.deinit();
+    const rows = [_]Row{
+        .{ .key = "a", .hash = @splat(1), .timestamp = 10 },
+        .{ .key = "b", .hash = @splat(2), .timestamp = 20 },
+        .{ .key = "c", .hash = @splat(3), .timestamp = 30 },
+    };
+    var selected = RowSelection{ .plan = &plan, .rows = &rows, .known = &.{ true, false, true }, .matched = &.{ false, false, true } };
+    try std.testing.expectEqual(@as(?bool, false), selected.decision(rows[0], 7));
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(rows[0], 8));
+    var changed = rows[0];
+    changed.timestamp += 1;
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    changed = rows[0];
+    changed.hash[0] += 1;
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    changed = rows[0];
+    changed.key = "aa";
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(rows[1], 7));
+    try std.testing.expectEqual(@as(?bool, true), selected.decision(rows[2], 7));
+    changed.key = "d";
+    try std.testing.expectEqual(@as(?bool, null), selected.decision(changed, 7));
+}
+
+fn scanPrimaryRange(db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, range_start: []const u8, range_end: []const u8, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, plan_cursor: *scan_plan.Cursor, selection: ?*RowSelection, materializer: Materializer) !void {
+    const Context = struct {
+        db: @TypeOf(db),
+        alloc: alloc_type,
+        arena: std.heap.ArenaAllocator,
+        from: []const u8,
+        to: []const u8,
+        byte_range: types.ByteRange,
+        opts: types.ScanOptions,
+        visitor: types.ScanVisitor,
+        ttl_ns: u64,
+        now_ns: u64,
+        progress: *Progress,
+        plans: *scan_plan.Cache,
+        plan_cursor: *scan_plan.Cursor,
+        selection: ?*RowSelection,
+        materializer: Materializer,
+        fn checkpoint(ptr: ?*anyopaque, _: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (self.opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (self.opts.columnar_stats) |stats| stats.primary_owners_examined += 1;
+            return .@"continue";
+        }
+        fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            if (self.opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (!keys.isRelationalRowKey(key)) return .@"continue";
+            const scratch = self.arena.allocator();
+            defer _ = self.arena.reset(.retain_capacity);
+            const id = (try keys.decodeStoredDocumentRowKeyAlloc(scratch, key)).?;
+            // Key bounds precede schema lookup and checksum/decode: damage in
+            // a neighboring row must not fail this bounded query.
+            if (!self.byte_range.contains(id) or std.mem.order(u8, id, self.from) == .lt or
+                (self.from.len != 0 and !self.opts.inclusive_from and std.mem.eql(u8, id, self.from))) return .@"continue";
+            if (self.to.len != 0 and (if (self.opts.exclusive_to) std.mem.order(u8, id, self.to) != .lt else std.mem.order(u8, id, self.to) == .gt)) return .stop;
+            if (self.opts.columnar_stats) |stats| stats.primary_rows_read += 1;
+            const version = try codec.rowSchemaVersion(value);
+            if (self.selection) |selected| if (version == selected.plan.view.version()) self.plan_cursor.use(selected.plan);
+            const plan = try self.plan_cursor.get(self.plans, self.db, version);
+            const view = plan.view;
+            const typed = if (self.db.core.store.valuesAreAuthenticated())
+                try codec.ordinalRowViewTrusted(value, view.tableSchema().*, view.physicalLayout())
+            else
+                try codec.ordinalRowView(value, view.tableSchema().*, view.physicalLayout());
+            const row = Row{ .key = id, .hash = typed.semanticHash(), .timestamp = typed.writeTimestampNs() };
+            if (!eligibleRow(row, self.from, self.to, self.byte_range, self.opts, self.ttl_ns, self.now_ns)) return .@"continue";
+            const decision = if (self.selection) |selected| selected.decision(row, version) else null;
+            const matched = if (decision) |selected| blk: {
+                if (self.opts.columnar_stats) |stats| stats.selection_reused_rows += 1;
+                break :blk selected;
+            } else blk: {
+                if (plan.filter != null) {
+                    if (self.opts.columnar_stats) |stats| stats.primary_predicate_rows += 1;
+                }
+                break :blk try plan.matches(scratch, row.key, typed);
+            };
+            if (!matched) return .@"continue";
+            const projected = if (self.opts.include_documents) try projectPrimary(plan, self.materializer, scratch, row.key, typed) else null;
+            try deliver(self.alloc, row, projected, self.opts, self.visitor, self.progress);
+            return if (self.opts.limit > 0 and self.progress.delivered >= self.opts.limit) .stop else .@"continue";
+        }
+    };
+    var context = Context{ .db = db, .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc), .from = from, .to = to, .byte_range = byte_range, .opts = opts, .visitor = visitor, .ttl_ns = ttl_ns, .now_ns = now_ns, .progress = progress, .plans = plans, .plan_cursor = plan_cursor, .selection = selection, .materializer = materializer };
+    defer context.arena.deinit();
+    var lower_raw = if (std.mem.order(u8, range_start, from) == .lt) from else range_start;
+    if (std.mem.order(u8, lower_raw, byte_range.start) == .lt) lower_raw = byte_range.start;
+    var upper_raw: ?[]const u8 = if (range_end.len != 0) range_end else null;
+    var inclusive_upper = false;
+    if (byte_range.end.len != 0 and (upper_raw == null or std.mem.order(u8, byte_range.end, upper_raw.?) == .lt)) upper_raw = byte_range.end;
+    if (to.len != 0 and (upper_raw == null or std.mem.order(u8, to, upper_raw.?) == .lt)) {
+        upper_raw = to;
+        inclusive_upper = !opts.exclusive_to;
+    }
+    if (upper_raw) |end| {
+        const order = std.mem.order(u8, lower_raw, end);
+        if (order == .gt or (order == .eq and !inclusive_upper)) return;
+    }
+    const lower = try keys.documentRangeLowerAlloc(alloc, lower_raw);
+    defer alloc.free(lower);
+    const upper = if (upper_raw) |end| if (inclusive_upper) blk: {
+        const exact = try keys.documentExactPrefixAlloc(alloc, end);
+        defer alloc.free(exact);
+        break :blk (try keys.nextPrefixAlloc(alloc, exact)) orelse return error.InvalidColumnSegment;
+    } else try keys.documentRangeLowerAlloc(alloc, end) else try keys.documentRangeUpperAlloc(alloc, "");
+    defer if (upper) |bytes| alloc.free(bytes);
+    try db.core.store.scanRelationalRowsReadTxnWithContext(txn, lower, upper orelse "", &context, Context.checkpoint, Context.visit);
+}

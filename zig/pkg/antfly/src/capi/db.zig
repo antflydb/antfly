@@ -638,6 +638,7 @@ const Handle = struct {
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
+    storage_owner_managed_config: local_write.OwnerManagedConfig = .{},
     storage_owner_table_name: ?[]u8 = null,
     storage_owner_group_id: u64 = 0,
     storage_owner_root_generation: u64 = 0,
@@ -832,6 +833,8 @@ const ReadableLeaseHook = struct {
             .intent_conflict => return error.IntentConflict,
             .txn_not_found => return error.TxnNotFound,
             .busy => return error.WouldBlock,
+            .outcome_unknown => return error.DurabilityOutcomeUnknown,
+            .unsupported => return error.UnsupportedOperation,
             .internal => return error.Internal,
         }
     }
@@ -1189,6 +1192,7 @@ const JsonDBIndexStats = struct {
     doc_count: u64,
     term_count: u64,
     edge_count: u64,
+    graph_counts_pending: bool,
     node_count: u64,
     repair_degraded: bool,
     repair_issue_count: u64,
@@ -4284,7 +4288,10 @@ pub fn storageOwnerOpen(
     if (owner_context) |context| context.acquire();
     var context_borrowed = owner_context != null;
     defer if (context_borrowed) owner_context.?.release();
+    const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     var open_options = db_mod.OpenOptions{
+        .schema_before_index_load = prepared_schema,
         .lsm_cache = if (owner_context) |context| &context.resources.lsm_cache else null,
         .hbc_cache = if (owner_context) |context| &context.resources.hbc_cache else null,
         .lsm_root_generation = request.lsm_root_generation,
@@ -4331,6 +4338,7 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.backend_runtime.ptr() else null,
         if (owner_context) |context| context.antflyProvider() else null,
         if (owner_context) |context| context.remoteContent() else null,
+        &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
     success = true;
     out_owner.* = handle;
@@ -4358,6 +4366,7 @@ pub fn storageOwnerConfigure(
         if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
         if (handle.storage_owner_context) |context| context.antflyProvider() else null,
         if (handle.storage_owner_context) |context| context.remoteContent() else null,
+        &handle.storage_owner_managed_config,
     ) catch |err| {
         std.log.err("storage owner configure failed table={s} err={s}", .{
             handle.storage_owner_table_name orelse "",
@@ -4387,6 +4396,7 @@ pub fn storageOwnerReconcile(
         request.advance_index_repair != 0,
         if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
         if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+        &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
         .state = switch (reconciled.state) {
@@ -5254,6 +5264,7 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
         null,
         null,
         null,
+        null,
     );
 
     var parsed_schema: ?tables_api.ParsedTableSchema = null;
@@ -5509,6 +5520,56 @@ pub fn storageOwnerLookupJson(
     return .ok;
 }
 
+pub fn storageOwnerScanStream(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    sink: *const kernel_owner_abi.ScanSink,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    _ = storageOwnerOperationTableName(handle, request) orelse return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+
+    var parsed = std.json.parseFromSlice(
+        table_reads_api.StorageKernelScanWireRequest,
+        handle.alloc,
+        request.request_json.slice(),
+        .{},
+    ) catch return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    defer parsed.deinit();
+    const opts: db_mod.types.ScanOptions = .{
+        .inclusive_from = parsed.value.inclusive_from,
+        .exclusive_to = parsed.value.exclusive_to,
+        .include_documents = parsed.value.include_documents,
+        .limit = parsed.value.limit,
+        .fields = parsed.value.fields,
+        .include_all_fields = parsed.value.include_all_fields,
+        .filter_query_json = parsed.value.filter_query_json,
+        .include_content_hashes = parsed.value.include_content_hashes,
+    };
+    handle.prepareScanRequest(parsed.value.from_key, parsed.value.to_key, opts) catch |err| return storageOwnerQueryFailure(err, .scan_stream, out_failure);
+    const Visitor = struct {
+        alloc: std.mem.Allocator,
+        sink: *const kernel_owner_abi.ScanSink,
+        line: std.ArrayListUnmanaged(u8) = .empty,
+        fn visit(raw: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.line.clearRetainingCapacity();
+            try @import("../api/local_query_contract.zig").appendScanLine(self.alloc, &self.line, entry.id, entry.document_json, entry.content_hash);
+            if (self.sink.write(self.sink.context, .fromSlice(self.line.items)) == 0) return error.Canceled;
+        }
+    };
+    var visitor = Visitor{ .alloc = handle.alloc, .sink = sink };
+    defer visitor.line.deinit(handle.alloc);
+    if (sink.start(sink.context) == 0) return storageOwnerQueryFailure(error.Canceled, .scan_stream, out_failure);
+    handle.db.scanVisit(handle.alloc, parsed.value.from_key, parsed.value.to_key, opts, .{
+        .context = &visitor,
+        .visit = Visitor.visit,
+    }) catch |err| return storageOwnerQueryFailure(err, .scan_stream, out_failure);
+    return .ok;
+}
+
 pub fn storageOwnerScanNdjson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -5544,6 +5605,28 @@ pub fn storageOwnerScanNdjson(
         .ptr = ndjson.ptr,
         .len = @intCast(ndjson.len),
     };
+    return .ok;
+}
+
+pub fn storageOwnerGraphMetricMaintenanceJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    _ = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const response = local_write.runGraphMetricMaintenanceOrActionJsonAlloc(handle.alloc, &handle.db, request.request_json.slice()) catch |err|
+        return storageOwnerQueryFailure(err, .graph_metric_maintenance, out_failure);
+    defer handle.alloc.free(response);
+    const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);
+    out_response.* = .{ .ptr = owned.ptr, .len = @intCast(owned.len) };
     return .ok;
 }
 
@@ -6890,9 +6973,8 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
-    if (!(lite_restore_staging.isImportTargetEmpty(handle.alloc, &handle.db) catch |err| return capi.mapError(err))) return .invalid_argument;
     const bytes = backup.bytes();
-    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, bytes) catch |err| return capi.mapError(err);
+    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, &handle.owned_lite_backend.?, bytes) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -6917,12 +6999,15 @@ pub export fn antfly_lite_restore_backup_json(
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
 
     const alloc = std.heap.c_allocator;
+    var encoded_report = stringifyJson(LiteRestoreReport{ .path = path }) catch return .internal;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null) catch |err| return capi.mapError(err);
-    const report = LiteRestoreReport{ .path = path };
-    out.* = stringifyJson(report) catch return .internal;
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null) catch |err| {
+        antfly_buffer_free(&encoded_report);
+        return capi.mapError(err);
+    };
+    out.* = encoded_report;
     return .ok;
 }
 
@@ -6933,6 +7018,29 @@ pub export fn antfly_lite_restore_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     return antfly_lite_restore_backup_json(dest_path, backup, replace, out_buf);
+}
+
+pub export fn antfly_lite_restore_backup_file_json(
+    dest_path: ?[*:0]const u8,
+    backup_path: ?[*:0]const u8,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const destination = cStringSpan(dest_path) orelse return .invalid_argument;
+    const source = cStringSpan(backup_path) orelse return .invalid_argument;
+
+    const alloc = std.heap.c_allocator;
+    var encoded_report = stringifyJson(LiteRestoreReport{ .path = destination }) catch return .internal;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace) catch |err| {
+        antfly_buffer_free(&encoded_report);
+        return capi.mapError(err);
+    };
+    out.* = encoded_report;
+    return .ok;
 }
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
@@ -7082,7 +7190,69 @@ fn restorePortableBackupToLiteFile(
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
-    try portable_backup.validatePortable(alloc, backup);
+
+    const Populate = struct {
+        fn run(context: []const u8, alloc_inner: Allocator, db: *db_mod.DB, _: std.Io) !void {
+            try lite_restore_staging.populateUnpublishedLiteDb(alloc_inner, db, context);
+        }
+    };
+    try restorePortableSourceToLiteFile(alloc, io, backend_runtime, dest_path, replace, backup, Populate.run, cancel);
+}
+
+fn restorePortableBackupPathToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    dest_path: []const u8,
+    backup_path: []const u8,
+    replace: bool,
+) !void {
+    if (!std.mem.endsWith(u8, backup_path, ".afb")) return error.InvalidArgument;
+    var file = if (std.fs.path.isAbsolute(backup_path))
+        try std.Io.Dir.openFileAbsolute(io, backup_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, backup_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > lite_restore_staging.max_afb_file_bytes) return error.InvalidArgument;
+
+    const Context = struct {
+        file: std.Io.File,
+        file_size: u64,
+    };
+    const Populate = struct {
+        fn run(context: Context, alloc_inner: Allocator, db: *db_mod.DB, io_inner: std.Io) !void {
+            try lite_restore_staging.populateUnpublishedLiteDbFromPortableFile(
+                alloc_inner,
+                db,
+                io_inner,
+                context.file,
+                context.file_size,
+            );
+        }
+    };
+    try restorePortableSourceToLiteFile(
+        alloc,
+        io,
+        null,
+        dest_path,
+        replace,
+        Context{ .file = file, .file_size = stat.size },
+        Populate.run,
+        null,
+    );
+}
+
+fn restorePortableSourceToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    dest_path: []const u8,
+    replace: bool,
+    context: anytype,
+    comptime populate: anytype,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
+) !void {
+    if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (cancel) |token| try token.check();
 
     const dest_exists = capiPathExists(io, dest_path);
@@ -7119,7 +7289,7 @@ fn restorePortableBackupToLiteFile(
 
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
         defer db.close();
-        try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
+        try populate(context, alloc, &db, io);
     }
 
     if (cancel) |token| try token.check();
@@ -7128,7 +7298,13 @@ fn restorePortableBackupToLiteFile(
         capiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
-    try antfly.common.fs_paths.syncDirPortable(io, std.fs.path.dirname(dest_path) orelse ".");
+    lite_restore_staging.confirmPublishedFileDurability(io, dest_path) catch |err| {
+        std.log.err(
+            "Lite restore published but crash durability could not be confirmed path={s} class={s}",
+            .{ dest_path, @errorName(err) },
+        );
+        return error.DurabilityOutcomeUnknown;
+    };
 }
 
 fn capiPathExists(io: std.Io, path: []const u8) bool {
@@ -8570,6 +8746,7 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
+            .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,
@@ -11634,6 +11811,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(restore_path);
     const restore_alias_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-alias");
     defer alloc.free(restore_alias_path);
+    const restore_unknown_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-outcome-unknown");
+    defer alloc.free(restore_unknown_path);
     const locked_restore_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-locked");
     defer alloc.free(locked_restore_path);
     const restore_malformed_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-malformed");
@@ -11658,6 +11837,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(pinned_snapshot_path);
     cleanupTestFile(restore_path);
     cleanupTestFile(restore_alias_path);
+    cleanupTestFile(restore_unknown_path);
     cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
@@ -11678,6 +11858,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(pinned_snapshot_path);
     defer cleanupTestFile(restore_path);
     defer cleanupTestFile(restore_alias_path);
+    defer cleanupTestFile(restore_unknown_path);
     defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
@@ -11686,14 +11867,21 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(@as(u32, 1), antfly_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
     try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.outcome_unknown))));
+    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.unsupported))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "retry") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.WriterLocked));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.SourceFileChanged));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.PortableRuntimeActivationPending));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, capi.mapError(error.FileLocksUnsupported));
     try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
     try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
+    try std.testing.expectEqual(capi.ErrorCode.outcome_unknown, capi.mapError(error.DurabilityOutcomeUnknown));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.InvalidBackupManifest));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.BackupArtifactIntegrityMismatch));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(src_path, null));
@@ -12338,6 +12526,34 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, false, &restore_report));
     defer antfly_db_buffer_free(restore_report.ptr, restore_report.len);
     try std.testing.expect(std.mem.indexOf(u8, restore_report.ptr.?[0..restore_report.len], "\"format\":\"aflite\"") != null);
+
+    lite_restore_staging.failNextPublishedFileDirectorySyncForTest();
+    antfly.test_error_logs.expectErrorLogs(1);
+    var unknown_report: capi.Buffer = .{ .ptr = @constCast("stale".ptr), .len = "stale".len };
+    try std.testing.expectEqual(capi.ErrorCode.outcome_unknown, antfly_lite_restore_backup_json(restore_unknown_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &unknown_report));
+    try std.testing.expect(unknown_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), unknown_report.len);
+
+    // Publication already happened, so the destination must be inspectable
+    // and a blind retry must be rejected rather than replacing it again.
+    var unknown_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_unknown_path, &unknown_handle));
+    defer antfly_db_close(unknown_handle);
+    var unknown_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(unknown_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &unknown_lookup));
+    defer antfly_db_buffer_free(unknown_lookup.ptr, unknown_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_lookup.ptr.?[0..unknown_lookup.len], "\"second\"") != null);
+    var retry_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_unknown_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &retry_report));
 
     var restored_file_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_path, &restored_file_handle));

@@ -138,6 +138,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             return &self.entry.owner;
         }
 
+        fn retireAfterConfigurationFailure(self: *Lease) void {
+            lock(&self.source.mutex);
+            self.entry.retired = true;
+            self.source.mutex.unlock();
+        }
+
         fn deinit(self: *Lease) void {
             if (!self.active) return;
             self.source.release(self.entry, self.exclusive);
@@ -285,7 +291,9 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
                 .lookup_group_local = lookupGroupLocal,
                 .lookup_group_local_routed = lookupGroupLocalRouted,
+                .scan_group_local_stream = scanGroupLocalStream,
                 .scan_group_local = scanGroupLocal,
+                .scan_group_local_routed_stream = scanGroupLocalRoutedStream,
                 .scan_group_local_routed = scanGroupLocalRouted,
                 .query_group_local = queryGroupLocal,
                 .query_group_local_routed = queryGroupLocalRouted,
@@ -330,6 +338,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .reprocess_document_artifact_range_group_local = reprocessDocumentArtifactRangeGroupLocal,
                 .list_artifact_repair_issues_group_local = listArtifactRepairIssuesGroupLocal,
+                .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .repair_artifact_issues_group_local = repairArtifactIssuesGroupLocal,
                 .repair_artifact_issues_group_local_controlled = repairArtifactIssuesGroupLocalControlled,
                 .update_document_artifact_child_range_placement_group_local = updateDocumentArtifactChildRangePlacementGroupLocal,
@@ -1109,6 +1118,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             target_index_name,
             advance_index_repair,
         ) catch |err| {
+            lease.retireAfterConfigurationFailure();
             lease.deinit();
             if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
             return err;
@@ -1206,13 +1216,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer if (retire_after) retireGroupForPublication(self, group_id, table_name) catch {};
         defer if (lease_active) lease.deinit();
 
-        const result = try lease.owner().reconcile(
+        const result = lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
             target_index_name,
             advance_index_repair,
-        );
+        ) catch |err| {
+            lease.retireAfterConfigurationFailure();
+            return err;
+        };
         var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
             // Runtime status is deliberately best effort and returns busy
             // rather than waiting behind a concurrent Raft apply writer. The
@@ -2269,6 +2282,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
     }
 
+    fn scanGroupLocalRoutedStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        sink: table_read_source.ScanStreamSink,
+    ) !bool {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try scanGroupLocalStream(ptr, alloc, group_id, table_name, from_key, to_key, opts, consistency, sink);
+    }
+
     fn scanGroupLocalRouted(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -2449,6 +2479,27 @@ pub const ProvisionedKernelOwnerSource = struct {
             .json = try alloc.dupe(u8, response.bytes()),
             .version = response.version(),
         };
+    }
+
+    fn scanGroupLocalStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        sink: table_read_source.ScanStreamSink,
+    ) !bool {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.prepareScanRead(group_id, from_key, to_key, opts, consistency);
+        const request_json = try table_reads.encodeStorageKernelScanRequest(alloc, from_key, to_key, opts);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try lease.owner().scanStream(table_name, request_json, sink);
+        return true;
     }
 
     fn scanGroupLocal(
@@ -3523,6 +3574,21 @@ pub const ProvisionedKernelOwnerSource = struct {
             result.accumulate(parsed.value);
         }
         return result;
+    }
+
+    fn graphMetricMaintenanceGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().graphMetricMaintenanceJson(table_name, body);
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
     }
 
     fn textStatsGroupLocal(

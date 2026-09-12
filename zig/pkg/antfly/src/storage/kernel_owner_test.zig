@@ -347,6 +347,41 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer batch_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, batch_response.bytes(), "\"inserted\":2") != null);
 
+    // Streaming crosses the real provider archive, retains backpressure and
+    // propagates caller-owned errors without passing Zig error-set ordinals.
+    const ScanCapture = struct {
+        starts: usize = 0,
+        rows: usize = 0,
+        stop_on_start: bool = false,
+        stop_on_row: bool = false,
+        fn start(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.starts += 1;
+            if (self.stop_on_start) return error.ConsumerStoppedBeforeScan;
+        }
+        fn write(ptr: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            try std.testing.expect(std.mem.endsWith(u8, bytes, "\n"));
+            self.rows += 1;
+            if (self.stop_on_row) return error.ConsumerStoppedAfterRow;
+        }
+        fn sink(self: *@This()) @import("../runtime_scan_sink.zig").ScanStreamSink {
+            return .{ .context = self, .start_fn = start, .write_fn = write };
+        }
+    };
+    const scan_json = "{\"from_key\":\"\",\"to_key\":\"\",\"include_documents\":true}";
+    var capture: ScanCapture = .{};
+    try owner.scanStream("docs", scan_json, capture.sink());
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 2), capture.rows);
+    capture = .{ .stop_on_start = true };
+    try std.testing.expectError(error.ConsumerStoppedBeforeScan, owner.scanStream("docs", scan_json, capture.sink()));
+    try std.testing.expectEqual(@as(usize, 0), capture.rows);
+    capture = .{ .stop_on_row = true };
+    try std.testing.expectError(error.ConsumerStoppedAfterRow, owner.scanStream("docs", scan_json, capture.sink()));
+    try std.testing.expectEqual(@as(usize, 1), capture.rows);
+    try std.testing.expectError(error.InvalidGraphMetricAction, owner.graphMetricMaintenanceJson("docs", "{\"operation\":\"metric_action_v1\"}"));
+
     // Status reads deliberately avoid waiting under the owner lease for a
     // background writer. A full-index acknowledgement does not make the next
     // observational read uncontended, so retry this transient status here.
@@ -679,6 +714,12 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         }
     }
     try std.testing.expect(dense_reconciled);
+    // A target reconcile cannot replace its sibling dense index, even when
+    // the desired catalog carries a newer sibling definition.
+    const sibling_changed = try std.mem.replaceOwned(u8, std.testing.allocator, replacement_indexes_json, "\"dimension\":3", "\"dimension\":4");
+    defer std.testing.allocator.free(sibling_changed);
+    _ = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", false);
+
     var indexed_batch = try owner.batchJson(
         "docs",
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",

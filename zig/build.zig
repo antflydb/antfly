@@ -126,7 +126,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, graph_metric_maintenance, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -937,7 +937,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog" },
+        .filters = &.{ "request gate", "request watchdog", "request task admission", "successful H1 requests do not wait" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
@@ -1372,6 +1372,30 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
+
+    const graph_metric_process_harness_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd/graph_metric_process_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_metric_process_harness_mod.addImport("antfly-zig", antfly_mod);
+    graph_metric_process_harness_mod.addImport("antfly_platform", platform_mod);
+    graph_metric_process_harness_mod.addImport("httpx", httpx_mod);
+    const graph_metric_process_harness = b.addExecutable(.{
+        .name = "graph-metric-process-harness",
+        .root_module = graph_metric_process_harness_mod,
+    });
+    graph_metric_process_harness.root_module.linkLibrary(
+        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?,
+    );
+    graph_metric_process_harness.step.dependOn(&antfly_main.step);
+    const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
+    run_graph_metric_process_harness.addArtifactArg(antfly_main);
+    run_graph_metric_process_harness.addArgs(&.{ "--profile", "promotion" });
+    run_graph_metric_process_harness.has_side_effects = true;
+    const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run process-level graph metric promotion and failover gates");
+    graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
+    integration_test_step.dependOn(&run_graph_metric_process_harness.step);
 
     // The aggregate intentionally runs with normal CPU concurrency. Give every
     // compile step a conservative scheduler claim unless it already has a

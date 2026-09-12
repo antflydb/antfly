@@ -155,6 +155,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
+    const api_graph_metric_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_graph_metric_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, api_graph_metric_test_mod, true, true);
+    api_graph_metric_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+
     const metadata_unit_baseline_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
@@ -376,6 +384,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
+            "restore admission recovers generated identity",
+            "restore admission missing row",
+            "restore expiry preserves durable ownership",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
             "retryable restore contention durably requeues progress and honors cancellation",
@@ -417,14 +428,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "portable AFB2 delta resolves exact base and deduplicates physical blobs",
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
+            "file import reports a busy source without waiting for its writer",
             "file import rejects oversized portable blocks before allocation",
             "import preflights full portable envelope before mutating destination",
             "export and import documents preserve timestamps",
+            "portable backup round trips relational rows and schema metadata",
+            "portable restore validates historical rows with their public schema epoch",
+            "portable archive accepts long history with a bounded decoded working set",
+            "ordinal rows bind layout support projection checksum and canonical bytes",
+            "relational restore plans",
             "export and import chunk artifacts round trip with public artifact ids",
             "export and import asset artifacts round trip with public artifact ids",
             "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "document batch round-trip",
+            "file reader detects same-size archive replacement between passes",
             "AFB2 manifest separates representation from snapshot mode",
             "AFB2 manifest rejects ambiguous delta and traversal paths",
             "AFB2 delta base binds inventory and identity to one canonical manifest",
@@ -614,6 +632,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const scan_sink_provider = b.addLibrary(.{
+        .name = "runtime-scan-sink-test-provider",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const scan_sink_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scan_sink_test_mod.linkLibrary(scan_sink_provider);
+    const scan_sink_tests = b.addTest(.{
+        .root_module = scan_sink_test_mod,
+        .filters = &.{"scan sink"},
+    });
+    const run_scan_sink_tests = b.addRunArtifact(scan_sink_tests);
+    b.step("runtime-scan-sink-test", "Run scan callbacks across independent error domains").dependOn(&run_scan_sink_tests.step);
+
     const api_cluster_secret_status_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_cluster_test_root.zig"),
         .target = target,
@@ -782,6 +822,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "embedding provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
+        "restore admission recovers generated identity after polled expiry",
+        "restore expiry preserves durable ownership",
         "restore runtime store persists checkpoints and requeues interrupted work",
         "restore job store rejects oversized request state",
         "restore filesystem scope containment handles filesystem roots and component boundaries",
@@ -865,6 +907,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public index config encoders retain credential-free provider urls",
         "public index config encoders omit root write-only producer documents",
         "created graph index response projects closed nested schemas",
+        "created graph metric configuration projects closed nested schemas",
         "enrichment index status encodes worker lifecycle diagnostics",
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
@@ -910,6 +953,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db completed partial managed admission serves and retires redundant repair",
         "db status cannot reopen a quarantined generation from an older publication certificate",
         "db status retains certified canonical admission during shadow build handoff",
+        "db managed admission recovers legacy terminal source coverage lag",
         "db initial replay repair retains certified canonical admission during shadow reconstruction",
         "db empty managed index does not invent generated coverage recovery debt",
         "db repair preflight retains a canonical generation completed after scheduler selection",
@@ -935,6 +979,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract rejects graph configs the runtime cannot materialize",
         "table graph validation rejects runtime-invalid configs before catalog admission",
         "table contract preserves typed artifact-backed graph configuration",
+        "table contract preserves graph metric configuration and rejects malformed nested values",
         "table contract rejects unknown fields in closed nested index objects",
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
@@ -1265,6 +1310,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
     addRuntimeTestFilters(b, run_lib_unit_tests, lib_unit_filters);
+    // The broad root discovery anchor may retain API tests after a merge adds
+    // imports. Keep this stateful error-path test in its dedicated API shards.
+    run_lib_unit_tests.addArgs(&.{
+        "--skip-test-filter",
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+    });
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -1369,6 +1420,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "local inference connection ABI retains C layout and validates capabilities",
         "local inference response validation contains malformed ownership",
         "inference connection invocation requires inference write permission",
+        "graph metric operational actions require table admin permission",
         "httpx inference connection preserves upstream retry guidance",
         "api http client preserves exact-group join unavailability and absence",
         "distributed join translates native and borrowed deadline boundaries",
@@ -1376,6 +1428,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph translates native worker and catalog deadline boundaries",
         "query embedding cache translates native query deadlines",
         "typed internal HTTP errors preserve conflict semantics",
+        "api http index generation retry refreshes once and preserves readiness cancellation and deadlines",
+        "api http retries identity generation and topology churn from a fresh query snapshot",
+        "derived enrichment visibility guard observes cancellation and deadline",
+        "db reverse graph probe rejects a deleted or replaced index incarnation",
+        "api http client preserves group doc identity conflicts",
+        "typed internal group reads preserve retryable resident storage failures",
+        "boundary dispatcher preserves local calls and maps cross-unit calls",
+        "stable status preserves public boundary semantics",
+        "db graph search filters result nodes and hidden traversal intermediates",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
         "request admission bounds positive capacity and preserves unlimited mode",
@@ -1385,11 +1446,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
+        "runtime HTTP streaming carries policy headers before commitment across both adapters",
+        "linked API route manifest preserves internal scan response streaming",
+        "scan stream preserves chunk backpressure without buffered fallback",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = api_http_runtime_filters,
+        // The native-generation merge raised this linked API/DB harness to
+        // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
+        // headroom; the shared runner still caps aggregate compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1480,6 +1548,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
 
+    const graph_metric_command_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd_graph_metric_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, graph_metric_command_test_mod, true, true);
+    graph_metric_command_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    graph_metric_command_test_mod.addImport("antfly-zig", antfly_mod);
+    graph_metric_command_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const graph_metric_command_tests = b.addTest(.{
+        .root_module = graph_metric_command_test_mod,
+        .filters = &.{"cmd.graph_metric_maintenance.test.graph metric maintenance"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        // This root includes the in-process HTTP service and storage runtime.
+        // Mach-O optimized codegen measured 8.4 GiB; allow the same debug
+        // headroom as the broad command root without raising Linux admission.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_graph_metric_command_tests = addFilteredTestRunArtifact(b, graph_metric_command_tests);
+    const graph_metric_command_test_step = b.step("graph-metric-command-test", "Run graph metric maintenance CLI and supervisor tests");
+    graph_metric_command_test_step.dependOn(&run_graph_metric_command_tests.step);
+    cmd_test_step.dependOn(&run_graph_metric_command_tests.step);
+
     const lite_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
         .target = target,
@@ -1539,6 +1633,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
+        "managed raft progress driver recovers readiness after a slow successful round",
         "managed raft progress driver stop interrupts a long cadence wait",
         "managed host service preserves leader-routed observation roles from transition ops",
         "managed host service seeds queued transitions from projected metadata store",
@@ -1797,16 +1892,50 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
+        // macOS ReleaseFast measured 10.74 GB for this root. Reserve realistic
+        // compiler headroom for aggregate scheduling; Linux CI stays bounded.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .root_module = antfly_test_mod,
+        // Keep module-discovery anchors reachable even for narrow runtime
+        // selections; otherwise filtered-out module tests hide their imports.
         .filters = &serverless_default_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_serverless_tests = addFilteredTestRunArtifact(b, serverless_tests);
+    const run_serverless_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, serverless_tests, selectTestFilters(b, &serverless_default_filters));
     const serverless_test_step = b.step("antfly-serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
+
+    const document_facts_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_facts_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, document_facts_test_mod, true, true);
+    document_facts_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const document_facts_tests = b.addTest(.{
+        .root_module = document_facts_test_mod,
+        .filters = selectTestFilters(b, &.{"document facts"}),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_document_facts_tests = addFilteredTestRunArtifact(b, document_facts_tests);
+    b.step("antfly-document-facts-test", "Run focused immutable document facts and scheduling tests").dependOn(&run_document_facts_tests.step);
+
+    const graph_page_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_page_tree_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, graph_page_test_mod, true, true);
+    graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const graph_page_tests = b.addTest(.{
+        .root_module = graph_page_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_graph_page_tests = addFilteredTestRunArtifact(b, graph_page_tests);
+    b.step("antfly-graph-page-test", "Run immutable graph page construction, query and recovery tests").dependOn(&run_graph_page_tests.step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -1821,6 +1950,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "objectstore-backed manifest store supports publish and list",
             "serverless retention",
             "serverless manifest GC floor",
+            "serverless fs manifest store",
+            "serverless object manifest candidate",
+            "scoped uploads",
             "manifest head CAS verifies a stat ETag when GET omits it",
             "objectstore-backed manifest store resolves conditional create races by content",
             "host object storage delegates through callbacks",
@@ -1830,6 +1962,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_serverless_manifest_tests = addFilteredTestRunArtifact(b, serverless_manifest_tests);
     const serverless_manifest_test_step = b.step("antfly-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
+
+    const serverless_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/serverless_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, serverless_runtime_test_mod, true, true);
+    serverless_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const serverless_runtime_tests = b.addTest(.{
+        .root_module = serverless_runtime_test_mod,
+        .filters = selectTestFilters(b, &.{ "managed runtime", "background publisher" }),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_serverless_runtime_tests = addFilteredTestRunArtifact(b, serverless_runtime_tests);
+    b.step("antfly-serverless-runtime-test", "Run focused serverless maintenance ownership and lifecycle tests").dependOn(&run_serverless_runtime_tests.step);
 
     const lake_scaffold_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
@@ -1896,6 +2043,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_connections_tests = api_tests_addTests_result.run_lib_api_connections_tests;
     const run_lib_api_storage_authority_tests = api_tests_addTests_result.run_lib_api_storage_authority_tests;
     const api_table_writes_docid_test_mod = api_tests_addTests_result.api_table_writes_docid_test_mod;
+    const api_table_reads_docid_test_mod = api_tests_addTests_result.api_table_reads_docid_test_mod;
     const run_lib_api_docid_tests = api_tests_addTests_result.run_lib_api_docid_tests;
     const api_derived_coverage_test_mod = api_tests_addTests_result.api_derived_coverage_test_mod;
     const run_lib_api_derived_coverage_tests = api_tests_addTests_result.run_lib_api_derived_coverage_tests;
@@ -1937,6 +2085,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
+            "metadata http client status role survives response and parser release",
             "metadata http client rejects invalid forwarded table names before I/O",
             "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
             "metadata http client preserves transport ambiguity for forwarded table mutations",
@@ -2233,6 +2382,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "native posting initial acceleration",
             "db online vector publication",
             "db multi-source dense target",
+            "db artifact dense target prefers current incarnation outcomes over stale name counter",
+            "db dense target reads atomic outcome and source coverage snapshot",
+            "db artifact dense reset waits for catalog readers before closing storage",
+            "db dense enrichment republishes unchanged source hash from cached artifact after index reset",
+            "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding",
+            "db restore dense rebuild publishes mixed progress before worker wait",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",
@@ -2274,6 +2429,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db query repair gate revalidates stale debt",
             "db status cannot reopen a quarantined generation from an older publication certificate",
             "db status retains certified canonical admission during shadow build handoff",
+            "db managed admission recovers legacy terminal source coverage lag",
             "db initial replay repair retains certified canonical admission during shadow reconstruction",
             "db empty managed index does not invent generated coverage recovery debt",
             "db repair preflight retains a canonical generation completed after scheduler selection",
@@ -3774,6 +3930,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
+            "standalone routing watch confirms absence before deadline and retries after expiry",
             "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
@@ -3833,6 +3990,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_runtime_io_abi_tests.step);
+    unit_test_step.dependOn(&run_scan_sink_tests.step);
 
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
@@ -3937,6 +4095,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
+    docstore_test_mod.addImport("antfly_pdf", pdf_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
@@ -4276,6 +4435,289 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(storage_vopr_step);
     chaos_test_step.dependOn(storage_vopr_step);
 
+    const graph_metric_unit_filters = [_][]const u8{
+        "graph maintenance",
+        "lmdb backend read forks",
+        "graph metric tree batch validation",
+        "graph rebuildReverseFromOwnedOutgoingEdges",
+        "db graph reverse rebuild resumes after interrupted reopen",
+        "graph metric sorted batch presence",
+        "db reverse graph probe rejects a deleted or replaced index incarnation",
+        "graph pagerank planned scan page writes durable out-degree intermediates",
+        "graph pagerank contribution and reduce pages resume",
+        "graph pagerank later iteration pages resume",
+        "graph pagerank convergence page reclaim",
+        "graph eigenvector contribution and reduce pages resume",
+        "graph eigenvector convergence page reclaim",
+        "graph hits contribution and reduce pages resume",
+        "graph hits hub contribution and hub reduce pages resume",
+        "graph hits convergence page reclaim",
+        "graph metric runtime config rejects",
+        "graph metric runtime role gates apply",
+        "graph metric runtime worker pool identity",
+        "graph metric runtime boundary tick",
+        "graph metric runtime retirement",
+        "ownership state tracks lease takeover and loss",
+        "ownership state renews only at the cached renewal deadline",
+        "lease release preserves tenure fencing across owner ID reuse",
+        "graph metric query shape bounds clauses and unique dependencies",
+        "graph metric staged",
+        "borrowed graph metric names do not allocate per node",
+        "graph metric column selection retains deterministic bounded top k",
+        "graph metric shared column application is allocation-failure safe",
+        "graph metric stable row materialization moves nodes once and is allocation-failure safe",
+        "graph metric order and filter dependencies attach status without projection",
+        "graph metric order and filter apply max results after metric processing",
+        "shortest path metric filtering evaluates the complete bounded candidate set",
+        "pattern metric filtering evaluates matches beyond the response limit",
+        "graph both direction emits one physical self loop and preserves reciprocal edges",
+        "graph durable writes reject invalid edge types before mutation",
+        "graph bounded adjacency pages preserve order and fail before budget overflow",
+        "graph edge encoding round-trip",
+        "graph metric reverse edge parser borrows ordinary keys and owns escaped components",
+        "graph storage rejects non-finite edge weights",
+        "graph metric metadata preserves score epoch input and decodes v3",
+        "graph metric edge filter equality and fingerprint treat types as set",
+        "graph metric rebuild at unchanged edge generation publishes an isolated score epoch",
+        "graph metric native rank index retains only the supported top-k prefix",
+        "graph degree scan attempt adoption resumes in bounded pages",
+        "graph degree scan page reclaim recomputes without double counting partials",
+        "graph degree large-build summary counts filtered materialization without coordinator scan",
+        "graph metric large-build summary",
+        "graph metric vector chunks",
+        "graph metric ordinal",
+        "graph metric membership",
+        "graph metric shared topology",
+        "topology receipts",
+        "graph metric edge scan",
+        "graph metric consumer barrier",
+        "ordinal blocks",
+        "graph degree planned build honors edge filter during scan page execution",
+        "graph metric filtered",
+        "graph metric coalesced global counters",
+        "graph metric partition spans remain balanced at production cardinality",
+        "graph metric partition census",
+        "partition census owns bounded checkpoints",
+        "runtime store erases concrete single-namespace store handles",
+        "failed commit keeps erased write handle abortable",
+        "graph metric floating page aggregates are deterministic across adoption order",
+        "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
+        "graph metric physical score reads",
+        "graph metric status exposes queued and active local build lease",
+        "graph metric coordinator reports expired exhausted page lease",
+        "graph planned metric build retires a superseded generation without poisoning newer work",
+        "graph pagerank planned build publishes scores matching local runner",
+        "graph pagerank warm rebuild normalizes changed node sets across summary pages",
+        "graph metric execution epoch fences old jobs without hiding published scores",
+        "graph pagerank reclaimed contribution and reduce pages overwrite partial output",
+        "graph pagerank scan adoption maintains one idempotent out-degree total",
+        "graph eigenvector reclaimed contribution and reduce pages overwrite stale output",
+        "graph hits reclaimed contribution and reduce pages overwrite stale output",
+        "graph hits planned build drains partitioned paired pages across workers",
+        "graph pagerank coordinator publish failure preserves prior published generation after reopen",
+        "graph pagerank exhausted publish page preserves root cause and prior generation",
+        "graph hits coordinator publish failure preserves prior published pair after reopen",
+    };
+    const graph_metric_unit_tests = b.addTest(.{
+        // The expanded storage-root suite exceeded 8 GiB on macOS ReleaseFast.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_unit_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_unit_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_unit_tests,
+        &graph_metric_unit_filters,
+    );
+    const graph_metric_unit_test_step = b.step("graph-metric-unit-test", "Run cheap graph metric runtime, ownership, and query tests");
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    b.step("graph-metric-core-test", "Run graph metric core unit tests without rebuilding API/wire harnesses").dependOn(&run_graph_metric_unit_tests.step);
+    const graph_metric_topology_filters = [_][]const u8{"graph metric shared topology"};
+    const graph_metric_topology_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"db default primary backend survives reopen"}, &graph_metric_topology_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_graph_metric_topology_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_topology_tests, &graph_metric_topology_filters);
+    const graph_metric_topology_test_step = b.step("graph-metric-topology-test", "Run durable topology preparation, sharing, recovery, and reclamation tests");
+    graph_metric_topology_test_step.dependOn(&run_graph_metric_topology_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_unit_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_command_tests.step);
+
+    const graph_metric_fan_in_filters = [_][]const u8{
+        "query parser accepts direct graph metric reads",
+        "query parser accepts graph metric rerank",
+        "api query contract bounds graph metric top k",
+        "api query contract uses portable graph metric filter operators",
+        "api query contract rejects oversized and duplicate graph metric clauses",
+        "query encoder emits graph metric results",
+        "query profile reports failed graph metric status across read surfaces",
+        "query encoder emits graph metric rerank score details",
+        "query merge applies deterministic graph metric top-k across shards",
+        "query merge rejects missing or unpublished graph metric shard results",
+        "query merge rejects duplicate direct graph metric score nodes",
+        "query merge rejects non-finite direct graph metric scores",
+        "query merge rejects duplicate direct graph metric shard results",
+        "query merge rejects mismatched direct graph metric shard identity",
+        "query merge rejects inconsistent graph metric fan-in status state",
+        "query merge rejects non-finite graph metric fan-in status numbers",
+        "query merge rejects out-of-range graph metric fan-in progress",
+        "query merge rejects incompatible graph metric fan-in metadata",
+        "query merge rejects unsolicited graph score surfaces",
+        "query merge rejects unsolicited graph search metric status",
+        "query merge validates included graph search metric status list",
+        "query merge rejects malformed graph search metric payloads",
+        "query merge rejects malformed graph search traversal payloads",
+        "query merge rejects unqualified graph search identity collisions without collapsing qualified identities",
+        "query merge rejects malformed graph search hit payloads",
+        "query merge preserves failed graph metric status across shard fan-in",
+        "query merge requires comparable graph search metric generations across shards",
+        "query merge allows unpublished projected graph search metric status",
+        "query merge rejects ambiguous graph search fan-in metric status",
+        "query merge preserves failed graph search metric status across shards",
+        "query merge enforces graph search order and filter metric generations across shards",
+        "query profile reports merged graph search metric generation",
+        "query merge requires comparable graph metric rerank generations across shards",
+        "query merge rejects malformed graph metric rerank score details",
+        "query merge rejects missing or unpublished graph metric rerank shard status",
+        "distributed graph result accounting includes shared metric storage and status details",
+        "distributed graph expand request bounds deferred worker metric candidates",
+        "distributed graph metric status merge validates metadata compatibility",
+        "distributed graph metric post processing applies max results after filter and order",
+        "public index contract exposes runtime status metadata",
+        "indexes openapi parses graph metric runtime summary",
+        "client openapi parses graph metric runtime summary",
+        "metadata openapi module generates extractor surface for routed endpoints",
+        "index encoders expose graph metric runtime ownership summary",
+        "index encoders expose mixed graph metric runtime roles without aggregate role",
+        "graph metric status encoder exposes active build pages",
+        "public table graph metric action handler returns status response",
+        "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested",
+        "graph metric status clone owns active build worker id",
+        "graph metric index stats cleanup owns nested status payloads",
+        "graph metric cached index stats clone retains owned progress and survives allocation failures",
+        "metadata runtime index status",
+    };
+    const graph_metric_fan_in_tests = b.addTest(.{
+        .root_module = api_graph_metric_test_mod,
+        .filters = &graph_metric_fan_in_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_fan_in_tests = addFilteredTestRunArtifact(b, graph_metric_fan_in_tests);
+    const graph_metric_fan_in_test_step = b.step("graph-metric-fan-in-test", "Run graph metric API contract and fail-closed distributed fan-in tests");
+    graph_metric_fan_in_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
+
+    const graph_metric_remote_wire_filters = [_][]const u8{
+        "api http client authenticates only the internal API namespace",
+        "multi-shard reads fail closed for shard-local graph metric scores",
+        "graph metric shard request carries internal status without mutating public request",
+        "encode query request includes graph metric read rerank and traversal status",
+        "remote query parser preserves graph metric fan-in provenance and durable status",
+        "remote query parser rejects invalid graph metric status and duplicate rerank profiles",
+        "graph metric queries use general table read preparation and search path",
+        "hosted cross-range graph metric fan-in merges compatible published shard generations",
+        "hosted cross-range graph metric fan-in merges active stale shard for published",
+        "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout",
+        "hosted cross-range graph metric fan-in merges compatible hits pair",
+        "hosted cross-range graph metric fan-in rejects incompatible remote hits pair",
+        "hosted cross-range graph metric fan-in rejects missing remote hits status",
+        "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
+    };
+    const graph_metric_remote_wire_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-graph-metric-wire-tests",
+        // macOS ReleaseFast measured 13.45 GB after the native-generation
+        // merge. Admit this indivisible compiler job with headroom; the shared
+        // runner's 22 GiB cap still bounds aggregate concurrent compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &graph_metric_remote_wire_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    }, api_tests_addTests_result.write_implementation_tests);
+    const run_graph_metric_remote_wire_tests = graph_metric_remote_wire_tests.run(b);
+    const graph_metric_remote_wire_test_step = b.step("graph-metric-remote-wire-test", "Run hosted graph metric shard request and remote-wire tests");
+    graph_metric_remote_wire_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+    graph_metric_unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_remote_wire_tests.step);
+
+    const graph_metric_smoke_filters = [_][]const u8{
+        "db graph metric runtime background coordinator and worker pool loops publish pagerank",
+    };
+    const graph_metric_smoke_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_smoke_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_smoke_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_smoke_tests,
+        &graph_metric_smoke_filters,
+    );
+    const graph_metric_smoke_test_step = b.step("graph-metric-smoke-test", "Run a small end-to-end PageRank scheduler and worker smoke test");
+    graph_metric_smoke_test_step.dependOn(&run_graph_metric_smoke_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_smoke_tests.step);
+
+    const graph_metric_integration_filters = [_][]const u8{
+        "graph.graph.test.graph pagerank ",
+        "graph.graph.test.graph eigenvector ",
+        "graph.graph.test.graph hits ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime background ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime degree canary ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime default gate ",
+        "graph metric failed planned build",
+        "graph metric repeated failed",
+        "graph metric build job cleanup",
+    };
+    const graph_metric_integration_tests = b.addTest(.{
+        // macOS ReleaseFast measured 7.74 GB for the lifecycle root.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        .root_module = db_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"db default primary backend survives reopen"},
+            &graph_metric_integration_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_integration_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_metric_integration_tests,
+        &graph_metric_integration_filters,
+    );
+    const graph_metric_integration_test_step = b.step("graph-metric-integration-test", "Run graph metric scheduler, worker, query, cleanup, and runtime lifecycle tests");
+    graph_metric_integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+    integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &.{}),
@@ -4290,6 +4732,33 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // inventory as well as its own unique cases. Run that union once.
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const graph_runtime_filters = [_][]const u8{
+        "storage.db.graph_runtime.test.",
+    };
+    const graph_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &graph_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_runtime_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        graph_runtime_tests,
+        &graph_runtime_filters,
+    );
+    const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
+    graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+
+    const resolver_backfill_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const resolver_backfill_step = b.step("antfly-resolver-backfill-test", "Run resolver catalog and durable backfill regressions");
+    resolver_backfill_step.dependOn(&addFilteredTestRunArtifact(b, resolver_backfill_tests).step);
 
     // Keep the small, deterministic release-blocker primitives in the PR/base
     // unit gate. The corpus-scale fixtures below protect thresholds that only
@@ -4508,6 +4977,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.backfill_state.",
             "storage.db.batcher.",
             "storage.db.config.",
+            "storage.db.column_read_cache.",
+            "storage.db.column_scan_plan.",
             "storage.db.db.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
@@ -4517,6 +4988,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.document_mapper.",
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
+            "storage.db.graph_runtime.",
             "storage.db.graph_asset_state.",
             "storage.db.graph_edge_contender.",
             "storage.db.graph_state_name.",
@@ -4531,6 +5003,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
+            "storage.db.relational_columns.",
+            "storage.db.relational_store.",
+            "storage.db.schema_cache_admission.",
+            "storage.db.schema_registry.",
+            "storage.db.table_catalog.",
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
             "storage.db.root_identity.",
@@ -5186,7 +5663,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
         .storage_test_step = lib_storage_test_step,
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{provisioned_query_visibility_tests.consumer.executable} }) catch @panic("OOM"),
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable } }) catch @panic("OOM"),
     };
 }
 

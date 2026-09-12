@@ -238,6 +238,7 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
     // Inference slices are logical host-plus-accelerator metrics. Their host
     // component is enforced by the aggregate budget above; ModelManager and

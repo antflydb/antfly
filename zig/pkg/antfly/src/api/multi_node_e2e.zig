@@ -1288,7 +1288,7 @@ fn expectGraphNodeKeys(
 
 fn expectGraphNodesResult(result: indexes_openapi.GraphResult) !indexes_openapi.GraphNodesResult {
     return switch (result) {
-        .graph_nodes_result => |nodes| nodes.*,
+        .graph_nodes_result => |nodes| nodes,
         else => error.TestUnexpectedResult,
     };
 }
@@ -1342,7 +1342,7 @@ fn expectGraphNodePath(
     const path_edges = node.path_edges orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected_edge_types.len, path_edges.len);
     for (expected_edge_types, path_edges) |expected, actual| {
-        try std.testing.expectEqualStrings(expected, actual.type.?);
+        try std.testing.expectEqualStrings(expected, actual.type);
     }
 }
 
@@ -5538,7 +5538,7 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },
@@ -7342,7 +7342,7 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },
@@ -7681,7 +7681,7 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
         "sparse_idx",
         "body",
         .{
-            .provider = .antfly,
+            .provider = "antfly",
             .model = "antfly-sparse-v1",
             .api_url = antfly_base_uri,
         },

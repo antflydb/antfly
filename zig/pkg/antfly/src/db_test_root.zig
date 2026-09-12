@@ -14,6 +14,8 @@
 
 test {
     _ = @import("antfly_source_root").antfly_sources.physical_db;
+    _ = @import("graph/query.zig");
+    _ = @import("storage/db/graph_runtime.zig");
     _ = @import("storage/db_split_vopr.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");

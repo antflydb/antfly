@@ -789,13 +789,16 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
-            const schema_before_index_load: ?storage_schema.TableSchema = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+            const schema_before_index_load: ?db_mod.SchemaBeforeIndexLoad = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
                 if (schema_json.len == 0) break :blk null;
                 var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
                 defer parsed_schema.deinit(allocator);
-                break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
+                break :blk .{
+                    .runtime_schema = try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema),
+                    .public_schema_json = schema_json,
+                };
             } else null;
-            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
             if (open_options.native_restore_open_plan) |native_plan| {
                 if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
@@ -1520,9 +1523,19 @@ pub fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.d
     var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
     var file_open = true;
     defer if (file_open) file.close(io);
+    const spool_path = try std.fmt.allocPrint(alloc, "{s}.spool", .{tmp_path});
+    defer alloc.free(spool_path);
+    defer if (std.fs.path.isAbsolute(spool_path))
+        std.Io.Dir.deleteFileAbsolute(io, spool_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var spool_file = try fs_paths.createFilePortable(io, spool_path, .{ .read = true, .truncate = true });
+    defer spool_file.close(io);
     var buf: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &buf);
-    try portable_backup.exportPortableToWriter(alloc, store, &writer.interface);
+    try portable_backup.exportPortableToWriterWithOptions(alloc, store, &writer.interface, .{
+        .spool = .{ .io = io, .file = spool_file },
+    });
     try writer.end();
     try file.sync(io);
     file.close(io);
@@ -1579,6 +1592,12 @@ pub fn validateTableBatchAgainstLocalSchema(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    // Relational writes are validated authoritatively by DB.batch after its
+    // final transform resolution and while holding the schema generation's
+    // apply lock. Repeating the API-level load/parse/transform pass doubles
+    // CPU and allocation cost without improving error timing: both paths are
+    // synchronous and return InvalidBatchRequest before any durable mutation.
+    if (db.usesRelationalStorage()) return;
     const schema_json = (try loadLocalTableSchemaJson(alloc, db)) orelse return;
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
@@ -1597,33 +1616,46 @@ pub fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    // An empty schema is still an explicit, durable table contract. Persist
-    // the marker so transition and Raft replay can distinguish a provisioned
-    // schema-less DB from an incomplete local generation without consulting
-    // the catalog.
-    if (schema_json.len == 0) {
-        try db.core.store.put(local_schema_json_key, "");
-        return;
-    }
-
-    const previous_schema_json = try loadLocalTableSchemaJson(alloc, db);
-    defer if (previous_schema_json) |value| alloc.free(value);
-    const marker_changed = if (previous_schema_json) |value|
-        !std.mem.eql(u8, value, schema_json)
-    else
-        true;
-
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer storage_schema.freeSchema(alloc, runtime_schema);
-
-    try db.setSchema(runtime_schema);
+    // The absent/empty catalog contract has the same canonical schema as
+    // table creation. Never overwrite only the public marker: its validator
+    // and the durable runtime layout must be committed in the same epoch.
+    const effective_schema_json = if (schema_json.len == 0) tables_api.default_schema_json else schema_json;
+    // Install the public and runtime forms together so storage-boundary writes
+    // immediately use the same authoritative validator as API writes.
+    try db.setSchemaJson(alloc, effective_schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
-    try db.reloadAlgebraicSchemaConfigs(schema_json);
-    if (marker_changed) try db.core.store.put(local_schema_json_key, schema_json);
+    try db.reloadAlgebraicSchemaConfigs(effective_schema_json);
+}
+
+/// Installed producer configuration for a live compiled owner. Reconciliation
+/// of unchanged catalog JSON must not cancel/join the same runtime again.
+pub const OwnerManagedConfig = struct {
+    fingerprint: ?[32]u8 = null,
+
+    fn digest(indexes_json: []const u8) [32]u8 {
+        var result: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(indexes_json, &result, .{});
+        return result;
+    }
+    fn matches(self: *const @This(), indexes_json: []const u8) bool {
+        const installed = self.fingerprint orelse return false;
+        return std.mem.eql(u8, &installed, &digest(indexes_json));
+    }
+    fn publish(self: *@This(), indexes_json: []const u8) void {
+        self.fingerprint = digest(indexes_json);
+    }
+};
+
+pub fn prepareOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, schema_json: []const u8) !?db_mod.SchemaBeforeIndexLoad {
+    if (schema_json.len == 0) return null;
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    return .{ .runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed), .public_schema_json = schema_json };
+}
+
+pub fn freeOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, prepared: ?db_mod.SchemaBeforeIndexLoad) void {
+    if (prepared) |schema| storage_schema.freeSchema(alloc, schema.runtime_schema);
 }
 
 pub fn configureStorageKernelOwnerDb(
@@ -1635,10 +1667,12 @@ pub fn configureStorageKernelOwnerDb(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
     remote_content: ?*const scraping.RemoteContentConfig,
+    installed: ?*OwnerManagedConfig,
 ) !void {
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {
-        if (backend_runtime != null) try reconfigureManagedDbEnrichmentRuntime(
+        const replace = backend_runtime != null and !(if (installed) |state| state.matches(indexes_json) else false);
+        if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
             alloc,
             db,
             indexes_json,
@@ -1653,6 +1687,8 @@ pub fn configureStorageKernelOwnerDb(
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
         });
+        if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner configuration", "*");
+        if (installed) |state| state.publish(indexes_json);
     }
 }
 
@@ -1694,7 +1730,7 @@ pub fn repairStorageKernelRestoreDb(
     indexes_json: []const u8,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
-    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null);
+    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null);
     const io = db.backend_runtime.filesystemIo() orelse std.Io.Threaded.global_single_threaded.io();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;
@@ -1747,9 +1783,11 @@ pub fn reconcileStorageKernelOwnerDb(
     advance_index_repair: bool,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    installed: ?*OwnerManagedConfig,
 ) !StorageKernelReconcileResult {
-    if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
-    if (indexes_json.len > 0 and backend_runtime != null) try reconfigureManagedDbEnrichmentRuntime(
+    if (target_index_name == null and schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    const replace = indexes_json.len > 0 and backend_runtime != null and !(if (installed) |state| state.matches(indexes_json) else false);
+    if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
         alloc,
         db,
         indexes_json,
@@ -1761,12 +1799,15 @@ pub fn reconcileStorageKernelOwnerDb(
         null,
         null,
     );
-    const provisioned = if (indexes_json.len > 0)
-        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
-            .drain_resolver_backfill = false,
-        })
-    else
-        metadata_table_provisioner.ProvisionSummary{};
+    const provisioned = if (indexes_json.len > 0) blk: {
+        const options: metadata_table_provisioner.ReconcileDbIndexOptions = .{ .drain_resolver_backfill = false };
+        break :blk if (target_index_name) |target|
+            try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, target, options)
+        else
+            try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, options);
+    } else metadata_table_provisioner.ProvisionSummary{};
+    if (replace) try db.resumeEnrichmentRuntimeAfterReconfigure("owner reconciliation", target_index_name orelse "*");
+    if (indexes_json.len > 0) if (installed) |state| state.publish(indexes_json);
 
     var result = StorageKernelReconcileResult{
         .indexes_added = provisioned.indexes_added,
@@ -1950,4 +1991,92 @@ test "native backup never reclaims an old attempt with a live lease" {
     try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
     try std.Io.Dir.cwd().access(std.testing.io, attempt.marker_path, .{});
     try std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{});
+}
+
+pub fn batchUsesDurableTransactionContract(alloc: std.mem.Allocator, db: *db_mod.DB, req: db_mod.types.BatchRequest) !bool {
+    const mutation = req.transaction orelse return false;
+    return switch (mutation) {
+        .prepare => |prepare| try transactionUsesDurableContract(alloc, db, prepare.txn_id),
+        else => false,
+    };
+}
+
+pub fn transactionUsesDurableContract(alloc: std.mem.Allocator, db: *db_mod.DB, txn_id: db_mod.types.TxnId) !bool {
+    if (try db.core.transactionSchemaBinding(alloc, txn_id) != null) return true;
+    const status = db.getTransactionStatus(txn_id) catch |err| switch (err) {
+        error.TxnNotFound => return false,
+        else => return err,
+    };
+    return status != .pending;
+}
+
+pub fn applyGraphMetricActionToDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+) !db_mod.types.GraphMetricStatus {
+    if (std.mem.eql(u8, action, "refresh")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, false);
+    if (std.mem.eql(u8, action, "rebuild")) return try db.scheduleGraphMetricBuild(alloc, index_name, metric_name, true);
+    if (std.mem.eql(u8, action, "delete")) return try db.deleteGraphMetricMaterialization(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "pause")) return try db.pauseGraphMetricMaintenance(alloc, index_name, metric_name);
+    if (std.mem.eql(u8, action, "resume")) return try db.resumeGraphMetricMaintenance(alloc, index_name, metric_name);
+    return error.InvalidGraphMetricAction;
+}
+
+const GraphMetricGroupActionRequest = contract.GraphMetricGroupActionRequest;
+const graph_metric_group_action_operation = contract.graph_metric_group_action_operation;
+
+pub fn runGraphMetricMaintenanceOrActionJsonAlloc(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    body: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(GraphMetricGroupActionRequest, alloc, body, .{ .ignore_unknown_fields = true }) catch
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    defer parsed.deinit();
+    const operation = parsed.value.operation orelse return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    if (!std.mem.eql(u8, operation, graph_metric_group_action_operation)) {
+        return try db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, body);
+    }
+    if (parsed.value.index_name.len == 0 or parsed.value.metric_name.len == 0 or parsed.value.action.len == 0) {
+        return error.InvalidGraphMetricAction;
+    }
+    var status = try applyGraphMetricActionToDb(
+        alloc,
+        db,
+        parsed.value.index_name,
+        parsed.value.metric_name,
+        parsed.value.action,
+    );
+    defer status.deinit(alloc);
+    return try std.json.Stringify.valueAlloc(alloc, status, .{ .emit_null_optional_fields = false });
+}
+
+pub fn reconfigureManagedDbEnrichmentRuntimePaused(
+    _: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_capability_cache: ?*remote_capabilities.Cache,
+    inference_api_url: ?[]const u8,
+    source_table: []const u8,
+    secret_store: ?*common_secrets.FileStore,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) !void {
+    var enrichments = try createManagedDbEnrichments(
+        db.runtime_alloc,
+        indexes_json,
+        backend_runtime,
+        antfly_provider,
+        remote_capability_cache,
+        inference_api_url,
+        source_table,
+        secret_store,
+        remote_content,
+    );
+    defer enrichments.deinit(db.runtime_alloc);
+    try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
 }

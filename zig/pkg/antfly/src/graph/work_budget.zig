@@ -268,6 +268,77 @@ pub const RetainedLease = struct {
     }
 };
 
+/// Scoped allocator for request-owned metric work. Scratch frees return their
+/// reservation immediately; escaping output is explicitly detached and retains
+/// a consumptive request charge. Only free allocations made by this wrapper.
+pub const RetainedAllocator = struct {
+    backing: std.mem.Allocator,
+    budget: ?*WorkBudget,
+    live_bytes: usize = 0,
+    denied: bool = false,
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    pub fn detach(self: *@This()) void {
+        self.live_bytes = 0;
+    }
+
+    fn reserve(self: *@This(), bytes: usize) bool {
+        if (self.budget) |budget| budget.retainStateBytes(bytes) catch {
+            self.denied = true;
+            return false;
+        };
+        self.live_bytes += bytes;
+        return true;
+    }
+
+    fn release(self: *@This(), bytes: usize) void {
+        self.live_bytes -= bytes;
+        if (self.budget) |budget| budget.releaseStateBytes(bytes);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.reserve(len)) return null;
+        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.release(len);
+            return null;
+        };
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (!self.reserve(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
+            self.release(growth);
+            return false;
+        }
+        self.release(memory.len -| new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (!self.reserve(growth)) return null;
+        const result = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+            self.release(growth);
+            return null;
+        };
+        self.release(memory.len -| new_len);
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.release(memory.len);
+    }
+};
+
 pub const AllocationReplacement = struct {
     lease: *RetainedLease,
     prior_bytes: usize,

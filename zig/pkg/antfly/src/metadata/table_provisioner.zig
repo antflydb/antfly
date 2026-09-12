@@ -224,7 +224,10 @@ pub fn reconcileReplicaRootWithOptions(
         var open_options = provisioningDbOpenOptions();
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
-        open_options.schema_before_index_load = runtime_schema;
+        open_options.schema_before_index_load = if (runtime_schema) |schema| .{
+            .runtime_schema = schema,
+            .public_schema_json = table.schema_json,
+        } else null;
         open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
@@ -422,7 +425,11 @@ pub fn reconcileDbIndexTargetWithOptions(
     const enrichments_removed = try removeAbsentEnrichments(alloc, db, desired_enrichments.items);
     if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0) {
         const pending = db.pendingWorkStats();
-        if (pending.enrichment.error_count == 0) try db.core.index_manager.syncAll(false);
+        // Targeted DDL cannot wait on checkpoints or maintenance owned by a
+        // sibling index. Deletion already retires its durable generation; only
+        // an installed target has index state to sync here.
+        if (pending.enrichment.error_count == 0 and target_value != null and target_summary.pending == 0)
+            try db.core.index_manager.syncIndexByName(index_name, false);
     }
     return .{
         .indexes_added = target_summary.added,
@@ -4126,6 +4133,61 @@ fn implementationTests() type {
             runtime.doc_identity.live_ordinals = 0;
             indexes[1].doc_count = 0;
             try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0));
+        }
+
+        test "target index reconciliation does not wait for sibling storage maintenance" {
+            if (@import("builtin").single_threaded) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/target-maintenance", .{tmp.sub_path});
+            defer alloc.free(path);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var db = try db_mod.DB.open(alloc, path, .{
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer db.close();
+            try db.addIndex(.{ .name = "sibling", .kind = .full_text, .config_json = "{}" });
+            const sibling = db.core.index_manager.textIndex("sibling").?;
+            const storage = sibling.main_store_owner.lsm.backend;
+            const Reconcile = struct {
+                db: *db_mod.DB,
+                io: std.Io,
+                done: std.Io.Event = .unset,
+                fn run(self: *@This()) !void {
+                    defer self.done.set(self.io);
+                    const created = try reconcileDbIndexTarget(std.testing.allocator, self.db,
+                        \\{"sibling":{"type":"full_text"},"target":{"type":"full_text"}}
+                    , "target");
+                    try std.testing.expectEqual(@as(usize, 1), created.indexes_added);
+                    const removed = try reconcileDbIndexTarget(std.testing.allocator, self.db,
+                        \\{"sibling":{"type":"full_text"}}
+                    , "target");
+                    try std.testing.expectEqual(@as(usize, 1), removed.indexes_removed);
+                }
+            };
+            var reconcile = Reconcile{ .db = &db, .io = io };
+            // Hold the actual sibling storage lock as a checkpoint/maintenance task
+            // would. Creating and dropping another index must finish before release.
+            try std.testing.expect(storage.mu.tryLock());
+            var locked = true;
+            defer if (locked) storage.mu.unlock();
+            var future = try io.concurrent(Reconcile.run, .{&reconcile});
+            const completed = if (reconcile.done.waitTimeout(io, .{
+                .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
+            })) |_| true else |err| switch (err) {
+                error.Timeout => false,
+                error.Canceled => false,
+            };
+            storage.mu.unlock();
+            locked = false;
+            try future.await(io);
+            try std.testing.expect(completed);
+            try std.testing.expect(db.core.index_manager.textIndex("sibling").?.main_store_owner.lsm.backend == storage);
         }
     };
     return Suite;

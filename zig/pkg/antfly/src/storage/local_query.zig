@@ -141,7 +141,7 @@ pub fn executeStorageKernelGraphHydrate(
     }
     try checkQueryDeadline(search_req);
     const has_incoming = if (req.incoming_index_name.len > 0)
-        try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys)
+        try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys, .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash }, req.identity_read_generation)
     else
         @constCast((&[_]bool{})[0..]);
     errdefer if (has_incoming.len > 0) alloc.free(has_incoming);

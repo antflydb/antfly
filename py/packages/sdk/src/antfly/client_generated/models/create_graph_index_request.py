@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
     from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
     from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
+    from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
     from ..models.graph_resolver_config import GraphResolverConfig
 
 
@@ -31,6 +32,9 @@ class CreateGraphIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        metrics (GraphIndexConfigMetrics | Unset): Named published graph metrics. Serverless supports background refresh
+            only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128
+            UTF-8 bytes per metric name.
         sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
             are unioned into this graph index. Artifact names must be unique within the array because the artifact name is
             the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires
@@ -60,6 +64,7 @@ class CreateGraphIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    metrics: GraphIndexConfigMetrics | Unset = UNSET
     sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
@@ -84,6 +89,10 @@ class CreateGraphIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        metrics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics.to_dict()
 
         sources: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.sources, Unset):
@@ -139,6 +148,8 @@ class CreateGraphIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
         if sources is not UNSET:
             field_dict["sources"] = sources
         if summarizer is not UNSET:
@@ -168,6 +179,7 @@ class CreateGraphIndexRequest:
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
         from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
         from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
+        from ..models.graph_index_config_metrics import GraphIndexConfigMetrics
         from ..models.graph_resolver_config import GraphResolverConfig
 
         d = dict(src_dict)
@@ -185,6 +197,13 @@ class CreateGraphIndexRequest:
                 enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _metrics = d.pop("metrics", UNSET)
+        metrics: GraphIndexConfigMetrics | Unset
+        if isinstance(_metrics, Unset):
+            metrics = UNSET
+        else:
+            metrics = GraphIndexConfigMetrics.from_dict(_metrics)
 
         _sources = d.pop("sources", UNSET)
         sources: list[GraphArtifactSourceConfig] | Unset = UNSET
@@ -250,6 +269,7 @@ class CreateGraphIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            metrics=metrics,
             sources=sources,
             summarizer=summarizer,
             template=template,

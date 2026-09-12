@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 48;
+pub const abi_version: u32 = 49;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -380,6 +380,46 @@ pub const Status = enum(u32) {
     restore_index_availability_incomplete = 422,
     invalid_pdf_decode_limits = 423,
     invalid_idempotency_key = 424,
+    graph_anchor_filter_requires_index = 425,
+    graph_distinct_budget_exceeded = 426,
+    graph_explored_edge_bytes_budget_exceeded = 427,
+    graph_explored_edges_budget_exceeded = 428,
+    graph_external_alias_document_filter_unsupported = 429,
+    graph_external_alias_source_unsupported = 430,
+    graph_match_operation_limit_exceeded = 431,
+    graph_max_weight_domain_violation = 432,
+    graph_metric_action_partial_outcome = 433,
+    graph_metric_disabled = 434,
+    graph_metric_global_materialization_required = 435,
+    graph_metric_materialization_rejected = 436,
+    graph_metric_query_budget_exceeded = 437,
+    graph_metric_status_conflict = 438,
+    graph_min_weight_domain_violation = 439,
+    graph_path_weight_overflow = 440,
+    graph_query_mode_unsupported = 441,
+    graph_reverse_variable_path_unsupported = 442,
+    graph_work_budget_exceeded = 443,
+    invalid_graph_edges = 444,
+    invalid_graph_metric_action = 445,
+    invalid_graph_metric_build_worker = 446,
+    invalid_graph_metric_runtime_config = 447,
+    backend_runtime_shutting_down = 448,
+    backend_runtime_unavailable = 449,
+    deadline_exceeded = 450,
+    durability_outcome_unknown = 451,
+    file_locks_unsupported = 452,
+    index_generation_mismatch = 453,
+    invalid_query_response = 454,
+    metadata_mutation_not_applied = 455,
+    metric_not_ready = 456,
+    metric_stale = 457,
+    portable_import_publication_in_progress = 458,
+    portable_import_recovery_required = 459,
+    portable_runtime_activation_pending = 460,
+    source_file_changed = 461,
+    storage_unavailable = 462,
+    transaction_too_large = 463,
+    unsupported_operation = 464,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

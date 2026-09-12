@@ -1,5 +1,242 @@
 # Zig E2E flakes
 
+## 2026-09-11: stale expiry and uncertain capacity found in fresh review (#694)
+
+Two deterministic regressions failed on `8a4d2d83e`: a delayed expired-job
+poll deleted a replacement after an unknown admission receipt, and a full
+retained-byte budget still allowed durable admission. The fix invalidates
+stale observations before persistence, conditionally deletes only the observed
+durable record, and reserves admission/update capacity through unknown outcomes.
+See `../FLAKES.md` for the proof, protocol/ABI changes, and regression coverage.
+
+Focused native Debug validation passed 29 restore-store, 248 metadata-logic,
+and 36 restore HTTP tests with no skips, failures, or leaks. Fresh 100/100
+acceptance per E2E scenario remains pending on a rebuilt revision.
+
+The native Debug soak starting 2026-09-11 17:01:24 UTC uses `8a4d2d83e`
+(binary SHA-256 `9d65a426a0e64b37687220f146b5d3d99f63322ed475162d79f34f4a024707f4`).
+Those results are historical; these fixes require another rebuilt binary.
+Short-lived E2E scenarios do not replace the expiry and capacity regressions.
+
+## 2026-09-11: expired restore key reuse found during soak review (#694)
+
+Review of `0126d8b30` found a seven-day expiry case outside the short-lived E2E
+scenarios: polling forgot the local job without deleting its durable key, so
+conditional re-admission returned expired history and never queued a restore.
+The deterministic regression passes with main's restore-store implementation
+and fails on that PR revision. Expiry now confirms durable retirement before
+releasing local ownership, and admission recovers expired records left behind
+by older caches. Fault regressions cover deletion failure, unknown deletion
+outcomes, leadership loss, and exactly-once requeue after recovery. See
+`../FLAKES.md` for evidence and the focused Debug command.
+
+The native Debug soak started at 2026-09-11 16:31:39 UTC uses `0126d8b30`.
+Its results are historical for this fix; fresh acceptance must use a rebuilt
+binary. Issue #705's separate heap-corruption failure remains unresolved.
+
+## 2026-09-11: restore admission recovery and range cleanup (#694)
+
+The second retained `0259bab66` metadata backup failure contains two jobs for
+the same restore fingerprint, with distinct generated keys. The first job had
+published the destination; the second failed `TableAlreadyExists`. Evidence:
+`/private/tmp/ci694-main-review-second-failure.tar.gz`, SHA-256
+`3cb2de630eff6dde0c17e3015c9f5f30b08072e063141cbfa3235dfec23e3842`.
+The receipt fix prevents the observed leadership error from being mislabeled
+as safe to replay. Conditional restore admission now additionally preserves a
+recoverable identity across an unresolved timeout; retrying that same key
+cannot overwrite the original job or create another one. Do not blindly retry
+an unknown outcome without the returned key, or treat a missing job as proof
+that the enqueue cannot still commit.
+
+Review also replaced per-completion table-wide progress scans with an atomic
+range/node index and versioned rebuild. See [runtime regressions](../FLAKES.md)
+for the deterministic admission and bounded-work coverage. These changes need
+a new final-revision 100/100 soak; prior acceptance counts are historical.
+The independent #705 heap corruption remains under investigation.
+
+## 2026-09-11: merged soak exposes a superseded create receipt (#694)
+
+The fresh `0259bab66` Linux batch failed an initial backup-table create with an
+unknown-outcome 409 after metadata leadership loss. Durable logs retain the
+common prefix and its replacement no-op, with no create. The failed root and
+worker log are preserved in `/private/tmp/ci694-main-review-first-failure.tar.gz`
+(SHA-256 `8893cda56544fb8af67124724cd730cb42c56900b46c4bbcec23021d4ca1eda9`).
+
+The production fix waits for the receipt's actual applied identity and exposes
+a distinct non-application proof only for a superseded single atomic topology
+command. Routing can then retry within its existing budgets. It does not replay
+unknown outcomes or change the fixture's assertions, cadence, or deadlines.
+See `zig/FLAKES.md` for the proof, protocol compatibility, and validation details.
+A new complete 100-per-scenario batch is required after this correction.
+
+## 2026-09-11: fresh review before the merged Linux soak (#694)
+
+The fresh review additionally reproduced mixed-version Raft catch-up stalling:
+released followers report their last index in rejection fields that the new
+leader interpreted as a request index. Compatibility handling now preserves the
+confirmed prefix and coalesces ambiguous pipeline failures into heartbeat-paced
+recovery. Its deterministic before/after regression and 403-test Raft suite
+pass, as do 100 stable etcd differential seeds. See `zig/FLAKES.md` for details.
+The new mixed Linux soak remains pending until the corrected binary is built;
+the pre-merge acceptance below does not validate this revision.
+
+## 2026-09-11: main merge and peer endpoint review follow-up (#694)
+
+The main merge preserves the regression targets in the new build modules.
+Review reproduced a peer endpoint change being ignored while placement stayed
+unchanged; the fix now includes owned node IDs and Raft URLs in the cache
+inputs without invalidating on heartbeat telemetry. The merged data-runtime
+suite passes 179/179 and Python harness checks pass 73/73. See `../FLAKES.md`
+for the deterministic before/after evidence. Fresh 100-per-scenario Linux
+acceptance is required; the 300/300 result below belongs to the pre-merge code.
+
+## 2026-09-11: mixed Linux acceptance before the main merge (#694)
+
+The fresh run completed **300/300**, with **100/100 each** for CLI quickstart,
+three-by-three metadata backup/restore, and CLI retry exhaustion/restart.
+Four workers each ran 25 iterations of all three scenarios, from 02:21:01 to
+03:17:04 UTC. There were zero failures, errors, skips, or failed-case retries;
+the driver exited 0. These results are from one revision and do not combine
+passes from the earlier failed runs.
+
+Production commit `05f96814e` includes the atomic coverage batch, lifecycle and
+placement authority fixes, durable Raft replacement/abort fixes, and monotonic
+replication progress. Test revision `b63468094` includes complete publication
+before exact semantic ranking. The subsequent `574af3586` formatter correction
+has an identical Python AST. The Linux x86_64 ReleaseFast executable was built
+with a fresh compiler cache and verified SHA-256:
+`dfdbe000a2712b11d0919a4dc66888c51f905030d3d14a8a360bee4d5cbc3265`.
+The driver used eight allowed CPUs (`0-6,8`) on a pod requesting four CPUs and
+limited to eight; these were not dedicated cores. The retry scenario retained
+all 36 provider attempts and the real production backoff.
+
+Complete logs, runner script, and machine-checked acceptance manifest are in
+`/private/tmp/ci694-replication-acceptance-results.tar.gz`, SHA-256
+`f78936d40adbf5f6b96519bdc3a8c871e96531b0f168a838192531326515a9cd`,
+verified against the runner archive. Historical failure archives remain
+preserved separately. This acceptance result does not establish that unrelated
+flakes cannot occur; deterministic regressions and evidence limits are recorded
+below. GitHub CI is tracked separately from this controlled Linux soak.
+
+## 2026-09-11: delayed Raft responses amplify metadata replication (#694)
+
+The full `42cb81c6a` run completed **297/300**: quickstart 99/100,
+backup/restore 98/100, retry exhaustion 100/100. Complete preserved evidence is
+in `/private/tmp/ci694-durable-complete-results.tar.gz`. Its second restore
+timeout also showed amplified Raft batches and one lagging metadata replica.
+
+The new mixed Linux run on `42cb81c6a` failed backup/restore immediately in
+worker 1. Metadata node 1 quarantined its group after one Ready batch exceeded
+the existing hard outbound ceiling at 1,144,753,225 bytes. Preserved logs/state
+and native stacks: `/private/tmp/ci694-durable-first-failure.tar.gz`, SHA-256
+`70658edd776376a2c5dc2a966b59d6941b0ea9a37b3030200e8d7fe835350657`.
+
+A deterministic regression shows an early acknowledgement resending 31 entries
+already in flight. The leader now preserves monotonic replication progress,
+ignores stale rejections and prior-term acknowledgements, and uses empty
+heartbeat probes to recover a lost append/ack without enlarging its window.
+Quorum commit also requires a current-term entry. All 401 Raft library tests
+pass; the corrected snapshot-abort history matches the etcd oracle. See
+`../FLAKES.md` for before/after evidence and protocol details. This is another
+failed acceptance run; the fresh corrected run recorded above passes 100/100
+for all three scenarios.
+
+The standalone quickstart failure also exposed an invalid test assumption:
+one searchable artifact does not guarantee that Alpha has published ahead of
+Beta. A controlled provider gate proves the partial milestone can succeed with
+only Beta searchable; complete publication then returns Alpha first. The test
+retains its partial milestone check and uses `complete` before exact ranking,
+with unchanged wait bounds and no query retries. Complete-query failures now
+include readiness and query diagnostics. This probe does not reproduce the
+original empty-hit result itself; see `../FLAKES.md` for the evidence limits.
+
+## 2026-09-11: unit CI retention assertion races legitimate consumer progress (#694)
+
+Run `34543627560`, x86 job `103092055515`, failed the provider-restart storage
+test because its negative index-progress assertion raced a healthy derived
+consumer. The revised test explicitly waits for that consumer, then verifies
+that enrichment's independent durable checkpoint retains the failed source
+record and that restart generates both searchable embeddings. Three focused
+retention checks pass; see `../FLAKES.md` for the original log and contract.
+
+## 2026-09-10: 299/300 identifies replacement persistence and abort outcome defects (#694)
+
+The `9e5b558ce` mixed run finished at 23:57 UTC with quickstart **100/100**,
+backup/restore **99/100**, and retry exhaustion **100/100**. Complete logs and the
+one preserved failure root are in
+`/private/tmp/ci694-authority-complete-results.tar.gz`; the downloaded archive's
+SHA-256 matches the runner copy. This remains failed acceptance.
+
+The failed shard's durable Raft history contains an overwritten term-2 prepare
+at index 4 on node 4, while nodes 5 and 6 retain the new leader's term-3 no-op.
+Review reproduced the missing persistence-watermark invalidation. All three
+transaction records are aborted; a second regression reproduced an unknown
+prepare outcome escaping despite a confirmed coordinator abort. The fixes bind
+persistence to entry identity and preserve the proven abort decision, with
+existing bounded stateless retries and unchanged deadlines. See `../FLAKES.md`
+for the before/after regressions and exact history. Fresh 100-per-scenario
+acceptance must include these fixes as well as the forwarding and placement
+review changes below.
+
+## 2026-09-10: review closes forwarding and placement authority gaps (#694)
+
+The `9e5b558ce` mixed soak had a backup seed-write `409 write outcome unknown`
+and therefore failed acceptance. The first failure is preserved in
+`/private/tmp/ci694-first-final-failure.tar.gz`; the durable transaction records
+show abort on all three groups. The subsequent investigation is recorded above.
+
+Independent deterministic review probes reproduced Raft transport starvation
+from sharing its executor with forwarded writes, and changed placement bypassing
+authority when two peers return the same lifecycle counter. Forwarding now has
+separate bounded whole-request admission. Placement reuse compares the exact
+plan inputs, including remote member rows and split bootstrap inputs. See
+`../FLAKES.md` for the production contract, resource budget, and before/after
+regressions. Fresh 100/100 runs for each of the three split scenarios must use
+these completed changes; earlier passing subsets do not count.
+
+## 2026-09-10: data-Raft placement requires authority before retirement (#694)
+
+The preserved `sjng4qip` backup failure contained repeated restored-group
+admissions followed by `ConflictingDataApplyBatch`. A deterministic data-runtime
+regression reproduced destructive retirement from an older empty catalog whose
+process-local metadata epoch was larger: group 77 changed from active to absent.
+The fix requires a coherent linearizable snapshot for changed local placement,
+serializes its acquisition with reconciliation, and leaves unchanged placement
+on the cached path. Equal epoch counters from different metadata processes do
+not suppress a genuinely authoritative deletion. See `../FLAKES.md` for the
+production contract and before/after artifacts.
+
+The prior 294/300 mixed run and 57/60 old-runtime backup diagnostic remain failed
+historical runs. Fresh 100-per-scenario acceptance must use the completed
+placement-authority fix together with the resident-owner, CDC, backup-ABI, and
+Raft-cadence fixes; no old passing subset counts toward that acceptance.
+
+## 2026-09-10: bounded coverage follow-up acceptance (#694)
+
+The `00dd1e4aef` Linux ReleaseFast executable
+(`7ef883c0c2928ece1562e62f6518b57316cd0a66628988ec59ae883ce3e3a033`)
+ran 100 of each split scenario with four workers and no failed-case retries.
+The run ended at 20:42 UTC with **294/300**, not passing acceptance:
+quickstart 99/100, 3x3 backup/restore 95/100, retry exhaustion 100/100.
+Failures: post-restart RAG resident availability, fatal restore apply conflict,
+fatal metadata `NotLeader`, backup timeout, repository teardown collision, and
+DELETE conflict. Preserved archive:
+`/private/tmp/ci694-bounded-soak-failures.tar.gz`; extracted state:
+`/private/tmp/ci694-bounded-soak-state/`.
+
+The next diagnostic run retained that runtime and used the corrected repository
+lifetime and native stack capture. It completed **57/60** backup cases. Failures
+were metadata `NotLeader`, metadata outbound Ready growth past its hard ceiling
+followed by `GroupLeaderUnavailable`, and a seed write with an unknown outcome.
+All three native stack captures succeeded. Archive:
+`/private/tmp/ci694-diagnostic-failures.tar.gz`; extracted state:
+`/private/tmp/ci694-diagnostic-state/`. These diagnostic runs are not combined
+with acceptance for subsequent production changes.
+
+Cold repair ownership, CDC scheduling admission, and backup ambiguity transport
+have deterministic regressions and fixes recorded in `../FLAKES.md`. Fresh
+100/100 acceptance for the complete implementation remains outstanding.
+
 Track intermittent failures with their original evidence, the contract being
 tested, and repeated validation. A passing soak reduces uncertainty; it does not
 establish the cause of a failure that was not reproduced locally. Keep resolved
@@ -9,6 +246,9 @@ entries so later failures can be compared with the original signature.
 
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
+| `test_table_chunker_full_text_index_routes_template_chunks[serverless]`, `test_semantic_query_embedding_template_supports_remote_text[serverless]` | [PR #503, run 34659490727, job 103470234534](https://github.com/antflydb/antfly/actions/runs/34659490727/job/103470234534) | This change | Publication client now honors explicit retryable 503 responses within one shared deadline; see below. |
+| Same CLI pipeline, completion regresses between `index get` and `index list` | [PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696) | PR #694 | Reproduced with the original Linux CI executable; delayed source callbacks now recognize completed observations within the same catalog epoch. See below. |
+| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; review follow-up isolates forwarding from Raft transport with bounded admission. Earlier merged-runtime soak: 90/90 passed (60 ordinary, 30 stalled-route); current 100-per-scenario acceptance remains outstanding. |
 | `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions` | [PR #692, run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692) | This change | Filesystem GET keeps metadata and payload on one open descriptor across atomic publication; see [deterministic reproduction and validation](../FLAKES.md#serverless-build-status-preconditionfailed-during-publication-692). |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
 | `test_retrieval.py::test_retrieval_agent_streaming_fallback_progress` | [PR #657, run 34176604388, job 101914807099](https://github.com/antflydb/antfly/actions/runs/34176604388/job/101914807099?pr=657), head [`bc8f8a20d`](https://github.com/antflydb/antfly/commit/bc8f8a20d34534969decc90813fbcb8f390164f1) | [`47106c1fd`](https://github.com/antflydb/antfly/commit/47106c1fd09e9be5f1e3333363fd77d007813632) | Teardown recovery fixed; original reset cause unknown; 30/30 soak runs passed. |
@@ -18,6 +258,235 @@ entries so later failures can be compared with the original signature.
 | Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
 | `test_quickstart.py::test_public_quickstart_query_string_boolean_controls` | [PR #657, run 34296218257, job 102299245250](https://github.com/antflydb/antfly/actions/runs/34296218257/job/102299245250?pr=657), head `292e5ec9c` | This change | Deterministic fixture mismatch reproduced 9/9; fresh stateful restart fixture passed 30/30 final soak runs. |
 | `test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes` | Same #657 job | This change | Live replication startup wait passed 30/30 ordinary and 30/30 delayed-fetch runs. Delayed first fetch reproduces the pending-durability 503 without the wait; original CI delay was not observed locally. |
+
+### Serverless publication retry contract (#503)
+
+Both failures returned HTTP 503 with the publication-authority retry message;
+the runtime logs reported `WorkLeaseLost` while background maintenance was
+enabled. The PR changed this condition from generic 500 `build failed` to
+503 with `Retry-After: 1`. The E2E build helper still retried only 409 or the
+old 500 response, so the new transient response failed immediately.
+
+The helper now retries 409 and 503 with valid `Retry-After` delta-seconds.
+It respects the advertised delay, caps request timeouts by remaining time,
+and shares a single deadline with the outer publication/readiness loop.
+Missing or malformed retry headers and generic 500 responses fail immediately;
+in particular, missing external-source resolution is not silently retried.
+Document mutation POSTs are never replayed by this policy. Runtime lease
+fencing and publication success/readiness assertions are unchanged.
+
+`test_publication_retry.py` exercises the exact CI response deterministically,
+including deadline exhaustion, scheduler sleep overshoot, bounded readiness
+polling, permanent errors, and no replay of batch mutations. These tests verify
+client behavior; they do not claim to identify which background lease holder
+caused the original contention.
+
+Validation after merging `origin/main` at `aefe3bad4`: the final ReleaseFast
+binary passed both affected tests on both backends (4/4), then ten repetitions
+of each serverless case (20/20). Reproduce the soak from the repository root:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=./zig-out/bin/antfly \
+  ANTFLY_E2E_ENV_FILE=/dev/null ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_index_lifecycle.py::test_table_chunker_full_text_index_routes_template_chunks[serverless]' \
+  'e2e/antfly/test_sparse.py::test_semantic_query_embedding_template_supports_remote_text[serverless]'
+```
+
+The retry/create-contract/standalone harness selection passed 97 tests,
+the graph/storage selection passed 219 with no leaks, and the full serverless
+suite passed 1,083 with six skips and no leaks. The initial sandboxed soak
+could not bind local ports; the permitted rerun above completed successfully.
+
+### Completed CLI readiness regresses after publication (#696)
+
+The CI job reported 397 passed, five skipped, and two failures: this CLI
+readiness regression and the backup seed 409 described below. The CLI test
+had already observed complete readiness through `index get`, then found
+`observation_complete=false` through `index list` without another source
+mutation. Revision and coverage counts remained intact. The
+[runtime entry](../FLAKES.md#completed-cli-index-readiness-regresses-after-a-delayed-notification-696-694)
+records the callback ordering, epoch-qualified fix, and deterministic tests.
+
+Linux validation uses the original CI artifact from head `5c54729b6` as the
+baseline and PR #694 with main merged as the fixed source. The repository's
+`scripts/ci/zig-e2e-regression-loop.sh` runs both failing node IDs with three
+workers and ten repetitions per worker, pinned to eight CPUs on a disposable
+runner with a fresh filesystem. The baseline reproduces both CI signatures.
+
+The baseline finished **47/60 passed**: CLI **29/30**, with one matching
+readiness regression; backup **18/30**, with ten seed-write 409s, one completed
+restore-progress retirement timeout, and one 30-second HTTP read timeout.
+The latter two failures are separate observations, not evidence for the
+forwarding executor cause. The original binary lacks the added underlying
+transport-error diagnostics. Raw worker logs were retained for comparison.
+
+The exact `3ab5f6aba` executable from passing Linux CI run `34439124254`
+then finished **59/60 passed** under the same mixed load: CLI **29/30** and
+backup/restore **30/30**. The remaining CLI failure matched the same completed
+target-6 signature. This exposed the independent exact-index callback path;
+the follow-up fix preserves its completed observation while retaining source
+and delete watermarks. Metadata also now owns atomic restore-progress
+retirement and rejects stale incarnation reports at apply time; see the
+[runtime entry](../FLAKES.md#restore-completion-owns-progress-retirement-694).
+
+Final acceptance requires **100/100 for each affected test**, using the branch
+with the native-storage main merge and all fixes, without failure retries.
+
+The follow-up Linux soak of `70e0b11869` is **not a passing acceptance run**.
+It finished **292/300 passed**: quickstart **98/100**, backup/restore **96/100**,
+and independent retry exhaustion **98/100** (the four backup non-passes include
+one fixture setup error). The final retry failure occurred during its healthy
+seed and exposed [coverage reads across an atomic commit](../FLAKES.md#coverage-reads-straddle-the-first-atomic-outcome-commit-694).
+It exposed thumbnail activation without a runtime owner observation, two
+metadata exits after slow successful WAL sync, and a seed batch with unknown
+write outcome. Failure roots and raw worker logs were retained. See the
+[runtime diagnosis](../FLAKES.md#slow-raft-sync-kills-the-runtime-targeted-activation-joins-sibling-work-694)
+for the production changes and remaining write-timeout investigation. A fresh
+100-per-scenario soak is required after those changes. The later partial-source
+replay failure and stale follower job read now have separate
+[production regressions](../FLAKES.md#partial-source-replay-and-stale-follower-restore-job-observations-694).
+
+The CLI quickstart now separates retry exhaustion into
+`test_cli_index_wait_survives_retry_exhaustion_and_restart`. The quickstart
+retains the 10.5-second maintenance observation, completed list/detail
+readiness, restart, image query, and RAG assertions. The dedicated test owns
+its initial healthy corpus, exhausts the unchanged provider retry policy,
+then checks isolated failure, later progress, and partial-generation restart.
+Both tests restore their mock provider state during cleanup. A Linux run of
+both tests passed: quickstart **13.37 s**, retry exhaustion **65.73 s**, including
+**62.31 s / 36 provider requests** before exhaustion. The earlier integrated
+quickstart averaged 77.2 s. Focused readiness soaks use the quickstart node ID;
+the retry-policy test remains in the ordinary E2E suite.
+
+Running the new test independently then exposed an additional initial-build
+availability defect: three of four exploratory executions failed while one
+passed. The durable repair checkpoint recorded terminal
+`RepairSourceCoverageIncomplete` for catalog admission, despite a previously
+published healthy image. The [runtime entry](../FLAKES.md#initial-catalog-admission-quarantines-a-healthy-generation-on-shadow-coverage-lag-694)
+records the fix and deterministic before/after regression; fixed-runtime Linux
+validation remains pending.
+
+### Three-by-three backup seed batch: unknown outcome (#694)
+
+The run reported 394 passed, five skipped, and one failure. Table creation and
+three-shard, three-voter replication checks succeeded, but the initial batch
+seeding three fixed document keys returned HTTP 409 `write outcome unknown`.
+The test failed before starting backup. Both routing-watch unit tests and the
+inference E2E suite passed in the same run. The failed aggregate checks merely
+report their child-job failures; they are not additional flakes.
+
+This is distinct from the earlier 503 `write unavailable` admission rejection.
+The seeding helper correctly refuses to replay an ambiguous generic batch.
+Its immediate error path now includes the six server log tails, status, response
+body, and chained exception, just like the deadline-exhaustion path. Fast tests
+cover this exact 409, transport failures, and other non-admission errors, require
+diagnostics, and verify that each fails after one POST.
+
+The failure reproduced on current main with #692 included: 1/30 initial runs,
+then 7/60 instrumented runs, using three concurrent soak workers. Every
+instrumented failure reported `ConcurrencyUnavailable` in the group batch
+forwarder. The [runtime investigation](../FLAKES.md#backup-seed-forwarding-exhausts-the-control-executor-694)
+records the executor fix and deterministic before/after regression.
+
+The fixture was also missing from the scheduler's legacy process-fixture list,
+which still named its predecessor `multi_metadata_backup_cluster`. It now
+declares `@e2e_resource("antfly_process")` directly, so future fixture renames
+retain the declaration. Actual pytest collection changes from `light--test--`
+to `antfly-process--test--`; the six-process cluster now consumes a process
+resource slot. The concurrent soak uses independent pytest workers and still
+stresses multiple clusters simultaneously.
+
+Validation on 2026-09-09 (America/Los_Angeles), macOS ARM64, native Debug:
+
+- 128 harness and scheduler tests passed.
+- The saturated-control forwarding regression failed before the executor fix
+  and passed afterward; borrowed I/O and error-classification checks passed.
+- All 114 focused forwarding, HTTP-client, and Raft checks passed after updating
+  three stale expectations for the distinct internal transport-ambiguity error.
+- Fixed-runtime soak: **59/60 passed**, three workers × twenty repetitions.
+  No seed-write 409 occurred; one run failed before seeding at table-create
+  admission, detailed below. This is not a clean full-test soak.
+- Pinned Ruff lint/format checks, Zig formatting, and diff checks passed.
+- Linux CI remains cross-platform validation.
+
+The fixed Debug executable SHA-256 was
+`ad61b7bdfd43fd6e425e44caab2e8c8a9d2252f7b366356fe7b12b6eb96454a8`.
+The final soak log is `/private/tmp/pr694-backup-outbound-fixed-soak.log`.
+
+Original CI diagnostics were insufficient to prove that CI hit the same internal
+error; the local reproduction and deterministic regression establish a concrete
+cause of the matching failure signature. Baseline soak logs are retained in
+`/private/tmp/pr694-backup-fixed-soak.log` (the earlier scheduler/diagnostics-only
+change) and `/private/tmp/pr694-backup-transport-soak.log` (underlying error added).
+
+#### Table-create admission timeout during #694 validation
+
+Worker 1, iteration 11 of the first forwarding-fix soak exhausted the existing
+30-second create-admission budget after five HTTP 503 responses with
+`metadata_leader_unavailable`, `X-Antfly-Metadata-Mutation-Not-Admitted: true`,
+and `X-Antfly-Metadata-Not-Leader: true`. It had not reached seed writes or the
+changed batch forwarder. The original six logs did not identify the internal
+cause, so they cannot prove which discovery defect occurred in that run.
+
+The [runtime investigation](../FLAKES.md#metadata-mutation-discovery-exhausts-admission-time-694)
+reproduced both a first-endpoint status probe consuming the entire mutation
+budget and a returned Raft role referencing a freed response buffer. Bounded
+endpoint probes, stable endpoint coverage, and role stabilization before
+response release fix those defects. Public retry policy, production deadlines,
+and the prohibition on replaying ambiguous writes remain unchanged.
+
+The live stalled-status reproduction failed before the fix with the same five
+pre-admission 503 responses, then passed the full backup/restore case afterward.
+The retained proxy test keeps every direct metadata node address available
+beside its stalled alternate route and activates the fault after bootstrap.
+This preserves a discoverable leader across elections. An earlier proxy version
+replaced one node address; elections could make that hidden node the only
+leader, violating the test's healthy-leader assumption.
+
+Exploratory validation is retained separately from the final soak:
+
+- A diagnostic baseline had one `AddressInUse` startup collision in 60 runs,
+  before the first public request; this was not the table-create failure.
+- Overlapping three-worker ordinary and three-worker proxy soaks with other
+  local builds raised host load above 100. The ordinary run passed 56/60:
+  three restore-progress retirement timeouts and one seed 409 after Raft apply
+  timeouts and thousands of transport send failures. The proxy run was stopped
+  to correct its endpoint assumption and reduce concurrent load. These results
+  do not establish that the discovery changes fix the separate stress failures.
+- Logs: `/private/tmp/pr694-create-full-diagnostic-soak.log`,
+  `/private/tmp/pr694-create-proxy-before.log`,
+  `/private/tmp/pr694-create-proxy-after.log`,
+  `/private/tmp/pr694-create-fixed-soak.log`, and
+  `/private/tmp/pr694-stalled-overlap-workers/`.
+
+Final validation on macOS ARM64, native Debug, with remote PR commits through
+`d0aa27d49` merged and the discovery/ownership and resolver-drain fixes applied:
+
+- **90/90 full backup/restore runs passed**: 60 ordinary and 30 with a stalled
+  alternate metadata status route. Three workers total; each ran ten rounds of
+  two ordinary tests followed by one faulted test. No table-create, seed-write,
+  backup, restore, or retirement failure occurred.
+- 100 metadata service, four data discovery/status, five resolver-backfill,
+  and 173 derived-coverage checks passed without leaks. All 134 Python
+  harness/scheduler checks passed, as did pinned Ruff, Zig format, and diff checks.
+- Log: `/private/tmp/pr694-final-merged-backup-soak.log`.
+- Executable SHA-256:
+  `bae3921f715c8e2f0e3a0d0aeb40088391d4600d611b473a79c3c618d87f28df`.
+
+After merging `origin/main` at `8211fc92c4`, the rebuilt native Debug executable
+passed a further **20/20** serial runs: ten ordinary backup/restore runs and ten
+with the stalled alternate metadata status route. The affected Zig suites
+passed 513 tests without leaks, and all 67 Python harness tests passed. The
+merge retained both sets of transport diagnostics and corrected an upstream
+empty-create assertion to include the newly persisted default storage setting.
+Log: `/private/tmp/pr694-main-merge-backup-soak.log`. Executable SHA-256:
+`bbf4146d631ee247fccde9deb3f6de995c68a429ec66179dd8aa15aecaf2f7dd`.
+
+The matching local reproductions establish concrete discovery defects; the
+original failed run's logs do not prove which one it encountered. The clean
+final soak is evidence of the merged behavior, not proof that unrelated
+higher-load or port-handoff failures are eliminated.
 
 ### Quickstart restart fixture and HA replication startup (#657)
 

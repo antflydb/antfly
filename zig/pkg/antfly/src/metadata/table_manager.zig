@@ -1129,6 +1129,7 @@ pub const RuntimeIndexStatusReport = struct {
     doc_count: u64 = 0,
     term_count: u64 = 0,
     edge_count: u64 = 0,
+    graph_counts_pending: bool = false,
     node_count: u64 = 0,
     root_node: u64 = 0,
     /// Exact physical artifact cardinality for the reported incarnation.
@@ -2694,6 +2695,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .doc_count = record.doc_count,
         .term_count = record.term_count,
         .edge_count = record.edge_count,
+        .graph_counts_pending = record.graph_counts_pending,
         .node_count = record.node_count,
         .root_node = record.root_node,
         .publication_target_count = record.publication_target_count,

@@ -55,7 +55,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             \\        "group_fields":[{"name":"category","path":"category","type":"keyword"}],
             \\        "measure_fields":[{"name":"amount","path":"amount","type":"number"}],
             \\        "materializations":[{"name":"sum_by_category","op":"sum","group_by":["category"],"measure":"amount"}]},
-            \\ "relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+            \\ "relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}],"metrics":{"degree":{"enabled":true,"kind":"degree","refresh":"manual"}}}}
         ;
 
         accept_publication: bool = true,
@@ -199,6 +199,16 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     _ = read_source.withGroupVisibleRootGeneration(generations.iface());
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
+    {
+        const response = (try write_source.source().graphMetricAction(alloc, "articles", "relations_graph", "degree", "pause")) orelse return error.ExpectedGraphMetricStatus;
+        var status = response;
+        defer status.deinit(alloc);
+        try std.testing.expect(status.maintenance_paused);
+        const resumed = (try write_source.source().graphMetricAction(alloc, "articles", "relations_graph", "degree", "resume")) orelse return error.ExpectedGraphMetricStatus;
+        var resumed_status = resumed;
+        defer resumed_status.deinit(alloc);
+        try std.testing.expect(!resumed_status.maintenance_paused);
+    }
     // A storage transition can outlive a request. Admission must stop waiting
     // on the request's controls, without altering the transition's ownership.
     {

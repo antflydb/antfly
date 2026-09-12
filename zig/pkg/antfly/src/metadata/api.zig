@@ -183,6 +183,31 @@ pub const MetadataStatus = struct {
     rebalance_placement_groups: usize = 0,
 };
 
+/// Detach the only borrowed field from JSON parser and HTTP response storage.
+/// Unknown roles fail closed and remain compatible with older clients.
+pub fn stabilizeMetadataStatus(
+    status: MetadataStatus,
+) MetadataStatus {
+    var stable = status;
+    const stable_roles = [_][]const u8{
+        "absent",
+        "unknown",
+        "disabled",
+        "follower",
+        "pre_candidate",
+        "candidate",
+        "leader",
+    };
+    for (stable_roles) |role| {
+        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
+            stable.metadata_raft_role = role;
+            return stable;
+        }
+    }
+    stable.metadata_raft_role = "unknown";
+    return stable;
+}
+
 pub const MetadataHead = struct {
     metadata_group_id: u64,
     metadata_incarnation: ?MetadataClusterIncarnation = null,
