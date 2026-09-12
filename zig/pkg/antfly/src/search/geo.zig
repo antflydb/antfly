@@ -34,6 +34,14 @@ pub const GeoPoint = struct {
     lon: f64,
 };
 
+pub fn latitudeIsValid(lat: f64) bool {
+    return math.isFinite(lat) and lat >= -90.0 and lat <= 90.0;
+}
+
+pub fn longitudeIsValid(lon: f64) bool {
+    return math.isFinite(lon) and lon >= -180.0 and lon <= 180.0;
+}
+
 /// Earth's mean radius in meters (WGS84).
 const earth_radius: f64 = 6371008.8;
 

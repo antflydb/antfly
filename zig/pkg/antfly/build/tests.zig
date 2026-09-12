@@ -404,14 +404,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "portable AFB2 delta resolves exact base and deduplicates physical blobs",
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
+            "file import reports a busy source without waiting for its writer",
             "file import rejects oversized portable blocks before allocation",
             "import preflights full portable envelope before mutating destination",
             "export and import documents preserve timestamps",
+            "portable backup round trips relational rows and schema metadata",
+            "portable restore validates historical rows with their public schema epoch",
+            "portable archive accepts long history with a bounded decoded working set",
+            "ordinal rows bind layout support projection checksum and canonical bytes",
+            "relational restore plans",
             "export and import chunk artifacts round trip with public artifact ids",
             "export and import asset artifacts round trip with public artifact ids",
             "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "document batch round-trip",
+            "file reader detects same-size archive replacement between passes",
             "AFB2 manifest separates representation from snapshot mode",
             "AFB2 manifest rejects ambiguous delta and traversal paths",
             "AFB2 delta base binds inventory and identity to one canonical manifest",
@@ -600,6 +607,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
+
+    const scan_sink_provider = b.addLibrary(.{
+        .name = "runtime-scan-sink-test-provider",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const scan_sink_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scan_sink_test_mod.linkLibrary(scan_sink_provider);
+    const scan_sink_tests = b.addTest(.{
+        .root_module = scan_sink_test_mod,
+        .filters = &.{"scan sink"},
+    });
+    const run_scan_sink_tests = b.addRunArtifact(scan_sink_tests);
+    b.step("runtime-scan-sink-test", "Run scan callbacks across independent error domains").dependOn(&run_scan_sink_tests.step);
 
     const api_cluster_secret_status_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_cluster_test_root.zig"),
@@ -1372,6 +1401,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "shared application admission covers MCP query and write operations",
         "API kernel ABI rejects mismatched context and function-table prefixes",
         "runtime HTTP values retain C layout",
+        "runtime HTTP streaming carries policy headers before commitment across both adapters",
+        "linked API route manifest preserves internal scan response streaming",
+        "scan stream preserves chunk backpressure without buffered fallback",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
@@ -3839,6 +3871,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_runtime_io_abi_tests.step);
+    unit_test_step.dependOn(&run_scan_sink_tests.step);
 
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
@@ -4510,6 +4543,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.backfill_state.",
             "storage.db.batcher.",
             "storage.db.config.",
+            "storage.db.column_read_cache.",
+            "storage.db.column_scan_plan.",
             "storage.db.db.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
@@ -4532,6 +4567,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.publication.",
             "storage.db.query_metrics.",
             "storage.db.range_state.",
+            "storage.db.relational_columns.",
+            "storage.db.relational_store.",
+            "storage.db.schema_cache_admission.",
+            "storage.db.schema_registry.",
+            "storage.db.table_catalog.",
             "storage.db.resolution_handoff.",
             "storage.db.resolution_runtime.",
             "storage.db.root_identity.",

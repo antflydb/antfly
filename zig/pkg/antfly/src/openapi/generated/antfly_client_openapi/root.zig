@@ -85,6 +85,7 @@ pub const ClusterStatus = types.ClusterStatus;
 pub const ClusterTopology = types.ClusterTopology;
 pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const CohereRerankerConfig = types.CohereRerankerConfig;
+pub const CommittedMutationOutcome = types.CommittedMutationOutcome;
 pub const ConfidenceStepConfig = types.ConfidenceStepConfig;
 pub const ConfigureExtensionRequest = types.ConfigureExtensionRequest;
 pub const ConjunctionQuery = types.ConjunctionQuery;

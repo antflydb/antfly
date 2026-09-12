@@ -4452,6 +4452,11 @@ pub const CohereRerankerConfig = struct {
     }
 };
 
+/// The metadata mutation committed, but requested visibility or local materialization is not yet fully healthy. Clients must observe status instead of automatically replaying the mutation. `committed_superseded` is terminal: a newer schema version became visible first.
+pub const CommittedMutationOutcome = struct {
+    status: []const u8,
+};
+
 /// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
 pub const ConfidenceStepConfig = struct {
     /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.

@@ -123,6 +123,7 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    relational_preparation_working_set,
     /// Transient heap used to project primary embedding artifacts into an
     /// immutable mmap exact-vector generation. This is separate from dense
     /// apply so readiness publication cannot consume foreground mutation
@@ -167,6 +168,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .relational_preparation_working_set => "relational.preparation_working_set",
             .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
             .dense_source_payload_state => "dense.source_payload_state",
             .lake_range_cache_queue => "lake.range_cache_queue",
@@ -405,6 +407,7 @@ pub const Options = struct {
             .shard_transition_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .dense_vector_block_build_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
             .dense_source_payload_state = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
+            .relational_preparation_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
         }).values;
     }
@@ -444,6 +447,7 @@ pub const Options = struct {
             .shard_transition_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .dense_vector_block_build_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .dense_source_payload_state = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .relational_preparation_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
         }).values;
     }
@@ -2783,6 +2787,19 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Stable capacity, not momentary free space: durable transaction admission
+    /// must not turn unrelated concurrent requests into permanent size limits.
+    /// Zero means neither the node nor this slice has a hard limit.
+    pub fn memoryHardLimitForSlice(self: *ResourceManager, slice: Slice) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const node = self.memory.budget.hard_limit_bytes;
+        const local = self.slices[sliceIndex(slice)].budget.hard_limit_bytes;
+        if (node == 0) return local;
+        if (local == 0) return node;
+        return @min(node, local);
+    }
+
     /// Returns the configured response for the slice's current pressure. Usage
     /// observed outside ResourceManager (for example allocator-backed LSM
     /// state) must consult this decision at its admission boundary; observing
@@ -3529,6 +3546,16 @@ pub const BudgetedAllocator = struct {
         self.releaseBytes(memory.len);
     }
 };
+
+test "durable admission capacity honors both node and slice limits" {
+    for ([_][3]u64{ .{ 0, 0, 0 }, .{ 1024, 0, 1024 }, .{ 0, 2048, 2048 }, .{ 1024, 2048, 1024 }, .{ 4096, 2048, 2048 } }) |limits| {
+        var options = Options{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = limits[0] } };
+        options.budgets[sliceIndex(.relational_preparation_working_set)] = .{ .hard_limit_bytes = limits[1] };
+        var manager = ResourceManager.init(options);
+        defer manager.deinit(std.testing.allocator);
+        try std.testing.expectEqual(limits[2], manager.memoryHardLimitForSlice(.relational_preparation_working_set));
+    }
+}
 
 test "source vector payloads scratch admission accounts credits and records denial cause" {
     const alloc = std.testing.allocator;

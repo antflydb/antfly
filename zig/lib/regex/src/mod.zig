@@ -54,6 +54,186 @@ const Node = struct {
 
 pub const Error = error{InvalidRegex} || Allocator.Error;
 
+/// Immutable Thompson program. Matching uses O(program size) caller-owned
+/// scratch and O(input length * program size) work, including substring search.
+/// Instances are safe to share between concurrent schema-epoch readers.
+pub const PreparedPattern = struct {
+    // Bound schema compilation and matching scratch independently of input
+    // length. The program preserves interior anchors and substring semantics.
+    const max_states = 4096;
+    const State = struct {
+        tag: enum { consume, split, start, end, accept },
+        node: ?*const Node = null,
+        first: u32 = 0,
+        second: u32 = 0,
+    };
+    arena: std.heap.ArenaAllocator,
+    root: *const Node,
+    anchored_start: bool,
+    states: []const State,
+    start: u32,
+
+    pub fn init(alloc: Allocator, pattern: []const u8) Error!PreparedPattern {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        var parser = Parser{ .alloc = arena.allocator(), .pattern = pattern };
+        const root = try parser.parse();
+        var compiler = Compiler{ .alloc = arena.allocator() };
+        const accept = try compiler.emit(.{ .tag = .accept });
+        const start = try compiler.lower(root, accept);
+        return .{ .root = root, .arena = arena, .anchored_start = requiresStart(root), .states = compiler.states.items, .start = start };
+    }
+
+    pub fn deinit(self: *PreparedPattern) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn matches(self: *const PreparedPattern, alloc: Allocator, text: []const u8) Error!bool {
+        const buffers = try alloc.alloc(u32, self.states.len * 3);
+        defer alloc.free(buffers);
+        const seen = try alloc.alloc(bool, self.states.len);
+        defer alloc.free(seen);
+        @memset(seen, false);
+        var current = buffers[0..self.states.len];
+        var next = buffers[self.states.len .. self.states.len * 2];
+        const stack = buffers[self.states.len * 2 ..];
+        var count: usize = 0;
+        for (0..text.len + 1) |pos| {
+            // Merge all possible substring starts into one state set instead
+            // of restarting the matcher for every byte of the haystack.
+            if (pos == 0 or !self.anchored_start)
+                self.expand(self.start, pos, text.len, current, &count, seen, stack);
+            for (current[0..count]) |index| if (self.states[index].tag == .accept) return true;
+            if (pos == text.len or (self.anchored_start and count == 0)) return false;
+            @memset(seen, false);
+            var next_count: usize = 0;
+            for (current[0..count]) |index| {
+                const state = self.states[index];
+                const node = state.node orelse continue;
+                const matched = switch (node.tag) {
+                    .literal => text[pos] == node.literal,
+                    .any => true,
+                    .char_class => node.char_class.?.matches(text[pos]),
+                    else => unreachable,
+                };
+                if (matched) self.expand(state.first, pos + 1, text.len, next, &next_count, seen, stack);
+            }
+            std.mem.swap([]u32, &current, &next);
+            count = next_count;
+        }
+        return false;
+    }
+
+    fn expand(self: *const PreparedPattern, first: u32, pos: usize, len: usize, out: []u32, count: *usize, seen: []bool, stack: []u32) void {
+        if (seen[first]) return;
+        seen[first] = true;
+        stack[0] = first;
+        var pending: usize = 1;
+        while (pending > 0) {
+            pending -= 1;
+            const index = stack[pending];
+            const state = self.states[index];
+            switch (state.tag) {
+                .consume, .accept => {
+                    out[count.*] = index;
+                    count.* += 1;
+                    continue;
+                },
+                .start => if (pos != 0) continue,
+                .end => if (pos != len) continue,
+                .split => {
+                    if (!seen[state.second]) {
+                        seen[state.second] = true;
+                        stack[pending] = state.second;
+                        pending += 1;
+                    }
+                },
+            }
+            if (!seen[state.first]) {
+                seen[state.first] = true;
+                stack[pending] = state.first;
+                pending += 1;
+            }
+        }
+    }
+
+    const Compiler = struct {
+        alloc: Allocator,
+        states: std.ArrayListUnmanaged(State) = .empty,
+        lowering_steps: usize = 0,
+
+        fn emit(self: *Compiler, state: State) Error!u32 {
+            if (self.states.items.len == max_states) return error.InvalidRegex;
+            const index: u32 = @intCast(self.states.items.len);
+            try self.states.append(self.alloc, state);
+            return index;
+        }
+
+        fn lower(self: *Compiler, node: *const Node, continuation: u32) Error!u32 {
+            // Empty counted subexpressions emit no states, but nested counts
+            // can still multiply compiler work. Bound visits as well as output.
+            if (self.lowering_steps == max_states * 4) return error.InvalidRegex;
+            self.lowering_steps += 1;
+            switch (node.tag) {
+                .empty => return continuation,
+                .literal, .any, .char_class => return self.emit(.{ .tag = .consume, .node = node, .first = continuation }),
+                .anchor_start => return self.emit(.{ .tag = .start, .first = continuation }),
+                .anchor_end => return self.emit(.{ .tag = .end, .first = continuation }),
+                .seq => {
+                    var next = continuation;
+                    var i = node.children.len;
+                    while (i > 0) {
+                        i -= 1;
+                        next = try self.lower(node.children[i], next);
+                    }
+                    return next;
+                },
+                .alt => {
+                    var next = try self.lower(node.children[0], continuation);
+                    for (node.children[1..]) |child| next = try self.emit(.{
+                        .tag = .split,
+                        .first = try self.lower(child, continuation),
+                        .second = next,
+                    });
+                    return next;
+                },
+                .repeat => {
+                    if (node.min > max_states or (node.max != null and node.max.? > max_states)) return error.InvalidRegex;
+                    var next = continuation;
+                    if (node.max) |max| {
+                        for (node.min..max) |_| next = try self.emit(.{
+                            .tag = .split,
+                            .first = try self.lower(node.child.?, next),
+                            .second = next,
+                        });
+                    } else {
+                        const loop = try self.emit(.{ .tag = .split, .second = next });
+                        const child = try self.lower(node.child.?, loop);
+                        self.states.items[loop].first = child;
+                        next = loop;
+                    }
+                    for (0..node.min) |_| next = try self.lower(node.child.?, next);
+                    return next;
+                },
+            }
+        }
+    };
+
+    fn requiresStart(node: *const Node) bool {
+        return switch (node.tag) {
+            .anchor_start => true,
+            .seq => node.children.len > 0 and requiresStart(node.children[0]),
+            .alt => blk: {
+                for (node.children) |child| if (!requiresStart(child)) break :blk false;
+                break :blk node.children.len > 0;
+            },
+            .repeat => node.min > 0 and requiresStart(node.child.?),
+            else => false,
+        };
+    }
+};
+
 pub fn matchesCompiled(pattern: []const u8, compiled: *RegexAutomaton, text: []const u8) bool {
     _ = pattern;
     const automaton_view = compiled.automaton();
@@ -109,23 +289,9 @@ fn findAnyPrefixCandidate(
 }
 
 pub fn matches(alloc: Allocator, pattern: []const u8, text: []const u8) Error!bool {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-
-    var parser = Parser{
-        .alloc = arena.allocator(),
-        .pattern = pattern,
-    };
-    const root = try parser.parse();
-
-    for (0..text.len + 1) |start| {
-        var results = std.ArrayListUnmanaged(usize).empty;
-        defer results.deinit(alloc);
-        try matchNode(alloc, root, text, start, &results);
-        if (results.items.len > 0) return true;
-    }
-
-    return false;
+    var prepared = try PreparedPattern.init(alloc, pattern);
+    defer prepared.deinit();
+    return prepared.matches(alloc, text);
 }
 
 fn verifyCompiledFrom(automaton_view: vellum.Automaton, anchored_end: bool, text: []const u8, start_idx: usize) bool {
@@ -232,6 +398,8 @@ const Parser = struct {
     alloc: Allocator,
     pattern: []const u8,
     pos: usize = 0,
+    depth: usize = 0,
+    nodes: usize = 0,
 
     fn parse(self: *Parser) Error!*const Node {
         const root = try self.parseExpr();
@@ -240,6 +408,9 @@ const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) Error!*const Node {
+        if (self.depth == 128) return error.InvalidRegex;
+        self.depth += 1;
+        defer self.depth -= 1;
         var alts = std.ArrayListUnmanaged(*const Node).empty;
         defer alts.deinit(self.alloc);
         try alts.append(self.alloc, try self.parseConcat());
@@ -436,6 +607,8 @@ const Parser = struct {
     }
 
     fn makeNode(self: *Parser, value: Node) Error!*const Node {
+        if (self.nodes == PreparedPattern.max_states * 4) return error.InvalidRegex;
+        self.nodes += 1;
         const node = try self.alloc.create(Node);
         node.* = value;
         return node;
@@ -552,6 +725,99 @@ fn matchRepeat(
     }
 
     for (accepted.items) |candidate| try appendUnique(out, alloc, candidate);
+}
+
+test "prepared program matches reference semantics across anchors empty branches and repetitions" {
+    const alloc = std.testing.allocator;
+    const patterns = [_][]const u8{
+        "",      "a",         "a|b",      "a|",     "(a|b)*", "^(a|b)+$",  "(^a|b$)",
+        "a^",    "$a",        "^$",       "(^a)?b", "a{0,3}", "(ab){1,3}", "a{2,}",
+        "(a?)*", "(a?){2,4}", "(a|ab)*b", "[^a]+",  ".*b$",
+    };
+    for (patterns) |pattern| {
+        var prepared = try PreparedPattern.init(alloc, pattern);
+        defer prepared.deinit();
+        for (0..127) |encoding| {
+            var text_buffer: [6]u8 = undefined;
+            var code = encoding + 1;
+            var length: usize = 0;
+            while (code > 1) : (code >>= 1) {
+                text_buffer[length] = if (code & 1 == 0) 'a' else 'b';
+                length += 1;
+            }
+            const text = text_buffer[0..length];
+            var expected = false;
+            for (0..length + 1) |start| {
+                var positions = std.ArrayListUnmanaged(usize).empty;
+                defer positions.deinit(alloc);
+                try matchNode(alloc, prepared.root, text, start, &positions);
+                if (positions.items.len > 0) {
+                    expected = true;
+                    break;
+                }
+            }
+            try std.testing.expectEqual(expected, try prepared.matches(alloc, text));
+        }
+    }
+}
+
+test "prepared program scratch is independent of haystack length" {
+    const text = [_]u8{'a'} ** (64 * 1024);
+    inline for (.{ "^[a-z]+$", "a*a*a*b" }) |pattern| {
+        var prepared = try PreparedPattern.init(std.testing.allocator, pattern);
+        defer prepared.deinit();
+        var buffer: [1024]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+        try std.testing.expectEqual(pattern[0] == '^', try prepared.matches(scratch.allocator(), &text));
+    }
+}
+
+test "prepared program bounds compilation and cleans up allocation failures" {
+    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "a{4097}"));
+    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "(a{64}){64}"));
+    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "((){4096}){4096}"));
+    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "(" ** 129 ++ "a" ++ ")" ** 129));
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var prepared = try PreparedPattern.init(alloc, "^(ab|cd){2,4}$");
+            defer prepared.deinit();
+            try std.testing.expect(try prepared.matches(alloc, "abcd"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "prepared pattern owns its parse and supports repeated independent matches" {
+    const alloc = std.testing.allocator;
+    const source = try alloc.dupe(u8, "(^a|b$)");
+    var prepared = PreparedPattern.init(alloc, source) catch |err| {
+        alloc.free(source);
+        return err;
+    };
+    defer prepared.deinit();
+    alloc.free(source);
+    try std.testing.expect(!prepared.anchored_start);
+    for (0..10) |_| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        try std.testing.expect(try prepared.matches(scratch.allocator(), "ax"));
+        try std.testing.expect(try prepared.matches(scratch.allocator(), "xb"));
+        try std.testing.expect(!try prepared.matches(scratch.allocator(), "xa"));
+        try std.testing.expect(!try prepared.matches(scratch.allocator(), "bx"));
+    }
+}
+
+test "prepared pattern start anchoring is conservative across alternatives and optional repeats" {
+    const alloc = std.testing.allocator;
+    var anchored = try PreparedPattern.init(alloc, "(^a|^b)+");
+    defer anchored.deinit();
+    try std.testing.expect(anchored.anchored_start);
+    try std.testing.expect(!try anchored.matches(alloc, "xa"));
+    try std.testing.expect(try anchored.matches(alloc, "ax"));
+    var optional = try PreparedPattern.init(alloc, "(^a)?b");
+    defer optional.deinit();
+    try std.testing.expect(!optional.anchored_start);
+    try std.testing.expect(try optional.matches(alloc, "xb"));
 }
 
 test "regex supports counted character classes" {

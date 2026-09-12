@@ -18,3 +18,7 @@ prettyplease = "0.2"
 syn = "2.0"
 serde_yaml = "0.9"
 openapiv3 = "2.2"
+
+[dev-dependencies]
+http = "1"
+tokio = { version = "1", features = ["rt"] }

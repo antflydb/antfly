@@ -2212,13 +2212,13 @@ test "source vector payloads collection syncs primary WAL without flushing hot d
         try store.put("doc", "current document");
         try store.put(key, first);
         try store.put(key, second);
-        const mutable_before = backend.mutable.entries.items.len;
+        const mutable_before = backend.mutable.entryCount();
         try std.testing.expect(mutable_before > 0);
         SyncProbe.syncs = 0;
         try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
         try std.testing.expectEqual(@as(usize, 2), SyncProbe.syncs);
-        try std.testing.expectEqual(mutable_before, backend.mutable.entries.items.len);
-        try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+        try std.testing.expectEqual(mutable_before, backend.mutable.entryCount());
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
         try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
     }
     var reopened = try backend_mod.Backend.open(alloc, "/primary", .{

@@ -1,10 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //go:build cgo
 
@@ -323,7 +329,9 @@ func (db *DB) Export() ([]byte, error) {
 }
 
 // ImportBackup imports a portable Antfly backup archive into this Lite
-// database.
+// database. OutcomeUnknown means the live handle adopted the imported
+// generation, but crash durability could not be confirmed; inspect the handle
+// and do not retry automatically.
 func (db *DB) ImportBackup(backup []byte) error {
 	return db.withInput(backup, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_lite_import_backup(handle, input)
@@ -331,6 +339,9 @@ func (db *DB) ImportBackup(backup []byte) error {
 }
 
 // Import imports a portable Antfly backup archive into this Lite database.
+// OutcomeUnknown means the live handle adopted the imported generation, but
+// crash durability could not be confirmed; inspect the handle and do not retry
+// automatically.
 func (db *DB) Import(backup []byte) error {
 	return db.withInput(backup, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_lite_import(handle, input)
@@ -345,6 +356,20 @@ func restoreBackupToFile(path string, backup []byte, replace bool) error {
 
 	var out C.antfly_buffer
 	if err := check(C.antfly_lite_restore_backup_json(cPath, input, C.bool(replace), &out)); err != nil {
+		return err
+	}
+	C.antfly_buffer_free(&out)
+	return nil
+}
+
+func restoreBackupFileToFile(path, backupPath string, replace bool) error {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	cBackupPath := C.CString(backupPath)
+	defer C.free(unsafe.Pointer(cBackupPath))
+
+	var out C.antfly_buffer
+	if err := check(C.antfly_lite_restore_backup_file_json(cPath, cBackupPath, C.bool(replace), &out)); err != nil {
 		return err
 	}
 	C.antfly_buffer_free(&out)
