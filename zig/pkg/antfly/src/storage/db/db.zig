@@ -1178,13 +1178,15 @@ fn retryableIndexRepairTerminalPhase(
 ) ?index_repair_state.Phase {
     const reason = last_error orelse return null;
     if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
-    // Only managed replacement/artifact generations can become complete
-    // after source artifacts are reprocessed. Structural-invalid and
-    // externally supplied generations retain fail-closed classification.
+    // A shadow can lag changing source artifacts during replacement or
+    // initial catalog admission. Resume its durable owner and discard only
+    // the inactive candidate; coverage lag is not structural corruption.
+    // Externally supplied and structurally invalid generations stay closed.
     if (trigger != .operator_generation_rebuild and
         trigger != .storage_format_migration and
         trigger != .artifact_coverage_mismatch and
-        trigger != .replay_artifact_unavailable)
+        trigger != .replay_artifact_unavailable and
+        trigger != .catalog_admission)
     {
         return null;
     }
@@ -15376,16 +15378,14 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return false;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const counters = try DerivedCoverageCounters.load(alloc, &coverage_txn, index_name, generation);
-        const produced = counters.produced orelse return false;
-        const skipped = counters.skipped orelse return false;
-        const terminal_failed = counters.terminal_failed orelse return false;
+        const coverage_counts = try loadDerivedCoverageCounters(alloc, self.core.store, index_name, generation, null, null);
+        const produced = coverage_counts.produced orelse return false;
+        const skipped = coverage_counts.skipped orelse return false;
+        const terminal_failed = coverage_counts.terminal_failed orelse return false;
         // Do not fall back to a primary-store scan on query admission. Modern
         // managed writes maintain this counter atomically; a missing legacy
         // counter simply leaves the durable repair owner in charge.
-        const source_total = (try range_cardinality.loadFromTxn(&coverage_txn)) orelse return false;
+        const source_total = coverage_counts.source_total orelse return false;
         const assessment = types.evaluateDerivedCoverageAssessment(
             policy,
             source_total,
@@ -15405,7 +15405,7 @@ pub const DB = struct {
                 // counter—not `produced`—is the active HBC cardinality
                 // authority.
                 const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
-                    (try loadDenseArtifactTargetCounterFromTxn(alloc, &coverage_txn, index_name)) orelse break :blk false
+                    (try coverage_counts.artifactCount()) orelse break :blk false
                 else
                     produced;
                 // Posting cache freshness is intentionally absent here.
@@ -18798,12 +18798,11 @@ pub const DB = struct {
                 }
             }
             const capacity_wait = err == error.CapacityUnavailable or err == error.CapacityObservationStale;
+            // Use the same classification for live failures and persisted
+            // terminal states from older binaries. Catalog admission retains
+            // its existing producer outcomes; it does not re-arm failed work.
             const retryable_replacement_coverage =
-                err == error.RepairSourceCoverageIncomplete and
-                (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .storage_format_migration or
-                    current_trigger == .artifact_coverage_mismatch or
-                    current_trigger == .replay_artifact_unavailable);
+                retryableIndexRepairTerminalPhase(@errorName(err), current_trigger) != null;
             const terminal_failure =
                 !retryable_replacement_coverage and indexRepairFailureIsTerminal(err);
             try self.recordIndexRepairAttemptFailure(
@@ -20761,14 +20760,12 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return .indeterminate;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const counters = try DerivedCoverageCounters.load(alloc, &coverage_txn, index_name, generation);
-        const produced = counters.produced;
-        const skipped = counters.skipped;
-        const terminal_failed = counters.terminal_failed;
+        const coverage_counts = try loadDerivedCoverageCounters(alloc, self.core.store, index_name, generation, self.core.index_manager.byte_range, null);
+        const produced = coverage_counts.produced;
+        const skipped = coverage_counts.skipped;
+        const terminal_failed = coverage_counts.terminal_failed;
 
-        const source_total = try range_cardinality.loadOrCountFromTxn(alloc, &coverage_txn, self.core.index_manager.byte_range);
+        const source_total = coverage_counts.source_total.?;
         const applied_sequence = try self.managedIndexAppliedSequence(alloc, index_name);
         const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg.*, applied_sequence);
         const replay_current = applied_sequence >= target_sequence;
@@ -25792,6 +25789,10 @@ pub const DB = struct {
                     const runtime = self.resolution_runtime.?;
                     if (try runtime.hasReresolveBacklog()) {
                         try self.backfillResolverCorpus();
+                    } else {
+                        // The worker may have cleared the enqueue cursor while
+                        // the resulting replay and downstream work is pending.
+                        try self.runUntilIdle();
                     }
                 }
             },
@@ -25826,6 +25827,11 @@ pub const DB = struct {
                 if (queued > 0) try self.runUntilIdle();
                 if (complete) break;
             }
+            // A background window may have enqueued the final records, so this
+            // caller's last window can report complete with zero queued work.
+            // Synchronous backfill promises applied output, not just an empty
+            // corpus cursor; drain the shared replay target before returning.
+            try self.runUntilIdle();
         }
     }
 
@@ -33626,12 +33632,10 @@ pub const DB = struct {
 
     fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
         item.coverage_config_hash = config_hash;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const counters = try DerivedCoverageCounters.load(self.core.alloc, &coverage_txn, index_name, generation);
-        const produced = counters.produced;
-        const skipped = counters.skipped;
-        const terminal_failed = counters.terminal_failed;
+        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, null);
+        const produced = coverage_counts.produced;
+        const skipped = coverage_counts.skipped;
+        const terminal_failed = coverage_counts.terminal_failed;
 
         const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
             @as(u2, @intFromBool(skipped != null)) +
@@ -52228,15 +52232,102 @@ const DerivedCoverageCounters = struct {
     produced: ?u64,
     skipped: ?u64,
     terminal_failed: ?u64,
+    source_total: ?u64,
+    artifact_count: ?u64,
+    artifact_invalid: bool,
 
     fn load(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, index_name: []const u8, generation: u64) !@This() {
         return .{
             .produced = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "produced"),
             .skipped = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "skipped"),
             .terminal_failed = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, txn, index_name, generation, "terminal_failed"),
+            .source_total = try range_cardinality.loadFromTxn(txn),
+            .artifact_count = try DB.loadDenseArtifactTargetCounterFromTxn(alloc, txn, index_name),
+            .artifact_invalid = false,
         };
     }
+
+    fn artifactCount(self: @This()) !?u64 {
+        if (self.artifact_invalid) return error.InvalidDenseArtifactTargetCounter;
+        return self.artifact_count;
+    }
 };
+
+fn loadDerivedCoverageCounters(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+    legacy_range: ?types.ByteRange,
+    test_ctx: ?*AsyncContext,
+) !DerivedCoverageCounters {
+    const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+    var owned_keys: [4][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (owned_keys[0..initialized]) |key| alloc.free(key);
+    for (tags, 0..) |tag, i| {
+        owned_keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, tag);
+        initialized += 1;
+    }
+    owned_keys[3] = try DB.denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+    initialized += 1;
+    const unsorted = [_][]const u8{ owned_keys[0], owned_keys[1], owned_keys[2], &internal_keys.range_document_count_key, owned_keys[3] };
+    var order = [_]usize{ 0, 1, 2, 3, 4 };
+    std.mem.sort(usize, &order, unsorted, struct {
+        fn less(keys: [5][]const u8, lhs: usize, rhs: usize) bool {
+            return std.mem.order(u8, keys[lhs], keys[rhs]) == .lt;
+        }
+    }.less);
+    var keys: [5][]const u8 = undefined;
+    for (order, 0..) |index, i| keys[i] = unsorted[index];
+    var values: [5]?[]const u8 = undefined;
+    var lease = try store.readManyConsistent(&keys, &values);
+    var lease_open = true;
+    defer if (lease_open) lease.abort();
+    var source_position: usize = undefined;
+    for (order, 0..) |index, i| if (index == 3) {
+        source_position = i;
+    };
+    // Legacy ranges without a maintained source counter need their historical
+    // scan fallback. Re-read the entire proof in that snapshot; never combine
+    // the earlier point batch with a newer corpus count.
+    if (legacy_range != null and values[source_position] == null) {
+        lease.abort();
+        lease_open = false;
+        lease = try store.beginReadTxn();
+        lease_open = true;
+        try lease.getManySorted(&keys, &values);
+    }
+    if (builtin.is_test) {
+        if (test_ctx) |ctx| if (test_dense_target_after_coverage_capture) |hook| try hook(ctx);
+    }
+    var artifact_invalid = false;
+    var decoded = [_]?u64{null} ** 5;
+    for (order, values) |index, raw| {
+        if (raw) |value| decoded[index] = switch (index) {
+            3 => try range_cardinality.decode(value),
+            4 => blk: {
+                if (value.len != 8) {
+                    artifact_invalid = true;
+                    break :blk null;
+                }
+                break :blk std.mem.readInt(u64, value[0..8], .little);
+            },
+            else => try internal_keys.decodeDerivedCoverageOutcomeCount(value),
+        };
+    }
+    if (legacy_range) |byte_range| {
+        if (decoded[3] == null) decoded[3] = try range_cardinality.loadOrCountFromTxn(alloc, store, &lease, byte_range);
+    }
+    return .{
+        .produced = decoded[0],
+        .skipped = decoded[1],
+        .terminal_failed = decoded[2],
+        .source_total = decoded[3],
+        .artifact_count = decoded[4],
+        .artifact_invalid = artifact_invalid,
+    };
+}
 
 test "db derived coverage snapshot stays coherent across atomic creation and transitions" {
     // Debug retains leak instrumentation; optimized timing uses the server's
@@ -61188,9 +61279,9 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     if (!denseIndexIsArtifactBacked(entry)) return true;
     if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
 
-    const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
+    const expected_doc_count = (try denseTargetCountForIndexContextWithCoverage(ctx, index_ref.name, .materialized)) orelse {
         std.log.warn(
-            "dense replay target advance deferred by missing durable artifact counter index={s}",
+            "dense replay target advance deferred by unavailable materialized coverage index={s}",
             .{index_ref.name},
         );
         return false;
@@ -61248,6 +61339,18 @@ fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
+    return try denseTargetCountForIndexContextWithCoverage(ctx, index_name, .all_sources);
+}
+
+const DenseTargetCoverage = enum { all_sources, materialized };
+
+var test_dense_target_after_coverage_capture: ?*const fn (*AsyncContext) anyerror!void = null;
+
+fn denseTargetCountForIndexContextWithCoverage(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    coverage: DenseTargetCoverage,
+) !?u64 {
     // Inline external vectors have no generated-enrichment incarnation, while
     // one source document can produce multiple chunk-backed or multi-source
     // vectors. Their durable artifact counter remains authoritative.
@@ -61257,12 +61360,10 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         }
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
-    var coverage_txn = try ctx.store.beginReadTxn();
-    defer coverage_txn.abort();
-    const counters = try DerivedCoverageCounters.load(ctx.alloc, &coverage_txn, index_name, generation);
-    const produced = counters.produced;
-    const skipped = counters.skipped;
-    const terminal_failed = counters.terminal_failed;
+    const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    const produced = coverage_counts.produced;
+    const skipped = coverage_counts.skipped;
+    const terminal_failed = coverage_counts.terminal_failed;
     const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
         @as(u2, @intFromBool(skipped != null)) +
         @as(u2, @intFromBool(terminal_failed != null));
@@ -61278,16 +61379,12 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         else
             false;
         if (requires_artifact_coverage) {
-            return try DB.loadDenseArtifactTargetCounterFromTxn(ctx.alloc, &coverage_txn, index_name);
+            return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
         // the counter tuple. The range-local primary cardinality distinguishes
         // that valid zero target from missing accounting on a non-empty range.
-        const source_count = try range_cardinality.loadOrCountFromTxn(
-            ctx.alloc,
-            &coverage_txn,
-            ctx.index_manager.byte_range,
-        );
+        const source_count = coverage_counts.source_total.?;
         return if (source_count == 0) 0 else null;
     }
     if (present_count != 3) return error.InvalidDerivedCoverageCounter;
@@ -61295,20 +61392,21 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
     // Outcome counters are created as a complete tuple by the first processed
     // document, so tuple presence alone is not a completion proof. Keep this
     // O(1) by comparing the maintained generation outcome summary with the
-    // maintained range-local primary summary. Publishing is fail-closed until
-    // every source document owned by this range has exactly one terminal
+    // maintained range-local primary summary. All-source certification remains
+    // fail-closed until every source owned by this range has one terminal
     // outcome. The namespace-wide ordinal summary deliberately remains shared
     // across split descendants so it cannot serve as this ownership proof.
     const accounted_without_failures = std.math.add(u64, produced.?, skipped.?) catch
         return error.InvalidDerivedCoverageCounter;
     const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
         return error.InvalidDerivedCoverageCounter;
-    const source_count = try range_cardinality.loadOrCountFromTxn(
-        ctx.alloc,
-        &coverage_txn,
-        ctx.index_manager.byte_range,
-    );
-    if (accounted != source_count) return null;
+    const source_count = coverage_counts.source_total.?;
+    if (accounted > source_count) return null;
+    if (coverage == .all_sources and accounted != source_count) return null;
+    // Replay consumes available artifacts, independently of provider work
+    // that has not produced one yet. Its materialized target may advance a
+    // certified generation while source coverage remains explicitly pending.
+    // Initial-build/repair cutover continues to require all_sources.
     return produced.?;
 }
 
@@ -62269,7 +62367,11 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
         if (ctx.background_closing.load(.acquire)) return false;
         const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
         if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
-        const expected = (try denseTargetCountForIndexContext(ctx, entry.config.name)) orelse continue;
+        const expected = (try denseTargetCountForIndexContextWithCoverage(
+            ctx,
+            entry.config.name,
+            if (checkpoint.status == .clean) .materialized else .all_sources,
+        )) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
         const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
         if (manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected) and
@@ -76471,68 +76573,82 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
 }
 
 test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
-    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |already_enqueued| {
+        const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = !already_enqueued });
+        defer db.close();
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
-
-    try db.batch(.{
-        .writes = &.{.{
-            .key = "doc:a",
-            .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+            \\}
             ,
-        }},
-        .sync_level = .enrichments,
-    });
-    try db.runUntilIdle();
+        });
 
-    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
-    defer alloc.free(resolution_key);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
 
-    const cfg: index_manager_mod.ResolverConfig = .{
-        .name = "kg_retry",
-        .table = "entities",
-        .source_artifact = "relations_v1",
-        .resolution_artifact = "resolution_retry_v1",
-        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
-        .config_generation = 1,
-    };
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+        defer alloc.free(resolution_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
 
-    {
-        lockApply(&db);
-        defer db.core.unlockApply();
-        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+        const cfg: index_manager_mod.ResolverConfig = .{
+            .name = "kg_retry",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_retry_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        };
+
+        {
+            lockApply(&db);
+            defer db.core.unlockApply();
+            try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+        }
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+        try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+        if (already_enqueued) {
+            // Model the worker clearing the dirty cursor after enqueueing the
+            // replay record, before resolution has materialized its output.
+            while (try db.resolution_runtime.?.hasReresolveBacklog()) {
+                var tick = try db.resolution_runtime.?.runReresolveBacklogWindow();
+                tick.deinit(db.runtime_alloc);
+            }
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+            try std.testing.expect(db.resolution_runtime.?.target_sequence.load(.acquire) >
+                db.resolution_runtime.?.applied_sequence.load(.acquire));
+        }
+
+        // Retrying the same catalog config is a material no-op, but the durable
+        // dirty cursor from the first attempt must still be drained.
+        try db.upsertResolver(cfg);
+
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
     }
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
-    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
-
-    // Retrying the same catalog config is a material no-op, but the durable
-    // dirty cursor from the first attempt must still be drained.
-    try db.upsertResolver(cfg);
-
-    const raw = try db.core.store.get(alloc, resolution_key);
-    defer alloc.free(raw);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
-    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
 }
 
 test "db refuses resolver removal while resolution or promotion replay is pending" {
@@ -87918,7 +88034,7 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -88044,6 +88160,82 @@ fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings) !void {
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 }
 
+fn resetDenseIndexForArtifactRebuildForTest(db: *DB, index_name: []const u8) !void {
+    // The native publisher holds catalog pins without the apply lock. Retire
+    // those borrowers before taking apply exclusive and closing the old HBC.
+    var structural = db.beginIndexStructuralMutation("test artifact dense reset", index_name);
+    defer structural.deinit();
+    lockApply(db);
+    defer db.core.unlockApply();
+    try db.core.index_manager.resetDenseIndexForArtifactRebuild(index_name);
+}
+
+test "db artifact dense reset waits for catalog readers before closing storage" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+
+    // Native publication holds this same catalog pin while reading the live
+    // posting generation, independently of the DB apply lock.
+    var reader = db.tryAcquireIndexCatalogReadLease() orelse return error.TestUnexpectedResult;
+    var reader_held = true;
+    defer if (reader_held) reader.release();
+    const Reset = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) !void {
+            defer self.done.store(true, .release);
+            try resetDenseIndexForArtifactRebuildForTest(self.db, "dense_idx");
+        }
+    };
+    var reset = Reset{ .db = &db };
+    var future = try std.testing.io.concurrent(Reset.run, .{&reset});
+    var joined = false;
+    defer if (!joined) {
+        if (reader_held) {
+            reader.release();
+            reader_held = false;
+        }
+        future.await(std.testing.io) catch {};
+    };
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!db.indexCatalogBarrierActive() and !reset.done.load(.acquire)) {
+        if (monotonicTimeNs() >= deadline) return error.TestTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(db.indexCatalogBarrierActive());
+    try std.testing.expect(!reset.done.load(.acquire));
+    if (db.tryAcquireIndexCatalogReadLease()) |lease| {
+        var unexpected = lease;
+        unexpected.release();
+        return error.TestUnexpectedResult;
+    }
+    // The old generation remains readable until its final catalog pin leaves.
+    try std.testing.expect(db.core.index_manager.denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() != null);
+    reader.release();
+    reader_held = false;
+    const result = future.await(std.testing.io);
+    joined = true;
+    try result;
+    try std.testing.expect(!db.indexCatalogBarrierActive());
+    var reopened_reader = db.tryAcquireIndexCatalogReadLease() orelse return error.TestUnexpectedResult;
+    reopened_reader.release();
+}
+
 test "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding" {
     const alloc = std.testing.allocator;
 
@@ -88077,7 +88269,7 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
     try std.testing.expect(first_calls > 0);
     try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -93380,8 +93572,8 @@ test "db restart after provider failure resumes enrichment from retained async r
     {
         // Permit one document to establish a durable enrichment watermark,
         // then keep returning a retryable provider error for the next
-        // document. The managed-index consumer must remain behind that source
-        // revision until enrichment has published its terminal outcome.
+        // document. The independent managed-index consumer may pass the source
+        // revision, but enrichment's durable watermark must retain its replay.
         var gated = GateDenseEmbedder{};
         var db = try DB.open(alloc, std.mem.span(path), .{
             .enrichment = .{
@@ -93417,21 +93609,20 @@ test "db restart after provider failure resumes enrichment from retained async r
         }
         try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
-        // Stop at the observed provider failure boundary and attempt the same
-        // asynchronous truncation that a derived consumer completion would
-        // request. The consumer is intentionally not allowed to reach the
-        // failed source revision: doing so could make a later same-revision
-        // artifact unreplayable. Enrichment's durable watermark must retain
-        // the source record across restart without spending the test budget on
-        // provider retry backoff.
+        // Stop at the observed provider failure boundary, then explicitly let
+        // the independent index consumer catch up. Replay retention must hold
+        // even in this ordering; racing an assertion against its progress does
+        // not test the enrichment checkpoint that owns the retained debt.
         db.enrichment_runtime.?.stop();
+        db.executor.notifySequence(failed_target_sequence);
+        try db.executor.waitForIndexes(failed_target_sequence, &.{"dv_v1"});
         try truncateReplaySequenceAsync(db.async_context, failed_target_sequence);
 
         const failed_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, failed_stats);
         try std.testing.expectEqual(first_applied_sequence, failed_stats.enrichment.applied_sequence);
         try std.testing.expectEqual(failed_target_sequence, failed_stats.enrichment.target_sequence);
-        try std.testing.expect((db.executor.appliedSequence("dv_v1") orelse 0) < failed_target_sequence);
+        try std.testing.expect((db.executor.appliedSequence("dv_v1") orelse 0) >= failed_target_sequence);
 
         const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, first_applied_sequence + 1);
         defer {
@@ -104197,7 +104388,11 @@ test "db coverage recovery admits a published generation after its admission mar
     try testManagedGenerationRepairAdmission(.coverage_recovery);
 }
 
-fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery }) !void {
+test "db managed admission recovers legacy terminal source coverage lag" {
+    try testManagedGenerationRepairAdmission(.coverage_lag);
+}
+
+fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery, coverage_lag }) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -104228,6 +104423,27 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
     try awaitManagedAdmissionPublicationForTest(&db, alloc, admission_id);
     try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+
+    if (mode == .coverage_lag) {
+        // Old binaries permanently quarantined catalog admission when a
+        // concurrent source change made its shadow coverage incomplete.
+        // The canonical checkpoint remains certified and must recover from
+        // this durable state without resetting provider retry outcomes.
+        try db.recordIndexRepairAttemptFailure(alloc, admission_id, "RepairSourceCoverageIncomplete", true);
+        const resumed = try db.advanceIndexRepairIntent(alloc, admission_id, .{});
+        try std.testing.expect(!resumed.terminal);
+        try std.testing.expect(resumed.repaired);
+        try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+        try db.failIfIndexQuarantined(cfg.name);
+        var result = try db.search(alloc, .{
+            .index_name = cfg.name,
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        return;
+    }
 
     if (mode == .coverage_recovery) {
         try db.removeIndexRepairIntentAndPin(alloc, admission_id);
@@ -107977,6 +108193,63 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     }
 }
 
+test "db dense target reads atomic outcome and source coverage snapshot" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\"}",
+        .coverage_generation = 42,
+    };
+    try db.addIndex(config);
+    try db.core.store.put(&internal_keys.range_document_count_key, &([_]u8{0} ** 8));
+    const Commit = struct {
+        fn afterProduced(ctx: *AsyncContext) !void {
+            test_dense_target_after_coverage_capture = null;
+            const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+            var keys: [3][]u8 = undefined;
+            var initialized: usize = 0;
+            defer for (keys[0..initialized]) |key| ctx.alloc.free(key);
+            var one: [8]u8 = undefined;
+            std.mem.writeInt(u64, &one, 1, .little);
+            const zero = [_]u8{0} ** 8;
+            var writes: [4]docstore_mod.KVPair = undefined;
+            for (tags, 0..) |tag, i| {
+                keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, "dense_idx", 42, tag);
+                initialized += 1;
+                writes[i] = .{ .key = keys[i], .value = if (i == 0) &one else &zero };
+            }
+            writes[3] = .{ .key = &internal_keys.range_document_count_key, .value = &one };
+            try ctx.store.putBatch(&writes, &.{});
+        }
+    };
+    // Publish a complete first tuple after the counter batch is captured.
+    // This call must observe the pre-commit empty table; the next sees all
+    // four committed counters. No scheduling/sleep is needed to force the race.
+    test_dense_target_after_coverage_capture = Commit.afterProduced;
+    defer test_dense_target_after_coverage_capture = null;
+    try std.testing.expectEqual(@as(?u64, 0), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try std.testing.expect(test_dense_target_after_coverage_capture == null);
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(db.async_context, config.name));
+
+    // Actual persisted corruption remains an error, rather than a retryable
+    // absence that could certify an incomplete generation.
+    const skipped_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, config.name, 42, "skipped");
+    defer alloc.free(skipped_key);
+    try db.core.store.putBatch(&.{}, &.{skipped_key});
+    try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, config.name));
+}
+
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
@@ -108025,6 +108298,25 @@ test "db artifact dense target prefers current incarnation outcomes over stale n
         @as(?u64, 2),
         try denseTargetCountForIndexContext(db.async_context, config.name),
     );
+
+    // A later source has no embedding yet. The certified generation must
+    // still advance across source-only replay records; final source coverage
+    // and shadow cutover must remain pending on that same durable state.
+    db.async_context.enrichment_desired_running.store(false, .release);
+    db.enrichment_runtime.?.stop();
+    const applied = try db.core.loadAppliedSequence(alloc, config.name);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:pending", .value = "{\"body\":\"provider pending\"}" }},
+        .sync_level = .write,
+    });
+    const target = db.core.nextDerivedSequence();
+    try std.testing.expect(target > applied);
+    try std.testing.expectEqual(@as(?u64, null), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContextWithCoverage(db.async_context, config.name, .materialized));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(db.async_context, .{
+        .name = config.name,
+        .kind = .dense_vector,
+    }, applied, target));
 }
 
 test "db multi-source dense target uses physical artifact cardinality" {
@@ -108106,7 +108398,10 @@ test "db dense finalization owner drains requests queued during publication" {
         .sync_level = .full_index,
     });
 
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // This fixture exercises the certification handoff, whose prerequisite
+    // is an already-published native generation. Online maintenance can return
+    // busy/deferred while another owner is staging files; it is not a barrier.
+    _ = try db.publishVectorBlockBasesAtStableTip();
 
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
@@ -108123,7 +108418,11 @@ test "db dense finalization owner drains requests queued during publication" {
 
     db.async_context.apply_mutex.lockShared();
     defer db.async_context.apply_mutex.unlockShared();
-    db.async_context.dense_projection_finalizing.store(true, .release);
+    var claim_lock = lockAtomicWithBackoffProfiled(&db.async_context.dense_finish_mutex, &db.async_context.stats.dense_finish_mutex);
+    const claimed = tryClaimDenseProjectionFinalizationLocked(db.async_context);
+    claim_lock.unlock();
+    try std.testing.expect(claimed);
+    defer finishDenseProjectionFinalization(db.async_context);
     try std.testing.expect(db.snapshotAsyncIndexingStats().dense_projection_finalizing);
     try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpoint(db.async_context, config.name, applied));
     try std.testing.expect(db.async_context.dense_projection_finalization_requested);
@@ -108164,7 +108463,11 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
         .sync_level = .full_index,
     });
 
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // Establish the physical publication boundary before introducing the
+    // rebuilding checkpoint. Online publication may leave an asynchronous
+    // checkpoint builder pending; this fixture exercises bulk-lease release
+    // against a generation whose coverage is already complete.
+    _ = try db.publishVectorBlockBasesAtStableTip();
 
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
@@ -108266,8 +108569,16 @@ test "db online vector publication leaves foreground and posting mutation admiss
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqualDeep(before, try dense.index.postingBacklogStats());
     try std.testing.expect(!db.nativeVectorProjectionMaintenanceNeeded());
-    // Steady-state maintenance must not scan or rewrite the same generation.
-    try std.testing.expectEqual(@as(usize, 0), try db.publishVectorBlockBasesOnline(.{}));
+    // A posting checkpoint queued before this pass may finish asynchronously.
+    // The aggregate progress count includes that legitimate handoff; it cannot
+    // prove whether the exact-vector plane was rebuilt. Compare its durable
+    // generation and storage sync count, retaining the no-primary-scan check.
+    // This fixture disables background vector-publication owners.
+    const vector_generation = manager.vector_block_generation.?.opened.store.manifest.?.latest_generation;
+    const vector_syncs = vector_storage.sync_contents_calls;
+    _ = try db.publishVectorBlockBasesOnline(.{});
+    try std.testing.expectEqual(vector_generation, manager.vector_block_generation.?.opened.store.manifest.?.latest_generation);
+    try std.testing.expectEqual(vector_syncs, vector_storage.sync_contents_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
 
     manager.clearVectorBlockGenerationForTest();
@@ -125355,7 +125666,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         .sync_level = .full_index,
     });
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dense_a");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dense_a");
     var ghost_vector = [_]f32{ 1, 1 };
     try db.core.index_manager.denseIndex("dense_b").?.index.insertVectorForTest(0xdead_beef, &ghost_vector);
     try DB.markRestorePrimaryRestoredForPathWithArtifact(

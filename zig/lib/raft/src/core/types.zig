@@ -286,6 +286,9 @@ pub const Progress = struct {
     next_index: Index = 1,
     state: ProgressState = .probe,
     probe_sent: bool = false,
+    /// Legacy rejections lack the rejected request's index. Coalesce their
+    /// uncertain feedback until a heartbeat instead of rewinding each flight.
+    legacy_rejection_pending: bool = false,
     pending_snapshot_attempt: ?SnapshotAttempt = null,
     recent_active: bool = false,
 };

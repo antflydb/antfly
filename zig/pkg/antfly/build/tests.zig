@@ -363,6 +363,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
+            "restore admission recovers generated identity",
+            "restore admission missing row",
+            "restore expiry preserves durable ownership",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
             "retryable restore contention durably requeues progress and honors cancellation",
@@ -798,6 +801,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "embedding provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
+        "restore admission recovers generated identity after polled expiry",
+        "restore expiry preserves durable ownership",
         "restore runtime store persists checkpoints and requeues interrupted work",
         "restore job store rejects oversized request state",
         "restore filesystem scope containment handles filesystem roots and component boundaries",
@@ -926,6 +931,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db completed partial managed admission serves and retires redundant repair",
         "db status cannot reopen a quarantined generation from an older publication certificate",
         "db status retains certified canonical admission during shadow build handoff",
+        "db managed admission recovers legacy terminal source coverage lag",
         "db initial replay repair retains certified canonical admission during shadow reconstruction",
         "db empty managed index does not invent generated coverage recovery debt",
         "db repair preflight retains a canonical generation completed after scheduler selection",
@@ -1558,6 +1564,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "managed raft progress driver publishes source failure",
         "managed raft progress driver reports a wedged round unhealthy",
         "managed raft progress driver ignores a completed observed generation",
+        "managed raft progress driver recovers readiness after a slow successful round",
         "managed raft progress driver stop interrupts a long cadence wait",
         "managed host service preserves leader-routed observation roles from transition ops",
         "managed host service seeds queued transitions from projected metadata store",
@@ -1973,6 +1980,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
+            "metadata http client status role survives response and parser release",
             "metadata http client rejects invalid forwarded table names before I/O",
             "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
             "metadata http client preserves transport ambiguity for forwarded table mutations",
@@ -2269,6 +2277,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "native posting initial acceleration",
             "db online vector publication",
             "db multi-source dense target",
+            "db artifact dense target prefers current incarnation outcomes over stale name counter",
+            "db dense target reads atomic outcome and source coverage snapshot",
+            "db artifact dense reset waits for catalog readers before closing storage",
+            "db dense enrichment republishes unchanged source hash from cached artifact after index reset",
+            "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding",
+            "db restore dense rebuild publishes mixed progress before worker wait",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",
@@ -2310,6 +2324,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db query repair gate revalidates stale debt",
             "db status cannot reopen a quarantined generation from an older publication certificate",
             "db status retains certified canonical admission during shadow build handoff",
+            "db managed admission recovers legacy terminal source coverage lag",
             "db initial replay repair retains certified canonical admission during shadow reconstruction",
             "db empty managed index does not invent generated coverage recovery debt",
             "db repair preflight retains a canonical generation completed after scheduler selection",
@@ -3817,6 +3832,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
+            "standalone routing watch confirms absence before deadline and retries after expiry",
             "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
@@ -3982,6 +3998,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
+    docstore_test_mod.addImport("antfly_pdf", pdf_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
@@ -4333,6 +4350,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // inventory as well as its own unique cases. Run that union once.
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const resolver_backfill_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const resolver_backfill_step = b.step("antfly-resolver-backfill-test", "Run resolver catalog and durable backfill regressions");
+    resolver_backfill_step.dependOn(&addFilteredTestRunArtifact(b, resolver_backfill_tests).step);
 
     // Keep the small, deterministic release-blocker primitives in the PR/base
     // unit gate. The corpus-scale fixtures below protect thresholds that only
