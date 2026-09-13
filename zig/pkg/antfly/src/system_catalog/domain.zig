@@ -1131,3 +1131,21 @@ test "system catalog tenant churn reclaims committed and rolled back parent buck
         try std.testing.expectEqual(@as(usize, 2), state.value.resources.len);
     }
 }
+
+pub const Meta = struct {
+    version: u16 = 1,
+    revision: u64 = 0,
+    next_id: u64 = 3,
+    last_command: [32]u8 = @splat(0),
+};
+
+pub const OwnedState = struct {
+    arena: std.heap.ArenaAllocator,
+    meta: Meta,
+    value: State,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};

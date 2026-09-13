@@ -28,7 +28,15 @@ import unittest
 from pathlib import Path
 
 ZIG_ROOT = Path(__file__).resolve().parents[1]
-UNITS = ("cli", "distributed", "serverless", "inference", "api_kernel")
+UNITS = (
+    "cli",
+    "distributed",
+    "storage_kernel",
+    "enrichment_compute",
+    "serverless",
+    "inference",
+    "api_kernel",
+)
 SCHEMAS = (
     "specs/openapi/ard/api.yaml",
     "openapi.yaml",
@@ -140,7 +148,7 @@ class RuntimeCacheTest(unittest.TestCase):
     def assert_compile(self, output, unit, status):
         name = (
             "antfly-storage-kernel"
-            if unit == "distributed"
+            if unit == "storage_kernel"
             else f"antfly-runtime-{unit}"
         )
         self.assertRegex(output, rf"compile lib {name} Debug \S+ {status}")
@@ -400,7 +408,10 @@ class RuntimeCacheTest(unittest.TestCase):
         for relative, consumers in (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
-            ("zig/lib/raft/src/root.zig", ("distributed", "api_kernel")),
+            (
+                "zig/lib/raft/src/root.zig",
+                ("distributed", "storage_kernel", "api_kernel"),
+            ),
         ):
             with self.subTest(source=relative):
                 source = self.own(relative)
@@ -428,7 +439,7 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(self.build("cache-probe"))
         settings = ("-Dlite-local-inference-runtime=true",)
         changed = self.build("cache-probe", settings=settings)
-        self.assert_archives(changed, rebuilt=("distributed",))
+        self.assert_archives(changed, rebuilt=("distributed", "storage_kernel"))
         # The actual capability implementation must still report the new value.
         self.assertNotEqual(self.probe(baseline), self.probe(changed))
         self.assert_archives(self.build("cache-probe", settings=settings))
@@ -1269,14 +1280,17 @@ class RuntimeCacheTest(unittest.TestCase):
                 path.write_bytes(path.read_bytes() + b"\n# cache regression edit\n")
                 output = self.build("cache-probe")
                 self.assert_archives(output, rebuilt=("api_kernel",))
-                self.assertNotEqual(self.probe(output).split()[-1], before.split()[-1])
+                self.assertNotEqual(self.probe(output).split()[5], before.split()[5])
                 before = self.probe(output)
 
         tokenizer = self.own("zig/lib/tokenizer/testdata/embedder/tokenizer.json")
         tokenizer.write_bytes(tokenizer.read_bytes() + b"\n")
         output = self.build("cache-probe", "cache-tokenizer")
         self.assert_archives(
-            output, rebuilt=tuple(unit for unit in UNITS if unit != "cli")
+            output,
+            rebuilt=tuple(
+                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+            ),
         )
         self.assertNotEqual(self.probe(output, "TOKENIZER_PROBE"), tokenizer_before)
 
@@ -1294,7 +1308,10 @@ class RuntimeCacheTest(unittest.TestCase):
         output = self.build("cache-probe")
         self.assertRegex(output, r"run exe patch_sentencepiece_proto .* success")
         self.assert_archives(
-            output, rebuilt=tuple(unit for unit in UNITS if unit != "cli")
+            output,
+            rebuilt=tuple(
+                unit for unit in UNITS if unit not in ("cli", "enrichment_compute")
+            ),
         )
 
         versioned = self.build("cache-probe", version="cache-after")
@@ -1321,7 +1338,8 @@ class RuntimeCacheTest(unittest.TestCase):
             "cache-probe", version="cache-after", settings=("-Dwith_tla=true",)
         )
         self.assert_archives(
-            storage_options, rebuilt=("distributed", "serverless", "api_kernel")
+            storage_options,
+            rebuilt=("distributed", "serverless", "api_kernel", "storage_kernel"),
         )
 
         # Served schemas remain unnecessary to all non-HTTP archive targets.

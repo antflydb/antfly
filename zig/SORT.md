@@ -253,10 +253,12 @@ The implementation is intentionally conservative today:
 - Stored JSON sorting is test/debug-only compatibility behavior and is not a
   production fallback for public exact `order_by`.
 
-The remaining production work is mostly performance depth: broader native
-filter coverage, physical `index_sort` acceleration, compaction/backfill
-tooling for coverage changes, and continued benchmarks over broad and selective
-query shapes.
+Doc-values sort, `_id` storage-order seek, physical `index_sort` acceleration,
+the sort planner, and distributed k-way merge are implemented; see Native Sort
+Capability Layers below. The remaining production work is mostly performance
+depth: broader native filter coverage, compaction/backfill tooling for
+coverage changes, and continued benchmarks over broad and selective query
+shapes.
 
 ## Overall Search Model
 
@@ -1446,76 +1448,85 @@ segments where some generations do not yet have the required physical sections.
 Those mixed states should reject newly unsupported exact sorts with clear 422s
 until backfill, compaction, or reindex has made coverage complete.
 
-## Rollout Plan
+## Native Sort Capability Layers
 
-### Phase 0: Make Current Behavior Fail Closed
+The native sort execution model was built up as a sequence of layers, from a
+fail-closed safety baseline through doc values, `_id` seek, physical
+`index_sort`, and distributed planning. Each layer below is implemented and in
+production use; they are presented in the order that each became a
+prerequisite for the next.
 
-1. Keep the current exact budgeted fallback as the safety baseline.
-2. Make public sorted queries validate mapping and physical coverage up front.
-3. Reject unmapped, non-sortable, or physically uncovered sort fields.
-4. Ensure native sort plans never fall back to stored JSON once selected.
-5. Keep stored JSON sorting behind test/debug-only paths.
+### Fail-Closed Baseline
 
-### Phase 1: Native Doc-Values Sort
+Public sorted queries validate mapping and physical coverage up front and
+reject unmapped, non-sortable, or physically uncovered sort fields before
+doing any work. Once a native sort plan (`sorted_segment_seek` or
+`native_doc_values_top_n`) is selected, execution never falls back to stored
+JSON; missing native coverage is an execution error instead (see Production
+Budgets And Rejection Reasons). Stored JSON sorting (`stored_json_debug`)
+remains a test/debug-only compatibility plan and is rejected outside
+test/debug runtimes with `stored_json_sort_disabled`.
 
-1. Compile sortable/doc-value capability from mappings into runtime schema.
-2. Persist typed doc values for mapped scalar fields during segment build,
-   replay, reopen, and compaction.
-3. Add canonical per-type sort encoding and comparator tests.
-4. Use doc values for field sort instead of parsing stored JSON.
-5. Defer projected `_source` loading until after page selection.
-6. Add observability for candidate count, doc-value load time, cursor rejects,
-   source loads, and budget rejections.
+### Native Doc-Values Sort
 
-This phase makes arbitrary mapped scalar sort exact and production-safe, even
-before physical segment sorting exists.
+Sortable/doc-value capability is compiled from mappings into the runtime
+schema. Segment build, replay, reopen, and compaction all persist typed doc
+values for mapped scalar fields, using the canonical per-type sort encoding
+described above. Field sort reads these doc values instead of parsing stored
+JSON, and projected `_source` loading is deferred until after the page has
+been selected. The `native_doc_values_top_n` plan reports candidate count,
+doc-value load time, cursor-reject count, source-load count, and budget
+rejections through the query profile.
 
-### Phase 2: `_id` Storage-Order Seek
+This makes arbitrary mapped scalar sort exact and production-safe independent
+of physical segment sorting.
 
-1. Treat `_id asc` match-all as a native primary-key ordered scan.
-2. Lower `search_after` on `_id` into an exclusive primary-key range lower
-   bound.
-3. Apply live-doc, TTL, identity generation, filters, and exclusions during the
-   scan.
-4. Stop after the requested page/shard window.
+### `_id` Storage-Order Seek
 
-This phase removes the need to collect every document id for the most basic
-sorted pagination path.
+Match-all queries ordered `_id asc` execute as a native primary-key ordered
+scan (`id_seek`) rather than collecting every document id. `search_after` on
+`_id` lowers into an exclusive primary-key range lower bound, and the scan
+applies live-doc, TTL, identity-generation, filter, and exclusion checks while
+walking the range, stopping once the requested page/shard window is filled.
 
-### Phase 3: Physical `index_sort`
+### Physical `index_sort`
 
-1. Add `index_sort` configuration to mappings/index metadata.
-2. Validate `index_sort` against mapped sortable/doc-value fields.
-3. Flush new segments in configured sort order.
-4. Preserve sort order during segment merges.
-5. Store segment min/max tuple metadata for pruning.
-6. Teach match-all and filter-only queries to use sorted segment seek.
+`index_sort` is a configuration on mappings/index metadata, validated against
+mapped sortable/doc-value fields. New segments flush in the configured sort
+order, merges preserve that order, and segment metadata stores min/max tuple
+bounds for pruning. Match-all, structured-filter, and full-text queries whose
+effective requested order matches `index_sort` use sorted-segment seek
+(`sorted_segment_seek`) instead of a doc-values collector.
 
-Changing `index_sort` requires a new index generation or reindex because it is a
-durable physical layout choice.
+Changing `index_sort` requires a new index generation or reindex because it is
+a durable physical layout choice.
 
-### Phase 4: Planner And Distributed Search
+### Planner And Distributed Search
 
-1. Add explicit sort execution plans: `none`, `id_seek`,
-   `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`,
-   `distributed_k_way_merge`, `stored_json_debug`, and
-   `unsupported_exact_sort`.
-2. Teach full-text queries to choose between text-candidate collection,
-   doc-values top-N, and sorted-order scan with text-match testing.
-3. Add distributed k-way merge over typed sort tuples.
-4. Forward `search_after` to every shard and merge shard-local windows at the
-   coordinator.
-5. Return exact or lower-bound total-hit relations based on shard capabilities.
+The planner exposes sort execution as an explicit `SortExecutionPlanKind`:
+`none`, `id_only`, `id_seek`, `sorted_segment_seek`,
+`native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`,
+`stored_json_debug`, and `unsupported_exact_sort`. Full-text queries with
+`order_by` choose between collecting text-match candidates into a doc-values
+top-N collector and scanning sorted segments while testing text-match
+membership, depending on whether the requested order matches `index_sort`.
 
-### Phase 5: Cleanup
+Distributed field sort uses coordinator-side k-way merge over typed sort
+tuples (`distributed_k_way_merge`): each shard validates the mapping and sort
+tuple and returns its local sorted window, `search_after` is forwarded to
+every shard, and the coordinator merges shard-local windows with the same
+typed comparator. Total-hit relation is reported as `exact` or a lower bound
+(`gte`) depending on shard capability.
 
-1. Remove stored JSON sort from public query execution.
-2. Keep compatibility/debug hooks only where they are explicitly named.
-3. Update SDKs, OpenAPI examples, and docs so supported sort behavior matches
-   runtime mappings.
-4. Add concise sort labels and alert rules to existing query metrics for plan
-   selection, budget failures, doc-value coverage failures, and source-load
-   behavior.
+### Stored JSON Sort Retirement And Documentation Parity
+
+Stored JSON sort is not part of public query execution; the `stored_json_debug`
+plan is available only in test/debug runtimes. SDKs, OpenAPI examples, and
+docs describe supported sort behavior as derived from runtime mappings (see
+Documentation, OpenAPI, And SDK Contract). Query metrics carry concise sort
+labels — plan, exactness, source, selection reason — with alerting on budget
+failures, doc-value coverage failures, and source-load behavior (see
+Production Observability).
 
 ## Testing Requirements
 

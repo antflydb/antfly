@@ -38,10 +38,11 @@ tags[#3]: ai,search,ml
 All RAG queries now automatically render documents using TOON format. No configuration needed!
 
 ```bash
-# RAG query will use TOON format by default
-curl -X POST http://localhost:8080/db/v1/rag \
+# Retrieval-agent query will use TOON format by default
+curl -X POST http://localhost:8080/db/v1/agents/retrieval \
   -H "Content-Type: application/json" \
   -d '{
+    "query": "What is vector search?",
     "queries": [{
       "table": "documents",
       "semantic_search": "What is vector search?"
@@ -149,6 +150,6 @@ TOON encoding and template integration are implemented by the Zig runtime in
 
 ## See Also
 
-- [TOON Specification](https://github.com/alpkeskin/gotoon)
-- [RAG API Documentation](./api/rag.md)
-- [Template System Documentation](./templates.md)
+- [TOON Specification](https://github.com/toon-format/spec)
+- [Retrieval Agent Guide](guides/support-answer-agent.mdx)
+- Template rendering uses Handlebars; see the `remoteMedia` and `document_extraction` helpers referenced in the [Multimodal guide](guides/multimodal.mdx)

@@ -19,3 +19,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 pub const resource_manager = @import("storage/resource_manager.zig");
 pub const rowsource = @import("storage/rowsource/mod.zig");
 pub const sim_runtime = @import("storage/sim_runtime.zig");
+
+pub const antfly_sources = struct {
+    pub const physical_db = @import("storage/db/db.zig");
+};

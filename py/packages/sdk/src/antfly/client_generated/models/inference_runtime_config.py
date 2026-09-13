@@ -24,12 +24,17 @@ T = TypeVar("T", bound="InferenceRuntimeConfig")
 class InferenceRuntimeConfig:
     """
     Attributes:
-        api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
         max_concurrent_requests (int | Unset): Deprecated compatibility alias for
             `admission.inference.max_concurrent_requests`. New configurations
             should use the process-level admission setting. If both spellings
             are supplied, they must have the same value.
              Example: 32.
+        api_url (str | Unset): URL of an out-of-process Antfly inference service that the Antfly
+            server should call for embedding, chunking, reranking, and
+            generation. Omit it to use the in-process inference runtime
+            (the default in standalone mode). `antfly inference run` ignores
+            this field; it configures the client side only.
+             Example: http://localhost:8080.
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
@@ -101,8 +106,8 @@ class InferenceRuntimeConfig:
             runtime ignores it; configure the top-level `log` object instead.
     """
 
-    api_url: str
     max_concurrent_requests: int | Unset = UNSET
+    api_url: str | Unset = UNSET
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
     ml_dir: str | Unset = UNSET
@@ -123,9 +128,9 @@ class InferenceRuntimeConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        api_url = self.api_url
-
         max_concurrent_requests = self.max_concurrent_requests
+
+        api_url = self.api_url
 
         api_key = self.api_key
 
@@ -180,13 +185,11 @@ class InferenceRuntimeConfig:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "api_url": api_url,
-            }
-        )
+        field_dict.update({})
         if max_concurrent_requests is not UNSET:
             field_dict["max_concurrent_requests"] = max_concurrent_requests
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
         if api_key is not UNSET:
             field_dict["api_key"] = api_key
         if models_dir is not UNSET:
@@ -234,9 +237,9 @@ class InferenceRuntimeConfig:
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
-        api_url = d.pop("api_url")
-
         max_concurrent_requests = d.pop("max_concurrent_requests", UNSET)
+
+        api_url = d.pop("api_url", UNSET)
 
         api_key = d.pop("api_key", UNSET)
 
@@ -305,8 +308,8 @@ class InferenceRuntimeConfig:
             log = InferenceschemasConfig.from_dict(_log)
 
         inference_runtime_config = cls(
-            api_url=api_url,
             max_concurrent_requests=max_concurrent_requests,
+            api_url=api_url,
             api_key=api_key,
             models_dir=models_dir,
             ml_dir=ml_dir,

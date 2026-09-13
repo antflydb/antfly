@@ -343,23 +343,7 @@ pub const ReplayIterationStats = struct {
 // ByteRange — shard ownership range
 // ============================================================================
 
-pub const ByteRange = struct {
-    start: []const u8, // inclusive, empty = -inf
-    end: []const u8, // exclusive, empty = +inf
-
-    /// Check if key is within [start, end).
-    pub fn contains(self: ByteRange, key: []const u8) bool {
-        // start <= key
-        if (self.start.len > 0) {
-            if (std.mem.order(u8, key, self.start) == .lt) return false;
-        }
-        // key < end
-        if (self.end.len > 0) {
-            if (std.mem.order(u8, key, self.end) != .lt) return false;
-        }
-        return true;
-    }
-};
+pub const ByteRange = @import("byte_range.zig").ByteRange;
 
 // ============================================================================
 // DocStore

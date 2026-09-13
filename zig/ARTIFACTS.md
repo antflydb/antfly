@@ -736,6 +736,20 @@ The model-facing producer types are separate from artifact kinds:
 - **chunkers**, **embedders**, and **rerankers** keep their current index-facing
   roles.
 
+### Text-to-speech (not implemented)
+
+Speech-to-text shipped as the `transcriber` producer type above; the symmetric
+text-to-speech capability has not been implemented in Zig. The design intent
+carried forward from the earlier Go-era proposal, recorded here as unimplemented
+direction rather than current behavior, called for a provider registry mirroring
+the reader/generator pattern -- OpenAI, Google Vertex, and ElevenLabs-class
+providers behind one interface -- with the caller selecting an output audio
+format per request. Output placement was meant to follow the same
+inline-vs-object-storage split used elsewhere in this document: small
+synthesized audio returned inline in the response, and larger or streamed
+output written to object storage with a reference returned instead of the raw
+bytes.
+
 For Zig providers, `antfly` is the canonical local/remote provider name. A
 provider config with `provider: "antfly"` and no `url` uses the local Antfly
 inference runtime when available. Supplying `url` routes to an Antfly

@@ -4630,7 +4630,7 @@ fn compactPinnedPlanWithUnlockedBuild(backend: anytype, plan: CompactionPlan, dr
 
 test "compaction admitted pinned execution handoff benchmark" {
     if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
-    const lsm = @import("../../root.zig").lsm_backend;
+    const lsm = @import("mod.zig");
     const alloc = std.testing.allocator;
     const now = @import("antfly_platform").time.monotonicNs;
     const Hooks = struct {

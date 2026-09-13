@@ -1429,3 +1429,39 @@ pre-merge component target passed all 22 test executions. Ruff, Zig formatting
 and whitespace checks passed. Standalone E2Es initially stopped at the disk
 headroom preflight; clearing obsolete local build artifacts restored headroom,
 and the subsequent complete run passed without changing production disk guards.
+
+
+## Bounded reporting and snapshot workloads — 2026-09-13
+
+[Raw observations and provenance](system_catalog_production_workloads_2026_09_13.json)
+include separate publication and first-reader measurements. These runs precede
+integration with main's compiled storage boundary; they measure the reporting
+algorithm and same-binary request modes, not final merged release capacity.
+
+| Report cache operation | 100 groups | 1,000 groups | 10,000 groups |
+| --- | --- | --- | --- |
+| Sparse publication p50 | 0.002 ms | 0.002 ms | 0.002 ms |
+| Sparse publication allocations | 36 | 36 | 36 |
+| First flat reader p50 | 0.003 ms | 0.029 ms | 0.403 ms |
+| Full refresh p50 | 0.047 ms | 0.484 ms | 5.664 ms |
+
+At 10,000 groups, the previous sparse refresh measured 2.107 ms. The new
+publication cost excludes flattening: readers that need every report pay the
+separately measured first-reader cost once per published component. Full refresh
+remains linear and has more allocations (100,708 versus the earlier 90,037).
+
+A real three-metadata/three-data-node cluster received a synthetic inventory of
+10,000 groups with one index each. Twelve measured collections followed two
+warmups; namespace creation and deletion ran concurrently.
+
+| Operation | Normal report admission p50 / p95 | Independent telemetry p50 / p95 |
+| --- | --- | --- |
+| Complete 10,000-index collection | 524 / 837 ms | 133 / 326 ms |
+| Concurrent namespace create + drop | 313 / 876 ms | 134 / 607 ms |
+
+All three data nodes remained alive in both modes. The compact control transfer
+was 8,027 bytes; the diagnostic transfer was 46,148,026 bytes across 89 pages,
+with no page above 512 KiB. Synthetic groups were outside actual table placement,
+so the compact size is not a claim that 10,000 active shard placements fit in
+8 KiB. Cold capture timings were 1,952 ms and 983 ms respectively and should not
+be interpreted as steady-state latency improvements.

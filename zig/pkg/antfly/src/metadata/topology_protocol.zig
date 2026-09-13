@@ -26,7 +26,9 @@ const std = @import("std");
 /// Version 6 adds digest-conditional restore expiry.
 /// Version 7 adds system catalog records and atomic catalog/table publication.
 /// Version 8 adds acknowledged sparse store reports.
-pub const current_version: u16 = 8;
+/// Version 9 adds durable membership-bound protocol activation.
+pub const current_version: u16 = 9;
+pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;

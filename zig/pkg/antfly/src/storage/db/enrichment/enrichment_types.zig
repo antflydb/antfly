@@ -22,12 +22,49 @@ const Allocator = std.mem.Allocator;
 /// defers the next embed batch while it is non-zero so interactive embeds
 /// get the embedder first. Lives here so the embed loop has no dependency
 /// on HTTP wiring.
-pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_embed_inflight = InteractiveCounter{ .kind = 0 };
 
 /// Process-wide count of interactive generation requests. Background asset
 /// producers (including GLiNER extraction) yield between batches while this is
 /// non-zero so long-running backfills do not contend with user-facing answers.
-pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_generate_inflight = InteractiveCounter{ .kind = 1 };
+
+var local_interactive_counters = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+
+const InteractiveCounter = struct {
+    kind: u32,
+
+    pub fn fetchAdd(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, @intCast(value));
+        return local_interactive_counters[self.kind].fetchAdd(value, order);
+    }
+
+    pub fn fetchSub(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, -@as(i32, @intCast(value)));
+        return local_interactive_counters[self.kind].fetchSub(value, order);
+    }
+
+    pub fn load(self: @This(), comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, 0);
+        return local_interactive_counters[self.kind].load(order);
+    }
+};
+
+/// Called only by the physical storage archive. Returns the previous count.
+/// One call surrounds an interactive inference operation, never a record loop.
+pub fn interactiveActivity(kind: u32, delta: i32) callconv(.c) u32 {
+    std.debug.assert(kind < local_interactive_counters.len);
+    const counter = &local_interactive_counters[kind];
+    if (delta == 0) return counter.load(.monotonic);
+    if (delta > 0) return counter.fetchAdd(@intCast(delta), .monotonic);
+    const amount: u32 = @intCast(-@as(i64, delta));
+    const previous = counter.fetchSub(amount, .monotonic);
+    std.debug.assert(previous >= amount);
+    return previous;
+}
 
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,

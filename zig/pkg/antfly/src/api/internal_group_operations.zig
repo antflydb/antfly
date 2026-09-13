@@ -19,13 +19,13 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 const batch_api = @import("batch.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const internal_keys = @import("../storage/internal_keys.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
 const operation = @import("operation.zig");
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_reads.zig");
+const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const query_api = @import("query.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
@@ -1074,258 +1074,6 @@ fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void 
     };
 }
 
-test "internal transaction operations preserve pre-decision leader unavailability" {
-    const Source = struct {
-        fn iface() table_writes.TableWriteSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .batch = batch,
-                    .txn_begin_group_local = txnBegin,
-                    .txn_prepare_group_local = txnPrepare,
-                },
-            };
-        }
-
-        fn batch(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: db_mod.types.BatchRequest,
-        ) anyerror!?void {
-            return null;
-        }
-
-        fn txnBegin(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: u64,
-            _: bool,
-            _: []const []const u8,
-        ) anyerror!?void {
-            return error.LeaderUnavailable;
-        }
-
-        fn txnPrepare(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: db_mod.types.TransactionIntentRequest,
-        ) anyerror!?void {
-            return error.MetadataSnapshotUnavailable;
-        }
-    };
-
-    const LegacyDeadlineSource = struct {
-        fn iface() table_writes.TableWriteSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .batch = batch,
-                    .txn_begin_group_local = txnBegin,
-                    .txn_prepare_group_local = txnPrepare,
-                },
-            };
-        }
-
-        fn batch(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: db_mod.types.BatchRequest,
-        ) anyerror!?void {
-            return null;
-        }
-
-        fn txnBegin(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: u64,
-            _: bool,
-            _: []const []const u8,
-        ) anyerror!?void {
-            return error.DeadlineExceeded;
-        }
-
-        fn txnPrepare(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: db_mod.types.TransactionIntentRequest,
-        ) anyerror!?void {
-            return error.Timeout;
-        }
-    };
-
-    const ContextDeadlineSource = struct {
-        failure: anyerror,
-
-        fn iface(self: *@This()) table_writes.TableWriteSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .batch = batch,
-                    .txn_begin_group_local_with_pre_decision_context = txnBegin,
-                    .txn_prepare_group_local_with_pre_decision_context = txnPrepare,
-                },
-            };
-        }
-
-        fn batch(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: db_mod.types.BatchRequest,
-        ) anyerror!?void {
-            return null;
-        }
-
-        fn txnBegin(
-            ptr: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: u64,
-            _: bool,
-            _: []const []const u8,
-            _: distributed_txn.PreDecisionContext,
-        ) anyerror!?void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.failure;
-        }
-
-        fn txnPrepare(
-            ptr: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
-            _: []const u8,
-            _: db_mod.types.TxnId,
-            _: u64,
-            _: db_mod.types.TransactionIntentRequest,
-            _: distributed_txn.PreDecisionContext,
-        ) anyerror!?void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.failure;
-        }
-    };
-
-    const Validator = struct {
-        fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
-    };
-
-    const operations = Operations{
-        .reads = null,
-        .shard_db_adapter = null,
-        .writes = Source.iface(),
-        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
-    };
-    const txn_id = [_]u8{0x42} ** 16;
-    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
-        std.testing.allocator,
-        .{},
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnPrepare(
-        std.testing.allocator,
-        .{},
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .req = .{} },
-    ));
-
-    const legacy_deadline_operations = Operations{
-        .reads = null,
-        .shard_db_adapter = null,
-        .writes = LegacyDeadlineSource.iface(),
-        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
-    };
-    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnBegin(
-        std.testing.allocator,
-        .{},
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnPrepare(
-        std.testing.allocator,
-        .{},
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .req = .{} },
-    ));
-
-    var context_deadline_source = ContextDeadlineSource{ .failure = error.Timeout };
-    const context_deadline_operations = Operations{
-        .reads = null,
-        .shard_db_adapter = null,
-        .writes = context_deadline_source.iface(),
-        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
-    };
-    const active_deadline = operation.RequestContext{ .deadline_ns = std.math.maxInt(u64) };
-    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
-        std.testing.allocator,
-        active_deadline,
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-    context_deadline_source.failure = error.DeadlineExceeded;
-    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnPrepare(
-        std.testing.allocator,
-        active_deadline,
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .req = .{} },
-    ));
-    context_deadline_source.failure = error.PreDecisionDeadlineExceeded;
-    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
-        std.testing.allocator,
-        .{},
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnBegin(
-        std.testing.allocator,
-        active_deadline,
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnPrepare(
-        std.testing.allocator,
-        active_deadline,
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .req = .{} },
-    ));
-    try std.testing.expectError(error.PreDecisionDeadlineExceeded, operations.txnBegin(
-        std.testing.allocator,
-        .{ .deadline_ns = 1 },
-        7,
-        "docs",
-        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
-    ));
-}
-
 const RepairCancelProbe = struct {
     alloc: std.mem.Allocator,
     lookup: RepairCancellationLookup,
@@ -1405,452 +1153,716 @@ fn validateDocumentArtifactChildRangeBatchScope(
     };
 }
 
-test "typed routed batch preserves forwarding cancellation and identity conflicts" {
-    const State = struct {
-        cancellation_signal: *const std.atomic.Value(bool),
-        calls: usize = 0,
-        fail_identity: bool = false,
-        visibility_error: ?anyerror = null,
-        saw_unfenced_split: bool = false,
-        saw_unfenced_merge: bool = false,
-        saw_unfenced_transaction: bool = false,
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "internal transaction operations preserve pre-decision leader unavailability" {
+            const Source = struct {
+                fn iface() table_writes.TableWriteSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .batch = batch,
+                            .txn_begin_group_local = txnBegin,
+                            .txn_prepare_group_local = txnPrepare,
+                        },
+                    };
+                }
 
-        fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            _ = self;
-            try std.testing.expectEqualStrings("documents", table_name);
-            try std.testing.expectEqual(@as(usize, 0), writes.len);
+                fn batch(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: db_mod.types.BatchRequest,
+                ) anyerror!?void {
+                    return null;
+                }
+
+                fn txnBegin(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: u64,
+                    _: bool,
+                    _: []const []const u8,
+                ) anyerror!?void {
+                    return error.LeaderUnavailable;
+                }
+
+                fn txnPrepare(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: db_mod.types.TransactionIntentRequest,
+                ) anyerror!?void {
+                    return error.MetadataSnapshotUnavailable;
+                }
+            };
+
+            const LegacyDeadlineSource = struct {
+                fn iface() table_writes.TableWriteSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .batch = batch,
+                            .txn_begin_group_local = txnBegin,
+                            .txn_prepare_group_local = txnPrepare,
+                        },
+                    };
+                }
+
+                fn batch(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: db_mod.types.BatchRequest,
+                ) anyerror!?void {
+                    return null;
+                }
+
+                fn txnBegin(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: u64,
+                    _: bool,
+                    _: []const []const u8,
+                ) anyerror!?void {
+                    return error.DeadlineExceeded;
+                }
+
+                fn txnPrepare(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: db_mod.types.TransactionIntentRequest,
+                ) anyerror!?void {
+                    return error.Timeout;
+                }
+            };
+
+            const ContextDeadlineSource = struct {
+                failure: anyerror,
+
+                fn iface(self: *@This()) table_writes.TableWriteSource {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{
+                            .batch = batch,
+                            .txn_begin_group_local_with_pre_decision_context = txnBegin,
+                            .txn_prepare_group_local_with_pre_decision_context = txnPrepare,
+                        },
+                    };
+                }
+
+                fn batch(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: db_mod.types.BatchRequest,
+                ) anyerror!?void {
+                    return null;
+                }
+
+                fn txnBegin(
+                    ptr: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: u64,
+                    _: bool,
+                    _: []const []const u8,
+                    _: distributed_txn.PreDecisionContext,
+                ) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return self.failure;
+                }
+
+                fn txnPrepare(
+                    ptr: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: u64,
+                    _: []const u8,
+                    _: db_mod.types.TxnId,
+                    _: u64,
+                    _: db_mod.types.TransactionIntentRequest,
+                    _: distributed_txn.PreDecisionContext,
+                ) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return self.failure;
+                }
+            };
+
+            const Validator = struct {
+                fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+            };
+
+            const operations = Operations{
+                .reads = null,
+                .shard_db_adapter = null,
+                .writes = Source.iface(),
+                .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+            };
+            const txn_id = [_]u8{0x42} ** 16;
+            try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
+                std.testing.allocator,
+                .{},
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
+            try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnPrepare(
+                std.testing.allocator,
+                .{},
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .req = .{} },
+            ));
+
+            const legacy_deadline_operations = Operations{
+                .reads = null,
+                .shard_db_adapter = null,
+                .writes = LegacyDeadlineSource.iface(),
+                .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+            };
+            try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnBegin(
+                std.testing.allocator,
+                .{},
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
+            try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnPrepare(
+                std.testing.allocator,
+                .{},
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .req = .{} },
+            ));
+
+            var context_deadline_source = ContextDeadlineSource{ .failure = error.Timeout };
+            const context_deadline_operations = Operations{
+                .reads = null,
+                .shard_db_adapter = null,
+                .writes = context_deadline_source.iface(),
+                .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+            };
+            const active_deadline = operation.RequestContext{ .deadline_ns = std.math.maxInt(u64) };
+            try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+                std.testing.allocator,
+                active_deadline,
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
+            context_deadline_source.failure = error.DeadlineExceeded;
+            try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnPrepare(
+                std.testing.allocator,
+                active_deadline,
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .req = .{} },
+            ));
+            context_deadline_source.failure = error.PreDecisionDeadlineExceeded;
+            try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+                std.testing.allocator,
+                .{},
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnBegin(
+                std.testing.allocator,
+                active_deadline,
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnPrepare(
+                std.testing.allocator,
+                active_deadline,
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .req = .{} },
+            ));
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, operations.txnBegin(
+                std.testing.allocator,
+                .{ .deadline_ns = 1 },
+                7,
+                "docs",
+                .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+            ));
         }
 
-        fn write(
-            ptr: *anyopaque,
-            _: std.mem.Allocator,
-            authority: RoutedBatchAuthority,
-            group_id: u64,
-            table_name: []const u8,
-            _: db_mod.types.BatchRequest,
-            forwarding: internal_batch_forwarding.Context,
-            cancellation: CancellationToken,
-        ) !?void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            try std.testing.expectEqual(@as(u64, 17), group_id);
-            switch (authority) {
-                .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
-                .transaction => self.saw_unfenced_transaction = true,
-                .split_replication => self.saw_unfenced_split = true,
-                .merge_replication => self.saw_unfenced_merge = true,
-            }
-            try std.testing.expectEqualStrings("documents", table_name);
-            try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
-            try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
-            try std.testing.expect(!forwarding.campaign_allowed);
-            try std.testing.expect(cancellation.ptr == @as(*const anyopaque, @ptrCast(self.cancellation_signal)));
-            try std.testing.expect(!cancellation.isCancelled());
-            if (self.fail_identity) return error.DocIdentityNamespaceMismatch;
-            if (self.visibility_error) |err| return err;
-            return {};
+        test "typed routed batch preserves forwarding cancellation and identity conflicts" {
+            const State = struct {
+                cancellation_signal: *const std.atomic.Value(bool),
+                calls: usize = 0,
+                fail_identity: bool = false,
+                visibility_error: ?anyerror = null,
+                saw_unfenced_split: bool = false,
+                saw_unfenced_merge: bool = false,
+                saw_unfenced_transaction: bool = false,
+
+                fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    _ = self;
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(@as(usize, 0), writes.len);
+                }
+
+                fn write(
+                    ptr: *anyopaque,
+                    _: std.mem.Allocator,
+                    authority: RoutedBatchAuthority,
+                    group_id: u64,
+                    table_name: []const u8,
+                    _: db_mod.types.BatchRequest,
+                    forwarding: internal_batch_forwarding.Context,
+                    cancellation: CancellationToken,
+                ) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(u64, 17), group_id);
+                    switch (authority) {
+                        .catalog => |catalog_fence| try std.testing.expectEqual(group_id, catalog_fence.route.group_id),
+                        .transaction => self.saw_unfenced_transaction = true,
+                        .split_replication => self.saw_unfenced_split = true,
+                        .merge_replication => self.saw_unfenced_merge = true,
+                    }
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
+                    try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
+                    try std.testing.expect(!forwarding.campaign_allowed);
+                    try std.testing.expect(cancellation.ptr == @as(*const anyopaque, @ptrCast(self.cancellation_signal)));
+                    try std.testing.expect(!cancellation.isCancelled());
+                    if (self.fail_identity) return error.DocIdentityNamespaceMismatch;
+                    if (self.visibility_error) |err| return err;
+                    return {};
+                }
+            };
+
+            var cancelled = std.atomic.Value(bool).init(false);
+            var state = State{ .cancellation_signal = &cancelled };
+            const operations = Operations{
+                .reads = null,
+                .shard_db_adapter = null,
+                .batch_validator = .{ .ptr = &state, .validate_fn = State.validate },
+                .routed_raft_batch_writer = .{ .ptr = &state, .write_fn = State.write },
+            };
+            const forwarding: internal_batch_forwarding.Context = .{
+                .remaining_ms = 425,
+                .forwards_remaining = 1,
+                .campaign_allowed = false,
+            };
+            const request: operation.RequestContext = .{
+                .cancellation = CancellationToken.fromAtomic(&cancelled),
+                .catalog_route_fence_json = "{\"metadata_group_id\":1,\"catalog_revision\":2,\"table_id\":3,\"topology_epoch\":4,\"route\":{\"group_id\":17,\"range_id\":5,\"identity_namespace\":{\"table_id\":3,\"shard_id\":17,\"range_id\":5}}}",
+            };
+
+            const result = try operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            );
+            try std.testing.expectEqual(@as(u32, 0), result.inserted);
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+            state.fail_identity = true;
+            try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+            state.fail_identity = false;
+            state.visibility_error = error.EnrichmentRetryInProgress;
+            try std.testing.expectError(error.EnrichmentRetryInProgress, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
+            state.visibility_error = error.EnrichmentWorkerFailed;
+            try std.testing.expectError(error.EnrichmentWorkerFailed, operations.routedBatch(
+                std.testing.allocator,
+                request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 4), state.calls);
+            state.visibility_error = null;
+
+            const unfenced_request: operation.RequestContext = .{
+                .cancellation = CancellationToken.fromAtomic(&cancelled),
+            };
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{},
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 4), state.calls);
+
+            const txn_id = [_]u8{7} ** 16;
+            const transaction_participants = [_][]const u8{"table:documents:group:17"};
+            _ = try operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .transaction = .{ .begin = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = 10,
+                    .created_at_ns = 11,
+                    .topology_epoch = 2,
+                    .participants = &transaction_participants,
+                } } },
+                forwarding,
+            );
+            try std.testing.expectEqual(@as(usize, 5), state.calls);
+            try std.testing.expect(state.saw_unfenced_transaction);
+
+            try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .transaction = .{ .prepare = .{
+                    .txn_id = txn_id,
+                    .topology_epoch = 0,
+                } } },
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 5), state.calls);
+
+            const split_replication: db_mod.types.SplitReplicationContext = .{
+                .transition_id = 91,
+                .attempt_epoch = 2,
+                .source_group_id = 16,
+                .destination_group_id = 17,
+                .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
+            };
+            _ = try operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .split_replication = split_replication },
+                forwarding,
+            );
+            try std.testing.expectEqual(@as(usize, 6), state.calls);
+            try std.testing.expect(state.saw_unfenced_split);
+
+            var mismatched_split = split_replication;
+            mismatched_split.destination_group_id = 18;
+            try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .split_replication = mismatched_split },
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 6), state.calls);
+
+            const merge_replication: db_mod.types.MergeReplicationContext = .{
+                .transition_id = 92,
+                .donor_group_id = 16,
+                .receiver_group_id = 17,
+                .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
+            };
+            _ = try operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .merge_replication = merge_replication },
+                forwarding,
+            );
+            try std.testing.expectEqual(@as(usize, 7), state.calls);
+            try std.testing.expect(state.saw_unfenced_merge);
+
+            var mismatched_merge = merge_replication;
+            mismatched_merge.receiver_group_id = 18;
+            try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
+                std.testing.allocator,
+                unfenced_request,
+                17,
+                "documents",
+                .{ .merge_replication = mismatched_merge },
+                forwarding,
+            ));
+            try std.testing.expectEqual(@as(usize, 7), state.calls);
+        }
+
+        test "typed internal query workers preserve identity generation validation" {
+            const FakeReads = struct {
+                fn source() table_reads.TableReadSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .lookup = lookup,
+                        .scan = scan,
+                        .query = publicQuery,
+                        .query_group_local = groupQuery,
+                        .graph_expand_group_local = graphExpand,
+                    } };
+                }
+
+                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return null;
+                }
+
+                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    return null;
+                }
+
+                fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    return null;
+                }
+
+                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    try std.testing.expectEqual(@as(u64, 17), group_id);
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+                    if (req.hierarchy_children != null) return error.HierarchyCursorStale;
+                    return error.UnsupportedQueryRequest;
+                }
+
+                fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+                    try std.testing.expectEqual(@as(u64, 17), group_id);
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+                    return error.UnsupportedQueryRequest;
+                }
+            };
+
+            const operations = Operations{
+                .reads = FakeReads.source(),
+                .shard_db_adapter = null,
+            };
+
+            try std.testing.expectError(error.InvalidArgument, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{ .identity_read_generation = 12345 },
+            ));
+            try std.testing.expectError(error.HierarchyCursorStale, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .identity_read_generation = 12345,
+                    .hierarchy_children = .{ .parent_id = "doc:a" },
+                },
+            ));
+
+            var frontier: [0]distributed_graph.GraphFrontierItem = .{};
+            var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
+            var exclude_edges: [0][]u8 = .{};
+            try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .name = @constCast("graph"),
+                    .index_name = @constCast("graph-index"),
+                    .frontier = frontier[0..],
+                    .exclude_nodes = exclude_nodes[0..],
+                    .exclude_edges = exclude_edges[0..],
+                    .params = .{},
+                    .identity_read_generation = 12345,
+                },
+            ));
+        }
+
+        test "typed internal group reads preserve retryable resident storage failures" {
+            const alloc = std.testing.allocator;
+            try std.testing.expectEqual(error.GenerationTransitionActive, Operations.mapCommonReadError(error.GenerationTransitionActive).?);
+            try std.testing.expectEqual(error.IndexGenerationMismatch, Operations.mapCommonReadError(error.IndexGenerationMismatch).?);
+            try std.testing.expectEqual(
+                error.DeadlineExceeded,
+                Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,
+            );
+            try std.testing.expectEqual(
+                error.Unavailable,
+                Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
+            );
+            const FakeReads = struct {
+                fn source() table_reads.TableReadSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .lookup = lookup,
+                        .scan = scan,
+                        .query = publicQuery,
+                        .query_group_local = groupQuery,
+                        .preflight_query_group_local = groupPreflight,
+                        .scan_group_local = groupScan,
+                        .text_stats_group_local = auxiliary,
+                        .algebraic_partials_group_local = auxiliary,
+                        .document_artifact_manifest_group_local = artifact,
+                        .document_artifact_manifests_group_local = artifacts,
+                    } };
+                }
+
+                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return null;
+                }
+
+                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    return null;
+                }
+
+                fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    return null;
+                }
+
+                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+
+                fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+
+                fn groupScan(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+
+                fn auxiliary(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+
+                fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+
+                fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
+                    return error.StorageReadTemporarilyUnavailable;
+                }
+            };
+
+            const operations = Operations{ .reads = FakeReads.source(), .shard_db_adapter = null };
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.query(alloc, .{}, 7, "docs", .{}));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.textStats(alloc, .{}, 7, "docs", "{}"));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+            try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
+            try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
+            try std.testing.expectEqual(
+                error.StorageReadTemporarilyUnavailable,
+                mapLookupError(error.ResourceBudgetExceeded),
+            );
+            try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+        }
+
+        test "internal group reads are callable without an HTTP request" {
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                fn reads() table_reads.TableReadSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .lookup = publicLookup,
+                        .scan = scan,
+                        .query = query,
+                        .lookup_group_local = groupLookup,
+                    } };
+                }
+
+                fn shardDb() metadata_mod.ShardDbAdapter {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .fetch_median_key = medianKey,
+                        .schema_index_ready = schemaIndexReady,
+                    } };
+                }
+
+                fn publicLookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return null;
+                }
+
+                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    return null;
+                }
+
+                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("query.zig").QueryResponse {
+                    return null;
+                }
+
+                fn groupLookup(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, _: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    try std.testing.expectEqual(@as(u64, 7), group_id);
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqualStrings("doc:a", key);
+                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+                    return .{ .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"), .version = 42 };
+                }
+
+                fn medianKey(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
+                    try std.testing.expectEqual(@as(u64, 7), group_id);
+                    return try inner_alloc.dupe(u8, "doc:m");
+                }
+
+                fn schemaIndexReady(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64, _: u32, _: u32) !bool {
+                    return true;
+                }
+            };
+
+            const operations = Operations{ .reads = Fake.reads(), .shard_db_adapter = Fake.shardDb() };
+            var lookup = try operations.lookup(alloc, .{}, .{
+                .group_id = 7,
+                .table_name = "documents",
+                .key = "doc:a",
+            });
+            defer lookup.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 42), lookup.version);
+            try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", lookup.json);
+
+            const median = (try operations.medianKey(alloc, .{}, 7)).?;
+            defer alloc.free(median);
+            try std.testing.expectEqualStrings("doc:m", median);
+            try std.testing.expectError(
+                error.NotFound,
+                operations.corruptEmbeddingArtifact(alloc, .{}, "documents", "doc:a", "embedding"),
+            );
         }
     };
-
-    var cancelled = std.atomic.Value(bool).init(false);
-    var state = State{ .cancellation_signal = &cancelled };
-    const operations = Operations{
-        .reads = null,
-        .shard_db_adapter = null,
-        .batch_validator = .{ .ptr = &state, .validate_fn = State.validate },
-        .routed_raft_batch_writer = .{ .ptr = &state, .write_fn = State.write },
-    };
-    const forwarding: internal_batch_forwarding.Context = .{
-        .remaining_ms = 425,
-        .forwards_remaining = 1,
-        .campaign_allowed = false,
-    };
-    const request: operation.RequestContext = .{
-        .cancellation = CancellationToken.fromAtomic(&cancelled),
-        .catalog_route_fence_json = "{\"metadata_group_id\":1,\"catalog_revision\":2,\"table_id\":3,\"topology_epoch\":4,\"route\":{\"group_id\":17,\"range_id\":5,\"identity_namespace\":{\"table_id\":3,\"shard_id\":17,\"range_id\":5}}}",
-    };
-
-    const result = try operations.routedBatch(
-        std.testing.allocator,
-        request,
-        17,
-        "documents",
-        .{},
-        forwarding,
-    );
-    try std.testing.expectEqual(@as(u32, 0), result.inserted);
-    try std.testing.expectEqual(@as(usize, 1), state.calls);
-
-    state.fail_identity = true;
-    try std.testing.expectError(error.DocIdentityNamespaceMismatch, operations.routedBatch(
-        std.testing.allocator,
-        request,
-        17,
-        "documents",
-        .{},
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 2), state.calls);
-
-    state.fail_identity = false;
-    state.visibility_error = error.EnrichmentRetryInProgress;
-    try std.testing.expectError(error.EnrichmentRetryInProgress, operations.routedBatch(
-        std.testing.allocator,
-        request,
-        17,
-        "documents",
-        .{},
-        forwarding,
-    ));
-    state.visibility_error = error.EnrichmentWorkerFailed;
-    try std.testing.expectError(error.EnrichmentWorkerFailed, operations.routedBatch(
-        std.testing.allocator,
-        request,
-        17,
-        "documents",
-        .{},
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 4), state.calls);
-    state.visibility_error = null;
-
-    const unfenced_request: operation.RequestContext = .{
-        .cancellation = CancellationToken.fromAtomic(&cancelled),
-    };
-    try std.testing.expectError(error.Unavailable, operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{},
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 4), state.calls);
-
-    const txn_id = [_]u8{7} ** 16;
-    const transaction_participants = [_][]const u8{"table:documents:group:17"};
-    _ = try operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .transaction = .{ .begin = .{
-            .txn_id = txn_id,
-            .begin_timestamp = 10,
-            .created_at_ns = 11,
-            .topology_epoch = 2,
-            .participants = &transaction_participants,
-        } } },
-        forwarding,
-    );
-    try std.testing.expectEqual(@as(usize, 5), state.calls);
-    try std.testing.expect(state.saw_unfenced_transaction);
-
-    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .transaction = .{ .prepare = .{
-            .txn_id = txn_id,
-            .topology_epoch = 0,
-        } } },
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 5), state.calls);
-
-    const split_replication: db_mod.types.SplitReplicationContext = .{
-        .transition_id = 91,
-        .attempt_epoch = 2,
-        .source_group_id = 16,
-        .destination_group_id = 17,
-        .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
-    };
-    _ = try operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .split_replication = split_replication },
-        forwarding,
-    );
-    try std.testing.expectEqual(@as(usize, 6), state.calls);
-    try std.testing.expect(state.saw_unfenced_split);
-
-    var mismatched_split = split_replication;
-    mismatched_split.destination_group_id = 18;
-    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .split_replication = mismatched_split },
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 6), state.calls);
-
-    const merge_replication: db_mod.types.MergeReplicationContext = .{
-        .transition_id = 92,
-        .donor_group_id = 16,
-        .receiver_group_id = 17,
-        .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 },
-    };
-    _ = try operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .merge_replication = merge_replication },
-        forwarding,
-    );
-    try std.testing.expectEqual(@as(usize, 7), state.calls);
-    try std.testing.expect(state.saw_unfenced_merge);
-
-    var mismatched_merge = merge_replication;
-    mismatched_merge.receiver_group_id = 18;
-    try std.testing.expectError(error.InvalidArgument, operations.routedBatch(
-        std.testing.allocator,
-        unfenced_request,
-        17,
-        "documents",
-        .{ .merge_replication = mismatched_merge },
-        forwarding,
-    ));
-    try std.testing.expectEqual(@as(usize, 7), state.calls);
+    return Suite;
 }
-
-test "typed internal query workers preserve identity generation validation" {
-    const FakeReads = struct {
-        fn source() table_reads.TableReadSource {
-            return .{ .ptr = undefined, .vtable = &.{
-                .lookup = lookup,
-                .scan = scan,
-                .query = publicQuery,
-                .query_group_local = groupQuery,
-                .graph_expand_group_local = graphExpand,
-            } };
-        }
-
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-            return null;
-        }
-
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-            return null;
-        }
-
-        fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-            return null;
-        }
-
-        fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-            try std.testing.expectEqual(@as(u64, 17), group_id);
-            try std.testing.expectEqualStrings("documents", table_name);
-            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-            if (req.hierarchy_children != null) return error.HierarchyCursorStale;
-            return error.UnsupportedQueryRequest;
-        }
-
-        fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
-            try std.testing.expectEqual(@as(u64, 17), group_id);
-            try std.testing.expectEqualStrings("documents", table_name);
-            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-            return error.UnsupportedQueryRequest;
-        }
-    };
-
-    const operations = Operations{
-        .reads = FakeReads.source(),
-        .shard_db_adapter = null,
-    };
-
-    try std.testing.expectError(error.InvalidArgument, operations.query(
-        std.testing.allocator,
-        .{},
-        17,
-        "documents",
-        .{ .identity_read_generation = 12345 },
-    ));
-    try std.testing.expectError(error.HierarchyCursorStale, operations.query(
-        std.testing.allocator,
-        .{},
-        17,
-        "documents",
-        .{
-            .identity_read_generation = 12345,
-            .hierarchy_children = .{ .parent_id = "doc:a" },
-        },
-    ));
-
-    var frontier: [0]distributed_graph.GraphFrontierItem = .{};
-    var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
-    var exclude_edges: [0][]u8 = .{};
-    try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
-        std.testing.allocator,
-        .{},
-        17,
-        "documents",
-        .{
-            .name = @constCast("graph"),
-            .index_name = @constCast("graph-index"),
-            .frontier = frontier[0..],
-            .exclude_nodes = exclude_nodes[0..],
-            .exclude_edges = exclude_edges[0..],
-            .params = .{},
-            .identity_read_generation = 12345,
-        },
-    ));
-}
-
-test "typed internal group reads preserve retryable resident storage failures" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectEqual(error.GenerationTransitionActive, Operations.mapCommonReadError(error.GenerationTransitionActive).?);
-    try std.testing.expectEqual(error.IndexGenerationMismatch, Operations.mapCommonReadError(error.IndexGenerationMismatch).?);
-    try std.testing.expectEqual(
-        error.DeadlineExceeded,
-        Operations.mapCommonReadError(error.CatalogRoutingSnapshotTimeout).?,
-    );
-    try std.testing.expectEqual(
-        error.Unavailable,
-        Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
-    );
-    const FakeReads = struct {
-        fn source() table_reads.TableReadSource {
-            return .{ .ptr = undefined, .vtable = &.{
-                .lookup = lookup,
-                .scan = scan,
-                .query = publicQuery,
-                .query_group_local = groupQuery,
-                .preflight_query_group_local = groupPreflight,
-                .scan_group_local = groupScan,
-                .text_stats_group_local = auxiliary,
-                .algebraic_partials_group_local = auxiliary,
-                .document_artifact_manifest_group_local = artifact,
-                .document_artifact_manifests_group_local = artifacts,
-            } };
-        }
-
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-            return null;
-        }
-
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-            return null;
-        }
-
-        fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-            return null;
-        }
-
-        fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-
-        fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-
-        fn groupScan(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-
-        fn auxiliary(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-
-        fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-
-        fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
-            return error.StorageReadTemporarilyUnavailable;
-        }
-    };
-
-    const operations = Operations{ .reads = FakeReads.source(), .shard_db_adapter = null };
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.query(alloc, .{}, 7, "docs", .{}));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.textStats(alloc, .{}, 7, "docs", "{}"));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
-    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
-    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
-    try std.testing.expectEqual(
-        error.StorageReadTemporarilyUnavailable,
-        mapLookupError(error.ResourceBudgetExceeded),
-    );
-    try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
-}
-
-test "internal group reads are callable without an HTTP request" {
-    const alloc = std.testing.allocator;
-    const Fake = struct {
-        fn reads() table_reads.TableReadSource {
-            return .{ .ptr = undefined, .vtable = &.{
-                .lookup = publicLookup,
-                .scan = scan,
-                .query = query,
-                .lookup_group_local = groupLookup,
-            } };
-        }
-
-        fn shardDb() metadata_mod.ShardDbAdapter {
-            return .{ .ptr = undefined, .vtable = &.{
-                .fetch_median_key = medianKey,
-                .schema_index_ready = schemaIndexReady,
-            } };
-        }
-
-        fn publicLookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-            return null;
-        }
-
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-            return null;
-        }
-
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("query.zig").QueryResponse {
-            return null;
-        }
-
-        fn groupLookup(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, _: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-            try std.testing.expectEqual(@as(u64, 7), group_id);
-            try std.testing.expectEqualStrings("documents", table_name);
-            try std.testing.expectEqualStrings("doc:a", key);
-            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            return .{ .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"), .version = 42 };
-        }
-
-        fn medianKey(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
-            try std.testing.expectEqual(@as(u64, 7), group_id);
-            return try inner_alloc.dupe(u8, "doc:m");
-        }
-
-        fn schemaIndexReady(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64, _: u32, _: u32) !bool {
-            return true;
-        }
-    };
-
-    const operations = Operations{ .reads = Fake.reads(), .shard_db_adapter = Fake.shardDb() };
-    var lookup = try operations.lookup(alloc, .{}, .{
-        .group_id = 7,
-        .table_name = "documents",
-        .key = "doc:a",
-    });
-    defer lookup.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 42), lookup.version);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", lookup.json);
-
-    const median = (try operations.medianKey(alloc, .{}, 7)).?;
-    defer alloc.free(median);
-    try std.testing.expectEqualStrings("doc:m", median);
-    try std.testing.expectError(
-        error.NotFound,
-        operations.corruptEmbeddingArtifact(alloc, .{}, "documents", "doc:a", "embedding"),
-    );
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

@@ -14,7 +14,8 @@
 
 const std = @import("std");
 const batch_api = @import("../api/batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
+const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
@@ -25,14 +26,30 @@ pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.r
 pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
 pub const merge_copy_attempt_protocol_version = internal_batch_forwarding.raft_batch_merge_copy_attempt_protocol_version;
 
+pub const OwnedStorageOwnerDescriptor = struct {
+    descriptor: descriptor_contract.Descriptor,
+
+    pub fn view(self: *const OwnedStorageOwnerDescriptor) descriptor_contract.Descriptor {
+        return self.descriptor;
+    }
+
+    pub fn deinit(self: *OwnedStorageOwnerDescriptor, alloc: std.mem.Allocator) void {
+        alloc.free(self.descriptor.schema_json);
+        alloc.free(self.descriptor.indexes_json);
+        self.* = undefined;
+    }
+};
+
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
     batch: batch_api.OwnedBatchRequest,
+    storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
     protocol_barrier_version: ?u16 = null,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.batch.deinit(alloc);
+        if (self.storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -56,13 +73,26 @@ pub fn encodeProtocolBarrier(
 }
 
 pub fn encode(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) ![]u8 {
+    return try encodeWithStorageOwnerDescriptor(alloc, table_name, req, null);
+}
+
+pub fn encodeWithStorageOwnerDescriptor(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.BatchRequest,
+    descriptor: ?descriptor_contract.Descriptor,
+) ![]u8 {
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.print("{{\"table\":{f},\"batch\":", .{std.json.fmt(table_name, .{})});
+    try writer.print("{{\"table\":{f}", .{std.json.fmt(table_name, .{})});
+    if (descriptor) |value| {
+        try writer.print(",\"storage_owner\":{f}", .{std.json.fmt(value, .{})});
+    }
+    try writer.writeAll(",\"batch\":");
     try writer.writeAll(batch_json);
     try writer.writeByte('}');
     return try out.toOwnedSlice();
@@ -73,6 +103,21 @@ pub fn looksLikeEnvelope(payload: []const u8) bool {
     if (!std.mem.startsWith(u8, trimmed, "{")) return false;
     return std.mem.indexOf(u8, trimmed, "\"table\"") != null and
         std.mem.indexOf(u8, trimmed, "\"batch\"") != null;
+}
+
+fn cloneStorageOwnerDescriptor(
+    alloc: std.mem.Allocator,
+    descriptor: descriptor_contract.Descriptor,
+) !OwnedStorageOwnerDescriptor {
+    const schema_json = try alloc.dupe(u8, descriptor.schema_json);
+    errdefer alloc.free(schema_json);
+    return .{ .descriptor = .{
+        .lsm_root_generation = descriptor.lsm_root_generation,
+        .identity = descriptor.identity,
+        .table_storage = descriptor.table_storage,
+        .schema_json = schema_json,
+        .indexes_json = try alloc.dupe(u8, descriptor.indexes_json),
+    } };
 }
 
 pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBatch {
@@ -106,280 +151,332 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
     errdefer batch.deinit(alloc);
 
+    var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;
+    errdefer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
+    if (root.get("storage_owner")) |descriptor_value| {
+        var parsed_descriptor = try std.json.parseFromValue(
+            descriptor_contract.Descriptor,
+            alloc,
+            descriptor_value,
+            .{},
+        );
+        defer parsed_descriptor.deinit();
+        storage_owner_descriptor = try cloneStorageOwnerDescriptor(alloc, parsed_descriptor.value);
+    }
+
     return .{
         .table_name = table_name,
         .batch = batch,
+        .storage_owner_descriptor = storage_owner_descriptor,
     };
 }
 
-test "raft protocol barrier is fail closed for legacy batch parsers" {
-    try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
-    try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
-    try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
-    try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
-    try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
-    try std.testing.expectEqual(protocol_version, merge_copy_attempt_protocol_version);
-    const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
-    defer std.testing.allocator.free(encoded);
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "raft protocol barrier is fail closed for legacy batch parsers" {
+            try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
+            try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
+            try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
+            try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
+            try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
+            try std.testing.expectEqual(protocol_version, merge_copy_attempt_protocol_version);
+            const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
+            defer std.testing.allocator.free(encoded);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
-    defer parsed.deinit();
-    const batch_value = parsed.value.object.get("batch") orelse return error.TestExpectedEqual;
-    const batch_json = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(batch_value, .{})});
-    defer std.testing.allocator.free(batch_json);
-    try std.testing.expectError(
-        error.InvalidBatchRequest,
-        batch_api.parseInternalBatchRequest(std.testing.allocator, batch_json),
-    );
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+            defer parsed.deinit();
+            const batch_value = parsed.value.object.get("batch") orelse return error.TestExpectedEqual;
+            const batch_json = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(batch_value, .{})});
+            defer std.testing.allocator.free(batch_json);
+            try std.testing.expectError(
+                error.InvalidBatchRequest,
+                batch_api.parseInternalBatchRequest(std.testing.allocator, batch_json),
+            );
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
-    try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
+            try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+        }
 
-test "raft protocol barrier rejects unsupported future versions" {
-    const encoded = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
-        .{protocol_version + 1},
-    );
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectError(
-        error.UnsupportedRaftBatchProtocolVersion,
-        decode(std.testing.allocator, encoded),
-    );
-}
+        test "raft protocol barrier rejects unsupported future versions" {
+            const encoded = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
+                .{protocol_version + 1},
+            );
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expectError(
+                error.UnsupportedRaftBatchProtocolVersion,
+                decode(std.testing.allocator, encoded),
+            );
+        }
 
-test "raft batch envelope detector tolerates whitespace and object field order" {
-    try std.testing.expect(looksLikeEnvelope(" \n {\"batch\":{},\"table\":\"docs\"}"));
-    try std.testing.expect(looksLikeEnvelope("{\"table\":\"docs\",\"batch\":{}}"));
-    try std.testing.expect(!looksLikeEnvelope(""));
-    try std.testing.expect(!looksLikeEnvelope("{\"kind\":\"metadata\",\"value\":1}"));
-}
+        test "raft batch envelope detector tolerates whitespace and object field order" {
+            try std.testing.expect(looksLikeEnvelope(" \n {\"batch\":{},\"table\":\"docs\"}"));
+            try std.testing.expect(looksLikeEnvelope("{\"table\":\"docs\",\"batch\":{}}"));
+            try std.testing.expect(!looksLikeEnvelope(""));
+            try std.testing.expect(!looksLikeEnvelope("{\"kind\":\"metadata\",\"value\":1}"));
+        }
 
-test "raft batch round trips table batch payload" {
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
-        .deletes = &.{"doc:b"},
-        .timestamp_ns = 123,
-        .sync_level = .write,
-    });
-    defer std.testing.allocator.free(encoded);
+        test "raft batch round trips table batch payload" {
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+                .deletes = &.{"doc:b"},
+                .timestamp_ns = 123,
+                .sync_level = .write,
+            });
+            defer std.testing.allocator.free(encoded);
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("docs", decoded.table_name);
-    try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.writes.len);
-    try std.testing.expectEqualStrings("doc:a", decoded.batch.req.writes[0].key);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.batch.req.writes[0].value);
-    try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.deletes.len);
-    try std.testing.expectEqualStrings("doc:b", decoded.batch.req.deletes[0]);
-    try std.testing.expectEqual(@as(u64, 123), decoded.batch.req.timestamp_ns);
-    try std.testing.expectEqual(db_mod.types.SyncLevel.write, decoded.batch.req.sync_level);
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("docs", decoded.table_name);
+            try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:a", decoded.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.batch.req.writes[0].value);
+            try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:b", decoded.batch.req.deletes[0]);
+            try std.testing.expectEqual(@as(u64, 123), decoded.batch.req.timestamp_ns);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.write, decoded.batch.req.sync_level);
+        }
 
-test "raft batch round trips internal split checkpoint" {
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .split_checkpoint = .{
-            .kind = .destination_complete,
-            .transition_id = 40,
-            .attempt_epoch = 1,
-            .source_group_id = 41,
-            .destination_group_id = 42,
-            .range_start = "doc:m",
-            .range_end = "doc:z",
-            .delta_sequence = 7,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
+        test "raft batch round trips internal split checkpoint" {
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .split_checkpoint = .{
+                    .kind = .destination_complete,
+                    .transition_id = 40,
+                    .attempt_epoch = 1,
+                    .source_group_id = 41,
+                    .destination_group_id = 42,
+                    .range_start = "doc:m",
+                    .range_end = "doc:z",
+                    .delta_sequence = 7,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const checkpoint = decoded.batch.req.split_checkpoint orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
-    try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
-    try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
-    try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
-    try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
-    try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
-    try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const checkpoint = decoded.batch.req.split_checkpoint orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(db_mod.types.SplitReplicationCheckpoint.Kind.destination_complete, checkpoint.kind);
+            try std.testing.expectEqual(@as(u64, 40), checkpoint.transition_id);
+            try std.testing.expectEqual(@as(u64, 41), checkpoint.source_group_id);
+            try std.testing.expectEqual(@as(u64, 42), checkpoint.destination_group_id);
+            try std.testing.expectEqualStrings("doc:m", checkpoint.range_start);
+            try std.testing.expectEqualStrings("doc:z", checkpoint.range_end);
+            try std.testing.expectEqual(@as(u64, 7), checkpoint.delta_sequence);
+        }
 
-test "raft batch round trips internal split replication identity" {
-    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 41, .range_id = 4100 };
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .writes = &.{.{ .key = "doc:m", .value = "{}" }},
-        .split_replication = .{
-            .transition_id = 40,
-            .attempt_epoch = 1,
-            .source_group_id = 41,
-            .destination_group_id = 42,
-            .identity_namespace = namespace,
-            .operation = .delta,
-            .sequence = 19,
-            .previous_sequence = 17,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
+        test "raft batch round trips internal split replication identity" {
+            const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 41, .range_id = 4100 };
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .writes = &.{.{ .key = "doc:m", .value = "{}" }},
+                .split_replication = .{
+                    .transition_id = 40,
+                    .attempt_epoch = 1,
+                    .source_group_id = 41,
+                    .destination_group_id = 42,
+                    .identity_namespace = namespace,
+                    .operation = .delta,
+                    .sequence = 19,
+                    .previous_sequence = 17,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const replication = decoded.batch.req.split_replication orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
-    try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
-    try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
-    try std.testing.expect(replication.identity_namespace.eql(namespace));
-    try std.testing.expectEqual(@as(u64, 19), replication.sequence);
-    try std.testing.expectEqual(@as(u64, 17), replication.previous_sequence.?);
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const replication = decoded.batch.req.split_replication orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
+            try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
+            try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
+            try std.testing.expect(replication.identity_namespace.eql(namespace));
+            try std.testing.expectEqual(@as(u64, 19), replication.sequence);
+            try std.testing.expectEqual(@as(u64, 17), replication.previous_sequence.?);
+        }
 
-test "raft batch round trips internal merge checkpoint" {
-    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .merge_checkpoint = .{
-            .kind = .bootstrap_complete,
-            .transition_id = 40,
-            .donor_group_id = 41,
-            .receiver_group_id = 42,
-            .receiver_base_start = "doc:a",
-            .receiver_base_end = "doc:m",
-            .merged_start = "doc:a",
-            .merged_end = "doc:z",
-            .bootstrap_applied_index = 19,
-            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
-            .allow_doc_identity_reassignment = true,
-            .receiver_identity_reassignment_namespace = namespace,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
+        test "raft batch round trips internal merge checkpoint" {
+            const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .merge_checkpoint = .{
+                    .kind = .bootstrap_complete,
+                    .transition_id = 40,
+                    .donor_group_id = 41,
+                    .receiver_group_id = 42,
+                    .receiver_base_start = "doc:a",
+                    .receiver_base_end = "doc:m",
+                    .merged_start = "doc:a",
+                    .merged_end = "doc:z",
+                    .bootstrap_applied_index = 19,
+                    .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
+                    .allow_doc_identity_reassignment = true,
+                    .receiver_identity_reassignment_namespace = namespace,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const checkpoint = decoded.batch.req.merge_checkpoint orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.MergeReplicationCheckpoint.Kind.bootstrap_complete, checkpoint.kind);
-    try std.testing.expectEqual(@as(u64, 41), checkpoint.donor_group_id);
-    try std.testing.expectEqual(@as(u64, 42), checkpoint.receiver_group_id);
-    try std.testing.expectEqualStrings("doc:m", checkpoint.receiver_base_end);
-    try std.testing.expectEqualStrings("doc:z", checkpoint.merged_end);
-    try std.testing.expectEqual(@as(u64, 19), checkpoint.bootstrap_applied_index);
-    try std.testing.expectEqual(@as(u64, 8), checkpoint.copy_attempt.donor_term);
-    try std.testing.expectEqual(@as(u64, 9), checkpoint.copy_attempt.sequence);
-    try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const checkpoint = decoded.batch.req.merge_checkpoint orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(db_mod.types.MergeReplicationCheckpoint.Kind.bootstrap_complete, checkpoint.kind);
+            try std.testing.expectEqual(@as(u64, 41), checkpoint.donor_group_id);
+            try std.testing.expectEqual(@as(u64, 42), checkpoint.receiver_group_id);
+            try std.testing.expectEqualStrings("doc:m", checkpoint.receiver_base_end);
+            try std.testing.expectEqualStrings("doc:z", checkpoint.merged_end);
+            try std.testing.expectEqual(@as(u64, 19), checkpoint.bootstrap_applied_index);
+            try std.testing.expectEqual(@as(u64, 8), checkpoint.copy_attempt.donor_term);
+            try std.testing.expectEqual(@as(u64, 9), checkpoint.copy_attempt.sequence);
+            try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
+        }
 
-test "raft batch round trips merge replay identity with checkpoint" {
-    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .merge_checkpoint = .{
-            .kind = .begin_copy,
-            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
-            .transition_id = 40,
-            .donor_group_id = 41,
-            .receiver_group_id = 42,
-            .receiver_base_start = "doc:m",
-            .receiver_base_end = "",
-            .merged_start = "doc:a",
-            .merged_end = "",
-            .allow_doc_identity_reassignment = true,
-            .receiver_identity_reassignment_namespace = namespace,
-        },
-        .merge_replication = .{
-            .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
-            .transition_id = 40,
-            .donor_group_id = 41,
-            .receiver_group_id = 42,
-            .identity_namespace = namespace,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
+        test "raft batch round trips merge replay identity with checkpoint" {
+            const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .merge_checkpoint = .{
+                    .kind = .begin_copy,
+                    .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
+                    .transition_id = 40,
+                    .donor_group_id = 41,
+                    .receiver_group_id = 42,
+                    .receiver_base_start = "doc:m",
+                    .receiver_base_end = "",
+                    .merged_start = "doc:a",
+                    .merged_end = "",
+                    .allow_doc_identity_reassignment = true,
+                    .receiver_identity_reassignment_namespace = namespace,
+                },
+                .merge_replication = .{
+                    .copy_attempt = .{ .donor_term = 8, .sequence = 9 },
+                    .transition_id = 40,
+                    .donor_group_id = 41,
+                    .receiver_group_id = 42,
+                    .identity_namespace = namespace,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
 
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const replication = decoded.batch.req.merge_replication orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
-    try std.testing.expectEqual(@as(u64, 41), replication.donor_group_id);
-    try std.testing.expectEqual(@as(u64, 42), replication.receiver_group_id);
-    try std.testing.expect(replication.identity_namespace.eql(namespace));
-    try std.testing.expectEqual(@as(u64, 8), replication.copy_attempt.donor_term);
-    try std.testing.expectEqual(@as(u64, 9), replication.copy_attempt.sequence);
-    var mismatched = decoded.batch.req;
-    mismatched.merge_replication.?.copy_attempt.sequence += 1;
-    try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", mismatched));
-    var bundled = decoded.batch.req;
-    bundled.merge_checkpoint.?.kind = .rollback;
-    bundled.deletes = &.{"doc:b"};
-    try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", bundled));
-}
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const replication = decoded.batch.req.merge_replication orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
+            try std.testing.expectEqual(@as(u64, 41), replication.donor_group_id);
+            try std.testing.expectEqual(@as(u64, 42), replication.receiver_group_id);
+            try std.testing.expect(replication.identity_namespace.eql(namespace));
+            try std.testing.expectEqual(@as(u64, 8), replication.copy_attempt.donor_term);
+            try std.testing.expectEqual(@as(u64, 9), replication.copy_attempt.sequence);
+            var mismatched = decoded.batch.req;
+            mismatched.merge_replication.?.copy_attempt.sequence += 1;
+            try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", mismatched));
+            var bundled = decoded.batch.req;
+            bundled.merge_checkpoint.?.kind = .rollback;
+            bundled.deletes = &.{"doc:b"};
+            try std.testing.expectError(error.InvalidBatchRequest, encode(std.testing.allocator, "docs", bundled));
+        }
 
-test "raft batch round trips merge artifacts and rejects public or unscoped payloads" {
-    const alloc = std.testing.allocator;
-    const keys = @import("../storage/internal_keys.zig");
-    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense");
-    defer alloc.free(key);
-    const artifacts = [_]db_mod.types.BatchWrite{.{ .key = key, .value = "\x00\xff\x01opaque" }};
-    const req: db_mod.types.BatchRequest = .{
-        .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 } },
-        .merge_artifacts = &artifacts,
+        test "raft batch round trips merge artifacts and rejects public or unscoped payloads" {
+            const alloc = std.testing.allocator;
+            const keys = @import("../storage/internal_keys.zig");
+            const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense");
+            defer alloc.free(key);
+            const artifacts = [_]db_mod.types.BatchWrite{.{ .key = key, .value = "\x00\xff\x01opaque" }};
+            const req: db_mod.types.BatchRequest = .{
+                .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 } },
+                .merge_artifacts = &artifacts,
+            };
+            const encoded = try encode(alloc, "docs", req);
+            defer alloc.free(encoded);
+            var decoded = try decode(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.merge_artifacts.len);
+            try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+            try std.testing.expectEqualSlices(u8, artifacts[0].value, decoded.batch.req.merge_artifacts[0].value);
+            const body = try batch_api.encodeBatchRequest(alloc, req);
+            defer alloc.free(body);
+            try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, body));
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{ .merge_artifacts = &artifacts }));
+            var mixed = req;
+            mixed.writes = &.{.{ .key = "doc:a", .value = "{}" }};
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", mixed));
+            var metadata = req;
+            metadata.merge_artifacts = &.{.{ .key = "\x00\x00__metadata__:unsafe", .value = "{}" }};
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", metadata));
+        }
+
+        test "raft batch round trips merge source transition" {
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .merge_source_transition = .{
+                    .kind = .finalize,
+                    .transition_id = 40,
+                    .receiver_group_id = 42,
+                },
+            });
+            defer std.testing.allocator.free(encoded);
+
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const transition = decoded.batch.req.merge_source_transition orelse
+                return error.TestExpectedEqual;
+            try std.testing.expectEqual(db_mod.types.MergeSourceTransitionMutation.Kind.finalize, transition.kind);
+            try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
+            try std.testing.expectEqual(@as(u64, 42), transition.receiver_group_id);
+        }
+
+        test "raft batch round trips deterministic storage owner descriptor" {
+            const descriptor = descriptor_contract.Descriptor{
+                .lsm_root_generation = 9,
+                .table_storage = .{ .dense_embeddings = .vector_store },
+                .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 4200 },
+                .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
+                .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
+            };
+            const encoded = try encodeWithStorageOwnerDescriptor(
+                std.testing.allocator,
+                "docs",
+                .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} },
+                descriptor,
+            );
+            defer std.testing.allocator.free(encoded);
+
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const actual = decoded.storage_owner_descriptor orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(descriptor.lsm_root_generation, actual.descriptor.lsm_root_generation);
+            try std.testing.expect(actual.descriptor.identity.eql(descriptor.identity));
+            try std.testing.expectEqualDeep(descriptor.table_storage, actual.descriptor.table_storage);
+            try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
+            try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
+        }
+
+        test "raft batch round trips deterministic transaction begin" {
+            const txn_id: db_mod.types.TxnId = .{1} ** 16;
+            const encoded = try encode(std.testing.allocator, "docs", .{
+                .transaction = .{ .begin = .{
+                    .txn_id = txn_id,
+                    .begin_timestamp = 100,
+                    .created_at_ns = 200,
+                    .topology_epoch = 3,
+                    .participants = &.{ "table2:4:docs:group:7", "table2:5:other:group:8" },
+                } },
+            });
+            defer std.testing.allocator.free(encoded);
+
+            var decoded = try decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            const begin = switch (decoded.batch.req.transaction orelse return error.TestExpectedEqual) {
+                .begin => |value| value,
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(txn_id, begin.txn_id);
+            try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
+            try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+        }
     };
-    const encoded = try encode(alloc, "docs", req);
-    defer alloc.free(encoded);
-    var decoded = try decode(alloc, encoded);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), decoded.batch.req.merge_artifacts.len);
-    try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
-    try std.testing.expectEqualSlices(u8, artifacts[0].value, decoded.batch.req.merge_artifacts[0].value);
-    const body = try batch_api.encodeBatchRequest(alloc, req);
-    defer alloc.free(body);
-    try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, body));
-    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{ .merge_artifacts = &artifacts }));
-    var mixed = req;
-    mixed.writes = &.{.{ .key = "doc:a", .value = "{}" }};
-    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", mixed));
-    var metadata = req;
-    metadata.merge_artifacts = &.{.{ .key = "\x00\x00__metadata__:unsafe", .value = "{}" }};
-    try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", metadata));
+    return Suite;
 }
-
-test "raft batch round trips merge source transition" {
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .merge_source_transition = .{
-            .kind = .finalize,
-            .transition_id = 40,
-            .receiver_group_id = 42,
-        },
-    });
-    defer std.testing.allocator.free(encoded);
-
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const transition = decoded.batch.req.merge_source_transition orelse
-        return error.TestExpectedEqual;
-    try std.testing.expectEqual(db_mod.types.MergeSourceTransitionMutation.Kind.finalize, transition.kind);
-    try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
-    try std.testing.expectEqual(@as(u64, 42), transition.receiver_group_id);
-}
-
-test "raft batch round trips deterministic transaction begin" {
-    const txn_id: db_mod.types.TxnId = .{1} ** 16;
-    const encoded = try encode(std.testing.allocator, "docs", .{
-        .transaction = .{ .begin = .{
-            .txn_id = txn_id,
-            .begin_timestamp = 100,
-            .created_at_ns = 200,
-            .topology_epoch = 3,
-            .participants = &.{ "table2:4:docs:group:7", "table2:5:other:group:8" },
-        } },
-    });
-    defer std.testing.allocator.free(encoded);
-
-    var decoded = try decode(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    const begin = switch (decoded.batch.req.transaction orelse return error.TestExpectedEqual) {
-        .begin => |value| value,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqual(txn_id, begin.txn_id);
-    try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
-    try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antfly is a distributed key-value store and vector search engine with a Zig server runtime. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
 
-The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/`, and each must be built from within its own directory. The Antfly and inference servers live under `zig/`.
+The Go tree contains client SDKs, bindings, the operator, proxies, and supporting libraries. Multiple independent Go modules exist under `go/pkg/` (`sdk`, `operator`, `docsaf`, `evalaf`, `genkit`, `memoryaf`, `proxy`, `antflylite`), and each must be built from within its own directory with `GOWORK=off` (the Makefiles set this). The Antfly and inference servers live under `zig/`.
 
 ## Go Version
 
@@ -40,9 +40,9 @@ See `docs/architecture.mdx` for full details.
 - `docs/`: Hand-written documentation (synced into colony/frontend/apps/www-antfly at build time)
 
 **Data Organization**:
-- **Shards**: Horizontal partitions by key range (`common.Range`)
+- **Shards**: Horizontal partitions by key range
 - **Tables**: Multiple shards with configurable replication
-- **Indexes**: `bleve` (full-text BM25), `embeddingindex` (vector), `remote` (proxy), enrichers (embeddings/summaries)
+- **Indexes**: `full_text` (BM25), `embeddings` (dense, sparse, and late-interaction vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations). Enrichments (chunking, embeddings, extraction, summaries) are declared inline on the index config; see `specs/openapi/antfly/indexes.yaml`
 
 **Storage**: LSM storage + Raft consensus, with separate runtime paths for provisioned, serverless, and embedded Lite deployments.
 
@@ -88,8 +88,8 @@ make build
 
 **Adding endpoints**:
 1. Update the relevant spec under `specs/openapi/`
-2. Run `make generate`
-3. Implement handler
+2. Run `make generate` (regenerates Zig types, joins the public `openapi.yaml`, regenerates the SDKs and docs)
+3. Implement the handler under `zig/pkg/antfly/src/api/`
 
 **Client SDKs**: Auto-generated in `go/pkg/sdk/`, `ts/packages/sdk/`, `py/packages/sdk/`, and `rs/crates/sdk/`.
 

@@ -17,6 +17,7 @@
 //! coupling it to the monolithic storage test artifact.
 
 const query = @import("api/query.zig");
+pub const antfly_sources = @import("source_owner_physical.zig");
 const distributed_graph = @import("api/distributed_graph.zig");
 const openapi_contract = @import("api/openapi_contract.zig");
 const indexes = @import("api/indexes.zig");

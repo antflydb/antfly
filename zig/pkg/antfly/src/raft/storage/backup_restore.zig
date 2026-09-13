@@ -17,7 +17,7 @@ const system_catalog = @import("../../system_catalog/domain.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../../storage/db/selected_root.zig").db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
@@ -169,6 +169,15 @@ pub const PreparedRestore = struct {
 
     pub fn seal(self: *@This()) !void {
         try self._generation.seal();
+    }
+
+    /// Transfer the prepared generation into a publication handle after all
+    /// restore-only repair opens are complete. The native plan is immutable
+    /// admission evidence and has no owned resources after this point.
+    pub fn takeStagedGeneration(self: *@This()) db_mod.generation_lifecycle.StagedGeneration {
+        const generation = self._generation;
+        self._generation = undefined;
+        return generation;
     }
 };
 
@@ -1085,7 +1094,7 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
+pub fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
     destroyPathIfExistsWithIo(io, snapshot_dir);

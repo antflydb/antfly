@@ -23,17 +23,17 @@ pub const resource_manager = @import("storage/resource_manager.zig");
 pub const roaring = @import("encoding/roaring.zig");
 
 pub const db = struct {
-    pub const OpenMode = @import("storage/db/db.zig").OpenMode;
-    pub const ReplayProgress = @import("storage/db/db.zig").ReplayProgress;
+    pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
+    pub const ReplayProgress = @import("antfly_source_root").antfly_sources.physical_db.ReplayProgress;
     pub const embedder = @import("storage/db/enrichment/embedder.zig");
     pub const replay_stream = @import("storage/db/derived/replay_stream.zig");
     pub const backfill_state = @import("storage/db/backfill_state.zig");
     pub const freeDBStats = @import("storage/db/types.zig").freeDBStats;
     pub const doc_identity = @import("storage/db/doc_identity.zig");
     pub const doc_set = @import("storage/db/doc_set.zig");
-    pub const BatchProfile = @import("storage/db/db.zig").BatchProfile;
-    pub const OpenOptions = @import("storage/db/db.zig").OpenOptions;
-    pub const DB = @import("storage/db/db.zig").DB;
+    pub const BatchProfile = @import("antfly_source_root").antfly_sources.physical_db.BatchProfile;
+    pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
+    pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
     pub const IndexManager = @import("storage/db/catalog/index_manager.zig").IndexManager;
     pub const aggregations = @import("storage/db/aggregations.zig");
     pub const algebraic = @import("storage/db/algebraic/mod.zig");
@@ -50,3 +50,6 @@ pub const metadata_api = @import("metadata/api.zig");
 pub const metadata = @import("metadata/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

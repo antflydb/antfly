@@ -19,23 +19,9 @@ const std = @import("std");
 const docstore = @import("../storage/docstore.zig");
 const domain = @import("domain.zig");
 
-pub const Meta = struct {
-    version: u16 = 1,
-    revision: u64 = 0,
-    next_id: u64 = 3,
-    last_command: [32]u8 = @splat(0),
-};
+pub const Meta = domain.Meta;
 
-pub const OwnedState = struct {
-    arena: std.heap.ArenaAllocator,
-    meta: Meta,
-    value: domain.State,
-
-    pub fn deinit(self: *@This()) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const OwnedState = domain.OwnedState;
 
 pub fn prefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "\x00\x00__metadata__:system_catalog:{d}:", .{group_id});

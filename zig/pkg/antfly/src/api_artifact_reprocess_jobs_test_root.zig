@@ -19,7 +19,7 @@ const http_client = @import("api/http_client.zig");
 const internal_transition_wire = @import("api/internal_transition_wire.zig");
 const http_routes = @import("api/http_routes.zig");
 const repair_jobs = @import("api/repair_jobs.zig");
-const db_mod = @import("storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 
 test {
     std.testing.refAllDecls(artifact_reprocess_jobs);
@@ -233,3 +233,6 @@ test "repair job store does not expire future live running heartbeat" {
     try std.testing.expectEqual(@as(u64, 4), parsed_begin.value.attempt_id);
     try std.testing.expectEqualStrings("running", parsed_begin.value.phase);
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

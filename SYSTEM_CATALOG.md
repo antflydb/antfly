@@ -461,13 +461,20 @@ best-effort patch. Unsupported peers use the existing full/reference endpoints.
 An empty delta with an unchanged header returns the existing applied cursor;
 acknowledging a transport sequence alone does not require a Raft entry.
 
-Once every protected metadata member demonstrates protocol 8 support, command 57
+Once every protected metadata member demonstrates protocol 9 support, command 57
 persists the activated version with the cluster incarnation and membership
 fingerprint. Elections and reopen reuse that proof; a membership change requires
-fresh validation. The activation row is included in Raft snapshots. Proposal
+fresh validation. Protocol 8 members still support sparse reports, but cannot
+admit the new activation command until all members advertise its decoder.
+The activation row is included in Raft snapshots. Proposal
 admission rechecks the observed term and membership under the catalog gate before
 committing activation. Upgrade-required errors retain their typed runtime ABI and
 HTTP 426 contract rather than becoming an untransportable runtime failure.
+
+Report failover pins its endpoint order for the entire attempt. An authoritative
+base-mismatch response returns directly to the publisher so it can send a full
+inventory; later follower responses cannot replace that recovery signal. This is
+required for replica retirement and draining as well as ordinary lost baselines.
 
 The acknowledged baseline retains the last transmitted observation clocks for
 unchanged groups. Local clock coalescing therefore cannot keep delaying the
@@ -642,3 +649,27 @@ a client still materializes the complete compact view, and diagnostic export sti
 owns the full diagnostic payload. A changed or expired transfer is restarted as a
 whole; pages from different captures are never combined. Full initial uploads and
 the diagnostic export ceiling remain explicit capacity limits.
+
+
+### Compiled storage ownership
+
+Catalog operations cross the storage boundary as complete requests: admission,
+qualified resolution, scoped listing, export, and targeted report reads each
+retain one storage transaction in the owner. Control code receives owned values;
+it never reaches through the boundary to a backend cursor. The apply progress
+contract carries a fixed-size checkpoint, without retaining replay bytes in the
+client. Sparse projection notifications preserve changed-group IDs and separate
+group/runtime invalidation flags through the synchronous callback boundary.
+
+Portable HA seed catalog validation lives with the storage-free seed topology
+contract, so both distributed capture and physical materialization enforce the
+same identity rules. Restore publication resolves the current destination group
+from the catalog; the manifest's source group selects the backup artifact.
+
+The compiled boundary retains all status strings before response arenas are
+released. Bounded status vocabularies are re-interned, including enrichment,
+projection, repair and schema lifecycle states. Graph traversal retains physical
+edge provenance only when paths are requested, sharing ancestry while queued.
+Native restore checks catalog compatibility after primary transfer and validates
+physical projection checkpoints after their artifacts are installed, before the
+restored generation is published.

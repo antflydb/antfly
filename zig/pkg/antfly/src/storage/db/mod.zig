@@ -86,35 +86,36 @@ pub const promotion_runtime = @import("promotion_runtime.zig");
 pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
-pub const DB = @import("db.zig").DB;
-pub const RaftAppliedEntryIdentity = @import("db.zig").RaftAppliedEntryIdentity;
+pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+pub const RaftAppliedEntryIdentity = @import("antfly_source_root").antfly_sources.physical_db.RaftAppliedEntryIdentity;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;
-pub const documentExtractionStoredUnitFingerprintAlloc = @import("db.zig").documentExtractionStoredUnitFingerprintAlloc;
-pub const DocumentArtifactChildRangeApplyBatch = @import("db.zig").DocumentArtifactChildRangeApplyBatch;
-pub const DocumentArtifactChildRangeDispatch = @import("db.zig").DocumentArtifactChildRangeDispatch;
-pub const DocumentArtifactChildRangeDispatcher = @import("db.zig").DocumentArtifactChildRangeDispatcher;
-pub const OpenOptions = @import("db.zig").OpenOptions;
-pub const SchemaBeforeIndexLoad = @import("db.zig").SchemaBeforeIndexLoad;
-pub const DenseNativeMigrationPolicySource = @import("db.zig").DenseNativeMigrationPolicySource;
-pub const NativeRestoreOpenPlan = @import("db.zig").NativeRestoreOpenPlan;
-pub const OpenMode = @import("db.zig").OpenMode;
-pub const HAAsyncEffectMirror = @import("db.zig").HAAsyncEffectMirror;
-pub const HAAsyncBatchMirror = @import("db.zig").HAAsyncBatchMirror;
-pub const HAAsyncMetadataMirror = @import("db.zig").HAAsyncMetadataMirror;
-pub const HAMutationBarrier = @import("db.zig").HAMutationBarrier;
-pub const HAProgressPollFn = @import("db.zig").HAProgressPollFn;
-pub const HAPrimaryProgressSyncWait = @import("db.zig").HAPrimaryProgressSyncWait;
-pub const HAWriteGate = @import("db.zig").HAWriteGate;
+pub const documentExtractionStoredUnitFingerprintAlloc = @import("antfly_source_root").antfly_sources.physical_db.documentExtractionStoredUnitFingerprintAlloc;
+pub const DocumentArtifactChildRangeApplyBatch = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeApplyBatch;
+pub const DocumentArtifactChildRangeDispatch = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeDispatch;
+pub const DocumentArtifactChildRangeDispatcher = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeDispatcher;
+pub const CommittedBatchEffectsObserver = @import("antfly_source_root").antfly_sources.physical_db.CommittedBatchEffectsObserver;
+pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
+pub const DenseNativeMigrationPolicySource = @import("antfly_source_root").antfly_sources.physical_db.DenseNativeMigrationPolicySource;
+pub const NativeRestoreOpenPlan = @import("antfly_source_root").antfly_sources.physical_db.NativeRestoreOpenPlan;
+pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
+pub const HAAsyncEffectMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncEffectMirror;
+pub const HAAsyncBatchMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncBatchMirror;
+pub const HAAsyncMetadataMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncMetadataMirror;
+pub const HAMutationBarrier = @import("antfly_source_root").antfly_sources.physical_db.HAMutationBarrier;
+pub const HAProgressPollFn = @import("antfly_source_root").antfly_sources.physical_db.HAProgressPollFn;
+pub const HAPrimaryProgressSyncWait = @import("antfly_source_root").antfly_sources.physical_db.HAPrimaryProgressSyncWait;
+pub const HAWriteGate = @import("antfly_source_root").antfly_sources.physical_db.HAWriteGate;
+pub const SchemaBeforeIndexLoad = @import("antfly_source_root").antfly_sources.physical_db.SchemaBeforeIndexLoad;
 pub const HAReplicationRecordView = @import("../ha/replication_record.zig").RecordView;
-pub const ReplayProgress = @import("db.zig").ReplayProgress;
-pub const QueryVisibilityHook = @import("db.zig").QueryVisibilityHook;
-pub const QueryVisibilityChange = @import("db.zig").QueryVisibilityChange;
-pub const QueryVisibilityEvent = @import("db.zig").QueryVisibilityEvent;
-pub const IndexRepairVisibility = @import("db.zig").IndexRepairVisibility;
-pub const IndexRepairAdmission = @import("db.zig").IndexRepairAdmission;
-pub const DerivedReplayDebtStatus = @import("db.zig").DerivedReplayDebtStatus;
-pub const BatchProfile = @import("db.zig").BatchProfile;
+pub const ReplayProgress = @import("antfly_source_root").antfly_sources.physical_db.ReplayProgress;
+pub const QueryVisibilityHook = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityHook;
+pub const QueryVisibilityChange = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityChange;
+pub const QueryVisibilityEvent = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityEvent;
+pub const IndexRepairVisibility = @import("antfly_source_root").antfly_sources.physical_db.IndexRepairVisibility;
+pub const IndexRepairAdmission = @import("antfly_source_root").antfly_sources.physical_db.IndexRepairAdmission;
+pub const DerivedReplayDebtStatus = @import("antfly_source_root").antfly_sources.physical_db.DerivedReplayDebtStatus;
+pub const BatchProfile = @import("antfly_source_root").antfly_sources.physical_db.BatchProfile;
 pub const RuntimePreflight = query_search.RuntimePreflight;
 pub const RuntimePreflightSummary = query_search.RuntimePreflightSummary;
 pub const SortRejectionDiagnostic = query_search.SortRejectionDiagnostic;
@@ -132,11 +133,15 @@ pub const TextFieldStats = distributed_stats.TextFieldStats;
 pub const TermDocFreq = distributed_stats.TermDocFreq;
 
 pub fn preflightRuntimeAlloc(alloc: std.mem.Allocator, runtime: RuntimePreflight) !RuntimePreflightSummary {
-    return try query_search.preflightRuntimeAlloc(alloc, runtime);
+    return try @import("runtime_preflight.zig").preflightRuntimeAlloc(alloc, .{
+        .has_full_text_results = runtime.has_full_text_results,
+        .embedding_result_names = runtime.embedding_result_names,
+        .graph_queries = runtime.graph_queries,
+    });
 }
 
 pub fn preflightSearchRequestAlloc(alloc: std.mem.Allocator, req: types.SearchRequest) !RuntimePreflightSummary {
-    return try query_search.preflightSearchRequestAlloc(alloc, req);
+    return try @import("runtime_preflight.zig").preflightSearchRequestAlloc(alloc, req);
 }
 
 pub fn deriveRuntimePreflightEstimates(summary: *RuntimePreflightSummary) void {
@@ -159,7 +164,7 @@ pub fn validateStructuredFilterValueAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) !void {
-    return query_search.validateStructuredFilterValueAlloc(alloc, value);
+    return @import("query/structured_filter_validation.zig").validateStructuredFilterValueAlloc(alloc, value);
 }
 
 pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {

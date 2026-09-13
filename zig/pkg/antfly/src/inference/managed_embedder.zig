@@ -62,6 +62,8 @@ const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
 var traced_local_batches = std.atomic.Value(u64).init(0);
 
+pub const SparseEmbedding = db_embedder.SparseEmbedding;
+
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
     return std.c.getenv(name);

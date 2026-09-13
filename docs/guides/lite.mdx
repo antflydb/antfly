@@ -109,7 +109,10 @@ antfly lite index create app.aflite --file full-text-index.json
 antfly lite run-until-idle app.aflite
 ```
 
-A query against it (`query.json`):
+A query against it (`query.json`). Note that the `antfly lite` CLI's query JSON
+takes a nested `match: {field, text}` object here, unlike the public `/db/v1`
+API's flat `match: {match: string, field: string}` shape used elsewhere in the
+docs:
 
 ```json
 {

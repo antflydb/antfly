@@ -119,7 +119,7 @@ Changing source membership, projection fields, analyzer semantics, embedding spa
 
 `sources` is the canonical multi-source API. Three one-source alternatives are supported and not deprecated: full-text `artifact_name`, embeddings `embedding_name`, and graph `source`. Normalized responses expose canonical `sources` where the released contract requires it.
 
-The released v0.2 embeddings fields remain supported for v0.2 compatibility, with no removal release scheduled. `source_artifact_name` is descriptive when paired with `embedding_name`; the matching enrichment is authoritative. Internal graph manifest and edge materialization fields are engine-owned, not alternate public APIs. No graph status aliases were released, and the unreleased Go v0.2 SDK surface creates no additional compatibility obligation.
+The released v0.2 embeddings fields remain supported for v0.2 compatibility, with no removal release scheduled. `source_artifact_name` is descriptive when paired with `embedding_name`; the matching enrichment is authoritative. Internal graph manifest and edge materialization fields are engine-owned, not alternate public APIs. No graph status aliases were released, and the released Go v0.2 SDK surface (`go/pkg/sdk/v0.2.0`) creates no additional compatibility obligation.
 
 ## Use Agent Skills
 
@@ -135,5 +135,5 @@ Then prompt it with the outcome, for example "Create an artifact-backed embeddin
 ## Next Steps
 
 - [Document Engine](/docs/guides/document-engine): how the planner composes full-text, vector, filter, and graph inputs over any index
-- [Build Image Search](/docs/guides/multimodal): a single-source embeddings index over remote media
+- [Multimodal Embeddings](/docs/guides/multimodal): a single-source embeddings index over remote media
 - [Tune Hybrid Search](/docs/guides/hybrid-search): fusion, reranking, and pruning over the results

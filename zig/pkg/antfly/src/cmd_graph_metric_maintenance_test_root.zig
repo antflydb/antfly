@@ -13,6 +13,7 @@
 // limitations.
 
 const graph_metric_maintenance = @import("cmd/graph_metric_maintenance.zig");
+pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
     _ = graph_metric_maintenance;

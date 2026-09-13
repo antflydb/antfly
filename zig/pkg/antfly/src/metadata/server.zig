@@ -15,6 +15,8 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const metadata_mod = @import("domain.zig");
 const metadata_authority = @import("authority.zig");
 const service = @import("service.zig");
@@ -24,9 +26,10 @@ const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
 const public_api_kernel = @import("../api/kernel_bridge.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const api_table_reads = @import("../api/table_reads.zig");
+const api_kernel_owner_source = @import("../api/kernel_owner_source.zig");
+const api_table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const api_table_router = @import("../api/table_router.zig");
-const api_table_writes = @import("../api/table_writes.zig");
+const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const reranking = @import("../reranking/mod.zig");
 const restore_jobs = @import("../api/restore_jobs.zig");
 const raft = @import("../raft/mod.zig");
@@ -38,6 +41,11 @@ const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const health_server = @import("../common/health_server.zig");
+
+const MetadataKernelOwnerSource = if (control_only_storage_sources)
+    api_kernel_owner_source.ProvisionedKernelOwnerSource
+else
+    void;
 
 pub const MetadataServerConfig = struct {
     http: raft_managed_host.ManagedHttpHostConfig,
@@ -79,6 +87,7 @@ pub const MetadataServer = struct {
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
     owned_reranker_runtime: ?*reranking.Runtime = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null,
@@ -161,6 +170,13 @@ pub const MetadataServer = struct {
             alloc.destroy(runtime);
         };
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
+        var owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null;
+        errdefer if (comptime control_only_storage_sources) {
+            if (owned_kernel_owner_source) |owner_source| {
+                owner_source.deinit();
+                alloc.destroy(owner_source);
+            }
+        };
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
         var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
@@ -230,7 +246,22 @@ pub const MetadataServer = struct {
             _ = public_read_source.withRerankerRuntime(reranker_runtime);
             _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
             owned_reranker_runtime = reranker_runtime;
-            _ = public_write_source.withBackendRuntime(backend_runtime);
+            if (comptime control_only_storage_sources) {
+                const owner_source = try alloc.create(api_kernel_owner_source.ProvisionedKernelOwnerSource);
+                owner_source.* = api_kernel_owner_source.ProvisionedKernelOwnerSource.init(
+                    alloc,
+                    replica_root_dir,
+                    catalog,
+                    raft.read_gate.alreadyReadSafeBarrier(),
+                );
+                _ = owner_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+                owned_kernel_owner_source = owner_source;
+                _ = public_read_source.withLocalReadSource(owner_source.readSource());
+                _ = public_write_source.withLocalWriteSource(owner_source.writeSource());
+                _ = owner_source.withDocumentChildRangeDispatchSource(public_write_source.source());
+            } else {
+                _ = public_write_source.withBackendRuntime(backend_runtime);
+            }
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
@@ -316,6 +347,7 @@ pub const MetadataServer = struct {
             .owned_public_read_source = owned_public_read_source,
             .owned_reranker_runtime = owned_reranker_runtime,
             .owned_public_write_source = owned_public_write_source,
+            .owned_kernel_owner_source = owned_kernel_owner_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
             .http_observer_lease = http_observer_lease,
@@ -361,6 +393,12 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
+        }
+        if (comptime control_only_storage_sources) {
+            if (self.owned_kernel_owner_source) |owner_source| {
+                owner_source.deinit();
+                self.alloc.destroy(owner_source);
+            }
         }
         if (self.owned_reranker_runtime) |runtime| {
             runtime.deinit();
@@ -1297,6 +1335,7 @@ fn activateIndex(
 fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     if (svc.local_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
+    if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
     const replica_root_dir = svc.replica_root_dir orelse return error.UnsupportedOperation;
     var shard_db = metadata_mod.FallbackLocalShardDbAdapter{
         .replica_root_dir = replica_root_dir,
@@ -1317,6 +1356,7 @@ fn schemaIndexReady(
     if (svc.local_shard_db_adapter) |adapter| {
         return try adapter.schemaIndexReady(alloc, table_name, group_id, schema_version, read_schema_version);
     }
+    if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
     const replica_root_dir = svc.replica_root_dir orelse return error.UnsupportedOperation;
     var shard_db = metadata_mod.FallbackLocalShardDbAdapter{
         .replica_root_dir = replica_root_dir,

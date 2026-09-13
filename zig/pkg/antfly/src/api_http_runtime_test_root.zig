@@ -60,3 +60,13 @@ test {
     _ = table_contract;
     _ = table_read_source;
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");
+
+test "system catalog routing and transport discovery" {
+    _ = @import("api/table_reads.zig").consumer_tests;
+    _ = @import("api/table_catalog.zig");
+    _ = @import("api/distributed_candidate_source.zig");
+    _ = @import("api/distributed_entity_sink.zig");
+}

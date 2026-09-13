@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const json_helpers = @import("json_helpers.zig");
 
 pub const Allocator = std.mem.Allocator;

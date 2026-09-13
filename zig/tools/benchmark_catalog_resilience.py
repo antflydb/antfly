@@ -46,7 +46,7 @@ def run(args):
         for independent in (False, True):
             barrier = threading.Barrier(2, timeout=30)
 
-            def telemetry():
+            def telemetry(barrier=barrier, independent=independent):
                 nonlocal sequence
                 session = requests.Session()
                 measured = []
@@ -94,7 +94,7 @@ def run(args):
                 finally:
                     session.close()
 
-            def ddl():
+            def ddl(barrier=barrier, independent=independent):
                 barrier.wait()
                 measured = []
                 for sample in range(args.samples + args.warmup):

@@ -229,7 +229,7 @@ Passing / skipped Antfly E2E areas in the latest full run:
 
 ## Pruned Stale Parity Items
 
-These old `PARITY.md` items were checked against the current tree and are no
+These items from the former inference `PARITY.md` (removed; it tracked parity against the retired Go inference server) were checked against the current tree and are no
 longer tracked as open bring-up work:
 
 - Query-builder API: implemented in `pkg/antfly/src/api/query_builder_agent.zig`

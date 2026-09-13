@@ -58,6 +58,7 @@ pub fn makeRootBuildOptions(
     link_libc: bool,
     standalone_runtime_focused_test: bool,
     lmdb_enabled: bool,
+    linked_storage: bool,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
     // Disabled storage engines must not change the production module identity.
@@ -69,6 +70,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
     options.addOption(bool, "lmdb_enabled", lmdb_enabled);
     options.addOption(bool, "bench_minimal_deps", false);
+    options.addOption(bool, "linked_storage", linked_storage);
     return options;
 }
 
@@ -125,6 +127,7 @@ pub fn makeLmdbModule(
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("antfly_source_root", mod);
     mod.addOptions("build_options", build_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly_platform", platform_mod);

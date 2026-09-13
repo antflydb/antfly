@@ -1,6 +1,6 @@
 # ONNX
 
-This document tracks the ONNX backend direction, current constraints, and the concrete plan for large-model whole-graph artifacts.
+This document describes the ONNX backend as implemented today plus the remaining plan for large-model whole-graph artifacts. Whole-model offline compile/export, package-first artifact discovery, external-data weight storage, and `Q8_0` weight-only quantized export are implemented and in active use (see Current State and Quantized ONNX Status below). Broader shape-bucket coverage, larger native semantic prefill buckets, `run-artifact --compare-host` support for semantic phase artifacts, and K-quant ONNX representations remain open work, tracked as phases below.
 
 ## Direction
 
@@ -77,8 +77,8 @@ antfly inference embed ~/.antfly/inference/models/antflydb/clipclap --backend me
 That path currently routes the converted graph through the generic partition
 executor machinery. It is not yet a fully compiled Metal-resident graph because
 the generic Metal partition executor and full op coverage are still future graph
-runtime work, not ONNX-specific work. `ANTFLY_INFERENCE_GRAPH_RUNTIME` and
-`ANTFLY_INFERENCE_ONNX_GRAPH_RUNTIME` remain compatibility/default fallbacks for
+runtime work, not ONNX-specific work. `TERMITE_GRAPH_RUNTIME` and
+`TERMITE_ONNX_GRAPH_RUNTIME` remain compatibility/default fallbacks for
 imported-ONNX tests and local scripts.
 
 For benchmark and CI validation of imported resident paths, use the graph

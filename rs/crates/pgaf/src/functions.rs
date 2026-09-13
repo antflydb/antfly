@@ -5,7 +5,7 @@ use crate::client::AntflyClient;
 /// Search an Antfly collection and return (id, score, data) tuples.
 ///
 /// Usage:
-///   SELECT * FROM antfly_search('http://localhost:8080/api/v1/', 'my_collection', 'search query');
+///   SELECT * FROM antfly_search('http://localhost:8080/db/v1/', 'my_collection', 'search query');
 ///
 /// Returns a set of (id TEXT, score FLOAT8, data JSONB) rows.
 #[pg_extern]

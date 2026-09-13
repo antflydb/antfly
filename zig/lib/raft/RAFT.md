@@ -206,8 +206,8 @@ The runtime depends on a write path supporting:
 - compact log
 - install snapshot
 
-The module should not bind itself to LMDB, Pebble, RocksDB, or the Antfly Zig
-DB.
+The module should not bind itself to a specific storage engine, such as LMDB,
+RocksDB, or the Antfly Zig LSM/DB.
 
 Snapshots have two layers:
 
@@ -270,6 +270,49 @@ should expose primitives needed for caller-managed, leader-issued leases:
 The recommended Antfly pattern is that a lease is a replicated record in shard
 state, only the current leader may grant or renew it, and workers present the
 lease epoch/term on state-changing writes.
+
+## Current Capabilities
+
+The single-group core implements leader election, pre-vote, check-quorum,
+leader transfer, `ReadIndex`, lease-based reads, snapshots (create, retry,
+abort, restore), learners, joint consensus (`ConfChangeV2`), restart/replay/
+compaction, `AsyncStorageWrites`, proposal forwarding and
+`DisableProposalForwarding`, `MaxSizePerMsg`, `MaxInflightMsgs`,
+`MaxInflightBytes`, `MaxUncommittedEntriesSize`, `MaxCommittedSizePerReady`,
+`Applied`, `ForgetLeader`, `StepDownOnRemoval`, `DisableConfChangeValidation`,
+and a public randomness API (`Config.random_source`, `Config.random_seed`,
+`core.RandomSource`, `core.SplitMix64`) for reproducible simulation and
+differential replay.
+
+The runtime implements the real `Group`/`MultiRaft` shape described above,
+plus: a round-robin, priority-aware, quiescence-aware scheduler; async-aware
+`processReady` handling; host-round execution (`runRound`); a host-side disk
+batcher and apply-queue seam with concrete in-memory implementations; bounded
+apply and outbound host queues with per-round draining and limit-based
+backpressure; host metrics; a control-plane command surface
+(`src/runtime/control_plane.zig`); a replica catalog/factory seam with
+concrete in-memory and file-backed implementations; host-driven replica
+restart scanning; and a metadata-driven reconciliation layer (placement
+provider seam, in-memory placement provider, and a replica reconciler driving
+`ensureReplica`/`removeReplica`/peer refresh).
+
+The transport layer implements an in-memory transport host, group serving and
+peer lifecycle, a debug/test peer-batch codec plus a binary peer-batch codec
+intended as the first production-oriented framing layer, a codec-backed
+transport host with a per-group peer route table, bounded retry/backoff
+across host rounds, a local-file snapshot transport implementation, host-driven
+snapshot fetch/install through the snapshot transport seam, and transport
+metrics for lifecycle, flush activity, and snapshot sends.
+
+Validation is a first-class deliverable, not an afterthought: direct Zig core
+tests, direct Zig cluster/harness tests, checked-in differential traces
+compared against `go.etcd.io/raft/v3`, and seeded stable/stress trace
+generation with explicit random-seed support for reproducible election
+scheduling.
+
+See [ROADMAP.md](ROADMAP.md) for what is still open: production protocol
+drivers, threaded disk-batch/apply-worker implementations, broader randomized
+differential parity, and the remaining runtime/parity gaps.
 
 ## Non-Goals
 

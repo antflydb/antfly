@@ -39,67 +39,6 @@ pub const LookupResponse = struct {
     }
 };
 
-test "table read source distinguishes unavailable physical capability observation" {
-    const Observer = struct {
-        fn lookup(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
-            _: db_types.LookupOptions,
-            _: read_gate.ReadConsistency,
-        ) anyerror!?LookupResponse {
-            return null;
-        }
-
-        fn scan(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
-            _: []const u8,
-            _: db_types.ScanOptions,
-            _: read_gate.ReadConsistency,
-        ) anyerror!?ScanResponse {
-            return null;
-        }
-
-        fn query(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: db_types.SearchRequest,
-            _: read_gate.ReadConsistency,
-        ) anyerror!?query_api.QueryResponse {
-            return null;
-        }
-
-        fn observe(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: []const u8,
-            _: DynamicFieldObservationQuery,
-        ) !?[]ObservedDynamicFieldCapabilitySet {
-            return &.{};
-        }
-    };
-
-    const unavailable = TableReadSource{ .ptr = undefined, .vtable = &.{
-        .lookup = Observer.lookup,
-        .scan = Observer.scan,
-        .query = Observer.query,
-    } };
-    try std.testing.expect(!unavailable.supportsObservedDynamicFieldCapabilitySets());
-
-    const available = TableReadSource{ .ptr = undefined, .vtable = &.{
-        .lookup = Observer.lookup,
-        .scan = Observer.scan,
-        .query = Observer.query,
-        .observed_dynamic_field_capability_sets = Observer.observe,
-    } };
-    try std.testing.expect(available.supportsObservedDynamicFieldCapabilitySets());
-}
-
 pub const ScanResponse = struct {
     ndjson: []u8,
 
@@ -1078,143 +1017,216 @@ pub const TableReadSource = struct {
     }
 };
 
-test "catalog route fence dispatch is strict and fail closed" {
-    const Fake = struct {
-        legacy_calls: usize = 0,
-        routed_calls: usize = 0,
-        join_legacy_calls: usize = 0,
-        join_routed_calls: usize = 0,
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "table read source distinguishes unavailable physical capability observation" {
+            const Observer = struct {
+                fn lookup(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: []const u8,
+                    _: db_types.LookupOptions,
+                    _: read_gate.ReadConsistency,
+                ) anyerror!?LookupResponse {
+                    return null;
+                }
 
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
-            return null;
+                fn scan(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: []const u8,
+                    _: []const u8,
+                    _: db_types.ScanOptions,
+                    _: read_gate.ReadConsistency,
+                ) anyerror!?ScanResponse {
+                    return null;
+                }
+
+                fn query(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: db_types.SearchRequest,
+                    _: read_gate.ReadConsistency,
+                ) anyerror!?query_api.QueryResponse {
+                    return null;
+                }
+
+                fn observe(
+                    _: *anyopaque,
+                    _: std.mem.Allocator,
+                    _: []const u8,
+                    _: DynamicFieldObservationQuery,
+                ) !?[]ObservedDynamicFieldCapabilitySet {
+                    return &.{};
+                }
+            };
+
+            const unavailable = TableReadSource{ .ptr = undefined, .vtable = &.{
+                .lookup = Observer.lookup,
+                .scan = Observer.scan,
+                .query = Observer.query,
+            } };
+            try std.testing.expect(!unavailable.supportsObservedDynamicFieldCapabilitySets());
+
+            const available = TableReadSource{ .ptr = undefined, .vtable = &.{
+                .lookup = Observer.lookup,
+                .scan = Observer.scan,
+                .query = Observer.query,
+                .observed_dynamic_field_capability_sets = Observer.observe,
+            } };
+            try std.testing.expect(available.supportsObservedDynamicFieldCapabilitySets());
         }
 
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency) !?ScanResponse {
-            return null;
-        }
+        test "catalog route fence dispatch is strict and fail closed" {
+            const Fake = struct {
+                legacy_calls: usize = 0,
+                routed_calls: usize = 0,
+                join_legacy_calls: usize = 0,
+                join_routed_calls: usize = 0,
 
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: read_gate.ReadConsistency) !?query_api.QueryResponse {
-            return null;
-        }
+                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+                    return null;
+                }
 
-        fn lookupGroupLocal(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.legacy_calls += 1;
-            return null;
-        }
+                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: read_gate.ReadConsistency) !?ScanResponse {
+                    return null;
+                }
 
-        fn lookupGroupLocalRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(group_id, fence.route.group_id);
-            try std.testing.expectEqual(@as(u64, 17), fence.table_id);
-            self.routed_calls += 1;
-            return null;
-        }
+                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: read_gate.ReadConsistency) !?query_api.QueryResponse {
+                    return null;
+                }
 
-        fn joinLegacy(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.join_legacy_calls += 1;
-            return null;
-        }
+                fn lookupGroupLocal(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.legacy_calls += 1;
+                    return null;
+                }
 
-        fn joinRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(group_id, fence.route.group_id);
-            self.join_routed_calls += 1;
-            return null;
+                fn lookupGroupLocalRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: db_types.LookupOptions, _: read_gate.ReadConsistency) !?LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(group_id, fence.route.group_id);
+                    try std.testing.expectEqual(@as(u64, 17), fence.table_id);
+                    self.routed_calls += 1;
+                    return null;
+                }
+
+                fn joinLegacy(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.join_legacy_calls += 1;
+                    return null;
+                }
+
+                fn joinRouted(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, _: []const u8, _: []const u8, _: ?u32) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(group_id, fence.route.group_id);
+                    self.join_routed_calls += 1;
+                    return null;
+                }
+            };
+
+            var wire_cancellation = std.atomic.Value(bool).init(false);
+            var fence = metadata_api.CatalogRouteFence{
+                .metadata_group_id = 3,
+                .catalog_revision = 19,
+                .table_id = 17,
+                .topology_epoch = 23,
+                .route = .{
+                    .group_id = 29,
+                    .range_id = 31,
+                    .identity_namespace = .{ .table_id = 17, .shard_id = 37, .range_id = 31 },
+                },
+            };
+            fence.admission_deadline_ns = 999;
+            fence.admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io);
+            fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_deadline") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_cancellation") == null);
+
+            var fake = Fake{};
+            const legacy_vtable = TableReadSource.VTable{
+                .lookup = Fake.lookup,
+                .scan = Fake.scan,
+                .query = Fake.query,
+                .lookup_group_local = Fake.lookupGroupLocal,
+                .join_partition_group_local_with_timeout = Fake.joinLegacy,
+                .join_rows_group_local_with_timeout = Fake.joinLegacy,
+                .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
+                .join_finalize_group_local_with_timeout = Fake.joinLegacy,
+            };
+            var source = TableReadSource{ .ptr = &fake, .vtable = &legacy_vtable };
+            const ingress_deadline: u64 = 1234;
+            try source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 29, ingress_deadline, CancellationToken.fromAtomic(&wire_cancellation));
+            try std.testing.expectEqual(@as(?u64, ingress_deadline), source.route_fence.?.admission_deadline_ns);
+            try std.testing.expect(source.route_fence.?.admission_cancellation.ptr == @as(*const anyopaque, @ptrCast(&wire_cancellation)));
+            try std.testing.expectError(
+                error.CatalogRouteFenceUnsupported,
+                source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale),
+            );
+            try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+            try std.testing.expectError(
+                error.CatalogRouteFenceUnsupported,
+                source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+            );
+            try std.testing.expectError(
+                error.CatalogRouteFenceUnsupported,
+                source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+            );
+            try std.testing.expectError(
+                error.CatalogRouteFenceUnsupported,
+                source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+            );
+            try std.testing.expectError(
+                error.CatalogRouteFenceUnsupported,
+                source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
+            );
+            try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
+
+            const routed_vtable = TableReadSource.VTable{
+                .lookup = Fake.lookup,
+                .scan = Fake.scan,
+                .query = Fake.query,
+                .lookup_group_local = Fake.lookupGroupLocal,
+                .lookup_group_local_routed = Fake.lookupGroupLocalRouted,
+                .join_partition_group_local_with_timeout = Fake.joinLegacy,
+                .join_rows_group_local_with_timeout = Fake.joinLegacy,
+                .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
+                .join_finalize_group_local_with_timeout = Fake.joinLegacy,
+                .join_partition_group_local_routed_with_timeout = Fake.joinRouted,
+                .join_rows_group_local_routed_with_timeout = Fake.joinRouted,
+                .join_unmatched_group_local_routed_with_timeout = Fake.joinRouted,
+                .join_finalize_group_local_routed_with_timeout = Fake.joinRouted,
+            };
+            source.vtable = &routed_vtable;
+            try std.testing.expect((try source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale)) == null);
+            try std.testing.expectEqual(@as(usize, 1), fake.routed_calls);
+            try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+            try std.testing.expect((try source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+            try std.testing.expect((try source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+            try std.testing.expect((try source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+            try std.testing.expect((try source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
+            try std.testing.expectEqual(@as(usize, 4), fake.join_routed_calls);
+            try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
+
+            var wrong_group_source = TableReadSource{ .ptr = &fake, .vtable = &routed_vtable };
+            try std.testing.expectError(
+                error.InvalidCatalogRouteFence,
+                wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30, null, .none),
+            );
         }
     };
-
-    var wire_cancellation = std.atomic.Value(bool).init(false);
-    var fence = metadata_api.CatalogRouteFence{
-        .metadata_group_id = 3,
-        .catalog_revision = 19,
-        .table_id = 17,
-        .topology_epoch = 23,
-        .route = .{
-            .group_id = 29,
-            .range_id = 31,
-            .identity_namespace = .{ .table_id = 17, .shard_id = 37, .range_id = 31 },
-        },
-    };
-    fence.admission_deadline_ns = 999;
-    fence.admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io);
-    fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
-    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_deadline") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "admission_cancellation") == null);
-
-    var fake = Fake{};
-    const legacy_vtable = TableReadSource.VTable{
-        .lookup = Fake.lookup,
-        .scan = Fake.scan,
-        .query = Fake.query,
-        .lookup_group_local = Fake.lookupGroupLocal,
-        .join_partition_group_local_with_timeout = Fake.joinLegacy,
-        .join_rows_group_local_with_timeout = Fake.joinLegacy,
-        .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
-        .join_finalize_group_local_with_timeout = Fake.joinLegacy,
-    };
-    var source = TableReadSource{ .ptr = &fake, .vtable = &legacy_vtable };
-    const ingress_deadline: u64 = 1234;
-    try source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 29, ingress_deadline, CancellationToken.fromAtomic(&wire_cancellation));
-    try std.testing.expectEqual(@as(?u64, ingress_deadline), source.route_fence.?.admission_deadline_ns);
-    try std.testing.expect(source.route_fence.?.admission_cancellation.ptr == @as(*const anyopaque, @ptrCast(&wire_cancellation)));
-    try std.testing.expectError(
-        error.CatalogRouteFenceUnsupported,
-        source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
-    try std.testing.expectError(
-        error.CatalogRouteFenceUnsupported,
-        source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
-    );
-    try std.testing.expectError(
-        error.CatalogRouteFenceUnsupported,
-        source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
-    );
-    try std.testing.expectError(
-        error.CatalogRouteFenceUnsupported,
-        source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
-    );
-    try std.testing.expectError(
-        error.CatalogRouteFenceUnsupported,
-        source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10),
-    );
-    try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
-
-    const routed_vtable = TableReadSource.VTable{
-        .lookup = Fake.lookup,
-        .scan = Fake.scan,
-        .query = Fake.query,
-        .lookup_group_local = Fake.lookupGroupLocal,
-        .lookup_group_local_routed = Fake.lookupGroupLocalRouted,
-        .join_partition_group_local_with_timeout = Fake.joinLegacy,
-        .join_rows_group_local_with_timeout = Fake.joinLegacy,
-        .join_unmatched_group_local_with_timeout = Fake.joinLegacy,
-        .join_finalize_group_local_with_timeout = Fake.joinLegacy,
-        .join_partition_group_local_routed_with_timeout = Fake.joinRouted,
-        .join_rows_group_local_routed_with_timeout = Fake.joinRouted,
-        .join_unmatched_group_local_routed_with_timeout = Fake.joinRouted,
-        .join_finalize_group_local_routed_with_timeout = Fake.joinRouted,
-    };
-    source.vtable = &routed_vtable;
-    try std.testing.expect((try source.lookupGroupLocal(std.testing.allocator, 29, "docs", "key", .{}, .stale)) == null);
-    try std.testing.expectEqual(@as(usize, 1), fake.routed_calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
-    try std.testing.expect((try source.joinPartitionGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
-    try std.testing.expect((try source.joinRowsGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
-    try std.testing.expect((try source.joinUnmatchedGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
-    try std.testing.expect((try source.joinFinalizeGroupLocalWithTimeout(std.testing.allocator, 29, "docs", "{}", 10)) == null);
-    try std.testing.expectEqual(@as(usize, 4), fake.join_routed_calls);
-    try std.testing.expectEqual(@as(usize, 0), fake.join_legacy_calls);
-
-    var wrong_group_source = TableReadSource{ .ptr = &fake, .vtable = &routed_vtable };
-    try std.testing.expectError(
-        error.InvalidCatalogRouteFence,
-        wrong_group_source.bindCatalogRouteFenceJson(std.testing.allocator, encoded, 30, null, .none),
-    );
+    return Suite;
+}
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }
 
 test "scan stream preserves chunk backpressure without buffered fallback" {
