@@ -3091,11 +3091,11 @@ pub const IndexManager = struct {
         }
     }
 
-    fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
+    fn bindPrimaryStore(self: *IndexManager, store: anytype, read_only: bool) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
-            self.loadVectorBlockGenerationIfPresent() catch |err| {
+            self.loadVectorBlockGenerationIfPresent(read_only) catch |err| {
                 std.log.warn("shared vector-block generation open failed; primary artifact fallback remains active err={s}", .{@errorName(err)});
             };
         }
@@ -4339,7 +4339,7 @@ pub const IndexManager = struct {
         return error.VectorBlockSnapshotAdvancedWithoutWal;
     }
 
-    fn loadVectorBlockGenerationIfPresent(self: *IndexManager) !void {
+    fn loadVectorBlockGenerationIfPresent(self: *IndexManager, read_only: bool) !void {
         if (self.vector_block_storage == null) return;
         if (self.acquireVectorBlockGeneration()) |current| {
             current.release();
@@ -4357,6 +4357,7 @@ pub const IndexManager = struct {
             break :blk true;
         };
         if (!current_exists) {
+            if (read_only) return;
             // A crash may leave first-generation blocks before CURRENT. Avoid
             // creating vector state for tables that have never staged it, but
             // still enter recovery when the native root contains debt.
@@ -4367,10 +4368,13 @@ pub const IndexManager = struct {
             defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
             if (names.len == 0) return;
         }
-        var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
+        var opened = if (read_only)
+            try vector_block_store_mod.Store.openReadOnlyWithBlocks(self.alloc, self.vector_block_storage.?, root)
+        else
+            try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+        if (!read_only) _ = opened.store.reclaimUnreferencedFiles() catch |err| {
             std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
         };
         if (opened.store.manifest == null) {
@@ -4541,7 +4545,7 @@ pub const IndexManager = struct {
         };
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
-            try self.loadVectorBlockGenerationIfPresent();
+            try self.loadVectorBlockGenerationIfPresent(false);
             if (self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
@@ -10545,7 +10549,7 @@ pub const IndexManager = struct {
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         const load_started_ns = nowNs();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, read_only);
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
@@ -10900,7 +10904,7 @@ pub const IndexManager = struct {
     ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
 
         var stored_cfg = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
@@ -10989,7 +10993,7 @@ pub const IndexManager = struct {
     pub fn addAllNoBackfill(self: *IndexManager, store: anytype, configs: []const types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (configs.len == 0) return;
 
         var stored_configs = try self.alloc.alloc(types.IndexConfig, configs.len);
@@ -11068,7 +11072,7 @@ pub const IndexManager = struct {
     pub fn registerReplacementIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
         if (self.has(cfg.name)) return error.IndexAlreadyExists;
         // A replacement opens only its target generation, but named artifact
         // sources still depend on the canonical durable producer/resolver
@@ -12185,7 +12189,7 @@ pub const IndexManager = struct {
     ) !?DetachedIndex {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        self.bindPrimaryStore(store);
+        self.bindPrimaryStore(store, false);
 
         if (std.meta.activeTag(replacement.*) != cfg.kind or
             types.indexConfigHash(detachedIndexConfig(replacement).*) != types.indexConfigHash(cfg))
@@ -31031,7 +31035,7 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer store.close();
     var manager = try IndexManager.init(alloc, base_path);
     defer manager.deinit();
-    manager.bindPrimaryStore(&store);
+    manager.bindPrimaryStore(&store, false);
 
     const corrupt_name = "dense_corrupt";
     const protected_root = ".repair-shadow-protected";
@@ -38293,7 +38297,7 @@ test "algebraic retirement pages generation keys and resumes from its durable cu
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store);
+        restarted.bindPrimaryStore(&store, false);
         while (true) {
             var result = try restarted.drainGeneratedArtifactCleanupOutboxPage(&store);
             defer result.deinit();
@@ -38353,7 +38357,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var manager = try IndexManager.init(alloc, std.mem.span(path));
         defer manager.deinit();
-        manager.bindPrimaryStore(&store);
+        manager.bindPrimaryStore(&store, false);
         try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
         const remaining = try store.scanPrefix(alloc, fact_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, remaining);
@@ -38366,7 +38370,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     {
         var restarted = try IndexManager.init(alloc, std.mem.span(path));
         defer restarted.deinit();
-        restarted.bindPrimaryStore(&store);
+        restarted.bindPrimaryStore(&store, false);
         while (try restarted.cleanupInactiveRepairShadowRootsPage()) {}
     }
     const remaining = try store.scanPrefix(alloc, fact_prefix);
