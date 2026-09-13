@@ -40690,7 +40690,9 @@ test "structural reconcile reconfigures retained writer before managed dense wri
             "docs",
             .{
                 .indexes_json = managed_indexes_json,
-                .schema_json = "{}",
+                // Reconcile the index change against the catalog's admitted
+                // default schema; {} would change that schema at version zero.
+                .schema_json = tables_api.default_schema_json,
             },
             &observations,
         );
