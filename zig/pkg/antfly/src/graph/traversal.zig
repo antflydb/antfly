@@ -30,6 +30,7 @@ const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const node_identity = @import("node_identity.zig");
 const work_budget_mod = @import("work_budget.zig");
+const edge_stream = @import("edge_stream.zig");
 
 // ============================================================================
 // Traversal types
@@ -157,6 +158,10 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
     const Reader = struct {
         graph_index: *GraphIndex,
 
+        pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: EdgeDirection) !edge_stream.Stream {
+            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+        }
+
         pub fn getEdges(self: @This(), a: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
             return try self.graph_index.getEdges(a, key, "", direction);
         }
@@ -269,81 +274,93 @@ pub fn traverseWithEdgeReader(
         // namespaces when their keys happen to be equal.
         if (current.ancestry.target_table != null) continue;
 
-        // Get edges
-        const edges = try getEdgesForTraversalBudget(alloc, edge_reader, current.ancestry.key, effective_rules, work_budget);
-        defer edge_reader.freeEdges(alloc, edges);
-        try work_budget.consumeMaterializedEdges(edges);
+        var stream = if (comptime @hasDecl(@TypeOf(edge_reader), "openEdgeStream"))
+            try edge_reader.openEdgeStream(alloc, current.ancestry.key, effective_rules.edge_types, effective_rules.direction)
+        else blk: {
+            const owned = try getEdgesForTraversalBudget(alloc, edge_reader, current.ancestry.key, effective_rules, work_budget);
+            errdefer edge_reader.freeEdges(alloc, owned);
+            break :blk try edge_stream.Stream.fromOwned(alloc, edge_reader, owned);
+        };
+        defer stream.deinit();
+        while (true) {
+            const pending_results = results.items.len + queue.items.len - queue_head;
+            if (effective_rules.result_admission == null and effective_rules.max_results != 0 and pending_results >= effective_rules.max_results) break;
+            const demand = if (effective_rules.result_admission == null and effective_rules.max_results != 0) effective_rules.max_results - pending_results else edge_stream.batch_records;
+            const edges = try stream.nextBudget(work_budget, demand) orelse break;
+            defer edge_reader.freeEdges(alloc, edges);
+            try work_budget.consumeMaterializedEdges(edges);
 
-        const admitted_edges = if (effective_rules.node_admission) |admission| blk: {
-            const edge_mask = try alloc.alloc(bool, edges.len);
-            @memset(edge_mask, false);
-            errdefer alloc.free(edge_mask);
-            var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
-            defer candidate_indexes.deinit(alloc);
-            var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
-            defer candidate_nodes.deinit(alloc);
-            try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
-            try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+            const admitted_edges = if (effective_rules.node_admission) |admission| blk: {
+                const edge_mask = try alloc.alloc(bool, edges.len);
+                @memset(edge_mask, false);
+                errdefer alloc.free(edge_mask);
+                var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
+                defer candidate_indexes.deinit(alloc);
+                var candidate_nodes = std.ArrayListUnmanaged(NodeRef).empty;
+                defer candidate_nodes.deinit(alloc);
+                try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
+                try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
+                for (edges, 0..) |edge, edge_index| {
+                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
+                    const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
+                    const target_table = if (std.mem.eql(u8, next_key, edge.target))
+                        metadataTargetTable(edge.metadata)
+                    else
+                        null;
+                    if (effective_rules.deduplicate and visited.contains(.{
+                        .table = target_table,
+                        .key = next_key,
+                    })) continue;
+                    candidate_indexes.appendAssumeCapacity(edge_index);
+                    candidate_nodes.appendAssumeCapacity(.{
+                        .key = next_key,
+                        .table = target_table,
+                        .external = std.mem.eql(u8, next_key, edge.target) and
+                            (admission.external_targets or
+                                target_table != null),
+                    });
+                }
+                const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
+                defer alloc.free(candidate_mask);
+                for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
+                    edge_mask[edge_index] = allowed;
+                }
+                break :blk edge_mask;
+            } else null;
+            defer if (admitted_edges) |mask| alloc.free(mask);
+
             for (edges, 0..) |edge, edge_index| {
-                if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
                 const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
+
+                if (admitted_edges) |mask| {
+                    if (!mask[edge_index]) continue;
+                } else {
+                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
+                }
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     metadataTargetTable(edge.metadata)
                 else
                     null;
-                if (effective_rules.deduplicate and visited.contains(.{
-                    .table = target_table,
-                    .key = next_key,
-                })) continue;
-                candidate_indexes.appendAssumeCapacity(edge_index);
-                candidate_nodes.appendAssumeCapacity(.{
-                    .key = next_key,
-                    .table = target_table,
-                    .external = std.mem.eql(u8, next_key, edge.target) and
-                        (admission.external_targets or
-                            target_table != null),
+                if (effective_rules.deduplicate and !try putVisitedRetained(
+                    alloc,
+                    &visited,
+                    .{ .table = target_table, .key = next_key },
+                    work_budget,
+                    &visited_retained_bytes,
+                )) continue;
+
+                const pending_states = queue.items.len - queue_head;
+                try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
+                try work_budget.consumeNode();
+                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry);
+                const total_weight = current.total_weight + edge.weight;
+                if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
+                try queue.append(alloc, .{
+                    .ancestry = next_ancestry,
+                    .depth = current.depth + 1,
+                    .total_weight = total_weight,
                 });
             }
-            const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
-            defer alloc.free(candidate_mask);
-            for (candidate_indexes.items, candidate_mask) |edge_index, allowed| {
-                edge_mask[edge_index] = allowed;
-            }
-            break :blk edge_mask;
-        } else null;
-        defer if (admitted_edges) |mask| alloc.free(mask);
-
-        for (edges, 0..) |edge, edge_index| {
-            const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
-
-            if (admitted_edges) |mask| {
-                if (!mask[edge_index]) continue;
-            } else {
-                if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
-            }
-            const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                metadataTargetTable(edge.metadata)
-            else
-                null;
-            if (effective_rules.deduplicate and !try putVisitedRetained(
-                alloc,
-                &visited,
-                .{ .table = target_table, .key = next_key },
-                work_budget,
-                &visited_retained_bytes,
-            )) continue;
-
-            const pending_states = queue.items.len - queue_head;
-            try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
-            try work_budget.consumeNode();
-            const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry);
-            const total_weight = current.total_weight + edge.weight;
-            if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
-            try queue.append(alloc, .{
-                .ancestry = next_ancestry,
-                .depth = current.depth + 1,
-                .total_weight = total_weight,
-            });
         }
     }
 

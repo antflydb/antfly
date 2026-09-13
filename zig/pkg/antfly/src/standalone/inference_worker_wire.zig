@@ -16,7 +16,7 @@ const std = @import("std");
 const bridge = @import("inference_bridge.zig");
 const http = @import("../runtime_http_abi.zig");
 
-pub const version: u32 = 4;
+pub const version: u32 = 5;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -26,6 +26,7 @@ pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = ""
 pub const Event = struct {
     kind: enum { progress, stream_start, stream_write, stream_close },
     status: u16 = 200,
+    headers: []const Header = &.{},
     phase: u8 = 0,
     completed: u64 = 0,
     total: u64 = 0,

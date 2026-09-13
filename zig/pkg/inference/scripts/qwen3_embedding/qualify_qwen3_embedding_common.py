@@ -24,18 +24,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
 import sys
-from typing import Any
+import threading
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 from transformers_embedding_oracle import (
     SCHEMA as ORACLE_SCHEMA,
+)
+from transformers_embedding_oracle import (
     cosine,
     truncate_and_renormalize,
 )
-
 
 SCHEMA = "antfly.qwen3_embedding.qualification.v1"
 EMBEDDINGS_PATH = "/ai/v1/embeddings"
@@ -70,6 +73,15 @@ def l2_norm(vector: list[float]) -> float:
 
 def gate(name: str, case: str, passed: bool, detail: str) -> dict[str, Any]:
     return {"gate": name, "case": case, "pass": bool(passed), "detail": detail}
+
+
+def unit_norm_gate(case_id: str, norm: float, name: str) -> dict[str, Any]:
+    return gate(
+        name,
+        case_id,
+        math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
+        f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
+    )
 
 
 def load_oracle(path: Path) -> dict[str, Any]:
@@ -197,12 +209,14 @@ def post_embeddings(
             f"expected {expected} embeddings, got "
             f"{len(data) if isinstance(data, list) else 'none'}"
         )
-    rows = sorted(
-        enumerate(data),
-        key=lambda item: (
-            item[1].get("index", item[0]) if isinstance(item[1], dict) else item[0]
-        ),
-    )
+    indexes = [item.get("index") if isinstance(item, dict) else None for item in data]
+    if any(type(index) is not int for index in indexes) or sorted(indexes) != list(
+        range(expected)
+    ):
+        raise QualificationError(
+            "embedding indexes must cover each request item exactly once"
+        )
+    rows = sorted(enumerate(data), key=lambda item: item[1]["index"])
     vectors: list[list[float]] = []
     for position, item in rows:
         embedding = item.get("embedding") if isinstance(item, dict) else None
@@ -231,14 +245,7 @@ def case_gates(
     if not rows[0]["pass"]:
         return rows
     norm = l2_norm(server_vector)
-    rows.append(
-        gate(
-            "unit_norm",
-            case_id,
-            math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
-            f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
-        )
-    )
+    rows.append(unit_norm_gate(case_id, norm, "unit_norm"))
     if norm <= 0.0:
         rows.append(
             gate("oracle_cosine", case_id, False, "server vector has zero norm")
@@ -273,14 +280,7 @@ def mrl_gates(
     if not rows[0]["pass"]:
         return rows
     norm = l2_norm(server_reduced)
-    rows.append(
-        gate(
-            "mrl_unit_norm",
-            case_id,
-            math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
-            f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
-        )
-    )
+    rows.append(unit_norm_gate(case_id, norm, "mrl_unit_norm"))
     if norm <= 0.0:
         rows.append(
             gate(
@@ -318,6 +318,10 @@ def batch_gates(
                 f"width {len(batch_vector)} != {len(single_vector)}",
             )
         ]
+    norm = l2_norm(batch_vector)
+    norm_row = unit_norm_gate(case_id, norm, "batch_unit_norm")
+    if not math.isfinite(norm) or norm <= 0.0:
+        return [norm_row]
     value = cosine(batch_vector, single_vector)
     return [
         gate(
@@ -325,7 +329,8 @@ def batch_gates(
             case_id,
             value >= BATCH_MIN_COSINE,
             f"cosine={value:.6f} min={BATCH_MIN_COSINE}",
-        )
+        ),
+        norm_row,
     ]
 
 
@@ -404,6 +409,70 @@ def case_input(case: dict[str, Any]) -> str:
     return served_text if isinstance(served_text, str) else case["text"]
 
 
+def concurrent_request_gates(args, cases, single_vectors, default_instruction):
+    """Reuse family parity gates under overlapping, differently configured requests.
+
+    This proves response isolation, not physical fusion. Scheduler/backend evidence
+    remains a separate execution gate. Long-context fixtures stay in the serial
+    family gate so concurrency does not multiply their memory requirements.
+    """
+    case_ids = [
+        item
+        for pair in zip(RETRIEVAL_QUERY_CASES, RETRIEVAL_DOCUMENT_CASES)
+        for item in pair
+    ]
+    requests = []
+    for offset in (0, 1):
+        for index, case_id in enumerate(case_ids):
+            dimensions = None if (index + offset) % 2 == 0 else CHECK_DIMENSIONS
+            case = cases[case_id]
+            body = embedding_request_body(
+                args.model,
+                case_input(case),
+                case["role"],
+                case["instruction"],
+                default_instruction,
+                dimensions=dimensions,
+            )
+            expected = single_vectors[case_id]
+            if dimensions is not None:
+                expected = truncate_and_renormalize(expected, dimensions)
+            requests.append((case_id, body, expected))
+    rows = []
+    concurrency = getattr(args, "concurrency", 4)
+    rounds = getattr(args, "concurrent_rounds", 2)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        for round_index in range(rounds):
+            ordered = requests if round_index % 2 == 0 else list(reversed(requests))
+            for start in range(0, len(ordered), concurrency):
+                window = ordered[start : start + concurrency]
+                barrier = threading.Barrier(len(window), timeout=args.timeout)
+
+                def invoke(item, start_barrier=barrier):
+                    start_barrier.wait()
+                    return post_embeddings(args.base_url, item[1], args.timeout)[0]
+
+                vectors = list(pool.map(invoke, window))
+                for (case_id, body, expected), actual in zip(window, vectors):
+                    for row in batch_gates(case_id, expected, actual):
+                        row.update(
+                            gate=(
+                                "cross_request_unit_norm"
+                                if row["gate"] == "batch_unit_norm"
+                                else "cross_request_vs_single"
+                            ),
+                            round=round_index,
+                            dimensions=body.get("dimensions", len(expected)),
+                        )
+                        rows.append(row)
+    return rows
+
+
+def add_concurrency_arguments(parser):
+    parser.add_argument("--concurrency", type=int, choices=(2, 4, 8, 16), default=4)
+    parser.add_argument("--concurrent-rounds", type=int, choices=range(1, 9), default=2)
+
+
 def run_qualification(
     args: argparse.Namespace,
     *,
@@ -463,6 +532,7 @@ def run_qualification(
     batch_vectors = post_embeddings(args.base_url, batch_body, args.timeout)
     for case_id, batch_vector in zip(document_ids, batch_vectors):
         rows.extend(batch_gates(case_id, server_full[case_id], batch_vector))
+    rows.extend(concurrent_request_gates(args, cases, server_full, default_instruction))
 
     oracle_vectors = {
         case_id: cases[case_id]["embeddings"]["1024"] for case_id in cases
@@ -486,6 +556,11 @@ def run_qualification(
         "model": args.model,
         "tier": args.tier,
         "min_cosine": min_cosine,
+        "cross_request": {
+            "concurrency": getattr(args, "concurrency", 4),
+            "rounds": getattr(args, "concurrent_rounds", 2),
+            "native_fusion_proven": False,
+        },
         "gates": rows,
         "pass": all(row["pass"] for row in rows),
     }

@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const rowsource = @import("../../storage/rowsource/types.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const lake_build_limits = @import("lake_build_limits.zig");
@@ -27,14 +28,24 @@ pub const Buffer = struct {
     batches: []OwnedBatch,
 
     pub fn captureAlloc(alloc: Allocator, source: rowsource.Source, limits: lake_build_limits.Limits) !Buffer {
+        return captureWithCancellationAlloc(alloc, source, limits, .none);
+    }
+
+    pub fn captureWithCancellationAlloc(
+        alloc: Allocator,
+        source: rowsource.Source,
+        limits: lake_build_limits.Limits,
+        cancellation: CancellationToken,
+    ) !Buffer {
+        try cancellation.check();
         var working_set = try lake_build_limits.WorkingSetAllocator.init(alloc, limits);
-        return captureBoundedAlloc(working_set.allocator(), source, limits) catch |err| {
+        return captureBoundedAlloc(working_set.allocator(), source, limits, cancellation) catch |err| {
             if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarReplayBudgetExceeded;
             return err;
         };
     }
 
-    fn captureBoundedAlloc(alloc: Allocator, source: rowsource.Source, limits: lake_build_limits.Limits) !Buffer {
+    fn captureBoundedAlloc(alloc: Allocator, source: rowsource.Source, limits: lake_build_limits.Limits, cancellation: CancellationToken) !Buffer {
         var budget = try lake_build_limits.Budget.init(limits);
         var batches = std.ArrayListUnmanaged(OwnedBatch).empty;
         errdefer {
@@ -42,7 +53,9 @@ pub const Buffer = struct {
             batches.deinit(alloc);
         }
         var replay_bytes: usize = 0;
-        while (try source.next(alloc)) |batch| {
+        while (true) {
+            try cancellation.check();
+            const batch = try source.next(alloc) orelse break;
             try budget.admitBatch(batch);
             replay_bytes = std.math.add(usize, replay_bytes, lake_build_limits.estimateBatchBytes(batch)) catch
                 return error.LakeSidecarReplayBudgetExceeded;

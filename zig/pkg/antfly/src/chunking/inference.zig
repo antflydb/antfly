@@ -122,7 +122,10 @@ pub fn chunkInputWithProvider(
     else
         null;
     const resolved_endpoint = execution.resolveAntflyEndpoint(explicit_endpoint, linked_callback_available);
-    if (resolved_endpoint == null) if (antfly_provider) |provider| {
+    // Execution-only providers carry I/O, routing and deadlines without a
+    // linked chunk callback. They still use the local direct chunker when no
+    // remote endpoint resolves (for example while rebuilding a restore).
+    if (resolved_endpoint == null and linked_callback_available) if (antfly_provider) |provider| {
         const ptr = provider.ptr orelse return error.InvalidChunkProvider;
         const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
         const io = execution.io orelse std.Io.Threaded.global_single_threaded.io();
@@ -562,6 +565,14 @@ test "antfly chunker omits incomplete and invalid provenance spans" {
         }
 
         fn execute(_: *anyopaque, req_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            if (req.method == .GET) {
+                try std.testing.expect(std.mem.indexOf(u8, req.uri, "/models?") != null);
+                return .{
+                    .status = 200,
+                    .content_type = try req_alloc.dupe(u8, "application/json"),
+                    .body = try req_alloc.dupe(u8, "{\"chunkers\":{\"chunker-v1\":{}}}"),
+                };
+            }
             try std.testing.expectEqual(http_common.Method.POST, req.method);
             try std.testing.expect(std.mem.endsWith(u8, req.uri, "/chunk"));
             return .{
@@ -623,6 +634,14 @@ test "antfly chunker binary round trip" {
         }
 
         fn execute(_: *anyopaque, req_alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            if (req.method == .GET) {
+                try std.testing.expect(std.mem.indexOf(u8, req.uri, "/models?") != null);
+                return .{
+                    .status = 200,
+                    .content_type = try req_alloc.dupe(u8, "application/json"),
+                    .body = try req_alloc.dupe(u8, "{\"chunkers\":{\"chunker-v1\":{}}}"),
+                };
+            }
             try std.testing.expectEqual(http_common.Method.POST, req.method);
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mime_type\":\"image/gif\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"data\":\"R0lG\"") != null);
@@ -771,4 +790,25 @@ test "antfly chunker uses the embedded provider executor when available" {
         chunkTextWithProvider(alloc, cfg, "provider input", canceled_provider),
     );
     try std.testing.expectEqual(@as(usize, 1), fake.context_calls);
+}
+
+test "antfly chunker execution-only provider preserves local fallback and cancellation" {
+    const alloc = std.testing.allocator;
+    const cfg = chunking_types.Config{
+        .provider = .antfly,
+        .model = "fixed",
+        .max_chunks = 2,
+        .text = .{ .target_tokens = 3, .overlap_tokens = 0, .separator = " " },
+    };
+    var provider: chunk_provider.Provider = .{ .execution = .{ .io = std.testing.io } };
+    const chunks = try chunkTextWithProvider(alloc, cfg, "alpha beta gamma delta epsilon", provider);
+    defer {
+        for (chunks) |*chunk| chunk.deinit(alloc);
+        alloc.free(chunks);
+    }
+    try std.testing.expect(chunks.len > 0 and chunks.len <= 2);
+    try std.testing.expect(chunks[0].text != null);
+    var canceled = std.atomic.Value(bool).init(true);
+    provider.execution.cancellation = .fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, chunkTextWithProvider(alloc, cfg, "alpha beta", provider));
 }

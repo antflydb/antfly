@@ -48,7 +48,7 @@ const standby_mod = @import("standby.zig");
 const status_mod = @import("status.zig");
 const validation = @import("validation.zig");
 const write_gate = @import("write_gate.zig");
-const wal_mod = @import("../wal.zig");
+const wal_mod = @import("../wal_runtime.zig");
 
 var test_path_counter: u64 = 0;
 

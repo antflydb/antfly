@@ -1,0 +1,74 @@
+{
+  "schema": "antfly.pdf.qualification_plan.v1",
+  "artifacts": {
+    "main_binary": "${main_binary}",
+    "pr_binary": "${pr_binary}",
+    "models": "${models}",
+    "corpus": "${work_dir}/corpus.json"
+  },
+  "limitations": [
+    "A passing native comparison establishes timing comparability, not that the candidate is faster.",
+    "The existing benchmark pins Florence/BGE and requires Metal evidence.",
+    "Keep the same sync level, cap, corpus, model files, compiler/build configuration and host; review cold/warm distributions separately."
+  ],
+  "gates": [
+    {
+      "id": "pdf-completed-indexing",
+      "layer": "document",
+      "kind": "performance",
+      "scope": "Existing unprofiled alternating-order, equal-output completed-indexing comparison; native report retains first-process and warm-process distributions.",
+      "artifacts": [
+        "main_binary",
+        "pr_binary",
+        "models",
+        "corpus"
+      ],
+      "command": [
+        "${python}",
+        "${repo}/scripts/bench/pdf/compare.py",
+        "--work-dir",
+        "${work_dir}",
+        "--circus-dir",
+        "${circus_dir}",
+        "--main-binary",
+        "${main_binary}",
+        "--main-revision",
+        "${main_revision}",
+        "--pr-binary",
+        "${pr_binary}",
+        "--pr-revision",
+        "${pr_revision}",
+        "--output",
+        "${run}/comparison",
+        "--name",
+        "${name}-performance",
+        "--suite",
+        "text",
+        "--mode",
+        "always",
+        "--consumers",
+        "2",
+        "--sync-level",
+        "full_index",
+        "--reader-batch-size",
+        "4",
+        "--render-workers",
+        "4",
+        "--render-prefetch",
+        "1",
+        "--render-memory-bytes",
+        "268435456",
+        "--pairs",
+        "2",
+        "--trials",
+        "3"
+      ],
+      "report": {
+        "path": "${run}/comparison/summary.json",
+        "schema": "antfly.pdf.comparison.v1",
+        "pass_field": "timing_comparable"
+      },
+      "timeout_seconds": 7200
+    }
+  ]
+}

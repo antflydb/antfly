@@ -283,6 +283,10 @@ pub const StateMachine = struct {
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
+        /// True only for failures whose retained task can be safely replayed.
+        /// Deferral must not publish apply/read completion. Other groups and
+        /// persisted transport may continue while this group's task is held.
+        is_apply_retryable: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId, err: anyerror) bool = null,
         retire_group: ?*const fn (
             ptr: *anyopaque,
             group_id: core.types.GroupId,
@@ -311,6 +315,11 @@ pub const StateMachine = struct {
         read_states: []const core.ReadState,
     ) !void {
         return try self.vtable.apply_ready(self.ptr, group_id, snapshot, committed_entries, read_states);
+    }
+
+    pub fn isApplyRetryable(self: StateMachine, group_id: core.types.GroupId, err: anyerror) bool {
+        const classify = self.vtable.is_apply_retryable orelse return false;
+        return classify(self.ptr, group_id, err);
     }
 
     pub fn retireGroup(self: StateMachine, group_id: core.types.GroupId) void {
@@ -343,6 +352,9 @@ pub const ApplyQueue = struct {
         ) anyerror!void,
         drain: *const fn (ptr: *anyopaque) ApplyDrainResult,
         abort: *const fn (ptr: *anyopaque) void,
+        /// Opts into per-group scheduling. The host drains one task at a time
+        /// so a retryable failure cannot hide another group's completion.
+        is_apply_retryable: ?*const fn (ptr: *anyopaque, group_id: core.types.GroupId, err: anyerror) bool = null,
     };
 
     pub fn enqueueApply(
@@ -357,6 +369,11 @@ pub const ApplyQueue = struct {
 
     pub fn drain(self: ApplyQueue) ApplyDrainResult {
         return self.vtable.drain(self.ptr);
+    }
+
+    pub fn isApplyRetryable(self: ApplyQueue, group_id: core.types.GroupId, err: anyerror) bool {
+        const classify = self.vtable.is_apply_retryable orelse return false;
+        return classify(self.ptr, group_id, err);
     }
 
     pub fn abort(self: ApplyQueue) void {

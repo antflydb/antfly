@@ -20,7 +20,7 @@ const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const shard_mod = @import("../../storage/shard.zig");
-const db_mod = @import("../../storage/db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const db_types = @import("../../storage/db/types.zig");
 const range_state = @import("../../storage/db/range_state.zig");
@@ -417,7 +417,7 @@ pub const Destination = struct {
         }
 
         for (docs) |kv| {
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
             errdefer alloc.free(doc_key);
             try deletes.append(alloc, doc_key);
         }

@@ -252,7 +252,21 @@ class BatchGateTests(unittest.TestCase):
     def test_equal_batch_and_single_vectors_pass(self) -> None:
         vector = basis_vector(1024, 9)
         rows = qualify.batch_gates("case", vector, list(vector))
-        self.assertTrue(rows[0]["pass"])
+        self.assertTrue(all(row["pass"] for row in rows))
+
+    def test_batch_vectors_must_obey_the_family_normalization_contract(self) -> None:
+        vector = basis_vector(1024, 9)
+        for scale in (0.0, 7.0, 1e200):
+            with self.subTest(scale=scale):
+                rows = qualify.batch_gates(
+                    "case", vector, [value * scale for value in vector]
+                )
+                self.assertTrue(
+                    any(
+                        row["gate"] == "batch_unit_norm" and not row["pass"]
+                        for row in rows
+                    )
+                )
 
     def test_divergent_batch_vector_fails(self) -> None:
         rows = qualify.batch_gates(

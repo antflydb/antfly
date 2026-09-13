@@ -66,11 +66,15 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
     defer index_by_doc.deinit(alloc);
 
     for (base_docs) |doc| {
+        // Reserve both containers before transferring string ownership. A
+        // failed map growth must never leave a slot owning freed strings.
+        try slots.ensureUnusedCapacity(alloc, 1);
+        try index_by_doc.ensureUnusedCapacity(alloc, 1);
         const doc_id = try alloc.dupe(u8, doc.doc_id);
         errdefer alloc.free(doc_id);
         const body = try alloc.dupe(u8, doc.body);
         errdefer alloc.free(body);
-        try slots.append(alloc, .{
+        slots.appendAssumeCapacity(.{
             .doc_id = doc_id,
             .body = body,
             .deleted = false,
@@ -78,17 +82,18 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
             .last_timestamp_ns = doc.last_timestamp_ns,
         });
         const slot_index = slots.items.len - 1;
-        try index_by_doc.put(alloc, slots.items[slot_index].doc_id, slot_index);
+        index_by_doc.putAssumeCapacity(slots.items[slot_index].doc_id, slot_index);
     }
 
     for (mutations) |mutation| {
         const existing_index = index_by_doc.get(mutation.doc_id);
         const idx = existing_index orelse blk: {
+            try slots.ensureUnusedCapacity(alloc, 1);
+            try index_by_doc.ensureUnusedCapacity(alloc, 1);
             const doc_id = try alloc.dupe(u8, mutation.doc_id);
-            errdefer alloc.free(doc_id);
-            try slots.append(alloc, .{ .doc_id = doc_id });
+            slots.appendAssumeCapacity(.{ .doc_id = doc_id });
             const slot_index = slots.items.len - 1;
-            try index_by_doc.put(alloc, slots.items[slot_index].doc_id, slot_index);
+            index_by_doc.putAssumeCapacity(slots.items[slot_index].doc_id, slot_index);
             break :blk slot_index;
         };
 
@@ -97,8 +102,9 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
         slot.last_timestamp_ns = mutation.timestamp_ns;
         switch (mutation.kind) {
             .upsert => {
+                const next_body = try alloc.dupe(u8, mutation.body orelse "");
                 if (slot.body) |body| alloc.free(body);
-                slot.body = try alloc.dupe(u8, mutation.body orelse "");
+                slot.body = next_body;
                 slot.deleted = false;
             },
             .delete => {
@@ -120,14 +126,18 @@ pub fn materializeOverBaseAlloc(alloc: Allocator, base_docs: []const Document, m
     errdefer alloc.free(docs);
 
     var out_idx: usize = 0;
-    for (slots.items) |slot| {
+    for (slots.items) |*slot| {
         if (slot.deleted or slot.body == null) continue;
         docs[out_idx] = .{
-            .doc_id = try alloc.dupe(u8, slot.doc_id),
-            .body = try alloc.dupe(u8, slot.body.?),
+            .doc_id = slot.doc_id,
+            .body = slot.body.?,
             .last_lsn = slot.last_lsn,
             .last_timestamp_ns = slot.last_timestamp_ns,
         };
+        // The completed view owns these buffers; avoid cloning the entire
+        // namespace a second time at the materialization boundary.
+        slot.doc_id = &.{};
+        slot.body = null;
         out_idx += 1;
     }
 
@@ -142,6 +152,26 @@ pub fn freeDocuments(alloc: Allocator, docs: []Document) void {
 
 fn lessDocument(_: void, lhs: Document, rhs: Document) bool {
     return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
+}
+
+test "serverless materializer transfers output ownership and unwinds every allocation failure" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            const base = [_]Document{.{ .doc_id = @constCast("a"), .body = @constCast("old"), .last_lsn = 1, .last_timestamp_ns = 1 }};
+            const mutations = [_]Mutation{
+                .{ .lsn = 2, .timestamp_ns = 2, .kind = .upsert, .doc_id = "a", .body = "replacement" },
+                .{ .lsn = 3, .timestamp_ns = 3, .kind = .upsert, .doc_id = "b", .body = "temporary" },
+                .{ .lsn = 4, .timestamp_ns = 4, .kind = .delete, .doc_id = "b" },
+                .{ .lsn = 5, .timestamp_ns = 5, .kind = .upsert, .doc_id = "c", .body = "new" },
+            };
+            const docs = try materializeOverBaseAlloc(alloc, &base, &mutations);
+            defer freeDocuments(alloc, docs);
+            try std.testing.expectEqual(@as(usize, 2), docs.len);
+            try std.testing.expectEqualStrings("replacement", docs[0].body);
+            try std.testing.expectEqualStrings("c", docs[1].doc_id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "materializer applies upserts and deletes into document state" {

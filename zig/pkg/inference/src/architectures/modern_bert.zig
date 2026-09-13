@@ -925,7 +925,8 @@ fn forwardCapturingActivationsCT(
         normed_attn_cts.deinit(allocator);
     }
 
-    var hidden = try embeddingsBlock(cb, config, input_ids, total_tokens);
+    // The activation-capture path uses the separate-QKV layout's stored biases.
+    var hidden = try embeddingsBlock(cb, config, null, input_ids, total_tokens);
     // Free hidden on any error path; the happy path frees it explicitly below.
     errdefer cb.free(hidden);
 

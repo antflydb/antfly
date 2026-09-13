@@ -22,7 +22,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseSafe,
     });
-    benchmark_module.addImport("vopr", module);
+    benchmark_module.addImport("vopr", if (optimize == .ReleaseSafe) module else b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    }));
     const benchmark_exe = b.addExecutable(.{ .name = "vopr-benchmark", .root_module = benchmark_module });
     const benchmark_step = b.step("benchmark", "Run deterministic VOPR search-efficiency benchmarks");
     benchmark_step.dependOn(&b.addRunArtifact(benchmark_exe).step);

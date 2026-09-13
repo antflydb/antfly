@@ -15,7 +15,7 @@
 const std = @import("std");
 const foreign_mod = @import("../foreign/mod.zig");
 const secrets = @import("../common/secrets.zig");
-const aggregations_mod = @import("../storage/db/aggregations.zig");
+const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
 const json_helpers = @import("json_helpers.zig");
 
 const Allocator = std.mem.Allocator;

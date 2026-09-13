@@ -1,7 +1,7 @@
 ---
 title: Glossary
 unlisted: true
-description: Key terms and concepts used in AntflyDB and the broader AI/search ecosystem
+description: Key terms and concepts used in Antfly and the broader AI/search ecosystem
 ---
 
 ## AI & Machine Learning
@@ -92,7 +92,9 @@ See: [Toolformer](https://arxiv.org/abs/2302.04761) | [Anthropic Tool Use](https
 
 ## Search & Indexing
 
-The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly supports multiple index types: [full-text](#full-text-search-bm25--bleve) (BM25), [vector](#aknn-approximate-k-nearest-neighbors) (AKNN), and graph.
+### Indexing
+
+The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly supports multiple index types: [full-text](#full-text-search-bm25) (BM25), [vector](#aknn-approximate-k-nearest-neighbors) (AKNN), and graph.
 
 ### Agentic Search
 
@@ -120,23 +122,23 @@ See: [Annoy](https://github.com/spotify/annoy) | [FAISS](https://github.com/face
 
 ### Facetting
 
-Organizing search results into categories (facets) based on document attributes. Facets let users filter results by category, date range, author, or other fields. Antfly supports faceted search through Bleve's faceting capabilities. See [Full-Text Search](#full-text-search-bm25--bleve).
+Organizing search results into categories (facets) based on document attributes. Facets let users filter results by category, date range, author, or other fields. Antfly's native full-text index supports faceted search. See [Full-Text Search](#full-text-search-bm25).
 
 See: [Faceted Search (Wikipedia)](https://en.wikipedia.org/wiki/Faceted_search)
 
-### Full-Text Search, BM25 & Bleve
+### Full-Text Search & BM25
 
 **Full-text search** indexes and queries the complete text content of documents. Unlike database queries on specific fields, full-text search handles natural language queries, typos, synonyms, and relevance ranking.
 
 **BM25** is the ranking function used for scoring documents based on term frequency and document length. BM25 improves on TF-IDF by accounting for term saturation and document length normalization.
 
-**Bleve** is the full-text search library (written in Go) that powers Antfly's `full_text` index type. It provides BM25 ranking, language-aware [tokenization](#tokenizers), [faceted search](#facetting), and highlighting.
+Antfly's full-text index (`zig/pkg/antfly/src/search`) is implemented natively in Zig as a Lucene-style segment index, using an FST-based term dictionary and roaring-bitmap posting lists to provide BM25 ranking, language-aware [tokenization](#tokenizers), [faceted search](#facetting), and highlighting.
 
-See: [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) | [Okapi BM25 (Wikipedia)](https://en.wikipedia.org/wiki/Okapi_BM25) | [BM25 Paper](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf) | [Bleve GitHub](https://github.com/blevesearch/bleve) | [Bleve Documentation](https://blevesearch.com/)
+See: [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) | [Okapi BM25 (Wikipedia)](https://en.wikipedia.org/wiki/Okapi_BM25) | [BM25 Paper](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf)
 
 ### Hybrid Search
 
-Combining multiple search approaches - typically [BM25](#full-text-search-bm25--bleve) (keyword) and [vector](#aknn-approximate-k-nearest-neighbors) (semantic) search - to get the benefits of both. Keyword search excels at exact matches; vector search handles [semantic similarity](#semantic-search). Antfly merges results using [RRF](#rrf-reciprocal-rank-fusion) or [RSF](#rsf-relative-score-fusion) fusion.
+Combining multiple search approaches - typically [BM25](#full-text-search-bm25) (keyword) and [vector](#aknn-approximate-k-nearest-neighbors) (semantic) search - to get the benefits of both. Keyword search excels at exact matches; vector search handles [semantic similarity](#semantic-search). Antfly merges results using [RRF](#rrf-reciprocal-rank-fusion) or [RSF](#rsf-relative-score-fusion) fusion.
 
 See: [Hybrid Search Explained](https://weaviate.io/blog/hybrid-search-explained)
 
@@ -176,11 +178,11 @@ Automatically splitting data partitions ([shards](#sharding)) when they grow too
 
 ### Raft & Multiraft
 
-**Raft** is a consensus algorithm that ensures multiple nodes agree on a sequence of operations, providing strong consistency in distributed systems. Raft uses leader election and log replication. Antfly builds on etcd's battle-tested Raft implementation.
+**Raft** is a consensus algorithm that ensures multiple nodes agree on a sequence of operations, providing strong consistency in distributed systems. Raft uses leader election and log replication. Antfly implements its own Raft consensus natively in Zig (`zig/lib/raft`, `zig/pkg/antfly/src/raft`), architecturally inspired by `etcd/raft`'s deterministic core and Dragonboat-style multi-group hosting.
 
 **Multiraft** extends this by using multiple independent Raft consensus groups. Unlike single-Raft systems where one group handles all data, Multiraft assigns separate Raft groups to different data partitions ([shards](#sharding)). This enables parallel operations, fault isolation, and independent scaling. Antfly uses Multiraft with separate groups for metadata and each storage shard.
 
-See: [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) | [Raft Visualization](https://raft.github.io/) | [etcd/raft](https://github.com/etcd-io/raft) | [TiKV Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/) | [CockroachDB Architecture](https://www.cockroachlabs.com/docs/stable/architecture/overview)
+See: [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) | [Raft Visualization](https://raft.github.io/) | [etcd/raft](https://github.com/etcd-io/raft) | [TiKV Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/)
 
 ### Sharding
 
@@ -200,27 +202,23 @@ The `document_extraction` asset producer downloads a document URL during enrichm
 
 ### Document Storage
 
-Storing data as self-contained JSON documents rather than rows in tables. Documents can have flexible schemas and nested structures. Antfly stores documents with automatic indexing of fields and efficient MessagePack serialization.
-
-See: [MessagePack](https://msgpack.org/)
+Storing data as self-contained JSON documents rather than rows in tables. Documents can have flexible schemas and nested structures. Antfly stores documents with automatic indexing of fields.
 
 ### Linear Merge
 
-A technique for bulk importing sorted data into an LSM-tree storage engine. By providing pre-sorted records, linear merge bypasses the normal write path and directly creates [SSTable](#pebble-rocksdb--sstables) files. This is dramatically faster for bulk imports. Antfly supports linear merge for efficient data ingestion from external sources.
+A technique for bulk importing sorted data into an LSM-tree storage engine. By providing pre-sorted records, linear merge bypasses the normal write path and directly creates [SSTable](#lsm--sstables) files. This is dramatically faster for bulk imports. Antfly supports linear merge for efficient data ingestion from external sources.
 
-### Pebble, RocksDB & SSTables
+### LSM & SSTables
 
-**Pebble** is the high-performance key-value store that powers Antfly's storage layer. Developed by CockroachDB, Pebble provides LSM-tree storage with efficient compression, range scans, and crash recovery. Each [shard](#sharding) has its own Pebble instance.
+Antfly's native storage engine (`zig/pkg/antfly/src/storage/lsm`) is a Zig LSM-tree implementation, with an alternative LMDB-compatible copy-on-write B-tree engine (`zig/pkg/antfly/src/lmdb`) also available. Each [shard](#sharding) has its own storage instance.
 
-**RocksDB** is Facebook's embedded key-value store based on Google's LevelDB. RocksDB pioneered many LSM-tree optimizations that Pebble implements. Pebble is essentially a Go reimplementation inspired by RocksDB's design.
+**SSTables (Sorted String Tables)** are the immutable, sorted files that form the LSM engine's on-disk storage format. SSTables enable efficient range scans and merging. The LSM-tree architecture writes data to memory first, then flushes to SSTables, and periodically compacts them for efficiency.
 
-**SSTables (Sorted String Tables)** are the immutable, sorted files that form the on-disk storage format. SSTables enable efficient range scans and merging. The LSM-tree architecture writes data to memory first, then flushes to SSTables, and periodically compacts them for efficiency.
-
-See: [Pebble GitHub](https://github.com/cockroachdb/pebble) | [Introducing Pebble](https://www.cockroachlabs.com/blog/pebble-rocksdb-kv-store/) | [RocksDB](https://rocksdb.org/) | [Bigtable Paper](https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf) | [LSM-Tree (Wikipedia)](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
+See: [LSM-Tree (Wikipedia)](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
 
 ### WAL (Write-Ahead Log)
 
-A durability mechanism where operations are written to a sequential log before being applied. If the system crashes, the WAL enables recovery by replaying logged operations. Antfly uses WAL for both [Raft](#raft--multiraft) consensus logs and [Pebble's](#pebble-rocksdb--sstables) storage durability.
+A durability mechanism where operations are written to a sequential log before being applied. If the system crashes, the WAL enables recovery by replaying logged operations. Antfly uses WAL for both [Raft](#raft--multiraft) consensus logs and the [LSM engine's](#lsm--sstables) storage durability.
 
 See: [Write-Ahead Logging (Wikipedia)](https://en.wikipedia.org/wiki/Write-ahead_logging)
 
@@ -234,7 +232,7 @@ See: [JSON Schema](https://json-schema.org/) | [Understanding JSON Schema](https
 
 ### ONNX (Open Neural Network Exchange)
 
-A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference uses ONNX for local model inference, providing [embedding](#embeddings), [chunking](#chunking), and [reranking](#rerankers) without external API calls.
+A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference runs local models through one of three backends: a native backend (CPU/Metal/CUDA) for GGUF and safetensors artifacts, an `onnx` backend, and an `ortgenai` backend, providing [embedding](#embeddings), [chunking](#chunking), [reranking](#rerankers), and generation without external API calls.
 
 See: [ONNX](https://onnx.ai/) | [ONNX Runtime](https://onnxruntime.ai/)
 
@@ -258,7 +256,7 @@ See: [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intri
 
 ### XLA (Accelerated Linear Algebra)
 
-A domain-specific compiler for linear algebra that optimizes TensorFlow computations. XLA can target CPUs, GPUs, and TPUs. While Antfly primarily uses [ONNX Runtime](#onnx-open-neural-network-exchange) for inference, XLA represents the broader ecosystem of ML acceleration technologies.
+A domain-specific compiler for linear algebra that optimizes TensorFlow computations. XLA can target CPUs, GPUs, and TPUs. Antfly Inference runs models through native (CPU/Metal/CUDA), [ONNX](#onnx-open-neural-network-exchange), and `ortgenai` backends; XLA represents the broader ecosystem of ML acceleration technologies.
 
 See: [XLA Overview](https://www.tensorflow.org/xla) | [OpenXLA](https://openxla.org/)
 

@@ -1383,7 +1383,12 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.buildSnapshot(&group_store.store, alloc, group_id);
     }
 
-    const PreparedSnapshot = struct {
+    pub const PreparedSnapshotFile = struct {
+        path: []u8,
+        size: u64,
+    };
+
+    pub const PreparedSnapshot = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
         group_id: u64,
@@ -1394,14 +1399,26 @@ pub const RaftApplyStore = struct {
                 .ptr = self,
                 .vtable = &.{
                     .materialize = materialize,
-                    .cancel = cancel,
-                    .deinit = PreparedSnapshot.deinit,
+                    .cancel = cancelSource,
+                    .deinit = deinitSource,
                 },
             };
         }
 
         fn materialize(ptr: *anyopaque, alloc: std.mem.Allocator) !raft_engine.runtime.storage_iface.SnapshotMaterialization {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const materialized = try self.materializeFile(alloc);
+            defer alloc.free(materialized.path);
+            errdefer std.Io.Dir.cwd().deleteFile(self.owner.runtimeIo(), materialized.path) catch {};
+            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
+                alloc,
+                self.owner.runtimeIo(),
+                materialized.path,
+                materialized.size,
+            ) };
+        }
+
+        pub fn materializeFile(self: *@This(), alloc: std.mem.Allocator) !PreparedSnapshotFile {
             if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
             const io = self.owner.runtimeIo();
             const spool_dir = try std.fmt.allocPrint(alloc, "{s}/snapshot-spool", .{self.owner.root_dir});
@@ -1412,7 +1429,7 @@ pub const RaftApplyStore = struct {
                 self.group_id,
                 snapshot_spool_nonce.fetchAdd(1, .monotonic),
             });
-            defer alloc.free(path);
+            errdefer alloc.free(path);
             errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
             var size: u64 = 0;
@@ -1426,21 +1443,24 @@ pub const RaftApplyStore = struct {
                 try file.sync(io);
                 size = (try file.stat(io)).size;
             }
-            return .{ .artifact = try raft_storage_mod.file_snapshot_artifact.FileSnapshotArtifact.create(
-                alloc,
-                io,
-                path,
-                size,
-            ) };
+            return .{ .path = path, .size = size };
         }
 
-        fn cancel(ptr: *anyopaque) void {
+        fn cancelSource(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.cancel();
+        }
+
+        pub fn cancel(self: *@This()) void {
             self.cancelled.store(true, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        fn deinitSource(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroy();
+        }
+
+        pub fn destroy(self: *@This()) void {
             self.txn.abort();
             self.owner.releaseSnapshotReader(self.group_id);
             std.heap.page_allocator.destroy(self);
@@ -1449,6 +1469,11 @@ pub const RaftApplyStore = struct {
 
     fn prepareSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !?raft_engine.runtime.storage_iface.SnapshotSource {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const prepared = (try self.prepareSnapshotHandle(group_id, applied_index)) orelse return null;
+        return prepared.source();
+    }
+
+    pub fn prepareSnapshotHandle(self: *RaftApplyStore, group_id: u64, applied_index: u64) !?*PreparedSnapshot {
         const io = self.runtimeIo();
         const shard = self.batchShard(group_id);
         shard.mutex.lockUncancelable(io);
@@ -1482,7 +1507,7 @@ pub const RaftApplyStore = struct {
             .txn = txn,
             .group_id = group_id,
         };
-        return prepared.source();
+        return prepared;
     }
 
     fn installSnapshotFromRaft(
@@ -1507,7 +1532,37 @@ pub const RaftApplyStore = struct {
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         try self.waitForGenerationPreparationLocked(shard, group_id);
-        try self.writeBatchLocked(shard, group_id, commit_index, entries_bytes);
+        self.writeBatchLocked(shard, group_id, commit_index, entries_bytes) catch |err| {
+            if (!builtin.is_test and err == error.ConflictingDataApplyBatch) {
+                self.logConflictingBatch(shard, group_id, commit_index, entries_bytes);
+            }
+            return err;
+        };
+    }
+
+    fn logConflictingBatch(self: *RaftApplyStore, shard: *BatchShard, group_id: u64, commit_index: u64, bytes: []const u8) void {
+        std.log.err("data apply conflict group_id={d} incoming_commit={d} persisted_commit={d}", .{
+            group_id, commit_index, if (shard.batches.get(group_id)) |batch| batch.commit_index else 0,
+        });
+        self.logBatchIdentities(group_id, "incoming", bytes);
+        const group_store = (self.groupStoreLocked(shard, group_id, false) catch return) orelse return;
+        var key_buf: [128]u8 = undefined;
+        const key = keyForGroup(&key_buf, group_id) catch return;
+        const persisted = group_store.store.get(self.alloc, key) catch return;
+        defer self.alloc.free(persisted);
+        if (persisted.len >= 8) self.logBatchIdentities(group_id, "persisted", persisted[8..]);
+    }
+
+    fn logBatchIdentities(self: *RaftApplyStore, group_id: u64, source: []const u8, bytes: []const u8) void {
+        const entries = raft_state_machine.decodeCommittedEntries(self.alloc, bytes) catch return;
+        defer self.alloc.free(entries);
+        for (entries, 0..) |entry, i| {
+            // Bound fatal diagnostics without logging document payloads.
+            if (i >= 8 and i + 1 != entries.len) continue;
+            std.log.err("data apply conflict identity group_id={d} source={s} index={d} term={d} type={s} bytes={d} digest={x}", .{
+                group_id, source, entry.index, entry.term, @tagName(entry.entry_type), entry.data.len, std.hash.Wyhash.hash(0, entry.data),
+            });
+        }
     }
 
     fn writeBatchLocked(

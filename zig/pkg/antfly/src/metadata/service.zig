@@ -14,12 +14,15 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const fs_paths = @import("../common/fs_paths.zig");
 const common_group_ids = @import("../common/group_ids.zig");
 const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const catalog_projection_reader = @import("catalog_projection_reader.zig");
 const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
@@ -52,9 +55,12 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_operation = @import("../api/operation.zig");
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const api_table_router = @import("../api/table_router.zig");
-const api_table_writes = @import("../api/table_writes.zig");
+const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = if (control_only_storage_sources)
+    @import("../storage/db/control_root.zig")
+else
+    @import("antfly_source_root").antfly_sources.selected_db;
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -1035,6 +1041,7 @@ const MetadataProposalApplyObservation = enum {
     pending,
     applied,
     superseded,
+    unavailable,
 };
 
 fn acceptedMetadataProposalIndex(accepted_index: ?u64, dispatch_error: ?anyerror) !u64 {
@@ -1048,18 +1055,15 @@ fn observeMetadataProposalApply(
     applied_entry_term: ?u64,
     receipt: MetadataProposalReceipt,
 ) MetadataProposalApplyObservation {
-    const raft_status = status orelse return .superseded;
+    const raft_status = status orelse return .unavailable;
     if (raft_status.applied_index >= receipt.index) {
-        return if (applied_entry_term != null and applied_entry_term.? == receipt.term)
-            .applied
-        else
-            .superseded;
+        const actual_term = applied_entry_term orelse return .unavailable;
+        return if (actual_term == receipt.term) .applied else .superseded;
     }
-    const still_receipt_leader = raft_status.soft.role == .leader and
-        raft_status.soft.leader_id != null and
-        raft_status.soft.leader_id.? == raft_status.id and
-        raft_status.hard.current_term == receipt.term;
-    return if (still_receipt_leader) .pending else .superseded;
+    // An admitted entry can survive a leader change. Wait for its exact
+    // applied identity within the existing caller deadline; role and current
+    // term alone prove neither application nor replacement.
+    return .pending;
 }
 
 test "metadata proposal receipt requires the accepted term at the applied index" {
@@ -1077,12 +1081,24 @@ test "metadata proposal receipt requires the accepted term at the applied index"
     status.applied_index = 9;
     try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
     try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
-    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(status, null, receipt));
 
     status.applied_index = 8;
     status.soft = .{ .role = .follower, .leader_id = 2 };
     status.hard.current_term = 4;
-    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+    // Losing leadership does not supersede an admitted log entry. The new
+    // leader can retain it and apply it after this node has stepped down.
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.soft = .{ .role = .candidate, .leader_id = null };
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.soft = .{ .role = .follower, .leader_id = 2 };
+    status.applied_index = 9;
+    try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
+    // Only applied entry identity can resolve success versus replacement;
+    // missing identity remains conservative, and a removed group terminates.
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(status, null, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(null, null, receipt));
 }
 
 test "metadata proposal receipt survives a post-acceptance dispatch failure" {
@@ -4111,7 +4127,7 @@ pub const MetadataService = struct {
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
@@ -4301,6 +4317,7 @@ pub const MetadataService = struct {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         if (self.routed_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
         if (self.local_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
         var fallback = metadata_mod.FallbackLocalShardDbAdapter{
             .replica_root_dir = replica_root_dir,
@@ -4578,8 +4595,9 @@ pub const MetadataService = struct {
                             .{ self.metadata_group_id, receipt.term, receipt.index, raft_status.hard.current_term, raft_status.applied_index, applied_entry_term },
                         );
                     }
-                    return error.NotLeader;
+                    return error.MetadataProposalSuperseded;
                 },
+                .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
             if (progress_driver_lease == null) {
@@ -4966,7 +4984,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5056,7 +5074,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5132,7 +5150,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5298,7 +5316,7 @@ pub const MetadataService = struct {
         self.lockRuntime();
         {
             defer self.unlockRuntime();
-            try self.raft.runRaftRoundOnly();
+            try self.raft.runRaftProgressOnly();
         }
         if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
@@ -5373,7 +5391,7 @@ pub const MetadataService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcileOnceIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -5396,7 +5414,7 @@ pub const MetadataService = struct {
             try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
             try request.ensureActive();
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
@@ -5410,7 +5428,7 @@ pub const MetadataService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -6099,7 +6117,9 @@ pub const MetadataService = struct {
                 .tables = tables,
                 .ranges = ranges,
             });
-        } else owner: {
+        } else if (comptime control_only_storage_sources)
+            return error.StorageKernelOwnerUnavailable
+        else owner: {
             const backend_runtime = try self.ensureBackendRuntime();
             break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
                 self.alloc,
@@ -6132,16 +6152,25 @@ pub const MetadataService = struct {
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
+        // A control compilation unit obtains durable restore markers from the
+        // resident data/storage owner. Until that adapter is installed, retain
+        // the projected state and retry instead of treating it as absent.
+        if (comptime control_only_storage_sources) {
+            if (self.local_shard_db_adapter == null) return;
+        }
         const local_node_id = self.raft.host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressWithOptions(
             self.alloc,
-            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
             group_ids,
             tables,
             ranges,
+            .{
+                .shared_io = if (comptime control_only_storage_sources) null else (try self.ensureBackendRuntime()).io(),
+                .shard_db_adapter = self.local_shard_db_adapter,
+            },
         );
         defer {
             for (local_progress) |record| metadata_table_manager.freeRestoreProgress(self.alloc, record);
@@ -6190,6 +6219,10 @@ pub const MetadataService = struct {
             ranges,
             stores,
         )) {
+            // A control unit never opens a physical shard DB. Preserve the
+            // last projected progress until its storage-owner provider has
+            // published authoritative runtime status, then retry next round.
+            if (comptime control_only_storage_sources) return;
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
@@ -6807,6 +6840,7 @@ pub const MetadataHttpService = struct {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         if (self.routed_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
         if (self.local_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
         var fallback = metadata_mod.FallbackLocalShardDbAdapter{
             .replica_root_dir = replica_root_dir,
@@ -7041,7 +7075,8 @@ pub const MetadataHttpService = struct {
             self.unlockRuntime();
             switch (observation) {
                 .applied => return,
-                .superseded => return error.NotLeader,
+                .superseded => return error.MetadataProposalSuperseded,
+                .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
             if (progress_driver_lease == null) {
@@ -7630,9 +7665,9 @@ pub const MetadataHttpService = struct {
                     self.metadata_group_id,
                 )) return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -7724,9 +7759,9 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -7805,9 +7840,9 @@ pub const MetadataHttpService = struct {
                     self.metadata_group_id,
                 )) return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -8465,9 +8500,9 @@ pub const MetadataHttpService = struct {
         {
             defer self.unlockRuntime();
             if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftOnly();
+                _ = try self.raft.syncPendingRaftProgressOnly();
             } else {
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
         }
         if (!try self.ensureMetadataIncarnation()) {
@@ -8551,7 +8586,7 @@ pub const MetadataHttpService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcileOnceIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -8569,7 +8604,7 @@ pub const MetadataHttpService = struct {
             try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
             try request.ensureActive();
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
@@ -8582,7 +8617,7 @@ pub const MetadataHttpService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -8640,7 +8675,7 @@ pub const MetadataHttpService = struct {
     pub fn syncPending(self: *MetadataHttpService) !raft_managed_host.ManagedSyncResult {
         self.lockRuntime();
         defer self.unlockRuntime();
-        return try self.raft.syncPendingRaftOnly();
+        return try self.raft.syncPendingRaftProgressOnly();
     }
 
     pub fn metrics(self: *MetadataHttpService) raft_service.ManagedServiceMetrics {
@@ -10081,7 +10116,9 @@ pub const MetadataHttpService = struct {
                 .tables = inputs.tables,
                 .ranges = inputs.ranges,
             });
-        } else owner: {
+        } else if (comptime control_only_storage_sources)
+            return error.StorageKernelOwnerUnavailable
+        else owner: {
             const backend_runtime = try self.ensureBackendRuntime();
             break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
                 self.alloc,
@@ -10115,16 +10152,24 @@ pub const MetadataHttpService = struct {
         projected_progress: []const metadata_table_manager.RestoreProgressRecord,
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
+        // See the threaded service path above. Never reopen storage from the
+        // control unit merely because the owner adapter has not arrived yet.
+        if (comptime control_only_storage_sources) {
+            if (self.local_shard_db_adapter == null) return;
+        }
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressWithOptions(
             self.alloc,
-            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
             group_ids,
             tables,
             ranges,
+            .{
+                .shared_io = if (comptime control_only_storage_sources) null else (try self.ensureBackendRuntime()).io(),
+                .shard_db_adapter = self.local_shard_db_adapter,
+            },
         );
         defer {
             for (local_progress) |record| metadata_table_manager.freeRestoreProgress(self.alloc, record);
@@ -10171,6 +10216,9 @@ pub const MetadataHttpService = struct {
             inputs.ranges,
             inputs.stores,
         )) {
+            // See the threaded service path above: physical fallback belongs
+            // to the compiled storage owner, never the metadata control unit.
+            if (comptime control_only_storage_sources) return;
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
@@ -11516,14 +11564,14 @@ fn advanceCdcLeaseRaft(service: anytype) !void {
     if (Service == MetadataService) {
         if (!service.raft.host.host.isLocalLeader(service.metadata_group_id))
             return error.CdcWorkLeaseLost;
-        try service.raft.runRaftRoundOnly();
+        try service.raft.runRaftProgressOnly();
     } else {
         if (!service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id))
             return error.CdcWorkLeaseLost;
         if (service.raft.pending_updates.items.len > 0) {
-            _ = try service.raft.syncPendingRaftOnly();
+            _ = try service.raft.syncPendingRaftProgressOnly();
         } else {
-            try service.raft.runRaftRoundOnly();
+            try service.raft.runRaftProgressOnly();
         }
     }
 }
@@ -11803,10 +11851,42 @@ fn syncLocalSchemaProgress(
 }
 
 fn runReplicationBackfillIfLeaseHeld(service: anytype) !bool {
-    const has_reconcile_lease = try service.ensureReconcileLease();
+    const has_reconcile_lease = service.ensureReconcileLease() catch |err| {
+        // This is scheduling admission, before any CDC work is enqueued.
+        // Losing leadership while acquiring/observing the lease closes this
+        // turn's admission; the next tick re-reads authoritative lease state.
+        // It must not terminate a healthy metadata follower.
+        if (metadata_authority.isRetryableError(err) or err == error.MetadataMutationOutcomeUnknown) return false;
+        return err;
+    };
     if (!has_reconcile_lease) return false;
     try service.runReplicationBackfillRound();
     return true;
+}
+
+test "metadata CDC scheduling defers lease authority loss before enqueue" {
+    const FakeService = struct {
+        failure: ?anyerror = error.NotLeader,
+        scheduled: usize = 0,
+        fn ensureReconcileLease(self: *@This()) !bool {
+            if (self.failure) |err| return err;
+            return true;
+        }
+        fn runReplicationBackfillRound(self: *@This()) !void {
+            self.scheduled += 1;
+        }
+    };
+    var service = FakeService{};
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.MetadataMutationOutcomeUnknown }) |err| {
+        service.failure = err;
+        try std.testing.expect(!try runReplicationBackfillIfLeaseHeld(&service));
+        try std.testing.expectEqual(@as(usize, 0), service.scheduled);
+    }
+    service.failure = error.Corrupted;
+    try std.testing.expectError(error.Corrupted, runReplicationBackfillIfLeaseHeld(&service));
+    service.failure = null;
+    try std.testing.expect(try runReplicationBackfillIfLeaseHeld(&service));
+    try std.testing.expectEqual(@as(usize, 1), service.scheduled);
 }
 
 fn syncLocalRestoreProgress(
@@ -12680,6 +12760,10 @@ fn collectLocalGroupStatusReport(
     split_observations: []const transition_state.SplitObservationRecord,
     merge_observations: []const transition_state.MergeObservationRecord,
 ) !?metadata_table_manager.GroupStatusReport {
+    // The normal path is the local data-runtime status provider. A control
+    // unit must not instantiate the old status-only DB fallback while that
+    // provider is starting; retain the previous observation and retry.
+    if (comptime control_only_storage_sources) return null;
     _ = stores;
     _ = merged_group_statuses;
     var db = db_mod.DB.open(alloc, db_path, .{
@@ -18830,6 +18914,25 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_index_requests > 0);
+
+    // Mutation and lifecycle waiters share the same cadence contract. A
+    // single-node quorum can apply accepted work without an election tick.
+    try svc.raft.submit(.{ .replica_intent = .{ .upsert = .{
+        .record = .{ .group_id = 2910, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty },
+        .peer_node_ids = &.{1},
+    } } });
+    _ = try svc.syncPending();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.ensureCatalogWorkflowLease();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.upsertTable(.{ .table_id = 99, .name = "cadence_contract" });
+    try svc.runRaftProgressOnly();
+    try svc.removeTable(99);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try advanceCdcLeaseRaft(&svc);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.runLifecycleRound();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

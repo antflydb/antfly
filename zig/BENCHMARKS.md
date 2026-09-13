@@ -2,18 +2,29 @@
 
 Run these commands from `zig/`. Artifact targets build and install into `zig-out`; execute the installed binary to run a benchmark or tool. Build flags belong to `zig build`, and runtime arguments belong to the binary.
 
-The commands below preserve the former build-run defaults. Replace the arguments with your chosen workload. File arguments remain relative to the working directory.
+Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=ReleaseFast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
+
+`inference-bench-training` and `inference-bench-paged-attention` run native CPU
+workloads. Their shared constructor honors optimization and system BLAS settings;
+product GPU and server settings do not change their builds. The standalone
+inference package exposes the same workloads as `bench-training` and
+`bench-paged-attention`. CI executes small real workloads through both entrypoints
+and checks their cache independence.
+
+The commands below preserve the former workload defaults. Replace the arguments with your chosen workload. File arguments remain relative to the working directory.
 
 | Build target | Run command with previous defaults |
 |---|---|
-| `antfly-storage-bench` | Installs `storage_bench` with DB/query, analytics, ingest, provisioned-ingest, HBC, and summary subcommands; their workloads are listed below. |
+| `antfly-storage-bench` | Installs the `storage_bench` driver and the batch, open, replay, and artifact-rebuild binaries listed below. |
 | `antfly-storage-db-derived-bench` | `./zig-out/bin/derived_log_bench` |
 | `antfly-storage-wal-bench` | `./zig-out/bin/wal_bench` |
-| `artifact-rebuild-bench` | `./zig-out/bin/artifact_rebuild_bench` |
+| `antfly-storage-bench` | `./zig-out/bin/artifact_rebuild_bench` |
 | `backend-bench` | `./zig-out/bin/backend_bench --samples 3 --keys 20000 --value-size 128 --hit-repeats 3 --miss-repeats 3 --scan-repeats 5` |
-| `batch-bench` | `./zig-out/bin/batch_bench` |
+| `antfly-storage-bench` | `./zig-out/bin/batch_bench` |
 | `bench` | `./zig-out/bin/bench` |
 | `bench-tokenizer` | `./zig-out/bin/tokenizer_benchmark` |
+| `bench-subgroup-scan` | `./zig-out/bin/bench-subgroup-scan` |
+| `vector-projection-bounds-bench` | `./zig-out/bin/vector_projection_bounds_bench` |
 | `db-split-bench` | `./zig-out/bin/db_split_bench` |
 | `antfly-storage-bench` | `./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000` |
 | `dense-profile-summary` | `./zig-out/bin/dense_profile_summary` |
@@ -40,7 +51,7 @@ The commands below preserve the former build-run defaults. Replace the arguments
 | `managed-host-wal-bench` | `./zig-out/bin/managed_host_wal_bench` |
 | `merge-cost` | `./zig-out/bin/merge_cost_bench` |
 | `merge-cycle` | `./zig-out/bin/merge_cycle_bench` |
-| `open-bench` | `./zig-out/bin/open_bench` |
+| `antfly-storage-bench` | `./zig-out/bin/open_bench` |
 | `antfly-storage-bench` | `./zig-out/bin/storage_bench provisioned-ingest --docs 50000 --dims 1536 --batch-size 100 --sync-level write --max-bulk-clone-calls 0 --max-bulk-clone-bytes 0 --max-bulk-clone-peak-bytes 0 --max-data-block-cache-bytes 805306368 --max-peak-footprint-bytes 3221225472 --max-ingest-ms 60000` |
 | `provisioned-warmup-bench` | `./zig-out/bin/provisioned_warmup_bench` |
 | `antfly-api-bench` | `./zig-out/bin/api_bench --docs 5000 --dims 384 --queries 25 --repeats 10 --k 100 --batch-size 250 --search-threads 5 --sync-level write` |
@@ -50,7 +61,7 @@ The commands below preserve the former build-run defaults. Replace the arguments
 | `raft-apply-bench` | `./zig-out/bin/raft_apply_bench` |
 | `recall-harness` | `./zig-out/bin/recall_harness` |
 | `regex-bench` | `./zig-out/bin/regex_bench` |
-| `replay-bench` | `./zig-out/bin/replay_bench` |
+| `antfly-storage-bench` | `./zig-out/bin/replay_bench` |
 | `rw-lock-bench` | `./zig-out/bin/rw_lock_bench` |
 | `search-bench-bitpack-bench` | `./zig-out/bin/search_benchmark_bitpack_bench` |
 | `search-bench-codec-bench` | `./zig-out/bin/search_benchmark_codec_bench` |
@@ -61,6 +72,48 @@ The commands below preserve the former build-run defaults. Replace the arguments
 | `text-segment-write-bench` | `./zig-out/bin/text_segment_write_bench --samples 3 --docs 20000 --batch-size 1000 --terms-per-doc 12 --merge-width 8 --storage host` |
 | `wand-skip-bench` | `./zig-out/bin/wand_skip_bench` |
 | `lmdb-bench` | Builds both `lmdb_bench_c` and `lmdb_bench_zig`; their invocation presets are below. |
+
+## DB lifecycle workloads
+
+Build once with `zig build antfly-storage-bench -Doptimize=ReleaseFast`, then run
+`batch_bench`, `open_bench`, `replay_bench`, or `artifact_rebuild_bench`. These commands keep
+their previous flags, defaults, and output record names. Batch and replay now use
+the production storage dependencies; generated workloads still explicitly supply
+deterministic providers. They remain separate compile artifacts so editing a focused
+workload does not rebuild the larger API/HBC driver. Compare performance using the same build options,
+including optimization and accelerator settings.
+
+For small disposable workloads:
+
+```sh
+./zig-out/bin/batch_bench --docs 16 --batch-size 8 --dims 8
+./zig-out/bin/open_bench --docs 16 --batch-size 8 --dims 8
+./zig-out/bin/replay_bench --workload generated_chunked_dense --docs 16 --batch-size 8 --dims 8
+./zig-out/bin/artifact_rebuild_bench --db-path /path/to/source-db --fixture-db-path /tmp/rebuild-fixture
+```
+
+`artifact_rebuild_bench` operates on `--db-path` directly unless `--fixture-db-path` is
+supplied; that option copies the source database into the fixture directory before
+opening it. Use a disposable destination for rebuild comparisons.
+
+`provisioned-warmup-bench` remains separate because it exercises DataServer
+background warmup and cleanup in addition to the DB workloads.
+
+### Build measurements
+
+On an Apple M4 host with Zig 0.16.0 and
+`-Doptimize=ReleaseFast -Dmetal=false -Dsystem-blas=false`, a batch default-value
+edit took 194 seconds in a standalone artifact and 349 seconds after folding it
+into `storage_bench`. The combined driver rebuilt in 0.7 seconds when cached, but
+its slower focused rebuild triggered the decision to retain separate artifacts
+under one target. Workload code, fixtures, and production dependencies were held
+constant for the comparison. Other builds were active on the host, so these are
+local observations rather than a general performance guarantee.
+
+The production-configured DB workloads measured up to 7 GiB compiler RSS, and
+the existing storage driver reached 12 GiB. Their scheduler reservations are
+8 GiB and 14 GiB respectively. Use the bounded build runner with a machine's
+memory budget when compiling the aggregate concurrently with other work.
 
 ## Presets
 

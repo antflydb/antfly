@@ -469,6 +469,23 @@ pub const Cluster = struct {
                 var dropped = self.network.orderedRemove(i);
                 defer dropped.deinit(self.alloc);
 
+                // Model a follower catching up through another delivery before
+                // acknowledging the pending snapshot's prefix. An invented
+                // acknowledgement for absent data violates Raft's durability
+                // contract and cannot be repaired by regressing leader Match.
+                if (log_index != dropped.snapshot.?.metadata.index) return error.InvalidSnapshotAbortIndex;
+                try self.node(to).step(dropped);
+                try self.collectReady(to);
+                var response_index: usize = 0;
+                while (response_index < self.network.items.len) {
+                    const response = self.network.items[response_index];
+                    if (response.msg_type == .snapshot_response and response.from == to and response.to == from) {
+                        var removed = self.network.orderedRemove(response_index);
+                        removed.deinit(self.alloc);
+                    } else {
+                        response_index += 1;
+                    }
+                }
                 try self.node(from).step(.{
                     .msg_type = .append_entries_response,
                     .from = to,

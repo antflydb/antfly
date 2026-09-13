@@ -1,5 +1,8 @@
 # VectorDBBench Findings
 
+> Paths under `.benchmark-results/` refer to local benchmark output that is not tracked in git.
+
+
 This is the working evidence log for the 50K and 1M Antfly VectorDBBench
 investigation. Keep benchmark-harness changes separate from product fixes: a
 vector-only control should not do full-text work, while normal Antfly users who
@@ -8,7 +11,7 @@ ingest throughput.
 
 ## Benchmark contract
 
-The subsequent [source publication memory fix](../.benchmark-results/vector-source-memory-fix/README.md)
+The subsequent source publication memory fix (`.benchmark-results/vector-source-memory-fix/README.md`)
 reproduces the suspected OOM as a source-budget rejection of a second WAL-sized
 allocation during GC preparation. Full and selective GC now prepare readers and
 inventory before publication, reuse the committed WAL suffix, and preserve the
@@ -20,7 +23,7 @@ That revision passes fresh 50K ABBA and its lifecycle checks, but the second
 1M candidate logs one maintenance OOM and is excluded. A same-binary diagnostic
 identifies a separate 77,594,648-byte mark-map allocation with 332,745,026 live
 bytes against the 402,653,184-byte source slice. The
-[mark-workspace follow-up](../.benchmark-results/vector-source-memory-admission/README.md)
+mark-workspace follow-up (`.benchmark-results/vector-source-memory-admission/README.md`)
 admits the map and source leases against the resident ANN snapshot before map
 allocation. Rejected setup releases its temporary snapshots and retries later;
 backing allocation and I/O failures still propagate. Its regression verifies
@@ -45,7 +48,7 @@ memory demand. Maximum sampled source WAL is 48.05 MiB in all four 1M arms.
 These periodic samples are not exact peaks. The second 1M control lacks a
 complete churn-stage source-counter interval; its lock/inventory breakdown is
 unavailable, not zero. See the
-[qualified results](../.benchmark-results/vector-source-memory-admission/RESULTS.md).
+qualified results (`.benchmark-results/vector-source-memory-admission/RESULTS.md`).
 Both arms contain the fixes: this is not a pre-fix/post-fix timing comparison,
 a comparison against `primary_lsm`, or qualification of other deployment modes.
 The frozen source/harness/binary hashes verify. Qualification excludes unrelated
@@ -82,8 +85,8 @@ collection before the errors, but the failing allocation is not identified.
 Next, reproduce memory admission/collection scratch pressure with allocation
 evidence, fix it while preserving publication and recovery fences, then rerun
 fresh 1M ABBA. No defaults change. See the
-[full results](../.benchmark-results/vector-structural-selected/RESULTS.md) and
-[memory-failure evidence](../.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md).
+full results (`.benchmark-results/vector-structural-selected/RESULTS.md`) and
+memory-failure evidence (`.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md`).
 
 The catalog/inventory investigation is under
 `.benchmark-results/vector-structural-refined/`. Identical-data memory-map captures
@@ -143,7 +146,7 @@ lifecycle comparison. Shared-catalog memory attribution and inventory WAL/map
 cost are the next targets. A selected subset still needs comparison against the
 stronger locked row-bounded baseline before new 1M qualification. Full tables,
 missing-counter limitations, and audit receipts are in
-[the structural results](../.benchmark-results/vector-structural/RESULTS.md).
+the structural results (`.benchmark-results/vector-structural/RESULTS.md`).
 
 Active scan scheduling, protected reuse, and their combined experiment are complete under
 `.benchmark-results/vector-progress-dedup/`: active scan scheduling proportional

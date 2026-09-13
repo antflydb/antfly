@@ -187,6 +187,8 @@ type ModelSpec struct {
 
 	// Tasks declares the model tasks to write into the pulled model manifest.
 	// For example: ["embed"].
+	// Generated eager preloads require a recognized task. If omitted, use lazy
+	// or bounded loading, or supply spec.config.preload with an explicit kind.
 	// +optional
 	Tasks []string `json:"tasks,omitempty"`
 

@@ -18,6 +18,9 @@ const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const work_lease = @import("../build/work_lease.zig");
+const head_coordination = @import("../head_coordination.zig");
 
 const retired_head_doc_offset = std.math.maxInt(u64);
 
@@ -52,14 +55,17 @@ pub const FsProgressStore = struct {
     pub fn getHead(self: *FsProgressStore, namespace: []const u8) !u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const path = try headPathAlloc(self.alloc, self.root_dir, namespace);
-        defer self.alloc.free(path);
-        const raw = try readFileAlloc(self.alloc, path);
-        defer self.alloc.free(raw);
-        return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+        var current = try self.readHeadUnlocked(namespace);
+        defer current.deinit();
+        if (current.value.head_version == 0) return error.FileNotFound;
+        return current.value.head_version;
     }
 
     pub fn compareAndSwapHead(self: *FsProgressStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
+        return self.compareAndSwapHeadMaybeFenced(namespace, expected, version, null);
+    }
+
+    fn compareAndSwapHeadMaybeFenced(self: *FsProgressStore, namespace: []const u8, expected: ?u64, version: u64, fence: ?progress_store.PublicationFence) !bool {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var lock_io_impl = threadedIo();
@@ -70,12 +76,124 @@ pub const FsProgressStore = struct {
         try namespace_lock.lock(lock_io, .exclusive);
         defer namespace_lock.unlock(lock_io);
 
-        const current = self.readOptionalU64Unlocked(namespace, .head) catch |err| switch (err) {
-            error.FileNotFound => null,
+        var current = try self.readHeadUnlocked(namespace);
+        defer current.deinit();
+        const current_version: ?u64 = if (current.value.head_version == 0) null else current.value.head_version;
+        if (current_version != expected) return false;
+        if (fence == null and !current.value.released) return error.PublicationFenceRequired;
+        if (fence) |required| try requireFence(current.value, required.owner_id, required.fencing_token);
+        var proposed = current.value;
+        proposed.head_version = version;
+        try self.writeHeadUnlocked(namespace, proposed);
+        return true;
+    }
+
+    fn readHeadUnlocked(self: *FsProgressStore, namespace: []const u8) !std.json.Parsed(head_coordination.Record) {
+        const path = try headPathAlloc(self.alloc, self.root_dir, namespace);
+        defer self.alloc.free(path);
+        const raw = readFileAlloc(self.alloc, path) catch |err| switch (err) {
+            error.FileNotFound => return std.json.parseFromSlice(head_coordination.Record, self.alloc, "{}", .{}),
             else => return err,
         };
-        if (current != expected) return false;
-        try self.writeU64Unlocked(namespace, .head, version);
+        defer self.alloc.free(raw);
+        const parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, raw, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        if (!head_coordination.valid(parsed.value)) return error.InvalidHeadCoordinationRecord;
+        return parsed;
+    }
+
+    fn writeHeadUnlocked(self: *FsProgressStore, namespace: []const u8, record: head_coordination.Record) !void {
+        const path = try headPathAlloc(self.alloc, self.root_dir, namespace);
+        defer self.alloc.free(path);
+        try ensureParentDir(path);
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{});
+        defer self.alloc.free(payload);
+        try writeFileAtomically(path, payload);
+        var sync_io = threadedIo();
+        defer sync_io.deinit();
+        try fs_paths.syncDirPortable(sync_io.io(), self.root_dir);
+    }
+
+    fn requireFence(record: head_coordination.Record, owner: []const u8, token: u64) !void {
+        if (record.released or record.fencing_token != token or record.owner_id == null or !std.mem.eql(u8, record.owner_id.?, owner)) return error.WorkLeaseLost;
+    }
+
+    fn erasedWorkLeaseProvider(ptr: *anyopaque) work_lease.Provider {
+        return .{ .ptr = ptr, .vtable = &lease_vtable };
+    }
+
+    const lease_vtable: work_lease.Provider.VTable = .{
+        .acquire = leaseAcquire,
+        .validate = leaseValidate,
+        .renew = leaseRenew,
+        .release = leaseRelease,
+        .acquire_bootstrap = leaseAcquire,
+        .renew_bootstrap = leaseRenew,
+        .release_bootstrap = leaseRelease,
+    };
+
+    fn leaseAcquire(ptr: *anyopaque, ns: []const u8, owner: []const u8, now: u64, ttl: u64) !?work_lease.Acquisition {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var file_lock = try openNamespaceLock(self.alloc, self.root_dir, ns, io);
+        defer file_lock.close(io);
+        try file_lock.lock(io, .exclusive);
+        defer file_lock.unlock(io);
+        var current = try self.readHeadUnlocked(ns);
+        defer current.deinit();
+        if (!current.value.released and current.value.expires_at_unix_ns > now) return null;
+        const token = std.math.add(u64, current.value.fencing_token, 1) catch return error.LeaseFencingTokenOverflow;
+        const expiry = std.math.add(u64, now, ttl) catch return error.LeaseExpiryOverflow;
+        try self.writeHeadUnlocked(ns, .{ .head_version = current.value.head_version, .owner_id = owner, .fencing_token = token, .expires_at_unix_ns = expiry, .released = false });
+        return .{ .fencing_token = token, .expires_at_unix_ns = expiry, .took_over = !current.value.released };
+    }
+
+    fn leaseValidate(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64) !void {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var current = try self.readHeadUnlocked(ns);
+        defer current.deinit();
+        try requireFence(current.value, owner, token);
+        if (current.value.expires_at_unix_ns <= now) return error.WorkLeaseLost;
+    }
+
+    fn changeLease(self: *FsProgressStore, ns: []const u8, owner: []const u8, token: u64, expiry: ?u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var file_lock = try openNamespaceLock(self.alloc, self.root_dir, ns, io);
+        defer file_lock.close(io);
+        try file_lock.lock(io, .exclusive);
+        defer file_lock.unlock(io);
+        var current = try self.readHeadUnlocked(ns);
+        defer current.deinit();
+        try requireFence(current.value, owner, token);
+        var proposed = current.value;
+        proposed.expires_at_unix_ns = expiry orelse 0;
+        proposed.released = expiry == null;
+        try self.writeHeadUnlocked(ns, proposed);
+    }
+
+    fn leaseRenew(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64) !u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        const expiry = std.math.add(u64, now, ttl) catch return error.LeaseExpiryOverflow;
+        try self.changeLease(ns, owner, token, expiry);
+        return expiry;
+    }
+
+    fn leaseRelease(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        self.changeLease(ns, owner, token, null) catch |err| switch (err) {
+            error.WorkLeaseLost => return false,
+            else => return err,
+        };
         return true;
     }
 
@@ -116,6 +234,85 @@ pub const FsProgressStore = struct {
             error.FileNotFound => null,
             else => return err,
         };
+    }
+
+    fn readDeadlinePathAlloc(self: *FsProgressStore, namespace: []const u8, version: u64) ![]u8 {
+        const leaf = try std.fmt.allocPrint(self.alloc, "READ_PINS/{d}", .{version});
+        defer self.alloc.free(leaf);
+        return std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, leaf });
+    }
+
+    fn readDeadlineUnlocked(self: *FsProgressStore, path: []const u8) !?u64 {
+        const raw = readFileAlloc(self.alloc, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10);
+    }
+
+    pub fn getManifestReadDeadline(self: *FsProgressStore, namespace: []const u8, version: u64) !?u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const path = try self.readDeadlinePathAlloc(namespace, version);
+        defer self.alloc.free(path);
+        return self.readDeadlineUnlocked(path);
+    }
+
+    pub fn compareAndSwapManifestReadDeadline(self: *FsProgressStore, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+        if (expected) |prior| if (deadline < prior) return false;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var namespace_lock = try openNamespaceLock(self.alloc, self.root_dir, namespace, io);
+        defer namespace_lock.close(io);
+        try namespace_lock.lock(io, .exclusive);
+        defer namespace_lock.unlock(io);
+        const path = try self.readDeadlinePathAlloc(namespace, version);
+        defer self.alloc.free(path);
+        if (try self.readDeadlineUnlocked(path) != expected) return false;
+        try ensureParentDir(path);
+        var buffer: [20]u8 = undefined;
+        const payload = try std.fmt.bufPrint(&buffer, "{d}", .{deadline});
+        try writeFileAtomically(path, payload);
+        // Also persist newly created READ_PINS and namespace directory entries,
+        // not only the pin file's rename inside READ_PINS.
+        const namespace_path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace });
+        defer self.alloc.free(namespace_path);
+        try fs_paths.syncDirPortable(io, namespace_path);
+        try fs_paths.syncDirPortable(io, self.root_dir);
+        return true;
+    }
+
+    fn pruneManifestReadDeadlines(self: *FsProgressStore, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, namespace, "READ_PINS" });
+        defer self.alloc.free(path);
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        var deleted = false;
+        while (try iterator.next(io)) |entry| {
+            try cancellation.check();
+            if (entry.kind != .file) continue;
+            const version = std.fmt.parseInt(u64, entry.name, 10) catch continue;
+            if (version >= floor) continue;
+            const deadline = try self.getManifestReadDeadline(namespace, version) orelse continue;
+            if (deadline >= expired_before) continue;
+            dir.deleteFile(io, entry.name) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            deleted = true;
+        }
+        if (deleted) try fs_paths.syncDirectoryHandlePortable(io, dir);
     }
 
     pub fn compareAndSwapManifestGcFloor(self: *FsProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
@@ -393,14 +590,16 @@ pub const FsProgressStore = struct {
         try namespace_lock.lock(lock_io, .exclusive);
         defer namespace_lock.unlock(lock_io);
 
-        const current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
+        var current = self.readOptionalStageProgressUnlocked(namespace, stage) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
+        defer if (current) |*value| value.deinit(self.alloc);
         if (!stageProgressOptionalEql(current, expected)) return false;
         if (current) |value| {
             if (desired.head_version < value.head_version) return false;
-            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+            if (desired.revision < value.revision or desired.completed_cycles < value.completed_cycles) return false;
+            if (desired.head_version == value.head_version and desired.revision == value.revision and desired.doc_offset < value.doc_offset) return false;
         }
         try self.writeStageProgressUnlocked(namespace, stage, desired);
         return true;
@@ -456,9 +655,11 @@ pub const FsProgressStore = struct {
     ) !progress_store.EnrichmentStageProgress {
         const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
         defer self.alloc.free(path);
-        const raw = try readFileAlloc(self.alloc, path);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, self.alloc, .limited(progress_store.EnrichmentStageProgress.max_encoded_bytes));
         defer self.alloc.free(raw);
-        return try parseStageProgress(raw);
+        return try progress_store.EnrichmentStageProgress.decodeAlloc(self.alloc, raw);
     }
 
     fn writeStageProgressUnlocked(
@@ -470,7 +671,7 @@ pub const FsProgressStore = struct {
         const path = try stagePathAlloc(self.alloc, self.root_dir, namespace, stage, "STATE");
         defer self.alloc.free(path);
         try ensureParentDir(path);
-        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ value.head_version, value.doc_offset });
+        const payload = try value.encodeAlloc(self.alloc);
         defer self.alloc.free(payload);
         try writeFileAtomically(path, payload);
     }
@@ -504,6 +705,7 @@ pub const FsProgressStore = struct {
     }
 
     const vtable: progress_store.ProgressStore.VTable = .{
+        .work_lease_provider = erasedWorkLeaseProvider,
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
@@ -512,6 +714,9 @@ pub const FsProgressStore = struct {
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
         .get_manifest_gc_floor = erasedGetManifestGcFloor,
         .compare_and_swap_manifest_gc_floor = erasedCompareAndSwapManifestGcFloor,
+        .get_manifest_read_deadline = erasedGetManifestReadDeadline,
+        .compare_and_swap_manifest_read_deadline = erasedCompareAndSwapManifestReadDeadline,
+        .prune_manifest_read_deadlines = erasedPruneManifestReadDeadlines,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
         .compare_and_swap_enrichment_head_version = erasedCompareAndSwapEnrichmentHeadVersion,
         .get_enrichment_stage = erasedGetEnrichmentStage,
@@ -545,13 +750,14 @@ pub const FsProgressStore = struct {
     }
 
     fn erasedCompareAndSwapHeadFenced(
-        _: *anyopaque,
-        _: []const u8,
-        _: ?u64,
-        _: u64,
-        _: progress_store.PublicationFence,
+        ptr: *anyopaque,
+        namespace: []const u8,
+        expected: ?u64,
+        version: u64,
+        fence: progress_store.PublicationFence,
     ) !bool {
-        return error.PublicationFenceUnsupported;
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return self.compareAndSwapHeadMaybeFenced(namespace, expected, version, fence);
     }
 
     fn erasedGetGcWatermark(ptr: *anyopaque, namespace: []const u8) !?u64 {
@@ -567,6 +773,21 @@ pub const FsProgressStore = struct {
     fn erasedGetManifestGcFloor(ptr: *anyopaque, namespace: []const u8) !?u64 {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.getManifestGcFloor(namespace);
+    }
+
+    fn erasedGetManifestReadDeadline(ptr: *anyopaque, namespace: []const u8, version: u64) !?u64 {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return self.getManifestReadDeadline(namespace, version);
+    }
+
+    fn erasedPruneManifestReadDeadlines(ptr: *anyopaque, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return self.pruneManifestReadDeadlines(namespace, floor, expired_before, cancellation);
+    }
+
+    fn erasedCompareAndSwapManifestReadDeadline(ptr: *anyopaque, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+        const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
+        return self.compareAndSwapManifestReadDeadline(namespace, version, expected, deadline);
     }
 
     fn erasedCompareAndSwapManifestGcFloor(ptr: *anyopaque, namespace: []const u8, expected: ?u64, floor: u64) !bool {
@@ -700,20 +921,12 @@ pub const FsProgressStore = struct {
     }
 };
 
-fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
-    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
-    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
-    return .{ .head_version = head_version, .doc_offset = doc_offset };
-}
-
 fn stageProgressOptionalEql(
     lhs: ?progress_store.EnrichmentStageProgress,
     rhs: ?progress_store.EnrichmentStageProgress,
 ) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+    return lhs.?.eql(rhs.?);
 }
 
 fn threadedIo() std.Io.Threaded {
@@ -753,6 +966,7 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
         var writer = file.writer(io, &buf);
         try writer.interface.writeAll(contents);
         try writer.end();
+        try file.sync(io);
     }
 
     if (std.fs.path.isAbsolute(path)) {
@@ -766,6 +980,7 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
             return err;
         };
     }
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.syncDirPortable(io, parent);
 }
 
 fn pathForAlloc(alloc: Allocator, root_dir: []const u8, namespace: []const u8, kind: FsProgressStore.Kind) ![]u8 {
@@ -845,6 +1060,44 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
+test "serverless manifest read pins persist across filesystem owners and use monotonic CAS" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "manifest-read-pin");
+    defer cleanupTmp(path);
+    {
+        var fs = try FsProgressStore.init(alloc, std.mem.span(path));
+        var store = fs.progressStore();
+        defer store.deinit();
+        try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 1));
+        try std.testing.expect(try store.compareAndSwapManifestReadDeadline("docs", 1, null, 100));
+    }
+    var fs = try FsProgressStore.init(alloc, std.mem.span(path));
+    var store = fs.progressStore();
+    defer store.deinit();
+    try std.testing.expectEqual(@as(?u64, 100), try store.getManifestReadDeadline("docs", 1));
+    try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 2));
+    try std.testing.expect(!try store.compareAndSwapManifestReadDeadline("docs", 1, null, 200));
+    try std.testing.expect(!try store.compareAndSwapManifestReadDeadline("docs", 1, 100, 99));
+    try std.testing.expect(try store.compareAndSwapManifestReadDeadline("docs", 1, 100, 200));
+    try std.testing.expectError(error.ManifestGcFloorNotCommitted, store.pruneManifestReadDeadlines("docs", 2, 201, .none));
+    try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", null, 2));
+    try store.pruneManifestReadDeadlines("docs", 2, 200, .none);
+    try std.testing.expectEqual(@as(?u64, 200), try store.getManifestReadDeadline("docs", 1));
+    try store.pruneManifestReadDeadlines("docs", 2, 201, .none);
+    try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 1));
+}
+
+test "serverless enrichment stage cursor filesystem CAS preserves key across heads and permits fenced wrap" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "enrichment-cursor");
+    defer cleanupTmp(path);
+    var impl = try FsProgressStore.init(std.testing.allocator, std.mem.span(path));
+    var store = impl.progressStore();
+    defer store.deinit();
+    try progress_store.testEnrichmentCursorCompareAndSwap(&store);
+}
+
 test "serverless manifest GC floor persists across filesystem owners and rejects rollback" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -867,7 +1120,7 @@ test "serverless manifest GC floor persists across filesystem owners and rejects
     try std.testing.expectEqual(@as(?u64, 3), try store.getManifestGcFloor("docs"));
 }
 
-test "fs progress store manages head and gc watermark with CAS" {
+test "serverless fs progress store manages head and gc watermark with CAS" {
     var path_buf: [256]u8 = undefined;
     const path = tmpPath(&path_buf, "cas");
     defer cleanupTmp(path);
@@ -1050,6 +1303,39 @@ test "serverless fs progress store preserves cross-instance GC watermark CAS" {
     try std.testing.expectEqual(@as(u32, 1), race.winners.load(.monotonic));
     const final = (try store_a.getGcWatermark("docs")).?;
     try std.testing.expect(final == 20 or final == 21);
+}
+
+test "serverless fs publication fencing survives bootstrap takeover and reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "fenced-bootstrap");
+    defer cleanupTmp(path);
+    var first = try FsProgressStore.init(alloc, std.mem.span(path));
+    defer first.deinit();
+    var second = try FsProgressStore.init(alloc, std.mem.span(path));
+    defer second.deinit();
+    var a = first.progressStore();
+    var b = second.progressStore();
+    const pa = try a.workLeaseProvider();
+    const pb = try b.workLeaseProvider();
+    const stale = (try pa.acquireBootstrap("docs", "one", 100, 10)).?;
+    try std.testing.expectError(error.FileNotFound, b.getHead("docs"));
+    try std.testing.expect((try pb.acquire("docs", "two", 109, 10)) == null);
+    const current = (try pb.acquire("docs", "two", 110, 10)).?;
+    try std.testing.expect(current.fencing_token > stale.fencing_token);
+    try std.testing.expectError(error.WorkLeaseLost, a.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = "one", .fencing_token = stale.fencing_token }));
+    try std.testing.expect(try b.compareAndSwapHeadFenced("docs", null, 1, .{ .owner_id = "two", .fencing_token = current.fencing_token }));
+    try std.testing.expect(try pb.release("docs", "two", current.fencing_token));
+    var reopened = try FsProgressStore.init(alloc, std.mem.span(path));
+    defer reopened.deinit();
+    var c = reopened.progressStore();
+    try std.testing.expectEqual(@as(u64, 1), try c.getHead("docs"));
+    const pc = try c.workLeaseProvider();
+    const next = (try pc.acquire("docs", "three", 111, 10)).?;
+    try std.testing.expect(next.fencing_token > current.fencing_token);
+    try std.testing.expectError(error.WorkLeaseLost, pb.renew("docs", "two", current.fencing_token, 112, 10));
+    try std.testing.expect(!try pa.release("docs", "one", stale.fencing_token));
+    try std.testing.expect(try pc.release("docs", "three", next.fencing_token));
 }
 
 test "serverless fs enrichment progress CAS is atomic across store instances" {

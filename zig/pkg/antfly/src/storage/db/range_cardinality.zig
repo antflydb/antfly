@@ -2,7 +2,15 @@
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at https://www.antfly.io/licensing/ELv2-license
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,6 +29,15 @@ pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
         else => return err,
     };
     defer alloc.free(raw);
+    return try decode(raw);
+}
+
+/// Read related publication counters through the same pinned store revision.
+pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    const raw = txn.get(&internal_keys.range_document_count_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
     return try decode(raw);
 }
 
@@ -54,6 +71,17 @@ pub fn countPrimaryDocuments(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try countPrimaryDocumentsFromTxn(alloc, store, &txn, byte_range);
+}
+
+fn countPrimaryDocumentsFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
     defer alloc.free(lower);
     const upper = if (byte_range.end.len == 0)
@@ -67,14 +95,14 @@ pub fn countPrimaryDocuments(
 
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (internal_keys.isPrimaryDocumentKey(key)) state.count = std.math.add(u64, state.count, 1) catch
+            if (internal_keys.isStoredDocumentRowKey(key)) state.count = std.math.add(u64, state.count, 1) catch
                 return error.RangeDocumentCountOverflow;
             return .@"continue";
         }
     };
 
     var state = CountState{};
-    try store.scanWithContext(lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
+    try store.scanReadTxnWithContext(txn, lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
     return state.count;
 }
 
@@ -83,7 +111,18 @@ pub fn loadOrCount(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
-    return (try load(alloc, store)) orelse try countPrimaryDocuments(alloc, store, byte_range);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try loadOrCountFromTxn(alloc, store, &txn, byte_range);
+}
+
+pub fn loadOrCountFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
+    return (try loadFromTxn(txn)) orelse try countPrimaryDocumentsFromTxn(alloc, store, txn, byte_range);
 }
 
 /// Appends the range-local cardinality transition to the caller's atomic

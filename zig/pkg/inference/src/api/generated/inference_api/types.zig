@@ -481,8 +481,8 @@ pub const ChunkResponse = struct {
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
-    /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -521,7 +521,7 @@ pub const Config = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", false },
+        .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
         .{ "models_dir", "models_dir", true },
         .{ "ml_dir", "ml_dir", true },
@@ -556,8 +556,10 @@ pub const Config = struct {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
-        try jw.objectField("api_url");
-        try jw.write(self.api_url);
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
@@ -2997,8 +2999,8 @@ pub const Role = antfly_generating_openapi.ChatMessageRole;
 pub const RuntimeConfig = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
-    /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
+    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
+    api_url: ?[]const u8 = null,
     /// API key used when calling an authenticated shared Antfly inference API.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
@@ -3036,7 +3038,7 @@ pub const RuntimeConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", false },
+        .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
         .{ "models_dir", "models_dir", true },
         .{ "ml_dir", "ml_dir", true },
@@ -3070,8 +3072,10 @@ pub const RuntimeConfig = struct {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
-        try jw.objectField("api_url");
-        try jw.write(self.api_url);
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);

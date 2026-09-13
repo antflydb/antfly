@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const feature_reads = @import("feature_reads.zig");
 const read_gate = @import("read_gate.zig");
@@ -141,6 +141,20 @@ pub const FeatureDBReads = struct {
     ) !db_mod.types.ScanResult {
         try self.reads.prepareScanWithConsistency(self.group_id, from_key, to_key, opts, consistency);
         return try db.scan(alloc, from_key, to_key, opts);
+    }
+
+    pub fn scanVisitWithConsistency(
+        self: FeatureDBReads,
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+        visitor: db_mod.types.ScanVisitor,
+    ) !void {
+        try self.reads.prepareScanWithConsistency(self.group_id, from_key, to_key, opts, consistency);
+        try db.scanVisit(alloc, from_key, to_key, opts, visitor);
     }
 };
 

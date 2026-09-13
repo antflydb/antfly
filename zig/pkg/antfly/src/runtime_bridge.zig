@@ -16,6 +16,10 @@ pub const Bytes = extern struct {
         return .{ .ptr = if (value.len == 0) null else value.ptr, .len = value.len };
     }
 
+    pub fn fromSlice(value: []const u8) Bytes {
+        return init(value);
+    }
+
     pub fn slice(self: Bytes) []const u8 {
         if (self.len == 0) return "";
         return self.ptr.?[0..self.len];
@@ -64,6 +68,8 @@ pub const Context = extern struct {
         return true;
     }
 };
+
+pub const BorrowedBytes = Bytes;
 
 test "runtime process context is C-layout and rejects malformed views" {
     const std = @import("std");

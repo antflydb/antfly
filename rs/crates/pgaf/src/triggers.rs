@@ -8,10 +8,10 @@ use std::num::NonZero;
 ///   CREATE TRIGGER sync_to_antfly
 ///     AFTER INSERT OR UPDATE OR DELETE ON my_table
 ///     FOR EACH ROW
-///     EXECUTE FUNCTION antfly_sync_trigger('http://localhost:8080/api/v1/', 'my_table', 'id');
+///     EXECUTE FUNCTION antfly_sync_trigger('http://localhost:8080/db/v1/', 'my_table', 'id');
 ///
 /// Arguments:
-///   1. base_url  - Antfly server URL (including /api/v1/ prefix)
+///   1. base_url  - Antfly server URL (including /db/v1/ prefix)
 ///   2. table     - Target Antfly table name
 ///   3. id_column - Column to use as the document ID (default: "id")
 #[pg_trigger]

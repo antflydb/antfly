@@ -37,7 +37,9 @@ COPY share/antfly /usr/share/antfly
 COPY --from=wasmtime /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 
 ENV ANTFLY_WASMTIME_LIB=/usr/local/lib/libwasmtime.so
-ENV LD_LIBRARY_PATH=/usr/local/lib
+# GKE mounts the host CUDA driver here; keep Wasmtime's bundled library path.
+# These directories can be absent on CPU-only nodes without affecting startup.
+ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/lib
 ENV ANTFLY_EXTENSION_PACKAGE_STORE=/tmp/antflydb/extensions
 
 # Exercise the target architecture's glibc loader during the image build.

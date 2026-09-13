@@ -71,6 +71,9 @@ esac
 cd "$repo_root/zig"
 
 uname -a
+if command -v lscpu >/dev/null 2>&1; then
+  lscpu
+fi
 zig version
 
 build_steps=(antfly)
@@ -84,6 +87,7 @@ build_args+=(
   "-Dstrip=$strip"
   "-Dcuda=$enable_cuda"
   "-Dcuda-artifacts=$cuda_artifacts"
+  --summary all
   "${build_steps[@]}"
 )
 python3 tools/run_bounded_zig_build.py --zig zig -- "${build_args[@]}"

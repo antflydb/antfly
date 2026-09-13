@@ -20,6 +20,9 @@ const progress_store = @import("progress_store.zig");
 const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("../remote_uri.zig");
 const object_store_support = @import("../object_store_support.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const work_lease = @import("../build/work_lease.zig");
+const ObjectWorkLeaseStore = @import("../build/object_work_lease_store.zig").ObjectWorkLeaseStore;
 
 const retired_head_doc_offset = std.math.maxInt(u64);
 
@@ -155,7 +158,7 @@ pub const ObjectProgressStore = struct {
     pub fn getHead(self: *ObjectProgressStore, namespace: []const u8) !u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        var current = (try self.tryReadHeadCurrent(key)) orelse return error.FileNotFound;
+        var current = (try self.tryReadHeadCurrentMaybeEtag(key, false)) orelse return error.FileNotFound;
         defer current.deinit(self.alloc);
         if (current.record.head_version == 0) return error.FileNotFound;
         return current.record.head_version;
@@ -194,6 +197,9 @@ pub const ObjectProgressStore = struct {
         else
             null;
         if (current_version != expected) return false;
+        if (fence == null) {
+            if (current) |entry| if (!entry.record.released) return error.PublicationFenceRequired;
+        }
         if (fence) |required| {
             const entry = current orelse return error.WorkLeaseLost;
             if (entry.record.released or
@@ -260,6 +266,54 @@ pub const ObjectProgressStore = struct {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "MANIFEST_GC_FLOOR");
         defer self.alloc.free(key);
         return self.tryReadValue(key);
+    }
+
+    pub fn getManifestReadDeadline(self: *ObjectProgressStore, namespace: []const u8, version: u64) !?u64 {
+        const leaf = try std.fmt.allocPrint(self.alloc, "READ_PINS/{d}", .{version});
+        defer self.alloc.free(leaf);
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, leaf);
+        defer self.alloc.free(key);
+        return self.tryReadValue(key);
+    }
+
+    pub fn compareAndSwapManifestReadDeadline(self: *ObjectProgressStore, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+        if (expected) |prior| if (deadline < prior) return false;
+        const leaf = try std.fmt.allocPrint(self.alloc, "READ_PINS/{d}", .{version});
+        defer self.alloc.free(leaf);
+        const key = try keyAlloc(self.alloc, self.prefix, namespace, leaf);
+        defer self.alloc.free(key);
+        return self.compareAndSwap(key, expected, deadline);
+    }
+
+    fn pruneManifestReadDeadlines(self: *ObjectProgressStore, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
+        const prefix = try keyAlloc(self.alloc, self.prefix, namespace, "READ_PINS/");
+        defer self.alloc.free(prefix);
+        var token: ?[]u8 = null;
+        defer if (token) |value| self.alloc.free(value);
+        while (true) {
+            try cancellation.check();
+            var page = try self.client.listObjects(self.bucket, .{ .prefix = prefix, .recursive = true, .max_keys = 256, .continuation_token = token });
+            defer page.deinit(self.alloc);
+            var next = if (page.next_continuation_token) |value| try self.alloc.dupe(u8, value) else null;
+            errdefer if (next) |value| self.alloc.free(value);
+            if (token != null and next != null and std.mem.eql(u8, token.?, next.?)) return error.InvalidContinuationToken;
+            for (page.entries) |entry| {
+                try cancellation.check();
+                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidManifestReadPinKey;
+                const version = std.fmt.parseInt(u64, entry.key[prefix.len..], 10) catch continue;
+                if (version >= floor) continue;
+                const deadline = try self.tryReadValue(entry.key) orelse continue;
+                if (deadline >= expired_before) continue;
+                self.client.deleteObject(self.bucket, entry.key, .{}) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+            }
+            if (token) |value| self.alloc.free(value);
+            token = next;
+            next = null;
+            if (token == null) break;
+        }
     }
 
     pub fn compareAndSwapManifestGcFloor(self: *ObjectProgressStore, namespace: []const u8, expected: ?u64, floor: u64) !bool {
@@ -416,11 +470,13 @@ pub const ObjectProgressStore = struct {
 
         const current = try self.tryReadStageProgressCurrent(key);
         defer if (current) |*entry| if (entry.etag) |etag| self.alloc.free(etag);
-        const current_value = if (current) |entry| entry.value else null;
+        var current_value = if (current) |entry| entry.value else null;
+        defer if (current_value) |*value| value.deinit(self.alloc);
         if (!stageProgressOptionalEql(current_value, expected)) return false;
         if (current_value) |value| {
             if (desired.head_version < value.head_version) return false;
-            if (desired.head_version == value.head_version and desired.doc_offset < value.doc_offset) return false;
+            if (desired.revision < value.revision or desired.completed_cycles < value.completed_cycles) return false;
+            if (desired.head_version == value.head_version and desired.revision == value.revision and desired.doc_offset < value.doc_offset) return false;
         }
         // The provider version token is the cross-process CAS primitive. Do
         // not silently degrade an existing-object update to an unconditional
@@ -429,7 +485,7 @@ pub const ObjectProgressStore = struct {
             if (entry.etag == null) return error.MissingObjectEtag;
         }
 
-        const payload = try std.fmt.allocPrint(self.alloc, "{d} {d}", .{ desired.head_version, desired.doc_offset });
+        const payload = try desired.encodeAlloc(self.alloc);
         defer self.alloc.free(payload);
         var result = self.client.putObject(self.bucket, key, payload, .{
             .content_type = "text/plain",
@@ -500,11 +556,31 @@ pub const ObjectProgressStore = struct {
     };
 
     fn tryReadHeadCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentHead {
+        return self.tryReadHeadCurrentMaybeEtag(key, true);
+    }
+
+    fn tryReadHeadCurrentMaybeEtag(self: *ObjectProgressStore, key: []const u8, require_etag: bool) !?CurrentHead {
         var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(self.alloc);
+
+        // HEAD visibility and fencing must use an ETag verified against the
+        // same body. Some adapters omit it from GET; a bare STAT would race
+        // publication, so read again conditionally before trusting its ETag.
+        if (require_etag and result.metadata.etag == null) {
+            var metadata = try self.client.statObject(self.bucket, key);
+            defer metadata.deinit(self.alloc);
+            const etag = metadata.etag orelse return error.MissingObjectEtag;
+            var verified = try self.client.getObject(self.bucket, key, .{ .if_match_etag = etag });
+            errdefer verified.deinit(self.alloc);
+            if (verified.metadata.etag) |actual| {
+                if (!std.mem.eql(u8, actual, etag)) return error.PreconditionFailed;
+            } else verified.metadata.etag = try self.alloc.dupe(u8, etag);
+            result.deinit(self.alloc);
+            result = verified;
+        }
 
         const trimmed = std.mem.trim(u8, result.body, " \t\r\n");
         var record: head_coordination.Record = undefined;
@@ -561,18 +637,21 @@ pub const ObjectProgressStore = struct {
     }
 
     fn tryReadStageProgressCurrent(self: *ObjectProgressStore, key: []const u8) !?CurrentStageProgress {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        var result = self.client.getObject(self.bucket, key, .{ .max_response_bytes = progress_store.EnrichmentStageProgress.max_encoded_bytes }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer result.deinit(self.alloc);
+        var value = try progress_store.EnrichmentStageProgress.decodeAlloc(self.alloc, result.body);
+        errdefer value.deinit(self.alloc);
         return .{
-            .value = try parseStageProgress(result.body),
-            .etag = if (result.metadata.etag) |value| try self.alloc.dupe(u8, value) else null,
+            .value = value,
+            .etag = if (result.metadata.etag) |etag| try self.alloc.dupe(u8, etag) else null,
         };
     }
 
     const vtable: progress_store.ProgressStore.VTable = .{
+        .work_lease_provider = erasedWorkLeaseProvider,
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
@@ -581,6 +660,9 @@ pub const ObjectProgressStore = struct {
         .compare_and_swap_gc_watermark = erasedCompareAndSwapGcWatermark,
         .get_manifest_gc_floor = erasedGetManifestGcFloor,
         .compare_and_swap_manifest_gc_floor = erasedCompareAndSwapManifestGcFloor,
+        .get_manifest_read_deadline = erasedGetManifestReadDeadline,
+        .compare_and_swap_manifest_read_deadline = erasedCompareAndSwapManifestReadDeadline,
+        .prune_manifest_read_deadlines = erasedPruneManifestReadDeadlines,
         .get_enrichment_head_version = erasedGetEnrichmentHeadVersion,
         .compare_and_swap_enrichment_head_version = erasedCompareAndSwapEnrichmentHeadVersion,
         .get_enrichment_stage = erasedGetEnrichmentStage,
@@ -601,6 +683,48 @@ pub const ObjectProgressStore = struct {
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         self.deinit();
+    }
+
+    fn borrowedLeaseStore(self: *ObjectProgressStore) ObjectWorkLeaseStore {
+        return .{ .alloc = self.alloc, .client = self.client, .bucket = self.bucket, .prefix = self.prefix };
+    }
+
+    fn erasedWorkLeaseProvider(ptr: *anyopaque) work_lease.Provider {
+        return .{ .ptr = ptr, .vtable = &lease_vtable };
+    }
+
+    const lease_vtable: work_lease.Provider.VTable = .{
+        .acquire = leaseAcquire,
+        .validate = leaseValidate,
+        .renew = leaseRenew,
+        .release = leaseRelease,
+        .acquire_bootstrap = leaseAcquire,
+        .renew_bootstrap = leaseRenew,
+        .release_bootstrap = leaseRelease,
+    };
+
+    fn leaseAcquire(ptr: *anyopaque, ns: []const u8, owner: []const u8, now: u64, ttl: u64) !?work_lease.Acquisition {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return borrowed.acquire(ns, owner, now, ttl);
+    }
+
+    fn leaseValidate(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64) !void {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return borrowed.validate(ns, owner, token, now);
+    }
+
+    fn leaseRenew(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64, now: u64, ttl: u64) !u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return borrowed.renew(ns, owner, token, now, ttl);
+    }
+
+    fn leaseRelease(ptr: *anyopaque, ns: []const u8, owner: []const u8, token: u64) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        var borrowed = self.borrowedLeaseStore();
+        return borrowed.release(ns, owner, token);
     }
 
     fn erasedGetHead(ptr: *anyopaque, namespace: []const u8) !u64 {
@@ -637,6 +761,21 @@ pub const ObjectProgressStore = struct {
     fn erasedGetManifestGcFloor(ptr: *anyopaque, namespace: []const u8) !?u64 {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.getManifestGcFloor(namespace);
+    }
+
+    fn erasedGetManifestReadDeadline(ptr: *anyopaque, namespace: []const u8, version: u64) !?u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return self.getManifestReadDeadline(namespace, version);
+    }
+
+    fn erasedPruneManifestReadDeadlines(ptr: *anyopaque, namespace: []const u8, floor: u64, expired_before: u64, cancellation: CancellationToken) !void {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return self.pruneManifestReadDeadlines(namespace, floor, expired_before, cancellation);
+    }
+
+    fn erasedCompareAndSwapManifestReadDeadline(ptr: *anyopaque, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return self.compareAndSwapManifestReadDeadline(namespace, version, expected, deadline);
     }
 
     fn erasedCompareAndSwapManifestGcFloor(ptr: *anyopaque, namespace: []const u8, expected: ?u64, floor: u64) !bool {
@@ -770,20 +909,12 @@ pub const ObjectProgressStore = struct {
     }
 };
 
-fn parseStageProgress(raw: []const u8) !progress_store.EnrichmentStageProgress {
-    var fields = std.mem.tokenizeAny(u8, raw, " \t\r\n");
-    const head_version = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    const doc_offset = try std.fmt.parseInt(u64, fields.next() orelse return error.InvalidEnrichmentStageProgress, 10);
-    if (fields.next() != null) return error.InvalidEnrichmentStageProgress;
-    return .{ .head_version = head_version, .doc_offset = doc_offset };
-}
-
 fn stageProgressOptionalEql(
     lhs: ?progress_store.EnrichmentStageProgress,
     rhs: ?progress_store.EnrichmentStageProgress,
 ) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return lhs.?.head_version == rhs.?.head_version and lhs.?.doc_offset == rhs.?.doc_offset;
+    return lhs.?.eql(rhs.?);
 }
 
 fn keyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8, suffix: []const u8) ![]u8 {
@@ -825,6 +956,86 @@ fn enrichmentStageHeadOffsetKeyAlloc(
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+test "serverless enrichment stage cursor object CAS preserves key across heads and permits fenced wrap" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "enrichment-cursor");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{std.mem.span(path)});
+    defer a.free(uri);
+    var impl = try ObjectProgressStore.initFileUri(a, uri);
+    var store = impl.progressStore();
+    defer store.deinit();
+    try progress_store.testEnrichmentCursorCompareAndSwap(&store);
+}
+
+test "serverless manifest read pins persist across object owners and reject acquisition across retirement" {
+    const alloc = std.testing.allocator;
+    const leases = @import("../manifest/read_lease.zig");
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "manifest-read-pin");
+    defer cleanupTmp(path);
+    const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(path)});
+    defer alloc.free(uri);
+    {
+        var impl = try ObjectProgressStore.initFileUri(alloc, uri);
+        var store = impl.progressStore();
+        defer store.deinit();
+        const lease = try leases.acquireAt(&store, "docs", 1, 100, 100);
+        try std.testing.expectEqual(100 + leases.duration_ns, lease.unix_deadline);
+    }
+    var impl = try ObjectProgressStore.initFileUri(alloc, uri);
+    var store = impl.progressStore();
+    defer store.deinit();
+    const prior = try store.getManifestReadDeadline("docs", 1);
+    try std.testing.expectEqual(@as(?u64, 100 + leases.duration_ns), prior);
+    const shared = try leases.acquireAt(&store, "docs", 1, 200, 200);
+    try std.testing.expectEqual(prior.?, shared.unix_deadline);
+    try std.testing.expect(!try store.compareAndSwapManifestReadDeadline("docs", 1, null, prior.? + 1));
+    try std.testing.expect(!try store.compareAndSwapManifestReadDeadline("docs", 1, prior, prior.? - 1));
+    try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", null, 2));
+    try std.testing.expectError(error.ManifestVersionRetired, leases.acquireAt(&store, "docs", 1, 300, 300));
+
+    // Deterministically interleave GC between the reader's pin write and
+    // final floor check. The lease must not escape even though the PUT won.
+    const Racing = struct {
+        store: *progress_store.ProgressStore,
+        fn getFloor(ptr: *anyopaque, namespace: []const u8) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.store.getManifestGcFloor(namespace);
+        }
+        fn getPin(ptr: *anyopaque, namespace: []const u8, version: u64) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.store.getManifestReadDeadline(namespace, version);
+        }
+        fn casPin(ptr: *anyopaque, namespace: []const u8, version: u64, expected: ?u64, deadline: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const won = try self.store.compareAndSwapManifestReadDeadline(namespace, version, expected, deadline);
+            try std.testing.expect(try self.store.compareAndSwapManifestGcFloor(namespace, 2, 3));
+            return won;
+        }
+    };
+    var racing: Racing = .{ .store = &store };
+    var vtable = store.vtable.*;
+    vtable.get_manifest_gc_floor = Racing.getFloor;
+    vtable.get_manifest_read_deadline = Racing.getPin;
+    vtable.compare_and_swap_manifest_read_deadline = Racing.casPin;
+    var racing_store = progress_store.ProgressStore{ .allocator = alloc, .ptr = &racing, .vtable = &vtable };
+    try std.testing.expectError(error.ManifestVersionRetired, leases.acquireAt(&racing_store, "docs", 2, 400, 400));
+    // Sweep also finds the failed acquisition's pin without a manifest entry.
+    try store.pruneManifestReadDeadlines("docs", 3, 101 + leases.duration_ns, .none);
+    try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 1));
+    try std.testing.expectEqual(@as(?u64, 400 + leases.duration_ns), try store.getManifestReadDeadline("docs", 2));
+    try store.pruneManifestReadDeadlines("docs", 3, 401 + leases.duration_ns, .none);
+    try std.testing.expectEqual(@as(?u64, null), try store.getManifestReadDeadline("docs", 2));
+    var cache: leases.Cache = .{};
+    const cached = try cache.acquire(&store, "docs", 3);
+    try std.testing.expect(try store.compareAndSwapManifestGcFloor("docs", 3, 4));
+    try std.testing.expectEqual(cached.unix_deadline, (try cache.acquire(&store, "docs", 3)).unix_deadline);
+    var fresh_cache: leases.Cache = .{};
+    try std.testing.expectError(error.ManifestVersionRetired, fresh_cache.acquire(&store, "docs", 3));
 }
 
 test "serverless manifest GC floor persists across object store owners and rejects rollback" {

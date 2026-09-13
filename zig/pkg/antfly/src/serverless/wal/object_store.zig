@@ -553,21 +553,25 @@ pub fn decodeRecordsFromAlloc(alloc: std.mem.Allocator, raw: []const u8, start_l
     var cursor: usize = 0;
     var out = std.ArrayListUnmanaged(wal_types.Record).empty;
     errdefer {
-        wal_types.freeRecords(alloc, out.items);
-        out = .empty;
+        for (out.items) |record| {
+            alloc.free(record.payload);
+            if (record.operation_id) |id| alloc.free(id);
+        }
+        out.deinit(alloc);
     }
 
     while (cursor < raw.len) {
         const parsed = try parseRecord(raw, cursor);
         if (parsed.lsn >= start_lsn) {
+            const payload = try alloc.dupe(u8, parsed.payload);
+            errdefer alloc.free(payload);
+            const operation_id = if (parsed.operation_id) |id| try alloc.dupe(u8, id) else null;
+            errdefer if (operation_id) |id| alloc.free(id);
             try out.append(alloc, .{
                 .lsn = parsed.lsn,
                 .timestamp_ns = parsed.timestamp_ns,
-                .payload = try alloc.dupe(u8, parsed.payload),
-                .operation_id = if (parsed.operation_id) |operation_id|
-                    try alloc.dupe(u8, operation_id)
-                else
-                    null,
+                .payload = payload,
+                .operation_id = operation_id,
             });
         }
         cursor = parsed.next_cursor;

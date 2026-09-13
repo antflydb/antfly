@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const reranker_data = @import("../reranker_data.zig");
-const reranker = @import("../reranker.zig");
-const reranker_head = @import("../reranker_head.zig");
+const reranker_data = @import("inference_internal").finetune.reranker_data;
+const reranker = @import("inference_internal").finetune.reranker;
+const reranker_head = @import("inference_internal").finetune.reranker_head;
 
 const print = std.debug.print;
 

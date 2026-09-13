@@ -22,7 +22,7 @@ const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 25;
+pub const abi_version: u32 = 26;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;

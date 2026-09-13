@@ -348,12 +348,21 @@ pub const Detail = enum(c_int) {
     generation_rate_limit,
     unsupported_tensor_type,
     generation_capacity_unavailable,
+    schema_in_use,
+    transaction_too_large,
     invalid_table_storage_settings,
     vector_store_requires_local_single_shard_table,
     vector_store_requires_empty_table,
     immutable_table_storage_settings,
     vector_store_lifecycle_unsupported,
     vector_store_reference_format_required,
+    // An ambiguous remote backup cannot authorize rollback at its caller.
+    backup_outcome_ambiguous,
+    metadata_mutation_not_applied,
+    // Append unpublished branch details after all main wire identities.
+    graph_metric_action_partial_outcome,
+    index_generation_mismatch,
+    generation_transition_active,
 };
 
 pub const Status = extern struct {
@@ -398,6 +407,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.Conflict => status(.conflict, .conflict),
         error.DecisionConflict => status(.conflict, .decision_conflict),
         error.TableTransitionActive => status(.conflict, .table_transition_active),
+        error.SchemaInUse => status(.conflict, .schema_in_use),
+        error.TransactionTooLarge => status(.invalid_argument, .transaction_too_large),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -426,6 +437,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
+        error.GraphMetricActionPartialOutcome => status(.retryable, .graph_metric_action_partial_outcome),
         error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
         error.HAReadOnlyStandby => status(.unavailable, .ha_read_only_standby),
         error.HAPromotedStandbyRequiresPrimaryOpen => status(.unavailable, .ha_promoted_standby_requires_primary_open),
@@ -438,10 +450,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
         error.TopologyChanged => status(.retryable, .topology_changed),
+        error.IndexGenerationMismatch => status(.retryable, .index_generation_mismatch),
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
         error.TableGenerationChanged => status(.conflict, .table_generation_changed),
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
+        error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
@@ -497,6 +511,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEmbeddingDimensions => status(.invalid_argument, .invalid_embedding_dimensions),
         error.BackupAlreadyExists => status(.already_exists, .backup_already_exists),
         error.BackupManifestTooLarge => status(.invalid_argument, .backup_manifest_too_large),
+        // Reuse the stable wire detail: both errors tell a remote caller that
+        // the archive's metadata exceeds the accepted manifest envelope.
+        error.BackupSchemaHistoryTooLarge => status(.invalid_argument, .backup_manifest_too_large),
         error.BackupIntegrityFailure => status(.corrupt, .backup_integrity_failure),
         error.BackupArtifactIntegrityMismatch => status(.corrupt, .backup_artifact_integrity_mismatch),
         error.BackupRepositoryBusy => status(.retryable, .backup_repository_busy),
@@ -580,6 +597,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.BackupStagingUnavailable => status(.unavailable, .backup_staging_unavailable),
         error.BackupArtifactMissing => status(.not_found, .backup_artifact_missing),
         error.BackupIntegrityMissing => status(.corrupt, .backup_integrity_missing),
+        error.BackupOutcomeAmbiguous => status(.conflict, .backup_outcome_ambiguous),
+        error.MetadataMutationNotApplied => status(.retryable, .metadata_mutation_not_applied),
         error.BackupAttemptLeaseLost => status(.conflict, .backup_attempt_lease_lost),
         error.BackgroundOwnerClosed => status(.unavailable, .background_owner_closed),
         error.RestoreSchedulingCapacity => status(.retryable, .restore_scheduling_capacity),
@@ -762,6 +781,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .conflict => "Conflict",
         .decision_conflict => "DecisionConflict",
         .table_transition_active => "TableTransitionActive",
+        .schema_in_use => "SchemaInUse",
+        .transaction_too_large => "TransactionTooLarge",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -788,10 +809,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .internal_failure => "InternalFailure",
         .not_leader => "NotLeader",
         .topology_changed => "TopologyChanged",
+        .index_generation_mismatch => "IndexGenerationMismatch",
         .identity_read_generation_changed => "IdentityReadGenerationChanged",
         .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
         .table_generation_changed => "TableGenerationChanged",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
+        .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
@@ -900,6 +923,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .backup_staging_unavailable => "BackupStagingUnavailable",
         .backup_artifact_missing => "BackupArtifactMissing",
         .backup_integrity_missing => "BackupIntegrityMissing",
+        .backup_outcome_ambiguous => "BackupOutcomeAmbiguous",
+        .metadata_mutation_not_applied => "MetadataMutationNotApplied",
         .backup_attempt_lease_lost => "BackupAttemptLeaseLost",
         .background_owner_closed => "BackgroundOwnerClosed",
         .restore_scheduling_capacity => "RestoreSchedulingCapacity",
@@ -1001,6 +1026,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
+        .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
@@ -1036,7 +1062,29 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
     };
 }
 
+test "schema epoch conflicts retain a retryable public status" {
+    // main published this value before the relational-only tail. Preserve it
+    // when both branches append details independently.
+    try std.testing.expectEqual(@as(c_int, 297), @intFromEnum(Detail.unsupported_tensor_type));
+    try std.testing.expectEqual(@as(c_int, 306), @intFromEnum(Detail.vector_store_reference_format_required));
+    try std.testing.expectEqual(@as(c_int, 307), @intFromEnum(Detail.backup_outcome_ambiguous));
+    try std.testing.expectEqual(@as(c_int, 308), @intFromEnum(Detail.metadata_mutation_not_applied));
+    const value = statusFromError(error.SchemaInUse);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+    try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
+}
+
+test "transaction capacity rejection retains a permanent public status" {
+    const value = statusFromError(error.TransactionTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
+}
+
 test "stable status preserves public boundary semantics" {
+    try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
+    try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));
@@ -1055,6 +1103,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
+    try std.testing.expectEqual(error.MetadataMutationNotApplied, errorFromStatus(statusFromError(error.MetadataMutationNotApplied)));
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));
@@ -1068,6 +1117,10 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.RateLimit, errorFromStatus(statusFromError(error.RateLimit)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
+    const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), schema_history_status.code);
+    try std.testing.expectEqual(@intFromEnum(Detail.backup_manifest_too_large), schema_history_status.detail);
+    try std.testing.expectEqual(error.BackupManifestTooLarge, errorFromStatus(schema_history_status));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
     try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
     try std.testing.expectEqual(error.CommitVisibilityNotSatisfied, errorFromStatus(statusFromError(error.CommitVisibilityNotSatisfied)));
@@ -1147,4 +1200,10 @@ test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
     try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
+}
+
+test "ambiguous backup outcome survives runtime transport without rollback authorization" {
+    const wire = statusFromError(error.BackupOutcomeAmbiguous);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
+    try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
 }

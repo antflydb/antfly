@@ -128,7 +128,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", bootstrap)
         self.assertIn("steps.toolchain.outputs.zig_nix_attribute", bootstrap)
         self.assertIn("steps.toolchain.outputs.zig_version", bootstrap)
-        self.assertIn("nix-build '<nixpkgs>' -A \"$ZIG_NIX_ATTRIBUTE\"", bootstrap)
+        self.assertIn("nix-build '<nixpkgs>' -A " + '"$ZIG_NIX_ATTRIBUTE"', bootstrap)
         self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
         self.assertIn("grep -q 'dynamically linked'", bootstrap)
 

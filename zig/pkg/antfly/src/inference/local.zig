@@ -527,7 +527,7 @@ pub const Provider = struct {
         var input_array = std.json.Array.init(alloc);
         defer input_array.deinit();
         for (inputs) |input| try input_array.append(.{ .string = input });
-        const json_body = try httpx.json.Json.stringify(self.allocator, EmbedWireRequest{
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, EmbedWireRequest{
             .model = model,
             .input = .{ .array = input_array },
         });
@@ -658,7 +658,7 @@ pub const Provider = struct {
         task_type: ?[]const u8,
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
-        const json_body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+        const json_body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
             .model = model,
             .input = input,
             .task_type = task_type,
@@ -957,13 +957,13 @@ test "antfly provider composes authorization and capability lease headers" {
     try std.testing.expectEqualStrings("X-Antfly-Capability-Revision", headers[3][0]);
 }
 
-test "antfly embed request omits nullable generated fields" {
+test "antfly embed request omits absent optional fields" {
     const alloc = std.testing.allocator;
     var input = std.json.Array.init(alloc);
     defer input.deinit();
     try input.append(.{ .string = "hello" });
 
-    const body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+    const body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
         .model = "antflydb/clipclap",
         .input = .{ .array = input },
     });
@@ -971,6 +971,8 @@ test "antfly embed request omits nullable generated fields" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"encoding_format\":\"float\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"dimensions\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"task_type\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"instruction\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "null") == null);
 }
 
@@ -1020,7 +1022,7 @@ test "antfly embed request carries retrieval task and instruction" {
     defer input.deinit();
     try input.append(.{ .string = "history of Korea" });
 
-    const body = try httpx.json.Json.stringify(alloc, EmbedWireRequest{
+    const body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
         .model = "nomic-ai/nomic-embed-text-v1.5",
         .input = .{ .array = input },
         .task_type = "RETRIEVAL_QUERY",
@@ -1241,8 +1243,21 @@ test "antfly sparse embed round trip" {
     defer io_impl.deinit();
     const io = io_impl.io();
 
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqualStrings("sparse-model", obj.get("model").?.string);
+            try std.testing.expectEqualStrings("alpha body", obj.get("input").?.array.items[0].string);
+            try std.testing.expectEqualStrings("float", obj.get("encoding_format").?.string);
+            try std.testing.expect(!obj.contains("task_type"));
+            try std.testing.expect(!obj.contains("instruction"));
+        }
+    };
+
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/embed", .respond = .{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
             .content_type = "application/json",
             .body =
             \\{"object":"list","data":[{"object":"embedding","index":0,"embedding":{"indices":[7,42],"values":[1.5,0.5]}}],"model":"sparse-model","usage":{"prompt_tokens":1,"total_tokens":1}}
@@ -1415,6 +1430,16 @@ fn testRerankScoresResponse(binary_response: bool) !void {
 }
 
 test "antfly embed round trip (binary)" {
+    try testDenseEmbedRequest(null, null);
+}
+
+test "antfly embed round trip preserves supplied task and instruction" {
+    try testDenseEmbedRequest("RETRIEVAL_DOCUMENT", null);
+    try testDenseEmbedRequest("RETRIEVAL_QUERY", "");
+    try testDenseEmbedRequest("RETRIEVAL_QUERY", "retrieve relevant encyclopedia passages");
+}
+
+fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: ?[]const u8) !void {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1430,8 +1455,29 @@ test "antfly embed round trip (binary)" {
     bin_buf[20..24].* = @bitCast(@as(f32, 1.5));
     bin_buf[24..28].* = @bitCast(@as(f32, 2.5));
 
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const obj = parsed.value.object;
+            try std.testing.expectEqualStrings("bge-small", obj.get("model").?.string);
+            try std.testing.expectEqualStrings("test input", obj.get("input").?.array.items[0].string);
+            try std.testing.expectEqualStrings("float", obj.get("encoding_format").?.string);
+            if (task_type) |value| {
+                try std.testing.expectEqualStrings(value, obj.get("task_type").?.string);
+            } else {
+                try std.testing.expect(!obj.contains("task_type"));
+            }
+            if (instruction) |value| {
+                try std.testing.expectEqualStrings(value, obj.get("instruction").?.string);
+            } else {
+                try std.testing.expect(!obj.contains("instruction"));
+            }
+        }
+    };
+
     var ts = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/embed", .respond = .{
+        .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
             .body = &bin_buf,
             .content_type = "application/octet-stream",
         } },
@@ -1453,7 +1499,10 @@ test "antfly embed round trip (binary)" {
             defer provider.deinit();
 
             var emb = provider.embedder();
-            var result = emb.embed(a, "bge-small", &.{"test input"}) catch return;
+            var result = (if (task_type != null or instruction != null)
+                provider.embedWithTask(a, "bge-small", &.{"test input"}, task_type, instruction)
+            else
+                emb.embed(a, "bge-small", &.{"test input"})) catch return;
             defer result.deinit();
 
             ok_out.* = true;

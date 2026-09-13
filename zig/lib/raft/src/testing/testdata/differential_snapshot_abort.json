@@ -1351,7 +1351,7 @@
           "leader_id": 1,
           "term": 2,
           "voted_for": null,
-          "commit_index": 1
+          "commit_index": 2
         }
       ],
       "messages": [

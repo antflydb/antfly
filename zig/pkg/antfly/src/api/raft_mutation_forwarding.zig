@@ -88,8 +88,8 @@ pub const RoutedMutationOptions = struct {
 
 /// Shared local-or-forwarded mutation state machine. `router` resolves either
 /// `.local` or `.forward`; `ops` supplies `local()` and `forward(peer, Context)`.
-/// The driver is intentionally strict: only NotLeader and a delivery-proven
-/// RaftMutationRequestNotSent are replayable.
+/// Replay requires non-admission, proven non-application of the entire atomic
+/// command, or a delivery-proven RaftMutationRequestNotSent.
 pub fn runRoutedMutation(
     router: anytype,
     ops: anytype,
@@ -114,6 +114,7 @@ fn runRoutedMutationWithClock(
     const deadline_ns = started_ns +|
         @as(u64, options.initial_remaining_ms) * std.time.ns_per_ms;
     var attempts: usize = 0;
+    var replay_proof_error: anyerror = error.NotLeader;
     var forwarding = Context{
         .remaining_ms = options.initial_remaining_ms,
         .forwards_remaining = options.initial_forwards,
@@ -138,8 +139,9 @@ fn runRoutedMutationWithClock(
         switch (route) {
             .local => {
                 ops.local() catch |err| switch (err) {
-                    error.NotLeader => {
-                        if (attempts >= options.max_attempts) return error.NotLeader;
+                    error.NotLeader, error.MetadataMutationNotApplied => {
+                        if (err == error.MetadataMutationNotApplied) replay_proof_error = err;
+                        if (attempts >= options.max_attempts) return replay_proof_error;
                         const elapsed_ms = elapsedMsSince(attempt_started_ns, clock.nowNs());
                         if (elapsed_ms >= forwarding.remaining_ms)
                             return error.RaftMutationDeadlineExceeded;
@@ -158,12 +160,12 @@ fn runRoutedMutationWithClock(
                     options.response_reserve_ms,
                 ) catch |err| return switch (err) {
                     error.RaftMutationDeadlineExceeded => error.RaftMutationDeadlineExceeded,
-                    error.RaftMutationForwardLimitReached => error.NotLeader,
+                    error.RaftMutationForwardLimitReached => replay_proof_error,
                 };
                 attempt_started_ns = clock.nowNs();
                 ops.forward(peer, child_forwarding) catch |err| switch (err) {
                     error.RaftMutationRequestNotSent => {
-                        if (attempts >= options.max_attempts) return error.NotLeader;
+                        if (attempts >= options.max_attempts) return replay_proof_error;
                         const total_elapsed_ms = elapsedMsSince(parent_attempt_started_ns, clock.nowNs());
                         if (total_elapsed_ms >= forwarding.remaining_ms)
                             return error.RaftMutationDeadlineExceeded;
@@ -171,9 +173,10 @@ fn runRoutedMutationWithClock(
                         attempt_started_ns = clock.nowNs();
                         continue;
                     },
-                    error.NotLeader => {
+                    error.NotLeader, error.MetadataMutationNotApplied => {
+                        if (err == error.MetadataMutationNotApplied) replay_proof_error = err;
                         forwarding = child_forwarding;
-                        if (attempts >= options.max_attempts) return error.NotLeader;
+                        if (attempts >= options.max_attempts) return replay_proof_error;
                         continue;
                     },
                     else => return err,

@@ -1,26 +1,32 @@
-# LSM Backend Performance Plan
+# LSM Backend Performance
 
-This document tracks the near-term LSM backend performance work derived from the review of:
+This document describes the design of Antfly's native Zig LSM backend's
+performance-critical paths: the foreground write contract, immutable memtable
+and compaction lifecycles, lock policy, background maintenance, and caching,
+plus the RocksDB/Pebble-influenced choices behind them. It grew out of a
+review of:
 
 - `pkg/antfly/src/storage/lsm_backend.zig`
 - `pkg/antfly/src/storage/lsm_backend/cache.zig`
 - `pkg/antfly/src/storage/lsm_backend/recovery.zig`
 - `pkg/antfly/src/storage/lsm_backend/storage_io.zig`
 
-The goal is to pull in the highest-leverage lessons from RocksDB and Pebble. The
+The design pulls in the highest-leverage lessons from RocksDB and Pebble. The
 project is still unreleased, so clean table/WAL codec breaks are preferable to
 carrying compatibility shims when a format change materially improves the
-long-term shape.
+long-term shape. Most of what follows is implemented; genuinely open items are
+collected in [Open work](#open-work) at the end instead of being scattered
+through each section.
 
-## Preferred Design
+## Design
 
 The LSM backend is the durable storage engine for performance-sensitive table
-and index metadata. It should behave like an observability-friendly Pebble-style
+and index metadata. It behaves like an observability-friendly Pebble-style
 engine: foreground writes append to WAL and mutate memory, while table-file
 creation, compaction, cleanup, and status publication happen through bounded
 background maintenance with short critical sections.
 
-This is the source of truth for the desired implementation shape. If code and
+This is the source of truth for the intended implementation shape. If code and
 this document disagree, treat the code path as transitional implementation debt
 unless a later design note explicitly says otherwise.
 
@@ -150,11 +156,9 @@ ResourceManager pressure:
   publication so peak memory is bounded by active blocks/windows rather than by
   a whole run or whole artifact.
 
-## RocksDB/Pebble-Shaped LSM Roadmap
+## RocksDB/Pebble-Influenced Shape
 
-Status: active
-
-The LSM is now past the first large architectural step: WAL-backed foreground
+The LSM is past the first large architectural step: WAL-backed foreground
 writes, immutable memtables, bounded maintenance, WAL checkpoints, prefix
 blooms, block-window scans, sharded caches, and table-block compression are all
 represented in the implementation. The remaining work is less about adding one
@@ -176,7 +180,10 @@ and maintenance that is always debt-driven.
 - Startup/open, retained-WAL, write-pressure, and maintenance debt metrics in
   benchmark/status/Prometheus surfaces.
 
-### Next priorities
+### Priority areas
+
+Status by area (most are complete; the memory-pressure item has an open
+sub-thread — see [Open work](#open-work)):
 
 1. [x] Finish no-heap table-artifact publication and disk-backed merge output.
    - Flush, compaction, and HBC final artifact publication should write through
@@ -236,7 +243,9 @@ and maintenance that is always debt-driven.
      visible value.
    - [x] Higher-precedence hits and tombstones cancel/drop lower-priority
      futures, and read stats expose async point batches, reads issued, canceled
-     reads, and wait time.
+     reads, and wait time. Extending the same future path into
+     sorted-by-run/batch point-read state is still open (see
+     [Open work](#open-work)).
 
 4. [x] Make compaction scheduling fully score- and overlap-driven.
    - Raise compaction concurrency only when selected jobs are disjoint by run
@@ -260,10 +269,9 @@ and maintenance that is always debt-driven.
      budgets; write-pressure stats now record initial and remaining L0 hard
      debt after bounded assists.
 
-5. [ ] Make LSM memory pressure first-class.
-   - Account mutable arena bytes, immutable pinned bytes, block-cache bytes,
-     WAL retention, recovery scratch, table-builder scratch, and compaction
-     scratch in ResourceManager.
+5. LSM memory pressure accounting treats mutable arena bytes, immutable pinned
+   bytes, block-cache bytes, WAL retention, recovery scratch, table-builder
+   scratch, and compaction scratch as explicit ResourceManager slices:
    - [x] Table-builder scratch is now a separate ResourceManager and
      Prometheus slice (`lsm.table_builder_working_set`) for persisted
      flush/sorted-ingest/compaction table writers.
@@ -279,8 +287,12 @@ and maintenance that is always debt-driven.
      used/peak bytes, table-builder/WAL slices, and RSS/physical-footprint gaps;
      any remaining gap is allocator retention or higher-level dense/docstore
      working set, not hidden LSM cache.
-   - [x] Add retained-cap policies for reusable scratch so one large row/block does
-     not permanently raise steady-state memory.
+   - [x] Retained-cap policies for reusable scratch exist so one large row/block
+     does not permanently raise steady-state memory.
+   - This checklist item is still marked open in the source material even
+     though every listed sub-step is checked; no further undone piece is
+     identified, so treat "fully first-class" as unconfirmed rather than
+     assuming a specific gap (see [Open work](#open-work)).
 
 6. [x] Keep prefix/filter policy store-aware.
    - Preserve the default first-separator prefix extractor for structured LSM
@@ -308,8 +320,6 @@ and maintenance that is always debt-driven.
 
 ## Current Performance Checklist
 
-Status: active
-
 Use this checklist for the next performance loop: measure a baseline, implement
 one bounded slice, rerun the same harness, and keep the change only if the
 metric movement matches the expected mechanism.
@@ -336,7 +346,7 @@ Write path:
   `--max-compaction-input-bytes`, and `--background-io-budget-bytes`
   when measuring RocksDB-like compaction and write-stall policy changes.
 
-### Current Sampled Baseline
+### Sampled Baseline Evidence
 
 Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
 
@@ -516,9 +526,9 @@ Large-ingest guardrails:
      where bloom/range/table-index precheck leaves multiple legal block
      candidates, then cancels/drops lower-priority work after a decisive hit or
      tombstone.
-   - [ ] Extend the same future path into sorted-by-run/batch point-read state
+   - Extending the same future path into sorted-by-run/batch point-read state
      once those paths can share issued reads without disturbing their current
-     block/index reuse.
+     block/index reuse is still open (see [Open work](#open-work)).
 3. [x] Add a borrowed-value point-read mode that can hold cache block handles
    until transaction end instead of duplicating every returned value.
    - [x] First slice: snapshot point-batch reads can return slices borrowed
@@ -609,15 +619,18 @@ Large-ingest guardrails:
      entry bytes live in the current mutable recovery arena, which moves as a
      unit into the immutable flush window and is released when that flush
      retires.
-4. [ ] Add final-state HBC bulk publication for sustained ingest so large loads
-   avoid persisting every intermediate online mutation.
+4. Adding final-state HBC bulk publication for sustained ingest, so large loads
+   avoid persisting every intermediate online mutation, is still open (see
+   [Open work](#open-work)).
 5. [x] Add background IO admission budgeting for maintenance work.
    - First slice: immutable flushes and scheduled compactions now reserve from
      a per-step background IO byte budget, can defer when the budget is
      exhausted, and expose budget/reserved/denied/oversized counters in
      maintenance stats.
-6. [ ] Raise compaction concurrency only after the scheduler can prove selected
-   jobs are non-overlapping or otherwise safe to run in parallel.
+6. Raising compaction concurrency only after the scheduler can prove selected
+   jobs are non-overlapping or otherwise safe to run in parallel is mostly
+   landed, with the exceptions noted inline below and in
+   [Open work](#open-work):
    - [x] Safety gate slice: compaction work now carries the selected source
      and target run IDs into the scheduler. The scheduler tracks in-flight run
      IDs, denies overlapping candidates with `conflict_denials`, and admits
@@ -681,11 +694,11 @@ Large-ingest guardrails:
      permanently. The same progress rule now applies to lower-level repair and
      pressure compactions. Strict cap behavior remains available for tests and
      diagnostics.
-7. [ ] Consider memtable structure changes after byte-budgeted WAL/flush and
-   recovery allocation work are measured; the current active memtable appends
-   plus hash-indexes writes and sorts on freeze/flush, so the main costs are
-   flush sort, range iteration, immutable lookup, and memory layout rather than
-   ordered-insert shifts.
+7. Considering further memtable structure changes beyond the byte-budgeted
+   arena allocation below (for example a Pebble-like skiplist/arena) is still
+   open; the current active memtable appends plus hash-indexes writes and
+   sorts on freeze/flush, so the main costs are flush sort, range iteration,
+   immutable lookup, and memory layout rather than ordered-insert shifts:
    - [x] First slice: normal active memtable key/value/namespace payloads now
      allocate from a memtable-owned arena, matching the recovery replay arena
      path. Structural entry arrays and hash-index buckets still use the backend
@@ -729,17 +742,14 @@ Large-ingest guardrails:
 
 ## Pebble Gap: Write Path And Compaction
 
-Status: in progress
-
 The latest VectorDBBench runs exposed a write-path gap that is separate from
-the read-cache work above. Go uses Pebble for the main DB and HBC index DBs, so
-it gets Pebble's memtables, immutable-memtable queue, background flushes,
-background compactions, L0 pressure handling, write stalls, a block-buffered
-SST writer, and a storage-engine WAL that makes foreground commits append-only
-before later table flush. The Zig LSM has table files, run metadata, compaction
-primitives, bulk-ingest modes, and now a bounded node-round maintenance
-scheduler, but it still lacks Pebble's dedicated foreground WAL, immutable
-memtable queue, background worker pool, and mature stall policy.
+the read-cache work above. Go used Pebble for the main DB and HBC index DBs
+(memtables, immutable-memtable queue, background flushes, background
+compactions, L0 pressure handling, write stalls, a block-buffered SST writer,
+and a storage-engine WAL that made foreground commits append-only before later
+table flush); that Go/Pebble path is gone from the codebase now, but the
+comparison shaped the Zig LSM's own foreground WAL, immutable memtable queue,
+background worker pool, and stall policy described below.
 
 The intended boundary is now explicit:
 
@@ -775,7 +785,8 @@ Current symptoms:
 - Foreground commits still publish through mutable-state flushes into table
   files once thresholds are reached. Pebble instead appends commit records to
   its WAL, applies them to an in-memory memtable, and lets background flush turn
-  immutable memtables into SSTs later.
+  immutable memtables into SSTs later; the Zig LSM's own WAL-backed immutable
+  memtable design (below) follows the same idea.
 - Derived replay over the primary store used to reopen snapshot read txns on
   hot ingest. On the Zig LSM backend, `beginReadTxn()` clones the active mutable
   memtable, so replay workers could drive multi-GB Activity Monitor footprint
@@ -798,7 +809,8 @@ Task list:
 3. [x] Export the maintenance/debt stats through HBC benchmark write logs so
    dense-index runs can answer whether compaction is idle, running, or
    backlogged.
-4. [ ] Export the same maintenance/debt stats through DB status and Prometheus.
+4. Exporting the same maintenance/debt stats through DB status and Prometheus
+   is still open (see [Open work](#open-work)).
 5. [x] Add a node-level LSM maintenance scheduler. It should pick backends by
    score/debt, run compaction outside foreground request handlers, and publish
    manifests safely.
@@ -870,8 +882,9 @@ Task list:
      prior `Backend.close() -> background.Executor.drain()` stall and the new
      owner-close runtime tests passed; that long-suite run later timed out in a
      focused shared-embedding wait that passes independently.
-15. [ ] Add final-state HBC bulk publication for empty or sustained ingest so
-   large loads do not persist every intermediate online mutation.
+15. Adding final-state HBC bulk publication for empty or sustained ingest, so
+   large loads do not persist every intermediate online mutation, is still
+   open (see [Open work](#open-work); this duplicates item 4 above).
 16. [x] Add LSM table-block compression. Start with adaptive per-block Snappy
    because the repo has a pure Zig codec today, keep the policy configurable per
    backend/store, and store blocks uncompressed when the compressed payload does
@@ -885,10 +898,10 @@ Task list:
      vector-field-backed index path strips source JSON vector fields from
      stored documents and persists the vectors as embedding artifacts, so table
      compression is only a secondary storage win.
-18. [ ] Re-run 50k and 1M VectorDBBench with samples and compare:
+18. Re-running 50k and 1M VectorDBBench with samples and comparing
    `logical_bytes`, `table_file_bytes`, `l0_runs`, `compaction_debt`,
    `flush_ms`, `compaction_ms`, `wal_append_ms`, `wal_sync_ms`, and search
-   p95/p99.
+   p95/p99 is still open (see [Open work](#open-work)).
 
 Design target:
 
@@ -901,14 +914,12 @@ Design target:
 
 ## Foreground Publish Versus Maintenance Debt
 
-Status: first backend slice implemented
-
-The latest 1M public guardrail showed a specific remaining architectural bug:
-normal online writes were being shaped like an API-owned bulk session. That made
-query-visible publish and storage cleanup too easy to couple: an upload could
-accumulate many small primary or HBC L0 runs behind a long-lived session, then
-pay the bill in finish/optimize or dense catch-up. Earlier failed runs showed
-hot stacks like:
+The latest 1M public guardrail showed a specific architectural bug that this
+section's design fixes: normal online writes were being shaped like an
+API-owned bulk session. That made query-visible publish and storage cleanup too
+easy to couple: an upload could accumulate many small primary or HBC L0 runs
+behind a long-lived session, then pay the bill in finish/optimize or dense
+catch-up. Earlier failed runs showed hot stacks like:
 
 - `IndexManager.finishDenseBulkIngestEntryWithOptions`
 - `HBCIndex.finishBulkIngestSessionWithOptions`
@@ -921,17 +932,16 @@ That explains the large publish windows and the "visible count advances in huge
 chunks" behavior. The HBC publish made progress, but every publish window could
 inherit a foreground L0 compaction loop.
 
-This is not the Pebble/RocksDB shape. Pebble and RocksDB make foreground write
-visibility depend on WAL + memtable publication and, when needed, memtable
-flush. They do not make normal write visibility depend on compacting L0 back to
-a target. L0/level cleanup is background maintenance debt. If debt exceeds hard
-limits, writes can be slowed, stalled, or rejected by policy, but that is an
-explicit pressure response rather than an implicit cost hidden inside every
-publish.
+That old behavior was not the Pebble/RocksDB shape: those engines make
+foreground write visibility depend on WAL + memtable publication and, when
+needed, memtable flush. They do not make normal write visibility depend on
+compacting L0 back to a target. L0/level cleanup is background maintenance
+debt. If debt exceeds hard limits, writes can be slowed, stalled, or rejected
+by policy, but that is an explicit pressure response rather than an implicit
+cost hidden inside every publish. The implementation below separates the three
+concepts that used to be blurred.
 
 ### Contract
-
-Separate the three concepts that are currently blurred:
 
 1. Visibility publish.
    - Make the latest accepted state query-visible.
@@ -971,7 +981,7 @@ debt before returning.
   - whether writes are stalled or slowed by hard limits
 - Health and cached status stay responsive while maintenance runs.
 
-### Implementation Plan
+### Implementation
 
 1. [x] Rename and tighten finish options.
    - Split `BulkIngestFinishOptions.max_deferred_l0_runs` into an explicit
@@ -1074,26 +1084,24 @@ Expected signals:
 
 WAL design note:
 
-- Pebble's WAL does not replace SST/table files. It moves the foreground durable
+- Pebble's WAL did not replace SST/table files; it moved the foreground durable
   write from "create/publish a sorted table now" to "append a mutation record
-  now, flush sorted tables later".
-- Reusing `pkg/antfly/src/storage/wal.zig` directly is not enough if the WAL is
-  backed by the LSM backend, because that would store the WAL inside the same
-  table/manifest system and preserve the small-file problem. The LSM needs a
-  native append-log file under the backend's storage root, with record framing,
-  checksums, rotation, replay, and checkpoint/truncation tied to manifest
-  publication.
-- The read path must merge mutable memtable state, queued immutable memtables,
-  and durable runs. The current mutable-plus-runs merge shape is close, but a
-  WAL-backed design needs immutable memtables to remain visible while background
+  now, flush sorted tables later". That reasoning carried over directly: the
+  LSM needed a native append-log file under the backend's storage root (not
+  `pkg/antfly/src/storage/wal.zig` reused as-is, since that would store the WAL
+  inside the same table/manifest system and preserve the small-file problem),
+  with record framing, checksums, rotation, replay, and checkpoint/truncation
+  tied to manifest publication.
+- The read path merges mutable memtable state, queued immutable memtables, and
+  durable runs, with immutable memtables staying visible while background
   flush is writing their table files.
 
 Implemented WAL slice:
 
-- The storage abstraction now has an append-file operation with native,
+- The storage abstraction has an append-file operation with native,
   memory-storage, and fallback implementations. Native storage appends to the
   existing file and can optionally sync the file handle.
-- Each durable LSM backend now writes committed mutable transaction batches to
+- Each durable LSM backend writes committed mutable transaction batches to
   segmented `wal/NNNN.log` files as framed, checksummed records before
   publishing them to the in-memory mutable state. `wal/index` records the active
   segment and segments rotate by byte budget.
@@ -1105,11 +1113,11 @@ Implemented WAL slice:
 - Manifest publication resets the WAL only when mutable state and queued
   immutable memtables are empty, so a crash between table flush and manifest
   publish can still recover from WAL.
-- Write stats now include WAL append, replay, reset, and sync counters.
+- Write stats include WAL append, replay, reset, and sync counters.
 
 Implemented immutable-memtable slice:
 
-- Durable byte-budgeted backends now rotate mutable state into an oldest-first
+- Durable byte-budgeted backends rotate mutable state into an oldest-first
   immutable-memtable queue instead of synchronously writing run tables when the
   threshold is crossed.
 - Read snapshots merge durable runs, queued immutable memtables, and current
@@ -1140,47 +1148,33 @@ Immutable memtable task list:
 
 ## Replay Read Path
 
-Status: in progress
-
 Replay rows are append-only and sequence-ordered. They are not a general query
 workload, so they should not pay for the full snapshot-read machinery that the
 LSM exposes for arbitrary scans.
 
-The old replay path used:
-
-- `DocStore.beginReadTxn()`
-- `txn.openCursor()`
-- a stable merged snapshot over mutable + immutable + runs
-
-That is correct for read-only scans, but it is the wrong shape for hot replay.
-On the LSM backend, opening that snapshot clones the active mutable memtable.
-Under sustained ingest, derived workers repeatedly reopened those snapshots and
+The old replay path used `DocStore.beginReadTxn()`, `txn.openCursor()`, and a
+stable merged snapshot over mutable + immutable + runs. That is correct for
+read-only scans, but it was the wrong shape for hot replay: on the LSM
+backend, opening that snapshot clones the active mutable memtable, so under
+sustained ingest, derived workers repeatedly reopening those snapshots
 inflated process footprint far beyond the actual steady-state working set.
 
-Current direction:
-
-- Keep general snapshot reads for query/search/scan code.
-- Keep probe transactions point-read only for current-tip lookups.
-- Add a replay-specific live scan path for append-only replay rows.
-- Make replay workers consume replay lanes from the current durable tip using a
-  dedicated current-scan contract instead of snapshot cursors or dense
-  point-probe loops.
-
-This is deliberately different from the generic snapshot contract:
-
-- replay only needs forward iteration by sequence
-- replay rows are append-only
-- the DB is single-writer
-- the hot path does not need a long-lived stable view of arbitrary keyspace
-
-That means the efficient API is not "snapshot + cursor" and it is also not
-"probe + hidden cursor". It is:
+The design keeps general snapshot reads for query/search/scan code, keeps
+probe transactions point-read only for current-tip lookups, and adds a
+replay-specific live scan path for append-only replay rows so replay workers
+consume replay lanes from the current durable tip using a dedicated
+current-scan contract instead of snapshot cursors or dense point-probe loops.
+This is deliberately different from the generic snapshot contract because
+replay only needs forward iteration by sequence, replay rows are append-only,
+the DB is single-writer, and the hot path does not need a long-lived stable
+view of arbitrary keyspace. The efficient API is therefore three separate
+contracts:
 
 - `ProbeTxn`: current-tip point reads only
 - `CurrentScanTxn`: ordered current-tip replay scans only
 - `ReadTxn`: general snapshot reads and arbitrary scans
 
-Near-term task list:
+Implemented:
 
 1. [x] Remove long-lived primary-store replay cursors that pin LSM snapshots.
 2. [x] Add a `DocStore` replay-specific live scan path for hint-filtered replay
@@ -1209,24 +1203,17 @@ Near-term task list:
    - [x] Compatibility cleanup: hinted replay no longer falls back to the
      replay-all lane. Missing hint-lane rows produce no hinted work; the
      replay-all lane remains for unhinted/all-lane consumers.
-7. [ ] Export replay-live scan metrics so we can compare:
-   - replay sequences scanned
-   - replay scan batches
-   - replay hint-filter skips
-   - replay clone bytes avoided
-   - [x] First slice: replay source stats now distinguish matched rows from
-     scanned rows, count replay scan batches, and count hint-filter skips.
-     Dense catch-up status JSON and Prometheus export scan batches and
-     hint-filter skips alongside the existing scanned/applied counters.
+7. [x] Export replay-live scan metrics: replay source stats distinguish
+   matched rows from scanned rows, count replay scan batches, and count
+   hint-filter skips. Dense catch-up status JSON and Prometheus export scan
+   batches and hint-filter skips alongside the existing scanned/applied
+   counters.
 
-Design target:
-
-- Query/search paths keep snapshot reads.
-- Probe paths stay point-read only.
-- Replay paths get a dedicated live scan contract.
-- Activity Monitor footprint during ingest should be dominated by real write
-  working set, HBC finish state, and caches, not by cloned mutable snapshots
-  held open for replay.
+Design target (achieved): query/search paths keep snapshot reads, probe paths
+stay point-read only, and replay paths get a dedicated live scan contract.
+Activity Monitor footprint during ingest is dominated by real write working
+set, HBC finish state, and caches, not by cloned mutable snapshots held open
+for replay.
 
 Segmented WAL task list:
 
@@ -1240,330 +1227,16 @@ Segmented WAL task list:
 5. [x] Reset/checkpoint by publishing a clean segment index and deleting obsolete
    segment files after manifest publication.
 
-Still open:
-
-- WAL metrics currently cover append/replay/reset/sync activity and immutable
-  memtable bytes, but do not yet expose an oldest-uncheckpointed-LSN or WAL
-  truncation-lag gauge.
-- WAL retention is still reset-based instead of checkpoint-based. A backend can
-  retain multi-GB segmented WAL debt after an interrupted or partially-complete
-  run, and startup must replay that entire tail before higher-level catch-up
-  becomes visible.
-- The next HBC-specific ingest slice is final-state bulk publication so large
-  sustained loads avoid persisting every intermediate online mutation.
-
-### Current 1M Recovery Findings
-
-Recent loaded-root reopen runs are now instrumented enough to be explicit about
-the remaining gaps:
-
-- Dense-index reopen spends about 33s in `DB.open()`, almost entirely in LSM
-  WAL replay.
-- The dense backend reports about 4.26GB replayed and about 4.34GB still
-  retained for replay on this root.
-- After open, higher-level dense catch-up is active but barely progressing.
-- Process RSS can climb into multi-GB territory while the existing
-  `ResourceManager` slices remain near zero, which means startup replay/open
-  memory still sits outside the tracked cache slices.
-
-That means there are still two independent problems to fix:
-
-1. old retained WAL tails must be retired sooner after durable recovery/catch-up
-2. startup replay/open memory must be explicitly accounted and eventually
-   pressure-limited, instead of being inferred from cache metrics
-
-### Near-term recovery/memory task list
-
-1. [x] Surface startup open metrics: configured/opened indexes, index-load time,
-   WAL replay records/entries/bytes/ns, and retained WAL debt.
-2. [x] Add a resource-manager slice for LSM in-memory replay/open state using
-   backend mutable + immutable bytes.
-3. [x] Export and test the new in-memory-state slice through status/metrics on
-   loaded-root startup paths.
-4. [x] Make startup/open progress publish from the actual recovery worker
-   instead of leaving public status frozen at an outer `opening_db` snapshot.
-5. [ ] Read back `wal_replay_*`, `lsm.in_memory_state`, and startup/open phase
-   on the same loaded root after the recovery-flush changes, then compare them
-   against the earlier multi-GB replay runs.
-6. [ ] Verify the second restart cost drops further once a run reaches a clean
-   post-recovery checkpoint, rather than replaying the same retained bytes.
-7. [x] Replace recovery's general-allocator entry churn with a bounded recovery
-   allocation model.
-   - Current evidence from `vmmap` on the live `1M` root:
-     - physical footprint can reach about `14.1G`
-     - RSS stays under `500M`
-     - mapped files are only about `389M`
-     - malloc zones account for about `13.0G` allocated / `13.8G` swapped
-   - This means the remaining memory problem is process-private heap growth and
-     allocator retention during recovery, not primarily mapped-file residency.
-   - Recovery replay now creates a mutable-memtable recovery arena and keeps
-     replayed namespace/key/value bytes arena-owned, while mutable hash-index
-     metadata stays on the normal allocator. A regression covers both the
-     replay ownership and arena release after deferred flush.
-8. [ ] Add a distinct startup/recovery working-set slice for higher-level dense
-   rebuild/catch-up transient buffers if physical footprint still materially
-   exceeds the new bounded recovery heap plus tracked caches.
-9. [ ] Diagnose why dense catch-up stalls after open on the `1M` root even
-   after WAL replay completes, because that still blocks proving post-fix WAL
-   retirement on restart.
-
-### Immediate loaded-root follow-up
-
-Status: active
-
-The loaded `1M` root is now making real progress again:
-
-- reopen is cheap (`wal_replay_bytes = 0`, `load_indexes_ns ~= 4.5s`)
-- startup reaches `artifact_rebuild`
-- dense rebuild advances steadily instead of stalling at `1007 / applied=0`
-- footprint is bounded in the low-GB range rather than the old runaway shape
-
-The next work should be executed in this order:
-
-1. [ ] Add a local loaded-root artifact-rebuild benchmark.
-   - Reopen a partially rebuilt root and measure:
-     - `load_indexes_ns`
-     - time to first applied entry
-     - steady-state applied entries/sec
-     - peak RSS / physical footprint
-     - tracked resource slices
-   - Cover `50k`, `250k`, and `1M` fixtures.
-   - The key regression case is a root with replay debt cleared but dense
-     artifact rebuild still required.
-2. [ ] Implement metadata-lookup reuse for dense apply.
-   - Current steady-state sample is dominated by:
-     - `IndexManager.applyDenseEmbeddingWritesEntry`
-     - `HBCIndex.getMetadata`
-     - metadata cache insert/remove churn
-   - Reuse or preload current vector-id metadata per rebuild chunk instead of
-     repeated point reads through HBC/LSM.
-3. [ ] Rerun the local artifact-rebuild benchmark and compare throughput,
-   memory, and cache usage.
-4. [ ] Let the loaded `1M` root finish end to end on the improved binary.
-5. [ ] Restart immediately after clean completion and confirm reopen remains
-   cheap without rebuilding the old retained-WAL/open-time debt.
-10. [ ] Add dense catch-up diagnostics for the post-open stall window:
-   - external vector cache hits/misses
-   - docstore artifact/document load counts and bytes
-   - recompute-leaf calls and member-vector reloads
-   - per-window watchdog logs when `applied_entries` does not move
-11. [ ] Add ResourceManager coverage for the remaining untracked dense/docstore
-    working sets:
-   - session-local external vector memo bytes
-   - centroid recompute scratch
-   - docstore decode/materialization buffers
-12. [ ] Re-run the loaded `1M` root with the new dense diagnostics and record:
-   - startup phase
-   - replay sequence progress
-   - cache hit/miss deltas
-   - resource slices vs `vmmap` / physical footprint
-13. [ ] Revisit startup dense cache caps once the new diagnostics are in hand.
-   The current startup defaults still clamp HBC caches to `nodes=128` and
-   `vectors=2048`, and recent samples still show `loadExternalVectorCached()`
-   missing on most `getVectorScratch()` calls during the same catch-up window.
-
-Implemented next slice:
-
-- Recovery-time WAL replay is moving to a bounded Pebble-style model instead of
-  "replay the whole retained tail into one mutable memtable, then maintain."
-- The first executable step is incremental recovery flushing:
-  - WAL replay can call back into the backend after each applied record
-  - once recovered mutable state crosses the normal flush threshold, recovery
-    rotates and flushes immediately
-  - WAL checkpoint/reset is deferred until replay completes, so unread later
-    segments are never retired early
-- Required regression:
-  - reopen over a multi-segment retained WAL tail must flush incrementally,
-    keep post-open mutable/immutable state bounded, and make the second reopen
-    avoid replaying the same retained bytes again
-- Remaining gap from live validation:
-  - recovery now flushes incrementally, but the long-running `1M` reopen still
-    accumulates a very large malloc footprint in private heap pages
-  - the next executable slice is allocator-model work, not more cache tuning
-
-## WAL Retention And Startup Replay
-
-Status: implemented; keep benchmarked
-
-Recent 1M loaded-root runs showed the next backend-level gap clearly:
-
-- dense startup catch-up may appear "stuck at zero" because the store is still
-  in `DB.open() -> LSM WAL replay`, before the higher-level index catch-up
-  phases start
-- retained index WAL can grow to multi-GB across interrupted runs
-- the current LSM reset path only deletes WAL segments after a manifest
-  publication with no mutable state and no queued immutable memtables
-- derived replay already has an applied watermark + truncation path; the LSM
-  WAL does not
-
-This is not dense-specific. Any LSM-backed index backend can inherit the same
-startup replay tax if it retains large WAL segments between runs.
-
-### Design target
-
-- Opening an LSM-backed store should replay only the uncovered WAL tail, not the
-  full retained history.
-- Durable flush + manifest publication should advance an explicit WAL checkpoint
-  and retire covered WAL segments incrementally.
-- Startup/status should report LSM open phases separately from higher-level
-  replay or index backfill so the node does not look idle while it is still
-  paying WAL replay debt.
-- Dense, sparse, and graph index stores should all inherit the same retention
-  guarantees from the LSM layer.
-
-### Current status
-
-1. Add explicit WAL checkpoint metadata to the backend.
-   - Implemented:
-     - current segment
-     - oldest uncheckpointed segment
-     - retained WAL bytes/segments
-     - checkpoint lag in sealed segments before the active WAL segment
-     - last durably covered WAL segment
-   - Surfaced through backend maintenance stats and Prometheus metrics.
-   - The durable flush marker is segment-granular because the state WAL is
-     segment-framed rather than mutation-sequenced; dedicated replay WALs keep
-     their own sequence watermarks.
-
-2. Add incremental segment retirement after durable publication.
-   - Implemented: when a flush + manifest publication durably covers WAL through
-     segment `N`, retire segments `<= N` immediately.
-   - Keep the full-reset path for the totally clean case, but do not require a
-     full reset to reclaim historical WAL.
-
-3. Split "checkpoint" from "reset".
-   - Implemented:
-     - `checkpoint`: advance durable coverage and retire covered segments while
-       keeping the current WAL live for new writes
-     - `reset`: clean-slate path when mutable + immutable state are both empty
-
-4. Add WAL pressure policy.
-   - Implemented:
-     - optional soft/hard WAL segment and byte limits on `Options`
-     - retained WAL pressure feeds backend maintenance score
-     - soft WAL pressure makes maintenance flush/checkpoint a live mutable
-       memtable before the normal flush threshold
-     - hard WAL pressure forces foreground rotate/flush/checkpoint work on the
-       commit path so retained WAL segments are retired without waiting for a
-       later maintenance pass.
-     - retained WAL bytes are accounted in the ResourceManager under
-       `lsm.wal_retention`, so pressure snapshots distinguish durable WAL debt
-       from transient WAL write buffers.
-
-### Remaining work
-
-1. Export startup/open phases for LSM-backed stores.
-   - Suggested phases:
-     - `opening_manifest`
-     - `replaying_wal`
-     - `mounting_runs`
-     - `starting_index_runtime`
-     - `higher_level_catch_up`
-   - Status/metrics should distinguish LSM replay debt from derived replay debt
-     and from index rebuild/backfill work.
-   - [x] First LSM slice: `Backend.OpenStats` now records successful open phase
-     timing for storage initialization, manifest loading, directory creation,
-     WAL replay, and run mounting, plus replay records/bytes and loaded run
-     counts. Higher-level index-runtime and catch-up phases remain separate
-     runtime work.
-   - [x] DB startup/status now aggregates LSM open stats across primary and
-     index stores, and exposes the phase counters through async-index startup
-     JSON/Prometheus metrics so LSM replay time is visible separately from
-     higher-level catch-up work.
-   - [x] Startup status now carries checkpoint/replay retention coordinates
-     and WAL replay tail-cleanup bytes through both JSON status and Prometheus,
-     so retained-WAL debt can be correlated with startup RSS and replay time.
-
-2. Add aggressive checkpoint triggers for index stores.
-   - After successful bulk finalize
-   - After successful startup repair/rebuild
-   - After large catch-up sessions
-   - After sustained write bursts that rotated segments
-   - [x] First slice: LSM-backed primary, full-text, and dense/HBC index
-     owners expose a durable-boundary WAL checkpoint hook that drains mutable
-     and immutable state before retiring covered WAL. Derived replay catch-up
-     paths now call it after successful dense bulk-window finalization and
-     after applied sequence publication for indexes that advanced.
-   - [x] Default policy slice: primary and index LSM profiles now configure
-     bounded WAL-retention pressure by default. Soft limits feed background
-     maintenance/checkpointing; hard limits force bounded foreground
-     flush/checkpoint work before retained WAL can grow without limit.
-   - [x] Sparse and graph LSM-backed stores now expose durable-boundary
-     checkpoint hooks. The managed-index dispatcher handles sparse and graph
-     refs, and full-text, sparse, and graph startup rebuild/backfill boundaries
-     explicitly checkpoint retained WAL after successful publication.
-
-3. Re-benchmark loaded-root restart behavior.
-   - Measure time to:
-     - LSM open complete
-     - first visible higher-level catch-up progress
-     - steady-state query readiness
-   - Compare retained WAL bytes before/after checkpoint-retirement changes
-
-### Required test coverage
-
-The goal is to make WAL retention behavior a backend contract, not a workload
-accident. Add focused tests at the LSM layer plus one integration-style restart
-test through DB/index open.
-
-Core backend tests:
-
-1. Checkpoint retires covered segments.
-   - Write enough state to create multiple WAL segments.
-   - Flush + publish durable runs.
-   - Assert covered segments are retired while the active tail remains.
-
-2. Restart replays only uncovered segments.
-   - Create several segments.
-   - Advance the checkpoint through an interior segment.
-   - Reopen and assert replay starts after the checkpointed coverage.
-
-3. Full reset still works.
-   - Reach the empty mutable + immutable state case.
-   - Assert reset removes obsolete segments and reinitializes the WAL index.
-
-4. Interrupted flush preserves correctness but bounds replay debt.
-   - Simulate a crash after WAL append and before or during publish.
-   - Reopen and assert data correctness.
-   - After a successful later checkpoint, assert old retained segments are
-     retired.
-
-5. Repeated open/close does not accumulate retained WAL indefinitely.
-   - Drive several write / flush / reopen cycles.
-   - Assert retained WAL bytes/segments stay bounded.
-   - [x] Backend coverage now drives repeated checkpointed write/reopen cycles,
-     asserts each clean reopen skips historical WAL replay, verifies retained
-     WAL bytes/segments return to zero after durable checkpoint, and confirms
-     all prior rows remain readable after the final reopen.
-
-Index-facing integration tests:
-
-6. Dense startup after successful checkpoint does not replay historical WAL.
-7. Sparse startup after successful checkpoint does not replay historical WAL.
-8. Graph startup after successful checkpoint does not replay historical WAL.
-
-Those do not need three separate codepaths if the harness can parameterize the
-LSM-backed index kind, but the behavior needs explicit coverage for all three.
-
-Observability tests:
-
-9. Status/metrics expose:
-   - retained WAL segments
-   - retained WAL bytes
-   - oldest uncheckpointed segment
-   - startup phase = `replaying_wal` during open replay
-   - startup phase transitions once replay completes
-
 ## Compression Direction
 
 RocksDB and Pebble compress table blocks, not whole logical databases. Antfly
-should follow that shape first: each table block carries a small compression
-header, the reader decompresses only blocks it touches, and block-cache/accounting
-can separately budget compressed bytes on disk and uncompressed bytes in memory.
+follows that shape: each table block carries a small compression header, the
+reader decompresses only blocks it touches, and block-cache/accounting
+separately budgets compressed bytes on disk and uncompressed bytes in memory.
 
-Near-term compression order:
+Compression order:
 
-1. Add adaptive LSM table-block compression as a per-store option. The first
+1. [x] Add adaptive LSM table-block compression as a per-store option. The first
    implementation uses Snappy-style block framing because it is available in
    pure Zig in this repository; zstd/lz4 should be added as additional policies
    once encoder support and CPU/ratio benchmarks justify them.
@@ -1573,50 +1246,40 @@ Near-term compression order:
    - `MaintenanceStats` records the same logical/physical totals for the active
      run set so benchmark logs can distinguish live compressed bytes from
      obsolete files or repeated table publication.
-2. Keep dense and sparse embedding artifacts binary. Binary vector payloads are
+2. [x] Keep dense and sparse embedding artifacts binary. Binary vector payloads are
    the format fix; table compression is only a secondary byte-reduction layer.
-3. Preserve byte-based mutable flush thresholds and per-store LSM configs as
+3. [x] Preserve byte-based mutable flush thresholds and per-store LSM configs as
    first-class work. Compression reduces bytes, but it does not fix flushing too
    often or persisting intermediate HBC states.
-4. Treat HBC quantized/vector-like blocks as adaptive: if compression does not
+4. [x] Treat HBC quantized/vector-like blocks as adaptive: if compression does not
    win by a threshold, store the block raw.
 
-MAYBE/later:
-
-- Add primary document and chunk codec envelopes. Small JSON/text values can
-  remain raw; larger JSON/text values can be zstd/lz4-compressed behind an
-  explicit versioned header.
-- Add zstd/lz4 LSM block compression policies. These should be configurable per
-  store, not a global format switch, because primary JSON/text rows, full-text
-  metadata, HBC metadata, and vector-like payloads have different CPU/ratio
-  tradeoffs.
-- Add value separation for very large values if table-block compression plus
-  byte-based flush policy still leaves high compaction rewrite cost.
+Still open (see [Open work](#open-work)): primary document/chunk codec
+envelopes, zstd/lz4 LSM block compression policies, and value separation for
+very large values.
 
 Implemented scheduler slice:
 
-- Each LSM backend now publishes a maintenance score derived from L0 run/byte
+- Each LSM backend publishes a maintenance score derived from L0 run/byte
   debt, lower-level overflow, and dirty manifest state.
 - `DataServer.runRound()` runs one bounded maintenance step through the
   provisioned write-cache, choosing the cached table DB with the highest LSM
   score. The DB then chooses primary-store or index LSM debt and runs one
   compaction/publish step under the DB apply lock.
-- Soft L0 limits are now scheduler debt. The maintenance step compacts toward
+- Soft L0 limits are scheduler debt. The maintenance step compacts toward
   the soft limit when foreground writes have not crossed the hard limit.
 - Hard L0 limits are foreground guardrails. After a mutable flush, a backend
   that crosses the hard run/byte limit does bounded inline cleanup so L0 debt
   cannot grow without bound while background rounds catch up.
-- Dense HBC LSM defaults now use a byte flush threshold and byte/run L0 limits,
+- Dense HBC LSM defaults use a byte flush threshold and byte/run L0 limits,
   while legacy entry-count thresholds remain available for small-value stores
   and tests.
 - Primary document, full-text main/WAL metadata, and graph reverse LSM defaults
-  now also use byte-based mutable flush thresholds and byte/run L0 limits. Small
+  also use byte-based mutable flush thresholds and byte/run L0 limits. Small
   unit tests can still opt into entry-count flushes explicitly, but production
-  defaults should not emit one run per tiny write batch.
+  defaults do not emit one run per tiny write batch.
 
-## Phase 1: In-Flight Load Coordination
-
-Status: implemented
+## In-Flight Load Coordination
 
 Problem:
 
@@ -1634,9 +1297,7 @@ Why this matches RocksDB/Pebble:
 - Both engines aggressively avoid duplicate miss work and avoid thundering-herd behavior around shared read structures.
 - The important change is not just hashing the key. It is coalescing the miss itself.
 
-## Phase 2: Native FD Cache Structure
-
-Status: implemented
+## Native FD Cache Structure
 
 Problem:
 
@@ -1658,9 +1319,7 @@ Why this matches RocksDB/Pebble:
 - This moves the design toward a real table-cache shape: shard first, hash lookup second, syscall outside the hottest lock.
 - The implementation is intentionally simpler than RocksDB's table cache, but it fixes the same class of contention.
 
-## Phase 3: Block Cache Eviction
-
-Status: implemented
+## Block Cache Eviction
 
 Problem:
 
@@ -1679,9 +1338,9 @@ Why this matches RocksDB/Pebble:
 - Sharded caches only pay off if lookup and eviction both operate on shard-local indexed state.
 - This is the minimum structure needed to make sharding materially useful under pressure.
 
-## Phase 4: Metadata Read Bundling
+## Metadata Read Bundling
 
-Status: implemented for new table files, with legacy fallback retained
+Implemented for new table files, with legacy fallback retained.
 
 Problem:
 
@@ -1723,23 +1382,19 @@ Implemented in this pass:
   - `seekAtOrAfter` uses footer/index metadata to jump directly into the candidate block
   - forward `next()` iteration reuses the current block window until it is exhausted, then loads only the next block instead of materializing the full run state or reopening the whole table
 
-Candidate implementation options:
+Candidate implementation options that remain open (see
+[Open work](#open-work)):
 
 1. Add a native-only table metadata cache keyed by `(path, run_id, generation)`.
-2. Keep direct trailer reads as the required index-open path for v9 footer
-   metadata.
-3. Optionally move more reader-open metadata into the footer bundle if future table properties are added.
+2. Optionally move more reader-open metadata into the footer bundle if future table properties are added.
 
-Why this is not in Phase 1:
+Direct trailer reads remain the required index-open path for v9 footer
+metadata.
 
-- This crosses the storage abstraction and, in the best version, the on-disk table format.
-- The cache and fd-cache changes were higher-confidence wins that did not require a format migration.
+## Longer-Term Block/Property Skipping
 
-## Phase 5: Longer-Term Block/Property Skipping
-
-Status: planned longer term
-
-This is where the bigger RocksDB/Pebble lessons live.
+This section is design-stage only; none of it is implemented. It captures the
+bigger RocksDB/Pebble lessons that have not yet been applied.
 
 ### 1. Data-Block Hash Index
 
@@ -1781,19 +1436,11 @@ Expected cost:
 - New collector logic at write time.
 - Reader-side predicate plumbing.
 
-## Suggested Order From Here
-
-1. Keep the current Phase 1-3 changes and benchmark them under miss-heavy point-lookups and reopen-heavy workloads.
-2. Benchmark v10 footer metadata and prefix-compressed direct point lookup under
-   reopen-heavy point-lookups.
-3. Use the measurements to decide whether the next format revision should add
-   richer block property collectors or a shared-cache physical-block policy.
-
 ## What Landed In This Pass
 
-- Pending load coordination is now keyed and blocking instead of scan-plus-yield.
-- The native fd cache is now sharded and hashed, and it no longer holds the hot lock across `openat`.
-- The block cache now evicts from maintained shard-local LRU state instead of globally rescanning the cache.
+- Pending load coordination is keyed and blocking instead of scan-plus-yield.
+- The native fd cache is sharded and hashed, and it no longer holds the hot lock across `openat`.
+- The block cache evicts from maintained shard-local LRU state instead of globally rescanning the cache.
 - New run tables use the footer-backed v10 packed-offset layout. The shipped v9
   layout remains readable; older table versions are intentionally rejected.
 
@@ -1837,9 +1484,8 @@ The compare tool:
 
 ## Immutable Memtable And WAL Efficiency
 
-Status: implemented in the current LSM slice; keep covered by tests because these are correctness-sensitive ownership paths.
-
-Task list:
+These are correctness-sensitive ownership paths and should stay covered by
+tests.
 
 1. [x] Make immutable flush non-destructive without cloning the whole memtable first. Flush now builds borrowed table entries from the immutable state and only retires the immutable memtable after the new runs are installed.
 2. [x] Avoid cloning all immutable memtables into every read transaction. Read snapshots now keep a small newest-to-oldest pointer slice under the reader guard, while only the mutable state is cloned.
@@ -1850,3 +1496,43 @@ Follow-up watch points:
 
 - If immutable backlog becomes deep, cursor initialization now has more logical sources. The maintenance scheduler should keep that depth low.
 - If reads are held for a long time, retired immutable memtables remain pinned until the last reader exits. That is intentional snapshot behavior; resource pressure metrics should make it visible.
+
+## Open work
+
+- **LSM memory pressure, "fully first-class" status**: every listed sub-step
+  under Priority area 5 above is done, but the umbrella item is still marked
+  open in the source with no specific remaining piece identified.
+- **Async point-read futures for sorted-by-run/batch state**: the future-based
+  concurrent block-read path (Priority area 3 / Point Read Work item 2) covers
+  independent point reads; extending it to sorted-by-run/batch point-read
+  state without disturbing current block/index reuse is not done.
+- **Final-state HBC bulk publication**: large sustained ingest still persists
+  intermediate online mutations rather than a true final-state bulk publish
+  (referenced from both the "Pebble Gap" task list and the WAL/immutable
+  section).
+- **DB status/Prometheus export of maintenance/debt stats**: HBC benchmark
+  write logs expose this; the DB status and Prometheus surfaces do not yet.
+- **Memtable structure beyond arena allocation**: the active memtable is a
+  hash-indexed owned-entry table with arena-allocated payloads. A Pebble-like
+  skiplist/arena that also removes sort-on-flush and mid-array shift costs is
+  a larger allocator/data-structure change that has not been started.
+- **Native-only table metadata cache keyed by `(path, run_id, generation)`**
+  and **moving more reader-open metadata into the footer bundle** (Metadata
+  Read Bundling) are candidate options, not implemented.
+- **Longer-Term Block/Property Skipping** (data-block hash index, block
+  property filters) is design-stage only; none of it is implemented.
+- **Compression follow-ups**: primary document/chunk codec envelopes for
+  large JSON/text values, zstd/lz4 LSM block compression policies, and value
+  separation for very large values are all still open.
+- **Re-run 50k and 1M VectorDBBench** with samples and compare
+  `logical_bytes`, `table_file_bytes`, `l0_runs`, `compaction_debt`,
+  `flush_ms`, `compaction_ms`, `wal_append_ms`, `wal_sync_ms`, and search
+  p95/p99 against the current implementation.
+- **Compaction concurrency**: raising concurrency beyond the current
+  non-overlap admission gate needs further proof that jobs are safe to run in
+  parallel; see Priority area / Write and Maintenance Work item 6 above.
+- Next benchmark-driven step for the read/scan and point-read work above:
+  benchmark v10 footer metadata and prefix-compressed direct point lookup
+  under reopen-heavy point-lookups, then decide whether the next format
+  revision should add richer block property collectors or a shared-cache
+  physical-block policy.

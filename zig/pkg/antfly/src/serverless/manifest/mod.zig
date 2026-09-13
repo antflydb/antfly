@@ -20,6 +20,7 @@ pub const remote_store = @import("remote_store.zig");
 pub const artifact_ref = @import("artifact_ref.zig");
 pub const base_source = @import("base_source.zig");
 pub const compatibility = @import("compatibility.zig");
+pub const read_lease = @import("read_lease.zig");
 
 pub const ArtifactKind = types.ArtifactKind;
 pub const ArtifactRef = types.ArtifactRef;
@@ -53,6 +54,7 @@ test "serverless manifest module compiles" {
     _ = artifact_ref;
     _ = base_source;
     _ = compatibility;
+    _ = read_lease;
     _ = ArtifactKind;
     _ = ArtifactRef;
     _ = BaseSourceDescriptor;

@@ -45,6 +45,11 @@ const asset_producer_mod = @import("asset_producer.zig");
 const inference_work = @import("../../../inference/work.zig");
 const chunk_provider = @import("../../../chunking/provider.zig");
 const document_extraction_mod = @import("document_extraction.zig");
+const runtime_failure_abi = @import("runtime_failure_abi");
+const document_extraction_client = if (!builtin.is_test and build_options.linked_storage)
+    @import("document_extraction_client.zig")
+else
+    struct {};
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -74,6 +79,7 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
+const relational_store = @import("../relational_store.zig");
 
 var activity_epoch_salt = std.atomic.Value(u64).init(1);
 
@@ -102,6 +108,7 @@ pub const Config = struct {
     asset_producer: ?asset_producer_mod.Producer = null,
     chunk_provider: ?ChunkProvider = null,
     enable_without_producers: bool = false,
+    relational_base_rows: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     /// Runtime-owned execution context for template remote I/O. Production
@@ -3568,9 +3575,9 @@ fn getOrCreateRequestChunks(
     const cache_key = try workerChunkCacheKey(runtime.alloc, request);
     errdefer runtime.alloc.free(cache_key);
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = try storeGetOptionalAllocWithRetry(runtime, doc_store_key);
+    const raw = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
     const source_digest: ?[32]u8 = if (raw) |value| sourceRecordDigest(value) else null;
     // A replay window can contain a newer update for the same document. Keep
     // old cache entries alive for already queued provider inputs, but reuse
@@ -3627,6 +3634,33 @@ fn getOrCreateRequestChunks(
     return cache.items[cache.items.len - 1].chunks;
 }
 
+fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
+    runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
+    runtime.error_count = @max(runtime.error_count, previous.error_count);
+    runtime.retryable_error_count = @max(runtime.retryable_error_count, previous.retryable_error_count);
+    runtime.fatal_error_count = @max(runtime.fatal_error_count, previous.fatal_error_count);
+    runtime.skip_by_hash_count = @max(runtime.skip_by_hash_count, previous.skip_by_hash_count);
+    runtime.skipped_source_count = @max(runtime.skipped_source_count, previous.skipped_source_count);
+    runtime.codec_decode_failures = @max(runtime.codec_decode_failures, previous.codec_decode_failures);
+    runtime.embed_batches_started = @max(runtime.embed_batches_started, previous.embed_batches_started);
+    runtime.embed_batches_completed = @max(runtime.embed_batches_completed, previous.embed_batches_completed);
+    runtime.embed_items_started = @max(runtime.embed_items_started, previous.embed_items_started);
+    runtime.embed_items_completed = @max(runtime.embed_items_completed, previous.embed_items_completed);
+    if (previous.embed_batches_completed != 0 and
+        previous.last_embed_batch_completed_ms >= runtime.last_embed_batch_completed_ms)
+    {
+        runtime.last_embed_batch_items = previous.last_embed_batch_items;
+        runtime.last_embed_batch_bytes = previous.last_embed_batch_bytes;
+        runtime.last_embed_batch_max_bytes = previous.last_embed_batch_max_bytes;
+        runtime.last_embed_batch_completed_ms = previous.last_embed_batch_completed_ms;
+        runtime.last_embed_batch_ns = previous.last_embed_batch_ns;
+    }
+    runtime.total_embed_ns = @max(runtime.total_embed_ns, previous.total_embed_ns);
+    runtime.dense_artifact_bytes_written = @max(runtime.dense_artifact_bytes_written, previous.dense_artifact_bytes_written);
+    runtime.sparse_artifact_bytes_written = @max(runtime.sparse_artifact_bytes_written, previous.sparse_artifact_bytes_written);
+    runtime.chunk_artifact_bytes_written = @max(runtime.chunk_artifact_bytes_written, previous.chunk_artifact_bytes_written);
+}
+
 pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
@@ -3671,6 +3705,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: bool = false,
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -3756,6 +3791,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = config.relational_base_rows,
             .clock = config.clock orelse platform_clock.Clock.real(),
             .deadline_clock = config.clock orelse platform_clock.Clock.real(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
@@ -3766,6 +3802,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .asset_producer = config.asset_producer,
                 .chunk_provider = config.chunk_provider,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .io = config.io,
@@ -3820,6 +3857,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
+    }
+
+    pub fn setRelationalBaseRows(self: *@This(), enabled: bool) void {
+        self.relational_base_rows = enabled;
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
@@ -4068,6 +4109,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
+    pub fn inheritProcessTelemetry(self: *@This(), previous: types.EnrichmentStats) void {
+        inheritProcessTelemetryUnlocked(self, previous);
+    }
+
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
         return self.isolated_failed_indexes.contains(index_name);
     }
@@ -4162,6 +4207,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     retry_error_has_request_identity: bool = false,
     retrying: bool = false,
     worker_failed: bool = false,
+    relational_base_rows: std.atomic.Value(bool) = .init(false),
     skip_by_hash_count: u64 = 0,
     skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
@@ -4255,6 +4301,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .relational_base_rows = .init(config.relational_base_rows),
             .clock = config.clock orelse backend_runtime.clock(),
             .deadline_clock = config.clock orelse backend_runtime.monotonicClock(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse backend_runtime.clock()),
@@ -4265,6 +4312,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .asset_producer = config.asset_producer,
                 .chunk_provider = config.chunk_provider,
                 .enable_without_producers = config.enable_without_producers,
+                .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
                 .io = backend_runtime.inferenceIo() orelse borrowed_io orelse config.io,
@@ -4385,6 +4433,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         self.status_hook = hook;
         self.mutex.unlock(io);
+    }
+
+    pub fn setRelationalBaseRows(self: *EnrichmentRuntime, enabled: bool) void {
+        self.relational_base_rows.store(enabled, .monotonic);
     }
 
     fn notifyStatusHook(self: *EnrichmentRuntime) void {
@@ -4801,6 +4853,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .chunk_artifact_bytes_written = self.chunk_artifact_bytes_written,
             .artifact_bytes_written = self.dense_artifact_bytes_written + self.sparse_artifact_bytes_written + self.chunk_artifact_bytes_written,
         };
+    }
+
+    /// Reconfiguration replaces the provider/runtime object without replacing
+    /// the owning DB. Keep cumulative process telemetry monotonic across that
+    /// handoff; durable replay state is reloaded separately before this call.
+    pub fn inheritProcessTelemetry(self: *EnrichmentRuntime, previous: types.EnrichmentStats) void {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        inheritProcessTelemetryUnlocked(self, previous);
     }
 
     pub fn indexHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8) bool {
@@ -10541,9 +10603,9 @@ fn processAsset(
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !void {
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     var raw_owned = true;
     defer if (raw_owned) runtime.alloc.free(raw);
 
@@ -11662,6 +11724,67 @@ fn processDocumentExtractionAsset(
         try finalizeEmptyDocumentExtractionCoverage(runtime, window, request, manifest);
         try flushGeneratedReplayWindow(runtime, window);
     }
+}
+
+fn extractDocumentDownloadedStreaming(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config: document_extraction_mod.Config,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    sink: document_extraction_mod.UnitSink,
+    out_failure: *runtime_failure_abi.FailureIdentity,
+) !void {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.linked_storage) {
+        return document_extraction_client.extractDownloadedStreamingWithLimitsWithFailure(
+            alloc,
+            downloaded,
+            source_url,
+            config_json,
+            raw_document_json,
+            config.pdf_decode_limits,
+            sink,
+            out_failure,
+        );
+    }
+    return document_extraction_mod.extractDownloadedStreaming(alloc, downloaded, source_url, config, sink);
+}
+
+fn renderDocumentPdfPagePngAdaptiveAlloc(
+    alloc: Allocator,
+    decoder_alloc: Allocator,
+    pdf_bytes: []const u8,
+    page_number: usize,
+    config: document_extraction_mod.Config,
+    max_pixels: u64,
+    max_dimension: u32,
+    out_failure: *runtime_failure_abi.FailureIdentity,
+) !document_extraction_mod.RenderedPdfPage {
+    out_failure.* = .{};
+    if (comptime !builtin.is_test and build_options.linked_storage) {
+        return document_extraction_client.renderPdfPagePngAdaptiveControlledAllocWithFailure(
+            alloc,
+            decoder_alloc,
+            pdf_bytes,
+            page_number,
+            config.ocr_render_dpi,
+            max_pixels,
+            max_dimension,
+            config.pdf_decode_limits.max_decoded_stream_bytes,
+            config.pdf_decode_limits.max_working_set_bytes,
+            0,
+            out_failure,
+        );
+    }
+    var session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, pdf_bytes, config.pdf_decode_limits);
+    defer session.deinit();
+    return session.renderPagePngAdaptiveAlloc(alloc, page_number, config.ocr_render_dpi, max_pixels, max_dimension);
+}
+
+fn boundaryFailureErrorName(failure: *const runtime_failure_abi.FailureIdentity, fallback: anyerror) []const u8 {
+    return if (failure.error_name_len > 0) failure.errorName() else @errorName(fallback);
 }
 
 fn writeDocumentExtractionFailureManifest(
@@ -16305,11 +16428,22 @@ fn markRuntimeGeneratedUnitTextFailure(
     kind: RuntimeGeneratedUnitTextKind,
     err: anyerror,
 ) !void {
+    return markRuntimeGeneratedUnitTextFailureNamed(alloc, unit, method, kind, @errorName(err), isRetryableEnrichmentError(err));
+}
+
+fn markRuntimeGeneratedUnitTextFailureNamed(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    error_name: []const u8,
+    retryable: bool,
+) !void {
     const failed_status = switch (kind) {
         .ocr => "failed_ocr",
         .transcript => "failed_transcription",
     };
-    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, error_name });
     errdefer alloc.free(warning);
     const owned_method = try alloc.dupe(u8, if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) "pdf_text" else method);
     errdefer alloc.free(owned_method);
@@ -16329,7 +16463,7 @@ fn markRuntimeGeneratedUnitTextFailure(
             unit.ocr_used = false;
             unit.ocr_confidence = null;
             unit.ocr_bbox = null;
-            unit.ocr_failure_retryable = isRetryableEnrichmentError(err);
+            unit.ocr_failure_retryable = retryable;
             if (std.mem.eql(u8, unit.unit_type, "image")) {
                 alloc.free(unit.text);
                 unit.text = try alloc.dupe(u8, "");
@@ -20671,9 +20805,9 @@ fn collectPlainDenseBatchItem(
     window: *GeneratedReplayWindow,
 ) !?PlainDenseBatchItem {
     const embedding_artifact_name = requestEmbeddingName(request);
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return null;
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return null;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -21158,9 +21292,9 @@ fn getOrCreatePlannedRequests(
     const owned_doc_key = try runtime.alloc.dupe(u8, doc_key);
     errdefer runtime.alloc.free(owned_doc_key);
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse {
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse {
         const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
         try request_plan_cache.append(runtime.alloc, .{
             .doc_key = owned_doc_key,
@@ -21932,10 +22066,10 @@ fn processPdfPageImageEmbeddingWithAllocator(
         policy.batch_bytes orelse return error.InferenceCapabilitiesUnavailable;
     if (batch_bytes == 0) return error.InvalidInferenceCapabilities;
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(metadata_alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyWithAllocator(runtime, metadata_alloc, request.doc_key);
     defer metadata_alloc.free(doc_store_key);
     var source_reader = AllocatedStoreReader{ .runtime = runtime, .alloc = metadata_alloc };
-    const raw = readAllocWithRetry(&source_reader, doc_store_key, AllocatedStoreReader.read) catch |err| switch (err) {
+    const raw = readAllocWithRetry(&source_reader, doc_store_key, AllocatedStoreReader.readDocument) catch |err| switch (err) {
         error.NotFound => return,
         else => return err,
     };
@@ -23075,9 +23209,9 @@ fn processDenseEmbedding(
         return processChunkedDenseWindow(runtime, &.{request}, chunk_cache, window);
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
@@ -23216,9 +23350,9 @@ fn processSparseEmbedding(
         return;
     }
 
-    const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
+    const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalAllocWithRetry(runtime, doc_store_key)) orelse return;
+    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse return;
     defer runtime.alloc.free(raw);
 
     const source_text = try extractSourceText(runtime.alloc, runtime.config, raw, request) orelse {
@@ -27098,11 +27232,41 @@ const AllocatedStoreReader = struct {
         defer txn.abort();
         return self.alloc.dupe(u8, try txn.get(key));
     }
+
+    fn readDocument(self: *@This(), key: []const u8) ![]u8 {
+        const raw = try self.read(key);
+        if (!runtimeUsesRelationalBaseRows(self.runtime)) return raw;
+        defer self.alloc.free(raw);
+        return try self.runtime.index_manager.materializeStoredValueAlloc(self.alloc, key, raw);
+    }
 };
 
 fn storeGetAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     var reader = AllocatedStoreReader{ .runtime = runtime, .alloc = runtime.alloc };
     return reader.read(key);
+}
+
+fn runtimeUsesRelationalBaseRows(runtime: *EnrichmentRuntime) bool {
+    return if (comptime builtin.os.tag == .freestanding)
+        runtime.relational_base_rows
+    else
+        runtime.relational_base_rows.load(.monotonic);
+}
+
+fn storeGetDocumentAlloc(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
+    var reader = AllocatedStoreReader{ .runtime = runtime, .alloc = runtime.alloc };
+    return reader.readDocument(key);
+}
+
+fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8) ![]u8 {
+    return documentSourceStoreKeyWithAllocator(runtime, runtime.alloc, doc_key);
+}
+
+fn documentSourceStoreKeyWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, doc_key: []const u8) ![]u8 {
+    return if (runtimeUsesRelationalBaseRows(runtime))
+        try relational_store.keyAlloc(alloc, doc_key)
+    else
+        try internal_keys.documentKeyAlloc(alloc, doc_key);
 }
 
 fn readAllocWithRetry(context: anytype, key: []const u8, comptime read_fn: anytype) ![]u8 {
@@ -27119,6 +27283,13 @@ fn readAllocWithRetry(context: anytype, key: []const u8, comptime read_fn: anyty
 
 fn storeGetAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) ![]u8 {
     return readAllocWithRetry(runtime, key, storeGetAlloc);
+}
+
+fn storeGetOptionalDocumentAllocWithRetry(runtime: *EnrichmentRuntime, key: []const u8) !?[]u8 {
+    return readAllocWithRetry(runtime, key, storeGetDocumentAlloc) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
 }
 
 /// `NotFound` is the only absence proof. In particular, writer contention is

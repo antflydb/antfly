@@ -4,7 +4,7 @@
 /// server is available. The query builder tests run without a server.
 ///
 /// Run all tests:       `cargo pgrx test pg18`
-/// Run with antfly:     `ANTFLY_TEST_URL=http://localhost:8080/api/v1/ cargo pgrx test pg18`
+/// Run with antfly:     `ANTFLY_TEST_URL=http://localhost:8080/db/v1/ cargo pgrx test pg18`
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {

@@ -531,7 +531,10 @@ fn ManifestServer(comptime prefix: []const u8) type {
         owner: *HandlerState,
 
         fn register(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler) !void {
-            const metadata = routeMetadata(method, path);
+            try self.registerWithMetadata(method, path, handler, routeMetadata(method, path));
+        }
+
+        fn registerWithMetadata(self: *const @This(), method: abi.HttpMethod, comptime path: []const u8, handler: httpx.Handler, metadata: RouteMetadata) !void {
             self.owner.route_validator.add(switch (method) {
                 .get => .GET,
                 .post => .POST,
@@ -569,6 +572,13 @@ fn ManifestServer(comptime prefix: []const u8) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             try self.register(.post, path, handler);
+        }
+
+        pub fn postResponseStreaming(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.registerWithMetadata(.post, path, handler, .{
+                .request_body = .buffered,
+                .streaming_response = true,
+            });
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
@@ -673,6 +683,53 @@ fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 
         if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
     }
     return null;
+}
+
+test "linked API route manifest preserves internal scan response streaming" {
+    const alloc = std.testing.allocator;
+    var status_source = KernelIngressTestStatus{};
+    const api_server = try alloc.create(server_mod.ApiHttpServer);
+    defer alloc.destroy(api_server);
+    api_server.* = server_mod.ApiHttpServer.init(alloc, .{}, status_source.source(), null, null);
+    defer api_server.deinit();
+    var state = HandlerState{
+        .alloc = alloc,
+        .handler = .{ .api_server = api_server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer {
+        for (state.routes.items) |route| alloc.destroy(route);
+        state.routes.deinit(alloc);
+        state.route_manifest.deinit(alloc);
+        state.route_validator.deinit();
+    }
+    var entries: ?[*]const abi.RouteManifestEntry = null;
+    var len: usize = 0;
+    const status = handlerRouteManifest(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = &state,
+        .out_entries = &entries,
+        .out_len = &len,
+    });
+    try std.testing.expect(status.isOk());
+    const routes = @import("http_routes.zig").Routes;
+    const table_prefix = routes.internal_groups_prefix ++ ":group_id/tables/:table_name";
+    var found_scan = false;
+    var found_query = false;
+    for (entries.?[0..len]) |entry| {
+        if (entry.method != .post) continue;
+        if (std.mem.eql(u8, entry.path.slice(), table_prefix ++ routes.documents_suffix)) {
+            try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
+            try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
+            found_scan = true;
+        }
+        if (std.mem.eql(u8, entry.path.slice(), table_prefix ++ routes.query_suffix)) {
+            try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
+            try std.testing.expectEqual(@as(u8, 0), entry.streaming_response);
+            found_query = true;
+        }
+    }
+    try std.testing.expect(found_scan and found_query);
 }
 
 test "linked API dispatch preserves kernel-owned ingress policy" {

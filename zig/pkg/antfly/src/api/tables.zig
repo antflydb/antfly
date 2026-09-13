@@ -20,7 +20,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
@@ -4815,13 +4815,14 @@ test "stored create table encoding round-trips a normalized public request" {
 test "stored create table encoding preserves empty requests" {
     const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
     defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("{}", encoded);
+    try std.testing.expectEqualStrings("{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", encoded);
 
     var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
     try std.testing.expect(decoded.description == null);
     try std.testing.expect(decoded.schema_json == null);
+    try std.testing.expectEqual(.primary_lsm, decoded.storage.dense_embeddings);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {

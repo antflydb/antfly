@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const compat = @import("../io/compat.zig");
-const gliner2 = @import("gliner2.zig");
+const gliner2 = @import("assets/gliner2_files.zig");
 const safetensors = @import("../models/safetensors.zig");
 
 pub const manifest_file_name = "training_manifest.json";

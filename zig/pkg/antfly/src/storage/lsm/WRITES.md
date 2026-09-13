@@ -1,5 +1,18 @@
 # LSM, HBC, and Full-Text Write Performance
 
+This document mixes shipped write-path work with items that are explicitly
+still open. The write benchmarks themselves, the WAL/immutable-memtable path,
+the compaction scheduler, per-store byte-based flush thresholds, and adaptive
+table-block compression are implemented and covered below in the sections that
+describe them (most are marked `Status: implemented` or narrated as landed
+with benchmark evidence). What remains open — per-store LSM config splits
+beyond HBC, full-text writer byte budgets, a true final-state HBC bulk
+publication path, DB status/Prometheus export of maintenance/debt stats, and
+further memtable structure changes — is called out inline where each section
+discusses it, generally as explicit task-list items or "Remaining"/"Next"
+notes. Do not treat an absence of dated follow-up evidence for a task-list
+item as confirmation that it shipped.
+
 ## Why add write benchmarks
 
 Yes. We should add benchmarks for on-disk full-text segment creation, merge, and compaction, plus disk LSM write behavior with explicit timings and write-amplification metrics.

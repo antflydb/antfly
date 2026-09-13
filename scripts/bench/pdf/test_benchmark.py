@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import tempfile
 import unittest
@@ -7,7 +8,54 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import benchmark
-from benchmark import artifact_errors, coverage_ready, unit_text_hashes
+from benchmark import (
+    artifact_errors,
+    completed_log_offset,
+    coverage_ready,
+    unit_text_hashes,
+)
+
+
+class LogCheckpointTests(unittest.TestCase):
+    def test_checkpoint_retains_partial_records_for_later_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            for complete, partial in (
+                (b"", b""),
+                (b"", b"partial"),
+                (b"complete\n", b""),
+                ("diagnostic café\r\n".encode(), b"partial \xc3"),
+                (b"complete\n", b"x" * 20000),
+            ):
+                with self.subTest(size=len(partial)):
+                    path.write_bytes(complete + partial)
+                    self.assertEqual(len(complete), completed_log_offset(path))
+                    with path.open("ab") as stream:
+                        stream.write(b"finished\n")
+                    self.assertEqual(path.stat().st_size, completed_log_offset(path))
+
+    def test_checkpoint_does_not_chase_concurrent_appends_or_read_unboundedly(self):
+        class AppendingLog(io.BytesIO):
+            max_read = 0
+
+            def read(self, size=-1):
+                self.max_read = max(self.max_read, size)
+                self.assert_bounded(size)
+                position = self.tell()
+                self.seek(0, 2)
+                self.write(b"later complete record\n")
+                self.seek(position)
+                return super().read(size)
+
+            @staticmethod
+            def assert_bounded(size):
+                if not 0 < size <= 8192:
+                    raise AssertionError(f"unbounded read: {size}")
+
+        log = AppendingLog(b"complete\n" + b"x" * 20000)
+        with patch.object(Path, "open", return_value=log):
+            self.assertEqual(len(b"complete\n"), completed_log_offset(Path("unused")))
+        self.assertEqual(8192, log.max_read)
 
 
 class CompletionTests(unittest.TestCase):

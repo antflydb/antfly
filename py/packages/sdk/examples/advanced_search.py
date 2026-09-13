@@ -2,6 +2,7 @@
 """Advanced search examples for Antfly SDK."""
 
 from typing import cast
+
 from antfly import AntflyClient
 from antfly.client_generated.models.query_hits_total import QueryHitsTotal
 from antfly.client_generated.models.query_hits_total_relation import QueryHitsTotalRelation

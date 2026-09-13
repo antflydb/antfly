@@ -22,12 +22,49 @@ const Allocator = std.mem.Allocator;
 /// defers the next embed batch while it is non-zero so interactive embeds
 /// get the embedder first. Lives here so the embed loop has no dependency
 /// on HTTP wiring.
-pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_embed_inflight = InteractiveCounter{ .kind = 0 };
 
 /// Process-wide count of interactive generation requests. Background asset
 /// producers (including GLiNER extraction) yield between batches while this is
 /// non-zero so long-running backfills do not contend with user-facing answers.
-pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+pub const interactive_generate_inflight = InteractiveCounter{ .kind = 1 };
+
+var local_interactive_counters = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+
+const InteractiveCounter = struct {
+    kind: u32,
+
+    pub fn fetchAdd(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, @intCast(value));
+        return local_interactive_counters[self.kind].fetchAdd(value, order);
+    }
+
+    pub fn fetchSub(self: @This(), value: u32, comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, -@as(i32, @intCast(value)));
+        return local_interactive_counters[self.kind].fetchSub(value, order);
+    }
+
+    pub fn load(self: @This(), comptime order: std.builtin.AtomicOrder) u32 {
+        if (comptime @import("storage_source_options").control_only)
+            return @import("kernel_owner_abi").antfly_storage_interactive_activity(self.kind, 0);
+        return local_interactive_counters[self.kind].load(order);
+    }
+};
+
+/// Called only by the physical storage archive. Returns the previous count.
+/// One call surrounds an interactive inference operation, never a record loop.
+pub fn interactiveActivity(kind: u32, delta: i32) callconv(.c) u32 {
+    std.debug.assert(kind < local_interactive_counters.len);
+    const counter = &local_interactive_counters[kind];
+    if (delta == 0) return counter.load(.monotonic);
+    if (delta > 0) return counter.fetchAdd(@intCast(delta), .monotonic);
+    const amount: u32 = @intCast(-@as(i64, delta));
+    const previous = counter.fetchSub(amount, .monotonic);
+    std.debug.assert(previous >= amount);
+    return previous;
+}
 
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,
@@ -140,6 +177,13 @@ pub const GeneratedEnrichmentRequest = struct {
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     execution_json: []const u8 = "",
+    /// Upstream materialized asset for a chunk-backed request, pinned with the
+    /// same catalog generation as the rest of the plan.
+    upstream_artifact_name: []const u8 = "",
+    /// Immutable, request-owned projection of the index catalog. Provider and
+    /// chunking work consumes these names without borrowing live IndexManager
+    /// arrays after the write-plan generation fence is released.
+    consumer_indexes: [][]u8 = &.{},
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
@@ -171,6 +215,9 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
+    if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
+    for (request.consumer_indexes) |name| alloc.free(name);
+    if (request.consumer_indexes.len > 0) alloc.free(request.consumer_indexes);
 }
 
 pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentRequest) !GeneratedEnrichmentRequest {
@@ -193,6 +240,19 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
+    errdefer if (execution_json.len > 0) alloc.free(execution_json);
+    const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
+    errdefer if (upstream_artifact_name.len > 0) alloc.free(upstream_artifact_name);
+    const consumer_indexes = try alloc.alloc([]u8, request.consumer_indexes.len);
+    var consumer_indexes_initialized: usize = 0;
+    errdefer {
+        for (consumer_indexes[0..consumer_indexes_initialized]) |name| alloc.free(name);
+        if (consumer_indexes.len > 0) alloc.free(consumer_indexes);
+    }
+    for (request.consumer_indexes, 0..) |name, i| {
+        consumer_indexes[i] = try alloc.dupe(u8, name);
+        consumer_indexes_initialized += 1;
+    }
     return .{
         .kind = request.kind,
         .index_name = index_name,
@@ -212,13 +272,15 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .content_type = content_type,
         .producer_json = producer_json,
         .execution_json = execution_json,
+        .upstream_artifact_name = upstream_artifact_name,
+        .consumer_indexes = consumer_indexes,
         .sequence = request.sequence,
     };
 }
 
 pub fn deinitGeneratedRequests(alloc: Allocator, requests: []const GeneratedEnrichmentRequest) void {
     for (requests) |request| freeGeneratedRequest(alloc, request);
-    alloc.free(requests);
+    if (requests.len > 0) alloc.free(requests);
 }
 
 pub fn freeGeneratedRef(alloc: Allocator, request: GeneratedEnrichmentRef) void {

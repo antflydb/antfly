@@ -29,6 +29,7 @@ pub const RoutedStateMachine = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
+                .is_apply_retryable = isApplyRetryable,
                 .retire_group = retireGroup,
             },
         };
@@ -74,6 +75,15 @@ pub const RoutedStateMachine = struct {
                 try observer.onReadStates(group_id, read_states);
             }
         }
+    }
+
+    fn isApplyRetryable(ptr: *anyopaque, group_id: u64, err: anyerror) bool {
+        const self: *RoutedStateMachine = @ptrCast(@alignCast(ptr));
+        const target = if (self.metadata_group_id != null and group_id == self.metadata_group_id.?)
+            self.metadata_state_machine
+        else
+            self.data_state_machine;
+        return target.isApplyRetryable(group_id, err);
     }
 
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {

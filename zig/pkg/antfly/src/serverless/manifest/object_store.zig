@@ -28,6 +28,7 @@ pub const ObjectStore = struct {
     alloc: std.mem.Allocator,
     opened: object_store_support.OpenedObjectStore,
     clock: platform_clock.Clock,
+    write_version: u16 = manifest_codec.wire_version,
 
     pub fn initRemoteUri(alloc: std.mem.Allocator, uri: []const u8) !ObjectStore {
         return try initRemoteUriWithS3Options(alloc, uri, null);
@@ -90,10 +91,17 @@ pub const ObjectStore = struct {
         };
     }
 
+    pub fn setWriteVersion(self: *ObjectStore, write_version: u16) !void {
+        if (write_version != manifest_codec.wire_version) {
+            return error.UnsupportedManifestWriteVersion;
+        }
+        self.write_version = write_version;
+    }
+
     pub fn put(self: *ObjectStore, manifest: manifest_types.Manifest) !void {
         const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, manifest.namespace, manifest.version);
         defer self.alloc.free(key);
-        const encoded = try manifest_codec.encodeAlloc(self.alloc, manifest);
+        const encoded = try manifest_codec.encodeForVersionAlloc(self.alloc, manifest, self.write_version);
         defer self.alloc.free(encoded);
 
         if (try self.tryGetEncoded(self.alloc, key)) |existing| {
@@ -125,59 +133,44 @@ pub const ObjectStore = struct {
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
         const key = try manifestKeyAlloc(alloc, self.opened.prefix, namespace, version);
         defer alloc.free(key);
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
+        var client = self.opened.client;
+        client.allocator = alloc;
+        var result = try client.getObject(self.opened.bucket, key, .{});
         defer result.deinit(alloc);
         return try manifest_codec.decodeAlloc(alloc, result.body);
     }
 
+    fn borrowedProgress(self: *ObjectStore) @import("../catalog/object_progress_store.zig").ObjectProgressStore {
+        return .{ .alloc = self.alloc, .client = self.opened.client, .bucket = self.opened.bucket, .prefix = self.opened.prefix, .owns_client = false };
+    }
+
     pub fn setHead(self: *ObjectStore, namespace: []const u8, version: u64) !void {
-        const key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(key);
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
-        defer self.alloc.free(payload);
-        var result = try self.opened.client.putObject(self.opened.bucket, key, payload, .{ .content_type = "text/plain" });
-        defer result.deinit(self.alloc);
+        var progress = self.borrowedProgress();
+        const current = progress.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (!try progress.compareAndSwapHead(namespace, current, version)) return error.HeadChanged;
     }
 
     pub fn getHead(self: *ObjectStore, namespace: []const u8) !u64 {
-        const key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(key);
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
-        defer result.deinit(self.alloc);
-        return try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10);
+        var progress = self.borrowedProgress();
+        return progress.getHead(namespace);
     }
 
     pub fn compareAndSwapHead(self: *ObjectStore, namespace: []const u8, expected: ?u64, version: u64) !bool {
         const manifest_key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
         defer self.alloc.free(manifest_key);
-        var meta = self.opened.client.statObject(self.opened.bucket, manifest_key) catch return error.ManifestVersionNotFound;
+        var meta = self.opened.client.statObject(self.opened.bucket, manifest_key) catch |err| switch (err) {
+            error.FileNotFound => return error.ManifestVersionNotFound,
+            else => return err,
+        };
         defer meta.deinit(self.alloc);
-
-        const head_key = try headKeyAlloc(self.alloc, self.opened.prefix, namespace);
-        defer self.alloc.free(head_key);
-
-        const current = self.tryReadHead(self.alloc, head_key) catch |err| switch (err) {
-            error.FileNotFound => null,
-            error.PreconditionFailed => return false,
+        var progress = self.borrowedProgress();
+        return progress.compareAndSwapHead(namespace, expected, version) catch |err| switch (err) {
+            error.PreconditionFailed => false,
             else => return err,
         };
-        defer if (current) |*value| self.alloc.free(value.etag);
-
-        if ((if (current) |value| value.version else null) != expected) return false;
-
-        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
-        defer self.alloc.free(payload);
-
-        var result = self.opened.client.putObject(self.opened.bucket, head_key, payload, .{
-            .content_type = "text/plain",
-            .if_none_match = current == null,
-            .if_match_etag = if (current) |value| value.etag else null,
-        }) catch |err| switch (err) {
-            error.PreconditionFailed => return false,
-            else => return err,
-        };
-        defer result.deinit(self.alloc);
-        return true;
     }
 
     pub fn listVersionsAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8) ![]u64 {
@@ -186,6 +179,8 @@ pub const ObjectStore = struct {
 
     fn listVersionsAllocWithPageSize(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, page_size: u32) ![]u64 {
         if (page_size == 0) return error.InvalidPageSize;
+        var client = self.opened.client;
+        client.allocator = alloc;
         const prefix = try manifestsPrefixAlloc(alloc, self.opened.prefix, namespace);
         defer alloc.free(prefix);
 
@@ -194,7 +189,7 @@ pub const ObjectStore = struct {
         var continuation_token: ?[]u8 = null;
         defer if (continuation_token) |token| alloc.free(token);
         while (true) {
-            var listed = try self.opened.client.listObjects(self.opened.bucket, .{
+            var listed = try client.listObjects(self.opened.bucket, .{
                 .prefix = prefix,
                 .recursive = true,
                 .max_keys = page_size,
@@ -232,30 +227,31 @@ pub const ObjectStore = struct {
         try self.opened.client.deleteObject(self.opened.bucket, key, .{});
     }
 
-    const HeadValue = struct {
-        version: u64,
-        etag: []u8,
-    };
-
-    fn tryReadHead(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !HeadValue {
-        var result = try self.opened.client.getObject(self.opened.bucket, key, .{});
-        defer result.deinit(alloc);
-        if (result.metadata.etag) |etag| {
-            return .{
-                .version = try std.fmt.parseInt(u64, std.mem.trim(u8, result.body, " \t\r\n"), 10),
-                .etag = try alloc.dupe(u8, etag),
-            };
-        }
-
-        var metadata = try self.opened.client.statObject(self.opened.bucket, key);
-        defer metadata.deinit(alloc);
-        const stat_etag = metadata.etag orelse return error.MissingObjectEtag;
-        var verified = try self.opened.client.getObject(self.opened.bucket, key, .{ .if_match_etag = stat_etag });
-        defer verified.deinit(alloc);
-        return .{
-            .version = try std.fmt.parseInt(u64, std.mem.trim(u8, verified.body, " \t\r\n"), 10),
-            .etag = try alloc.dupe(u8, stat_etag),
+    pub fn deleteRetiredCandidate(self: *ObjectStore, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        if (cutoff == 0) return error.InvalidPublicationFence;
+        const key = try manifestKeyAlloc(self.alloc, self.opened.prefix, namespace, version);
+        defer self.alloc.free(key);
+        var object = self.opened.client.getObject(self.opened.bucket, key, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
         };
+        defer object.deinit(self.opened.client.allocator);
+        var current = try manifest_codec.decodeAlloc(self.alloc, object.body);
+        defer current.deinit(self.alloc);
+        if (current.publication_fencing_token == 0 or current.publication_fencing_token >= cutoff) return false;
+        // Do not substitute a separate HEAD/STAT identity: recreation between
+        // GET and STAT could pair old authority with the new object's ETag.
+        const etag = object.metadata.etag orelse return error.ConditionalManifestDeletionUnsupported;
+        const head = self.getHead(namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (head == version) return error.CannotDeleteHead;
+        self.opened.client.deleteObject(self.opened.bucket, key, .{ .if_match_etag = etag }) catch |err| switch (err) {
+            error.FileNotFound, error.PreconditionFailed => return false,
+            else => return err,
+        };
+        return true;
     }
 
     fn tryGetEncoded(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -290,6 +286,7 @@ pub const ObjectStore = struct {
         .compare_and_swap_head = erasedCompareAndSwapHead,
         .list_versions_alloc = erasedListVersionsAlloc,
         .delete_version = erasedDeleteVersion,
+        .delete_retired_candidate = erasedDeleteRetiredCandidate,
     };
 
     fn erasedDeinit(_: std.mem.Allocator, ptr: *anyopaque) void {
@@ -331,6 +328,11 @@ pub const ObjectStore = struct {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         try self.deleteVersion(namespace, version);
     }
+
+    fn erasedDeleteRetiredCandidate(ptr: *anyopaque, namespace: []const u8, version: u64, cutoff: u64) !bool {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.deleteRetiredCandidate(namespace, version, cutoff);
+    }
 };
 
 fn manifestsPrefixAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
@@ -341,11 +343,6 @@ fn manifestsPrefixAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace:
 fn manifestKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8, version: u64) ![]u8 {
     if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/manifests/{d}.bin", .{ namespace, version });
     return try std.fmt.allocPrint(alloc, "{s}/{s}/manifests/{d}.bin", .{ prefix, namespace, version });
-}
-
-fn headKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const u8) ![]u8 {
-    if (prefix.len == 0) return try std.fmt.allocPrint(alloc, "{s}/HEAD", .{namespace});
-    return try std.fmt.allocPrint(alloc, "{s}/{s}/HEAD", .{ prefix, namespace });
 }
 
 fn parseVersionFromManifestKey(key: []const u8) !u64 {
@@ -362,6 +359,7 @@ const ConditionalCreateRaceClient = struct {
     hidden_reads_after_publish: usize = 0,
     omit_get_etag: bool = false,
     omit_stat_etag: bool = false,
+    replacement_on_delete: ?[]const u8 = null,
 
     fn client(self: *@This()) object_storage.ObjectStorage {
         return .{
@@ -451,6 +449,12 @@ const ConditionalCreateRaceClient = struct {
     fn deleteObject(ptr: *anyopaque, bucket: []const u8, key: []const u8, opts: object_storage.DeleteOptions) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var client_impl = self.backingClient(std.testing.allocator);
+        if (self.replacement_on_delete) |body| {
+            self.replacement_on_delete = null;
+            try client_impl.deleteObject(bucket, key, .{});
+            var replacement = try client_impl.putObject(bucket, key, body, .{ .if_none_match = true });
+            replacement.deinit(std.testing.allocator);
+        }
         try client_impl.deleteObject(bucket, key, opts);
     }
 
@@ -509,6 +513,46 @@ test "objectstore-backed manifest store supports publish and list" {
     const versions = try impl.listVersionsAllocWithPageSize(std.testing.allocator, "docs", 2);
     defer std.testing.allocator.free(versions);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, versions);
+}
+
+test "serverless object manifest candidate deletion protects recreated bootstrap and normal versions" {
+    var backing = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+    defer backing.deinit();
+    var impl = try ObjectStore.initWithClient(std.testing.allocator, backing.client(), "manifests", "");
+    defer impl.deinit();
+    var store = impl.manifestStore();
+    try manifest_store.testRetiredCandidateRecreation(&store);
+}
+
+test "serverless object manifest candidate recreation between GET and DELETE is identity fenced" {
+    const alloc = std.testing.allocator;
+    var backing = object_storage.MemoryObjectStorage.init(alloc);
+    defer backing.deinit();
+    var adapter: ConditionalCreateRaceClient = .{ .backing = &backing, .winner_body = "", .injected = true };
+    var store = try ObjectStore.initWithClient(alloc, adapter.client(), "manifests", "");
+    defer store.deinit();
+    var candidate: manifest_types.Manifest = .{
+        .namespace = @constCast("docs"),
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 0,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = @constCast(&.{}),
+        .publication_fencing_token = 1,
+    };
+    try store.put(candidate);
+    candidate.publication_fencing_token = 3;
+    const replacement = try manifest_codec.encodeAlloc(alloc, candidate);
+    defer alloc.free(replacement);
+    adapter.replacement_on_delete = replacement;
+    try std.testing.expect(!try store.deleteRetiredCandidate("docs", 1, 2));
+    try std.testing.expect(adapter.replacement_on_delete == null);
+    var current = try store.getAlloc(alloc, "docs", 1);
+    defer current.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), current.publication_fencing_token);
+    adapter.omit_get_etag = true;
+    try std.testing.expectError(error.ConditionalManifestDeletionUnsupported, store.deleteRetiredCandidate("docs", 1, 4));
 }
 
 test "manifest head CAS verifies a stat ETag when GET omits it" {

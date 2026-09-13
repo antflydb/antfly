@@ -229,6 +229,24 @@ pub fn rebalanceLeafAfterDelete(self: anytype, txn: anytype, db_state: anytype, 
     return false;
 }
 
+fn leafEntriesFit(self: anytype, txn: anytype, pgno: format.Pgno, entries: []const SerializedLeafEntry) Error!bool {
+    _ = mutate_leaf.pageFillPermille(self.arena.allocator(), try txn.pageSize(), pgno, entries) catch |err| {
+        if (err == error.MapFull) return false;
+        return err;
+    };
+    return true;
+}
+
+fn retainUnderfilledLeaf(self: anytype, txn: anytype, path: anytype, old_first_key: []const u8, entries: []SerializedLeafEntry) Error!bool {
+    // The occupancy target is a heuristic, not a B-tree invariant. If a wide
+    // sibling cannot donate/merge, keep the nonempty leaf locally instead of
+    // rebuilding the entire database just to remove one key.
+    if (!try self.canPropagateFirstKeyChange(path.parents, txn, old_first_key, entries[0].key)) return false;
+    try self.writeLeafEntriesToPgno(txn, path.leaf_pgno, entries);
+    try self.applyFirstKeyChange(path.parents, txn, old_first_key, entries[0].key);
+    return true;
+}
+
 fn rebalanceLeafWithLeftSibling(self: anytype, txn: anytype, db_state: anytype, path: anytype, old_first_key: []const u8, entries: []SerializedLeafEntry, parent_entries: []BranchPageEntry, old_parent_subtree_first_key: []const u8) Error!bool {
     const step = path.parents[path.parents.len - 1];
     const left_index = step.child_index - 1;
@@ -246,6 +264,10 @@ fn rebalanceLeafWithLeftSibling(self: anytype, txn: anytype, db_state: anytype, 
         try borrowed_entries.append(self.arena.allocator(), donated);
         for (entries) |entry| try borrowed_entries.append(self.arena.allocator(), entry);
 
+        // Occupancy is not a capacity proof for variable-width entries. Decide
+        // whether to redistribute before modifying either sibling.
+        if (!try leafEntriesFit(self, txn, path.leaf_pgno, borrowed_entries.items)) return retainUnderfilledLeaf(self, txn, path, old_first_key, entries);
+        if (!try self.canPropagateFirstKeyChange(path.parents, txn, old_first_key, borrowed_entries.items[0].key)) return false;
         try self.writeLeafEntriesToPgno(txn, left_pgno, left_entries);
         try self.writeLeafEntriesToPgno(txn, path.leaf_pgno, borrowed_entries.items);
         try self.applyFirstKeyChange(path.parents, txn, old_first_key, borrowed_entries.items[0].key);
@@ -256,6 +278,7 @@ fn rebalanceLeafWithLeftSibling(self: anytype, txn: anytype, db_state: anytype, 
     for (left_entries) |entry| try merged.append(self.arena.allocator(), entry);
     for (entries) |entry| try merged.append(self.arena.allocator(), entry);
 
+    if (!try leafEntriesFit(self, txn, left_pgno, merged.items)) return retainUnderfilledLeaf(self, txn, path, old_first_key, entries);
     try self.writeLeafEntriesToPgno(txn, left_pgno, merged.items);
     const remaining_parent = try rebalance_branch.removeChild(self.arena.allocator(), parent_entries, step.child_index);
     try self.writeBranchEntriesToPgno(txn, step.pgno, remaining_parent);
@@ -283,6 +306,7 @@ fn rebalanceLeafWithRightSibling(self: anytype, txn: anytype, db_state: anytype,
         for (entries) |entry| try borrowed_entries.append(self.arena.allocator(), entry);
         try borrowed_entries.append(self.arena.allocator(), donated);
 
+        if (!try leafEntriesFit(self, txn, path.leaf_pgno, borrowed_entries.items)) return retainUnderfilledLeaf(self, txn, path, old_first_key, entries);
         if (path.parents.len > 1 and !try self.canPropagateFirstKeyChange(
             path.parents[0 .. path.parents.len - 1],
             txn,
@@ -307,6 +331,7 @@ fn rebalanceLeafWithRightSibling(self: anytype, txn: anytype, db_state: anytype,
     for (entries) |entry| try merged.append(self.arena.allocator(), entry);
     for (right_entries) |entry| try merged.append(self.arena.allocator(), entry);
 
+    if (!try leafEntriesFit(self, txn, path.leaf_pgno, merged.items)) return retainUnderfilledLeaf(self, txn, path, old_first_key, entries);
     if (path.parents.len > 1 and !try self.canPropagateFirstKeyChange(
         path.parents[0 .. path.parents.len - 1],
         txn,

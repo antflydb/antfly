@@ -39,6 +39,7 @@ pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    writer_lock_marker: []const u8 = "",
     io: ?std.Io = null,
 };
 
@@ -87,6 +88,7 @@ pub const Store = struct {
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
             .resource_manager = opts.resource_manager,
+            .writer_lock_marker = opts.writer_lock_marker,
         };
         const file = if (opts.io) |io|
             try native.NativeFile.createWithIo(allocator, io, path, native_opts)
@@ -137,6 +139,25 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         return try self.file.vacuumWithCancel(cancel);
+    }
+
+    /// Publishes an offline, fully finalized store generation while fencing
+    /// all live readers and writers. The prepared store remains valid only so
+    /// its retired descriptor can be closed by normal teardown.
+    pub fn replaceWithPreparedGeneration(self: *Store, prepared: *Store) !native.GenerationPublicationOutcome {
+        if (self == prepared) return error.InvalidArgument;
+        try self.reserveWriterSlot();
+        defer self.releaseWriterSlot();
+
+        const io = self.file.io_impl.io();
+        self.generation_lock.lockUncancelable(io);
+        defer self.generation_lock.unlock(io);
+
+        lockStore(self);
+        defer self.mutex.unlock();
+        lockStore(prepared);
+        defer prepared.mutex.unlock();
+        return try self.file.replaceWithPreparedGeneration(&prepared.file);
     }
 
     pub fn reserveWriterSlot(self: *Store) !void {

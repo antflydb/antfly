@@ -13,8 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const gliner2_boundary = @import("../gliner2_boundary.zig");
-const reranker = @import("../reranker.zig");
+const gliner2_boundary = @import("inference_internal").finetune.gliner2_boundary;
+const reranker = @import("inference_internal").finetune.reranker;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

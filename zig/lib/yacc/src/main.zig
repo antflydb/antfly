@@ -51,11 +51,20 @@ pub fn main(init: std.process.Init) !void {
     };
     defer init.gpa.free(generated);
 
+    // Publish the final source so checks and regeneration share one immutable output.
+    const terminated = try init.gpa.dupeZ(u8, generated);
+    defer init.gpa.free(terminated);
+    var tree = try std.zig.Ast.parse(init.gpa, terminated, .zig);
+    defer tree.deinit(init.gpa);
+    if (tree.errors.len != 0) return error.InvalidGeneratedZig;
+    const formatted = try tree.renderAlloc(init.gpa);
+    defer init.gpa.free(formatted);
+
     if (std.mem.lastIndexOfScalar(u8, output_path, '/')) |slash| {
         try std.Io.Dir.cwd().createDirPath(io, output_path[0..slash]);
     }
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = output_path,
-        .data = generated,
+        .data = formatted,
     });
 }

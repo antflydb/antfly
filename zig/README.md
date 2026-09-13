@@ -52,9 +52,9 @@ currently live under `pkg/inference/`.
 
 - Zig `0.16.0` or newer.
 - `uv` for Python e2e suites and repository helper scripts.
-- Optional native runtime dependencies for some inference features, such as MLX,
-  ONNX Runtime, FFmpeg, or platform GPU support. The build detects available
-  local support and exposes flags such as `-Dmlx=...`, `-Dmetal=...`, and
+- Optional native runtime dependencies for some inference features, such as
+  ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
+  support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
   `-Donnx=...`.
 
 ## Common Builds

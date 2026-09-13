@@ -22,6 +22,7 @@ import type {
   ChatStreamCallbacks,
   ClusterRestoreRequest,
   ClusterStatus,
+  CommittedMutationOutcome,
   ConnectionsResponse,
   CreatedIndex,
   CreateIndexRequest,
@@ -1099,7 +1100,10 @@ export class AntflyClient {
     /**
      * Create a new table
      */
-    create: async (tableName: string, config: CreateTableRequest = {}) => {
+    create: async (
+      tableName: string,
+      config: CreateTableRequest = {}
+    ): Promise<Table | CommittedMutationOutcome> => {
       for (const [indexName, indexConfig] of Object.entries(config.indexes ?? {})) {
         try {
           validateCreateIndexRequestRelationships(indexConfig);
@@ -1115,17 +1119,22 @@ export class AntflyClient {
       if (error) {
         throw indexMutationError("Failed to create table", error, response);
       }
+      if (!data) throw new Error("Failed to create table: unexpected empty response");
       return data;
     },
 
     /**
      * Drop a table
      */
-    drop: async (tableName: string) => {
-      const { error } = await this.client.DELETE("/db/v1/tables/{tableName}", {
+    drop: async (tableName: string): Promise<true | CommittedMutationOutcome> => {
+      const { data, error, response } = await this.client.DELETE("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
       if (error) throw new Error(`Failed to drop table: ${error.error}`);
+      if (response.status === 202) {
+        if (!data) throw new Error("Failed to drop table: unexpected empty pending response");
+        return data as CommittedMutationOutcome;
+      }
       return true;
     },
 
@@ -1134,7 +1143,7 @@ export class AntflyClient {
       tableName: string,
       config: TableSchema,
       options?: { expectedVersion?: number }
-    ): Promise<Table | undefined> => {
+    ): Promise<Table | CommittedMutationOutcome> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
@@ -1144,6 +1153,7 @@ export class AntflyClient {
             : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
+      if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
       return data;
     },
 
@@ -1152,7 +1162,7 @@ export class AntflyClient {
       tableName: string,
       patch: Record<string, unknown>,
       options?: { expectedVersion?: number }
-    ): Promise<Table | undefined> => {
+    ): Promise<Table | CommittedMutationOutcome> => {
       const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: patch,
@@ -1162,6 +1172,7 @@ export class AntflyClient {
             : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
+      if (!data) throw new Error("Failed to patch table schema: unexpected empty response");
       return data;
     },
 
@@ -1170,7 +1181,7 @@ export class AntflyClient {
       tableName: string,
       config: TableSchema,
       options?: { expectedVersion?: number }
-    ): Promise<Table | undefined> => {
+    ): Promise<Table | CommittedMutationOutcome> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
         params: { path: { tableName } },
         body: config,
@@ -1180,6 +1191,7 @@ export class AntflyClient {
             : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
+      if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
       return data;
     },
 

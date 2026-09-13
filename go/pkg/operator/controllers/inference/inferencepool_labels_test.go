@@ -74,7 +74,7 @@ func TestInferencePoolPodTemplateLabelsUpdateWhenPoolLabelsChange(t *testing.T) 
 		Spec: antflyaiv1alpha1.InferencePoolSpec{
 			WorkloadType: antflyaiv1alpha1.WorkloadTypeGeneral,
 			Models: antflyaiv1alpha1.ModelConfig{
-				Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model"}},
+				Preload:         []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"generate"}}},
 				LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 			},
 			Replicas: antflyaiv1alpha1.ReplicaConfig{

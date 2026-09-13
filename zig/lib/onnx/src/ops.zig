@@ -21,7 +21,7 @@
 const std = @import("std");
 const log = std.log.scoped(.onnx_ops);
 const ml = @import("ml");
-const proto = @import("proto.zig");
+const proto = @import("onnx_data").proto;
 const attrs_mod = @import("attrs.zig");
 const tensor_mod = @import("tensor.zig");
 

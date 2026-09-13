@@ -16,6 +16,24 @@
 
 const derived_types = @import("derived_types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
+const types = @import("../types.zig");
+const platform = @import("antfly_platform");
+
+/// Deadline and clock are one contract across manual and borrowed-Io workers.
+/// Never forward the absolute timestamp while discarding its clock domain.
+pub const VisibilityWait = struct {
+    cancellation: types.CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+    clock: ?platform.clock.Clock = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
+        if (self.deadline_ns) |deadline_ns| {
+            const now_ns = if (self.clock) |clock| clock.nowRealtimeNs() else platform.time.monotonicNs();
+            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
+        }
+    }
+};
 
 pub const RuntimeError = error{AsyncWorkerFailed};
 

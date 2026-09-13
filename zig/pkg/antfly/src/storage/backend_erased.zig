@@ -42,12 +42,22 @@ fn ParentBox(comptime T: type) type {
         child_count: usize = 0,
         owner_closed: bool = false,
         finalizing: bool = false,
+        parent_release: ?ParentRelease = null,
 
         fn retainChild(self: *@This()) !void {
             platform.sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             if (self.owner_closed or self.finalizing) return error.TransactionClosed;
             self.child_count += 1;
+        }
+
+        // A live fork can extend the immutable snapshot's lifetime after its
+        // original owner closes. Its own reference proves the anchor is live.
+        fn retainSnapshot(self: *@This()) !void {
+            platform.sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.finalizing or (self.owner_closed and self.child_count == 0)) return error.TransactionClosed;
+            self.child_count = try std.math.add(usize, self.child_count, 1);
         }
 
         fn requestAbort(self: *@This()) void {
@@ -95,8 +105,10 @@ fn ParentBox(comptime T: type) type {
 
         fn finalizeAbort(self: *@This()) void {
             const allocator = self.allocator;
+            const parent_release = self.parent_release;
             self.handle.abort();
             allocator.destroy(self);
+            if (parent_release) |parent| parent.release(parent.ptr);
         }
     };
 }
@@ -104,6 +116,7 @@ fn ParentBox(comptime T: type) type {
 const ParentRelease = struct {
     ptr: *anyopaque,
     release: *const fn (*anyopaque) void,
+    retain_snapshot: *const fn (*anyopaque) anyerror!void,
 };
 
 fn parentReleaseFor(parent: anytype) ParentRelease {
@@ -114,7 +127,13 @@ fn parentReleaseFor(parent: anytype) ParentRelease {
             typed.releaseChild();
         }
     }.run;
-    return .{ .ptr = parent, .release = release };
+    const retain_snapshot = struct {
+        fn run(ptr: *anyopaque) !void {
+            const typed: *Parent = @ptrCast(@alignCast(ptr));
+            try typed.retainSnapshot();
+        }
+    }.run;
+    return .{ .ptr = parent, .release = release, .retain_snapshot = retain_snapshot };
 }
 
 fn allocBox(allocator: Allocator, value: anytype) !*Box(@TypeOf(value)) {
@@ -207,6 +226,83 @@ pub const Cursor = struct {
     }
 };
 
+/// Values remain valid until close, independently of other scopes on the
+/// same immutable snapshot. A streaming consumer closes one scope per block.
+pub const ReadScope = struct {
+    allocator: Allocator,
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    const VTable = struct {
+        get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        close: *const fn (Allocator, *anyopaque) void,
+    };
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        return self.vtable.get(self.ptr, key);
+    }
+    /// Results share the scope lifetime, not the parent snapshot's lifetime.
+    pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
+        for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    pub fn close(self: *@This()) void {
+        self.vtable.close(self.allocator, self.ptr);
+        self.* = undefined;
+    }
+};
+
+pub fn readScopeFrom(alloc: Allocator, handle: anytype) !ReadScope {
+    return readScopeFromWithParent(alloc, handle, null);
+}
+
+fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRelease) !ReadScope {
+    const State = struct {
+        handle: @TypeOf(handle),
+        parent: ?ParentRelease,
+        fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.get(key);
+        }
+        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySorted(keys, values);
+        }
+        fn close(a: Allocator, ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.handle.close();
+            if (self.parent) |owner| owner.release(owner.ptr);
+            a.destroy(self);
+        }
+    };
+    const state = try alloc.create(State);
+    state.* = .{ .handle = handle, .parent = parent };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close } };
+}
+
+/// Portable fallback: cursor-owned storage pins are bounded; returned copies
+/// belong to this scope, never to the long-lived transaction.
+pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
+    const Scope = struct {
+        cursor: Cursor,
+        arena: std.heap.ArenaAllocator,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            const entry = (try self.cursor.seekAtOrAfter(key)) orelse return error.NotFound;
+            if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
+            return self.arena.allocator().dupe(u8, entry.value);
+        }
+        pub fn close(self: *@This()) void {
+            self.cursor.close();
+            self.arena.deinit();
+        }
+    };
+    return readScopeFrom(alloc, Scope{ .cursor = cursor, .arena = std.heap.ArenaAllocator.init(alloc) });
+}
+
 pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -217,6 +313,8 @@ pub const ReadTxn = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
+        open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
     };
 
     pub fn abort(self: *ReadTxn) void {
@@ -245,6 +343,24 @@ pub const ReadTxn = struct {
     pub fn openCursor(self: *ReadTxn) !Cursor {
         return try self.vtable.open_cursor(self.allocator, self.ptr);
     }
+
+    /// Owns the same immutable snapshot, with independent read/cursor scratch.
+    /// The original handle may be aborted before this handle or its cursors.
+    pub fn forkRead(self: *ReadTxn) !ReadTxn {
+        const fork = self.vtable.fork_read orelse return error.ReadSnapshotForkUnsupported;
+        return fork(self.allocator, self.ptr);
+    }
+
+    pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
+        return self.forkRead();
+    }
+
+    pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
+        if (self.vtable.open_read_scope) |open| return open(alloc, self.ptr);
+        var cursor = try self.openCursor();
+        errdefer cursor.close();
+        return cursorReadScope(alloc, cursor);
+    }
 };
 
 pub const ProbeTxn = struct {
@@ -253,8 +369,13 @@ pub const ProbeTxn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// One get_many_sorted call observes a single committed view. Separate
+        /// calls need not share a snapshot; generic per-key fallbacks cannot
+        /// claim this capability.
+        get_many_sorted_is_atomic: bool = false,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
     };
@@ -266,6 +387,12 @@ pub const ProbeTxn = struct {
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// May pin an immutable generation until abort. Prefer get for long-lived
+    /// probes; use this for a short-lived point projection.
+    pub fn getLeased(self: *ProbeTxn, key: []const u8) ![]const u8 {
+        return try (self.vtable.get_leased orelse self.vtable.get)(self.ptr, key);
     }
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -365,6 +492,7 @@ pub const WriteTxn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -378,12 +506,15 @@ pub const WriteTxn = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *WriteTxn) void {
+        const gate = self.write_gate;
         self.vtable.abort(self.allocator, self.ptr);
+        if (gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn commit(self: *WriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
@@ -483,6 +614,7 @@ pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -494,20 +626,37 @@ pub const Batch = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
+        contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
     };
 
     pub fn abort(self: *Batch) void {
+        const gate = self.write_gate;
         self.vtable.abort(self.allocator, self.ptr);
+        if (gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn commit(self: *Batch) !void {
         try self.vtable.commit(self.allocator, self.ptr);
+        if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// Return presence only. Native backends avoid retained value payloads and
+    /// share sorted-run/block probes; portable fallbacks preserve get semantics.
+    pub fn containsManySorted(self: *Batch, keys: []const []const u8, present: []bool) !void {
+        if (keys.len != present.len) return error.InvalidBatch;
+        for (keys, 0..) |key, i| if (i != 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        @memset(present, false);
+        if (self.vtable.contains_many_sorted) |contains| return contains(self.ptr, keys, present);
+        for (keys, present) |key, *exists| exists.* = if (self.get(key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
     }
 
     pub fn getManySorted(self: *Batch, keys: []const []const u8, values: []?[]const u8) !void {
@@ -608,6 +757,10 @@ pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Opt-in transaction-wide serialization for read/modify/write users.
+    /// The backend owns this gate and must outlive all stores/transactions.
+    /// Reads and computation outside a write transaction remain concurrent.
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -698,16 +851,28 @@ pub const Store = struct {
     }
 
     pub fn beginWrite(self: *Store) !WriteTxn {
-        return try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var txn = try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
+        txn.write_gate = self.write_gate;
+        return txn;
     }
 
     pub fn beginBatch(self: *Store) !Batch {
-        return try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var batch = try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        batch.write_gate = self.write_gate;
+        return batch;
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Batch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            return try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
+            if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+            errdefer if (self.write_gate) |mutex| mutex.unlock();
+            var batch = try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
+            batch.write_gate = self.write_gate;
+            return batch;
         }
         return try self.beginBatch();
     }
@@ -1007,9 +1172,14 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
 }
 
 pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
+    return readTxnFromWithParent(allocator, handle, null);
+}
+
+fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: ?ParentRelease) anyerror!ReadTxn {
     const Handle = @TypeOf(handle);
     const wrapper_box_allocator = wrapperBoxAllocator(allocator);
     const box_ptr = try allocParentBox(wrapper_box_allocator, handle);
+    box_ptr.parent_release = parent_release;
 
     const vt = struct {
         fn unbox(ptr: *anyopaque) *ParentBox(Handle) {
@@ -1045,6 +1215,30 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        fn forkRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            defer parent.releaseChild();
+            // Forks pin the original immutable owner, never their immediate
+            // scratch handle. Repeated fork/close therefore retains constant
+            // ownership depth and cannot recurse through an unbounded chain.
+            const anchor = parent.parent_release orelse parentReleaseFor(parent);
+            try anchor.retain_snapshot(anchor.ptr);
+            errdefer anchor.release(anchor.ptr);
+            var forked = try parent.handle.forkBorrowedRead();
+            errdefer forked.abort();
+            return readTxnFromWithParent(alloc, forked, anchor);
+        }
+
+        fn openReadScope(alloc: Allocator, ptr: *anyopaque) anyerror!ReadScope {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var scope = try parent.handle.openReadScope(alloc);
+            errdefer scope.close();
+            return readScopeFromWithParent(alloc, scope, parentReleaseFor(parent));
+        }
     };
 
     return .{
@@ -1055,6 +1249,8 @@ pub fn readTxnFrom(allocator: Allocator, handle: anytype) !ReadTxn {
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .open_cursor = vt.openCursor,
+            .fork_read = if (@hasDecl(Handle, "forkBorrowedRead")) vt.forkRead else null,
+            .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
         },
     };
 }
@@ -1077,6 +1273,11 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         }
 
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            return try unbox(ptr).handle.get(key);
+        }
+
+        fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            if (@hasDecl(Handle, "getLeased")) return try unbox(ptr).handle.getLeased(key);
             return try unbox(ptr).handle.get(key);
         }
 
@@ -1110,8 +1311,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
         .vtable = &.{
+            .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
             .get = vt.get,
+            .get_leased = vt.getLeased,
             .get_many_sorted = vt.getManySorted,
             .get_many_sorted_with_block_cache_admission = vt.getManySortedWithBlockCacheAdmission,
         },
@@ -1369,6 +1572,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn containsManySorted(ptr: *anyopaque, keys: []const []const u8, present: []bool) anyerror!void {
+            return unbox(ptr).handle.containsManySorted(keys, present);
+        }
+
         fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
@@ -1423,6 +1630,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
+            .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
         },
     };
 }
@@ -1945,6 +2153,7 @@ test "runtime store erases concrete single-namespace store handles" {
     };
 
     const MockStore = struct {
+        fail_open: *bool,
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{ .cursors = true };
         }
@@ -1953,18 +2162,23 @@ test "runtime store erases concrete single-namespace store handles" {
             return .{};
         }
 
-        pub fn beginWrite(_: *@This()) !MockWrite {
+        pub fn beginWrite(self: *@This()) !MockWrite {
+            if (self.fail_open.*) return error.OpenFailed;
             return .{};
         }
 
-        pub fn beginBatch(_: *@This()) !MockBatch {
+        pub fn beginBatch(self: *@This()) !MockBatch {
+            if (self.fail_open.*) return error.OpenFailed;
             return .{};
         }
     };
 
-    const mock = MockStore{};
+    var fail_open = false;
+    const mock = MockStore{ .fail_open = &fail_open };
     var store = try storeFrom(std.testing.allocator, mock);
     defer store.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &gate;
     try std.testing.expect(store.capabilities().cursors);
 
     var read = try store.beginRead();
@@ -1985,14 +2199,35 @@ test "runtime store erases concrete single-namespace store handles" {
     try std.testing.expectEqualStrings("a", (try current_scan_cur.first()).?.key);
 
     var write = try store.beginWrite();
+    try std.testing.expect(!gate.tryLock());
     try write.put("k", "w");
     try std.testing.expectEqualStrings("w", try write.get("k"));
     try write.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 
     var batch = try store.beginBatch();
+    try std.testing.expect(!gate.tryLock());
     try batch.put("k", "b");
     try std.testing.expectEqualStrings("b", try batch.get("k"));
     try batch.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    batch = try store.beginBatchWithOptions(.{});
+    try std.testing.expect(!gate.tryLock());
+    batch.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    fail_open = true;
+    try std.testing.expectError(error.OpenFailed, store.beginWrite());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expectError(error.OpenFailed, store.beginBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expectError(error.OpenFailed, store.beginBatchWithOptions(.{}));
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }
 
 test "failed commit keeps erased write handle abortable" {
@@ -2045,9 +2280,25 @@ test "failed commit keeps erased write handle abortable" {
 
     var shared = Shared{};
     var txn = try writeTxnFrom(std.testing.allocator, MockWrite{ .shared = &shared });
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    txn.write_gate = &gate;
     try std.testing.expectError(error.CommitFailed, txn.commit());
+    try std.testing.expect(!gate.tryLock());
     txn.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expectEqual(@as(usize, 1), shared.commits);
+    try std.testing.expect(shared.aborted);
+    shared = .{};
+    var batch = try batchFrom(std.testing.allocator, MockWrite{ .shared = &shared });
+    try std.testing.expect(gate.tryLock());
+    batch.write_gate = &gate;
+    try std.testing.expectError(error.CommitFailed, batch.commit());
+    try std.testing.expect(!gate.tryLock());
+    batch.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expect(shared.aborted);
 }
 
@@ -2246,6 +2497,80 @@ test "runtime namespace store forwards batch options" {
     try std.testing.expectEqual(backend_types.BatchMode.bulk_ingest, shared.last_mode);
 }
 
+test "graph maintenance erased read forks flatten snapshot ownership and retain cursors" {
+    const Shared = struct { live: usize = 1, owner_aborts: usize = 0 };
+    const MockCursor = struct {
+        shared: *Shared,
+        pub fn close(_: *@This()) void {}
+        pub fn first(self: *@This()) !?Entry {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            return .{ .key = "key", .value = "snapshot" };
+        }
+        pub fn last(self: *@This()) !?Entry {
+            return self.first();
+        }
+        pub fn next(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn prev(_: *@This()) !?Entry {
+            return null;
+        }
+        pub fn seekAtOrAfter(self: *@This(), _: []const u8) !?Entry {
+            return self.first();
+        }
+        pub fn seekAtOrBefore(self: *@This(), _: []const u8) !?Entry {
+            return self.first();
+        }
+    };
+    const MockRead = struct {
+        shared: *Shared,
+        owner: bool = true,
+        pub fn forkBorrowedRead(self: *@This()) !@This() {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            self.shared.live += 1;
+            return .{ .shared = self.shared, .owner = false };
+        }
+        pub fn abort(self: *@This()) void {
+            self.shared.live -= 1;
+            if (self.owner) self.shared.owner_aborts += 1;
+        }
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            if (self.shared.owner_aborts != 0) return error.TransactionClosed;
+            return "snapshot";
+        }
+        pub fn openCursor(self: *@This()) !MockCursor {
+            return .{ .shared = self.shared };
+        }
+    };
+    const Run = struct {
+        fn run(a: Allocator, iterations: usize) !void {
+            var shared: Shared = .{};
+            var read = try readTxnFrom(a, MockRead{ .shared = &shared });
+            var read_open = true;
+            defer if (read_open) read.abort();
+            var retained: ?Cursor = null;
+            defer if (retained) |*cursor| cursor.close();
+            for (0..iterations) |i| {
+                const next = try read.forkRead();
+                read.abort();
+                read = next;
+                if (i == 1) retained = try read.openCursor();
+                try std.testing.expect(shared.live <= 3);
+                try std.testing.expectEqualStrings("snapshot", try read.get("key"));
+            }
+            read.abort();
+            read_open = false;
+            try std.testing.expectEqualStrings("snapshot", (try retained.?.first()).?.value);
+            retained.?.close();
+            retained = null;
+            try std.testing.expectEqual(@as(usize, 0), shared.live);
+            try std.testing.expectEqual(@as(usize, 1), shared.owner_aborts);
+        }
+    };
+    try Run.run(std.testing.allocator, 100_000);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{@as(usize, 8)});
+}
+
 test "erased cursor retains read transaction until cursor close" {
     const Shared = struct {
         aborted: bool = false,
@@ -2270,8 +2595,8 @@ test "erased cursor retains read transaction until cursor close" {
         pub fn prev(_: *@This()) !?Entry {
             return null;
         }
-        pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
-            return null;
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+            return if (std.mem.eql(u8, key, "key")) self.first() else null;
         }
         pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?Entry {
             return null;
@@ -2299,6 +2624,20 @@ test "erased cursor retains read transaction until cursor close" {
     try std.testing.expect(!shared.aborted);
     try std.testing.expectEqualStrings("key", (try cursor.first()).?.key);
     cursor.close();
+    try std.testing.expect(shared.cursor_closed);
+    try std.testing.expect(shared.aborted);
+
+    // Backends without a native scope use bounded cursor-owned copies while
+    // retaining the same parent snapshot, including after owner abort.
+    shared = .{};
+    var scoped_txn = try readTxnFrom(std.testing.allocator, MockRead{ .shared = &shared });
+    var scope = try scoped_txn.openReadScope(std.testing.allocator);
+    scoped_txn.abort();
+    try std.testing.expect(!shared.aborted);
+    const value = try scope.get("key");
+    try std.testing.expectError(error.NotFound, scope.get("missing"));
+    try std.testing.expectEqualStrings("value", value);
+    scope.close();
     try std.testing.expect(shared.cursor_closed);
     try std.testing.expect(shared.aborted);
 }

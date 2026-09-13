@@ -1,6 +1,11 @@
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import compare
 from compare import comparable_pair, summarize
 
 
@@ -53,6 +58,46 @@ def run(seconds=(10, 8, 6)):
             for i in range(len(seconds))
         ],
     }
+
+
+class OutputDirectoryTests(unittest.TestCase):
+    def test_comparison_writes_versioned_report_in_fresh_evidence_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "evidence"
+            binary = Path(__file__)
+            argv = [
+                "compare.py",
+                "--work-dir",
+                str(root),
+                "--circus-dir",
+                str(root),
+                "--output",
+                str(output),
+                "--name",
+                "test",
+                "--pairs",
+                "1",
+                "--main-binary",
+                str(binary),
+                "--main-revision",
+                "a" * 40,
+                "--pr-binary",
+                str(binary),
+                "--pr-revision",
+                "b" * 40,
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch.object(compare, "run_subject", side_effect=[run(), run()]),
+                patch("builtins.print"),
+            ):
+                self.assertEqual(0, compare.main())
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual("antfly.pdf.comparison.v1", summary["schema"])
+            self.assertTrue(summary["timing_comparable"])
+            with patch("sys.argv", argv), self.assertRaises(FileExistsError):
+                compare.main()
 
 
 class CompareTests(unittest.TestCase):

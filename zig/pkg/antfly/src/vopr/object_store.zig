@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Production serverless object-store protocols over the reusable scripted
 //! objectstore fault client. Fault selection belongs to VOPR; artifacts,
@@ -94,22 +105,25 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     defer artifacts.deinit();
 
     // A short provider write followed by timeout must not be mistaken for a
-    // published content-addressed artifact. Retrying replaces it with the full
-    // immutable body, so checksum-derived identity and bytes agree.
+    // published content-addressed artifact. Immutable create-only writes must
+    // reject the corrupt occupant rather than overwrite an identity that a
+    // reader may already have pinned. A separate valid artifact exercises the
+    // remaining publication protocols.
     faults.partiallyCommitNextPut(3, error.Timeout);
     try std.testing.expectError(error.Timeout, artifacts.put("complete-artifact"));
-    var artifact = try artifacts.put("complete-artifact");
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, artifacts.put("complete-artifact"));
+    var artifact = try artifacts.put("valid-artifact");
     defer artifact.deinit(alloc);
     faults.failNextGet(error.Canceled);
     try std.testing.expectError(error.Canceled, artifacts.getAlloc(artifact.artifact_id));
     const artifact_bytes = try artifacts.getAlloc(artifact.artifact_id);
     defer alloc.free(artifact_bytes);
-    try std.testing.expectEqualStrings("complete-artifact", artifact_bytes);
+    try std.testing.expectEqualStrings("valid-artifact", artifact_bytes);
 
-    // Duplicate provider completion is harmless for an unconditional
-    // content-addressed artifact write.
+    // Duplicate provider completion is harmless for a create-only artifact
+    // write: an authenticated existing body satisfies the retry.
     faults.duplicateNextPut();
-    var duplicate = try artifacts.put("complete-artifact");
+    var duplicate = try artifacts.put("valid-artifact");
     defer duplicate.deinit(alloc);
     try std.testing.expectEqualStrings(artifact.artifact_id, duplicate.artifact_id);
 
@@ -176,9 +190,10 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     // A provider that omits an ETag must not turn the conditional append into
     // an unconditional whole-log replacement.
     faults.omitEtagFromNextGet();
+    var enrichment_operation_buffer: [128]u8 = undefined;
     try std.testing.expectError(
         error.MissingObjectEtag,
-        wal.appendIdempotentIfLatest("docs", 21, "derived", "enrich-v1/1/1/0/1", 1),
+        wal.appendIdempotentIfLatest("docs", 21, "derived", try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 1, 1, "doc-a", 1), 1),
     );
     try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
 
@@ -197,6 +212,10 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
     const first_progress = progress_store.EnrichmentStageProgress{
         .head_version = 1,
         .doc_offset = 1,
+        .revision = 1,
+        .pipeline_version = 1,
+        .after_order_key = "00000001a",
+        .cycle_upper_order_key = "00000001z",
     };
     try std.testing.expect(try progress.compareAndSwapEnrichmentStageProgress(
         "docs",
@@ -211,13 +230,12 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
             "docs",
             .lexical_sparse,
             first_progress,
-            .{ .head_version = 1, .doc_offset = 2 },
+            .{ .head_version = 1, .doc_offset = 2, .revision = 2, .pipeline_version = 1, .after_order_key = "00000001b", .cycle_upper_order_key = "00000001z" },
         ),
     );
-    try std.testing.expectEqual(
-        @as(?progress_store.EnrichmentStageProgress, first_progress),
-        try progress.getEnrichmentStageProgress("docs", .lexical_sparse),
-    );
+    var retained_progress = (try progress.getEnrichmentStageProgress("docs", .lexical_sparse)).?;
+    defer retained_progress.deinit(progress.allocator);
+    try std.testing.expect(first_progress.eql(retained_progress));
 
     faults.resetClientAfterCrash();
     try std.testing.expectEqual(@as(u64, 1), try manifests.getHead("docs"));
@@ -230,7 +248,7 @@ test "HA seed backup restore VOPR retries ambiguous publication and canceled dow
     const io = std.testing.io; // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
     var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
     defer tmp.cleanup();
-    try tmp.dir.makePath(io, "source");
+    try tmp.dir.createDirPath(io, "source");
     try tmp.dir.writeFile(io, .{ .sub_path = "source/table.sst", .data = "durable-table-state" });
 
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
@@ -375,13 +393,14 @@ test "serverless object store VOPR consumes stale enrichment generation without 
         .body = "{\"text\":\"stale-derived-overwrite\"}",
     });
     defer alloc.free(stale_mutation);
+    var enrichment_operation_buffer: [128]u8 = undefined;
     try std.testing.expectEqual(
         @as(?u64, 2),
         try wal.appendIdempotentIfLatest(
             "docs",
             101,
             stale_mutation,
-            "enrich-v1/1/1/0/1",
+            try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 1, 1, "doc-a", 1),
             1,
         ),
     );
@@ -430,7 +449,7 @@ test "serverless object store VOPR consumes stale enrichment generation without 
             "docs",
             102,
             stale_mutation,
-            "enrich-v1/2/1/0/1",
+            try @import("../serverless/enrichment/operation_id.zig").formatDocument(&enrichment_operation_buffer, 2, 1, "doc-a", 1),
             2,
         ),
     );
@@ -526,6 +545,16 @@ test "serverless object store VOPR enrichment conflict preserves pruning progres
     ));
     defer runtime.deinit();
 
+    // Completed builds leave shared source pins alive for bounded reader
+    // protection. This case exercises eventual collection after those rights
+    // have expired, not unsafe immediate deletion of their source versions.
+    const lease = @import("../serverless/manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn read(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.read };
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 1), stats.enrichment_conflicts);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_namespaces);

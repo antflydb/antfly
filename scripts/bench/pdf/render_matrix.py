@@ -39,6 +39,11 @@ def render_observations(log):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Fresh evidence directory; defaults to WORK_DIR/NAME",
+    )
     parser.add_argument("--circus-dir", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--revision", required=True)
@@ -69,7 +74,7 @@ def main():
     args.work_dir = args.work_dir.resolve(strict=True)
     args.circus_dir = args.circus_dir.resolve(strict=True)
     args.binary = args.binary.resolve(strict=True)
-    out = args.work_dir / args.name
+    out = args.output if args.output is not None else args.work_dir / args.name
     out.mkdir()
     save(
         out / "experiment.json",
@@ -97,7 +102,12 @@ def main():
             log = (args.work_dir / current[label]["name"] / "antfly.log").read_text()
             current[label]["render_observations"] = render_observations(log)
             save(out / f"round-{round_index:02d}.json", current)
-    report = {"baseline": "w1-p1", "profiled": args.profile, "configurations": {}}
+    report = {
+        "schema": "antfly.pdf.render_matrix.v1",
+        "baseline": "w1-p1",
+        "profiled": args.profile,
+        "configurations": {},
+    }
     for workers, prefetch in settings:
         label = f"w{workers}-p{prefetch}"
         pairs = [ablation_pair(r["w1-p1"], r[label]) for r in rounds]

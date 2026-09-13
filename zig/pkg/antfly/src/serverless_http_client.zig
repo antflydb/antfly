@@ -1056,7 +1056,7 @@ test "serverless http client round-trips serverless http server" {
 
     var query_head = try internal.queryHead("", "docs");
     defer query_head.deinit();
-    try std.testing.expectEqual(@as(usize, 3), query_head.value.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 5), query_head.value.artifacts.len);
     try std.testing.expectEqual(serverless.QueryView.published, query_head.value.view);
     try std.testing.expectEqual(@as(usize, 1), query_head.value.documents.len);
     try std.testing.expectEqualStrings("doc-a", query_head.value.documents[0].doc_id);
@@ -1675,7 +1675,7 @@ test "serverless http client round-trips over std http listener" {
 
     var query_head = try internal.queryHead(base_uri, "docs");
     defer query_head.deinit();
-    try std.testing.expectEqual(@as(usize, 3), query_head.value.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 5), query_head.value.artifacts.len);
     try std.testing.expectEqual(serverless.QueryView.published, query_head.value.view);
     try std.testing.expectEqual(@as(usize, 1), query_head.value.documents.len);
     try std.testing.expect(query_head.value.artifacts[0].byte_len > 0);
@@ -1902,7 +1902,7 @@ test "serverless http client round-trips semantic search with embedding_template
     try std.testing.expectEqualStrings(serverless.search_sources.default_sparse_embedding_index_name, query_head.value.materialized_search_sources.findSparse().?.index_name);
     try std.testing.expectEqualStrings(serverless.search_sources.default_chunk_preview_output_name, query_head.value.materialized_derived_outputs.findByKind(.chunk_preview).?.name);
     try std.testing.expectEqualStrings(serverless.search_sources.default_rerank_terms_output_name, query_head.value.materialized_derived_outputs.findByKind(.rerank_terms).?.name);
-    try std.testing.expectEqual(@as(usize, 5), query_head.value.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 7), query_head.value.artifacts.len);
     try std.testing.expectEqual(serverless.ArtifactKind.sparse_segment, query_head.value.artifacts[3].kind);
     try std.testing.expectEqualStrings(serverless.search_sources.default_sparse_embedding_index_name, query_head.value.artifacts[3].search_sources.findSparse().?.index_name);
     try std.testing.expect(query_head.value.artifacts[3].search_sources.findVector() == null);

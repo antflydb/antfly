@@ -35,6 +35,19 @@ on the hot metadata loop.
 
 Provisioning should reconcile from cached runtime state or durable summaries first, then enqueue background reconcile/open work when needed.
 
+## Implementation Status
+
+This is a mixed-progress document: the request-path and provisioning contracts
+above are enforced today, the "First Slice" and "Second Slice" work below has
+shipped, and most of "Long-Term Shape" is implemented (see "Startup Execution
+Order" for the current per-step state). The node-local runtime registry
+(`ShardRuntimeRegistry`/`ShardProvisioner` split, item 1-2 below) has not been
+built; runtime status today is served from the provisioned-cache warm path
+described in "Second Slice" rather than a dedicated registry. Cold-open
+latency work ("Open Performance Plan" onward) is partially done: instrumentation
+has shipped, parallel index load and cache warmup are in progress, and the
+replay-mode follow-through work is gated on further measurement.
+
 ## Long-Term Shape
 
 ### 1. Node-local runtime registry
@@ -87,9 +100,12 @@ Stale is acceptable. Invented freshness is not.
 
 ### 5. Explicit DB open modes
 
-`DB.open()` must stop smuggling writer-side recovery into read/status paths.
+`DB.open()` no longer smuggles writer-side recovery into read/status paths:
+`.query_readonly` and `.status_only` open modes exist and skip
+`replayPendingDerivedBatches()` (this is "Startup Execution Order" step 1,
+implemented).
 
-Long-term contract:
+Contract:
 
 - `DB.open(..., .query_readonly)`
   - mounts durable primary/index state
@@ -109,7 +125,8 @@ Read/status correctness then comes from explicit replay debt, not from forcing o
 
 ### 6. Replay debt must be durable and visible
 
-Per derived index we need durable watermarks/status such as:
+Per derived index there are durable watermarks/status such as (implemented,
+"Startup Execution Order" step 2):
 
 - `applied_sequence`
 - `pending_sequence` or equivalent derived target
@@ -235,7 +252,7 @@ Opt-in structured timing covers:
 - `IndexManager.load()` per-index open and backfill timings
 - derived catch-up collection and apply timings
 
-`bench/storage/open_bench.zig` makes those timings comparable across changes.
+`open_bench` (built with `zig build antfly-storage-bench`) makes those timings comparable across changes.
 
 Status: complete.
 
@@ -255,9 +272,9 @@ Status: in progress.
 
 Current benchmark signal:
 
-- `bench/storage/open_bench.zig --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
+- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog --index-open-parallelism 1`
   - `open_ms=9.056`
-- `bench/storage/open_bench.zig --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
+- `./zig-out/bin/open_bench --docs 200 --batch-size 25 --indexes-text 2 --indexes-dense 1 --indexes-sparse 1 --stage-backlog`
   - `open_ms=5.622`
 
 That is roughly a `1.6x` improvement on the replay-heavy reopen case before

@@ -736,3 +736,96 @@ Query tests:
 - External node ids can be returned without document hydration.
 - Hydration-required query over external nodes fails closed.
 - Entity/global projection query shapes are rejected in V1.
+
+## Immutable graph-metric execution
+
+Document and external-source serverless publications use the same request-wide
+plan in `serverless/build/lake_graph_metric.zig`. Reusable metrics are resolved
+first. Dirty requests are grouped by authenticated source identity, equivalent
+edge filter, and exact metric computation parameters. Names and refresh policies
+are not computation identity. Each source is fetched/prepared once. Compatible
+filters share a union topology when the whole group fits its work and memory
+budgets; otherwise the planner processes cheaper exact topology requirements
+first. An unaffordable spectral sibling must not force an affordable degree
+metric to build its adjacency lanes or inherit its rejection. Each unique metric
+is computed, encoded, and uploaded once. Compatible HITS authority/hub metrics
+share their kernel.
+
+Graph artifact wire v3 stores sorted node/type dictionaries and fixed-width
+ordinal edge records (including weights and qualified-table ordinals). Metric
+preparation reads validated borrowed views directly into compact outbound
+topology, without per-edge string allocation, node hashing, or allocating then
+discarding inbound edges. The graph-query reader reuses the same validated view
+for memory admission and owned adjacency decoding. Encoders build dictionaries
+once, check output limits before allocation, and observe cancellation. The
+current score artifact remains v9: its prefix-compressed point/ranked blocks
+remain independently readable without fetching another node dictionary.
+
+The plan retains only one source and one filtered projection at a time; alias
+fanout retains lightweight references, not score vectors or encoded payloads.
+References preserve request order and independently carry index names and
+publication, topology, and computation provenance. Equivalent PageRank aliases
+use the first available prior artifact in request order as their optional seed;
+authentication or compatibility failure still cold-starts the shared computation.
+Aggregate budgets count actual unique work, source reads, and output uploads.
+
+Both publication paths resolve the complete requested plan against a shared
+inventory of prior computations. Equivalent new or renamed aliases reuse a ready
+payload without source reads, kernel work, encoding, or uploads. Each immutable
+prior payload is authenticated and its header read at most once per publication,
+including failed verification. New aliases retain the original computation time
+while carrying their own current publication and topology provenance.
+Lake and sidecar manifest validation permits shared IDs for distinct graph/metric
+names only when every immutable metadata field agrees; conflicting duplicate
+declarations remain invalid.
+
+The preceding manifest's ordered metric references are the admission-plan
+witness. Rejected computations remain reusable only while the complete plan,
+source identities, and materializer policy are unchanged. Removing or changing a
+budget-consuming sibling therefore retries previously rejected work; an unchanged
+plan does not cause a retry loop. Missing or invalid prior payloads are rebuilt
+with fresh publication/computation provenance.
+
+The storage-independent PageRank, eigenvector, and HITS kernels partition the
+CSR vertex/edge work stream into fixed logical tiles, including boundaries inside
+high-degree vertices. Complete rows remain target-owned. Only tile-boundary rows
+need partial sums (at most 32 stack records), reduced in a fixed order independent
+of the `std.Io` worker count. Large graphs have at most
+`ceil((nodes + edges) / 16)` work units per logical tile; no extra edge-sized
+scratch allocation or atomic floating-point updates are required.
+
+Graph-metric queries authenticate control, routing, primary-score, and ranked
+blocks before publishing them to the bounded shared memory cache. Disk retention
+is optional and asynchronous: one cache-owned `std.Io` worker drains at most
+32 outstanding jobs / 16 MiB, independent of request allocator, executor, and
+cancellation lifetimes. Queue pressure or disk failure does not fail a verified
+read or make shared waiters download it again. Shutdown cancels pending retention
+and joins the worker before destroying the cache. Pending bytes/jobs, failures,
+and bypasses are exposed in `QueryCacheStats`; maintenance can explicitly drain
+retention, but queries never wait for it. Local-cache read errors fall back to
+authenticated origin reads; origin integrity failures remain fatal.
+
+Column queries resolve immutable physical computations before admission and
+range planning. Equivalent aliases share routing, transport, and decode work,
+while every logical output is admitted up front and owns its result array and
+publication provenance. Conflicting immutable metadata cannot reuse another
+column's validation.
+
+Non-serverless single- and multi-column reads use the same snapshot-local
+physical-key reader in `graph/score_read.zig`. Status policies are checked before
+score allocation. Only identical encoded metric/generation prefixes are aliases;
+equal configurations with different durable publications remain independent.
+Rows and physical columns are sorted independently, duplicate keys are read
+once, and all logical results preserve input order and independent ownership.
+One reusable key slab and result-vector pair serve batches of at most 4096
+storage keys, avoiding per-score prefix formatting and per-batch arena churn.
+The existing durable ordinal/vector-chunk jobs and shared numerical kernels
+remain the non-serverless computation path.
+
+Materializer epoch 13 invalidates earlier admission and preparation policies,
+including rejections retained before adaptive topology grouping. Serverless is
+unreleased and supports only the current artifact contract: old graph wire
+versions are rejected, not migrated or silently decoded.
+
+See [preparation and score-reader benchmarks](bench/graph/METRIC_PREPARATION.md)
+for reproducible phase-specific measurements and their limitations.

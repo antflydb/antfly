@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/codegen_main.zig"),
             .target = b.graph.host,
-            .optimize = optimize,
+            .optimize = .ReleaseSafe,
         }),
     });
     b.installArtifact(codegen_exe);

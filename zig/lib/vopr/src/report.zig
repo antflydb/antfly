@@ -53,6 +53,8 @@ pub const Aggregate = struct {
     harness_errors: u64,
     exact_replays: u64,
     corpus_entries: u64,
+    seeded_entries: u64 = 0,
+    seeded_findings: u64 = 0,
     quarantined_entries: u64,
     retained_entries: u64,
     semantic_states: u64,
@@ -90,6 +92,8 @@ pub const Aggregate = struct {
             },
             .corpus = .{
                 .entries = self.corpus_entries,
+                .seeded = self.seeded_entries,
+                .seeded_findings = self.seeded_findings,
                 .quarantined = self.quarantined_entries,
                 .retained = self.retained_entries,
             },

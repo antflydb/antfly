@@ -648,8 +648,9 @@ The lane suffix still describes fidelity:
   `lib-metadata-vopr-placement-chaos-test` select the broader fault suites;
   `lib-metadata-vopr-chaos-soak-test` combines those three selections.
 
-The aggregate `vopr-test`, `antfly-integration-test`, `antfly-chaos-test`, and
-`chaos-soak-test` retain their existing selections.
+The aggregate `vopr-test`, `antfly-integration-test`, and `antfly-chaos-test`
+retain their existing selections. `vopr-soak-test` includes the broader fault
+selections alongside retained-corpus search campaigns.
 
 Metadata planning fixes (2026-09-07): rename validation exposed four failures
 that also reproduced at merged, pre-rename commit `6d21a583f`. The shared
@@ -717,7 +718,7 @@ regressions pass **2/2** in both Debug and ReleaseSafe.
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
-| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
+| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test antfly-storage-ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
 | Production DataServer replicated merge/split seam | `data/runtime.zig`; the focused rollback/fresh-retry history uses one owner and two groups, while `data-server-transition-vopr-test` chains merge into split across three real `DataServer` owners and three replicated groups over time. It uses public HTTP/Raft listeners, routed merge actions, leader transfer, a public post-bootstrap delta write, replicated bootstrap/catch-up/finalize, owner restart, catalog-independent replay, exact routed terminal retry, every-replica range/transition/watermark convergence, document equality, actor-owned teardown, and fresh-root replay of the recorded actor/time schedule on one `VoprIo`. Clock-only stutter is normalized at the explicit physical LSM differential boundary; no different actor may execute, and a recorded actor that does not become ready within the bound is replay divergence. A regression preserves exactly-once split-action lane release when an inline durable job fails | `zig build data-server-transition-vopr-test`; broader `data-server-vopr-test antfly-data-runtime-test lib-data-storage-test` gates remain required before release |
@@ -2988,11 +2989,192 @@ lsm                   ha
   persistent index, index manager, DB split, HA, and application domains.
 - Every failure prints or stores an exact replay artifact.
 
-### `chaos-soak-test`
+### `vopr-soak-test`
 
-- Larger history counts, broader fault budgets, and retained legacy chaos
-  suites.
+- Larger history counts, broader fault budgets, and retained native
+  differentials.
+- Runs the campaign CLI for HA, Raft, distributed data, and production
+  HA/scaling with `--fail-on-findings` and one worker. Defaults are 100 histories
+  for the smaller scenarios and two for production HA/scaling.
+  Property findings fail the gate after reports and replay artifacts are
+  written; replay divergence and harness errors also fail it.
+- Uses `--defer-diagnostics` to retain findings and flight recordings without
+  spending the soak budget on automatic reduction and counterfactual replay.
+  Run `vopr recipe` against a retained trace for that separate analysis.
+- Retains the metadata transition/public/placement and Raft differential
+  selections from the former soak target. Their native I/O is still native;
+  sharing a tier does not turn them into exact-replay campaigns.
 - Never part of the default fast gate.
+
+```sh
+zig build vopr-soak-test -Doptimize=ReleaseSafe -j1 \
+  -Dvopr-soak-histories=1000 -Dvopr-soak-production-histories=2 \
+  -Dvopr-soak-seed=2709476608 \
+  -Dvopr-soak-artifacts=/tmp/antfly-vopr-soak
+```
+
+The artifact directory has separate `ha`, `raft`, `distributed-data`, and
+`ha-scaling` corpora, with `results.json`, HTML reports, retained traces, and failure
+diagnostics. Reusing a directory resumes its corpus. Reproducing the entire
+guided search requires the same initial corpus as well as the same seed and
+budget; each retained history independently supports exact replay.
+
+### HA, Raft, and scaling follow-up after PR #539
+
+The merged fault algebra supplies explicit overlap, precedence, exclusions,
+fault budgets, and healing. Those engine features are not evidence that every
+production ownership transition has been composed with every fault.
+The bounded `vopr-test` gate is also not evidence of a completed soak run.
+
+The HA lifecycle scenario now uses `VoprIo` files and monotonic time for the
+production primary log, replication slots, standby receive/progress WALs,
+and fencing receipts. Standby apply deadlines borrow the progress WAL clock,
+including deadlines constructed by the production DataServer caller.
+The scenario is version 2; version-1 native-storage traces must be regenerated,
+not silently replayed under different semantics. Its application callback
+still checks an ordered payload model; it does not yet apply into the
+production cluster's DB. Its restart actions close and reopen owners; they
+do not yet inject power loss between individual storage operations.
+
+The separate `ha-scaling` scenario (`production-ha-scaling`, version 1)
+composes the production metadata quorum, three Raft-backed DataServers, and
+separate production HA primary/standby DataServers on the shared VOPR scheduler.
+HA is the documented single-primary mode: promotion does not replace a Raft
+voter. The HA owners use a fixed standalone table catalog with the current
+routing interface; the Raft deployment uses its real metadata quorum. Its
+bounded `ha-scaling-vopr-test` records and exactly replays one complete history:
+
+1. Drain the third data owner and establish two caught-up replicas. Start a
+   separate HA primary/standby pair, write through public HTTP, and apply the
+   actual replication log into real standby DBs. Verify a standby read and
+   reject promotion without a fencing receipt.
+2. Restart the third owner with a fresh registration incarnation and raise the
+   desired replica count to three. Wait for production placement and Raft apply.
+3. Set automatic sharding thresholds and let production status collection and
+   median-key RPCs choose a split. During the active transition, fence the old
+   HA writer at its durable tail after another public write, catch up the
+   standby, and restart the Raft deployment's metadata leader. Reopen the
+   durable fence store and promote through the authenticated admin API.
+4. Accept a public write on the promoted HA owner, verify pre/post-promotion
+   values, and finish the Raft deployment's split while public writes continue.
+   Require three published ranges and converged replicas before allowing
+   automatic merges. Reunite the split siblings, preserving the independent
+   document-ID namespaces of the two original ranges. Lower replication to two,
+   drain the third owner, verify every remaining replica, and stop the drained process.
+
+The oracles check acknowledged document values, exact range coverage without
+gaps or overlap, standby safe-read/apply bounds, fencing, promotion identity,
+replica convergence, bounded completion, and owner cleanup. HA log/slot/progress
+and fencing writes borrow VOPR storage and clocks, including after promotion.
+Automatic planning borrows the DataServer wall and monotonic clocks, so shard
+cooldown expiry is independent of host time and wall-clock corrections. It
+obtains median keys through the production routed shard-DB adapter. Disk-size collection uses the owner's
+filesystem, including virtual storage, rather than opening a private native
+filesystem. Disk-scan admission uses primary document cardinality while derived
+indexes catch up, so a populated split destination can supply merge evidence.
+Reconstructed metadata owners reinstall their shard RPC callbacks.
+HA replication uses its separate internal bearer credential; the fixture
+configures that credential independently of the HA admin endpoint. Restarted
+Raft owners retain the externally bound listener URL in their registration.
+`ha-production-vopr-test` isolates the production HA lifecycle on `VoprIo` and
+cancels immediately after promotion to verify task and network cleanup;
+`ha-scaling-vopr-test` also checks the composed history and exact replay.
+The maintenance coordinator closes admission and exits when its borrowed lane
+is canceled, allowing the remaining registration owners to unwind.
+The composed split-to-merge history also covers unbounded range adjacency and
+source finalization on every document replica. Finalization atomically persists
+the narrowed range and Raft entry receipt through a metadata-only path. A later
+merge therefore validates the same base in the Raft projection and document DB;
+replaying an older split entry cannot narrow that merged range again.
+
+This is a bounded composition, not exhaustive fault coverage. The existing
+fixture retains a native temporary namespace for ancillary stores such as the
+unused API restore-job LMDB; that boundary is not a power-loss model. Torn HA
+writes, disjoint placement, broader link/disk/resource fault combinations,
+retention pressure, and the Kubernetes operator/cloud provisioning loop remain
+follow-up coverage. Threshold and desired-replica changes exercise the Zig
+controllers, not a simulated Kubernetes autoscaler.
+
+### Scheduled retained-corpus soaks
+
+[zig-vopr-soak.yml](../.github/workflows/zig-vopr-soak.yml) runs daily at 10:00
+UTC once merged into the default branch, and supports manual dispatch. It
+builds one ReleaseSafe runner, then runs two shards each of `ha`, `raft`,
+`distributed-data`, and `ha-scaling`. Per-shard history budgets are 1000,
+1000, 12, and 2 respectively; the dispatch input can override them. Each shard
+uses one worker and records its exact seed, revision, command, initial corpus,
+and completion status in `run.json`.
+
+Scheduled campaigns use `--defer-diagnostics`: every finding still retains its
+trace, flight recording, and aggregate summary, but automatic reduction and
+counterfactual searches run separately through `vopr recipe`. This keeps one
+production finding from consuming the entire scheduled budget before reports
+are published.
+
+The workflow restores the last compatible scenario corpus, copies it into a
+fresh run directory, and uploads reports, traces, logs, and diagnostics even
+when the campaign fails. A separate job replays and merges the uploaded shard
+corpora, deduplicates them, and saves a bounded working corpus for the next run.
+The merge chooses its compatibility authority by exact replay with the current
+runner, preferring fresh histories. Duplicate-only campaigns can use a replayed
+seed; divergent candidates remain inputs for quarantine instead of aborting
+the merge before valid histories are retained. If no candidate replays, the job
+fails with an authority-selection log and leaves the uploaded shard traces
+available for diagnosis without publishing a working corpus.
+The working corpus keeps up to 128 clean traces for HA/Raft, eight for
+distributed data, and two for production HA/scaling, plus the smallest retained
+representative of every distinct failure fingerprint. `retention.json` records
+that selection; the full merged corpus remains in the uploaded artifact.
+Incompatible versions are quarantined for review; unexpected replay errors or
+replay divergence fail the run and preserve evidence. A still-reproducing
+finding in the initial corpus also fails the campaign. Campaign timeouts leave
+room for artifact upload; interrupted runs never acquire a stale success report.
+
+Run and merged-corpus artifacts are retained for 90 days. The cache is an
+acceleration/resumption mechanism and can be evicted; download the retained
+corpus artifact to resume manually after eviction. Scheduling a workflow does
+not establish that a nightly budget has completed: use its uploaded `run.json`,
+`results.json`, and corpus `index.json` as evidence. Replaying a single trace
+requires only that trace and a compatible runner; repeating corpus-guided
+search requires the initial corpus, seed, budget, and runner revision.
+
+```sh
+zig build vopr-build -Doptimize=ReleaseSafe -j1
+python3 ../scripts/ci/zig_vopr_soak.py --binary zig-out/bin/vopr run \
+  --scenario ha-scaling --seed 0xa17f5500 --histories 2 \
+  --corpus /tmp/previous-vopr-corpus --output /tmp/new-vopr-run
+python3 ../scripts/ci/zig_vopr_soak.py --binary zig-out/bin/vopr merge \
+  --inputs /tmp/new-vopr-run --output /tmp/merged-vopr-corpus
+```
+
+Initial search at base seed `0xa17f5500` found a Raft oracle failure after a
+crash discarded an unpersisted term. The version-2 Raft scenario checks
+volatile monotonicity within an incarnation and durable term/commit plus
+completed application across restarts. It also preserves each node's append
+and apply lane order, matching the [async Raft storage contract](https://github.com/etcd-io/raft/blob/main/raft.go).
+These corrections preserve checks for lost durable state; they do not suppress
+all regressions after a restart.
+
+The same search found that the distributed-data scenario required retirement
+on all three replicas while one remained partitioned. Version 2 verifies
+surviving-quorum reads and retirement first, explicitly heals, then verifies
+every replica. Healing restores metadata blackhole routes as well as virtual
+network faults, so a later partition cannot accidentally retain an earlier
+one. Metadata uses the shared Raft cluster restart path to preserve virtual
+endpoints and establishes a ReadIndex proof before post-restart writes.
+The delayed-transport choice injects a two-tick delay into the actual virtual
+network and asserts that it was exercised; a supplied native executor was
+previously overwritten during cluster setup. An uncertain reconcile-lease
+proposal remains pending until
+committed authority is observed; it does not abort the whole partition
+history or grant authority from an unknown response. This scenario still
+schedules coarse fault modes around a
+native HTTP differential; its four-choice trace is not packet-level replay
+of the production cluster. The native HA seed-snapshot regression now creates
+its deadline from the DB's runtime clock, matching the production caller.
+The forced-reallocation restart regression keeps the request pending until
+every voter reports the exact observed request ID; pre-request size reports
+cannot acknowledge the scan.
 
 ### Integration and legacy storage tests
 
@@ -3014,9 +3196,6 @@ Legacy storage commands are:
 - DB split: `db-split-workload-test` and `db-split-replay-fixtures`.
 - Aggregate legacy workloads: `storage-workload-test` and
   `storage-workload-soak`.
-
-The old `*-sim-test` and `storage-sim-soak` spellings are compatibility aliases,
-not canonical suite names.
 
 Reduced legacy artifacts are written under `/tmp` with an
 `antfly-{lmdb,wal,persistent,index-manager,db-split}-replay-` prefix. Promote a
@@ -3862,12 +4041,13 @@ strict scopes:
 
 Therefore the features labeled integrated below are implemented to their stated
 boundaries, but the complete roadmap is not finished. In particular, local
-run/index/report tooling is implemented while nightly retention, corpus merging,
-notifications, and dashboards are operational follow-up; distributed VOPR is an
+run/index/report tooling and scheduled corpus-retaining campaigns are implemented,
+while completed scheduled runs, notifications, and dashboards remain operational
+follow-up; distributed VOPR is an
 implemented runtime foundation with incomplete composition breadth; and the
 event-query layer, saved cross-run set algebra, validation/counting commands,
-and bounded live stream are implemented while nightly retention and broader
-operational integration remain future work.
+and bounded live stream are implemented while routine quarantine review and
+broader operational integration remain future work.
 
 The word **fully** is consequently never implicit. The conformance audit is:
 
@@ -3876,7 +4056,7 @@ The word **fully** is consequently never implicit. The conformance audit is:
 | Named VOPR engine/tooling features | **Implemented at the registered in-process `std.Io` boundary.** `vopr-engine-test` and the registered-source `vopr-determinism-audit` pass at this checkpoint | The audit manifest is not a transitive production call-graph proof; arbitrary guest-kernel RNG/syscall interception, uninstrumented native libraries, and separate process address spaces are also excluded |
 | Rows labeled integrated | **Implemented for the production seam, schedules, properties, and exact-replay gate named in that row** | Residual work stated in the row and combinations with other independently tested domains |
 | Rows labeled partially integrated | **Not complete end to end** | Promotion requires the remaining public/deployment composition and its replay gate |
-| Local results/index/corpus tooling | **Implemented as repository-owned commands and formats** | Nightly sharding, retention policy, notifications, dashboards, and routine quarantine review |
+| Local results/index/corpus tooling | **Implemented as repository-owned commands, formats, and a scheduled sharded workflow with replay-validated corpus retention** | Completed scheduled-run evidence, notifications, dashboards, and routine quarantine review |
 | Antithesis parity | **Not claimed** | Hosted orchestration/UI, deterministic execution of arbitrary containers or kernels, and operational service parity |
 
 This is the answer to “have we fully implemented what we call finished?”: only
@@ -4568,8 +4748,8 @@ work already completed:
   campaign should not require multi-gigabyte retention merely because most
   adjacent states repeat. This is artifact/runtime efficiency work, not a
   relaxation of replay truth or a substitute for the bounded flight recorder;
-- make nightly campaign sharding, corpus merge, retention, quarantine review,
-  usage indexing, and notifications a repository-owned operational workflow;
+- operate the scheduled sharded corpus-retaining workflow, review its quarantined
+  traces, and add usage indexing and notifications;
 - extend the registered-source determinism audit through transitive production
   callees reached by borrowed-`std.Io` scenarios, with reviewed exceptions and
   stable semantic lock/operation identities. The present manifest is a useful
@@ -4874,10 +5054,10 @@ The shortest current summary is:
    reranking adapters, production metadata-admin mutations, MCP/A2A
    orchestration, cloud-auth refresh/signing, bounded extension invocation, and
    client/background fairness.
-5. **Operationalize the self-contained platform.** Run sharded nightly
-   campaigns, deterministic corpus merges, retention/quarantine workflows,
-   usage indexing, notifications, dashboards, and search-quality regression
-   tracking.
+5. **Operationalize the self-contained platform.** Gather completed-run evidence
+   from the scheduled sharded campaigns and replay-validated corpus retention;
+   add routine quarantine review, usage indexing, notifications, dashboards,
+   and search-quality regression tracking.
 6. **Keep distributed fidelity explicit.** Continue using the integrated
    in-process multi-node mode for production owners that borrow `std.Io`. Add a
    repository-owned federated agent/broker only when separate-address-space or

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("../../io/compat.zig");
+const compat = @import("inference_internal").io.compat;
 const inference = @import("inference_internal");
 const gliner2_boundary = inference.finetune.gliner2_boundary;
 const reranker = inference.finetune.reranker;

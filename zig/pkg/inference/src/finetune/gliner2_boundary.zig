@@ -27,9 +27,9 @@ const optimizers = ml.graph.optimizers;
 
 pub const boundary_cache_file_name = "gliner2_top_layer_boundary_cache.json";
 pub const boundary_cache_family_version = "gliner2_top_layer_boundary_cache/v1alpha1";
-pub const boundary_head_file_name = "gliner2_top_layer_boundary_head.json";
+pub const boundary_head_file_name = @import("assets/gliner2_files.zig").boundary_head_file_name;
 pub const boundary_head_family_version = "gliner2_top_layer_boundary_head/v1alpha1";
-pub const boundary_task_head_file_name = "gliner2_top_layer_boundary_task_head.json";
+pub const boundary_task_head_file_name = @import("assets/gliner2_files.zig").boundary_task_head_file_name;
 pub const boundary_task_head_family_version = "gliner2_top_layer_boundary_task_head/v1alpha1";
 
 pub const CachedBoundaryExampleSummary = struct {

@@ -60,6 +60,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 const inference = @import("inference_internal");
 const ml = @import("ml");
@@ -3014,7 +3015,7 @@ fn trainingStateFingerprint(
         .base_model_fingerprint_sha256 = base_model_fingerprint_sha256,
         .training_executable_sha256 = training_executable_sha256,
         .training_runtime_identity = training_runtime_identity,
-        .inference_version = build_options.inference_version,
+        .inference_version = build_info.version(),
         .build_enable_system_blas = build_options.enable_system_blas,
         .build_enable_metal = build_options.enable_metal,
         .build_enable_cuda = build_options.enable_cuda,

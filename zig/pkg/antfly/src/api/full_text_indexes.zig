@@ -89,7 +89,8 @@ pub fn listFullTextIndexNamesAlloc(
     var it = root.iterator();
     while (it.next()) |entry| {
         if (!isFullTextIndexConfig(entry.value_ptr.*)) continue;
-        try names.append(alloc, try alloc.dupe(u8, entry.key_ptr.*));
+        try names.ensureUnusedCapacity(alloc, 1);
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.key_ptr.*));
     }
 
     std.mem.sort([]u8, names.items, {}, lessString);
