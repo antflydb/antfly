@@ -65,10 +65,20 @@ pub const AuthOptions = struct {
     bearer_token: ?[]const u8 = null,
 };
 
+/// Which admin path spelling the server we are talking to has been observed
+/// to accept. `.unknown` tries the canonical `/admin/v1/standby` (or
+/// `/standby/v1`) spelling first, as does `.canonical`; `.legacy` means an
+/// earlier probe found the canonical spelling 404ing and the legacy
+/// `/admin/v1/ha` (or `/ha/v1`) spelling working, so subsequent requests go
+/// straight there. See `zig/HOT_STANDBY.md` "Naming".
+pub const PathStyle = enum { canonical, legacy, unknown };
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
     auth: AuthOptions = .{},
+    /// Learned once a request round-trips successfully; see `PathStyle`.
+    path_style: PathStyle = .unknown,
 
     pub fn init(alloc: Allocator, executor: http_common.RequestExecutor) Client {
         return initWithOptions(alloc, executor, .{});
@@ -86,7 +96,7 @@ pub const Client = struct {
         const uri = try join(self.alloc, base_uri, http_admin.Routes.health);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{ .method = .GET, .uri = uri });
+        var resp = try self.executeAdmin(.{ .method = .GET, .uri = uri });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status);
     }
@@ -95,7 +105,7 @@ pub const Client = struct {
         const uri = try join(self.alloc, base_uri, http_admin.Routes.ready);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{ .method = .GET, .uri = uri });
+        var resp = try self.executeAdmin(.{ .method = .GET, .uri = uri });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status);
     }
@@ -111,7 +121,7 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeAdmin(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -554,7 +564,7 @@ pub const Client = struct {
         comptime T: type,
         req: http_common.HttpRequest,
     ) !ParsedOutput(T) {
-        var resp = try self.executeWithRetry(req);
+        var resp = try self.executeAdmin(req);
         errdefer resp.deinit(self.alloc);
         try mapStatus(resp.status);
 
@@ -596,6 +606,46 @@ pub const Client = struct {
             .content_type = "application/json",
             .body = body,
         });
+    }
+
+    /// Sends an admin request, transparently accommodating a server that
+    /// still only understands the legacy `/admin/v1/ha` (or `/ha/v1`) path
+    /// spelling. `path_style` remembers which spelling worked so steady-state
+    /// traffic against an old server pays the extra round trip only once.
+    fn executeAdmin(self: *Client, req: http_common.HttpRequest) !http_common.HttpResponse {
+        if (self.path_style == .legacy) {
+            if (try legacyUriAlloc(self.alloc, req.uri)) |legacy_uri| {
+                defer self.alloc.free(legacy_uri);
+                var legacy_req = req;
+                legacy_req.uri = legacy_uri;
+                var resp = try self.executeWithRetry(legacy_req);
+                if (resp.status != 404) return resp;
+                // The server no longer accepts the legacy spelling (perhaps
+                // it was upgraded); forget what we learned and re-probe below.
+                resp.deinit(self.alloc);
+                self.path_style = .unknown;
+            }
+        }
+
+        var resp = try self.executeWithRetry(req);
+        errdefer resp.deinit(self.alloc);
+        if (resp.status != 404) {
+            self.path_style = .canonical;
+            return resp;
+        }
+
+        const legacy_uri = try legacyUriAlloc(self.alloc, req.uri) orelse return resp;
+        defer self.alloc.free(legacy_uri);
+        var legacy_req = req;
+        legacy_req.uri = legacy_uri;
+        var legacy_resp = try self.executeWithRetry(legacy_req);
+        if (legacy_resp.status == 404) {
+            legacy_resp.deinit(self.alloc);
+            return resp;
+        }
+        resp.deinit(self.alloc);
+        self.path_style = .legacy;
+        return legacy_resp;
     }
 
     fn executeWithRetry(self: *Client, raw_req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -643,6 +693,24 @@ pub const Client = struct {
 fn join(alloc: Allocator, base_uri: []const u8, path: []const u8) ![]u8 {
     if (!validation.isHTTPURLWithHostNoHiddenWhitespace(base_uri)) return error.InvalidHAAdminURL;
     return try routes.Routes.join(alloc, base_uri, path);
+}
+
+/// If `uri` contains the canonical `/admin/v1/standby` or `/standby/v1`
+/// prefix, returns a newly allocated URI with that prefix swapped for its
+/// legacy `/admin/v1/ha` or `/ha/v1` spelling. Operates on the full URI
+/// (scheme, host, and any query string already appended) rather than a bare
+/// path, since callers build `uri` by joining a base URI with a route
+/// constant before appending query parameters. Returns `null` when `uri`
+/// contains neither canonical prefix.
+fn legacyUriAlloc(alloc: Allocator, uri: []const u8) !?[]u8 {
+    // The URI is `<scheme>://<host>[/prefix]<path>`; the admin path starts at
+    // the first occurrence of one of the canonical bases.
+    const path_start = std.mem.indexOf(u8, uri, admin_api.routes.standby) orelse
+        std.mem.indexOf(u8, uri, admin_api.routes.standby_v1_base) orelse
+        return null;
+    const legacy_path = (try admin_api.routes.legacyAdminPathAlloc(alloc, uri[path_start..])) orelse return null;
+    defer alloc.free(legacy_path);
+    return try std.mem.concat(alloc, u8, &.{ uri[0..path_start], legacy_path });
 }
 
 fn validateClientSlotName(slot_name: []const u8) !void {
@@ -1654,6 +1722,67 @@ test "storage.ha http client round trips admin commands" {
         "--receipt-reason",
         "http-client-test",
     }));
+}
+
+/// Wraps another executor to simulate a server that predates the
+/// `standby` rename (v0.2): it 404s any request for a canonical
+/// `/admin/v1/standby` or `/standby/v1` path and forwards everything else
+/// (i.e. legacy-spelled requests) to `inner`.
+const LegacyOnlyExecutor = struct {
+    inner: http_common.RequestExecutor,
+
+    fn isCanonicalPath(uri: []const u8) bool {
+        return std.mem.indexOf(u8, uri, admin_api.routes.standby) != null or
+            std.mem.indexOf(u8, uri, admin_api.routes.standby_v1_base) != null;
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+        const self: *LegacyOnlyExecutor = @ptrCast(@alignCast(ptr));
+        if (isCanonicalPath(req.uri)) {
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "not found"),
+            };
+        }
+        return self.inner.execute(alloc, req);
+    }
+
+    fn executor(self: *LegacyOnlyExecutor) http_common.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+    }
+};
+
+test "storage.ha http client falls back to legacy admin paths and remembers the style" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "legacy-path-fallback");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+
+    var server = http_admin.Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+    });
+    defer server.deinit();
+
+    var legacy_only = LegacyOnlyExecutor{ .inner = server.executor() };
+    var client = Client.init(alloc, legacy_only.executor());
+    try std.testing.expectEqual(PathStyle.unknown, client.path_style);
+
+    // checkHealth/checkReady exercise the /standby/v1 <-> /ha/v1 swap.
+    try client.checkHealth("http://ha-admin.test");
+    try std.testing.expectEqual(PathStyle.legacy, client.path_style);
+
+    // A typed /admin/v1/standby/... route also falls back and the client
+    // remembers the legacy style across calls, so this second request never
+    // needs to probe the canonical path first.
+    var status = try client.getPrimaryStatus("http://ha-admin.test", .{});
+    defer status.deinit(alloc);
+    try std.testing.expectEqualStrings("primary", status.parsed.value.snapshot.role);
+    try std.testing.expectEqual(PathStyle.legacy, client.path_style);
 }
 
 test "storage.ha http client round trips typed commit operations" {

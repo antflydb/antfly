@@ -2003,6 +2003,44 @@ func TestPlanHADoesNotPublishTypedAdminPathForInvalidSlotNames(t *testing.T) {
 	}
 }
 
+// canonicalAdminOpenAPIKey translates a "METHOD /ha/..." key (the shape the
+// operator's own legacy admin route constants, and this file's fixtures,
+// produce) into the "METHOD /standby/..." key the admin OpenAPI spec now
+// documents. The server serves both the legacy /admin/v1/ha and canonical
+// /admin/v1/standby prefixes as aliases of one another for one minor, but
+// specs/openapi/antfly/admin.yaml documents only the canonical shape; see
+// zig/HOT_STANDBY.md, "Naming". The operator intentionally keeps sending
+// the legacy paths (haAdmin*Path below) until its minimum supported server
+// version understands the canonical ones.
+// standbyRoleRoutes are the routes whose canonical spelling is not a plain
+// prefix swap: `/ha/standby/<x>` became `/standby/<x>`.
+var standbyRoleRoutes = []string{"status", "bootstrap", "upstream"}
+
+func canonicalAdminOpenAPIKey(key string) string {
+	for _, route := range standbyRoleRoutes {
+		if strings.HasSuffix(key, " /ha/standby/"+route) {
+			return strings.TrimSuffix(key, " /ha/standby/"+route) + " /standby/" + route
+		}
+	}
+	const legacyPrefix = " /ha/"
+	if idx := strings.Index(key, legacyPrefix); idx >= 0 {
+		return key[:idx] + " /standby/" + key[idx+len(legacyPrefix):]
+	}
+	return key
+}
+
+// legacyAdminOpenAPIKey is the inverse of canonicalAdminOpenAPIKey, used to
+// compare the spec's canonical route keys against the operator's legacy
+// route constant coverage.
+func legacyAdminOpenAPIKey(key string) string {
+	for _, route := range standbyRoleRoutes {
+		if strings.HasSuffix(key, " /standby/"+route) {
+			return strings.TrimSuffix(key, " /standby/"+route) + " /ha/standby/" + route
+		}
+	}
+	return strings.Replace(key, "/standby/", "/ha/", 1)
+}
+
 func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 	operations := loadAdminOpenAPIOperations(t)
 	fixedOperations := []struct {
@@ -2062,8 +2100,8 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 				t.Fatalf("expected OpenAPI path %s, got %s", tt.openAPIPath, path)
 			}
 			key := tt.method + " " + path
-			if operations[key] != tt.operationID {
-				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[key])
+			if operations[canonicalAdminOpenAPIKey(key)] != tt.operationID {
+				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[canonicalAdminOpenAPIKey(key)])
 			}
 		})
 	}
@@ -2181,8 +2219,8 @@ func TestHAAdminOperationsMatchAdminOpenAPISpec(t *testing.T) {
 				t.Fatalf("expected OpenAPI path %s, got %s", tt.openAPIPath, path)
 			}
 			key := method + " " + path
-			if operations[key] != tt.operationID {
-				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[key])
+			if operations[canonicalAdminOpenAPIKey(key)] != tt.operationID {
+				t.Fatalf("expected %s to resolve to operationId %s, got %q", key, tt.operationID, operations[canonicalAdminOpenAPIKey(key)])
 			}
 		})
 	}
@@ -2227,7 +2265,7 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	for _, route := range routes {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
 			path := strings.TrimPrefix(route.path, haAdminBasePath)
-			key := route.method + " " + path
+			key := canonicalAdminOpenAPIKey(route.method + " " + path)
 			if operations[key] == "" {
 				t.Fatalf("operator HA admin route %s is missing from specs/openapi/antfly/admin.yaml", key)
 			}
@@ -2241,12 +2279,21 @@ func TestHAAdminRouteConstantsAreDocumentedInAdminOpenAPISpec(t *testing.T) {
 	for _, route := range routes {
 		covered[route.method+" "+strings.TrimPrefix(route.path, haAdminBasePath)] = true
 	}
-	for key := range operations {
-		if !strings.Contains(key, " /ha/") {
+	// setHAStandbyUpstream is configured at standby startup via the
+	// --ha-standby-upstream-url container argument (see
+	// antflycluster_controller.go's appendHAArg), not through the typed
+	// admin HTTP API, so the operator has no route constant for it and it
+	// is intentionally absent from routes/covered above.
+	uncoveredOperationIDs := map[string]bool{"setHAStandbyUpstream": true}
+	for key, operationID := range operations {
+		if !strings.Contains(key, " /standby/") {
 			continue
 		}
-		if !covered[key] {
-			t.Fatalf("admin OpenAPI HA route %s is not registered in operator HA admin route constants", key)
+		if uncoveredOperationIDs[operationID] {
+			continue
+		}
+		if !covered[legacyAdminOpenAPIKey(key)] {
+			t.Fatalf("admin OpenAPI standby route %s (operationId %s) is not registered in operator HA admin route constants", key, operationID)
 		}
 	}
 }

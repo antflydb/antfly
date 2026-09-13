@@ -33,7 +33,7 @@ pub const Command = struct {
 
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
 const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait" };
-const ha_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
+const standby_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
 const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job" };
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
@@ -68,7 +68,8 @@ pub const commands = [_]Command{
     .{ .name = "inference", .description = "Manage the inference runtime", .route = .inference, .subcommands = &inference_subcommands },
     .{ .name = "serverless", .description = "Run serverless commands", .route = .serverless, .subcommands = &serverless_subcommands },
     .{ .name = "lite", .description = "Manage embedded Antfly Lite databases", .route = .standalone, .subcommands = &lite_subcommands },
-    .{ .name = "ha", .description = "Manage hot-standby replication for a standalone node", .route = .ha, .subcommands = &ha_subcommands },
+    .{ .name = "standby", .description = "Manage hot-standby replication", .route = .ha, .subcommands = &standby_subcommands },
+    .{ .name = "ha", .description = "Manage hot-standby replication (deprecated alias for standby)", .route = .ha, .subcommands = &standby_subcommands, .hidden = true },
     .{ .name = "table", .description = "Manage tables", .route = .cli, .subcommands = &table_subcommands },
     .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
@@ -230,6 +231,10 @@ test "command table drives routes and completion entries" {
     try std.testing.expectEqual(Route.cli, findCommand("table").?.route);
     try std.testing.expectEqual(Route.completion, findCommand("completion").?.route);
     try std.testing.expectEqual(Route.graph_metric_maintenance, findCommand("__graph-metric-maintenance").?.route);
+    try std.testing.expectEqual(Route.ha, findCommand("standby").?.route);
+    try std.testing.expectEqual(Route.ha, findCommand("ha").?.route);
+    try std.testing.expect(!findCommand("standby").?.hidden);
+    try std.testing.expect(findCommand("ha").?.hidden);
     try std.testing.expect(findCommand("termite") == null);
 }
 
@@ -240,6 +245,7 @@ test "completion output omits hidden commands" {
         try write(shell, &output.writer);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "__graph-metric-maintenance") == null);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "graph-metric-maintenance") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "standby") != null);
     }
 }
 
@@ -250,5 +256,14 @@ test "zsh completion contains nested inference and completion commands" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "inference) subcommands=(run embed classify") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "completion) subcommands=(bash zsh fish)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "index) subcommands=(create drop list get wait)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "ha) subcommands=(status slot seed fence promote rejoin follow switchover stream commit artifact)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "standby) subcommands=(status slot seed fence promote rejoin follow switchover stream commit artifact)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "'standby:Manage hot-standby replication'") != null);
+}
+
+test "zsh completion hides the deprecated ha alias" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try write(.zsh, &output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "'ha:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "ha) subcommands=(") == null);
 }

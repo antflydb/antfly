@@ -215,8 +215,10 @@ pub const Config = struct {
         max_savepoints: usize = 64,
     };
 
-    /// Hot-standby settings from the `ha` config section. Every field mirrors
-    /// an `antfly standalone --ha-*` flag; the runtime fills flags that were not
+    /// Hot-standby settings, read from the `hot_standby` config section (or the
+    /// deprecated `ha` alias, accepted for one minor release; if both are
+    /// present `hot_standby` wins and `ha` is ignored). Every field mirrors an
+    /// `antfly standalone --ha-*` flag; the runtime fills flags that were not
     /// given from here, and `antfly ha --config` reads the same section to find
     /// the node's HA state and admin endpoint. Enum-valued sync fields are kept
     /// as strings and parsed by the runtime's flag parsers so both surfaces
@@ -865,7 +867,10 @@ pub const Config = struct {
             ),
             .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
-            .ha = try haConfigFromOpenApi(alloc, validated.value.ha),
+            // `hot_standby` is the current config key; `ha` is accepted for one
+            // minor release as a deprecated alias. If both are set, `hot_standby`
+            // wins and `ha` is silently ignored (no conflict error).
+            .ha = try haConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -966,7 +971,7 @@ pub const Config = struct {
         return @intCast(raw);
     }
 
-    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HAConfig) !?HAConfig {
+    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HAConfig {
         const cfg = value orelse return null;
         var out = HAConfig{};
         errdefer out.deinit(alloc);
@@ -3563,6 +3568,44 @@ test "common config parses the ha section" {
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
         \\{ "ha": { "identity": { "cluster_id": -1 } } }
     ));
+}
+
+test "common config parses the hot_standby section and the deprecated ha alias" {
+    const alloc = std.testing.allocator;
+
+    // `hot_standby` parses exactly like the legacy `ha` section did.
+    var via_hot_standby = try Config.parseFromSlice(alloc,
+        \\{
+        \\  "hot_standby": {
+        \\    "admin": { "url": "http://127.0.0.1:8080", "token_env": "ANTFLY_HA_ADMIN_TOKEN" },
+        \\    "identity": { "cluster_id": 7, "timeline_id": 3, "epoch": 2 },
+        \\    "primary": { "log": "/var/lib/antfly/ha/primary.wal", "slots": "/var/lib/antfly/ha/slots", "node_id": "primary-a" }
+        \\  }
+        \\}
+    );
+    defer via_hot_standby.deinit();
+    const hs = via_hot_standby.ha.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", hs.admin_url.?);
+    try std.testing.expectEqual(@as(u64, 7), hs.cluster_id.?);
+    try std.testing.expectEqualStrings("primary-a", hs.primary_node_id.?);
+
+    // The legacy `ha` key is still accepted (deprecated alias).
+    var via_ha = try Config.parseFromSlice(alloc,
+        \\{ "ha": { "identity": { "cluster_id": 9 } } }
+    );
+    defer via_ha.deinit();
+    try std.testing.expectEqual(@as(u64, 9), via_ha.ha.?.cluster_id.?);
+
+    // When both are present, `hot_standby` wins and `ha` is ignored (no
+    // conflict error).
+    var both = try Config.parseFromSlice(alloc,
+        \\{
+        \\  "ha": { "identity": { "cluster_id": 1 } },
+        \\  "hot_standby": { "identity": { "cluster_id": 2 } }
+        \\}
+    );
+    defer both.deinit();
+    try std.testing.expectEqual(@as(u64, 2), both.ha.?.cluster_id.?);
 }
 
 test "common config parses bounded transaction session policy" {

@@ -11,9 +11,14 @@ Use the typed admin API for normal automation:
 
 | Surface | Use |
 |---------|-----|
-| `/admin/v1/ha` | Operator and SDK control-plane actions |
-| `antfly ha ...` | Human and break-glass commands, plus pod-local helpers |
+| `/admin/v1/standby` | Operator and SDK control-plane actions |
+| `antfly standby ...` | Human and break-glass commands, plus pod-local helpers |
 | `/internal/v1` | Runtime-to-runtime replication traffic only |
+
+The old `/admin/v1/ha` paths and the `antfly ha` command name still work as
+aliases for one minor release. The Kubernetes operator's Go implementation
+continues to call the old `/admin/v1/ha` paths and read `ANTFLY_HA_ADMIN_TOKEN`
+until its minimum supported server version is 0.3.
 
 The Kubernetes operator lives in `go/pkg/operator` and should use the Go SDK
 admin wrapper generated from `specs/openapi/antfly/admin.yaml`. It should not
@@ -62,9 +67,10 @@ the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
 other runtime configuration.
 
 When using CLI commands against a running node, pass `--admin-url <url>`; the
-token is read from `ANTFLY_HA_ADMIN_TOKEN` when that variable is set, or from
-the variable named by `--admin-token-env`. On the node itself,
-`antfly ha --data-dir /antflydb status primary` opens the local HA state without
+token is read from `ANTFLY_STANDBY_ADMIN_TOKEN` (falling back to the deprecated
+`ANTFLY_HA_ADMIN_TOKEN`) when one of those variables is set, or from the
+variable named by `--admin-token-env`. On the node itself,
+`antfly standby --data-dir /antflydb status primary` opens the local HA state without
 any path or identity flags. Do not put raw tokens in command-line flags because
 argv can be exposed through process inspection and job history. The older
 `--ha-url` and `--ha-token-env` spellings still work.
@@ -277,7 +283,9 @@ identity/digest index prevents old identities from being reused after history
 truncation.
 
 Controllers read the authenticated, read-only endpoint
-`GET /admin/v1/ha/seed-lifecycle/receipts`. The required `kind` query is
+`GET /admin/v1/standby/seed-lifecycle/receipts` (the old
+`/admin/v1/ha/seed-lifecycle/receipts` path is served as an alias). The
+required `kind` query is
 `capture` or `activation`; `after` is an exclusive durable WAL cursor and
 `limit` is between 1 and 1000. Responses include `first_cursor`, `end_cursor`,
 `next_cursor`, `history_truncated`, `gap`, and `has_more`. A `gap` means the
@@ -319,7 +327,7 @@ The operator's automatic promotion path is failover only and stays out of the
 way while the primary is reachable, so a planned change is driven from the CLI:
 
 ```bash
-antfly ha --admin-url http://primary-a:8080 switchover \
+antfly standby --admin-url http://primary-a:8080 switchover \
   --to http://standby-a:8080 \
   --follower http://standby-b:8080 \
   --wait-timeout 60s
@@ -345,7 +353,7 @@ and no data was lost. Either rerun the switchover once the standby has caught
 up, or promote with `force` as an explicit RPO decision. After a successful
 switchover, roll the former primary's pod into the standby role (the operator
 does this from `spec.highAvailability.runtime.standby`) with
-`former_primary_log` configured, then run `antfly ha rejoin rewind` against it;
+`former_primary_log` configured, then run `antfly standby rejoin rewind` against it;
 a running primary owns its log, so the rewind cannot happen before the restart.
 
 ### Repointing a standby
@@ -353,7 +361,7 @@ a running primary owns its log, so the rewind cannot happen before the restart.
 A standby can be moved to a different primary without a restart:
 
 ```bash
-antfly ha --admin-url http://standby-b:8080 follow \
+antfly standby --admin-url http://standby-b:8080 follow \
   --upstream-url http://standby-a:8080 --slot standby-b \
   --cluster-id 1 --timeline-id 3 --epoch 3
 ```
@@ -365,11 +373,13 @@ request is a no-op (`changed: false`).
 
 ### Using the config file
 
-`antfly ha --config /etc/antfly/config.json` reads the server's `ha` section.
-When it names `ha.admin.url` the command targets that endpoint and reads the
-token from the variable in `ha.admin.token_env`; otherwise the section's paths
-and identity are used as local handles. On a node with the standard layout,
-`antfly ha --data-dir /antflydb status primary` needs no flags at all.
+`antfly standby --config /etc/antfly/config.json` reads the server's
+`hot_standby` section (the deprecated `ha` section is still read). When it
+names `hot_standby.admin.url` the command targets that endpoint and reads the
+token from the variable in `hot_standby.admin.token_env`; otherwise the
+section's paths and identity are used as local handles. On a node with the
+standard layout, `antfly standby --data-dir /antflydb status primary` needs no
+flags at all.
 
 ## Former Primary Return
 

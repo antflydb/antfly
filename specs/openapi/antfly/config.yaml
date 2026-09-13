@@ -37,7 +37,11 @@ components:
         transaction_sessions:
           $ref: "#/components/schemas/TransactionSessionConfig"
         ha:
-          $ref: "#/components/schemas/HAConfig"
+          $ref: "#/components/schemas/HotStandbyConfig"
+          deprecated: true
+          description: "DEPRECATED: use hot_standby"
+        hot_standby:
+          $ref: "#/components/schemas/HotStandbyConfig"
         metadata:
           $ref: "#/components/schemas/MetadataInfo"
         inference:
@@ -1021,57 +1025,64 @@ components:
         - object
       default: local
 
-    HAConfig:
+    HotStandbyConfig:
       type: object
       additionalProperties: false
       description: |
         Hot-standby replication settings for a standalone node. Every field
         mirrors an `antfly standalone --ha-*` flag; a flag given on the command
         line wins over the value here. `antfly ha --config <file>` reads the
-        same section to find the node's HA state and admin endpoint, so the
-        replication identity and paths are written once, in the same way a
-        PostgreSQL standby carries `primary_conninfo` in its configuration.
+        same section to find the node's replication state and admin endpoint,
+        so the replication identity and paths are written once, in the same
+        way a PostgreSQL standby carries `primary_conninfo` in its
+        configuration.
+
+        This section was named `ha` before v0.3; that spelling is still
+        accepted for one minor release (see `ha` on `Config`), but
+        `hot_standby` is the name going forward and wins if both are set.
       properties:
         admin:
-          $ref: "#/components/schemas/HAAdminConfig"
+          $ref: "#/components/schemas/HotStandbyAdminConfig"
         identity:
-          $ref: "#/components/schemas/HAIdentityConfig"
+          $ref: "#/components/schemas/HotStandbyIdentityConfig"
         primary:
-          $ref: "#/components/schemas/HAPrimaryConfig"
+          $ref: "#/components/schemas/HotStandbyPrimaryRoleConfig"
         standby:
-          $ref: "#/components/schemas/HAStandbyConfig"
+          $ref: "#/components/schemas/HotStandbyStandbyRoleConfig"
         sync:
-          $ref: "#/components/schemas/HASyncConfig"
+          $ref: "#/components/schemas/HotStandbySyncConfig"
         retention:
-          $ref: "#/components/schemas/HARetentionConfig"
+          $ref: "#/components/schemas/HotStandbyRetentionConfig"
         fence_wal:
           type: string
           description: "Durable promotion fence WAL path (`--ha-fence-wal`)."
         former_primary_log:
           type: string
           description: "Replication log a demoted primary rewinds in place (`--ha-former-primary-log`)."
-    HAAdminConfig:
+    HotStandbyAdminConfig:
       type: object
       additionalProperties: false
-      description: "How the HA admin API of this node is reached and authenticated."
+      description: "How the hot-standby admin API of this node is reached and authenticated."
       properties:
         url:
           type: string
           format: uri
           description: |
-            URL where this node's HA admin API is reachable. Used as the default
-            target by `antfly ha` when no `--admin-url`, `--data-dir`, or local
-            handle flag is given. Not used by the server itself.
+            URL where this node's hot-standby admin API is reachable. Used as
+            the default target by `antfly ha` when no `--admin-url`,
+            `--data-dir`, or local handle flag is given. Not used by the
+            server itself.
           example: "http://127.0.0.1:8080"
         token_env:
           type: string
           description: |
             Name of the environment variable holding the admin bearer token. The
-            server requires `Authorization: Bearer <token>` on admin and HA
-            routes when set (`--admin-token-env`); `antfly ha` reads the same
-            variable to authenticate. Tokens never appear in configuration.
+            server requires `Authorization: Bearer <token>` on admin and
+            hot-standby routes when set (`--admin-token-env`); `antfly ha`
+            reads the same variable to authenticate. Tokens never appear in
+            configuration.
           example: "ANTFLY_HA_ADMIN_TOKEN"
-    HAIdentityConfig:
+    HotStandbyIdentityConfig:
       type: object
       additionalProperties: false
       description: "Replication identity shared by the primary and its standbys."
@@ -1103,10 +1114,10 @@ components:
           format: int64
           minimum: 1
           description: "Current epoch (`--ha-epoch`)."
-    HAPrimaryConfig:
+    HotStandbyPrimaryRoleConfig:
       type: object
       additionalProperties: false
-      description: "Primary-role state. Setting `log` and `slots` enables the primary HA role."
+      description: "Primary-role state. Setting `log` and `slots` enables the primary hot-standby role."
       properties:
         log:
           type: string
@@ -1120,10 +1131,10 @@ components:
         seed_capture_root:
           type: string
           description: "Runtime-owned immutable seed generation root (`--ha-seed-capture-root`)."
-    HAStandbyConfig:
+    HotStandbyStandbyRoleConfig:
       type: object
       additionalProperties: false
-      description: "Standby-role state. Setting `log` and `progress` enables the standby HA role."
+      description: "Standby-role state. Setting `log` and `progress` enables the standby hot-standby role."
       properties:
         log:
           type: string
@@ -1144,7 +1155,7 @@ components:
         slot:
           type: string
           description: "Replication slot name on the upstream (`--ha-standby-slot`)."
-    HASyncConfig:
+    HotStandbySyncConfig:
       type: object
       additionalProperties: false
       description: "Synchronous replication policy enforced by the primary."
@@ -1173,7 +1184,7 @@ components:
           enum: [block, fail-closed, degrade-to-async]
           default: block
           description: "`--ha-sync-failure`."
-    HARetentionConfig:
+    HotStandbyRetentionConfig:
       type: object
       additionalProperties: false
       description: "Retention caps after which the primary marks lagging slots reseed-required. 0 disables a cap."

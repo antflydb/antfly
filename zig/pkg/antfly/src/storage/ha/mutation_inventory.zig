@@ -108,7 +108,7 @@ pub const entries = [_]Entry{
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "backup publication has an external side effect but no final HA authority recheck spanning snapshot and manifest publication" },
     .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
-    .{ .surface = .ha_control, .disposition = .local_operational, .path_pattern = "/admin/v1/ha/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
+    .{ .surface = .ha_control, .disposition = .local_operational, .path_pattern = "/admin/v1/standby/... | /admin/v1/ha/... | /internal/v1/standby/replication/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
     .{ .surface = .storage_maintenance, .disposition = .local_operational, .path_pattern = "/admin/v1/maintenance/...", .methods = post_delete, .reason = "maintenance rewrites physical local representation without changing logical promoted state" },
     .{ .surface = .protocol_action, .disposition = .reject, .path_pattern = "/mcp/v1/... | /a2a | /agents/v1/extensions/...", .methods = post_delete, .reason = "protocol tool calls are payload-dispatched and cannot prove every invoked mutation enters RemoteApply" },
     .{ .surface = .restore_job, .disposition = .reject, .path_pattern = "/restore/jobs/{id}", .methods = &.{.DELETE}, .reason = "restore workflow cancellation mutates primary-local durable job state" },
@@ -137,7 +137,9 @@ pub const Classification = struct {
 pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
     if (method == .GET) return null;
 
-    if (std.mem.startsWith(u8, path, "/admin/v1/ha/") or
+    if (std.mem.startsWith(u8, path, "/admin/v1/standby/") or
+        std.mem.startsWith(u8, path, "/admin/v1/ha/") or
+        std.mem.startsWith(u8, path, "/internal/v1/standby/replication/") or
         std.mem.startsWith(u8, path, "/internal/v1/ha/replication/"))
         return classified(.ha_control, .local_operational);
     if (std.mem.startsWith(u8, path, "/admin/v1/maintenance/"))
@@ -321,7 +323,9 @@ test "HA public non-GET route matrix has an explicit durability disposition" {
     };
     const cases = [_]Case{
         // HA and node-local physical administration.
+        .{ .method = .POST, .path = "/admin/v1/standby/promote", .surface = .ha_control, .disposition = .local_operational },
         .{ .method = .POST, .path = "/admin/v1/ha/standby/promote", .surface = .ha_control, .disposition = .local_operational },
+        .{ .method = .POST, .path = "/internal/v1/standby/replication/pull", .surface = .ha_control, .disposition = .local_operational },
         .{ .method = .POST, .path = "/internal/v1/ha/replication/pull", .surface = .ha_control, .disposition = .local_operational },
         .{ .method = .POST, .path = "/admin/v1/maintenance/compact", .surface = .storage_maintenance, .disposition = .local_operational },
         .{ .method = .DELETE, .path = "/admin/v1/maintenance/jobs/7", .surface = .storage_maintenance, .disposition = .local_operational },

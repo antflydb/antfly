@@ -167,7 +167,7 @@ test "storage.ha validation checks paths are bounded by an allowed root" {
 }
 
 test "storage.ha validation parses URLs and rejects hidden whitespace" {
-    const uri = try parseURLNoHiddenWhitespace("https://primary.antfly.svc:8080/admin/v1/ha");
+    const uri = try parseURLNoHiddenWhitespace("https://primary.antfly.svc:8080/admin/v1/standby");
     try std.testing.expectEqualStrings("https", uri.scheme);
     try std.testing.expect(uri.host != null);
     try std.testing.expect(isURLWithHostNoHiddenWhitespace("http://127.0.0.1:8080"));

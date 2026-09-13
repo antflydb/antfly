@@ -43,7 +43,9 @@ from conftest import (
 )
 from port_reservations import LoopbackPortReservations
 
-HA_ADMIN_ROOT = "/admin/v1/ha"
+HA_ADMIN_ROOT = "/admin/v1/standby"
+# Served as an alias for one minor release; see zig/HOT_STANDBY.md "Naming".
+HA_LEGACY_ADMIN_ROOT = "/admin/v1/ha"
 DB_API_ROOT = "/db/v1"
 HA_BACKUP_MAGIC = b"AFHABKP\n"
 HA_BACKUP_HEADER_SIZE = 96
@@ -603,7 +605,7 @@ def _wait_for_standby_applied(
             )
         try:
             response = cluster.standby.admin_get_response(
-                "/standby/status",
+                "/status",
                 upstream_lsn=lsn,
                 request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
             )
@@ -918,18 +920,33 @@ def _binary_supports_ha_standalone(binary: str) -> bool:
 
 
 def _assert_admin_requires_bearer(node: HAStandaloneNode, path: str) -> None:
-    missing = requests.get(f"{node.url}{HA_ADMIN_ROOT}{path}", timeout=10)
-    assert missing.status_code == 401
-    wrong = requests.get(
-        f"{node.url}{HA_ADMIN_ROOT}{path}",
-        headers={"Authorization": "Bearer wrong-token"},
+    for root in (HA_ADMIN_ROOT, HA_LEGACY_ADMIN_ROOT):
+        missing = requests.get(f"{node.url}{root}{path}", timeout=10)
+        assert missing.status_code == 401, root
+        wrong = requests.get(
+            f"{node.url}{root}{path}",
+            headers={"Authorization": "Bearer wrong-token"},
+            timeout=10,
+        )
+        assert wrong.status_code == 401, root
+
+
+def _assert_legacy_admin_alias(node: HAStandaloneNode, path: str) -> None:
+    """The deprecated /admin/v1/ha prefix must answer exactly like the canonical one."""
+    canonical = node.admin_get(path)
+    legacy = requests.get(
+        f"{node.url}{HA_LEGACY_ADMIN_ROOT}{path}",
+        headers=node.admin_headers(),
         timeout=10,
     )
-    assert wrong.status_code == 401
+    assert legacy.status_code == 200, legacy.text
+    body = legacy.json()
+    assert body["schema_version"] == canonical["schema_version"]
+    assert body["snapshot"]["identity"] == canonical["snapshot"]["identity"]
 
 
 def _assert_internal_replication_requires_bearer(node: HAStandaloneNode) -> None:
-    url = f"{node.url}/internal/v1/ha/replication/identify"
+    url = f"{node.url}/internal/v1/standby/replication/identify"
     missing = requests.get(url, timeout=10)
     assert missing.status_code == 401
     wrong = requests.get(
@@ -975,15 +992,16 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     ha_cluster.configure_table_identity(shard_id=shard_id, table_id=table_id)
     ha_cluster.primary.start()
     _assert_admin_requires_bearer(ha_cluster.primary, "/primary/status")
+    _assert_legacy_admin_alias(ha_cluster.primary, "/primary/status")
     _assert_internal_replication_requires_bearer(ha_cluster.primary)
 
     seed = ha_cluster.seed_standby_catalog_from_primary()
     assert seed["backup_lsn"] >= 1
 
     ha_cluster.standby.start(enable_replication=False)
-    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
+    _assert_admin_requires_bearer(ha_cluster.standby, "/status")
     bootstrapped = ha_cluster.standby.admin_post(
-        "/standby/bootstrap",
+        "/bootstrap",
         {
             "manifest_path": str(seed["manifest_path"]),
             "content_root": str(seed["content_root"]),
@@ -1006,7 +1024,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     )
     assert seeding_slot["active"] is False
     blocked_stream = requests.post(
-        f"{ha_cluster.primary.url}/internal/v1/ha/replication/start",
+        f"{ha_cluster.primary.url}/internal/v1/standby/replication/start",
         headers=ha_cluster.primary.admin_headers(),
         json={
             "slot_name": "standby-a",
@@ -1403,7 +1421,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
 
 def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HACluster):
     ha_cluster.standby.start(enable_replication=False)
-    _assert_admin_requires_bearer(ha_cluster.standby, "/standby/status")
+    _assert_admin_requires_bearer(ha_cluster.standby, "/status")
 
     required_lsn = 1
     forced_request = {

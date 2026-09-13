@@ -295,7 +295,9 @@ pub const Config = struct {
     backup: ?BackupConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
-    ha: ?HAConfig = null,
+    /// DEPRECATED: use hot_standby
+    ha: ?HotStandbyConfig = null,
+    hot_standby: ?HotStandbyConfig = null,
     metadata: ?MetadataInfo = null,
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
@@ -353,6 +355,7 @@ pub const Config = struct {
         .{ "storage", "storage", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "ha", "ha", true },
+        .{ "hot_standby", "hot_standby", true },
         .{ "metadata", "metadata", true },
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
@@ -434,6 +437,10 @@ pub const Config = struct {
         }
         if (self.ha) |value| {
             try jw.objectField("ha");
+            try jw.write(value);
+        }
+        if (self.hot_standby) |value| {
+            try jw.objectField("hot_standby");
             try jw.write(value);
         }
         if (self.metadata) |value| {
@@ -1011,11 +1018,11 @@ pub const GraphExecutionConfig = struct {
     }
 };
 
-/// How the HA admin API of this node is reached and authenticated.
-pub const HAAdminConfig = struct {
-    /// URL where this node's HA admin API is reachable. Used as the default target by `antfly ha` when no `--admin-url`, `--data-dir`, or local handle flag is given. Not used by the server itself.
+/// How the hot-standby admin API of this node is reached and authenticated.
+pub const HotStandbyAdminConfig = struct {
+    /// URL where this node's hot-standby admin API is reachable. Used as the default target by `antfly ha` when no `--admin-url`, `--data-dir`, or local handle flag is given. Not used by the server itself.
     url: ?[]const u8 = null,
-    /// Name of the environment variable holding the admin bearer token. The server requires `Authorization: Bearer <token>` on admin and HA routes when set (`--admin-token-env`); `antfly ha` reads the same variable to authenticate. Tokens never appear in configuration.
+    /// Name of the environment variable holding the admin bearer token. The server requires `Authorization: Bearer <token>` on admin and hot-standby routes when set (`--admin-token-env`); `antfly ha` reads the same variable to authenticate. Tokens never appear in configuration.
     token_env: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1046,14 +1053,14 @@ pub const HAAdminConfig = struct {
     }
 };
 
-/// Hot-standby replication settings for a standalone node. Every field mirrors an `antfly standalone --ha-*` flag; a flag given on the command line wins over the value here. `antfly ha --config <file>` reads the same section to find the node's HA state and admin endpoint, so the replication identity and paths are written once, in the same way a PostgreSQL standby carries `primary_conninfo` in its configuration.
-pub const HAConfig = struct {
-    admin: ?HAAdminConfig = null,
-    identity: ?HAIdentityConfig = null,
-    primary: ?HAPrimaryConfig = null,
-    standby: ?HAStandbyConfig = null,
-    sync: ?HASyncConfig = null,
-    retention: ?HARetentionConfig = null,
+/// Hot-standby replication settings for a standalone node. Every field mirrors an `antfly standalone --ha-*` flag; a flag given on the command line wins over the value here. `antfly ha --config <file>` reads the same section to find the node's replication state and admin endpoint, so the replication identity and paths are written once, in the same way a PostgreSQL standby carries `primary_conninfo` in its configuration. This section was named `ha` before v0.3; that spelling is still accepted for one minor release (see `ha` on `Config`), but `hot_standby` is the name going forward and wins if both are set.
+pub const HotStandbyConfig = struct {
+    admin: ?HotStandbyAdminConfig = null,
+    identity: ?HotStandbyIdentityConfig = null,
+    primary: ?HotStandbyPrimaryRoleConfig = null,
+    standby: ?HotStandbyStandbyRoleConfig = null,
+    sync: ?HotStandbySyncConfig = null,
+    retention: ?HotStandbyRetentionConfig = null,
     /// Durable promotion fence WAL path (`--ha-fence-wal`).
     fence_wal: ?[]const u8 = null,
     /// Replication log a demoted primary rewinds in place (`--ha-former-primary-log`).
@@ -1118,7 +1125,7 @@ pub const HAConfig = struct {
 };
 
 /// Replication identity shared by the primary and its standbys.
-pub const HAIdentityConfig = struct {
+pub const HotStandbyIdentityConfig = struct {
     /// Replicated cluster id (`--ha-cluster-id`).
     cluster_id: ?i64 = null,
     /// Replicated shard id; 0 means the whole instance (`--ha-shard-id`).
@@ -1173,8 +1180,8 @@ pub const HAIdentityConfig = struct {
     }
 };
 
-/// Primary-role state. Setting `log` and `slots` enables the primary HA role.
-pub const HAPrimaryConfig = struct {
+/// Primary-role state. Setting `log` and `slots` enables the primary hot-standby role.
+pub const HotStandbyPrimaryRoleConfig = struct {
     /// Replication log path (`--ha-primary-log`).
     log: ?[]const u8 = null,
     /// Replication slot store path (`--ha-primary-slots`).
@@ -1223,7 +1230,7 @@ pub const HAPrimaryConfig = struct {
 };
 
 /// Retention caps after which the primary marks lagging slots reseed-required. 0 disables a cap.
-pub const HARetentionConfig = struct {
+pub const HotStandbyRetentionConfig = struct {
     /// `--ha-retention-max-lag-lsn`.
     max_lag_lsn: ?i64 = null,
     /// `--ha-retention-max-retained-bytes`.
@@ -1264,8 +1271,8 @@ pub const HARetentionConfig = struct {
     }
 };
 
-/// Standby-role state. Setting `log` and `progress` enables the standby HA role.
-pub const HAStandbyConfig = struct {
+/// Standby-role state. Setting `log` and `progress` enables the standby hot-standby role.
+pub const HotStandbyStandbyRoleConfig = struct {
     /// Received replication log path (`--ha-standby-log`).
     log: ?[]const u8 = null,
     /// Durable receive/apply progress WAL path (`--ha-standby-progress`).
@@ -1321,7 +1328,7 @@ pub const HAStandbyConfig = struct {
 };
 
 /// Synchronous replication policy enforced by the primary.
-pub const HASyncConfig = struct {
+pub const HotStandbySyncConfig = struct {
     /// `--ha-sync-mode`.
     mode: ?[]const u8 = null,
     /// `--ha-sync-selection`.

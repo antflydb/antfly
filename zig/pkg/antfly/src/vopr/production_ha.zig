@@ -6,6 +6,7 @@
 //! production admin surface and consumes the standby's durable WAL owner.
 const std = @import("std");
 const runtime = @import("../data/runtime.zig");
+const admin_api = @import("../admin/mod.zig");
 const ha = @import("../storage/ha/mod.zig");
 const storage_io = @import("../storage/lsm_backend/storage_io.zig");
 const wal = @import("../storage/wal.zig");
@@ -183,7 +184,7 @@ pub const Owners = struct {
     }
 
     pub fn fence(self: *Owners, executor: http.RequestExecutor, upstream: []const u8) !void {
-        const uri = try std.fmt.allocPrint(self.alloc, "{s}/admin/v1/ha/fence", .{upstream});
+        const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ upstream, admin_api.routes.standby_fence });
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, .{
             .identity = identity,
@@ -204,7 +205,7 @@ pub const Owners = struct {
     }
 
     pub fn standbyAdmin(self: *Owners, executor: http.RequestExecutor, expected_status: u16) !void {
-        const uri = try std.fmt.allocPrint(self.alloc, "{s}/admin/v1/ha/promotion/current-fence", .{self.uri.?});
+        const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ self.uri.?, admin_api.routes.standby_promotion_current_fence });
         defer self.alloc.free(uri);
         try self.admin(executor, uri, "{}", expected_status);
     }

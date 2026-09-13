@@ -74,6 +74,10 @@ fn mainImpl(init: std.process.Init) !void {
         .cli => return runRuntimeUnit(.cli, subcommand, init, &args),
         .data => return runRuntimeUnit(.data, subcommand, init, &args),
         .graph_metric_maintenance => return runRuntimeUnit(.graph_metric_maintenance, subcommand, init, &args),
+        // `standby` (visible) and `ha` (hidden, deprecated alias) share this
+        // route and land in the same runtime unit; the entrypoint always
+        // prints help using the `standby` spelling regardless of which name
+        // was invoked.
         .ha => return runRuntimeUnit(.ha, subcommand, init, &args),
         .inference => {
             var worker_lifetime = inference_process_supervisor.WorkerLifetime{};

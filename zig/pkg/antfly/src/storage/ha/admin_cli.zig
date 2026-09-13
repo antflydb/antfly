@@ -2108,8 +2108,8 @@ test "storage.ha admin cli parses standby upstream and follow commands" {
     try std.testing.expectEqual(@as(u64, 2), upstream.command.standby_upstream.identity.epoch);
     try std.testing.expectEqualStrings("switchover", upstream.command.standby_upstream.reason);
 
-    // `antfly ha follow` is a top-level alias for `standby upstream` with the
-    // same flags, for operator ergonomics after a switchover.
+    // `antfly standby follow` is a top-level alias for `standby upstream`
+    // with the same flags, for operator ergonomics after a switchover.
     var follow = try parse(alloc, &.{
         "follow",
         "--upstream-url",

@@ -310,15 +310,21 @@ test "gzip request completes with combined encoded and decoded budget" {
 fn requiresInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
-        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
-    return in_internal_namespace and !ha_exempt;
+    // Hot-standby replication authenticates with its own bearer token; the
+    // legacy `/internal/v1/ha` spelling stays exempt for one minor release.
+    const standby_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+        std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
+        std.mem.eql(u8, path, internal_routes.legacy_standby) or
+        std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
+    return in_internal_namespace and !standby_exempt;
 }
 
-test "internal namespace requires a service principal except HA" {
+test "internal namespace requires a service principal except hot standby" {
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/capabilities"));
     try std.testing.expect(requiresInternalServicePrincipal("/internal/v1/future-operation"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby"));
+    try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/standby/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha"));
     try std.testing.expect(!requiresInternalServicePrincipal("/internal/v1/ha/replication/start"));
     try std.testing.expect(!requiresInternalServicePrincipal("/tables/internal/v1"));

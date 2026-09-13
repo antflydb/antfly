@@ -92,10 +92,17 @@ pub const AuthOptions = struct {
     bearer_token: ?[]const u8 = null,
 };
 
+/// Which spelling of the internal replication routes the upstream answers.
+/// New clients start on the canonical `/internal/v1/standby/...` routes and
+/// fall back to the pre-0.3 `/internal/v1/ha/...` spelling once, so a
+/// standby can be upgraded before the primary it streams from.
+pub const PathStyle = enum { unknown, canonical, legacy };
+
 pub const Client = struct {
     alloc: Allocator,
     executor: http_common.RequestExecutor,
     auth: AuthOptions = .{},
+    path_style: PathStyle = .unknown,
 
     pub fn init(alloc: Allocator, executor: http_common.RequestExecutor) Client {
         return initWithOptions(alloc, executor, .{});
@@ -109,8 +116,8 @@ pub const Client = struct {
         };
     }
 
-    pub fn identifySystem(self: *Client, base_uri: []const u8) !internal_api.HAIdentifySystemResponse {
-        const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_identify);
+    pub fn identifySystem(self: *Client, base_uri: []const u8) !internal_api.StandbyIdentifySystemResponse {
+        const uri = try self.routeUri(base_uri, internal_api.routes.standby_replication_identify);
         var free_uri_on_error = true;
         errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
@@ -123,7 +130,7 @@ pub const Client = struct {
         try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
-            internal_api.HAIdentifySystemResponse,
+            internal_api.StandbyIdentifySystemResponse,
             self.alloc,
             resp.response.body,
             .{ .ignore_unknown_fields = true },
@@ -152,7 +159,7 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_slots);
+        const uri = try self.routeUri(base_uri, internal_api.routes.standby_replication_slots);
         var free_uri_on_error = true;
         errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
@@ -384,7 +391,7 @@ pub const Client = struct {
         slot_name: []const u8,
         from_lsn: u64,
         options: ReplicateOptions,
-    ) !ParsedResponse(internal_api.HAStartReplicationResponse) {
+    ) !ParsedResponse(internal_api.StandbyStartReplicationResponse) {
         try validateSlotName(slot_name);
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
@@ -403,7 +410,7 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_start);
+        const uri = try self.routeUri(base_uri, internal_api.routes.standby_replication_start);
         var free_uri_on_error = true;
         errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
@@ -420,7 +427,7 @@ pub const Client = struct {
         try mapStatus(resp.response.status, resp.response.body);
 
         const parsed = try std.json.parseFromSlice(
-            internal_api.HAStartReplicationResponse,
+            internal_api.StandbyStartReplicationResponse,
             self.alloc,
             resp.response.body,
             .{ .ignore_unknown_fields = true },
@@ -460,7 +467,7 @@ pub const Client = struct {
         );
         defer self.alloc.free(body);
 
-        const uri = try join(self.alloc, base_uri, internal_api.routes.ha_replication_status);
+        const uri = try self.routeUri(base_uri, internal_api.routes.standby_replication_status);
         var free_uri_on_error = true;
         errdefer if (free_uri_on_error) self.alloc.free(uri);
         var resp = try self.execute(.{
@@ -475,13 +482,18 @@ pub const Client = struct {
         try mapStatus(resp.response.status, resp.response.body);
 
         var parsed = try std.json.parseFromSlice(
-            internal_api.HAStandbyStatusUpdateResponse,
+            internal_api.StandbyStatusUpdateResponse,
             self.alloc,
             resp.response.body,
             .{ .ignore_unknown_fields = true },
         );
         defer parsed.deinit();
         try verifyStandbyStatusUpdateResponse(parsed.value, slot_name, identity, progress);
+    }
+
+    fn routeUri(self: *Client, base_uri: []const u8, canonical_path: []const u8) ![]u8 {
+        const path = if (self.path_style == .legacy) internal_api.routes.legacyReplicationPath(canonical_path) else canonical_path;
+        return try join(self.alloc, base_uri, path);
     }
 
     fn execute(self: *Client, raw_request: http_common.HttpRequest) !OwnedResponse {
@@ -494,27 +506,68 @@ pub const Client = struct {
             request.authorization = authorization.?;
         }
 
+        var response = try self.executeWithReconnect(request);
+        if (self.path_style == .legacy or response.status != 404 or isSlotNotFoundBody(response.body)) {
+            if (self.path_style == .unknown and response.status >= 200 and response.status < 300) self.path_style = .canonical;
+            return .{ .request_uri = request.uri, .response = response };
+        }
+
+        // The canonical route is missing. A pre-0.3 primary only serves the
+        // legacy spelling, so retry there once before reporting the route
+        // as absent.
+        const legacy_uri = (try legacyUriAlloc(self.alloc, request.uri)) orelse
+            return .{ .request_uri = request.uri, .response = response };
+        var legacy_request = request;
+        legacy_request.uri = legacy_uri;
+        var legacy_response = self.executeWithReconnect(legacy_request) catch |err| {
+            self.alloc.free(legacy_uri);
+            response.deinit(self.alloc);
+            return err;
+        };
+        if (legacy_response.status == 404) {
+            legacy_response.deinit(self.alloc);
+            self.alloc.free(legacy_uri);
+            return .{ .request_uri = request.uri, .response = response };
+        }
+        self.path_style = .legacy;
+        response.deinit(self.alloc);
+        self.alloc.free(request.uri);
+        return .{ .request_uri = legacy_uri, .response = legacy_response };
+    }
+
+    fn executeWithReconnect(self: *Client, request: http_common.HttpRequest) !http_common.HttpResponse {
         var attempt: usize = 0;
         while (true) {
-            return .{
-                .request_uri = request.uri,
-                .response = self.executor.execute(self.alloc, request) catch |err| switch (err) {
-                    error.HttpConnectionClosing,
-                    error.ConnectionResetByPeer,
-                    error.ConnectionRefused,
-                    error.BrokenPipe,
-                    error.EndOfStream,
-                    => {
-                        if (attempt >= 1) return err;
-                        attempt += 1;
-                        continue;
-                    },
-                    else => return err,
+            return self.executor.execute(self.alloc, request) catch |err| switch (err) {
+                error.HttpConnectionClosing,
+                error.ConnectionResetByPeer,
+                error.ConnectionRefused,
+                error.BrokenPipe,
+                error.EndOfStream,
+                => {
+                    if (attempt >= 1) return err;
+                    attempt += 1;
+                    continue;
                 },
+                else => return err,
             };
         }
     }
 };
+
+fn isSlotNotFoundBody(body: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "SlotNotFound");
+}
+
+/// Rewrites a canonical replication URI onto the legacy prefix, or returns
+/// null when the URI is not a replication route.
+fn legacyUriAlloc(alloc: Allocator, uri: []const u8) !?[]u8 {
+    const canonical = internal_api.routes.standby_replication;
+    const legacy = internal_api.routes.legacy_standby_replication;
+    const index = std.mem.indexOf(u8, uri, canonical) orelse return null;
+    const tail = uri[index + canonical.len ..];
+    return try std.mem.concat(alloc, u8, &.{ uri[0..index], legacy, tail });
+}
 
 const OwnedResponse = struct {
     request_uri: []const u8,
@@ -549,7 +602,7 @@ const VerifiedFrame = struct {
 
 fn decodeAndValidateFrames(
     alloc: Allocator,
-    response: internal_api.HAStartReplicationResponse,
+    response: internal_api.StandbyStartReplicationResponse,
     expected_identity: standby_mod.Identity,
     requested_lsn: u64,
     current_lsn: u64,
@@ -610,7 +663,7 @@ fn freeVerifiedFrames(alloc: Allocator, frames: []VerifiedFrame) void {
     alloc.free(frames);
 }
 
-fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplicationFrame) ![]u8 {
+fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.StandbyReplicationFrame) ![]u8 {
     if (frame.lsn <= 0) return error.InvalidReplicationFrame;
     const size = try std.base64.standard.Decoder.calcSizeForSlice(frame.encoded);
     const out = try alloc.alloc(u8, size);
@@ -619,7 +672,7 @@ fn decodeFrame(alloc: Allocator, frame: internal_api.openapi.types.HAReplication
     return out;
 }
 
-fn validateFrameMetadata(frame: internal_api.openapi.types.HAReplicationFrame, record: replication_record.RecordView) !void {
+fn validateFrameMetadata(frame: internal_api.openapi.types.StandbyReplicationFrame, record: replication_record.RecordView) !void {
     if (record.kind != replicationRecordKind(frame.kind)) return error.ReplicationFrameKindMismatch;
     if (record.payload_codec != replicationPayloadCodec(frame.payload_codec)) return error.ReplicationFramePayloadCodecMismatch;
 }
@@ -637,7 +690,7 @@ fn validateRecordIdentity(record: replication_record.RecordView, expected: stand
     if (record.epoch != expected.epoch) return error.WrongEpoch;
 }
 
-fn replicationRecordKind(kind: internal_api.openapi.types.HARecordKind) replication_record.RecordKind {
+fn replicationRecordKind(kind: internal_api.openapi.types.StandbyRecordKind) replication_record.RecordKind {
     return switch (kind) {
         .batch_mutation => .batch_mutation,
         .metadata_mutation => .metadata_mutation,
@@ -651,7 +704,7 @@ fn replicationRecordKind(kind: internal_api.openapi.types.HARecordKind) replicat
     };
 }
 
-fn replicationPayloadCodec(codec: internal_api.openapi.types.HAPayloadCodec) replication_record.PayloadCodec {
+fn replicationPayloadCodec(codec: internal_api.openapi.types.StandbyPayloadCodec) replication_record.PayloadCodec {
     return switch (codec) {
         .raw => .raw,
         .json => .json,
@@ -677,7 +730,7 @@ fn verifyStartReplicationResponse(response: anytype, expected_slot_name: []const
 }
 
 fn verifyStandbyStatusUpdateResponse(
-    response: internal_api.HAStandbyStatusUpdateResponse,
+    response: internal_api.StandbyStatusUpdateResponse,
     expected_slot_name: []const u8,
     expected_identity: standby_mod.Identity,
     expected_progress: standby_mod.Progress,
@@ -732,7 +785,7 @@ fn mapStatus(status: u16, body: []const u8) !void {
     // Preserve resource absence separately from an incompatible/missing route
     // so the standby exposes an actionable degraded-state reason.
     if (status == 404) {
-        if (std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "SlotNotFound")) return error.SlotNotFound;
+        if (isSlotNotFoundBody(body)) return error.SlotNotFound;
         return error.InternalReplicationEndpointNotFound;
     }
     if (status == 405) return error.UnsupportedOperation;
@@ -889,10 +942,10 @@ const CorruptFrameExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *CorruptFrameExecutor = @ptrCast(@alignCast(ptr));
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_start)) {
             return try self.startResponse(alloc);
         }
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_status)) {
             return try jsonTestResponse(alloc, .{ .unexpected_status_update = true });
         }
         return .{
@@ -963,10 +1016,10 @@ const WrongIdentityBatchExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *WrongIdentityBatchExecutor = @ptrCast(@alignCast(ptr));
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_start)) {
             return try self.startResponse(alloc);
         }
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_status)) {
             return try jsonTestResponse(alloc, .{ .unexpected_status_update = true });
         }
         return .{
@@ -1065,10 +1118,10 @@ const StatusAckMismatchExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *StatusAckMismatchExecutor = @ptrCast(@alignCast(ptr));
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_start)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_start)) {
             return try self.startResponse(alloc);
         }
-        if (std.mem.endsWith(u8, req.uri, internal_api.routes.ha_replication_status)) {
+        if (std.mem.endsWith(u8, req.uri, internal_api.routes.standby_replication_status)) {
             return try self.statusResponse(alloc);
         }
         return .{
@@ -1238,6 +1291,74 @@ test "storage.ha http replication client releases transferred request URIs once 
         error.InternalReplicationEndpointNotFound,
         client.startReplication("http://primary.internal.test", "standby-a", 1, .{}),
     );
+}
+
+/// Emulates a pre-0.3 primary: canonical replication routes are unknown and
+/// only the legacy `/internal/v1/ha/...` spelling is served.
+const LegacyOnlyExecutor = struct {
+    inner: http_common.RequestExecutor,
+    canonical_attempts: usize = 0,
+    legacy_requests: usize = 0,
+
+    fn executor(self: *LegacyOnlyExecutor) http_common.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = execute },
+        };
+    }
+
+    fn execute(ptr: *anyopaque, alloc: Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const self: *LegacyOnlyExecutor = @ptrCast(@alignCast(ptr));
+        if (std.mem.indexOf(u8, req.uri, internal_api.routes.standby_replication) != null) {
+            self.canonical_attempts += 1;
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "not found"),
+            };
+        }
+        if (std.mem.indexOf(u8, req.uri, internal_api.routes.legacy_standby_replication) != null) self.legacy_requests += 1;
+        return try self.inner.execute(alloc, req);
+    }
+};
+
+test "storage.ha http replication client falls back to the legacy route prefix once" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "legacy-prefix-fallback");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var server = http_internal.Server.init(alloc, &primary);
+    var legacy_only = LegacyOnlyExecutor{ .inner = server.executor() };
+    var client = Client.init(alloc, legacy_only.executor());
+
+    try std.testing.expectEqual(PathStyle.unknown, client.path_style);
+    const identified = try client.identifySystem("http://primary.internal.test");
+    try std.testing.expectEqual(@as(i64, @intCast(identity.cluster_id)), identified.identity.cluster_id);
+    try std.testing.expectEqual(PathStyle.legacy, client.path_style);
+    try std.testing.expectEqual(@as(usize, 1), legacy_only.canonical_attempts);
+
+    try client.createReplicationSlot("http://primary.internal.test", "standby-a", 0);
+    try std.testing.expectEqual(@as(usize, 1), legacy_only.canonical_attempts);
+    try std.testing.expectEqual(@as(usize, 2), legacy_only.legacy_requests);
+    try std.testing.expect(primary.slot("standby-a") != null);
+}
+
+test "storage.ha http replication client stays on canonical routes when the upstream serves them" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "canonical-prefix");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+
+    _ = try client.identifySystem("http://primary.internal.test");
+    try std.testing.expectEqual(PathStyle.canonical, client.path_style);
 }
 
 test "storage.ha http replication client pulls applies and acknowledges standby progress" {

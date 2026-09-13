@@ -58,8 +58,9 @@ directories as standalone metadata, data, and inference nodes.
 standby: the primary replication log and slot store, the standby receive log
 and progress WAL, and the fence WAL. `antfly standalone` takes these paths
 through its `--ha-*` flags; the Kubernetes operator provisions exactly this
-layout under the data root, and `antfly ha --data-dir <data-dir>` opens
-whichever of these files exist and reads the log identity from them.
+layout under the data root, and `antfly standby --data-dir <data-dir>` opens
+whichever of these files exist and reads the log identity from them
+(`antfly ha` is a deprecated alias for `antfly standby`).
 
 Table database snapshots are a lower-level DB artifact and remain adjacent to
 the database path as `<db_path>.snapshots/<snapshot-id>/...`.

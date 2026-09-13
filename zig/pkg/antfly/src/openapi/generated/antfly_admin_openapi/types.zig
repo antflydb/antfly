@@ -9,7 +9,7 @@ pub const BaseBackupManifestPathRequest = struct {
 };
 
 pub const BaseBackupStartRequest = struct {
-    slot_name: HASlotName,
+    slot_name: StandbySlotName,
     /// Operator-chosen stable id for the base-backup manifest.
     manifest_id: []const u8,
 };
@@ -22,7 +22,7 @@ pub const CommitAppendRequest = struct {
     shard_id: ?i64 = null,
     table_id: ?i64 = null,
     commit_timestamp_ns: ?i64 = null,
-    sync_policy: HASyncPolicy,
+    sync_policy: StandbySyncPolicy,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -75,13 +75,13 @@ pub const CommitAppendRequest = struct {
 
 pub const CommitCheckRequest = struct {
     target_lsn: i64,
-    sync_policy: HASyncPolicy,
+    sync_policy: StandbySyncPolicy,
 };
 
 pub const FenceAcquireRequest = struct {
-    identity: HAIdentity,
-    old_primary_id: HANodeID,
-    promoted_node_id: HANodeID,
+    identity: StandbyIdentity,
+    old_primary_id: StandbyNodeID,
+    promoted_node_id: StandbyNodeID,
     new_timeline_id: i64,
     new_epoch: i64,
     /// Fence generation authorizing this fence. When the fencing authority is a Kubernetes Lease this is the exact Lease transition generation and must be supplied. When omitted, the node allocates the next generation itself: the current durable fence generation plus one, or 1 when no fence exists. Allocation is only permitted when the node is not configured with an external fencing authority, so a Lease-managed cluster cannot be fenced by an unauthorized caller.
@@ -143,7 +143,239 @@ pub const FenceAcquireRequest = struct {
     }
 };
 
-pub const HAActionReceipt = struct {
+pub const OwnerJobCheckRequest = struct {
+    role: []const u8,
+    kind: []const u8,
+    expected_identity: ?StandbyIdentity = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "kind", "kind", false },
+        .{ "expected_identity", "expected_identity", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.expected_identity) |value| {
+            try jw.objectField("expected_identity");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const PromotionAssessRequest = struct {
+    required_lsn: ?i64,
+    fencing_confirmed: bool,
+    force: bool,
+    use_current_fence: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "required_lsn", "required_lsn", false },
+        .{ "fencing_confirmed", "fencing_confirmed", false },
+        .{ "force", "force", false },
+        .{ "use_current_fence", "use_current_fence", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("required_lsn");
+        try jw.write(self.required_lsn);
+        try jw.objectField("fencing_confirmed");
+        try jw.write(self.fencing_confirmed);
+        try jw.objectField("force");
+        try jw.write(self.force);
+        try jw.objectField("use_current_fence");
+        try jw.write(self.use_current_fence);
+        try jw.endObject();
+    }
+};
+
+pub const ReadCheckRequest = struct {
+    consistency: ?[]const u8 = null,
+    required_lsn: OpenApiOptionalNullable(i64) = .absent,
+    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
+    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "consistency", "consistency", true },
+        .{ "required_lsn", "required_lsn", false },
+        .{ "required_metadata_lsn", "required_metadata_lsn", false },
+        .{ "metadata_applied_lsn", "metadata_applied_lsn", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.consistency) |value| {
+            try jw.objectField("consistency");
+            try jw.write(value);
+        }
+        switch (self.required_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.required_metadata_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.metadata_applied_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RejoinAssessRequest = struct {
+    /// Former primary node id that is attempting to rejoin.
+    node_id: StandbyNodeID,
+    identity: StandbyIdentity,
+    /// Last local LSN durably present on the former primary.
+    last_lsn: i64,
+    /// Earliest parent-timeline WAL LSN still retained for rewind.
+    retained_from_lsn: i64,
+    allow_rewind_after_forced_promotion: bool,
+    /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
+    receipt: ?StandbyFenceReceipt = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "node_id", "node_id", false },
+        .{ "identity", "identity", false },
+        .{ "last_lsn", "last_lsn", false },
+        .{ "retained_from_lsn", "retained_from_lsn", false },
+        .{ "allow_rewind_after_forced_promotion", "allow_rewind_after_forced_promotion", false },
+        .{ "receipt", "receipt", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("last_lsn");
+        try jw.write(self.last_lsn);
+        try jw.objectField("retained_from_lsn");
+        try jw.write(self.retained_from_lsn);
+        try jw.objectField("allow_rewind_after_forced_promotion");
+        try jw.write(self.allow_rewind_after_forced_promotion);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ReplicationSlotCreateRequest = struct {
+    slot_name: StandbySlotName,
+    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    initial_lsn: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        switch (self.initial_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("initial_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("initial_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SeedArtifactCaptureRequest = struct {
+    slot_name: StandbySlotName,
+    generation: []const u8,
+    topology_id: []const u8,
+    topology_generation: i64,
+    node_id: []const u8,
+    target_pvc_name: []const u8,
+    target_pvc_uid: []const u8,
+};
+
+pub const SeededSlotActivateRequest = struct {
+    slot_name: StandbySlotName,
+    generation: []const u8,
+    manifest_id: []const u8,
+    timeline_id: i64,
+    checkpoint_lsn: i64,
+    seed_receipt_sha256: []const u8,
+    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
+    capture_receipt_sha256: []const u8,
+    manifest_sha256: []const u8,
+    aggregate_sha256: []const u8,
+};
+
+pub const StandbyActionReceipt = struct {
     /// Stable action correlation id derived from the acted-on HA resource and boundary values.
     action_id: []const u8,
     /// Typed HA action that produced this response.
@@ -153,14 +385,14 @@ pub const HAActionReceipt = struct {
     /// Idempotency state for this action response.
     state: []const u8,
     /// Node id for the node-local admin endpoint that produced this receipt.
-    node_id: HANodeID,
+    node_id: StandbyNodeID,
 };
 
-pub const HABaseBackupBeginResponse = struct {
+pub const StandbyBaseBackupBeginResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
+    action: StandbyActionReceipt,
     /// Stable standby replication slot reserved for the base backup.
-    slot_name: HASlotName,
+    slot_name: StandbySlotName,
     /// Stable base-backup manifest id for retry and action correlation.
     manifest_id: []const u8,
     /// LSN reserved as the base-backup start boundary.
@@ -169,36 +401,70 @@ pub const HABaseBackupBeginResponse = struct {
     start_record_lsn: i64,
 };
 
-pub const HABaseBackupFinishResponse = struct {
+pub const StandbyBaseBackupFinishResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
+    action: StandbyActionReceipt,
     manifest_id: []const u8,
     backup_lsn: i64,
     /// Durable `backup_end` record LSN.
     end_record_lsn: i64,
 };
 
-pub const HACommitAppendResponse = struct {
+pub const StandbyBootstrapRequest = struct {
+    /// Absolute normalized pod-local path to the HA base-backup manifest.
+    manifest_path: []const u8,
+    /// Optional absolute normalized pod-local directory containing files referenced by the manifest.
+    content_root: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("manifest_path");
+        try jw.write(self.manifest_path);
+        switch (self.content_root) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content_root");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content_root");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const StandbyBootstrapResponse = struct {
+    schema_version: i64,
+    action: StandbyActionReceipt,
+    manifest_id: []const u8,
+    backup_lsn: i64,
+    /// Standby checkpoint LSN after manifest validation.
+    checkpoint_lsn: i64,
+};
+
+pub const StandbyCommitAppendResponse = struct {
     schema_version: i64,
     lsn: i64,
-    gate: HACommitGate,
+    gate: StandbyCommitGate,
 };
 
-pub const HACommitCheckResponse = struct {
+pub const StandbyCommitCheckResponse = struct {
     schema_version: i64,
-    gate: HACommitGate,
+    gate: StandbyCommitGate,
 };
 
-pub const HACommitGate = struct {
+pub const StandbyCommitGate = struct {
     target_lsn: i64,
     action: []const u8,
-    durability: HADurabilityDecision,
+    durability: StandbyDurabilityDecision,
 };
 
-pub const HACurrentFenceResponse = struct {
+pub const StandbyCurrentFenceResponse = struct {
     schema_version: i64,
     held: bool,
-    receipt: ?HAFenceReceipt = null,
+    receipt: ?StandbyFenceReceipt = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -229,7 +495,7 @@ pub const HACurrentFenceResponse = struct {
     }
 };
 
-pub const HADurabilityDecision = struct {
+pub const StandbyDurabilityDecision = struct {
     status: []const u8,
     mode: []const u8,
     selection: []const u8,
@@ -241,10 +507,10 @@ pub const HADurabilityDecision = struct {
     candidate_count: i64,
 };
 
-pub const HAFenceReceipt = struct {
-    identity: HAIdentity,
-    old_primary_id: HANodeID,
-    promoted_node_id: HANodeID,
+pub const StandbyFenceReceipt = struct {
+    identity: StandbyIdentity,
+    old_primary_id: StandbyNodeID,
+    promoted_node_id: StandbyNodeID,
     parent_timeline_id: i64,
     parent_epoch: i64,
     new_timeline_id: i64,
@@ -257,16 +523,16 @@ pub const HAFenceReceipt = struct {
     reason: []const u8,
 };
 
-pub const HAFenceResponse = struct {
+pub const StandbyFenceResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    receipt: HAFenceReceipt,
+    action: StandbyActionReceipt,
+    receipt: StandbyFenceReceipt,
 };
 
 /// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
-pub const HAIdentifier = []const u8;
+pub const StandbyIdentifier = []const u8;
 
-pub const HAIdentity = struct {
+pub const StandbyIdentity = struct {
     cluster_id: i64,
     /// Shard identity. Use 0 for whole-instance HA scope.
     shard_id: i64,
@@ -276,7 +542,7 @@ pub const HAIdentity = struct {
     epoch: i64,
 };
 
-pub const HALeaseWatchdogProof = struct {
+pub const StandbyLeaseWatchdogProof = struct {
     capability_version: i64,
     /// Watchdog capability is running and has validated this exact shared Lease.
     active: bool,
@@ -288,9 +554,9 @@ pub const HALeaseWatchdogProof = struct {
     lease_namespace: []const u8,
     stable_topology_id: []const u8,
     /// Local runtime node id producing the proof.
-    local_node_id: HANodeID,
+    local_node_id: StandbyNodeID,
     /// Holder identity copied from the exact validated Kubernetes Lease.
-    observed_holder_node_id: HANodeID,
+    observed_holder_node_id: StandbyNodeID,
     pod_uid: []const u8,
     process_boot_id: []const u8,
     observed_lease_transitions: i64,
@@ -298,21 +564,21 @@ pub const HALeaseWatchdogProof = struct {
 };
 
 /// Stable HA node id.
-pub const HANodeID = []const u8;
+pub const StandbyNodeID = []const u8;
 
-pub const HAOwnerJobCheckResponse = struct {
+pub const StandbyOwnerJobCheckResponse = struct {
     schema_version: i64,
-    decision: HAOwnerJobDecision,
+    decision: StandbyOwnerJobDecision,
 };
 
-pub const HAOwnerJobDecision = struct {
+pub const StandbyOwnerJobDecision = struct {
     kind: []const u8,
     role: []const u8,
     action: []const u8,
-    identity: HAIdentity,
+    identity: StandbyIdentity,
     durable_lsn: i64,
     next_lsn: i64,
-    promotion_handoff: ?HAPromotionHandoff = null,
+    promotion_handoff: ?StandbyPromotionHandoff = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -355,16 +621,16 @@ pub const HAOwnerJobDecision = struct {
     }
 };
 
-pub const HAPrimarySnapshot = struct {
+pub const StandbyPrimarySnapshot = struct {
     role: []const u8,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
-    node_id: HANodeID,
-    identity: HAIdentity,
+    node_id: StandbyNodeID,
+    identity: StandbyIdentity,
     current_lsn: i64,
-    slots: []const HASlotSnapshot,
-    retention: HARetentionSnapshot,
-    durability: ?HADurabilityDecision = null,
-    lease_watchdog: ?HALeaseWatchdogProof = null,
+    slots: []const StandbySlotSnapshot,
+    retention: StandbyRetentionSnapshot,
+    durability: ?StandbyDurabilityDecision = null,
+    lease_watchdog: ?StandbyLeaseWatchdogProof = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -412,18 +678,18 @@ pub const HAPrimarySnapshot = struct {
     }
 };
 
-pub const HAPrimaryStatusResponse = struct {
+pub const StandbyPrimaryStatusResponse = struct {
     schema_version: i64,
-    snapshot: HAPrimarySnapshot,
+    snapshot: StandbyPrimarySnapshot,
 };
 
-pub const HAPromotionAssessResponse = struct {
+pub const StandbyPromotionAssessResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    assessment: HAPromotionAssessment,
+    action: StandbyActionReceipt,
+    assessment: StandbyPromotionAssessment,
 };
 
-pub const HAPromotionAssessment = struct {
+pub const StandbyPromotionAssessment = struct {
     required_lsn: i64,
     received_lsn: i64,
     applied_lsn: i64,
@@ -440,38 +706,38 @@ pub const HAPromotionAssessment = struct {
     can_promote: bool,
 };
 
-pub const HAPromotionHandoff = struct {
-    identity: HAIdentity,
+pub const StandbyPromotionHandoff = struct {
+    identity: StandbyIdentity,
     switch_lsn: i64,
     next_lsn: i64,
 };
 
-pub const HAPromotionResponse = struct {
+pub const StandbyPromotionResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    assessment: HAPromotionAssessment,
-    promotion: HAPromotionResult,
+    action: StandbyActionReceipt,
+    assessment: StandbyPromotionAssessment,
+    promotion: StandbyPromotionResult,
     fence_generation: i64,
     fence_token: []const u8,
     forced: bool,
 };
 
-pub const HAPromotionResult = struct {
+pub const StandbyPromotionResult = struct {
     /// Standby node id that executed the promotion.
-    node_id: HANodeID,
+    node_id: StandbyNodeID,
     switch_lsn: i64,
-    old_identity: HAIdentity,
-    new_identity: HAIdentity,
+    old_identity: StandbyIdentity,
+    new_identity: StandbyIdentity,
     forced: bool,
     data_loss_possible: bool,
 };
 
-pub const HAReadCheckResponse = struct {
+pub const StandbyReadCheckResponse = struct {
     schema_version: i64,
-    decision: HAReadDecision,
+    decision: StandbyReadDecision,
 };
 
-pub const HAReadDecision = struct {
+pub const StandbyReadDecision = struct {
     action: []const u8,
     consistency: []const u8,
     required_lsn: OpenApiOptionalNullable(i64) = .absent,
@@ -548,14 +814,14 @@ pub const HAReadDecision = struct {
     }
 };
 
-pub const HARejoinAssessResponse = struct {
+pub const StandbyRejoinAssessResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    assessment: HARejoinAssessment,
+    action: StandbyActionReceipt,
+    assessment: StandbyRejoinAssessment,
     /// Present when `/ha/rejoin/rewind` executed against a configured local former-primary log.
-    rewind: ?HARejoinRewindResult = null,
+    rewind: ?StandbyRejoinRewindResult = null,
     /// Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
-    reseed: ?HARejoinReseedResult = null,
+    reseed: ?StandbyRejoinReseedResult = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -594,10 +860,10 @@ pub const HARejoinAssessResponse = struct {
     }
 };
 
-pub const HARejoinAssessment = struct {
+pub const StandbyRejoinAssessment = struct {
     action: []const u8,
     reason: []const u8,
-    former_node_id: HANodeID,
+    former_node_id: StandbyNodeID,
     target_timeline_id: i64,
     target_epoch: i64,
     /// Cluster identity of the retained parent-timeline fork record.
@@ -616,10 +882,10 @@ pub const HARejoinAssessment = struct {
     data_loss_discarded: bool,
 };
 
-pub const HARejoinReseedResult = struct {
+pub const StandbyRejoinReseedResult = struct {
     /// Former primary node id scheduled for reseed.
-    node_id: HANodeID,
-    slot_name: HASlotName,
+    node_id: StandbyNodeID,
+    slot_name: StandbySlotName,
     target_timeline_id: i64,
     target_epoch: i64,
     fork_lsn: i64,
@@ -628,9 +894,9 @@ pub const HARejoinReseedResult = struct {
     base_backup_required: bool,
 };
 
-pub const HARejoinRewindResult = struct {
+pub const StandbyRejoinRewindResult = struct {
     /// Former primary node id whose local log was rewound.
-    node_id: HANodeID,
+    node_id: StandbyNodeID,
     fork_lsn: i64,
     previous_last_lsn: i64,
     current_last_lsn: i64,
@@ -641,8 +907,8 @@ pub const HARejoinRewindResult = struct {
     data_loss_discarded: bool,
 };
 
-pub const HAReplicationSlot = struct {
-    slot_name: HASlotName,
+pub const StandbyReplicationSlot = struct {
+    slot_name: StandbySlotName,
     timeline_id: i64,
     restart_lsn: i64,
     received_lsn: i64,
@@ -700,19 +966,19 @@ pub const HAReplicationSlot = struct {
     }
 };
 
-pub const HAReplicationSlotActionResponse = struct {
+pub const StandbyReplicationSlotActionResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
+    action: StandbyActionReceipt,
     slot_action: []const u8,
-    slot: HAReplicationSlot,
+    slot: StandbyReplicationSlot,
 };
 
-pub const HAReplicationSlotListResponse = struct {
+pub const StandbyReplicationSlotListResponse = struct {
     schema_version: i64,
-    slots: []const HAReplicationSlot,
+    slots: []const StandbyReplicationSlot,
 };
 
-pub const HARetentionSnapshot = struct {
+pub const StandbyRetentionSnapshot = struct {
     primary_lsn: i64,
     oldest_restart_lsn: i64,
     retained_lsn_count: i64,
@@ -722,7 +988,7 @@ pub const HARetentionSnapshot = struct {
     reseed_recommended: i64,
 };
 
-pub const HARuntimeLifecycleObservation = struct {
+pub const StandbyRuntimeLifecycleObservation = struct {
     node_id: OpenApiOptionalNullable([]const u8) = .absent,
     role: []const u8,
     pod_uid: OpenApiOptionalNullable([]const u8) = .absent,
@@ -763,10 +1029,10 @@ pub const HARuntimeLifecycleObservation = struct {
     }
 };
 
-pub const HASeedArtifactCaptureResponse = struct {
+pub const StandbySeedArtifactCaptureResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    slot_name: HASlotName,
+    action: StandbyActionReceipt,
+    slot_name: StandbySlotName,
     generation: []const u8,
     topology_id: []const u8,
     topology_generation: i64,
@@ -794,11 +1060,11 @@ pub const HASeedArtifactCaptureResponse = struct {
     already_captured: bool,
 };
 
-pub const HASeedLifecycleReceiptEvent = struct {
+pub const StandbySeedLifecycleReceiptEvent = struct {
     cursor: i64,
     kind: []const u8,
     generation: []const u8,
-    slot_name: HASlotName,
+    slot_name: StandbySlotName,
     topology_id: []const u8,
     topology_generation: i64,
     node_id: []const u8,
@@ -853,22 +1119,22 @@ pub const HASeedLifecycleReceiptEvent = struct {
     }
 };
 
-pub const HASeedLifecycleReceiptInventoryResponse = struct {
+pub const StandbySeedLifecycleReceiptInventoryResponse = struct {
     schema_version: i64,
-    entries: []const HASeedLifecycleReceiptEvent,
+    entries: []const StandbySeedLifecycleReceiptEvent,
     first_cursor: i64,
     end_cursor: i64,
     next_cursor: i64,
     history_truncated: bool,
     gap: bool,
     has_more: bool,
-    runtime: HARuntimeLifecycleObservation,
+    runtime: StandbyRuntimeLifecycleObservation,
 };
 
-pub const HASeededSlotActivateResponse = struct {
+pub const StandbySeededSlotActivateResponse = struct {
     schema_version: i64,
-    action: HAActionReceipt,
-    slot_name: HASlotName,
+    action: StandbyActionReceipt,
+    slot_name: StandbySlotName,
     generation: []const u8,
     manifest_id: []const u8,
     timeline_id: i64,
@@ -881,9 +1147,9 @@ pub const HASeededSlotActivateResponse = struct {
 };
 
 /// Stable standby replication slot name.
-pub const HASlotName = []const u8;
+pub const StandbySlotName = []const u8;
 
-pub const HASlotSnapshot = struct {
+pub const StandbySlotSnapshot = struct {
     name: []const u8,
     timeline_id: i64,
     active: bool,
@@ -942,20 +1208,11 @@ pub const HASlotSnapshot = struct {
     }
 };
 
-pub const HAStandbyBootstrapResponse = struct {
-    schema_version: i64,
-    action: HAActionReceipt,
-    manifest_id: []const u8,
-    backup_lsn: i64,
-    /// Standby checkpoint LSN after manifest validation.
-    checkpoint_lsn: i64,
-};
-
-pub const HAStandbySnapshot = struct {
+pub const StandbySnapshot = struct {
     role: []const u8,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
-    node_id: HANodeID,
-    identity: HAIdentity,
+    node_id: StandbyNodeID,
+    identity: StandbyIdentity,
     received_lsn: i64,
     applied_lsn: i64,
     safe_read_lsn: i64,
@@ -974,7 +1231,7 @@ pub const HAStandbySnapshot = struct {
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
-    lease_watchdog: ?HALeaseWatchdogProof = null,
+    lease_watchdog: ?StandbyLeaseWatchdogProof = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1122,65 +1379,12 @@ pub const HAStandbySnapshot = struct {
     }
 };
 
-pub const HAStandbyStatusResponse = struct {
+pub const StandbyStatusResponse = struct {
     schema_version: i64,
-    snapshot: HAStandbySnapshot,
+    snapshot: StandbySnapshot,
 };
 
-pub const HAStandbyUpstream = struct {
-    upstream_url: []const u8,
-    slot_name: HASlotName,
-};
-
-pub const HAStandbyUpstreamResponse = struct {
-    schema_version: i64,
-    action: HAActionReceipt,
-    identity: HAIdentity,
-    upstream: HAStandbyUpstream,
-    /// Upstream in effect before this request. Absent when the standby had no continuous upstream configured.
-    previous: ?HAStandbyUpstream = null,
-    /// False when the requested upstream already matched, which makes retries idempotent.
-    changed: bool,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "schema_version", "schema_version", false },
-        .{ "action", "action", false },
-        .{ "identity", "identity", false },
-        .{ "upstream", "upstream", false },
-        .{ "previous", "previous", true },
-        .{ "changed", "changed", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("schema_version");
-        try jw.write(self.schema_version);
-        try jw.objectField("action");
-        try jw.write(self.action);
-        try jw.objectField("identity");
-        try jw.write(self.identity);
-        try jw.objectField("upstream");
-        try jw.write(self.upstream);
-        if (self.previous) |value| {
-            try jw.objectField("previous");
-            try jw.write(value);
-        }
-        try jw.objectField("changed");
-        try jw.write(self.changed);
-        try jw.endObject();
-    }
-};
-
-pub const HASyncPolicy = struct {
+pub const StandbySyncPolicy = struct {
     /// Durability mode to require before acknowledging the commit.
     mode: []const u8,
     /// How named standbys are selected to satisfy the policy.
@@ -1188,7 +1392,7 @@ pub const HASyncPolicy = struct {
     /// Number of eligible standbys required for `any` selection.
     required: ?i64 = null,
     /// Ordered candidate standby names for synchronous commit.
-    standby_names: ?[]const HASlotName = null,
+    standby_names: ?[]const StandbySlotName = null,
     /// Caller-visible action when synchronous durability is not currently satisfied.
     failure_policy: ?[]const u8 = null,
 
@@ -1233,23 +1437,116 @@ pub const HASyncPolicy = struct {
     }
 };
 
-pub const HAWatchdogProofResponse = struct {
-    schema_version: i64,
-    proof: HALeaseWatchdogProof,
+pub const StandbyUpstream = struct {
+    upstream_url: []const u8,
+    slot_name: StandbySlotName,
 };
 
-pub const HAWriteCheckResponse = struct {
-    schema_version: i64,
-    decision: HAWriteDecision,
+pub const StandbyUpstreamRequest = struct {
+    /// Identity the standby is expected to have right now. Mismatch rejects the swap.
+    identity: StandbyIdentity,
+    /// Base URL of the primary to pull from.
+    upstream_url: []const u8,
+    slot_name: StandbySlotName,
+    reason: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "identity", "identity", false },
+        .{ "upstream_url", "upstream_url", false },
+        .{ "slot_name", "slot_name", false },
+        .{ "reason", "reason", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("upstream_url");
+        try jw.write(self.upstream_url);
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
-pub const HAWriteDecision = struct {
+pub const StandbyUpstreamResponse = struct {
+    schema_version: i64,
+    action: StandbyActionReceipt,
+    identity: StandbyIdentity,
+    upstream: StandbyUpstream,
+    /// Upstream in effect before this request. Absent when the standby had no continuous upstream configured.
+    previous: ?StandbyUpstream = null,
+    /// False when the requested upstream already matched, which makes retries idempotent.
+    changed: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "action", "action", false },
+        .{ "identity", "identity", false },
+        .{ "upstream", "upstream", false },
+        .{ "previous", "previous", true },
+        .{ "changed", "changed", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("upstream");
+        try jw.write(self.upstream);
+        if (self.previous) |value| {
+            try jw.objectField("previous");
+            try jw.write(value);
+        }
+        try jw.objectField("changed");
+        try jw.write(self.changed);
+        try jw.endObject();
+    }
+};
+
+pub const StandbyWatchdogProofResponse = struct {
+    schema_version: i64,
+    proof: StandbyLeaseWatchdogProof,
+};
+
+pub const StandbyWriteCheckResponse = struct {
+    schema_version: i64,
+    decision: StandbyWriteDecision,
+};
+
+pub const StandbyWriteDecision = struct {
     role: []const u8,
     action: []const u8,
-    identity: HAIdentity,
+    identity: StandbyIdentity,
     durable_lsn: i64,
     next_lsn: i64,
-    promotion_handoff: ?HAPromotionHandoff = null,
+    promotion_handoff: ?StandbyPromotionHandoff = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1283,303 +1580,6 @@ pub const HAWriteDecision = struct {
         try jw.write(self.next_lsn);
         if (self.promotion_handoff) |value| {
             try jw.objectField("promotion_handoff");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const OwnerJobCheckRequest = struct {
-    role: []const u8,
-    kind: []const u8,
-    expected_identity: ?HAIdentity = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "role", "role", false },
-        .{ "kind", "kind", false },
-        .{ "expected_identity", "expected_identity", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("role");
-        try jw.write(self.role);
-        try jw.objectField("kind");
-        try jw.write(self.kind);
-        if (self.expected_identity) |value| {
-            try jw.objectField("expected_identity");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const PromotionAssessRequest = struct {
-    required_lsn: ?i64,
-    fencing_confirmed: bool,
-    force: bool,
-    use_current_fence: bool,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "required_lsn", "required_lsn", false },
-        .{ "fencing_confirmed", "fencing_confirmed", false },
-        .{ "force", "force", false },
-        .{ "use_current_fence", "use_current_fence", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("required_lsn");
-        try jw.write(self.required_lsn);
-        try jw.objectField("fencing_confirmed");
-        try jw.write(self.fencing_confirmed);
-        try jw.objectField("force");
-        try jw.write(self.force);
-        try jw.objectField("use_current_fence");
-        try jw.write(self.use_current_fence);
-        try jw.endObject();
-    }
-};
-
-pub const ReadCheckRequest = struct {
-    consistency: ?[]const u8 = null,
-    required_lsn: OpenApiOptionalNullable(i64) = .absent,
-    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
-    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "consistency", "consistency", true },
-        .{ "required_lsn", "required_lsn", false },
-        .{ "required_metadata_lsn", "required_metadata_lsn", false },
-        .{ "metadata_applied_lsn", "metadata_applied_lsn", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.consistency) |value| {
-            try jw.objectField("consistency");
-            try jw.write(value);
-        }
-        switch (self.required_lsn) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("required_lsn");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("required_lsn");
-                try jw.write(value);
-            },
-        }
-        switch (self.required_metadata_lsn) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("required_metadata_lsn");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("required_metadata_lsn");
-                try jw.write(value);
-            },
-        }
-        switch (self.metadata_applied_lsn) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("metadata_applied_lsn");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("metadata_applied_lsn");
-                try jw.write(value);
-            },
-        }
-        try jw.endObject();
-    }
-};
-
-pub const RejoinAssessRequest = struct {
-    /// Former primary node id that is attempting to rejoin.
-    node_id: HANodeID,
-    identity: HAIdentity,
-    /// Last local LSN durably present on the former primary.
-    last_lsn: i64,
-    /// Earliest parent-timeline WAL LSN still retained for rewind.
-    retained_from_lsn: i64,
-    allow_rewind_after_forced_promotion: bool,
-    /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
-    receipt: ?HAFenceReceipt = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "node_id", "node_id", false },
-        .{ "identity", "identity", false },
-        .{ "last_lsn", "last_lsn", false },
-        .{ "retained_from_lsn", "retained_from_lsn", false },
-        .{ "allow_rewind_after_forced_promotion", "allow_rewind_after_forced_promotion", false },
-        .{ "receipt", "receipt", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("node_id");
-        try jw.write(self.node_id);
-        try jw.objectField("identity");
-        try jw.write(self.identity);
-        try jw.objectField("last_lsn");
-        try jw.write(self.last_lsn);
-        try jw.objectField("retained_from_lsn");
-        try jw.write(self.retained_from_lsn);
-        try jw.objectField("allow_rewind_after_forced_promotion");
-        try jw.write(self.allow_rewind_after_forced_promotion);
-        if (self.receipt) |value| {
-            try jw.objectField("receipt");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const ReplicationSlotCreateRequest = struct {
-    slot_name: HASlotName,
-    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: OpenApiOptionalNullable(i64) = .absent,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("slot_name");
-        try jw.write(self.slot_name);
-        switch (self.initial_lsn) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("initial_lsn");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("initial_lsn");
-                try jw.write(value);
-            },
-        }
-        try jw.endObject();
-    }
-};
-
-pub const SeedArtifactCaptureRequest = struct {
-    slot_name: HASlotName,
-    generation: []const u8,
-    topology_id: []const u8,
-    topology_generation: i64,
-    node_id: []const u8,
-    target_pvc_name: []const u8,
-    target_pvc_uid: []const u8,
-};
-
-pub const SeededSlotActivateRequest = struct {
-    slot_name: HASlotName,
-    generation: []const u8,
-    manifest_id: []const u8,
-    timeline_id: i64,
-    checkpoint_lsn: i64,
-    seed_receipt_sha256: []const u8,
-    /// SHA-256 of the exact runtime-owned capture COMPLETE receipt bytes that authorized publication.
-    capture_receipt_sha256: []const u8,
-    manifest_sha256: []const u8,
-    aggregate_sha256: []const u8,
-};
-
-pub const StandbyBootstrapRequest = struct {
-    /// Absolute normalized pod-local path to the HA base-backup manifest.
-    manifest_path: []const u8,
-    /// Optional absolute normalized pod-local directory containing files referenced by the manifest.
-    content_root: OpenApiOptionalNullable([]const u8) = .absent,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("manifest_path");
-        try jw.write(self.manifest_path);
-        switch (self.content_root) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("content_root");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("content_root");
-                try jw.write(value);
-            },
-        }
-        try jw.endObject();
-    }
-};
-
-pub const StandbyUpstreamRequest = struct {
-    /// Identity the standby is expected to have right now. Mismatch rejects the swap.
-    identity: HAIdentity,
-    /// Base URL of the primary to pull from.
-    upstream_url: []const u8,
-    slot_name: HASlotName,
-    reason: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "identity", "identity", false },
-        .{ "upstream_url", "upstream_url", false },
-        .{ "slot_name", "slot_name", false },
-        .{ "reason", "reason", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("identity");
-        try jw.write(self.identity);
-        try jw.objectField("upstream_url");
-        try jw.write(self.upstream_url);
-        try jw.objectField("slot_name");
-        try jw.write(self.slot_name);
-        if (self.reason) |value| {
-            try jw.objectField("reason");
             try jw.write(value);
         }
         try jw.endObject();
@@ -1791,7 +1791,7 @@ pub const StorageMaintenanceState = enum {
 
 pub const WriteCheckRequest = struct {
     role: []const u8,
-    expected_identity: ?HAIdentity = null,
+    expected_identity: ?StandbyIdentity = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{

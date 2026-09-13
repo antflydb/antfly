@@ -60,7 +60,7 @@ Implementation notes:
   receive/apply crash windows, sync-ack crashes, duplicate/gap/out-of-order
   WAL, fenced and unfenced promotion, old-primary rejoin/rewind/reseed, WAL
   expiry, and timeline propagation.
-- Hot-standby HA is productionized: runtime wiring, generated `/admin/v1/ha`
+- Hot-standby HA is productionized: runtime wiring, generated `/admin/v1/standby`
   Zig and Go clients, `go/pkg/operator` integration through the Go SDK
   wrapper, real base backup, sync commit, fencing, promotion/timeline/
   former-primary repair, standby freshness, WAL retention/reseed, auth,
@@ -464,7 +464,7 @@ choices.
 ## API and CLI Surface
 
 The HA control plane should be API-first. The stable automation contract should
-be a typed, versioned `/admin/v1/ha` API specified in
+be a typed, versioned `/admin/v1/standby` API specified in
 `specs/openapi/antfly/admin.yaml`, with Zig admin API routing and helpers under
 `zig/pkg/antfly/src/admin/`. The CLI should remain as an ergonomic human and
 break-glass interface, but long-term operator automation should not depend on
@@ -492,7 +492,7 @@ The implementation path is:
    promotion state, and rejoin state; and
 5. generate the same admin OpenAPI contract into `go/pkg/sdk/admin`, keep a
    small hand-written Go wrapper around the generated client, and have
-   `go/pkg/operator` and other Go automation call that typed `/admin/v1/ha`
+   `go/pkg/operator` and other Go automation call that typed `/admin/v1/standby`
    wrapper. The supported Zig CLI should use the Zig admin bindings generated
    from the same spec rather than importing or shelling through the Go SDK.
 
@@ -508,7 +508,7 @@ and standby-status-update.
 
 Recommended split:
 
-- `/admin/v1/ha`: human and operator control-plane actions. This API owns
+- `/admin/v1/standby`: human and operator control-plane actions. This API owns
   replication slot lifecycle, base-backup orchestration, HA status, fencing
   receipts, promotion, former-primary rejoin, rewind, and reseed workflows. It
   should return typed responses with action ids, LSNs, timelines, fence tokens,
@@ -521,7 +521,7 @@ Recommended split:
   is where WAL streaming, replication pulls, standby status updates, identity
   probes, and other node-to-node mechanisms belong. It should not be the
   operator policy or human operations surface.
-- CLI: a thin client over `/admin/v1/ha` for remote operations, plus local
+- CLI: a thin client over `/admin/v1/standby` for remote operations, plus local
   offline helpers where useful. CLI output should be derived from the same typed
   responses the admin API returns.
 - Go SDK: generated client/types under `go/pkg/sdk/admin/oapi`, with a
@@ -583,7 +583,7 @@ error, then layer type checks on top of the shared classifier:
 Admin authentication should be explicit but operationally simple. The Antfly
 runtime may be started with `--admin-token-env <name>`; when set, the Zig
 process reads a bearer token from that environment variable at startup and
-requires `Authorization: Bearer <token>` on typed `/admin/v1/ha` routes. Health
+requires `Authorization: Bearer <token>` on typed `/admin/v1/standby` routes. Health
 checks and node-to-node `/internal/v1` replication traffic are separate from
 this control-plane auth path. The operator should read its outbound bearer token
 from `spec.highAvailability.admin.tokenEnvVar`, defaulting to
@@ -594,12 +594,13 @@ When `adminTokenSecretRef` is used, the referenced Secret key should be required
 (`optional: false`) so pods do not start without the admin token. Kubernetes
 should inject both process environments from Secrets; the operator should not
 need direct Secret read permissions merely to call the HA admin API.
-For human or break-glass operations, `antfly ha --admin-url <url> <command>`
+For human or break-glass operations, `antfly standby --admin-url <url> <command>`
 resolves the bearer token from the environment variable named by
-`--admin-token-env` (default `ANTFLY_HA_ADMIN_TOKEN` when that variable is set)
-and sends it to the typed admin routes. `ANTFLY_HA_ADMIN_URL` supplies the
-default admin URL when no target flag is given. On the node itself,
-`antfly ha --data-dir <dir> <command>` opens the local HA state under
+`--admin-token-env` (default `ANTFLY_STANDBY_ADMIN_TOKEN`, falling back to
+`ANTFLY_HA_ADMIN_TOKEN`, when one of those variables is set) and sends it to
+the typed admin routes. `ANTFLY_STANDBY_ADMIN_URL` (falling back to
+`ANTFLY_HA_ADMIN_URL`) supplies the default admin URL when no target flag is
+given. On the node itself, `antfly standby --data-dir <dir> <command>` opens the local HA state under
 `<dir>/ha/` directly and reads the log identity from the files, so no path or
 identity flags are needed. The `--ha-url`, `--ha-token-env`, and `--ha-*`
 identity spellings remain accepted as aliases, and the `--` separator before
@@ -634,10 +635,10 @@ performed the intended step. The Kubernetes operator should publish the expected
 node-local executor as `status.haStatus.plannedActions[].adminNodeID` and reject
 typed action receipts whose `action.node_id` does not match it.
 
-Kubernetes Jobs that run `antfly ha ...` are acceptable as a bootstrap mechanism
+Kubernetes Jobs that run `antfly standby ...` are acceptable as a bootstrap mechanism
 for workflows that need pod-local volume mounts or shared backup files. They
 should not become the only production automation path. The operator should move
-toward typed `/admin/v1/ha` calls for idempotent actions and reserve CLI Jobs
+toward typed `/admin/v1/standby` calls for idempotent actions and reserve CLI Jobs
 for explicitly local file-transfer or recovery steps.
 
 ### Implementation Guardrails
@@ -682,7 +683,7 @@ The concrete follow-up decisions are:
   fences, old-primary rejoin, rewind, reseed, retained-WAL expiry, and timeline
   switch propagation.
 - Do not advertise production-grade Postgres-style HA parity until the runtime
-  wiring, generated `/admin/v1/ha` Zig and Go clients, `go/pkg/operator`
+  wiring, generated `/admin/v1/standby` Zig and Go clients, `go/pkg/operator`
   integration, real base backup, synchronous commit, fencing, promotion
   receipts, standby freshness, retention/reseed handling, auth, audit, metrics,
   runbooks, compatibility tests, crash/e2e/operator coverage, and former-primary
@@ -704,7 +705,7 @@ replication path, the implementation should satisfy this checklist:
   and after synchronous acknowledgement, duplicate/gap/out-of-order WAL,
   promotion with and without fence evidence, old-primary rejoin, rewind, reseed,
   WAL-retention expiry, and timeline switch propagation;
-- production-grade scope includes the generated `/admin/v1/ha` Zig and Go
+- production-grade scope includes the generated `/admin/v1/standby` Zig and Go
   clients, `go/pkg/operator` integration through the Go SDK wrapper, real
   base-backup/reseed workflows, synchronous commit modes, fencing, promotion
   receipts, former-primary repair, standby freshness controls, WAL retention
@@ -778,7 +779,7 @@ retained-WAL expiry forcing reseed, and timeline switch propagation.
 
 Production-grade Postgres-style parity requires more than streaming records. The
 bulk feature-parity bar includes end-to-end primary/standby runtime wiring,
-generated `/admin/v1/ha` Zig and Go SDK clients, `go/pkg/operator` integration,
+generated `/admin/v1/standby` Zig and Go SDK clients, `go/pkg/operator` integration,
 real base-backup and seed workflows, `remote_write` and `remote_apply`
 synchronous commit policies, hard-to-misuse fencing, promotion/timeline
 switch/former-primary repair, standby freshness controls, WAL retention and
@@ -787,32 +788,34 @@ tests, black-box e2e, operator e2e, and crash/simulation coverage.
 
 ## Operator CLI and Configuration
 
-This section records the design of the `antfly ha` command and the `ha` config
-section as they exist after the v0.2.1 ergonomics pass. The goal was the
-PostgreSQL shape: identity and paths are written once, tools derive everything
-else from the data directory or the config file, and the verbs an operator
-types match the vocabulary of `pg_ctl promote`, `pg_rewind`, `repmgr standby
-follow`, and `patronictl switchover`. The command keeps its `ha` noun; the four
-availability modes are summarized in `STORAGE.md`, and `ha` is the only one
-with hand-operated verbs.
+This section records the design of the `antfly standby` command (`antfly ha`
+is a deprecated alias) and the `hot_standby` config section (the deprecated
+`ha` key is still read) as they exist after the v0.3 naming pass. The goal was
+the PostgreSQL shape: identity and paths are written once, tools derive
+everything else from the data directory or the config file, and the verbs an
+operator types match the vocabulary of `pg_ctl promote`, `pg_rewind`, `repmgr
+standby follow`, and `patronictl switchover`. The four availability modes are
+summarized in `STORAGE.md`, and hot standby is the only one with
+hand-operated verbs.
 
 ### Naming
 
-The command, config section, and admin API currently use the noun `ha`. That
-is ambiguous: Raft replication, Lite's fsync durability, and serverless
+The command, config section, and admin API used the noun `ha` through v0.2.x.
+That was ambiguous: Raft replication, Lite's fsync durability, and serverless
 object storage are also availability stories, and `STORAGE.md` lists all four.
-The decision for v0.3 is to rename this surface to **`standby`**:
+This release renames the surface to **`standby`**:
 
-| Surface | Today | v0.3 |
+| Surface | Before | Now |
 |---|---|---|
 | CLI | `antfly ha` | `antfly standby` (`ha` kept as a hidden alias for one minor) |
-| Config section | `ha:` | `hot_standby:` (covers both roles; PostgreSQL's `hot_standby` is the precedent) |
-| Admin API | `/admin/v1/ha/...`, `/ha/v1/health`, `/ha/v1/ready` | `/admin/v1/standby/...`, `/standby/v1/...`; old paths served as aliases for one minor |
+| Config section | `ha:` | `hot_standby:` (covers both roles; PostgreSQL's `hot_standby` is the precedent; `ha:` is still read) |
+| Admin API | `/admin/v1/ha/...`, `/ha/v1/health`, `/ha/v1/ready` | `/admin/v1/standby/...`, `/standby/v1/health`, `/standby/v1/ready`; old paths served as aliases for one minor |
 | Schemas and SDKs | `HAIdentity`, `HAFenceReceipt`, `HAStandbySnapshot`, ... | `StandbyIdentity`, `StandbyFenceReceipt`, `StandbySnapshot`, ... |
 | Operator CRD | `spec.highAvailability` | unchanged; a CRD field rename needs a new API version and conversion, and `highAvailability` remains a sensible umbrella |
-| Admin token env | `ANTFLY_HA_ADMIN_TOKEN` | kept; `ANTFLY_STANDBY_ADMIN_TOKEN` may be added with the old name as fallback |
+| Admin token env | `ANTFLY_HA_ADMIN_TOKEN` | `ANTFLY_STANDBY_ADMIN_TOKEN` added as the preferred name; `ANTFLY_HA_ADMIN_TOKEN` still works as a fallback |
 | Metrics | subsystem `ha` | `standby`, dual-emitted during the deprecation window |
-| Internal package | `storage/ha` | unchanged; not user-facing |
+| Internal replication API | `/internal/v1/ha/replication/...`, `HAIdentity`, `HAReplicationFrame`, ... | `/internal/v1/standby/replication/...`, `StandbyIdentity`, `StandbyReplicationFrame`, ...; the old prefix is served as an alias and a new standby falls back to it once when its primary still runs 0.2, so either side may be upgraded first |
+| Internal package | `storage/ha` | `storage/standby` |
 
 `replication` was considered and rejected because it already names three
 different things in Antfly: `replication_factor` (Raft replicas of a shard),
@@ -826,31 +829,40 @@ the schemas, and this document's filename. The verbs read as they do in
 repmgr: `antfly standby promote`, `antfly standby follow`, `antfly standby
 switchover`.
 
-Compatibility follows the same rule as every other change to this surface:
-the server accepts both spellings for one minor release, and the Kubernetes
-operator switches to the new ones only once its minimum supported server
-version has them.
+### Compatibility
+
+The old CLI name (`antfly ha`), the old config key (`ha:`), the old admin API
+paths (`/admin/v1/ha/...`, `/ha/v1/health`, `/ha/v1/ready`), and the old
+environment variable names (`ANTFLY_HA_ADMIN_URL`, `ANTFLY_HA_ADMIN_TOKEN`)
+all continue to work for one minor release and are scheduled for removal in
+0.4. The Kubernetes operator keeps using the old admin API paths and
+environment variable names until its minimum supported server version is 0.3.
 
 ### Target resolution
 
-Every `antfly ha` invocation resolves exactly one target before the verb runs.
-Local targets open the node's WAL, slot store, and fence store directly and are
-meant for a stopped node or break-glass repair; remote targets speak to a
-running node's `/admin/v1/ha` API and are the normal path. Precedence, highest
-first:
+Every `antfly standby` invocation (`antfly ha` is a deprecated alias) resolves
+exactly one target before the verb runs. Local targets open the node's WAL,
+slot store, and fence store directly and are meant for a stopped node or
+break-glass repair; remote targets speak to a running node's
+`/admin/v1/standby` API (the old `/admin/v1/ha` path is served as an alias)
+and are the normal path. Precedence, highest first:
 
 1. Explicit flags: `--admin-url` (remote) or any local handle flag
    (`--primary-log`, `--standby-log`, `--fence-wal`, ...). The `--ha-*` spellings
    are accepted as aliases.
-2. Environment: `ANTFLY_HA_ADMIN_URL` supplies a remote target when no flag
-   chose one; `ANTFLY_HA_ADMIN_TOKEN`, when set, supplies the token variable for
-   any remote target that lacks `--admin-token-env`. This follows the
-   `ANTFLY_URL`/`ANTFLY_TOKEN` convention of the data-plane CLI.
-3. Config file: `--config <file>` reads the server's `ha` section. If it names
-   `ha.admin.url`, the command is remote, because a node with a configured admin
-   endpoint is expected to be running and to own its files. Otherwise the
-   section's paths and identity become local handles. `ha.admin.token_env`
-   fills the token variable for any remote target.
+2. Environment: `ANTFLY_STANDBY_ADMIN_URL` (falling back to the deprecated
+   `ANTFLY_HA_ADMIN_URL`) supplies a remote target when no flag chose one;
+   `ANTFLY_STANDBY_ADMIN_TOKEN` (falling back to `ANTFLY_HA_ADMIN_TOKEN`), when
+   set, supplies the token variable for any remote target that lacks
+   `--admin-token-env`. This follows the `ANTFLY_URL`/`ANTFLY_TOKEN` convention
+   of the data-plane CLI.
+3. Config file: `--config <file>` reads the server's `hot_standby` section (the
+   deprecated `ha` section is still read). If it names
+   `hot_standby.admin.url`, the command is remote, because a node with a
+   configured admin endpoint is expected to be running and to own its files.
+   Otherwise the section's paths and identity become local handles.
+   `hot_standby.admin.token_env` fills the token variable for any remote
+   target.
 4. Data directory: `--data-dir <dir>` opens whatever HA state exists under
    `<dir>/ha/` (see the layout below). Nothing is created; a directory with no
    HA state is an error rather than an empty database.
@@ -878,7 +890,7 @@ requires on first start.
 
 ### Data directory layout
 
-`antfly ha --data-dir` and the Kubernetes operator agree on one layout under
+`antfly standby --data-dir` and the Kubernetes operator agree on one layout under
 the data root, documented in `DATA_DIR.md`:
 
 ```text
@@ -898,14 +910,15 @@ primary log itself and opening it twice in one process would contend for the
 same lock; `rewind` runs against a stopped node with an explicit
 `--former-primary-log`.
 
-### The `ha` config section
+### The `hot_standby` config section
 
-`specs/openapi/antfly/config.yaml` defines `HAConfig`, mirrored one-to-one onto
-the `antfly standalone --ha-*` flags:
+`specs/openapi/antfly/config.yaml` defines `StandbyConfig`, mirrored one-to-one
+onto the `antfly standalone --ha-*` flags. The section is named `hot_standby:`;
+the deprecated `ha:` key is still read for one minor release:
 
 ```yaml
-ha:
-  admin:     { url: http://127.0.0.1:8080, token_env: ANTFLY_HA_ADMIN_TOKEN }
+hot_standby:
+  admin:     { url: http://127.0.0.1:8080, token_env: ANTFLY_STANDBY_ADMIN_TOKEN }
   identity:  { cluster_id: 1, shard_id: 0, table_id: 0, timeline_id: 1, epoch: 1 }
   primary:   { log: /antflydb/ha/primary.wal, slots: /antflydb/ha/slots, node_id: primary-a }
   standby:   { log: ..., progress: ..., node_id: standby-a, upstream_url: http://primary:8080, slot: standby-a }
@@ -949,7 +962,7 @@ generation and the append of the new receipt are one critical section.
 
 A standby's upstream was fixed at process start; the puller read it immutably
 every round and the only way to move a standby to a new primary was a pod
-restart with new flags. `POST /ha/standby/upstream` (`antfly ha follow
+restart with new flags. `POST /ha/standby/upstream` (`antfly standby follow
 --upstream-url <url> --slot <name>`) replaces the upstream URL and slot a
 running standby pulls from. The request carries the identity the caller expects
 the standby to have; a mismatch is rejected with the existing `WrongTimeline`,
@@ -965,7 +978,7 @@ retired only when no round can hold them.
 ### `switchover`: planned primary change
 
 The operator's promotion chain is a failover chain: it is unreachable while the
-primary is healthy. `antfly ha switchover --to <standby-admin-url>` is the
+primary is healthy. `antfly standby switchover --to <standby-admin-url>` is the
 planned counterpart, composed entirely from existing typed routes plus
 `follow`. It is zero-loss without a drain endpoint because it fences the old
 primary first and only then reads the boundary:
@@ -1042,7 +1055,7 @@ Treat the e2e work as a set of concrete product-path gates:
 - the initial gate proves primary startup, slot creation, base-backup seed,
   standby startup, primary writes, standby catch-up, read-only enforcement, and
   standby restart/replay using real processes and durable files;
-- the admin-auth gate proves typed `/admin/v1/ha` calls require bearer auth when
+- the admin-auth gate proves typed `/admin/v1/standby` calls require bearer auth when
   `--admin-token-env` is configured, while health checks and replication
   traffic remain separate from that control-plane auth;
 - the freshness gate proves standby reads report stale, `at_least_lsn`, and
@@ -1192,7 +1205,7 @@ concrete ownership authority, described in [Operator Integration](#operator-inte
 
 ### CLI and Admin API
 
-`/admin/v1/ha` is the stable typed control-plane API, defined in the dedicated
+`/admin/v1/standby` is the stable typed control-plane API, defined in the dedicated
 `specs/openapi/antfly/admin.yaml` OpenAPI spec, separate from the public DB
 and `/internal/v1` specs. Generated Zig admin request/response types, request
 parsing helpers, and shared route/type constants live in
@@ -1203,7 +1216,7 @@ only as clients of the contract, never as owners of HA operator actions.
 
 Node-local admin behavior in the HA runtime (`admin.zig`, `admin_exec.zig`,
 `http_admin.zig`) imports `zig/pkg/antfly/src/admin/` types and routes rather
-than hard-coding `/admin/v1/ha` paths or schemas in storage modules. The admin
+than hard-coding `/admin/v1/standby` paths or schemas in storage modules. The admin
 API covers: creating, dropping, pausing, resuming, and listing replication
 slots; seeding a standby from a base backup with resumable action state;
 reporting primary LSN, standby received/apply LSN, lag, slot retention,
@@ -1211,7 +1224,7 @@ degraded sync status, and reseed recommendations; promotion with explicit
 safe, forced, and lossy modes; timeline/LSN compatibility checks before
 promotion or rejoin; and former-primary rewind-or-reseed workflows.
 
-The CLI (`admin_cli.zig`) is a thin client over `/admin/v1/ha` for remote
+The CLI (`admin_cli.zig`) is a thin client over `/admin/v1/standby` for remote
 operations, with local/offline helpers only where direct filesystem access is
 required; CLI table and JSON output are aligned with the admin API response
 schemas.
@@ -1219,12 +1232,12 @@ schemas.
 The supported Zig `antfly standalone` runtime starts a primary with a durable
 HA replication log, slot store, promotion fence WAL, optional former-primary
 rewind log, optional admin bearer-token env var, node id, and identity flags,
-attaching the same `/admin/v1/ha` executor, durable fence store,
+attaching the same `/admin/v1/standby` executor, durable fence store,
 former-primary log handle, admin auth enforcement, and
-`/internal/v1/ha/replication` executor used by tests and the CLI. A standby
+`/internal/v1/standby/replication` executor used by tests and the CLI. A standby
 can likewise be started with a durable received-WAL log, progress WAL,
 promotion fence WAL, optional former-primary rewind log, admin bearer-token
-env var, node id, and identity flags; its runtime path exposes `/admin/v1/ha`
+env var, node id, and identity flags; its runtime path exposes `/admin/v1/standby`
 status, read/write gate, bootstrap, and promotion operations against the real
 standby handle, guarded by the same admin auth policy as primary nodes.
 Continuous pull/apply plugs into the DataServer-managed standby DB open path
@@ -1264,12 +1277,12 @@ durable runtime WAL/fence paths (`HARuntimeSpec`), and automatic-failover
 policy (`HAAutomaticFailoverPolicy`), plus a matching `HAStatus` status block.
 The operator bootstraps standby pods from base backup and attaches them to
 replication slots, manages slot lifecycle and WAL retention pressure, and
-prefers typed `/admin/v1/ha` calls for idempotent operator actions.
+prefers typed `/admin/v1/standby` calls for idempotent operator actions.
 `specs/openapi/antfly/admin.yaml` plus `zig/pkg/antfly/src/admin/` are the
 operator-facing contract source for admin HTTP method/path, request, and
 response fields; the Go admin client/types generated into
 `go/pkg/sdk/admin/oapi` and wrapped in `go/pkg/sdk/admin` are what the
-operator imports for executable `/admin/v1/ha` calls. The operator keeps path
+operator imports for executable `/admin/v1/standby` calls. The operator keeps path
 constants only for status display and plan summaries — live calls, auth
 header installation, retry/error classification, and request/response
 decoding go through the SDK wrapper.
@@ -1324,11 +1337,11 @@ fencing requirements are satisfied by the configured environment.
 Hot-standby HA ships with boring operator runbooks, maintained as
 `go/pkg/operator/docs/operations/hot-standby-ha.md`. The summary below is a
 pointer into that runbook, which covers the Kubernetes operator path in
-`go/pkg/operator`, the typed `/admin/v1/ha` path generated from
+`go/pkg/operator`, the typed `/admin/v1/standby` path generated from
 `specs/openapi/antfly/admin.yaml`, and the supported Zig CLI path. The split
 is explicit:
 
-- typed `/admin/v1/ha` calls are the preferred operator and SDK automation
+- typed `/admin/v1/standby` calls are the preferred operator and SDK automation
   surface;
 - CLI commands are human and break-glass helpers, or pod-local helpers for
   workflows that need mounted data paths;
@@ -1397,7 +1410,7 @@ operational workflows are typed, observable, restartable, and fenced, and that
 bar is met: real `antfly standalone` primary and standby runtime wiring
 (durable replication logs, received-WAL logs, slot stores, progress WALs,
 fence WALs, former-primary logs, read/write gates, admin auth, and
-background-job gating); the stable `/admin/v1/ha` OpenAPI contract generated
+background-job gating); the stable `/admin/v1/standby` OpenAPI contract generated
 into Zig admin bindings and the Go SDK admin wrapper, consumed by the
 Kubernetes operator instead of shelling out or duplicating HTTP code;
 base-backup creation, manifest pinning, file/object copy, checksum
@@ -1471,7 +1484,7 @@ described in [Implementation](#implementation):
   `go/pkg/operator/docs/operations/hot-standby-ha.md`, but further work to
   make edge cases boring (for example, richer degraded-state guidance) can
   continue without changing the core contract.
-- **Operator-planned switchover**: `antfly ha switchover` composes the planned
+- **Operator-planned switchover**: `antfly standby switchover` composes the planned
   sequence from typed routes, but the Kubernetes operator still plans only
   failover; a `spec`-driven planned switchover that reuses the same steps and
   the new `standby/upstream` route is the next automation step.

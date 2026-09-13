@@ -1146,7 +1146,7 @@ fn parseSwitchoverArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Swit
     return options;
 }
 
-fn identityEql(a: admin_api.openapi.HAIdentity, b: admin_api.openapi.HAIdentity) bool {
+fn identityEql(a: admin_api.openapi.StandbyIdentity, b: admin_api.openapi.StandbyIdentity) bool {
     return a.cluster_id == b.cluster_id and a.shard_id == b.shard_id and a.table_id == b.table_id and
         a.timeline_id == b.timeline_id and a.epoch == b.epoch;
 }
@@ -1310,7 +1310,7 @@ fn rejoinFormerPrimary(
     primary_url: []const u8,
     options: SwitchoverOptions,
     former_node_id: []const u8,
-    old_identity: admin_api.openapi.HAIdentity,
+    old_identity: admin_api.openapi.StandbyIdentity,
     final_lsn_raw: i64,
 ) !void {
     var fence = try client.currentFence(options.to);
@@ -1352,8 +1352,8 @@ fn followNewPrimary(
     client: *ha.http_client.Client,
     options: SwitchoverOptions,
     follower: SwitchoverOptions.Follower,
-    old_slots: []const admin_api.openapi.HASlotSnapshot,
-    old_identity: admin_api.openapi.HAIdentity,
+    old_slots: []const admin_api.openapi.StandbySlotSnapshot,
+    old_identity: admin_api.openapi.StandbyIdentity,
     final_lsn: u64,
 ) !void {
     var initial_lsn = final_lsn;
@@ -1680,7 +1680,7 @@ fn appendJsonTableLineFmt(
     try out.append(alloc, '\n');
 }
 
-fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPolicy {
+fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.StandbySyncPolicy {
     return .{
         .mode = @tagName(policy.mode),
         .selection = @tagName(policy.selection),
@@ -1690,7 +1690,7 @@ fn syncPolicyOpenApi(policy: ha.primary.SyncPolicy) !admin_api.openapi.HASyncPol
     };
 }
 
-fn adminIdentity(identity: ha.standby.Identity) !admin_api.openapi.HAIdentity {
+fn adminIdentity(identity: ha.standby.Identity) !admin_api.openapi.StandbyIdentity {
     return .{
         .cluster_id = try i64FromU64(identity.cluster_id),
         .shard_id = try i64FromU64(identity.shard_id),
@@ -1718,7 +1718,7 @@ fn fenceRequestOpenApi(request: ha.fencing.FenceRequest) !admin_api.openapi.Fenc
     };
 }
 
-fn fenceReceiptOpenApi(receipt: ha.fencing.Receipt) !admin_api.openapi.HAFenceReceipt {
+fn fenceReceiptOpenApi(receipt: ha.fencing.Receipt) !admin_api.openapi.StandbyFenceReceipt {
     return .{
         .identity = try adminIdentity(receipt.identity),
         .old_primary_id = receipt.old_primary_id,
@@ -2021,24 +2021,35 @@ fn processEnvGet(_: ?*const anyopaque, name: [:0]const u8) ?[]const u8 {
 
 const process_env = EnvLookup{ .getFn = processEnvGet };
 
-pub const default_admin_url_env = "ANTFLY_HA_ADMIN_URL";
-pub const default_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN";
+pub const default_admin_url_env = "ANTFLY_STANDBY_ADMIN_URL";
+pub const default_admin_token_env = "ANTFLY_STANDBY_ADMIN_TOKEN";
+/// Deprecated spellings, still honored as a fallback for one minor release.
+pub const legacy_admin_url_env = "ANTFLY_HA_ADMIN_URL";
+pub const legacy_admin_token_env = "ANTFLY_HA_ADMIN_TOKEN";
 
-/// Fills in the admin URL from `ANTFLY_HA_ADMIN_URL` when no target was given,
-/// and the token environment variable name from `ANTFLY_HA_ADMIN_TOKEN` when a
-/// remote target is in use and that variable is set. Local handles and
-/// `--data-dir` always win over the environment, so a configured default URL
-/// never turns a local-file command into an HTTP call.
+fn nonEmptyEnv(env: EnvLookup, name: [:0]const u8) ?[]const u8 {
+    const raw = env.get(name) orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+/// Fills in the admin URL from `ANTFLY_STANDBY_ADMIN_URL` (falling back to
+/// the deprecated `ANTFLY_HA_ADMIN_URL`) when no target was given, and the
+/// token environment variable name from whichever of
+/// `ANTFLY_STANDBY_ADMIN_TOKEN` / `ANTFLY_HA_ADMIN_TOKEN` is set when a
+/// remote target is in use. Local handles and `--data-dir` always win over
+/// the environment, so a configured default URL never turns a local-file
+/// command into an HTTP call.
 fn applyEnvironmentDefaults(options: *LocalOptions, env: EnvLookup) !void {
     if (options.remote_url == null and options.data_dir == null and !options.hasLocalHandles()) {
-        if (env.get(default_admin_url_env)) |raw| {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len > 0) options.remote_url = try validateHAAdminURL(trimmed);
-        }
+        const raw = nonEmptyEnv(env, default_admin_url_env) orelse nonEmptyEnv(env, legacy_admin_url_env);
+        if (raw) |trimmed| options.remote_url = try validateHAAdminURL(trimmed);
     }
     if (options.remote_url != null and options.remote_token_env == null) {
-        if (env.get(default_admin_token_env)) |raw| {
-            if (std.mem.trim(u8, raw, " \t\r\n").len > 0) options.remote_token_env = default_admin_token_env;
+        if (nonEmptyEnv(env, default_admin_token_env) != null) {
+            options.remote_token_env = default_admin_token_env;
+        } else if (nonEmptyEnv(env, legacy_admin_token_env) != null) {
+            options.remote_token_env = legacy_admin_token_env;
         }
     }
 }
@@ -2163,9 +2174,11 @@ fn parseU64(raw: []const u8) !u64 {
 
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
-        \\usage: {s} ha [target options] <command> [command options]
+        \\usage: {s} standby [target options] <command> [command options]
         \\
         \\Manage hot-standby replication for a standalone Antfly node.
+        \\`antfly ha` is a deprecated alias for this command and will be
+        \\removed in a future minor release.
         \\
         \\Target (pick one):
         \\  --data-dir DIR            Open the node's local HA state under DIR/ha/
@@ -2173,14 +2186,18 @@ fn printUsage(argv0: []const u8) void {
         \\                            standby-progress.wal, fence.wal). Paths and
         \\                            identity are read from the files that exist.
         \\  --admin-url URL           Send the command to a running node's HA admin
-        \\                            endpoint. Defaults to $ANTFLY_HA_ADMIN_URL.
+        \\                            endpoint. Defaults to $ANTFLY_STANDBY_ADMIN_URL,
+        \\                            falling back to $ANTFLY_HA_ADMIN_URL.
         \\  --admin-token-env NAME    Environment variable holding the admin bearer
-        \\                            token. Defaults to ANTFLY_HA_ADMIN_TOKEN when
-        \\                            that variable is set. Raw token flags are
-        \\                            refused.
-        \\  --config PATH             Read the server config file's `ha` section:
-        \\                            `ha.admin.url` makes the command remote, else
-        \\                            its paths and identity become local handles.
+        \\                            token. Defaults to ANTFLY_STANDBY_ADMIN_TOKEN
+        \\                            (falling back to ANTFLY_HA_ADMIN_TOKEN) when
+        \\                            one of those variables is set. Raw token
+        \\                            flags are refused.
+        \\  --config PATH             Read the server config file's `hot_standby`
+        \\                            section (the deprecated `ha` section is still
+        \\                            read): `hot_standby.admin.url` makes the
+        \\                            command remote, else its paths and identity
+        \\                            become local handles.
         \\
         \\Explicit local handles (override --data-dir, or use without it):
         \\  --primary-log PATH  --primary-slots PATH  --primary-node-id NODE
@@ -2210,11 +2227,11 @@ fn printUsage(argv0: []const u8) void {
         \\  artifact publish|restore|verify|activate|prune|gc-source|gc-target
         \\
         \\examples:
-        \\  {s} ha --data-dir /var/lib/antfly status primary
-        \\  {s} ha --admin-url http://127.0.0.1:8081 status standby
-        \\  {s} ha --admin-url http://127.0.0.1:8081 promote assess --current-fence
-        \\  {s} ha --admin-url http://primary:8080 switchover --to http://standby-a:8080 --follower standby-b=http://standby-b:8080
-        \\  {s} ha artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
+        \\  {s} standby --data-dir /var/lib/antfly status primary
+        \\  {s} standby --admin-url http://127.0.0.1:8081 status standby
+        \\  {s} standby --admin-url http://127.0.0.1:8081 promote assess --current-fence
+        \\  {s} standby --admin-url http://primary:8080 switchover --to http://standby-a:8080 --follower standby-b=http://standby-b:8080
+        \\  {s} standby artifact publish --location s3://ha-seeds/cluster-a --generation seed-standby-a-42 --slot standby-a --manifest /source/manifest.afha --content-root /source/content
         \\
     , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
 }
@@ -3319,6 +3336,8 @@ test "ha cmd parses and validates the data dir target" {
 const TestEnv = struct {
     url: ?[]const u8 = null,
     token: ?[]const u8 = null,
+    legacy_url: ?[]const u8 = null,
+    legacy_token: ?[]const u8 = null,
 
     fn lookup(self: *const TestEnv) EnvLookup {
         return .{ .ctx = @ptrCast(self), .getFn = get };
@@ -3328,6 +3347,8 @@ const TestEnv = struct {
         const self: *const TestEnv = @ptrCast(@alignCast(ctx.?));
         if (std.mem.eql(u8, name, default_admin_url_env)) return self.url;
         if (std.mem.eql(u8, name, default_admin_token_env)) return self.token;
+        if (std.mem.eql(u8, name, legacy_admin_url_env)) return self.legacy_url;
+        if (std.mem.eql(u8, name, legacy_admin_token_env)) return self.legacy_token;
         return null;
     }
 };
@@ -3363,6 +3384,25 @@ test "ha cmd defaults admin url and token env from the environment" {
     const bad_url = TestEnv{ .url = "not-a-url" };
     var invalid = LocalOptions{};
     try std.testing.expectError(error.HAAdminURLInvalid, applyEnvironmentDefaults(&invalid, bad_url.lookup()));
+
+    // The deprecated ANTFLY_HA_* names still work when the new names are unset.
+    const legacy_only = TestEnv{ .legacy_url = "http://127.0.0.1:9090", .legacy_token = "legacy-secret" };
+    var legacy = LocalOptions{};
+    try applyEnvironmentDefaults(&legacy, legacy_only.lookup());
+    try std.testing.expectEqualStrings("http://127.0.0.1:9090", legacy.remote_url.?);
+    try std.testing.expectEqualStrings(legacy_admin_token_env, legacy.remote_token_env.?);
+
+    // The new ANTFLY_STANDBY_* names win when both spellings are present.
+    const both = TestEnv{
+        .url = "http://127.0.0.1:8081",
+        .token = "secret",
+        .legacy_url = "http://127.0.0.1:9090",
+        .legacy_token = "legacy-secret",
+    };
+    var preferred = LocalOptions{};
+    try applyEnvironmentDefaults(&preferred, both.lookup());
+    try std.testing.expectEqualStrings("http://127.0.0.1:8081", preferred.remote_url.?);
+    try std.testing.expectEqualStrings(default_admin_token_env, preferred.remote_token_env.?);
 }
 
 test "ha cmd applies the config file ha section as a target" {

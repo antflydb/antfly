@@ -14,8 +14,13 @@
 
 //! HTTP adapter for HA admin operations.
 //!
-//! Typed `/admin/v1/ha` routes are the operator-facing control-plane contract.
-//! The legacy command endpoint remains only for replication compatibility
+//! Typed `/admin/v1/standby` routes are the operator-facing control-plane
+//! contract. The legacy `/admin/v1/ha` and `/ha/v1/...` spellings are accepted
+//! as aliases for one minor release (see `zig/HOT_STANDBY.md` "Naming"):
+//! `handleOperation` canonicalizes the incoming request path via
+//! `admin_api.routes.canonicalAdminPathAlloc` before any route matching, so
+//! every comparison below only ever needs to know the canonical spelling. The
+//! legacy command endpoint remains only for replication compatibility
 //! commands that do not yet have a typed admin route.
 
 const std = @import("std");
@@ -53,9 +58,14 @@ const wal_mod = @import("../wal_runtime.zig");
 var test_path_counter: u64 = 0;
 
 pub const Routes = struct {
-    pub const health = "/ha/v1/health";
-    pub const ready = "/ha/v1/ready";
-    pub const command = "/ha/v1/admin/command";
+    pub const health = "/standby/v1/health";
+    pub const ready = "/standby/v1/ready";
+    pub const command = "/standby/v1/admin/command";
+
+    /// Deprecated aliases, remove after 0.4. See `zig/HOT_STANDBY.md` "Naming".
+    pub const legacy_health = "/ha/v1/health";
+    pub const legacy_ready = "/ha/v1/ready";
+    pub const legacy_command = "/ha/v1/admin/command";
 };
 
 pub const CommandRequest = struct {
@@ -271,7 +281,10 @@ pub const Server = struct {
     }
 
     fn handleOperation(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
-        const path = requestPath(req.target);
+        const raw_path = requestPath(req.target);
+        const canonicalized = try admin_api.routes.canonicalAdminPathAlloc(self.alloc, raw_path);
+        defer if (canonicalized) |owned| self.alloc.free(owned);
+        const path = canonicalized orelse raw_path;
         if (isAdminAuthRequired(path) and !self.authorized(req)) {
             return try textResponse(self.alloc, 401, "unauthorized");
         }
@@ -3603,6 +3616,101 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_promote.body, "\"node_id\":\"standby-a\"");
     try expectContains(typed_promote.body, "\"fence_generation\":1");
     try expectContains(typed_promote.body, "\"new_identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2");
+}
+
+test "storage.ha http admin accepts legacy /ha/v1 health, ready, and command paths as aliases" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, .{});
+    defer server.deinit();
+
+    var canonical_health = try server.handle(.{ .method = .GET, .uri = Routes.health });
+    defer canonical_health.deinit(alloc);
+    var legacy_health = try server.handle(.{ .method = .GET, .uri = Routes.legacy_health });
+    defer legacy_health.deinit(alloc);
+    try std.testing.expectEqual(canonical_health.status, legacy_health.status);
+    try std.testing.expectEqualStrings(canonical_health.body, legacy_health.body);
+    try std.testing.expectEqual(@as(u16, 200), legacy_health.status);
+
+    var canonical_ready = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer canonical_ready.deinit(alloc);
+    var legacy_ready = try server.handle(.{ .method = .GET, .uri = Routes.legacy_ready });
+    defer legacy_ready.deinit(alloc);
+    try std.testing.expectEqual(canonical_ready.status, legacy_ready.status);
+    try std.testing.expectEqualStrings(canonical_ready.body, legacy_ready.body);
+
+    // No primary/standby is configured on this server, so `identify` cannot
+    // complete either way; what matters here is that canonical and legacy
+    // command paths reach the identical handler and fail identically.
+    var canonical_command = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer canonical_command.deinit(alloc);
+    var legacy_command = try server.handle(.{
+        .method = .POST,
+        .uri = Routes.legacy_command,
+        .content_type = "application/json",
+        .body = "{\"argv\":[\"identify\"]}",
+    });
+    defer legacy_command.deinit(alloc);
+    try std.testing.expectEqual(canonical_command.status, legacy_command.status);
+    try std.testing.expectEqualStrings(canonical_command.body, legacy_command.body);
+}
+
+test "storage.ha http admin accepts legacy /admin/v1/ha typed routes as aliases for /admin/v1/standby" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "legacy-admin-path-alias");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+
+    var server = Server.init(alloc, .{
+        .primary = &primary,
+        .primary_node_id = "primary-a",
+    });
+    defer server.deinit();
+
+    // GET, exact fixed route: canonical and legacy spellings must reach the
+    // same handler and return byte-identical bodies.
+    var canonical_status = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+    defer canonical_status.deinit(alloc);
+    const legacy_primary_status = (try admin_api.routes.legacyAdminPathAlloc(alloc, admin_api.routes.ha_primary_status)).?;
+    defer alloc.free(legacy_primary_status);
+    try std.testing.expectEqualStrings(admin_api.routes.legacy_standby_prefix ++ "/primary/status", legacy_primary_status);
+    var legacy_status = try server.handle(.{ .method = .GET, .uri = legacy_primary_status });
+    defer legacy_status.deinit(alloc);
+    try std.testing.expectEqual(canonical_status.status, legacy_status.status);
+    try std.testing.expectEqualStrings(canonical_status.body, legacy_status.body);
+    try std.testing.expectEqual(@as(u16, 200), legacy_status.status);
+
+    // POST, exact fixed route requiring a body: replication slot creation.
+    var legacy_create = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.legacy_standby_prefix ++ "/replication-slots",
+        .content_type = "application/json",
+        .body = "{\"slot_name\":\"standby-legacy\",\"initial_lsn\":0}",
+    });
+    defer legacy_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), legacy_create.status);
+    try expectContains(legacy_create.body, "\"slot_name\":\"standby-legacy\"");
+
+    // PUT, parameterized route: replication slot pause by the legacy slot prefix.
+    var legacy_pause = try server.handle(.{
+        .method = .PUT,
+        .uri = admin_api.routes.legacy_standby_prefix ++ "/replication-slots/standby-legacy/pause",
+    });
+    defer legacy_pause.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), legacy_pause.status);
+    try expectContains(legacy_pause.body, "\"slot_action\":\"pause\"");
+
+    // An unknown legacy-prefixed path still 404s.
+    var legacy_missing = try server.handle(.{ .method = .GET, .uri = admin_api.routes.legacy_standby_prefix ++ "/does-not-exist" });
+    defer legacy_missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), legacy_missing.status);
 }
 
 test "storage.ha admin typed operation bypasses legacy request dispatch" {

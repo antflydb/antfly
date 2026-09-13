@@ -94,23 +94,23 @@ pub const Server = struct {
             if (!mutex.tryLock()) return try textResponse(response_alloc, 503, "HAStateTransitionBusy");
         }
         defer if (state_mutex) |mutex| mutex.unlock();
-        const path = requestPath(req.target);
+        const path = internal_api.routes.canonicalReplicationPath(requestPath(req.target));
         switch (req.method) {
             .get => {
-                if (std.mem.eql(u8, path, internal_api.routes.ha_replication_identify)) {
+                if (std.mem.eql(u8, path, internal_api.routes.standby_replication_identify)) {
                     return try self.handleIdentify(response_alloc);
                 }
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
                 return try textResponse(response_alloc, 404, "not found");
             },
             .post => {
-                if (std.mem.eql(u8, path, internal_api.routes.ha_replication_slots)) {
+                if (std.mem.eql(u8, path, internal_api.routes.standby_replication_slots)) {
                     return try self.handleCreateReplicationSlot(response_alloc, req);
                 }
-                if (std.mem.eql(u8, path, internal_api.routes.ha_replication_start)) {
+                if (std.mem.eql(u8, path, internal_api.routes.standby_replication_start)) {
                     return try self.handleStartReplication(response_alloc, req);
                 }
-                if (std.mem.eql(u8, path, internal_api.routes.ha_replication_status)) {
+                if (std.mem.eql(u8, path, internal_api.routes.standby_replication_status)) {
                     return try self.handleStandbyStatusUpdate(response_alloc, req);
                 }
                 if (knownFixedRoute(path)) return try textResponse(response_alloc, 405, "method not allowed");
@@ -338,10 +338,10 @@ fn requestPath(uri: []const u8) []const u8 {
 }
 
 fn knownFixedRoute(path: []const u8) bool {
-    return std.mem.eql(u8, path, internal_api.routes.ha_replication_identify) or
-        std.mem.eql(u8, path, internal_api.routes.ha_replication_slots) or
-        std.mem.eql(u8, path, internal_api.routes.ha_replication_start) or
-        std.mem.eql(u8, path, internal_api.routes.ha_replication_status);
+    return std.mem.eql(u8, path, internal_api.routes.standby_replication_identify) or
+        std.mem.eql(u8, path, internal_api.routes.standby_replication_slots) or
+        std.mem.eql(u8, path, internal_api.routes.standby_replication_start) or
+        std.mem.eql(u8, path, internal_api.routes.standby_replication_status);
 }
 
 fn uint64FromJson(value: i64) !u64 {
@@ -467,7 +467,7 @@ test "storage.ha internal typed operation bypasses legacy request dispatch" {
     var server = Server.init(std.testing.allocator, null);
     var response = try server.operationExecutor().execute(.{
         .method = .get,
-        .target = internal_api.routes.ha_replication_identify,
+        .target = internal_api.routes.standby_replication_identify,
     });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status);
@@ -482,7 +482,7 @@ test "storage.ha internal http adapter sheds requests while state transition is 
     try std.testing.expect(mutex.tryLock());
     var busy = try server.handle(.{
         .method = .GET,
-        .uri = internal_api.routes.ha_replication_identify,
+        .uri = internal_api.routes.standby_replication_identify,
     });
     defer busy.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), busy.status);
@@ -491,7 +491,7 @@ test "storage.ha internal http adapter sheds requests while state transition is 
 
     var unavailable = try server.handle(.{
         .method = .GET,
-        .uri = internal_api.routes.ha_replication_identify,
+        .uri = internal_api.routes.standby_replication_identify,
     });
     defer unavailable.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), unavailable.status);
@@ -502,7 +502,7 @@ test "storage.ha internal http adapter handles every generated HA replication ro
     var server = Server.init(alloc, null);
 
     for (internal_api.openapi.server.routes) |route| {
-        if (!std.mem.startsWith(u8, route.path, "/ha/replication/")) continue;
+        if (!std.mem.startsWith(u8, route.path, "/standby/replication/")) continue;
 
         const path = try generatedRoutePathAlloc(alloc, route.path);
         defer alloc.free(path);
@@ -521,12 +521,28 @@ test "storage.ha internal http adapter handles every generated HA replication ro
     }
 }
 
+test "storage.ha internal http adapter serves the legacy replication prefix as an alias" {
+    const alloc = std.testing.allocator;
+    var server = Server.init(alloc, null);
+
+    var canonical = try server.handle(.{ .method = .GET, .uri = internal_api.routes.standby_replication_identify });
+    defer canonical.deinit(alloc);
+    var legacy = try server.handle(.{ .method = .GET, .uri = internal_api.routes.legacy_standby_replication_identify });
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(canonical.status, legacy.status);
+    try std.testing.expect(legacy.status != 404 and legacy.status != 405);
+
+    var wrong_method = try server.handle(.{ .method = .POST, .uri = internal_api.routes.legacy_standby_replication_identify });
+    defer wrong_method.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), wrong_method.status);
+}
+
 test "storage.ha internal http adapter returns method errors for generated HA replication routes" {
     const alloc = std.testing.allocator;
     var server = Server.init(alloc, null);
 
     for (internal_api.openapi.server.routes) |route| {
-        if (!std.mem.startsWith(u8, route.path, "/ha/replication/")) continue;
+        if (!std.mem.startsWith(u8, route.path, "/standby/replication/")) continue;
 
         const path = try generatedRoutePathAlloc(alloc, route.path);
         defer alloc.free(path);
@@ -553,7 +569,7 @@ test "storage.ha internal http adapter serves replication pull and status update
 
     var identify = try server.handle(.{
         .method = .GET,
-        .uri = internal_api.routes.ha_replication_identify,
+        .uri = internal_api.routes.standby_replication_identify,
     });
     defer identify.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), identify.status);
@@ -563,7 +579,7 @@ test "storage.ha internal http adapter serves replication pull and status update
 
     var create = try server.handle(.{
         .method = .POST,
-        .uri = internal_api.routes.ha_replication_slots,
+        .uri = internal_api.routes.standby_replication_slots,
         .body = "{\"slot_name\":\"standby-a\",\"initial_lsn\":0}",
     });
     defer create.deinit(alloc);
@@ -573,7 +589,7 @@ test "storage.ha internal http adapter serves replication pull and status update
 
     var start = try server.handle(.{
         .method = .POST,
-        .uri = internal_api.routes.ha_replication_start,
+        .uri = internal_api.routes.standby_replication_start,
         .body = "{\"slot_name\":\"standby-a\",\"from_lsn\":1,\"max_records\":1}",
     });
     defer start.deinit(alloc);
@@ -589,7 +605,7 @@ test "storage.ha internal http adapter serves replication pull and status update
 
     var status = try server.handle(.{
         .method = .POST,
-        .uri = internal_api.routes.ha_replication_status,
+        .uri = internal_api.routes.standby_replication_status,
         .body = "{\"slot_name\":\"standby-a\",\"timeline_id\":1,\"received_lsn\":1,\"applied_lsn\":1,\"safe_read_lsn\":1}",
     });
     defer status.deinit(alloc);
@@ -623,7 +639,7 @@ test "storage.ha internal http adapter reports seeding slot as a lifecycle confl
     defer alloc.free(start_body);
     var start = try server.handle(.{
         .method = .POST,
-        .uri = internal_api.routes.ha_replication_start,
+        .uri = internal_api.routes.standby_replication_start,
         .body = start_body,
     });
     defer start.deinit(alloc);
@@ -638,7 +654,7 @@ test "storage.ha internal http adapter reports seeding slot as a lifecycle confl
     defer alloc.free(status_body);
     var status = try server.handle(.{
         .method = .POST,
-        .uri = internal_api.routes.ha_replication_status,
+        .uri = internal_api.routes.standby_replication_status,
         .body = status_body,
     });
     defer status.deinit(alloc);

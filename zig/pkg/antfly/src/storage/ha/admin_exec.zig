@@ -1069,7 +1069,7 @@ pub fn execute(alloc: Allocator, ctx: Context, plan: admin_cli.Plan) !Result {
         // continuous-replication puller, which this local/CLI execution
         // path has no handle to (there is no `*DataServer` here, only the
         // narrower HA primitives in `Context`). It is remote-only: routed
-        // through `POST /admin/v1/ha/standby/upstream` via
+        // through `POST /admin/v1/standby/upstream` via
         // `http_client.setStandbyUpstream`, never through this executor.
         .standby_upstream => return error.StandbyUpstreamRequiresAdminApi,
         .primary_status => |command| try executePrimaryStatus(alloc, try requirePrimary(ctx), command),
