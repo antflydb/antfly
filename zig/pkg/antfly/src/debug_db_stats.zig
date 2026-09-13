@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("storage/db/mod.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const metadata_mod = @import("metadata/mod.zig");
 
 pub fn main() !void {

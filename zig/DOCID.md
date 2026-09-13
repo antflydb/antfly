@@ -2,11 +2,11 @@
 
 ## Purpose
 
-`antfly-zig` currently inherits the same flat-keyspace idea as Go antfly:
-document IDs are written directly into LMDB keys, and derived records are built
-by concatenating textual delimiters and suffixes.
+`antfly-zig` originally inherited the same flat-keyspace idea as Go antfly:
+document IDs were written directly into LMDB keys, and derived records were
+built by concatenating textual delimiters and suffixes.
 
-Examples from the current code:
+Examples from the original layout:
 
 - primary document: `<docID>`
 - embedding: `<docID>:i:<indexName>:e`
@@ -14,11 +14,12 @@ Examples from the current code:
 - enrichment artifact: `<docID>:e:<type>:<name>:...`
 - TTL metadata: `<docID>:t`
 
-This works only as long as document IDs do not collide with the storage format.
-It couples correctness to delimiter avoidance and makes arbitrary byte-valued
-document IDs unsafe.
+That layout only worked as long as document IDs did not collide with the
+storage format. It coupled correctness to delimiter avoidance and made
+arbitrary byte-valued document IDs unsafe.
 
-This document proposes a document identity design for `antfly-zig` that:
+This document describes the document identity design `antfly-zig` moved to,
+which:
 
 - allows arbitrary document IDs
 - preserves lexicographic ordering by raw document ID bytes
@@ -27,23 +28,25 @@ This document proposes a document identity design for `antfly-zig` that:
 - gives query execution a compact internal posting identity for bitmap filters
   and exclusions
 
-## Current Problem
+## Original Problem
 
-The current storage layout depends on raw user IDs appearing as the leading
+The original storage layout depended on raw user IDs appearing as the leading
 portion of many structured keys.
 
-That creates several classes of problems:
+That created several classes of problems:
 
-- document IDs containing `:i:`, `:e:`, `:t`, `:out:`, or similar markers can
+- document IDs containing `:i:`, `:e:`, `:t`, `:out:`, or similar markers could
   confuse key parsing
-- document IDs containing bytes such as `0x00` or `0xff` interact badly with
+- document IDs containing bytes such as `0x00` or `0xff` interacted badly with
   sentinel-based range construction
-- metadata and secondary records are distinguished by string suffixes instead of
-  explicit record types
-- internal code must repeatedly split and parse strings to recover structure
+- metadata and secondary records were distinguished by string suffixes instead
+  of explicit record types
+- internal code had to repeatedly split and parse strings to recover structure
 
-Even when a specific path happens to work today, the format is brittle because
-new record types must keep avoiding user-controlled bytes.
+Even where a specific path happened to work, the format was brittle because
+new record types had to keep avoiding user-controlled bytes. The binary key
+codec described below replaced this layout; see Implementation Notes for the
+shipped state.
 
 ## Goals
 
@@ -111,10 +114,10 @@ ordering of raw components.
 
 ## Key Layout
 
-We should stop using "raw doc ID followed by textual suffixes" and instead move
-to explicit binary records.
+`antfly-zig` moved away from "raw doc ID followed by textual suffixes" to
+explicit binary records.
 
-Suggested high-level layout:
+High-level layout:
 
 ```text
 primary document
@@ -146,9 +149,9 @@ Notes:
 
 - `D` and `G` are top-level namespaces, not literal strings.
 - `P`, `T`, `S`, `E`, `C`, `A`, `O`, and `I` are single-byte record kinds.
-- fixed-width integers should be big-endian so numeric order is preserved
+- fixed-width integers are big-endian so numeric order is preserved
   lexicographically
-- internal metadata should remain under a separate reserved prefix outside user
+- internal metadata remains under a separate reserved prefix outside user
   document namespaces
 
 ## Ordering Properties
@@ -262,11 +265,11 @@ allocatable live ordinal.
 
 ## Canonical Document Identity
 
-The binary key codec fixes how user document IDs are stored. It does not, by
-itself, give the query engine a compact internal identity that can be shared by
+The binary key codec fixes how user document IDs are stored. On its own it does
+not give the query engine a compact internal identity that can be shared by
 full-text, dense vector, sparse vector, algebraic, and graph indexes.
 
-Long term, Antfly should treat document identity as a backend primitive:
+Antfly treats document identity as a backend primitive:
 
 ```text
 table / shard / range
@@ -383,8 +386,9 @@ Current internal query paths often resolve filters and exclusions into string
 document-ID lists. That works, but it forces every index family to repeatedly
 translate public IDs back into its own physical identity.
 
-Introduce an internal document-set abstraction. Persisted compact ordinals are
-the canonical internal identity, but query-time sets should remain adaptive:
+Antfly has an internal document-set abstraction for this. Persisted compact
+ordinals are the canonical internal identity, but query-time sets remain
+adaptive:
 
 ```zig
 const ResolvedDocSet = union(enum) {
@@ -401,10 +405,10 @@ const ResolvedDocFilter = struct {
 };
 ```
 
-The planner should prefer ordinal-backed forms whenever the shard has
-doc-ordinal coverage, but it should not force every tiny set through a bitmap.
-`doc_keys` remains useful for explicit small ID filters, point lookups, API
-compatibility, and index families that have not yet been converted.
+The planner prefers ordinal-backed forms whenever the shard has doc-ordinal
+coverage, but it does not force every tiny set through a bitmap. `doc_keys`
+remains useful for explicit small ID filters, point lookups, API compatibility,
+and mixed-coverage or legacy-snapshot fallback paths.
 
 A reasonable normalization policy is:
 
@@ -433,14 +437,14 @@ exclude_bitmap        exclusions, blocked IDs, must_not filters
 candidate_bitmap      index-produced candidate set
 ```
 
-Query execution should intersect and subtract these bitmaps before expensive
-scoring whenever possible. Tiny lists can stay as lists until an operator needs
-set algebra, repeated reuse, or bitmap-only execution.
+Query execution intersects and subtracts these bitmaps before expensive scoring
+whenever possible. Tiny lists can stay as lists until an operator needs set
+algebra, repeated reuse, or bitmap-only execution.
 
 ## Query Language and CTE Bindings
 
 Named filter bindings fit naturally with canonical ordinals. The public JSON DSL
-can allow reusable document-set expressions:
+allows reusable document-set expressions:
 
 ```json
 {
@@ -481,7 +485,7 @@ If `visible` only contains a handful of explicit IDs, the binding can remain as
 `doc_keys` or sorted `ordinals` and be applied through a cheaper point-membership
 path.
 
-`ref` should point at the compiled binding, not re-expand the original JSON
+`ref` points at the compiled binding rather than re-expanding the original JSON
 each time it appears. This lets a single expensive filter be reused across
 multiple query branches, vector searches, sparse searches, full-text clauses,
 and exclusions.
@@ -511,16 +515,16 @@ they behave like CTEs over document sets.
 
 ## Index Integration
 
-All index families should converge on `doc_ordinal` as the common document
-identity used for filtering and candidate exchange.
+All index families converge on `doc_ordinal` as the common document identity
+used for filtering and candidate exchange, with compatibility fallbacks for
+legacy or mixed-coverage snapshots. See Implementation Notes for the shipped
+detail behind each index family below.
 
 ### Full-Text
 
-Full-text already has the closest shape: query filters can produce Roaring
-bitmaps of numeric document IDs. The long-term change is to make those numeric
-IDs map cleanly to canonical shard-local ordinals.
-
-Possible implementation:
+Full-text query filters produce Roaring bitmaps of numeric document IDs, and
+those numeric IDs map to canonical shard-local ordinals through an optional
+document-ordinal sidecar carried on each segment:
 
 ```text
 segment_doc_id -> doc_ordinal
@@ -528,18 +532,20 @@ segment_live_bitmap projected into doc_ordinal space
 full_text_filter(query) -> RoaringBitmap(doc_ordinal)
 ```
 
-Segment-local IDs can still exist for compact postings. The planner boundary
-should exchange canonical ordinals.
+Segment-local IDs still exist for compact postings. When every relevant
+segment has sidecar coverage, the planner boundary exchanges canonical
+ordinals directly; segments without coverage (legacy or mixed-version
+snapshots) fall back to projection through public document IDs.
 
 ### Dense Vector
 
-Dense vector metadata currently has vector IDs and doc-key mappings. That is not
-the same as a canonical posting ID.
+Dense vector metadata has vector IDs and doc-key mappings, which is not by
+itself a canonical posting ID.
 
-Long term, primary document-level dense vectors should use a stable vector ID
-that is independent from physical ordinals. The dense layer must still persist
-explicit mappings so ordinal-backed filters can constrain vector search without
-making the vector ID itself rebuild-sensitive:
+Primary document-level dense vectors use a stable vector ID that is
+independent from physical ordinals. The dense layer persists explicit mappings
+so ordinal-backed filters can constrain vector search without making the
+vector ID itself rebuild-sensitive:
 
 ```text
 doc_id -> primary_document_vector_id
@@ -547,58 +553,61 @@ vector_id -> doc_ordinal
 doc_ordinal -> vector_id(s)
 ```
 
-Dense search should accept:
+Dense search accepts:
 
 ```text
 include: ?ResolvedDocSet
 exclude: ?ResolvedDocSet
 ```
 
-and apply them during candidate generation or immediately after candidate
+and applies them during candidate generation or immediately after candidate
 retrieval, before expensive reranking or projection. Bitmap-backed sets are best
 for broad filters and exclusions; sorted ordinal lists are often cheaper for
-small explicit filters. Child/chunk/external vectors can keep their own
-physical row IDs, and primary document vectors keep a stable vector ID that is
-joined to the current ordinal through persisted membership rows.
+small explicit filters. Child/chunk/external vectors keep their own physical
+row IDs, and primary document vectors keep a stable vector ID that is joined to
+the current ordinal through persisted membership rows.
 
 ### Sparse Vector
 
-Sparse postings should store `doc_ordinal` instead of raw document keys:
+Sparse postings keep their own physical `doc_num` rather than storing
+`doc_ordinal` directly; resolved ordinal filters map through
+`doc_ordinal -> doc_id -> doc_num` before sparse scoring:
 
 ```text
-term / feature -> [(doc_ordinal, weight)]
+term / feature -> [(doc_num, weight)]
 ```
 
 This gives sparse query filters the same document-set boundary as full-text:
 small candidate sets can remain as ordinal lists, while broad term filters can
-use bitmaps.
+use bitmaps, without requiring sparse doc numbers to equal identity ordinals.
 
 ### Algebraic
 
-Algebraic path dictionary postings should move from string doc-key rows to
-ordinal postings:
+Algebraic path dictionary postings have ordinal-backed rows alongside the
+existing string doc-key posting rows:
 
 ```text
-path / value / token -> RoaringBitmap(doc_ordinal)
+path / value / token -> RoaringBitmap(doc_ordinal), plus existing doc-key rows
 ```
 
-During migration, algebraic filters can continue returning `doc_keys` when
-ordinal coverage is missing. Once coverage exists, the preferred result is a
-`ResolvedDocSet` that dense, sparse, full-text, and graph planning can all
-consume. Small and sparse results may remain as sorted ordinals; large dense or
-reusable results can promote to `ordinal_bitmap`.
+Algebraic filters return `doc_keys` when ordinal coverage is missing. When
+coverage exists, the result is a `ResolvedDocSet` that dense, sparse,
+full-text, and graph planning can all consume. Small and sparse results may
+remain as sorted ordinals; large dense or reusable results can promote to
+`ordinal_bitmap`.
 
 ### Graph
 
-Document-backed graph nodes and edges should reference `doc_ordinal` where the
-node is a document identity. Graph-native node IDs can remain separate, but any
-edge that is used as a document filter should be able to produce a
-`ResolvedDocSet`.
+Document-backed graph nodes and edges reference `doc_ordinal` where the node is
+a document identity: graph query execution materializes a request-local
+`ResolvedDocSet` for document-backed graph hits alongside the public hit list.
+Graph-native node IDs remain separate, and edges used as document filters can
+produce a `ResolvedDocSet`.
 
 ## Visibility, Deletes, and Generations
 
-Ordinals should not be renumbered for ordinary deletes or updates. Correctness
-should come from visibility metadata:
+Ordinals are not renumbered for ordinary deletes or updates. Correctness comes
+from visibility metadata:
 
 ```text
 doc_ordinal -> created_generation
@@ -618,12 +627,12 @@ effective_candidates =
 
 Physical compaction may reclaim ordinals later, but only behind a generation or
 epoch boundary that makes old indexes and cached bitmaps invalid. Normal query
-correctness should not depend on immediate ordinal reuse.
+correctness does not depend on immediate ordinal reuse.
 
 ## Shards, Ranges, and Restore
 
-`doc_ordinal` is shard-local or range-local. It should not be globally
-meaningful without its shard/range namespace.
+`doc_ordinal` is shard-local or range-local, and is not globally meaningful
+without its shard/range namespace.
 
 For distributed planning:
 
@@ -639,7 +648,12 @@ If ranges split or merge, the system has two safe options:
 1. preserve existing ordinal namespaces until indexes are rebuilt
 2. create a new generation and rebuild ordinal mappings for the new ranges
 
-Backup and restore should persist:
+Split preserves the source identity namespace on both output ranges (option 1).
+Merge preserves the receiver's identity namespace by default, with an explicit
+opt-in reassignment flow that rewrites the receiver namespace and replays donor
+documents into it (option 2).
+
+Backup and restore persist:
 
 - document key codec version
 - canonical document identity policy
@@ -651,72 +665,86 @@ The deterministic `canonical_doc_id` lets restore tooling validate that rebuilt
 ordinal mappings still refer to the same logical documents, even if compact
 ordinals are reassigned during an explicit rebuild.
 
-## Planner Roadmap
+## Implemented Components
 
-The migration should be incremental. Do not require every index to switch at
-once.
+The migration to this design landed incrementally, by component, rather than as
+a single flag-day change; index families that have not converged on ordinals
+for a given code path keep a `doc_keys`/public-ID fallback rather than being
+blocked on the rest. The summaries below name where each component lives; see
+Implementation Notes for the full detail and test coverage behind each one.
 
-### Phase 1: Safe Document Keys
+### Safe Document Keys
 
-- Implement the binary document key codec described above.
-- Centralize document-key construction and parsing.
-- Move primary records, derived records, graph records, TTL records, and dense
-  metadata off delimiter-based raw doc-key strings.
+The binary document key codec described above is implemented in
+`src/storage/internal_keys.zig`, which centralizes document-key construction
+and parsing. Primary records, derived records, graph records, TTL records, and
+dense metadata use the structured internal key encoding instead of
+delimiter-based raw doc-key strings.
 
-### Phase 2: Ordinal Allocation
+### Ordinal Allocation
 
-- Add a backend-owned doc-ordinal allocator per shard/range.
-- Persist `doc_id -> doc_ordinal` and `doc_ordinal -> doc_id`.
-- Add live/tombstone generation metadata.
-- Keep existing query behavior unchanged.
+`src/storage/db/doc_identity.zig` implements a backend-owned doc-ordinal
+allocator per shard/range. It persists `doc_id -> doc_ordinal` and
+`doc_ordinal -> doc_id`, along with live/tombstone generation metadata, and
+existing query behavior is unchanged for callers that do not opt into
+ordinal-backed filtering.
 
-### Phase 3: Internal Document Sets
+### Internal Document Sets
 
-- Add `ResolvedDocSet`.
-- Convert request-level filters and exclusions to use `ResolvedDocSet`
-  internally.
-- Keep `doc_keys` as a compatibility and tiny-set representation.
-- Add sorted ordinal-list and ordinal-bitmap representations.
-- Add counters for doc-key list, ordinal-list, bitmap fast path, missing ordinal
-  coverage, bitmap promotion, and unsupported filter shapes.
+`src/storage/db/doc_set.zig` defines `ResolvedDocSet` and `ResolvedDocFilter`.
+Request-level filters and exclusions use these internally, with `doc_keys`
+retained as the compatibility/tiny-set representation alongside sorted
+ordinal-list and density-promoted Roaring-bitmap representations.
+`DBStats.doc_set_planning` exposes counters for doc-key fallback, ordinal-list,
+bitmap promotion, missing ordinal coverage, and unsupported filter shapes.
 
-### Phase 4: Algebraic Filter Bitmaps
+### Algebraic Filter Bitmaps
 
-- Teach algebraic filter resolution to return ordinal-backed `ResolvedDocSet`
-  values when possible.
-- Preserve the existing doc-key list path as fallback.
-- Add direct include/exclude `ResolvedDocSet` plumbing into vector search
-  requests.
+Algebraic filter resolution (`resolvedDocFilterForFilterJsonAlloc` in
+`src/storage/db/algebraic/index.zig`) returns ordinal-backed `ResolvedDocSet`
+values when the referenced documents have ordinal coverage, and falls back to
+the doc-key list path for binding-heavy or mixed-coverage cases. Vector and
+sparse search requests carry direct include/exclude `ResolvedDocSet` plumbing
+sourced from this resolver.
 
-### Phase 5: Dense and Sparse Consumption
+### Dense and Sparse Consumption
 
-- Teach dense vector search to consume include/exclude ordinal lists and
-  bitmaps.
-- Teach sparse vector search to consume include/exclude ordinal lists and
-  bitmaps.
-- Avoid mapping every filter hit through string doc IDs on hot paths.
+Dense and sparse vector search consume include/exclude ordinal lists and
+bitmaps directly. Dense search uses stable, deterministic vector IDs joined to
+the current ordinal through persisted membership rows; sparse search keeps its
+own physical `doc_num` and maps `doc_ordinal -> doc_id -> doc_num` for resolved
+filters rather than storing `doc_ordinal` in postings directly. Both paths
+avoid mapping every filter hit through string document IDs on their hot paths.
 
-### Phase 6: Full-Text Projection
+### Full-Text Projection
 
-- Project full-text segment-local doc IDs into canonical ordinals at planner
-  boundaries.
-- Let full-text filters and query clauses produce reusable ordinal bitmaps.
+Full-text segments carry an optional document-ordinal sidecar populated during
+backfill, incremental projection, and segment merge. When every relevant
+segment has sidecar coverage, full-text filters and query clauses project
+directly to and from canonical ordinals instead of public document IDs;
+segments without full sidecar coverage (legacy or mixed-version snapshots) fall
+back to the public-ID projection path.
 
-### Phase 7: Query `with` Bindings
+### Query `with` Bindings
 
-- Add public JSON DSL support for `with` bindings and `{ "ref": "name" }`.
-- Compile each binding once per request.
-- Cache binding results for the request lifetime.
-- Push binding bitmaps into vector, sparse, full-text, algebraic, and graph
-  operators.
+Public query JSON accepts a top-level `with` object for named document
+filters, and `{ "ref": "name" }` is a structured filter clause. Each binding is
+compiled once per request into `SearchRequest.doc_filter_bindings` and reused
+for the request lifetime; the compiled `ResolvedDocFilter` is pushed into
+dense, sparse, full-text, algebraic, and graph operators.
 
-### Phase 8: Cross-Index Cleanup
+### Cross-Index Cleanup
 
-- Move algebraic postings to ordinal-backed rows or bitmap blocks.
-- Move sparse postings to ordinal-backed rows.
-- Add graph-to-document bitmap production for document-backed graph filters.
-- Add health/stat fields for ordinal coverage, fallback rates, stale
-  generations, and rebuild requirements.
+Algebraic scalar, path-dictionary, geo, and join-fact postings have
+ordinal-backed rows alongside their legacy document-key rows, used directly
+when ordinal coverage is complete. Sparse postings keep a distinct physical
+`doc_num` rather than moving to ordinal-backed rows outright (see Dense and
+Sparse Consumption above). Graph query execution materializes a request-local
+`ResolvedDocSet` for document-backed graph hits alongside the public hit list.
+`DBStats.doc_identity` and `DBStats.doc_set_planning` expose ordinal coverage,
+fallback-rate, stale-generation, and rebuild-required health fields. Remaining
+cross-index work is production-scale and rolling-upgrade validation rather
+than a known internal public-document-ID exchange gap; see Open Problems.
 
 ## Implementation Notes
 
@@ -2475,7 +2503,7 @@ Useful adversarial IDs:
 
 ## Recommendation
 
-`antfly-zig` should move to a binary, order-preserving key codec for all
+`antfly-zig` moved to a binary, order-preserving key codec for all
 document-derived records.
 
 This gives us:
@@ -2485,5 +2513,6 @@ This gives us:
 - efficient prefix scans
 - less brittle storage internals
 
-Trying to patch the current delimiter format with more escaping would preserve
-the core problem. The right fix is to make storage keys structured and binary.
+Patching the original delimiter format with more escaping would have preserved
+the core problem. The right fix was to make storage keys structured and binary,
+as described above and implemented in `src/storage/internal_keys.zig`.

@@ -808,7 +808,7 @@ pub const Config = struct {
             .storage = storage_config,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             .inference = if (validated.value.inference) |inference| .{
-                .api_url = if (inference.api_url.len > 0) try alloc.dupe(u8, inference.api_url) else null,
+                .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
                 .models_dir = if (inference.models_dir) |value| try alloc.dupe(u8, value) else null,
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
@@ -1484,6 +1484,20 @@ fn parseRemoteContentConfig(alloc: std.mem.Allocator, value: std.json.Value) !Co
     }
 
     return cfg;
+}
+
+/// Encode the effective remote-content security snapshot for the separately
+/// compiled storage owner. The facade can represent a hot-reload publisher, so
+/// acquire it before reading the current policy.
+pub fn remoteContentSecurityJsonAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) ![]u8 {
+    const configured = remote_content orelse return try alloc.dupe(u8, "");
+    var snapshot = configured.acquire();
+    defer snapshot.deinit();
+    const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
+    return try std.json.Stringify.valueAlloc(alloc, security, .{});
 }
 
 fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Value) !Config.S3CredentialConfig {

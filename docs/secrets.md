@@ -255,8 +255,11 @@ Static S3-compatible credentials can use references:
       "external_io": {
         "protocol": "s3",
         "endpoint": "minio.internal:9000",
-        "access_key_id": "${secret:storage.access_key_id}",
-        "secret_access_key": "${secret:storage.secret_access_key}",
+        "credentials": {
+          "source": "static",
+          "access_key_id": "${secret:storage.access_key_id}",
+          "secret_access_key": "${secret:storage.secret_access_key}"
+        },
         "buckets": ["antfly-data"]
       }
     }

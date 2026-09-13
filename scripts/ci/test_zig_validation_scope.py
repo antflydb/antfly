@@ -86,6 +86,8 @@ class ZigValidationScopeTests(unittest.TestCase):
             "openapi.yaml",
             "zig/lib/yacc/src/main.zig",
             "zig/tools/test_runtime_cache.py",
+            "zig/tools/test_linked_tests.py",
+            "zig/tools/test_audit_test_selection.py",
             "scripts/ci/test_zig_validation_scope.py",
         }
         unrelated = {

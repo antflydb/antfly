@@ -436,6 +436,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -494,6 +496,7 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
         run: |
+          lscpu
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
@@ -610,7 +613,7 @@ jobs:
 
           (
             set +e
-            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}" 2>&1 | tee -a "$unit_log"
+            taskset -c "${{ steps.cpus.outputs.list }}" make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all" 2>&1 | tee -a "$unit_log"
             exit "${PIPESTATUS[0]}"
           ) &
           unit_pid="$!"
@@ -619,7 +622,10 @@ jobs:
             # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
             # the independent hard limit without killing an active cold build.
             idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
-            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
+            # PR #716's DB-core execution started 52 minutes into the combined
+            # build/test step and was still progressing at the old 60m limit.
+            # Allow 90m total, retaining the 30m idle and 120m outer job limits.
+            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-5400}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"
             last_mtime=0
@@ -740,6 +746,8 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
+          tools/test_audit_test_selection.py
+          tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
@@ -770,7 +778,7 @@ jobs:
       - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
-          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
+          taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"
           status="$?"
           if [ "$status" -ne 0 ] && [ -d /sys/fs/cgroup ]; then
             echo "::group::unit failure cgroup memory"
@@ -901,7 +909,19 @@ jobs:
       # Verbose output identifies the individual checks in the CI log.
       - name: Test runtime compilation and cache contracts
         working-directory: zig
-        run: python3 -u -m unittest -v tools/test_runtime_cache.py
+        run: python3 -u -m unittest -v tools/test_runtime_cache.py tools/test_linked_tests.py
+
+      - name: Verify physical storage compilation ownership
+        working-directory: zig
+        run: python3 -u tools/check_storage_compilation.py --report storage-compilation.json
+
+      - name: Upload storage compilation measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-compilation
+          path: zig/storage-compilation.json
+          if-no-files-found: ignore
 
   vopr-qualification:
     name: VOPR qualification

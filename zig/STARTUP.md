@@ -35,6 +35,19 @@ on the hot metadata loop.
 
 Provisioning should reconcile from cached runtime state or durable summaries first, then enqueue background reconcile/open work when needed.
 
+## Implementation Status
+
+This is a mixed-progress document: the request-path and provisioning contracts
+above are enforced today, the "First Slice" and "Second Slice" work below has
+shipped, and most of "Long-Term Shape" is implemented (see "Startup Execution
+Order" for the current per-step state). The node-local runtime registry
+(`ShardRuntimeRegistry`/`ShardProvisioner` split, item 1-2 below) has not been
+built; runtime status today is served from the provisioned-cache warm path
+described in "Second Slice" rather than a dedicated registry. Cold-open
+latency work ("Open Performance Plan" onward) is partially done: instrumentation
+has shipped, parallel index load and cache warmup are in progress, and the
+replay-mode follow-through work is gated on further measurement.
+
 ## Long-Term Shape
 
 ### 1. Node-local runtime registry
@@ -87,9 +100,12 @@ Stale is acceptable. Invented freshness is not.
 
 ### 5. Explicit DB open modes
 
-`DB.open()` must stop smuggling writer-side recovery into read/status paths.
+`DB.open()` no longer smuggles writer-side recovery into read/status paths:
+`.query_readonly` and `.status_only` open modes exist and skip
+`replayPendingDerivedBatches()` (this is "Startup Execution Order" step 1,
+implemented).
 
-Long-term contract:
+Contract:
 
 - `DB.open(..., .query_readonly)`
   - mounts durable primary/index state
@@ -109,7 +125,8 @@ Read/status correctness then comes from explicit replay debt, not from forcing o
 
 ### 6. Replay debt must be durable and visible
 
-Per derived index we need durable watermarks/status such as:
+Per derived index there are durable watermarks/status such as (implemented,
+"Startup Execution Order" step 2):
 
 - `applied_sequence`
 - `pending_sequence` or equivalent derived target

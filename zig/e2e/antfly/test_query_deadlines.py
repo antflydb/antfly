@@ -77,9 +77,10 @@ def test_join_timeout_budget_survives_coordinator_and_workers(stateful_api):
     )
 
 
-def test_graph_timeout_budget_survives_worker_and_catalog(backup_api):
-    table = "deadline_graph"
-    backup_api.create_table(table, num_shards=3)
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_graph_timeout_budget_survives_worker_and_catalog(backup_api, num_shards):
+    table = f"deadline_graph_{num_shards}"
+    backup_api.create_table(table, num_shards=num_shards)
     backup_api.create_index(
         table,
         "graph_idx",

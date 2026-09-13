@@ -15,7 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const platform_time = @import("antfly_platform").time;
-const wal_mod = @import("../wal.zig");
+const wal_mod = @import("../wal_runtime.zig");
 const validation = @import("validation.zig");
 
 pub const ledger_dir_name = ".antfly-ha-lifecycle-receipts.wal";

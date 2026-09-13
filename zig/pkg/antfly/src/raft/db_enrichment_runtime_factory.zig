@@ -15,7 +15,7 @@
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const fs_paths = @import("../common/fs_paths.zig");
-const db_mod = @import("../storage/db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 
 pub const GroupDbPathResolver = struct {
     ptr: *anyopaque,

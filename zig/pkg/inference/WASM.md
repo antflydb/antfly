@@ -2,7 +2,7 @@
 
 ## Context
 
-Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently three backends exist: BLAS (CPU), MLX (Metal/Apple Silicon), ONNX (runtime).
+Antfly inference-zig is a Zig ML inference engine with a clean backend abstraction: `ComputeBackend` VTable in `src/ops/ops.zig` (~35 required ops) and `Session` VTable in `src/backends/session.zig`. Model architectures (BERT, T5, GPT) call ops through the VTable without knowing the backend. Currently four backends exist: native (CPU), Metal (Apple Silicon), ONNX (runtime), and ORT GenAI.
 
 Goal: enable antfly inference to run in the browser via WASM, with WASM SIMD as the foundation and WebGPU compute shaders as an acceleration layer. Client-side embedding, reranking, and eventually generation without a server.
 
@@ -316,10 +316,13 @@ BERT (`src/architectures/bert.zig`) uses only **9 ops**:
 
 ---
 
-## Implementation Phases
+## Delivered Capabilities
 
-### Phase 1–7: WASM SIMD Foundation ✅ COMPLETE
+The sections below were originally tracked as sequential phases; all are
+shipped. They are kept in delivery order as a reference, not as a remaining
+plan.
 
+### WASM SIMD Foundation
 Phases 1–7 are fully implemented and working. The WASM SIMD backend runs BERT inference end-to-end in the browser.
 
 **Build**: `~/bin/zig build -Dwasm=true wasm` → `zig-out/bin/antfly-inference.wasm` (1.2 MB, ReleaseSafe)
@@ -400,8 +403,7 @@ Current limits:
 - the Gemma 4 browser page path currently supports one selected image and one selected audio clip at a time
 - projector-backed multimodal HF bundle UIs are still follow-on work
 
-### Phase 8: WebGPU Acceleration Layer ✅ COMPLETE (matmul + attention)
-
+### WebGPU Acceleration Layer
 Optional GPU acceleration for heavy ops (matmul, attention). Build with `-Dwebgpu=true` to enable.
 
 **Build**: `~/bin/zig build -Dwasm=true -Dwebgpu=true wasm`
@@ -431,8 +433,7 @@ Without `-Dwebgpu=true`, the binary has no WebGPU imports and runs pure SIMD. Wi
 
 Activations, norms, and element-wise ops stay on WASM SIMD (faster than GPU round-trip for these sizes).
 
-### Phase 9: Synchronous GPU Downloads ✅ COMPLETE
-
+### Synchronous GPU Downloads
 Worker-based architecture for correct synchronous GPU buffer reads.
 
 **Problem:** WebGPU's `staging.mapAsync()` is async, but WASM is synchronous — `gpu_download()` must return data immediately. The previous `flush()` approach couldn't work because the Zig code reads the download result within the same synchronous call stack.
@@ -485,8 +486,7 @@ await t.init('antfly-inference.wasm');  // no gpu, no worker — pure SIMD
 const emb = t.embed(model, ids, mask, 1, 128);  // sync
 ```
 
-### Phase 10: CLIP Embeddings ✅ COMPLETE
-
+### CLIP Embeddings
 Multimodal text+image semantic search in the browser.
 
 **New op:** `causalSelfAttention` — per-head attention with causal mask (`if (ki > qi) score = -inf`). Optional additive `attn_bias`. SIMD dot products.
@@ -499,8 +499,7 @@ Multimodal text+image semantic search in the browser.
 
 **E2E test:** `web/test-clip-wasm.mjs` — load model, text embedding, image embedding, cosine similarity.
 
-### Phase 11: Whisper Transcription ✅ COMPLETE
-
+### Whisper Transcription
 Client-side speech-to-text.
 
 **New ops:** `conv1d` (mel frontend), `crossAttention` (asymmetric Q[dec_seq] × K/V[enc_seq] with encoder padding mask).
@@ -515,8 +514,7 @@ Client-side speech-to-text.
 
 **E2E test:** `web/test-whisper-wasm.mjs` — load model, encoder forward, decoder forward, greedy decode loop (5 steps).
 
-### Phase 12: CLAP Audio Embeddings ✅ COMPLETE
-
+### CLAP Audio Embeddings
 Audio+text multimodal search in the browser.
 
 **New op:** `conv2d` — Two paths: groups=1 (im2col + matmul), depthwise (direct convolution with SIMD accumulation).
@@ -527,8 +525,7 @@ Audio+text multimodal search in the browser.
 
 **E2E test:** `web/test-clap-wasm.mjs` — load model, text embedding, audio embedding, cosine similarity.
 
-### Phase 13: Florence-2 OCR ✅ COMPLETE
-
+### Florence-2 OCR
 Client-side OCR, image captioning, object detection.
 
 **New ops:** `tokenGridConv2d` (reshape + conv2d for DaViT patch embed), `windowedSelfAttention` (pad → window → per-window multi-head attention → unpad for DaViT spatial blocks), `channelSelfAttention` (attention over channel dimension for DaViT channel blocks).
@@ -541,8 +538,7 @@ Client-side OCR, image captioning, object detection.
 
 **E2E test:** `web/test-florence-wasm.mjs` — load model, encoder forward (vision + prompt), decoder forward, greedy decode loop (5 steps).
 
-### Phase 14: WebGPU Acceleration for New Ops ✅ COMPLETE
-
+### WebGPU Acceleration for New Ops
 GPU shader dispatch for the bottleneck ops added in Phases 10-13.
 
 **New WGSL shaders:**
@@ -559,8 +555,7 @@ GPU shader dispatch for the bottleneck ops added in Phases 10-13.
 
 **New externs in `wasm_extern.zig`:** `gpu_causal_attention` (no mask param), `gpu_cross_attention` (asymmetric dec_seq/enc_seq).
 
-### Phase 15: ONNX Runtime Web Integration ✅ COMPLETE
-
+### ONNX Runtime Web Integration
 Optional support for running ONNX-only models (e.g. mxbai-rerank-base-v1) alongside native `antfly-inference.wasm`. Purely JS-side — no Zig changes needed.
 
 **Architecture:** Two independent WASM modules on the same page:
@@ -586,8 +581,7 @@ const result = await t.onnxInfer(session, {
 });
 ```
 
-### Phase 16: GPT Generative Support ✅ COMPLETE
-
+### GPT Generative Support
 Browser-based text generation for GPT-2, LLaMA, Mistral, Phi, Qwen2, Gemma, Falcon, OPT, BLOOM.
 
 **New ops:** `rope` (rotary position embeddings), `ropePerItem` (per-item positions for KV-cached decode), `gqaCausalAttention` (grouped query attention with causal mask), `gqaPagedAttention` (paged attention wrapper).
@@ -604,8 +598,7 @@ Browser-based text generation for GPT-2, LLaMA, Mistral, Phi, Qwen2, Gemma, Falc
 
 **E2E test:** `web/test-gpt-wasm.mjs` — load GPT-2 model + tokenizer, forward pass shape check, greedy decode, multi-step generation.
 
-### Phase 17: f16 Weight Storage ✅ COMPLETE
-
+### f16 Weight Storage
 Halves weight memory for f16 SafeTensors models.
 
 **Design:** `WasmBuf` extended with `f16_data: ?[]f16` field. `registerF16Weight()` stores raw f16 values. `viewF32()` returns `{ data: []const f32, allocated: bool }` — borrowed for f32 buffers, heap-allocated dequant copy for f16/quantized. All ops that read weights (`linear`, `linearNoBias`, `embeddingLookup`, `layerNorm`, `rmsNorm`, `toFloat32`) use `viewF32()`.
@@ -614,8 +607,7 @@ Halves weight memory for f16 SafeTensors models.
 
 **Memory savings:** GPT-2 small: 496MB → 248MB. LLaMA-3.2-1B: 4.8GB → 2.4GB (now fits WASM).
 
-### Phase 18: Quantized GPU Kernels ✅ COMPLETE
-
+### Quantized GPU Kernels
 Run Q4_0/Q8_0 GGUF models without f32 expansion.
 
 **Design:** `WasmBuf` extended with `quant_raw: ?[]const u8` and `quant_type: ?TensorType` fields. `registerQuantizedWeight()` stores raw quantized bytes. `viewF32()` dequantizes on-the-fly via `quant_codec.dequantizeToFloat32()` as a CPU fallback.
@@ -640,8 +632,7 @@ continue to use tiled MM/GEMM shaders.
 
 **Memory savings:** LLaMA-3.2-1B (Q4_0): 4.8GB → ~670MB (7x). Phi-2 (Q4_0): 10.8GB → ~1.5GB.
 
-### Phase 19: KV Cache ✅ COMPLETE
-
+### KV Cache
 Constant-time per-token decode instead of O(N) full recompute.
 
 **Design:** `WasmKvCache` struct — contiguous per-layer K/V arrays pre-allocated to `max_len`. During forward pass, each layer's `gqaPagedAttentionOp` appends new K/V to the cache and attends against the full history. `gqaCachedAttention` handles asymmetric Q (1 token) vs KV (full history) lengths.
@@ -658,8 +649,7 @@ Constant-time per-token decode instead of O(N) full recompute.
 
 **E2E test:** `web/test-gpt-wasm.mjs` Test 6 — verifies cached generation produces identical tokens to full recompute.
 
-### Phase 20: Weight Streaming ✅ COMPLETE
-
+### Weight Streaming
 Progressive model loading for large models.
 
 **Design:** Two-phase model creation:
@@ -695,8 +685,7 @@ Header-first GGUF registration for decoder-only models.
 
 **Current limitation:** streamed GGUF still requires explicit config JSON.
 
-### Phase 21: Tiled Quantized Matmul Shaders ✅ COMPLETE
-
+### Tiled Quantized Matmul Shaders
 3-5x GPU matmul speedup for Q4_0/Q8_0 models via shared memory tiling.
 
 **Design:** Rewrote `matmul_transb_q4_0.wgsl` and `matmul_transb_q8_0.wgsl` with `TILE_M=16, TILE_N=16, TILE_K=32` tiling. `TILE_K=32` matches exactly one quantization block (32 values). Each K-tile step loads A (f32) and B (quantized) cooperatively into shared memory, dequantizing B on load. Inner loop accumulates `sum += tile_a[row][i] * tile_b[col][i]` for 32 iterations.
@@ -705,8 +694,7 @@ Header-first GGUF registration for decoder-only models.
 
 No changes to `webgpu-ops.js` — pipeline names, bind group layout, and dispatch grid are unchanged.
 
-### Phase 22: WebGPU GQA Attention Shader ✅ COMPLETE
-
+### WebGPU GQA Attention Shader
 GPU-accelerated grouped-query attention for LLaMA, Mistral, Phi, Qwen2, Gemma.
 
 **New shader:** `web/shaders/gqa_causal_attention.wgsl` — 256-thread workgroups, MAX_SEQ=512. Mirrors `causal_attention.wgsl` structure but with asymmetric head counts: Q stride = `num_heads * head_dim`, K/V stride = `num_kv_heads * head_dim`, K/V head index = `h / heads_per_group`.
@@ -717,8 +705,7 @@ GPU-accelerated grouped-query attention for LLaMA, Mistral, Phi, Qwen2, Gemma.
 
 **New externs:** `gpu_gqa_causal_attention` in `wasm_extern.zig`.
 
-### Phase 23: GPU-Resident KV Cache ✅ COMPLETE
-
+### GPU-Resident KV Cache
 Eliminates O(seq_len) K/V upload per decode step. ~10x speedup for long-sequence generation.
 
 **Problem:** Every GPU attention call during generation uploaded the full K/V history. For seq_len=1024, kv_dim=4096: ~32MB uploaded per token.
@@ -735,8 +722,7 @@ Eliminates O(seq_len) K/V upload per decode step. ~10x speedup for long-sequence
 
 Falls back to CPU for kv_len > 2048.
 
-### Phase 24: T5 Encoder-Decoder ✅ COMPLETE
-
+### T5 Encoder-Decoder
 Text-to-text models (translation, summarization) in the browser.
 
 **New ops in `wasm_compute.zig`:**
@@ -751,8 +737,7 @@ No decoder KV cache — full recompute per step. Correctness first.
 
 **E2E test:** `web/test-t5-wasm.mjs` — load T5-small, encoder forward, decoder forward (single step), greedy generation (5 tokens).
 
-### Phase 25: Vision-Language Models (Gemma3 Multimodal) ✅ COMPLETE
-
+### Vision-Language Models (Gemma3 Multimodal)
 Image understanding + text generation in the browser.
 
 **Three JS-orchestrated stages:**
@@ -769,8 +754,7 @@ Image understanding + text generation in the browser.
 
 **E2E test:** `web/test-gemma3-vision-wasm.mjs` — export checks, image preprocessing, vision encode, multimodal forward, cached generation (gracefully handles models too large for 4GB WASM).
 
-### Phase 26: T5 Decoder KV Cache ✅ COMPLETE
-
+### T5 Decoder KV Cache
 O(1) per-token T5 decoding instead of O(n²) full recompute.
 
 **Design:** T5 has two attention types per decoder layer — self-attention (Q/K/V from decoder) and cross-attention (Q from decoder, K/V from encoder). Self-attention reuses the existing `WasmKvCache` + `gqaPagedAttention` (MHA is GQA with `num_kv_heads == num_heads`). Cross-attention K/V are constant across all decode steps (they depend only on encoder output), so they're computed once on the first decode step and stored in a new `T5CrossCache`.
@@ -785,8 +769,7 @@ O(1) per-token T5 decoding instead of O(n²) full recompute.
 
 **E2E test:** `web/test-t5-wasm.mjs` Test 4 — verifies cached generation produces identical tokens to full recompute (Test 3).
 
-### Phase 27: Q5_K / Q6_K WebGPU Shaders ✅ COMPLETE
-
+### Q5_K / Q6_K WebGPU Shaders
 GPU-accelerated matmul for Q5_K/Q6_K quantized models (Llama 3 Q5_K_M, Mistral Q6_K).
 
 **Block layouts:**
@@ -802,16 +785,14 @@ GPU-accelerated matmul for Q5_K/Q6_K quantized models (Llama 3 Q5_K_M, Mistral Q
 
 **New externs:** `gpu_matmul_transb_q5_k`, `gpu_matmul_transb_q6_k`
 
-### Phase 28: mT5 Validation ✅ COMPLETE
-
+### mT5 Validation
 Confirmed mT5 (multilingual T5) works with existing `load_model_t5` + `t5_encode` + `t5_decode`. mT5 uses the same T5 architecture with a larger vocabulary (250,112 tokens covering 101 languages).
 
 **E2E test:** `web/test-mt5-wasm.mjs` — load mT5-small, encoder forward, decoder forward (single step), greedy generation (5 tokens).
 
 **mBART:** Out of scope — BART uses learned position embeddings, LayerNorm, and bias, requiring a separate `bart.zig` architecture.
 
-### Phase 29: Speculative Decoding ✅ COMPLETE
-
+### Speculative Decoding
 KV cache truncation support for draft/verify rollback.
 
 **Design:** Added `truncateTo(new_len)` to both `WasmKvCache` and `GpuKvCache` — sets `cached_len = min(new_len, cached_len)`. This enables the JS-side speculative decoding loop: draft K tokens with a small model, verify against the target, rollback rejected tokens via truncation.
@@ -820,8 +801,7 @@ KV cache truncation support for draft/verify rollback.
 
 **JS API:** `gptTruncateKvCache()` + `gptGenerateSpeculative()` (draft model prefill, verify batch, accept prefix, rollback at mismatch)
 
-### Phase 30: Batched Generation ✅ COMPLETE
-
+### Batched Generation
 Generate multiple sequences simultaneously using independent KV caches.
 
 **Design:** Zero Zig changes — JS manages multiple independent caches. Each sequence gets its own KV cache, prefills independently, and decode loop advances all active sequences per step. Sequences that hit EOS stop while others continue.
@@ -830,8 +810,7 @@ Generate multiple sequences simultaneously using independent KV caches.
 
 **E2E test:** `web/test-gpt-wasm.mjs` Test 8 — verifies batch output matches individual `gptGenerateCached()` calls for two different prompts.
 
-### Phase 31: WebGPU Norms/Activations ✅ COMPLETE
-
+### WebGPU Norms/Activations
 GPU-accelerated RMSNorm and LayerNorm for large hidden dimensions.
 
 **Design:** Threshold-based GPU dispatch: `dim >= 4096 and total_elements >= 65536`. One workgroup (256 threads) per row. Tree reduction in shared memory.
@@ -845,8 +824,7 @@ GPU-accelerated RMSNorm and LayerNorm for large hidden dimensions.
 
 **New externs:** `gpu_rms_norm`, `gpu_layer_norm`
 
-### Phase 32: Gemma3 Q4_0 Validation ✅ COMPLETE
-
+### Gemma3 Q4_0 Validation
 End-to-end test for Gemma3-2B with Q4_0 GGUF weights.
 
 **E2E test:** `web/test-gemma3-q4-wasm.mjs` — load Gemma3-2B Q4_0 GGUF via `load_model_gpt_gguf`, cached forward pass, 32-token greedy generation, token validity checks.
@@ -1175,7 +1153,7 @@ Current status:
 - streamed GGUF loading now parses tokenizer-related header metadata in `web/runtime/gguf-stream.js` and surfaces `{ tokenizerJson, chatTemplate }` through `streamLoadGgufModel(..., { onMetadata })`; `streamLoadGgufModel(..., { autoLoadTokenizer: true, onTokenizerLoaded })` can now also install that tokenizer automatically without a second whole-file fetch
 - the web runtime now exposes `gguf_chat_template` and `render_chat_prompt`, so direct mode and worker mode can extract a GGUF chat template and render a single-turn system/user prompt through Zig's existing Jinja chat-template engine instead of relying on raw prompt text
 - GPU-resident weights have now started as an explicit runtime feature: `WasmCompute` now owns a `GpuWeightStore`, WebGPU-enabled registration eagerly uploads those weights during model load, and the WebGPU matmul / LayerNorm / RMSNorm paths now reuse those resident GPU buffers instead of re-uploading long-lived `B`, `gamma`, and `beta` tensors on every dispatch
-- local build verification now passes for both `wasm32` and `wasm64`, but this currently depends on a local Zig freestanding `std.Io.Threaded` workaround tracked in the repo root `ZIG.md`
+- local build verification now passes for both `wasm32` and `wasm64`, but this currently depends on a local Zig freestanding `std.Io.Threaded` workaround that was tracked in a since-removed repo-root `ZIG.md` note
 - large-model browser bring-up remains follow-on work
 
 ### Initial Refactor Slice

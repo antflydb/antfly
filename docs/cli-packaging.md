@@ -103,7 +103,7 @@ consumers.
    Cloud Build inputs plus the verified GNU archives; it never executes release
    tooling from `source_commit`.
    Native archives remain available under
-   `https://releases.antfly.io/antfly/v0.2.0/` for direct installation.
+   `https://releases.antfly.io/antfly/<version>/` for direct installation.
 
 Stable and RC releases publish the verified CLI packages to npm and PyPI.
 Nightlies build and ledger-verify those same packages, but publish only the R2
@@ -226,11 +226,11 @@ integrations:
 The release workflow publishes these native archives:
 
 ```text
-antfly_0.2.0_Darwin_arm64.tar.gz
-antfly_0.2.0_Linux_arm64.tar.gz
-antfly_0.2.0_Linux_arm64_gnu.tar.gz
-antfly_0.2.0_Linux_x86_64.tar.gz
-antfly_0.2.0_Linux_x86_64_gnu.tar.gz
+antfly_<version>_Darwin_arm64.tar.gz
+antfly_<version>_Linux_arm64.tar.gz
+antfly_<version>_Linux_arm64_gnu.tar.gz
+antfly_<version>_Linux_x86_64.tar.gz
+antfly_<version>_Linux_x86_64_gnu.tar.gz
 ```
 
 The packaging script consumes the Darwin archive and GNU archive for each Linux
@@ -254,7 +254,7 @@ preparing an installation for a different host. In automatic mode it also
 falls back to musl when an older release does not provide a GNU archive.
 
 For published prerelease tags, npm uses the release version directly. Python
-wheels use PEP 440 equivalents, for example `v0.2.0-rc.1` becomes `0.2.0rc1`.
+wheels use PEP 440 equivalents, for example `v<version>-rc.1` becomes `<version>rc1`.
 Stable npm releases publish with the `latest` dist-tag. Prerelease npm versions
 publish with the `next` dist-tag, so `npm install -g @antfly/cli` stays on the
 latest stable release and `npm install -g @antfly/cli@next` can install RC
@@ -263,9 +263,9 @@ builds. Nightly package artifacts remain in R2 and have no npm dist-tag.
 It creates:
 
 ```text
-dist/cli-packages/python/antfly_cli-0.2.0-py3-none-macosx_11_0_arm64.whl
-dist/cli-packages/python/antfly_cli-0.2.0-py3-none-manylinux_2_28_aarch64.whl
-dist/cli-packages/python/antfly_cli-0.2.0-py3-none-manylinux_2_28_x86_64.whl
+dist/cli-packages/python/antfly_cli-<version>-py3-none-macosx_11_0_arm64.whl
+dist/cli-packages/python/antfly_cli-<version>-py3-none-manylinux_2_28_aarch64.whl
+dist/cli-packages/python/antfly_cli-<version>-py3-none-manylinux_2_28_x86_64.whl
 ```
 
 and populates npm platform packages:

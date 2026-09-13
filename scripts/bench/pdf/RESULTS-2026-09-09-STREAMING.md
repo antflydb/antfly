@@ -128,7 +128,7 @@ executables and preparing the corpus as described in the README:
 ```sh
 .benchmark-results/pdf-verification/venv/bin/python scripts/bench/pdf/compare.py \
   --work-dir .benchmark-results/pdf-verification \
-  --circus-dir /Users/ajroetker/go/src/github.com/antflydb/antfly-circus \
+  --circus-dir ../antfly-circus \
   --main-binary .benchmark-results/pdf-verification/pr-render-29dd963a4/bin/antfly \
   --main-revision 29dd963a403479df56ceae5b3571801f1412bff9 \
   --pr-binary .benchmark-results/pdf-verification/pr-stream-tail/bin/antfly \

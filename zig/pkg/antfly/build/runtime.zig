@@ -24,17 +24,9 @@ pub const RuntimeArtifactRole = enum {
     standalone,
 };
 
-pub const RuntimeLibraryUnit = enum {
-    api_kernel,
-    distributed,
-    // Serverless/lake execution is a large, independently deployable graph.
-    // Keep it out of the PIC storage kernel so LLVM never has to optimize the
-    // two closures as one ARM64 ReleaseFast compilation unit.
-    serverless,
-    inference,
-    // Remote/client commands do not own storage or server runtimes.
-    cli,
-};
+const runtime_memory = @import("runtime_memory.zig");
+pub const RuntimeLibraryUnit = runtime_memory.RuntimeLibraryUnit;
+const runtimeCompileMaxRss = runtime_memory.runtimeCompileMaxRss;
 
 // Static archives must be presented from consumers to providers. The
 // distributed/application unit calls into both the API kernel and inference
@@ -47,6 +39,8 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
     .serverless,
     .distributed,
     .api_kernel,
+    .storage_kernel,
+    .enrichment_compute,
     .inference,
 };
 
@@ -80,6 +74,7 @@ pub const AddRuntimeOptions = struct {
     strip: bool,
     link_libc: bool,
     sanitize_thread: bool,
+    cpu_inference: bool = false,
     runtime_artifact_role: ?RuntimeArtifactRole,
     structlog_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
@@ -146,28 +141,38 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The executable, C API, and focused artifacts reuse their owning
         // runtime units instead of recompiling implementations in each root.
-        const unit_options = b.addOptions();
-        unit_options.addOption(RuntimeLibraryUnit, "unit", unit);
-
         const role_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_lib.zig"),
+            .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            .pic = if (unit == .distributed) true else null,
+            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
         });
+        var role_imports = production_antfly_imports;
+        role_imports.boundary_profile = switch (unit) {
+            .cli, .inference => .common,
+            .distributed, .api_kernel, .serverless => .owner,
+            .enrichment_compute => .enrichment,
+            .storage_kernel => .all,
+        };
         switch (unit) {
-            .cli => production_antfly_imports.configureCli(role_mod, link_libc),
-            .inference => production_antfly_imports.configureInference(b, role_mod, link_libc),
-            .distributed => production_antfly_imports.configureStorage(b, role_mod, link_libc),
-            .api_kernel => production_antfly_imports.configureApi(role_mod, link_libc),
-            .serverless => production_antfly_imports.configureServerless(b, role_mod, link_libc),
+            .cli => role_imports.configureCli(role_mod, link_libc),
+            .inference => role_imports.configureInference(b, role_mod, link_libc),
+            .distributed, .storage_kernel => role_imports.configureStorage(b, role_mod, link_libc),
+            .enrichment_compute => role_imports.configureEnrichment(b, role_mod, link_libc),
+            .api_kernel => role_imports.configureApi(role_mod, link_libc),
+            .serverless => role_imports.configureServerless(b, role_mod, link_libc),
+        }
+        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .enrichment_compute, true, role_imports.boundary_profile);
+        if (unit == .storage_kernel) {
+            const capi_options = b.addOptions();
+            capi_options.addOption(bool, "linked_storage", true);
+            role_mod.addOptions("capi_build_options", capi_options);
         }
         addMacosSdkPaths(b, role_mod, target);
-        if (unit == .cli or unit == .distributed) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
-        if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
-        role_mod.addOptions("runtime_library_options", unit_options);
-        if (unit != .cli and unit != .inference) {
+        if (unit == .cli or unit == .distributed or unit == .storage_kernel) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .storage_kernel) role_mod.addImport("antfly_storage_root", role_mod);
+        if (unit != .cli and unit != .inference and unit != .enrichment_compute) {
             const role_usermgr_storage_mod = b.createModule(.{
                 .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
                 .target = target,
@@ -179,52 +184,20 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
 
         const role_artifact = b.addLibrary(.{
-            .name = if (unit == .distributed)
+            .name = if (unit == .storage_kernel)
                 "antfly-storage-kernel"
             else
                 b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
             .root_module = role_mod,
             .linkage = .static,
-            .max_rss = switch (unit) {
-                // Claims conservatively cover clean production ReleaseFast
-                // peaks measured for both aarch64-linux-musl and explicit
-                // aarch64-macos (including Metal and Accelerate). They are
-                // scheduling reservations, not hard process limits. A larger
-                // budget can overlap more units while a smaller cgroup
-                // automatically schedules only the subset that fits.
-                // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, while the integrated HA API kernel
-                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-                // build. Reserve 10 GiB so the scheduler serializes competing
-                // roots instead of discarding a successful production build.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast storage codegen reached
-                // 23.03 GB (21.44 GiB) with the platform frameworks enabled;
-                // reserve 24 GiB on macOS for observed codegen plus headroom.
-                // A clean native aarch64-linux-musl production container build
-                // reached 19.89 GB (18.52 GiB) for the current production
-                // graph. Preserve the graph branch's 22 GiB non-macOS claim
-                // alongside the newer 24 GiB macOS measurement so Zig's scheduler does
-                // not discard a successfully compiled production artifact.
-                // Use the same Linux-target claim for native and cross builds;
-                // the target artifact determines the dominant codegen shape.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 24 else 22) * 1024 * 1024 * 1024,
-                // This is deliberately a separate non-PIC product unit. The
-                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
-                // the 10 GiB reservation keeps it serialized with the macOS
-                // storage kernel until both release runners confirm that.
-                .serverless => 10 * 1024 * 1024 * 1024,
-                // The broad aarch64-macOS ReleaseFast inference root now
-                // reaches roughly 13.6 GB after storage/runtime integration.
-                // Reserve enough headroom for mode-dependent IR; the build
-                // scheduler can overlap whichever roots fit without forcing
-                // callers to serialize the whole build.
-                .inference => 16 * 1024 * 1024 * 1024,
-                // Clean aarch64-macOS ReleaseFast codegen currently peaks
-                // around 2.23 GB, just above the former 2 GiB reservation.
-                .cli => 3 * 1024 * 1024 * 1024,
-            },
+            .max_rss = runtimeCompileMaxRss(unit, .{
+                .host = b.graph.host.result,
+                .target = target.result,
+                .optimize = optimize,
+                .strip = strip,
+                .cpu_inference = options.cpu_inference,
+                .sanitize_thread = sanitize_thread,
+            }),
         });
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
@@ -232,7 +205,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         );
         runtime_unit_step.dependOn(&role_artifact.step);
         runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
-        if (unit == .distributed) {
+        if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
             // to retain only the C ABI roots in the shared libraries while
@@ -241,11 +214,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_artifact.link_data_sections = true;
         }
         // Zig's build runner uses these claims to run as many LLVM codegen
-        // steps concurrently as fit in available RAM. The distributed
-        // archive is PIC because the executable and C ABI libraries share
-        // it; both consumers therefore reuse the same analyzed and
-        // optimized storage graph.
-        if (unit == .distributed) {
+        // steps concurrently as fit in available RAM. The storage archive
+        // is PIC and shared by the executable and C API final links.
+        if (unit == .storage_kernel) {
             libantfly_link_mod.linkLibrary(role_artifact);
         }
         if (strip) {
@@ -254,6 +225,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             setStripRecursively(role_mod, &visited);
         }
     }
+
+    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
 
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot
@@ -308,7 +281,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
             },
-            .data, .graph_metric_maintenance, .metadata => {
+            .graph_metric_maintenance => {},
+            .data, .metadata => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
             },
@@ -320,6 +294,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
             },
+        }
+        if (role != .inference) {
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
         }
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

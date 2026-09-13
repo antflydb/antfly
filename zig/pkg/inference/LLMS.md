@@ -1,5 +1,26 @@
 # Antfly inference LLM Plan
 
+> **Editorial note (2026 audit pass):** this document has not been reframed
+> as a design doc — it is long (1300+ lines), and its "Delivery Phases"
+> section (below) is a deeply-nested, dated implementation log that leans
+> heavily on an `mlx` compute backend. That backend has since been removed
+> from the codebase entirely (see `src/backends/backends.zig`'s `BackendType`
+> enum: `native`, `onnx`, `metal`, `cuda`, `pjrt`, `wasm` — no `mlx`), so most
+> of the MLX-specific "Done:" narrative below (particularly in Phase 5 and
+> Phase 10) describes dead code paths, not current behavior. Disentangling
+> which described capabilities carried over to `native`/`metal` versus which
+> were MLX-only and are now gone would require re-verifying each claim
+> individually against current source; that was judged too large and
+> error-prone to do safely as part of this pass, so the phase content below
+> is left as historical narrative rather than reframed as shipped design.
+> Current, accurate design docs for the overlapping subsystems exist
+> separately: [KVCACHE.md](KVCACHE.md) for the KV cache as implemented today,
+> [GRAPH.md](GRAPH.md) for the graph IR/runtime, [GGML.md](GGML.md) for
+> GGUF/quantization format coverage, and [CUDA.md](CUDA.md) for the CUDA
+> backend that superseded the "future `cuda`" placeholder below. Treat any
+> specific claim in this file as unverified unless cross-checked against
+> current source or one of those docs.
+
 ## Goal
 
 Add first-class local LLM support to antfly inference with:
@@ -7,10 +28,10 @@ Add first-class local LLM support to antfly inference with:
 - complete GGUF model/container support
 - native Zig execution, not a llama.cpp wrapper
 - Hypura-like storage-tier-aware inference
-- compute backends remaining separate from model format:
-  - `mlx`
-  - `native`
-  - future `cuda`
+- compute backends remaining separate from model format (the backend set
+  has since evolved to `native`, `metal`, `cuda`, `onnx`, `pjrt`, and `wasm`;
+  the `mlx` backend named below was later removed — see the editorial note
+  above)
 
 The intended end state is:
 
@@ -1018,9 +1039,9 @@ E2E bring-up checklist:
     - first real-token check after inspection is clean:
       - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate <gemma-gguf-dir> 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - validated MLX command for the small bring-up target:
-      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate <models-dir>/gemma-3-270m-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --no-chat-template --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - validated MLX command for the 4B QAT target:
-      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate /Users/ajroetker/go/src/github.com/antflydb/antfly-inference-zig/termite-models/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
+      - `ulimit -n 65536 && ./zig-out/bin/antfly inference generate <models-dir>/gemma-3-4b-it-qat-gguf 'hi' --backend mlx --max-tokens 1 --prefill-chunk-size 64 --print-chat-template-status --print-prompt --print-token-ids --print-finish-reason`
     - if the candidate Gemma export reports unsupported tensor types, pick a smaller dense GGUF that stays inside the current coverage set rather than debugging Mixtral first
   - then run the smoke path against the exact target Mixtral GGUF artifact
   - compare the reported GGUF tensor-type set with native quant coverage
