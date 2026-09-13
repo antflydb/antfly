@@ -43,6 +43,9 @@ All notable changes to Antfly will be documented in this file.
   deprecated alias and defaults to the legacy path style for this release.
 - **Operator metrics** — dual-emitted under both the `ha` and `standby`
   subsystems during the deprecation window.
+- **`storage/hot_standby` package** — the Zig package moved from
+  `storage/ha`; its test names and build steps are now
+  `storage.hot_standby ...` and `antfly-storage-hot-standby-*`.
 - **Planned switchover** — `antfly standby switchover --to <standby>` fences the
   old primary first, waits for the standby to reach the final LSN, fences and
   promotes the standby with the same fence generation, assesses the old

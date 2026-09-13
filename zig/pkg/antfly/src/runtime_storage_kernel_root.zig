@@ -122,9 +122,9 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
-    exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_ha_seed_activate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_ha_seed_validate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_ha_seed_prune_json");
+    exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
+    exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
+    exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
     exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
     exportInternal(&storage_kernel_exports.storageOwnerReconcile, "antfly_storage_owner_reconcile");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightWriteAdmission, "antfly_storage_owner_preflight_write_admission");

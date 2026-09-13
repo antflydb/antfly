@@ -988,7 +988,7 @@ pub const HASeedOperation = enum(u32) {
 };
 
 /// The request JSON is borrowed for one synchronous coarse operation. Its
-/// schema is the corresponding `storage/ha/seed_activation.zig` request type;
+/// schema is the corresponding `storage/hot_standby/seed_activation.zig` request type;
 /// no allocator, Zig error union, or storage handle crosses the ABI.
 pub const HASeedJsonRequest = extern struct {
     version: u32 = abi_version,
@@ -1615,19 +1615,19 @@ pub extern fn antfly_storage_owner_open(
 
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
-pub extern fn antfly_storage_ha_seed_activate_json(
+pub extern fn antfly_storage_hot_standby_seed_activate_json(
     request: *const HASeedJsonRequest,
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
-pub extern fn antfly_storage_ha_seed_validate_json(
+pub extern fn antfly_storage_hot_standby_seed_validate_json(
     request: *const HASeedJsonRequest,
     out_result: *HASeedValidationResult,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
-pub extern fn antfly_storage_ha_seed_prune_json(
+pub extern fn antfly_storage_hot_standby_seed_prune_json(
     request: *const HASeedJsonRequest,
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,

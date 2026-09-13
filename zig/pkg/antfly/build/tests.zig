@@ -783,7 +783,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db split modeled ",
         "serverless",
         "raft.",
-        "storage.ha",
+        "storage.hot_standby",
         "HBC recall",
     };
     const lib_unit_default_filters = [_][]const u8{
@@ -1843,21 +1843,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_lsm_vopr_test_step = b.step("lsm-vopr-test", "Run replayable real-backend LSM VOPR campaigns");
     lib_lsm_vopr_test_step.dependOn(&run_lib_lsm_vopr_tests.step);
     const lib_ha_chaos_default_filters = [_][]const u8{
-        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
-        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
-        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
-        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
-        "storage.ha chaos crash after apply before ack reports durable progress on resume",
-        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
-        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
-        "storage.ha chaos network partition requires fence before standby promotion",
+        "storage.hot_standby chaos crash during base backup preserves slot pin and catch-up boundary",
+        "storage.hot_standby chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.hot_standby chaos rejects noncontiguous records and follows timeline switch across restart",
+        "storage.hot_standby chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.hot_standby chaos crash after apply before ack reports durable progress on resume",
+        "storage.hot_standby chaos primary restart preserves synchronous acknowledgement boundaries",
+        "storage.hot_standby chaos lag retention forces reseed and former primary cannot rewind expired WAL",
+        "storage.hot_standby chaos network partition requires fence before standby promotion",
     };
     const lib_ha_chaos_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
     });
     const run_lib_ha_chaos_tests = addFilteredTestRunArtifact(b, lib_ha_chaos_tests);
-    const lib_ha_chaos_test_step = b.step("antfly-storage-ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
+    const lib_ha_chaos_test_step = b.step("antfly-storage-hot-standby-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
     const lib_ha_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1867,23 +1867,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_ha_vopr_test_step = b.step("ha-vopr-test", "Run replayable HA lifecycle VOPR campaigns");
     lib_ha_vopr_test_step.dependOn(&run_lib_ha_vopr_tests.step);
     const lib_ha_compat_default_filters = [_][]const u8{
-        "storage.ha compat decodes v1 replication record fixture",
-        "storage.ha compat keeps v1 replication record encoding stable",
-        "storage.ha compat decodes v1 timeline switch record fixture",
-        "storage.ha compat keeps v1 timeline switch encoding stable",
-        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
-        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
-        "storage.ha compat decodes v1 backup manifest fixture",
-        "storage.ha compat keeps v1 backup manifest encoding stable",
-        "storage.ha compat keeps v1 backup manifest file kind tags stable",
-        "storage.ha compat keeps v1 record kind tags stable",
+        "storage.hot_standby compat decodes v1 replication record fixture",
+        "storage.hot_standby compat keeps v1 replication record encoding stable",
+        "storage.hot_standby compat decodes v1 timeline switch record fixture",
+        "storage.hot_standby compat keeps v1 timeline switch encoding stable",
+        "storage.hot_standby compat decodes v1 base backup and checkpoint record fixtures",
+        "storage.hot_standby compat keeps v1 base backup and checkpoint encodings stable",
+        "storage.hot_standby compat decodes v1 backup manifest fixture",
+        "storage.hot_standby compat keeps v1 backup manifest encoding stable",
+        "storage.hot_standby compat keeps v1 backup manifest file kind tags stable",
+        "storage.hot_standby compat keeps v1 record kind tags stable",
     };
     const lib_ha_compat_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
     });
     const run_lib_ha_compat_tests = addFilteredTestRunArtifact(b, lib_ha_compat_tests);
-    const lib_ha_compat_test_step = b.step("antfly-storage-ha-compat-test", "Run HA replication format compatibility tests");
+    const lib_ha_compat_test_step = b.step("antfly-storage-hot-standby-compat-test", "Run HA replication format compatibility tests");
     lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
@@ -2205,14 +2205,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const ha_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"storage.ha"},
+        .filters = &.{"storage.hot_standby"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
-    const ha_test_step = b.step("antfly-storage-ha-test", "Run hot-standby HA storage tests");
+    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby HA storage tests");
     ha_test_step.dependOn(&run_ha_tests.step);
 
     // cmd/ha.zig is owned by the distributed runtime unit. Keep its focused
@@ -4026,7 +4026,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(lib_standalone_runtime_test_step);
     // The aggregate's storage HA shard owns the library tests. Keep only the
-    // command-root coverage that the shard cannot discover; `antfly-storage-ha-test` remains
+    // command-root coverage that the shard cannot discover; `antfly-storage-hot-standby-test` remains
     // available as the convenient focused target containing both artifacts.
     unit_test_step.dependOn(&run_ha_cli_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
@@ -5023,7 +5023,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.typed_doc_values_coverage.",
             "storage.db.types.",
         },
-        &.{"storage.ha."},
+        &.{"storage.hot_standby."},
         &.{
             "storage.lite.",
             "storage.lsm.",

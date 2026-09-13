@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const antfly = @import("../cli_root.zig");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
-const seed_activation_contract = @import("../storage/ha/seed_activation_contract.zig");
+const seed_activation_contract = @import("../storage/hot_standby/seed_activation_contract.zig");
 const storage_source_options = @import("storage_source_options");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 

@@ -40,7 +40,7 @@ Implementation notes:
 - HA string validation is shared only at the missing/padded classification
   layer: `HAStringValidation = enum { ok, missing, padded }` and
   `classifyHAString(value: ?[]const u8)` in
-  `zig/pkg/antfly/src/storage/ha/validation.zig` replaced the old
+  `zig/pkg/antfly/src/storage/hot_standby/validation.zig` replaced the old
   `paddedHAString` helper. Field-specific errors and type-specific validation
   for paths, node ids, slot names, token environment variables, and URLs stay
   local to each caller rather than living in one catch-all `validateHAString`.
@@ -56,7 +56,7 @@ Implementation notes:
   catch-up, read-only behavior, standby restart/replay resume, fenced
   promotion, and old-primary write rejection.
 - HA is integrated with the Zig simulation harness
-  (`zig/pkg/antfly/src/storage/ha/vopr.zig` and `chaos.zig`), which exercises
+  (`zig/pkg/antfly/src/storage/hot_standby/vopr.zig` and `chaos.zig`), which exercises
   receive/apply crash windows, sync-ack crashes, duplicate/gap/out-of-order
   WAL, fenced and unfenced promotion, old-primary rejoin/rewind/reseed, WAL
   expiry, and timeline propagation.
@@ -815,7 +815,7 @@ This release renames the surface to **`standby`**:
 | Admin token env | `ANTFLY_HA_ADMIN_TOKEN` | `ANTFLY_STANDBY_ADMIN_TOKEN` added as the preferred name; `ANTFLY_HA_ADMIN_TOKEN` still works as a fallback |
 | Metrics | subsystem `ha` | `standby`, dual-emitted during the deprecation window |
 | Internal replication API | `/internal/v1/ha/replication/...`, `HAIdentity`, `HAReplicationFrame`, ... | `/internal/v1/standby/replication/...`, `StandbyIdentity`, `StandbyReplicationFrame`, ...; the old prefix is served as an alias and a new standby falls back to it once when its primary still runs 0.2, so either side may be upgraded first |
-| Internal package | `storage/ha` | `storage/standby` |
+| Internal package | `storage/ha` | `storage/hot_standby` (`storage.hot_standby` in Zig; test names and build steps follow: `antfly-storage-hot-standby-test`) |
 
 `replication` was considered and rejected because it already names three
 different things in Antfly: `replication_factor` (Raft replicas of a shard),
@@ -1134,7 +1134,7 @@ old phase ordering where one component depends on another.
 
 ### Local Replication Format
 
-`zig/pkg/antfly/src/storage/ha/replication_record.zig` defines the
+`zig/pkg/antfly/src/storage/hot_standby/replication_record.zig` defines the
 `ReplicationRecord` envelope and binary codec described in
 [WAL Stream Shape](#wal-stream-shape). `compat.zig` hard-codes golden v1
 byte fixtures so header, endian, enum, CRC, or payload layout drift is caught

@@ -100,7 +100,7 @@ pub const legacy_standby_prefix = base ++ "/ha";
 
 /// Canonical unauthenticated health-surface base (`/standby/v1/...`), and its
 /// legacy `/ha/v1` alias. These sit outside `base` (`/admin/v1`) entirely; see
-/// `storage/ha/http_admin.zig`'s `Routes`.
+/// `storage/hot_standby/http_admin.zig`'s `Routes`.
 pub const standby_v1_base = "/standby/v1";
 pub const legacy_standby_v1_base = "/ha/v1";
 
@@ -336,10 +336,10 @@ test "admin routes match generated OpenAPI HA operations" {
 
 test "admin routes own HA admin path literals consumed by Zig runtime code" {
     try expectNoHardCodedHAAdminPath("../cmd/ha.zig", @embedFile("../cmd/ha.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/ha/admin_exec.zig", @embedFile("../storage/ha/admin_exec.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/ha/http_admin.zig", @embedFile("../storage/ha/http_admin.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/ha/http_client.zig", @embedFile("../storage/ha/http_client.zig"));
-    try expectNoHardCodedHAAdminPath("../storage/ha/operator.zig", @embedFile("../storage/ha/operator.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/hot_standby/admin_exec.zig", @embedFile("../storage/hot_standby/admin_exec.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_admin.zig", @embedFile("../storage/hot_standby/http_admin.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/hot_standby/http_client.zig", @embedFile("../storage/hot_standby/http_client.zig"));
+    try expectNoHardCodedHAAdminPath("../storage/hot_standby/operator.zig", @embedFile("../storage/hot_standby/operator.zig"));
     try expectNoHardCodedHAAdminPath("../standalone/runtime.zig", @embedFile("../standalone/runtime.zig"));
 }
 

@@ -32697,7 +32697,7 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
         }
 
-        test "storage.ha data runtime rejects concurrent seed capture before waiting on mutation barrier" {
+        test "storage.hot_standby data runtime rejects concurrent seed capture before waiting on mutation barrier" {
             var server: DataServer = undefined;
             server.ha_seed_capture_active = .init(true);
             try std.testing.expectError(
@@ -33239,7 +33239,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"title\":\"pending\"}", pending.json);
         }
 
-        test "storage.ha data server rejects writes and owner jobs after primary promotion fence" {
+        test "storage.hot_standby data server rejects writes and owner jobs after primary promotion fence" {
             const alloc = std.testing.allocator;
             const FakeStatus = struct {
                 fn iface() antfly.public_api.http_server.StatusSource {
@@ -41770,7 +41770,7 @@ fn implementationTests() type {
             try std.testing.expect(std.mem.indexOf(u8, text_merge_output, "antfly_text_merge_deferred_for_pressure_total 4") != null);
         }
 
-        test "storage.ha data runtime default seed snapshot derives standalone groups from metadata only" {
+        test "storage.hot_standby data runtime default seed snapshot derives standalone groups from metadata only" {
             const alloc = std.testing.allocator;
 
             const FakeMetadata = struct {

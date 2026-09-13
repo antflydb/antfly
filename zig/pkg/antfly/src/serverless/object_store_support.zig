@@ -390,7 +390,7 @@ pub const OpenedObjectStore = struct {
     }
 };
 
-test "storage.ha cleanup object store does not create a missing bucket while opening deletion authority" {
+test "storage.hot_standby cleanup object store does not create a missing bucket while opening deletion authority" {
     const alloc = std.testing.allocator;
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
