@@ -65,6 +65,7 @@ const gliner_mod = @import("../pipelines/gliner.zig");
 const grammar_mod = @import("../pipelines/grammar.zig");
 const audio_mod = @import("../pipelines/audio.zig");
 const readers_mod = @import("../readers/reader.zig");
+const qwen3vl_reader_mod = @import("../readers/qwen3vl.zig");
 const rebel_mod = @import("../pipelines/rebel.zig");
 const resolver_mod = @import("../pipelines/resolver.zig");
 const cleanup_pipeline_mod = @import("../pipelines/entity_cleanup.zig");
@@ -1423,7 +1424,6 @@ const max_chunk_target_tokens = lib_chunker.max_chunk_target_tokens;
 const max_chunk_audio_window_ms = lib_chunker.max_chunk_audio_window_ms;
 const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
-const default_qwen3vl_ocr_prompt = "Transcribe all visible text exactly. Preserve the original reading order, line breaks, punctuation, and accents. Return only the transcription.";
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -6724,6 +6724,31 @@ pub const Node = struct {
         }
     };
 
+    fn qwen3VlEncodedReadBatchResult(
+        allocator: std.mem.Allocator,
+        results: []const Qwen3VlReadResult,
+        images: []const readers_api.EncodedImage,
+    ) !readers_api.BatchResult {
+        if (results.len != images.len) return error.InvalidReadResultCount;
+        const out = try allocator.alloc(readers_api.Result, results.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*item| readers_api.deinitResult(allocator, item);
+            allocator.free(out);
+        }
+        for (results, images, out) |result, image, *item| {
+            item.* = .{ .text = try allocator.dupe(u8, result.text) };
+            initialized += 1;
+            item.item_id = if (image.item_id.len > 0) try allocator.dupe(u8, image.item_id) else "";
+            item.source_fingerprint = if (image.source_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            item.page_number = image.page_number;
+        }
+        return .{
+            .items = out,
+            .execution = .{ .requested_items = out.len, .serial_items = out.len },
+        };
+    }
+
     fn readQwen3VlImagesWithAdmission(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -6735,7 +6760,7 @@ pub const Node = struct {
         control: InferenceExecutionControl,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        const prompt = qwen3VlReadPrompt(requested_prompt);
+        const prompt = qwen3vl_reader_mod.resolvePrompt(requested_prompt);
         const max_tokens: i32 = @intCast(requested_max_tokens orelse default_read_admission_max_tokens);
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
@@ -6861,7 +6886,7 @@ pub const Node = struct {
 
         if (is_qwen3vl) {
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
-                qwen3VlReadPrompt(request.prompt).len,
+                qwen3vl_reader_mod.resolvePrompt(request.prompt).len,
                 1,
                 @intCast(max_tokens orelse default_read_admission_max_tokens),
             );
@@ -7052,6 +7077,56 @@ pub const Node = struct {
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "readers");
         defer self.allocator.free(model_path);
         try execution_control.check();
+
+        // Generator-backed readers execute serially through the same resident
+        // generation path as HTTP /read. They do not use the Florence broker
+        // or the encoder-decoder reader loader.
+        {
+            var manifest = try manifest_mod.loadListingFromDir(allocator, model_path);
+            defer manifest.deinit();
+            if (isQwen3VlReadModel(&manifest)) {
+                const prompt = qwen3vl_reader_mod.resolvePrompt(request.prompt);
+                const output_tokens = max_tokens orelse default_read_admission_max_tokens;
+                const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
+                const image_datas = try allocator.alloc([]const u8, request.images.len);
+                defer allocator.free(image_datas);
+                for (request.images, 0..) |image, index| {
+                    try validateEncodedImageMime(image.mime_type, image.bytes);
+                    image_datas[index] = image.bytes;
+                }
+                try validateInferenceExecutorInvocation(contract, .{
+                    .item_count = request.images.len,
+                    .text_bytes_per_item = prompt.len,
+                    .output_tokens_per_item = output_tokens,
+                    .encoded_media_bytes = encoded_bytes,
+                    .decoded_pixels = try measureExecutorDecodedImages(&manifest, image_datas),
+                    .media_parts_per_item = 1,
+                    .has_image = true,
+                });
+                var reserved_units = @max(required_units, estimateGenerateAdmissionUnitsFromShape(
+                    prompt.len,
+                    1,
+                    @intCast(output_tokens),
+                ));
+                try self.acquireAdmissionUnits(reserved_units);
+                defer self.releaseAdmissionUnits(reserved_units);
+                const results = try self.readQwen3VlImagesWithAdmission(
+                    allocator,
+                    model_path,
+                    image_datas,
+                    request.prompt,
+                    max_tokens,
+                    &reserved_units,
+                    execution_control,
+                );
+                defer {
+                    for (results) |*result| result.deinit(allocator);
+                    allocator.free(results);
+                }
+                try execution_control.check();
+                return qwen3VlEncodedReadBatchResult(allocator, results, request.images);
+            }
+        }
 
         // Flatten even an existing PDF/window batch into independently
         // attributable tickets. Compatible work from other requests can fill
@@ -15818,7 +15893,7 @@ pub const Node = struct {
         const is_qwen3vl = isQwen3VlReadModel(&admission_manifest);
 
         if (is_qwen3vl) {
-            const prompt = qwen3VlReadPrompt(body.prompt);
+            const prompt = qwen3vl_reader_mod.resolvePrompt(body.prompt);
             const generation_units = estimateGenerateAdmissionUnitsFromShape(
                 prompt.len,
                 1,
@@ -15831,7 +15906,7 @@ pub const Node = struct {
         const executor_contract = resolvedInferenceExecutorContract(self, "read", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const read_prompt_bytes = if (is_qwen3vl)
-            qwen3VlReadPrompt(body.prompt).len
+            qwen3vl_reader_mod.resolvePrompt(body.prompt).len
         else if (body.prompt) |prompt|
             prompt.len
         else
@@ -22859,14 +22934,6 @@ test "read prompt treats empty public values as an omitted OCR prompt" {
     try std.testing.expectEqualStrings("<OCR>", normalizeReadPrompt("<OCR>").?);
 }
 
-test "Qwen3-VL read prompt defaults to the qualified OCR task and preserves document modes" {
-    try std.testing.expectEqualStrings(default_qwen3vl_ocr_prompt, qwen3VlReadPrompt(null));
-    try std.testing.expectEqualStrings(default_qwen3vl_ocr_prompt, qwen3VlReadPrompt(" \n\t"));
-    try std.testing.expectEqualStrings("qwenvl markdown", qwen3VlReadPrompt("qwenvl markdown"));
-    try std.testing.expectEqualStrings("qwenvl html", qwen3VlReadPrompt("qwenvl html"));
-    try std.testing.expectEqualStrings("Extract the invoice number only.", qwen3VlReadPrompt("Extract the invoice number only."));
-}
-
 test "Qwen3-VL read and prepared generation stop cancelled work before model loading" {
     const allocator = std.testing.allocator;
     var node = try Node.init(allocator, .{});
@@ -23007,6 +23074,53 @@ test "/read recognizes a Qwen3-VL generator bundle before reader model loading" 
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INCOMPATIBLE_MODEL") != null);
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+
+    // The embedded encoded-image route must reach the same generator artifact
+    // gate and never send it through the encoder-decoder reader loader.
+    const image = try decodeDataUri(allocator, "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC");
+    defer image.deinit(allocator);
+    const encoded = readers_api.EncodedRequest{ .images = &.{.{ .bytes = image.data, .mime_type = "image/png" }} };
+    {
+        try node.acquireAdmissionUnits(4);
+        defer node.releaseAdmissionUnits(4);
+        try std.testing.expectError(error.QueueFull, node.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
+        try std.testing.expectEqual(@as(usize, 4), node.inference_admission.inFlightUnits());
+    }
+    try std.testing.expectError(error.IncompatibleModel, node.readEncodedImagesReportedDirect(allocator, "owner/qwen", encoded));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectError(error.Timeout, node.readEncodedImagesReportedDirectWithContext(allocator, "owner/qwen", encoded, 0, .{}));
+}
+
+test "Qwen3-VL encoded read results own page identities and report serial execution" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var text = [_]u8{ 'p', 'a', 'g', 'e' };
+            var item_id = [_]u8{ 'p', '2' };
+            var fingerprint = [_]u8{ 'd', 'o', 'c' };
+            const results = [_]Node.Qwen3VlReadResult{
+                .{ .text = &text, .prompt_tokens = 10, .completion_tokens = 2 },
+                .{ .text = &text, .prompt_tokens = 11, .completion_tokens = 2 },
+            };
+            const images = [_]readers_api.EncodedImage{
+                .{ .bytes = "image", .mime_type = "image/png", .item_id = &item_id, .source_fingerprint = &fingerprint, .page_number = 2 },
+                .{ .bytes = "image", .mime_type = "image/png", .page_number = 1 },
+            };
+            var batch = try Node.qwen3VlEncodedReadBatchResult(allocator, &results, &images);
+            defer batch.deinit(allocator);
+            @memset(&text, 'x');
+            @memset(&item_id, 'x');
+            @memset(&fingerprint, 'x');
+            try std.testing.expectEqualStrings("page", batch.items[0].text);
+            try std.testing.expectEqualStrings("p2", batch.items[0].item_id);
+            try std.testing.expectEqualStrings("doc", batch.items[0].source_fingerprint.?);
+            try std.testing.expectEqual(@as(?u32, 2), batch.items[0].page_number);
+            try std.testing.expectEqual(@as(?u32, 1), batch.items[1].page_number);
+            try batch.execution.validate(2);
+            try std.testing.expectEqual(@as(usize, 2), batch.execution.serial_items);
+            try std.testing.expectEqual(@as(usize, 0), batch.execution.fallback_items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "read admission units scale with image batch and decode length" {
@@ -23018,7 +23132,7 @@ test "read admission units scale with image batch and decode length" {
 
 test "Qwen3-VL read admission includes one serial multimodal generation" {
     const generation_units = Node.estimateGenerateAdmissionUnitsFromShape(
-        default_qwen3vl_ocr_prompt.len,
+        qwen3vl_reader_mod.DefaultPrompt.len,
         1,
         @intCast(default_read_admission_max_tokens),
     );
@@ -29793,10 +29907,6 @@ fn readMaxTokensJsonField(obj: std.json.ObjectMap, name: []const u8) !?usize {
 fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
     const value = prompt orelse return null;
     return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
-}
-
-fn qwen3VlReadPrompt(prompt: ?[]const u8) []const u8 {
-    return normalizeReadPrompt(prompt) orelse default_qwen3vl_ocr_prompt;
 }
 
 fn isQwen3VlReadModel(manifest: *const manifest_mod.ModelManifest) bool {

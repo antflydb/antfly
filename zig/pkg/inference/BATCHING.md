@@ -419,8 +419,9 @@ The `/read` endpoint accepts multiple images and routes them through a reader-le
 - `LoadedReader.readBatch`: the stable reader contract used by the server and local direct calls.
 - Model-family implementations: native Florence can use a real batch fast path; VLM, GenAI, Pix2Struct, and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.
 
-Qwen3-VL split GGUF generators are also accepted by `/read` when their selected
-artifacts and backend pass the normal runtime compatibility checks.
+`/read` can also use Qwen3-VL, a general vision-language model, for OCR and
+document transcription. Split GGUF generator bundles are accepted when their
+selected artifacts and backend pass the normal runtime compatibility checks.
 Qwen requests reuse the resident native Metal generation pipeline and execute
 one image at a time so every input still maps to one independent read result;
 the outer request admission covers the complete serial batch. This is a
