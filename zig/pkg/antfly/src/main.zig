@@ -104,6 +104,8 @@ extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callc
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
@@ -149,7 +151,13 @@ pub fn runRuntimeUnit(
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .serverless => antfly_runtime_serverless(&context),
-        .standalone => antfly_runtime_standalone(&context),
+        .standalone => if (std.mem.eql(u8, command, "lite"))
+            if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
+                antfly_runtime_standalone_lite(&context)
+            else
+                antfly_runtime_lite(&context)
+        else
+            antfly_runtime_standalone(&context),
     };
     if (code != 0) std.process.exit(@intCast(code));
 }

@@ -1,5 +1,25 @@
 # LSM version publication
 
+## Physical usage observation
+
+Use `Backend.measurePhysicalUsage()` for explicit filesystem measurements;
+do not walk the writer's run store or obsolete ledger from a benchmark or
+diagnostic caller. The backend captures a shared read version and immutable
+cleanup ledger under its mutex, then stats their files outside it. Capture does
+not clone the mutable memtable or flatten the run directory. Existing tracked
+version/ledger retirement owns cleanup on success, I/O failure, and allocation
+failure. Active SST pins prevent reclamation until measurement ends; retaining
+obsolete path metadata deliberately does not delay physical deletion.
+
+The result separates active SST bytes, observed obsolete-file bytes, retained
+WAL bytes, and already-missing obsolete files. Only `FileNotFound` for an obsolete
+path means zero bytes. Missing active SSTs and other filesystem errors propagate.
+WAL accounting uses the backend's maintained retention cache. Active/obsolete
+overlap is counted once. This is a measurement of one captured inventory over
+the call's duration, not an atomic filesystem snapshot or allocated-block count;
+live manifests, unpublished outputs and unrelated files are outside its scope.
+It performs O(files) metadata I/O and is not a replacement for hot-path counters.
+
 ## Indexed current-tip reads inside write transactions
 
 Scalar reads in both bound and namespace write transactions resolve their local

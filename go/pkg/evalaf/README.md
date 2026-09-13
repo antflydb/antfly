@@ -20,7 +20,7 @@ Evalaf is a comprehensive evaluation framework for testing and monitoring LLM ap
 ### Installation
 
 ```bash
-go get github.com/antflydb/anteval
+go get github.com/antflydb/antfly/go/pkg/evalaf
 ```
 
 ### Basic Usage
@@ -30,7 +30,7 @@ package main
 
 import (
     "context"
-    "github.com/antflydb/anteval/eval"
+    "github.com/antflydb/antfly/go/pkg/evalaf/eval"
 )
 
 func main() {
@@ -303,7 +303,7 @@ go test ./...
 
 ## Module Path
 
-This project uses the module path `github.com/antflydb/anteval` while living in the `evalaf/` directory of the antfly repository. This is a nested Go module.
+This project uses the module path `github.com/antflydb/antfly/go/pkg/evalaf` while living in the `evalaf/` directory of the antfly repository. This is a nested Go module.
 
 ## Dependencies
 

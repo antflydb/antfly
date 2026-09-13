@@ -21,7 +21,7 @@ ts/
   apps/antfarm/      Web dashboard (React + Vite)
 py/packages/sdk/     Python SDK
 rs/
-  pgaf/              PostgreSQL extension (Rust/pgrx)
+  crates/pgaf/       PostgreSQL extension (Rust/pgrx)
   crates/sdk/        Generated Rust SDK (shared types with pgaf)
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
@@ -105,8 +105,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Antfly Lite binding | `go/pkg/antflylite/` |
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
-| Antfly proxy | `go/pkg/proxy/antfly/` |
-| Inference proxy | `go/pkg/proxy/inference/` |
+| Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
@@ -162,8 +161,8 @@ cd py && uv sync && uv run pytest
 ### Rust (pgaf)
 
 ```bash
-cd rs/pgaf && make test       # Unit tests
-cd rs/pgaf && make test-e2e   # E2E (requires running Antfly server)
+cd rs/crates/pgaf && make test       # Unit tests
+cd rs/crates/pgaf && make test-e2e   # E2E (requires running Antfly server)
 ```
 
 ## Code Generation
@@ -206,9 +205,7 @@ Release tags:
 The previous standalone operator tag streams were consolidated into
 `go/pkg/operator/v*`.
 
-```bash
 See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
-```
 
 ## License
 

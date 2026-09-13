@@ -15853,6 +15853,25 @@ test "backup location parsing requires absolute file uri" {
     try std.testing.expectError(error.InvalidBackupLocation, parseFileLocation("file://relative"));
 }
 
+test "authorized filesystem location returns canonical ancestor for no-follow traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "canonical", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "canonical", "alias", .{ .is_directory = true });
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const alias_location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new-backup", .{root});
+    defer alloc.free(alias_location);
+    const expected = try std.fmt.allocPrint(alloc, "{s}/canonical/new-backup", .{root});
+    defer alloc.free(expected);
+
+    const resolved = try resolveFilesystemLocationAlloc(alloc, "/", alias_location, std.testing.io);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
 test "restore source identities are bounded and canonical" {
     const alloc = std.testing.allocator;
 

@@ -31,6 +31,7 @@ const tensor_mod = @import("tensor.zig");
 const token = @import("token.zig");
 const value_mod = @import("value.zig");
 const symbol = @import("symbol.zig");
+const index_config = @import("index_config.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_types = @import("../../backend_types.zig");
 const docstore_mod = @import("../../docstore.zig");
@@ -119,11 +120,7 @@ const expression_bucket_output_dims = [_]ir.Dimension{.bucket};
 const expression_kind_scalar_output_dims = [_]ir.Dimension{ .kind, .scalar };
 const expression_time_bucket_scalar_output_dims = [_]ir.Dimension{ .time, .bucket, .scalar };
 
-pub const FieldConfig = struct {
-    name: []const u8,
-    path: []const u8,
-    type: []const u8,
-};
+pub const FieldConfig = index_config.FieldConfig;
 
 pub const ResolvedField = struct {
     public: []const u8,
@@ -137,155 +134,15 @@ pub const ResolvedMeasureField = struct {
     field: ResolvedField,
 };
 
-pub const JoinConfig = struct {
-    name: []const u8,
-    left_fields: []const []const u8 = &.{},
-    right_fields: []const []const u8 = &.{},
-    left_type_field: ?[]const u8 = null,
-    left_type_value: ?[]const u8 = null,
-    right_type_field: ?[]const u8 = null,
-    right_type_value: ?[]const u8 = null,
-    left_time_field: ?[]const u8 = null,
-    right_time_field: ?[]const u8 = null,
-    temporal_bucket: ?[]const u8 = null,
-    temporal_window_seconds: ?i64 = null,
-    max_fanout: ?usize = null,
-};
+pub const JoinConfig = index_config.JoinConfig;
+pub const MaterializationConfig = index_config.MaterializationConfig;
+pub const LawConfig = index_config.LawConfig;
+pub const AdaptiveConfig = index_config.AdaptiveConfig;
+pub const PathFactPolicyConfig = index_config.PathFactPolicyConfig;
+pub const Config = index_config.Config;
 
-pub const MaterializationConfig = struct {
-    name: []const u8,
-    op: []const u8,
-    group_by: []const []const u8 = &.{},
-    measure: ?[]const u8 = null,
-    time: ?[]const u8 = null,
-    bucket: ?[]const u8 = null,
-    join: ?[]const u8 = null,
-    group_side: ?[]const u8 = null,
-    measure_side: ?[]const u8 = null,
-    implicit_query: bool = false,
-    law: ?[]const u8 = null,
-    axes: []const []const u8 = &.{},
-};
-
-pub const LawConfig = struct {
-    name: []const u8,
-    id: []const u8,
-    structure: []const u8 = "",
-    invertible: bool = false,
-};
-
-// A materialized approximate distinct-count. Per group key, a HyperLogLog
-// sketch over the canonical tokens of `value_field` is maintained incrementally
-// on ingest, so a cardinality query reads one sketch per group instead of
-// rescanning and deduplicating every document's value. `precision` of 0 selects
-// the default; larger precision trades memory (2^precision bytes/sketch) for a
-// smaller standard error. Maintenance is append-only: deletes require a rebuild
-// and are not folded back into the sketch.
-pub const HllCardinalityConfig = struct {
-    name: []const u8,
-    group_by: []const []const u8 = &.{},
-    value_field: []const u8,
-    precision: u8 = 0,
-};
-
-/// Static and adaptive sketches share one runtime registry. Keep the registry
-/// small enough that every foreground mutation has a predictable upper bound
-/// even when each sketch uses the maximum dense precision.
-pub const max_hll_cardinality_materializations: usize = 64;
-
-pub const AdaptiveConfig = struct {
-    observe: bool = true,
-    lazy_materialization: bool = false,
-    dematerialization: bool = false,
-    min_observations: u64 = 3,
-    max_auto_materializations_per_index: u64 = 32,
-    max_backfill_rows_per_tick: u64 = 10_000,
-    min_estimated_scan_rows_saved: u64 = 1_000,
-    dematerialize_after_observation_misses: u64 = 3,
-    observation_decay_after_misses: u64 = 0,
-    observation_decay_retain_percent: u8 = 50,
-    path_profile_history_retention: u64 = 64,
-
-    pub fn policy(self: AdaptiveConfig) adaptive_mod.Policy {
-        return .{
-            .observe = self.observe,
-            .lazy_materialization = self.lazy_materialization,
-            .dematerialization = self.dematerialization,
-            .min_observations = self.min_observations,
-            .max_auto_materializations_per_index = self.max_auto_materializations_per_index,
-            .max_backfill_rows_per_tick = self.max_backfill_rows_per_tick,
-            .min_estimated_scan_rows_saved = self.min_estimated_scan_rows_saved,
-            .dematerialize_after_observation_misses = self.dematerialize_after_observation_misses,
-            .observation_decay_after_misses = self.observation_decay_after_misses,
-            .observation_decay_retain_percent = self.observation_decay_retain_percent,
-            .path_profile_history_retention = self.path_profile_history_retention,
-        };
-    }
-};
-
-pub const PathFactPolicyConfig = struct {
-    allow_numeric_string_coercion: bool = true,
-    allow_datetime_string_coercion: bool = true,
-};
-
-pub const Config = struct {
-    version: u16 = 2,
-    table: []const u8 = "",
-    schema_version: u32 = 0,
-    capability_fingerprint: []const u8 = "",
-    capability_lifecycle_status: []const u8 = "current",
-    capability_change_added_fields: u32 = 0,
-    capability_change_removed_fields: u32 = 0,
-    capability_change_changed_type_fields: u32 = 0,
-    skipped_dynamic_fields: u32 = 0,
-    skipped_complex_fields: u32 = 0,
-    skipped_unbounded_fields: u32 = 0,
-    group_fields: []const FieldConfig = &.{},
-    measure_fields: []const FieldConfig = &.{},
-    time_fields: []const FieldConfig = &.{},
-    dynamic_field_rules: []const fact_mod.DynamicRule = &.{},
-    // Set when dynamic_field_rules changed against a table that already holds
-    // documents, so existing docs have not been re-projected through the new
-    // rules. While true, query-time resolution of dynamic-template fields is
-    // withheld (those queries fall back to a complete scan) so aggregates are
-    // never computed over only the post-change subset. Static fields are
-    // unaffected. The durable flag remains conservative; a generation-local
-    // completion marker releases the runtime gate after a full rebuild.
-    dynamic_rules_backfill_pending: bool = false,
-    laws: []const LawConfig = &.{},
-    joins: []const JoinConfig = &.{},
-    materializations: []const MaterializationConfig = &.{},
-    hll_cardinalities: []const HllCardinalityConfig = &.{},
-    adaptive: AdaptiveConfig = .{},
-    pathfact_policy: PathFactPolicyConfig = .{},
-    max_result_buckets: ?usize = null,
-    max_planner_scan_rows: ?usize = null,
-    max_batch_accumulator_entries: ?usize = null,
-    max_cardinality_cache_bytes: ?usize = null,
-    // Hard ingest/backfill bound for the Cartesian group tuples multiplied by
-    // distinct value tokens contributed by one document across every HLL.
-    max_hll_contributions_per_document: usize = 4096,
-    // Hard bound on dense sketch bytes merged/written for one document across
-    // every HLL. This closes the gap between a contribution-count limit and the
-    // 2^precision cost of each dense group sketch.
-    max_hll_contribution_bytes_per_document: usize = 8 * 1024 * 1024,
-    // Hard raw-byte budget for HLL sketches exported by one distributed shard
-    // request. The internal wire format base64-encodes these bytes, so the
-    // default leaves headroom below the HTTP executor's 4 MiB response limit.
-    // Exceeding the budget makes the optimized route unavailable and lets auto
-    // mode fall back to the exact execution path.
-    max_distributed_hll_partial_bytes: usize = 2 * 1024 * 1024,
-    // Durable HLL repair advances by at most this many document-fact rows per
-    // transaction, independently of whether adaptive materialization is on.
-    max_hll_maintenance_rows_per_tick: u64 = 10_000,
-    // Query observations are best-effort telemetry. Bound both the hash table
-    // and owned key storage so adversarial dynamic-field shapes cannot turn
-    // adaptive cardinality into an unbounded memory sink.
-    max_pending_hll_observation_entries: usize = 4096,
-    max_pending_hll_observation_bytes: usize = 1024 * 1024,
-    min_max_candidate_cache_size: ?usize = null,
-    enable_temporal_range_pruning: bool = true,
-};
+pub const HllCardinalityConfig = index_config.HllCardinalityConfig;
+pub const max_hll_cardinality_materializations = index_config.max_hll_cardinality_materializations;
 
 pub fn validateConfig(cfg: Config) !void {
     if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;

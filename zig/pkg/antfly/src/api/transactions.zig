@@ -15,10 +15,11 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const docstore_mod = @import("../storage/docstore.zig");
+const mem_backend = @import("../storage/mem_backend.zig");
 const lease_mod = @import("../storage/db/lease.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -3089,7 +3090,7 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
             for (transform.operations, 0..) |op, op_index| {
                 if (op_index > 0) try out.append(alloc, ',');
                 try out.appendSlice(alloc, "{\"op\":");
-                try appendJsonString(alloc, &out, db_mod.transform.transformOpText(op.op));
+                try appendJsonString(alloc, &out, db_mod.types.transformOpText(op.op));
                 try out.appendSlice(alloc, ",\"path\":");
                 try appendJsonString(alloc, &out, op.path);
                 if (op.value_json) |value_json| {
@@ -4377,16 +4378,11 @@ test "durable transaction sessions preserve and enforce principal bindings" {
 }
 
 test "durable session mutations publish only after persistence succeeds" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-failure-atomic", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
-    defer std.testing.allocator.free(path_z);
-
-    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
-    defer store.close();
-    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(std.testing.allocator, &store);
     var registry = SessionRegistry.init(&durable);
     defer registry.deinit(std.testing.allocator);
 
@@ -4593,16 +4589,11 @@ test "terminal commit response preserves live debt ahead of repair" {
 }
 
 test "durable session limits bound count and encoded record size" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-limits", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
-    defer std.testing.allocator.free(path_z);
-
-    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
-    defer store.close();
-    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(std.testing.allocator, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(std.testing.allocator, &store);
     var registry = SessionRegistry.initWithOptions(&durable, null, null, null, 1, 4096);
     defer registry.deinit(std.testing.allocator);
     _ = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 1);

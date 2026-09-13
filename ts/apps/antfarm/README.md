@@ -1,84 +1,31 @@
-# React + TypeScript + Vite
+# Antfarm
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Antfarm is the Antfly dashboard: a React + Vite app served by the `antfly`
+binary at `http://localhost:8080` in standalone mode, and deployable separately
+for hosted environments. It provides playgrounds for search, RAG, chat,
+knowledge graphs, embeddings, reranking, chunking, extraction, OCR,
+transcription, and evals, plus table, index, and connection management.
 
-Currently, two official plugins are available:
+See [ANTFARM.md](ANTFARM.md) for the information architecture and product
+direction.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Development
 
-## Expanding the ESLint configuration
+From the `ts/` workspace root:
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      ...tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      ...tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      ...tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+pnpm install
+pnpm --filter antfarm dev         # Vite dev server
+pnpm --filter antfarm build       # sync command index, typecheck, build
+pnpm --filter antfarm test        # vitest unit project
+pnpm --filter antfarm typecheck
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The command palette index is generated from the page sources. Run
+`pnpm --filter antfarm generate` after adding or renaming a page; `build` and
+`typecheck` fail if the checked-in index is stale.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Build into the server
 
-export default tseslint.config([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
-
-
-# Update playwright
-
-```sh
-npm install -D @playwright/test@latest
-npx playwright install --with-deps
-```
-
-# Install shadcn/ui
-
-```sh
-npx shadcn@latest init
-npx shadcn@latest add button
-```
+The repo-level `make build-antfarm` target builds the production assets that
+the Zig server embeds. `make build` runs it automatically.

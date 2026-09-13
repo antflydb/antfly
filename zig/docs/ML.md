@@ -3,7 +3,7 @@
 Antfly's Zig inference subsystem can serve "traditional" ML models —
 tree ensembles (XGBoost, LightGBM, ONNX-ML), linear / logistic regression,
 and SVMs — alongside the neural
-network paths (ONNX, MLX, CUDA, Native).
+network paths (ONNX, Metal, CUDA, Native).
 
 The implementation lives in two layers:
 

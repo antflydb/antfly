@@ -40,21 +40,8 @@ pub const AppliedSplitState = struct {
     original_range_end: []const u8,
 };
 
-pub const MergeSourcePhase = enum(u8) {
-    accepting = 1,
-    finalized = 2,
-    rolled_back = 3,
-};
-
-/// Durable donor-side range-merge fence. `applied_index` is the exact Raft
-/// index of the lifecycle command, and therefore the receiver watermark that
-/// must be covered before metadata can retire a finalized donor.
-pub const AppliedMergeSourceState = struct {
-    transition_id: u64,
-    receiver_group_id: u64,
-    phase: MergeSourcePhase,
-    applied_index: u64,
-};
+pub const MergeSourcePhase = @import("../../storage/data_raft_projection_wire.zig").MergeSourcePhase;
+pub const AppliedMergeSourceState = @import("../../storage/data_raft_projection_wire.zig").AppliedMergeSourceState;
 
 pub const SplitHandoff = struct {
     byte_range: AppliedDataRange,

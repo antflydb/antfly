@@ -1,4 +1,4 @@
-# Full-Text Performance and Benchmark Plan
+# Full-Text Performance and Benchmarking
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Benchmark credibility comes before performance claims: a timing is not accepted
 unless the compared engines demonstrably executed equivalent queries over the
 same corpus and produced equivalent results.
 
-This plan complements [FULL_TEXT.md](FULL_TEXT.md). `FULL_TEXT.md` remains the
+This document complements [FULL_TEXT.md](FULL_TEXT.md). `FULL_TEXT.md` remains the
 source for visibility, maintenance, field-layout, and product semantics. This
 document owns performance methodology and the search execution roadmap.
 
@@ -39,8 +39,9 @@ historical evidence rather than a current performance claim. Since then, the
 Zig implementation has gained block-max metadata, Block-Max WAND, postings
 `advanceTo`, cross-segment global top-k collection, deleted-document filtering,
 position-decoding avoidance for ranking-only queries, and an embedded
-`search-benchmark-game` adapter. We must establish a new verified baseline
-before repeating the old ratio or setting a public target.
+`search-benchmark-game` adapter. A new verified baseline has since been
+established (see [Implementation Progress](#implementation-progress)); it
+supersedes the ratio above for any public comparison.
 
 The earlier investigation identified these likely costs:
 
@@ -430,12 +431,12 @@ For each applicable profile measure:
 - time until the expected document count is searchable; and
 - query latency immediately after restart and after warmup.
 
-## Engine Optimization Roadmap
+## Engine Optimizations
 
-Correctness and benchmark changes should land before interpreting optimization
-results. Engine changes then proceed in the following order.
+Correctness and benchmark changes land before interpreting optimization
+results. The engine changes below are organized in implementation order.
 
-### 1. Establish profiles and regression gates
+### Profiles and Regression Gates
 
 Add query-class-specific baselines and phase counters before changing executor
 architecture. Capture CPU profiles and allocation profiles for representative
@@ -449,7 +450,7 @@ Acceptance:
 - each target query has a dominant-cost explanation; and
 - a regression threshold can be evaluated independently per query class.
 
-### 2. Remove native ID and projection work from the kernel boundary
+### Kernel Search Boundary
 
 Expose a narrow internal search API that acquires an immutable text snapshot,
 executes a typed query, and returns native corpus ordinals and scores. It must
@@ -467,7 +468,7 @@ Acceptance:
 - stable IDs are returned without per-hit key lookup where possible; and
 - the same scorer and postings code serves kernel and DB execution.
 
-### 3. Replace boolean all-hit/hash-map execution
+### Boolean Query Execution
 
 Introduce composable iterator/scorer primitives:
 
@@ -499,7 +500,7 @@ Acceptance:
 - exact counts retain exact semantics; and
 - term-query performance does not regress outside its agreed threshold.
 
-### 4. Add a two-phase scored phrase executor
+### Two-Phase Phrase Execution
 
 Phrase execution should use:
 
@@ -530,7 +531,7 @@ Acceptance:
 - memory no longer scales with total phrase matches for top-k; and
 - phrase, repeated-term phrase, and cutoff-tie cases are covered.
 
-### 5. Add segment-level competitive pruning
+### Segment-Level Competitive Pruning
 
 Compute conservative segment score upper bounds for the active query. Order
 segments by likely competitiveness and skip a segment only when its upper bound
@@ -547,7 +548,7 @@ Acceptance:
 - multi-segment work counters decrease on selective workloads; and
 - single-segment behavior remains unchanged.
 
-### 6. Tune postings and block-max layout from evidence
+### Postings and Block-Max Layout
 
 Use `search_benchmark_codec_bench.zig`, `wand_skip_bench.zig`, full-corpus
 profiles, and index-size measurements to evaluate:
@@ -565,9 +566,9 @@ checks, include merge/reopen tests, and report both speed and size. A microbench
 improvement is insufficient if full-corpus latency, RSS, or index size regresses
 materially.
 
-### 7. Reduce query setup and allocation cost
+### Query Setup and Allocation Cost
 
-After iterator architecture is stable:
+Once the iterator architecture is stable:
 
 - reuse query-local scratch buffers;
 - avoid sorting term-state indices from scratch when a small incremental
@@ -581,7 +582,7 @@ Do not parse queries ahead of the timed region unless all compared engines are
 also given pre-parsed queries. Server benchmarks always include normal request
 parsing.
 
-### 8. Improve merge policy and observability
+### Merge Policy and Observability
 
 - Expose per-index segment count and per-segment sizes through a read-only
   internal status surface.
@@ -592,119 +593,25 @@ parsing.
 - Keep scheduled maintenance distinct from explicit force compaction, as
   defined in `FULL_TEXT.md`.
 
-## Implementation Milestones
+## Status
 
-### Milestone 0: Freeze the benchmark specification
-
-- [x] Define the typed query grammar and version.
-- [x] Define corpus normalization and stable ordinal assignment.
-- [x] Define score tolerance and cutoff-tie rules.
-- [x] Define single and production segment modes.
-- [x] Define the machine-readable run manifest and result schema.
-- [x] Check in a small deterministic correctness corpus and query suite.
-
-Exit gate: two independent engine adapters can consume the same artifacts and
-the verifier can deliberately detect injected count, ID, and score mismatches.
-
-### Milestone 1: Correct embedded adapter
-
-Likely files:
-
-- `bench/full_text/search_benchmark_common.zig`
-- `bench/full_text/search_benchmark_index.zig`
-- `bench/full_text/search_benchmark_query.zig`
-- `search-benchmark-game/engines/antfly-zig/Makefile`
-- `search-benchmark-game/engines/antfly-zig/details.json`
-- `build.zig`
-
-Tasks:
-
-- [x] Add verification output containing IDs, scores, count, and relation.
-- [x] Replace ambiguous query parsing with the benchmark grammar.
-- [x] Make analyzer and BM25 configuration explicit.
-- [x] Add stable corpus ordinals.
-- [x] Add segment-mode selection and post-index assertions.
-- [x] Emit index, segment, corpus, build, and environment manifests.
-- [x] Add adapter protocol and golden tests.
-
-Exit gate: no timed sample is recorded when correctness preflight fails.
-
-### Milestone 2: Add the production-backed kernel API
-
-Likely files:
-
-- `pkg/antfly/src/index.zig`
-- `pkg/antfly/src/search/search.zig`
-- `pkg/antfly/src/embedded/db.zig`, only for snapshot/access plumbing
-- segment ordinal/doc-value sections if native identity needs format work
-
-Tasks:
-
-- [x] Return corpus ordinals and scores without body loading.
-- [x] Bypass MVCC/public projection in kernel mode.
-- [x] Prove equivalence with a static fully visible DB search.
-- [x] Add phase and work counters without affecting default production cost.
-
-Exit gate: profiles show the timed kernel path is limited to declared kernel
-work, and the server path remains unchanged.
-
-### Milestone 3: Reproducible runner and baseline
-
-- [x] Integrate Tantivy correctness output.
-- [x] Add analyzer-token-stream comparison.
-- [x] Run the full corpus in both segment modes.
-- [x] Run at least five warm repetitions per class.
-- [x] Record index time/size, RSS, reopen time, latency, and raw samples.
-- [x] Publish an internal baseline report with commit hashes and manifests.
-
-Exit gate: replace the historical latency table with a reproducible current
-baseline, including failed/unsupported query counts.
-
-### Milestone 4: Boolean iterator tree
-
-- [x] Route simple fast-path seeks through postings `advanceTo`.
-- [x] Implement conjunction, disjunction, required/optional, exclusion, and
-      minimum-should-match scorers.
-- [x] Separate exact-count and competitive top-k plans.
-- [x] Remove benchmark query shapes from the all-hit/hash-map fallback.
-- [x] Add randomized differential tests against the old executor.
-
-Exit gate: correctness is unchanged, top-k memory does not scale with match
-count, and union/intersection latency is reported independently.
-
-### Milestone 5: Scored two-phase phrases
-
-- [x] Add approximation and positional verification interfaces.
-- [x] Define and test phrase scoring semantics.
-- [x] Add exact count without scored-hit materialization.
-- [x] Feed phrase top-k into the global competitive collector.
-- [x] Add phrase work counters and randomized differential tests.
-
-Exit gate: phrase correctness passes against the comparator and top-k no longer
-allocates one hit per phrase match.
-
-### Milestone 6: Segment, codec, and allocation optimization
-
-- [x] Add conservative segment upper bounds and search ordering.
-- [x] Evaluate persisted postings/block-max layouts.
-- [x] Reduce query-local allocations and repeated sorting.
-- [x] Tune production merge policy with read/write tradeoff measurements.
-
-Exit gate: accepted improvements pass format, reopen, corruption, merge,
-correctness, index-size, RSS, and query-class regression gates.
-
-### Milestone 7: Product/server benchmark
-
-- [x] Add persistent-client concurrency sweeps.
-- [x] Add read-only and mixed read/write workloads.
-- [x] Add searchable-freshness markers.
-- [x] Define and implement durability-profile manifests.
-- [x] Add graceful/crash restart and recovery measurements.
-- [x] Compare Antfly with a normal server comparator such as Quickwit.
-
-Exit gate: the public report clearly separates kernel results from product
-results and includes throughput, tail latency, freshness, durability, memory,
-disk, indexing, and recovery.
+The eight-milestone implementation plan above is complete: the benchmark
+specification (grammar, corpus normalization, score/cutoff-tie rules, segment
+modes, manifest schema) is frozen and checked in; the embedded adapter
+(`bench/full_text/search_benchmark_*.zig`, `search-benchmark-game/engines/antfly-zig/`)
+is correct and correctness-gated; the production-backed kernel API
+(`pkg/antfly/src/index.zig`, `pkg/antfly/src/search/search.zig`) returns
+native ordinals/scores without MVCC or body-loading overhead; the runner
+(`tools/run_search_kernel_benchmark.py`, `tools/run_search_server_benchmark.py`)
+is reproducible with an archived baseline; the boolean iterator tree, scored
+two-phase phrase executor, and segment/codec/allocation optimizations
+described in the Engine Optimization Roadmap above are implemented in
+`pkg/antfly/src/search/scorer.zig` and `pkg/antfly/src/section/inverted.zig`;
+and the product/server benchmark (persistent-client concurrency sweeps, mixed
+read/write, freshness, durability-profile, and restart/recovery measurements)
+is implemented and compared against Quickwit. The dated log below records the
+ongoing measurement history against that completed harness; it is not a list
+of outstanding milestone work.
 
 ## Implementation Progress
 
@@ -3064,8 +2971,8 @@ checked-in or archived result bundle.
   splice incompatible samples into an old graph.
 - Public claims must link to the exact manifest and raw result artifact.
 
-Initial thresholds should be chosen only after Milestone 3 establishes stable
-variance on the target machines.
+Initial thresholds are chosen only after a stable-variance baseline is
+established on the target machines.
 
 ## Risks and Design Constraints
 
@@ -3116,25 +3023,40 @@ them rather than carrying their codecs indefinitely. Benchmark artifacts that
 use those formats may be inspected with the corresponding historical binary or
 an isolated analysis tool.
 
-## Decision Points
+## Decisions
 
-Resolve these during Milestone 0 rather than implicitly in code:
+These were resolved explicitly rather than implicitly in code:
 
-1. Whether the external `search-benchmark-game` protocol can be extended with a
-   verification command or needs a companion verifier executable.
-2. Whether stable corpus ordinals belong in an existing ordinal section or a
-   dedicated benchmark-visible native doc-value field.
-3. The exact analyzer configuration both engines can implement identically.
-4. Phrase scoring semantics and whether phrase frequency contributes to BM25.
-5. Whether the primary top-k benchmark requires exact totals or permits `gte`.
-6. The production segment policy used for the cross-engine comparison.
-7. The hardware class and noise controls for regression gating.
-8. Which durability profiles are meaningfully supported by every server
-   comparator.
+1. The external `search-benchmark-game` protocol was extended with
+   verification commands (`VERIFY_TOP_N`, `VERIFY_TOP_N_COUNT`), backed by a
+   companion Python verifier (`tools/verify_search_benchmark.py`); see
+   [Correctness protocol](#correctness-protocol).
+2. Stable corpus ordinals use a dedicated benchmark-visible native
+   ordinal/doc-value mapping (`corpus_ordinal`), also used in production; see
+   [Contract](#contract).
+3. The analyzer configuration is explicit and declared in the manifest (for
+   example `ascii_lowercase`), and the `ANALYZE` protocol compares exact
+   token, position, and byte-offset output between engines; see [Analyzer and
+   scoring equivalence](#analyzer-and-scoring-equivalence).
+4. Phrase frequency contributes to BM25: phrase scoring matches Tantivy's
+   semantics (sum constituent-term IDFs including repeated terms, use exact
+   phrase occurrence count as BM25 frequency, apply the field norm once).
+5. The primary top-k benchmark permits `total_hits_relation = gte`; exact
+   totals are a separate operation and are never inferred from competitively
+   pruned execution.
+6. Both `single` and `production` segment modes are used for cross-engine
+   comparison, each explicitly declared and never mixed; see [Segment
+   modes](#segment-modes).
+7. Hardware class and noise controls are standardized by the [Timing
+   procedure](#timing-procedure) (pinned/recorded hardware and build
+   settings, declared warmup, at least five repetitions).
+8. Server comparators are mapped to the three named durability profiles
+   (`unsafe-throughput`, `process-durable`, `machine-durable`); see
+   [Durability and recovery](#durability-and-recovery).
 
-## Definition of Done
+## Completion Criteria
 
-This plan is complete when:
+The benchmark suite satisfies these criteria (see [Status](#status)):
 
 - kernel and server benchmarks are separate binaries/workflows and reports;
 - the kernel comparison verifies analyzer output, counts, IDs, cutoff ties, and

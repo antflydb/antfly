@@ -9,14 +9,20 @@ UI components for React + Antfly. Create search applications using declarative c
 **[Documentation about Antfly](https://docs.antfly.io).**
 
 ```jsx
+import '@antfly/components/styles';
+import { Antfly, QueryBox, Autosuggest, Facet, Results } from '@antfly/components';
+
 const MySearchComponent = () => (
-  <Antfly url="http://<antfly_url>/table/movies">
-    <SearchBox id="mainSearch" fields={["title"]} />
-    <Autosuggest id="autosuggest" fields={["title"]} returnFields={["title"]} />
+  <Antfly url="http://<antfly_url>/db/v1" table="movies">
+    <QueryBox id="mainSearch" mode="live">
+      <Autosuggest fields={["title"]} returnFields={["title"]} />
+    </QueryBox>
     <Facet id="actors" fields={["actors"]} />
     <Facet id="releasedYear" fields={["releasedYear"]} />
     <Results
       id="results"
+      searchBoxId="mainSearch"
+      fields={["title"]}
       items={data =>
         // Map on result hits and display whatever you want.
         data.map(item => <MyCardItem key={item._id} source={item._source} />)
@@ -25,6 +31,8 @@ const MySearchComponent = () => (
   </Antfly>
 );
 ```
+
+`url` is the Antfly API base URL including `/db/v1`; the table is given separately via `table`. `@antfly/sdk`, `react`, and `react-dom` are peer dependencies — install them alongside `@antfly/components`, and import `@antfly/components/styles` once for layout-critical CSS (dropdown positioning, pagination, facet lists).
 
 ## Hooks
 
@@ -40,8 +48,9 @@ import { useSearchHistory } from '@antfly/components';
 function MyComponent() {
   const { history, isReady, saveSearch, clearHistory } = useSearchHistory(10);
 
-  // Save a search result
+  // Save a search result (history is a SearchResult[], upserted by id)
   saveSearch({
+    id: "search-123",
     query: "how does raft work",
     timestamp: Date.now(),
     summary: "Raft is a consensus algorithm...",
@@ -164,8 +173,8 @@ pnpm storybook
 
 - Released under **Apache-2.0 licence**.
 - Each component is built with React and is **customisable**. Not too much extra features nor magic.
-- It comes with **no style** so it's the developers responsibility to implement their own.
-- **35.32KB gzipped** for the whole lib, compatible with old browsers: >0.03% usage.
+- Ships a baseline stylesheet (`@antfly/components/styles`) for layout-critical CSS only; visual styling is otherwise the developer's responsibility via the library's stable `react-af-*` class names.
+- Compatible with old browsers: >0.03% usage.
 
 ## Documentation
 

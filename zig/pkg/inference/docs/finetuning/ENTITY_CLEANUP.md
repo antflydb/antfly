@@ -213,9 +213,9 @@ Validation rules:
 - [x] Implement learned cleanup clustering pipeline
 - [x] Add cache-prep tool for cleanup training
 - [x] Add trainer for validity, dedup embedding, and representative scoring
-- [x] Integrate cleanup stage into recognize serving path
-- [x] Integrate cleanup stage into native recognize CLI
-- [x] Integrate cleanup into GLiNER extraction path
+- [x] Integrate cleanup stage into recognize serving path (`src/server/server.zig`)
+- [ ] Integrate cleanup stage into a native (local CLI) recognize/extract path — not
+  found in `src/native_extract.zig` or `src/pipelines/gliner.zig` today; see Open work.
 - [x] Add workflow docs and one bundled GLiNER2 cleanup smoke workflow
 
 ## Current Code Surface
@@ -227,7 +227,6 @@ The current implementation in this repo adds:
 - `src/finetune/tools/prepare_entity_cleanup_cache.zig`
 - `src/finetune/train/train_eval_entity_cleanup_head.zig`
 - server integration in `src/server/server.zig`
-- local CLI integration in `src/native_recognize.zig`
 
 The learned cleanup head is intentionally lightweight:
 - hashed mention/context features
@@ -437,7 +436,8 @@ zig build run-gliner2-entity-cleanup-smoke-workflow -- \
 - [x] Add `src/finetune/entity_cleanup_gliner_cache.zig`
 - [x] Add `src/finetune/tools/prepare_gliner2_entity_cleanup_cache.zig`
 - [x] Export the new module from `src/finetune/root.zig`
-- [x] Export the new module from `src/termite_internal.zig`
+- [x] Export the new module from `src/inference_internal.zig` (formerly
+  `src/termite_internal.zig`)
 - [x] Add build step `prepare-gliner2-entity-cleanup-cache` in `pkg/inference/build.zig`
 - [x] Reuse existing `train-eval-entity-cleanup-head` on GLiNER2-derived caches
 - [x] Add delegated root-build steps in repo-root `build.zig`
@@ -454,8 +454,27 @@ of the following are true:
 - `prepare-gliner2-entity-cleanup-cache` exists and emits a stable cache
 - the cleanup trainer can consume that cache and emit `entity_cleanup_head.json`
 - `materialize-gliner2-lora` preserves `entity_cleanup_head.json`
-- recognize / extract / native recognize all apply cleanup from the materialized model dir
+- the server's recognize/extract endpoints apply cleanup from the materialized
+  model dir (a native-CLI equivalent does not exist yet; see Open work)
 - one smoke workflow validates cache prep, cleanup-head training, and materialization
 
 At that point, the cleanup head is no longer just a sidecar experiment. It is a
 first-class bundled auxiliary head for GLiNER2.
+
+## Open work
+
+- Native (local CLI) recognize/extract integration: cleanup is wired into the
+  server's recognize/extract endpoints (`src/server/server.zig`) but not into
+  a native CLI path (no `src/native_recognize.zig` or cleanup call in
+  `src/native_extract.zig`/`src/pipelines/gliner.zig` was found). Confirm
+  whether a native path is needed, or correct this document if server-only
+  coverage is the intended shape.
+- Upgrade the cleanup head's features from hashed mention/context text to
+  GLiNER2-native span or boundary representations (see "Recommended
+  Production Path" and "Why This Is The Right Next Step" above) so the
+  cleanup head trains on the same representations as the detector.
+- The `src/finetune/train/train_eval_gliner2_lora_bundle.zig` reference under
+  "Step 2: Reuse GLiNER2 Boundary Cache Infrastructure" does not match a file
+  in the current tree; verify the intended target and correct the path.
+- There is still no separate OCR-to-recognize request-path smoke test (noted
+  under "Current Serving Behavior").

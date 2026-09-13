@@ -15360,10 +15360,14 @@ export interface components {
             max_concurrent_requests?: number;
             /**
              * Format: uri
-             * @description URL of the Antfly inference embedding/chunking service
+             * @description URL of an out-of-process Antfly inference service that the Antfly
+             *     server should call for embedding, chunking, reranking, and
+             *     generation. Omit it to use the in-process inference runtime
+             *     (the default in standalone mode). `antfly inference run` ignores
+             *     this field; it configures the client side only.
              * @example http://localhost:8080
              */
-            api_url: string;
+            api_url?: string;
             /** @description API key used when calling an authenticated shared Antfly inference API. */
             api_key?: string;
             /**

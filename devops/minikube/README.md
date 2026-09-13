@@ -7,7 +7,7 @@ This guide explains how to deploy Antfly in a Minikube Kubernetes environment.
 - Docker installed
 - Minikube installed
 - kubectl installed
-- Go 1.25+ installed
+- Zig 0.16 installed (`make build` drives `zig build`), plus Node and pnpm for Antfarm
 
 ## Building and Deploying
 
@@ -76,7 +76,7 @@ kubectl port-forward svc/antfly-workers-svc 12380:12380 22380:22380 32380:32380 
 To stop Minikube:
 
 ```bash
-make minikube-stop
+make minikube-delete
 ```
 
 To delete the Minikube cluster:

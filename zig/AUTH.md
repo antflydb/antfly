@@ -23,6 +23,14 @@ The request auth layer builds an `AuthenticatedIdentity` with:
 Route authorization is coarse-grained and permission based. Document-level read narrowing is enforced separately by row filters.
 Table lookup, query, and document-scan routes require `read` permission on the target table.
 
+### API Key Secret Storage And Verification
+
+API key secrets are generated as high-entropy random values, so verification hashes them with a salted SHA-256 rather than a slow password-style KDF: each key gets its own random salt, and the stored verifier is the hash of the salt concatenated with the secret. A slow adaptive hash exists to make guessing a low-entropy human-chosen password expensive; a random 128-bit secret is already infeasible to guess, so spending extra CPU on a deliberately slow hash on every request would only add latency without adding security.
+
+At verification time the server always computes and compares the secret hash before it checks the key's expiration, never the other way around. Checking expiration first would let a request against an expired key fail differently from a request against a truly unknown key, which leaks whether a given key ID ever existed; verifying the hash unconditionally first keeps "wrong secret" and "expired key" indistinguishable from an unauthenticated caller's point of view until the hash has already matched.
+
+When an API key is created with an explicit permission set, each requested permission is checked against the creating user's currently granted permissions and rejected if it would exceed them: a key can only narrow what its creator can already do, never broaden it. The same effective-permission narrowing (the key's explicit permissions intersected with its owner's current permissions) is re-applied on every use, so a later reduction in the owner's own access also narrows what the key can do.
+
 ## Row Filter Enforcement
 
 Row filters are stored as query JSON per table name, with `*` as a wildcard table fallback.

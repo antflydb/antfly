@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const process_memory = @import("antfly_platform").process_memory;
+const memory_budget = @import("../storage/memory_budget.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
-const db_mod = @import("../storage/db/db.zig");
+const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -25,235 +25,93 @@ const filesystem_capacity = @import("../storage/filesystem_capacity.zig");
 const runtime_status = @import("runtime_status.zig");
 const scraping = @import("antfly_scraping");
 const table_catalog = @import("table_catalog.zig");
-const table_reads = @import("table_reads.zig");
-const table_writes = @import("table_writes.zig");
+const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
+const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
+const storage_source_options = @import("storage_source_options");
 
-const MiB: u64 = 1024 * 1024;
-const GiB: u64 = 1024 * MiB;
-const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
+const linked_storage = storage_source_options.control_only;
+
+const ProvisionedLsmCache = if (linked_storage) void else lsm_backend.Cache;
+const ProvisionedHbcCache = if (linked_storage) void else hbc_mod.Cache;
+const ProvisionedReadCache = if (linked_storage) void else table_reads.ProvisionedTableReadCache;
+const ProvisionedWriteCache = if (linked_storage) void else table_writes.ProvisionedTableWriteCache;
+
+const MiB = memory_budget.MiB;
+const GiB = memory_budget.GiB;
+const MinSmartLsmCacheBytes = memory_budget.MinSmartLsmCacheBytes;
 // Primary values and decoded run indexes are the authoritative miss path for
 // HBC. Give their reclaimable cache an elastic ceiling instead of imposing a
 // fixed corpus-size cliff; the aggregate ResourceManager ledger and synchronous
 // reclaim still preserve room for foreground work and the process reserve.
-const MaxSmartLsmCacheBytes: u64 = 8 * GiB;
-const MinSmartLsmCompactionBytes: u64 = 128 * 1024 * 1024;
-const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
-const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartLsmTableBuilderBytes: u64 = 512 * 1024 * 1024;
-const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
+const MaxSmartLsmCacheBytes = memory_budget.MaxSmartLsmCacheBytes;
+const MinSmartLsmCompactionBytes = memory_budget.MinSmartLsmCompactionBytes;
+const MaxSmartLsmCompactionBytes = memory_budget.MaxSmartLsmCompactionBytes;
+const MinSmartLsmTableBuilderBytes = memory_budget.MinSmartLsmTableBuilderBytes;
+const MaxSmartLsmTableBuilderBytes = memory_budget.MaxSmartLsmTableBuilderBytes;
+const MinSmartLsmInMemoryStateBytes = memory_budget.MinSmartLsmInMemoryStateBytes;
 // Allocator-backed LSM state has substantial process-footprint amplification
 // while immutable tables are being encoded and published. Do not scale this
 // slice to multi-gigabyte queues on large hosts; local backend limits provide
 // fairness, while this remains the aggregate process admission ceiling.
-const MaxSmartLsmInMemoryStateBytes: u64 = 768 * 1024 * 1024;
-const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
+const MaxSmartLsmInMemoryStateBytes = memory_budget.MaxSmartLsmInMemoryStateBytes;
+const MinSmartHbcCacheBytes = memory_budget.MinSmartHbcCacheBytes;
 // HBC exact vectors are derivative, reclaimable copies of LSM-owned values.
 // A fixed 2 GiB ceiling produces a deterministic corpus-size cliff for 768-D
 // vectors, so this cache is allowed to consume an elastic share of the node
 // envelope while the aggregate ResourceManager budget remains authoritative.
-const MaxSmartHbcCacheBytes: u64 = 16 * GiB;
-const MinSmartDenseApplyBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartDenseApplyBytes: u64 = 512 * 1024 * 1024;
-const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartReplayWindowBytes: u64 = 256 * 1024 * 1024;
-const MinSmartFullTextPendingBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartFullTextPendingBytes: u64 = 512 * 1024 * 1024;
-const MinSmartFullTextBuildBytes: u64 = 128 * 1024 * 1024;
-const MaxSmartFullTextBuildBytes: u64 = 1024 * 1024 * 1024;
-const MinSmartFullTextResidencyBytes: u64 = 256 * 1024 * 1024;
-const MaxSmartFullTextResidencyBytes: u64 = 2 * 1024 * 1024 * 1024;
-const MinSmartDerivedBacklogBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartDerivedBacklogBytes: u64 = 512 * 1024 * 1024;
-const MinSmartTextMergeBytes: u64 = 32 * 1024 * 1024;
-const MaxSmartTextMergeBytes: u64 = 256 * 1024 * 1024;
-const MinSmartAlgebraicTensorBytes: u64 = 32 * 1024 * 1024;
-const MaxSmartAlgebraicTensorBytes: u64 = 256 * 1024 * 1024;
-const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
-const MinSmartShardTransitionBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartShardTransitionBytes: u64 = 512 * 1024 * 1024;
-const MinSmartVectorBlockBuildBytes: u64 = 64 * 1024 * 1024;
-const MaxSmartVectorBlockBuildBytes: u64 = 256 * 1024 * 1024;
+const MaxSmartHbcCacheBytes = memory_budget.MaxSmartHbcCacheBytes;
+const MinSmartDenseApplyBytes = memory_budget.MinSmartDenseApplyBytes;
+const MaxSmartDenseApplyBytes = memory_budget.MaxSmartDenseApplyBytes;
+const MinSmartReplayWindowBytes = memory_budget.MinSmartReplayWindowBytes;
+const MaxSmartReplayWindowBytes = memory_budget.MaxSmartReplayWindowBytes;
+const MinSmartFullTextPendingBytes = memory_budget.MinSmartFullTextPendingBytes;
+const MaxSmartFullTextPendingBytes = memory_budget.MaxSmartFullTextPendingBytes;
+const MinSmartFullTextBuildBytes = memory_budget.MinSmartFullTextBuildBytes;
+const MaxSmartFullTextBuildBytes = memory_budget.MaxSmartFullTextBuildBytes;
+const MinSmartFullTextResidencyBytes = memory_budget.MinSmartFullTextResidencyBytes;
+const MaxSmartFullTextResidencyBytes = memory_budget.MaxSmartFullTextResidencyBytes;
+const MinSmartDerivedBacklogBytes = memory_budget.MinSmartDerivedBacklogBytes;
+const MaxSmartDerivedBacklogBytes = memory_budget.MaxSmartDerivedBacklogBytes;
+const MinSmartTextMergeBytes = memory_budget.MinSmartTextMergeBytes;
+const MaxSmartTextMergeBytes = memory_budget.MaxSmartTextMergeBytes;
+const MinSmartAlgebraicTensorBytes = memory_budget.MinSmartAlgebraicTensorBytes;
+const MaxSmartAlgebraicTensorBytes = memory_budget.MaxSmartAlgebraicTensorBytes;
+const MinSmartDenseRepairBytes = memory_budget.MinSmartDenseRepairBytes;
+const MaxSmartDenseRepairBytes = memory_budget.MaxSmartDenseRepairBytes;
+const MinSmartShardTransitionBytes = memory_budget.MinSmartShardTransitionBytes;
+const MaxSmartShardTransitionBytes = memory_budget.MaxSmartShardTransitionBytes;
+const MinSmartVectorBlockBuildBytes = memory_budget.MinSmartVectorBlockBuildBytes;
+const MaxSmartVectorBlockBuildBytes = memory_budget.MaxSmartVectorBlockBuildBytes;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
 }
 
-pub const MemoryLimitSource = enum {
-    explicit,
-    cgroup_v2,
-    cgroup_v1,
-    host,
-    unavailable,
-};
+pub const MemoryLimitSource = memory_budget.MemoryLimitSource;
 
-const DetectedMemoryLimit = struct {
-    bytes: u64,
-    source: MemoryLimitSource,
-};
+const DetectedMemoryLimit = memory_budget.DetectedMemoryLimit;
 
-fn resolveEffectiveMemoryLimit(
-    explicit_bytes: ?u64,
-    detected: ?DetectedMemoryLimit,
-) ?DetectedMemoryLimit {
-    if (detected) |detected_limit| {
-        if (explicit_bytes) |explicit_limit| {
-            if (explicit_limit <= detected_limit.bytes) {
-                return .{ .bytes = explicit_limit, .source = .explicit };
-            }
-        }
-        return detected_limit;
-    }
-    if (explicit_bytes) |explicit_limit| {
-        return .{ .bytes = explicit_limit, .source = .explicit };
-    }
-    return null;
-}
+const resolveEffectiveMemoryLimit = memory_budget.resolveEffectiveMemoryLimit;
 
-fn detectedMemoryLimit() ?DetectedMemoryLimit {
-    const envelope = process_memory.systemEnvelope();
-    if (envelope.limit_bytes == 0) return null;
-    return .{
-        .bytes = envelope.limit_bytes,
-        .source = switch (envelope.source) {
-            .cgroup_v2 => .cgroup_v2,
-            .cgroup_v1 => .cgroup_v1,
-            .host => .host,
-            .unavailable => .unavailable,
-        },
-    };
-}
+const detectedMemoryLimit = memory_budget.detectedMemoryLimit;
 
-fn adaptiveSliceHardLimit(total: u64, divisor: u64, min_bytes: u64, max_bytes: u64) u64 {
-    const target = if (divisor == 0) total else total / divisor;
-    if (total < min_bytes * 4) {
-        return @min(@max(8 * MiB, target), max_bytes);
-    }
-    return std.math.clamp(target, min_bytes, max_bytes);
-}
+const adaptiveSliceHardLimit = memory_budget.adaptiveSliceHardLimit;
 
-fn clampU64ToUsize(value: u64) usize {
-    const usize_max: u64 = std.math.maxInt(usize);
-    return @intCast(@min(value, usize_max));
-}
+const clampU64ToUsize = memory_budget.clampU64ToUsize;
 
-fn resourceBudget(soft_numerator: u64, hard_limit_bytes: u64) resource_manager_mod.Budget {
-    return .{
-        .soft_limit_bytes = hard_limit_bytes * soft_numerator / 4,
-        .hard_limit_bytes = hard_limit_bytes,
-    };
-}
+const resourceBudget = memory_budget.resourceBudget;
 
-fn elasticCacheBudget(hard_limit_bytes: u64) resource_manager_mod.Budget {
-    return .{
-        .soft_limit_bytes = hard_limit_bytes * 7 / 8,
-        .hard_limit_bytes = hard_limit_bytes,
-    };
-}
+const elasticCacheBudget = memory_budget.elasticCacheBudget;
 
-const SmartResourceBudgets = struct {
-    options: resource_manager_mod.Options,
-    lsm_cache_budget_bytes: usize,
-    effective_memory_limit_bytes: u64 = 0,
-    memory_limit_source: MemoryLimitSource = .unavailable,
-};
+const SmartResourceBudgets = memory_budget.SmartResourceBudgets;
 
-fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudgets {
-    var options = resource_manager_mod.Options{};
-    const explicit: ?u64 = if (process_memory_limit_bytes == 0) null else @intCast(process_memory_limit_bytes);
-    const effective = resolveEffectiveMemoryLimit(explicit, detectedMemoryLimit()) orelse {
-        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
-        return .{
-            .options = options,
-            .lsm_cache_budget_bytes = lsm_cache_budget,
-        };
-    };
+const smartResourceBudgets = memory_budget.smartResourceBudgets;
 
-    var budgets = smartResourceBudgetsForTotal(effective.bytes);
-    budgets.effective_memory_limit_bytes = effective.bytes;
-    budgets.memory_limit_source = effective.source;
-    return budgets;
-}
+const smartResourceBudgetsResolved = memory_budget.smartResourceBudgetsResolved;
 
-fn smartResourceBudgetsResolved(
-    process_memory_limit_bytes: usize,
-    source: MemoryLimitSource,
-) SmartResourceBudgets {
-    if (process_memory_limit_bytes == 0) {
-        const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
-        var options = resource_manager_mod.Options{};
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
-        return .{
-            .options = options,
-            .lsm_cache_budget_bytes = lsm_cache_budget,
-            .memory_limit_source = source,
-        };
-    }
-    var budgets = smartResourceBudgetsForTotal(@intCast(process_memory_limit_bytes));
-    budgets.effective_memory_limit_bytes = @intCast(process_memory_limit_bytes);
-    budgets.memory_limit_source = source;
-    return budgets;
-}
+const safeManagedHostMemory = memory_budget.safeManagedHostMemory;
 
-fn safeManagedHostMemory(total: u64) u64 {
-    const preferred_headroom = std.math.clamp(@max(total / 4, 6 * GiB), 4 * GiB, 24 * GiB);
-    const headroom = @min(preferred_headroom, total / 2);
-    return total - headroom;
-}
-
-fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
-    var options = resource_manager_mod.Options{};
-    options.memory_budget = resourceBudget(3, safeManagedHostMemory(total));
-
-    const lsm_hard = adaptiveSliceHardLimit(total, 4, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
-    const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
-    const lsm_table_builder_hard = adaptiveSliceHardLimit(total, 32, MinSmartLsmTableBuilderBytes, MaxSmartLsmTableBuilderBytes);
-    const lsm_in_memory_state_hard = adaptiveSliceHardLimit(total, 8, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
-    const lsm_wal_write_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
-    const hbc_hard = adaptiveSliceHardLimit(total, 3, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
-    const dense_search_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
-    const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
-    const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
-    const full_text_hard = adaptiveSliceHardLimit(total, 32, MinSmartFullTextPendingBytes, MaxSmartFullTextPendingBytes);
-    const full_text_build_hard = adaptiveSliceHardLimit(total, 24, MinSmartFullTextBuildBytes, MaxSmartFullTextBuildBytes);
-    const full_text_residency_hard = adaptiveSliceHardLimit(total, 8, MinSmartFullTextResidencyBytes, MaxSmartFullTextResidencyBytes);
-    const derived_hard = adaptiveSliceHardLimit(total, 32, MinSmartDerivedBacklogBytes, MaxSmartDerivedBacklogBytes);
-    const text_merge_hard = adaptiveSliceHardLimit(total, 64, MinSmartTextMergeBytes, MaxSmartTextMergeBytes);
-    const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
-    const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
-    const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
-    const vector_block_build_hard = adaptiveSliceHardLimit(total, 16, MinSmartVectorBlockBuildBytes, MaxSmartVectorBlockBuildBytes);
-
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = elasticCacheBudget(hbc_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = resourceBudget(3, dense_search_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = resourceBudget(3, dense_apply_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = resourceBudget(3, full_text_residency_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
-    // Inference slices are logical host-plus-accelerator metrics. Their host
-    // component is enforced by the aggregate budget above; ModelManager and
-    // BackendRuntime retain device-aware backend admission.
-
-    return .{
-        .options = options,
-        .lsm_cache_budget_bytes = clampU64ToUsize(lsm_hard),
-    };
-}
+const smartResourceBudgetsForTotal = memory_budget.smartResourceBudgetsForTotal;
 
 pub const ProvisionedGroupStorage = struct {
     const VisibleRootGeneration = struct {
@@ -266,13 +124,13 @@ pub const ProvisionedGroupStorage = struct {
     group_visible_root_generations: std.AutoHashMapUnmanaged(u64, VisibleRootGeneration) = .empty,
     resource_manager: resource_manager_mod.ResourceManager,
     filesystem_capacity_probe: ?filesystem_capacity.Probe = null,
-    lsm_cache: lsm_backend.Cache,
-    hbc_cache: hbc_mod.Cache,
+    lsm_cache: ProvisionedLsmCache,
+    hbc_cache: ProvisionedHbcCache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
-    read_cache: table_reads.ProvisionedTableReadCache,
+    read_cache: ProvisionedReadCache,
     write_cache_state_mutex: std.atomic.Mutex = .unlocked,
-    write_cache: table_writes.ProvisionedTableWriteCache,
-    startup_write_cache: table_writes.ProvisionedTableWriteCache,
+    write_cache: ProvisionedWriteCache,
+    startup_write_cache: ProvisionedWriteCache,
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
@@ -308,23 +166,25 @@ pub const ProvisionedGroupStorage = struct {
             .resource_manager = resource_manager_mod.ResourceManager.init(manager_options),
             .effective_memory_limit_bytes = budgets.effective_memory_limit_bytes,
             .memory_limit_source = budgets.memory_limit_source,
-            .lsm_cache = lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
-            .hbc_cache = hbc_mod.Cache.init(alloc),
+            .lsm_cache = if (linked_storage) {} else lsm_backend.Cache.init(alloc, budgets.lsm_cache_budget_bytes),
+            .hbc_cache = if (linked_storage) {} else hbc_mod.Cache.init(alloc),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
-            .read_cache = table_reads.ProvisionedTableReadCache.init(alloc),
-            .write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
-            .startup_write_cache = table_writes.ProvisionedTableWriteCache.init(alloc),
+            .read_cache = if (linked_storage) {} else table_reads.ProvisionedTableReadCache.init(alloc),
+            .write_cache = if (linked_storage) {} else table_writes.ProvisionedTableWriteCache.init(alloc),
+            .startup_write_cache = if (linked_storage) {} else table_writes.ProvisionedTableWriteCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedGroupStorage) void {
         self.group_visible_root_generations.deinit(self.alloc);
-        self.startup_write_cache.deinit();
-        self.write_cache.deinit();
-        self.read_cache.deinit();
+        if (comptime !linked_storage) {
+            self.startup_write_cache.deinit();
+            self.write_cache.deinit();
+            self.read_cache.deinit();
+            self.hbc_cache.deinit();
+            self.lsm_cache.deinit();
+        }
         self.runtime_status_cache.deinit();
-        self.hbc_cache.deinit();
-        self.lsm_cache.deinit();
         self.resource_manager.deinit(self.alloc);
         self.* = undefined;
     }
@@ -334,6 +194,7 @@ pub const ProvisionedGroupStorage = struct {
     /// no new cache lease can appear while this barrier holds the shared state
     /// mutex. The cache containers remain valid for the ordinary final deinit.
     pub fn quiesceExternalProviderUsers(self: *ProvisionedGroupStorage) !void {
+        if (comptime linked_storage) return;
         lockAtomic(&self.write_cache_state_mutex);
         defer self.write_cache_state_mutex.unlock();
         try self.startup_write_cache.closeAllDbsLocked();
@@ -344,6 +205,7 @@ pub const ProvisionedGroupStorage = struct {
     /// alive. Call this after attached write sources are quiescent and before
     /// either the sources or this storage are destroyed.
     pub fn detachWriteSourceRuntimeHooks(self: *ProvisionedGroupStorage) void {
+        if (comptime linked_storage) return;
         self.startup_write_cache.detachRuntimeHooks();
         self.write_cache.detachRuntimeHooks();
         self.startup_write_cache.table_eviction_hook = null;
@@ -383,6 +245,13 @@ pub const ProvisionedGroupStorage = struct {
         if (self.backend_runtime) |runtime| {
             read_source.backend_runtime = runtime;
             write_source.backend_runtime = runtime;
+        }
+        if (comptime linked_storage) {
+            read_source.runtime_status_cache = &self.runtime_status_cache;
+            _ = read_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+            write_source.runtime_status_cache = &self.runtime_status_cache;
+            _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+            return;
         }
         self.lsm_cache.attachResourceManager(&self.resource_manager);
         self.hbc_cache.attachResourceManager(&self.resource_manager);
@@ -447,7 +316,7 @@ pub const ProvisionedGroupStorage = struct {
         return self.dense_native_authority_permitted.load(.acquire);
     }
 
-    pub fn denseNativeMigrationPolicySource(self: *const ProvisionedGroupStorage) db_mod.DenseNativeMigrationPolicySource {
+    pub fn denseNativeMigrationPolicySource(self: *const ProvisionedGroupStorage) runtime_callbacks.DenseNativeMigrationPolicySource {
         return .{
             .ptr = self,
             .authority_permitted = denseNativeAuthorityPermitted,
@@ -461,6 +330,11 @@ pub const ProvisionedGroupStorage = struct {
         write_source: *table_writes.ProvisionedTableWriteSource,
     ) void {
         self.backend_runtime = runtime;
+        if (comptime linked_storage) {
+            read_source.backend_runtime = runtime;
+            write_source.backend_runtime = runtime;
+            return;
+        }
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
         self.startup_write_cache.backend_runtime = runtime;
@@ -480,6 +354,7 @@ pub const ProvisionedGroupStorage = struct {
     /// root generation must remain stable: advancing it would fence the one
     /// live writer even though no root replacement occurred.
     pub fn invalidateInPlaceMetadataReconcileCaches(self: *ProvisionedGroupStorage) void {
+        if (comptime linked_storage) return;
         self.read_cache.clear();
         self.hbc_cache.clear();
     }
@@ -560,207 +435,217 @@ pub const ProvisionedGroupStorage = struct {
     }
 };
 
-test "provisioned dense native authority gate is fail-closed and monotonic" {
-    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer storage.deinit();
-    const source = storage.denseNativeMigrationPolicySource();
-    try std.testing.expect(!source.authorityPermitted());
-    storage.setDenseNativeAuthorityPermitted(true);
-    try std.testing.expect(source.authorityPermitted());
-    storage.setDenseNativeAuthorityPermitted(false);
-    try std.testing.expect(source.authorityPermitted());
+pub const implementation_tests = implementationTests();
+fn implementationTests() type {
+    if (!@import("builtin").is_test or @import("storage_source_options").control_only) return struct {};
+    const Suite = struct {
+        test "provisioned dense native authority gate is fail-closed and monotonic" {
+            var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+            defer storage.deinit();
+            const source = storage.denseNativeMigrationPolicySource();
+            try std.testing.expect(!source.authorityPermitted());
+            storage.setDenseNativeAuthorityPermitted(true);
+            try std.testing.expect(source.authorityPermitted());
+            storage.setDenseNativeAuthorityPermitted(false);
+            try std.testing.expect(source.authorityPermitted());
+        }
+
+        test "provisioned group storage prunes stale visible root generations" {
+            var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            const generation_source = storage.groupVisibleRootGenerationSource();
+            var reservation = (try generation_source.reserveRootGenerationForGroup(44)).?;
+            defer reservation.deinit();
+            try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
+            storage.pruneGroupVisibleRootGenerations(&.{});
+            try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
+            reservation.advance();
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(44));
+
+            var cancelled = (try generation_source.reserveRootGenerationForGroup(55)).?;
+            cancelled.deinit();
+            try std.testing.expect(!storage.group_visible_root_generations.contains(55));
+
+            try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
+
+            storage.invalidateInPlaceMetadataReconcileCaches();
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+
+            storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
+            try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(22));
+            try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
+        }
+
+        test "provisioned group storage aligns lsm cache with resource budget" {
+            var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            const stats = storage.resource_manager.sliceStats(.lsm_block_table_cache);
+            try std.testing.expect(stats.hard_limit_bytes > 0);
+            try std.testing.expectEqual(stats.hard_limit_bytes, @as(u64, @intCast(storage.lsm_cache.max_bytes)));
+        }
+
+        test "provisioned lsm cache is an elastic share of the node envelope" {
+            const small = smartResourceBudgetsForTotal(2 * 1024 * MiB);
+            const medium = smartResourceBudgetsForTotal(8 * 1024 * MiB);
+            const large = smartResourceBudgetsForTotal(64 * 1024 * MiB);
+
+            try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), small.lsm_cache_budget_bytes);
+            try std.testing.expectEqual(@as(usize, 2 * GiB), medium.lsm_cache_budget_bytes);
+            try std.testing.expectEqual(@as(usize, MaxSmartLsmCacheBytes), large.lsm_cache_budget_bytes);
+            try std.testing.expect(small.lsm_cache_budget_bytes < medium.lsm_cache_budget_bytes);
+            try std.testing.expect(medium.lsm_cache_budget_bytes < large.lsm_cache_budget_bytes);
+
+            inline for (.{
+                .{ .budgets = small, .total = 2 * 1024 * MiB },
+                .{ .budgets = medium, .total = 8 * 1024 * MiB },
+                .{ .budgets = large, .total = 64 * 1024 * MiB },
+            }) |fixture| {
+                const budgets = fixture.budgets;
+                const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+                try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
+                try std.testing.expectEqual(configured.hard_limit_bytes * 7 / 8, configured.soft_limit_bytes);
+                try std.testing.expectEqual(
+                    safeManagedHostMemory(fixture.total),
+                    budgets.options.memory_budget.hard_limit_bytes,
+                );
+            }
+        }
+
+        test "provisioned HBC cache is an elastic share of the node envelope" {
+            const small = smartResourceBudgetsForTotal(2 * GiB);
+            const medium = smartResourceBudgetsForTotal(12 * GiB);
+            const large = smartResourceBudgetsForTotal(64 * GiB);
+
+            const small_hbc = small.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const medium_hbc = medium.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const large_hbc = large.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+
+            try std.testing.expectEqual(@as(u64, 2 * GiB / 3), small_hbc.hard_limit_bytes);
+            try std.testing.expectEqual(@as(u64, 4 * GiB), medium_hbc.hard_limit_bytes);
+            try std.testing.expectEqual(@as(u64, MaxSmartHbcCacheBytes), large_hbc.hard_limit_bytes);
+            try std.testing.expect(small_hbc.hard_limit_bytes < medium_hbc.hard_limit_bytes);
+            try std.testing.expect(medium_hbc.hard_limit_bytes < large_hbc.hard_limit_bytes);
+            inline for (.{ small_hbc, medium_hbc, large_hbc }) |budget| {
+                try std.testing.expectEqual(budget.hard_limit_bytes * 7 / 8, budget.soft_limit_bytes);
+            }
+        }
+
+        test "effective process memory limit preserves source and clamps explicit requests" {
+            const detected = DetectedMemoryLimit{ .bytes = 8 * GiB, .source = .cgroup_v2 };
+
+            const automatic = resolveEffectiveMemoryLimit(null, detected).?;
+            try std.testing.expectEqual(@as(u64, 8 * GiB), automatic.bytes);
+            try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, automatic.source);
+
+            const explicit = resolveEffectiveMemoryLimit(4 * GiB, detected).?;
+            try std.testing.expectEqual(@as(u64, 4 * GiB), explicit.bytes);
+            try std.testing.expectEqual(MemoryLimitSource.explicit, explicit.source);
+
+            const clamped = resolveEffectiveMemoryLimit(16 * GiB, detected).?;
+            try std.testing.expectEqual(@as(u64, 8 * GiB), clamped.bytes);
+            try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, clamped.source);
+
+            const explicit_without_detection = resolveEffectiveMemoryLimit(2 * GiB, null).?;
+            try std.testing.expectEqual(@as(u64, 2 * GiB), explicit_without_detection.bytes);
+            try std.testing.expectEqual(MemoryLimitSource.explicit, explicit_without_detection.source);
+            try std.testing.expectEqual(@as(?DetectedMemoryLimit, null), resolveEffectiveMemoryLimit(null, null));
+        }
+
+        test "provisioned group storage wires remote content to writer caches" {
+            var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
+                .ptr = undefined,
+                .vtable = undefined,
+            }, raft_mod.read_gate.alreadyReadSafeBarrier());
+            var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
+                .ptr = undefined,
+                .vtable = undefined,
+            });
+            const remote_content = scraping.RemoteContentConfig{};
+            _ = write_source.withRemoteContent(&remote_content);
+
+            try storage.attachSources(&read_source, &write_source);
+
+            try std.testing.expectEqual(&remote_content, storage.write_cache.remote_content.?);
+            try std.testing.expectEqual(&remote_content, storage.startup_write_cache.remote_content.?);
+            try std.testing.expectEqual(&storage.lsm_cache, storage.read_cache.lsm_cache.?);
+            try std.testing.expectEqual(&storage.lsm_cache, storage.write_cache.lsm_cache.?);
+            try std.testing.expectEqual(&storage.lsm_cache, storage.startup_write_cache.lsm_cache.?);
+            try std.testing.expectEqual(&storage.read_cache.remote_capability_cache, write_source.remote_capability_cache.?);
+
+            // Keep the production aggregate LSM admission policy covered by the API
+            // module's permanent root-test filter as well as the exhaustive budget
+            // fixture below.
+            const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
+            try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
+            try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
+            try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
+
+            if (filesystem_capacity.supported) {
+                const capacity = try storage.resource_manager.capacitySource().?.current();
+                try std.testing.expect(capacity.capacity_bytes.? > 0);
+                try std.testing.expect(capacity.available_bytes.? <= capacity.capacity_bytes.?);
+            }
+        }
+
+        test "provisioned group storage derives all resource budgets" {
+            var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+            defer storage.deinit();
+
+            inline for (.{
+                resource_manager_mod.Slice.lsm_block_table_cache,
+                resource_manager_mod.Slice.lsm_compaction_work,
+                resource_manager_mod.Slice.lsm_table_builder_working_set,
+                resource_manager_mod.Slice.lsm_in_memory_state,
+                resource_manager_mod.Slice.lsm_wal_write_working_set,
+                resource_manager_mod.Slice.hbc_node_metadata_cache,
+                resource_manager_mod.Slice.dense_search_working_set,
+                resource_manager_mod.Slice.dense_apply_working_set,
+                resource_manager_mod.Slice.dense_routing_working_set,
+                resource_manager_mod.Slice.full_text_pending_segments,
+                resource_manager_mod.Slice.full_text_segment_residency,
+                resource_manager_mod.Slice.derived_backlog,
+                resource_manager_mod.Slice.text_merge_buffers,
+                resource_manager_mod.Slice.algebraic_tensor_accumulators,
+                resource_manager_mod.Slice.lite_native_page_cache,
+                resource_manager_mod.Slice.lite_native_link_cache,
+                resource_manager_mod.Slice.dense_repair_working_set,
+                resource_manager_mod.Slice.shard_transition_working_set,
+                resource_manager_mod.Slice.relational_preparation_working_set,
+                resource_manager_mod.Slice.dense_vector_block_build_working_set,
+            }) |slice| {
+                const stats = storage.resource_manager.sliceStats(slice);
+                try std.testing.expect(stats.hard_limit_bytes > 0);
+                try std.testing.expect(stats.soft_limit_bytes > 0);
+                try std.testing.expect(stats.soft_limit_bytes <= stats.hard_limit_bytes);
+            }
+
+            inline for (.{
+                resource_manager_mod.Slice.inference_model_residency,
+                resource_manager_mod.Slice.inference_kv_working_set,
+                resource_manager_mod.Slice.inference_scratch_working_set,
+            }) |slice| {
+                const stats = storage.resource_manager.sliceStats(slice);
+                try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_bytes);
+            }
+            try std.testing.expect(storage.resource_manager.snapshot().memory.hard_limit_bytes > 0);
+
+            const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
+            try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
+            try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
+            try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
+        }
+    };
+    return Suite;
 }
-
-test "provisioned group storage prunes stale visible root generations" {
-    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer storage.deinit();
-
-    const generation_source = storage.groupVisibleRootGenerationSource();
-    var reservation = (try generation_source.reserveRootGenerationForGroup(44)).?;
-    defer reservation.deinit();
-    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
-    storage.pruneGroupVisibleRootGenerations(&.{});
-    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(44));
-    reservation.advance();
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(44));
-
-    var cancelled = (try generation_source.reserveRootGenerationForGroup(55)).?;
-    cancelled.deinit();
-    try std.testing.expect(!storage.group_visible_root_generations.contains(55));
-
-    try storage.bumpGroupVisibleRootGenerations(&.{ 11, 22, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
-
-    storage.invalidateInPlaceMetadataReconcileCaches();
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
-
-    storage.pruneGroupVisibleRootGenerations(&.{ 11, 33 });
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(11));
-    try std.testing.expectEqual(@as(u64, table_reads.backend_current_root_generation), storage.visibleRootGenerationForGroup(22));
-    try std.testing.expectEqual(@as(u64, 1), storage.visibleRootGenerationForGroup(33));
-}
-
-test "provisioned group storage aligns lsm cache with resource budget" {
-    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer storage.deinit();
-
-    const stats = storage.resource_manager.sliceStats(.lsm_block_table_cache);
-    try std.testing.expect(stats.hard_limit_bytes > 0);
-    try std.testing.expectEqual(stats.hard_limit_bytes, @as(u64, @intCast(storage.lsm_cache.max_bytes)));
-}
-
-test "provisioned lsm cache is an elastic share of the node envelope" {
-    const small = smartResourceBudgetsForTotal(2 * 1024 * MiB);
-    const medium = smartResourceBudgetsForTotal(8 * 1024 * MiB);
-    const large = smartResourceBudgetsForTotal(64 * 1024 * MiB);
-
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), small.lsm_cache_budget_bytes);
-    try std.testing.expectEqual(@as(usize, 2 * GiB), medium.lsm_cache_budget_bytes);
-    try std.testing.expectEqual(@as(usize, MaxSmartLsmCacheBytes), large.lsm_cache_budget_bytes);
-    try std.testing.expect(small.lsm_cache_budget_bytes < medium.lsm_cache_budget_bytes);
-    try std.testing.expect(medium.lsm_cache_budget_bytes < large.lsm_cache_budget_bytes);
-
-    inline for (.{
-        .{ .budgets = small, .total = 2 * 1024 * MiB },
-        .{ .budgets = medium, .total = 8 * 1024 * MiB },
-        .{ .budgets = large, .total = 64 * 1024 * MiB },
-    }) |fixture| {
-        const budgets = fixture.budgets;
-        const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-        try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
-        try std.testing.expectEqual(configured.hard_limit_bytes * 7 / 8, configured.soft_limit_bytes);
-        try std.testing.expectEqual(
-            safeManagedHostMemory(fixture.total),
-            budgets.options.memory_budget.hard_limit_bytes,
-        );
-    }
-}
-
-test "provisioned HBC cache is an elastic share of the node envelope" {
-    const small = smartResourceBudgetsForTotal(2 * GiB);
-    const medium = smartResourceBudgetsForTotal(12 * GiB);
-    const large = smartResourceBudgetsForTotal(64 * GiB);
-
-    const small_hbc = small.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-    const medium_hbc = medium.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-    const large_hbc = large.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-
-    try std.testing.expectEqual(@as(u64, 2 * GiB / 3), small_hbc.hard_limit_bytes);
-    try std.testing.expectEqual(@as(u64, 4 * GiB), medium_hbc.hard_limit_bytes);
-    try std.testing.expectEqual(@as(u64, MaxSmartHbcCacheBytes), large_hbc.hard_limit_bytes);
-    try std.testing.expect(small_hbc.hard_limit_bytes < medium_hbc.hard_limit_bytes);
-    try std.testing.expect(medium_hbc.hard_limit_bytes < large_hbc.hard_limit_bytes);
-    inline for (.{ small_hbc, medium_hbc, large_hbc }) |budget| {
-        try std.testing.expectEqual(budget.hard_limit_bytes * 7 / 8, budget.soft_limit_bytes);
-    }
-}
-
-test "effective process memory limit preserves source and clamps explicit requests" {
-    const detected = DetectedMemoryLimit{ .bytes = 8 * GiB, .source = .cgroup_v2 };
-
-    const automatic = resolveEffectiveMemoryLimit(null, detected).?;
-    try std.testing.expectEqual(@as(u64, 8 * GiB), automatic.bytes);
-    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, automatic.source);
-
-    const explicit = resolveEffectiveMemoryLimit(4 * GiB, detected).?;
-    try std.testing.expectEqual(@as(u64, 4 * GiB), explicit.bytes);
-    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit.source);
-
-    const clamped = resolveEffectiveMemoryLimit(16 * GiB, detected).?;
-    try std.testing.expectEqual(@as(u64, 8 * GiB), clamped.bytes);
-    try std.testing.expectEqual(MemoryLimitSource.cgroup_v2, clamped.source);
-
-    const explicit_without_detection = resolveEffectiveMemoryLimit(2 * GiB, null).?;
-    try std.testing.expectEqual(@as(u64, 2 * GiB), explicit_without_detection.bytes);
-    try std.testing.expectEqual(MemoryLimitSource.explicit, explicit_without_detection.source);
-    try std.testing.expectEqual(@as(?DetectedMemoryLimit, null), resolveEffectiveMemoryLimit(null, null));
-}
-
-test "provisioned group storage wires remote content to writer caches" {
-    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer storage.deinit();
-
-    var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
-        .ptr = undefined,
-        .vtable = undefined,
-    }, raft_mod.read_gate.alreadyReadSafeBarrier());
-    var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
-        .ptr = undefined,
-        .vtable = undefined,
-    });
-    const remote_content = scraping.RemoteContentConfig{};
-    _ = write_source.withRemoteContent(&remote_content);
-
-    try storage.attachSources(&read_source, &write_source);
-
-    try std.testing.expectEqual(&remote_content, storage.write_cache.remote_content.?);
-    try std.testing.expectEqual(&remote_content, storage.startup_write_cache.remote_content.?);
-    try std.testing.expectEqual(&storage.lsm_cache, storage.read_cache.lsm_cache.?);
-    try std.testing.expectEqual(&storage.lsm_cache, storage.write_cache.lsm_cache.?);
-    try std.testing.expectEqual(&storage.lsm_cache, storage.startup_write_cache.lsm_cache.?);
-    try std.testing.expectEqual(&storage.read_cache.remote_capability_cache, write_source.remote_capability_cache.?);
-
-    // Keep the production aggregate LSM admission policy covered by the API
-    // module's permanent root-test filter as well as the exhaustive budget
-    // fixture below.
-    const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
-    try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
-    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
-    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
-
-    if (filesystem_capacity.supported) {
-        const capacity = try storage.resource_manager.capacitySource().?.current();
-        try std.testing.expect(capacity.capacity_bytes.? > 0);
-        try std.testing.expect(capacity.available_bytes.? <= capacity.capacity_bytes.?);
-    }
-}
-
-test "provisioned group storage derives all resource budgets" {
-    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
-    defer storage.deinit();
-
-    inline for (.{
-        resource_manager_mod.Slice.lsm_block_table_cache,
-        resource_manager_mod.Slice.lsm_compaction_work,
-        resource_manager_mod.Slice.lsm_table_builder_working_set,
-        resource_manager_mod.Slice.lsm_in_memory_state,
-        resource_manager_mod.Slice.lsm_wal_write_working_set,
-        resource_manager_mod.Slice.hbc_node_metadata_cache,
-        resource_manager_mod.Slice.dense_search_working_set,
-        resource_manager_mod.Slice.dense_apply_working_set,
-        resource_manager_mod.Slice.dense_routing_working_set,
-        resource_manager_mod.Slice.full_text_pending_segments,
-        resource_manager_mod.Slice.full_text_segment_residency,
-        resource_manager_mod.Slice.derived_backlog,
-        resource_manager_mod.Slice.text_merge_buffers,
-        resource_manager_mod.Slice.algebraic_tensor_accumulators,
-        resource_manager_mod.Slice.lite_native_page_cache,
-        resource_manager_mod.Slice.lite_native_link_cache,
-        resource_manager_mod.Slice.dense_repair_working_set,
-        resource_manager_mod.Slice.shard_transition_working_set,
-        resource_manager_mod.Slice.relational_preparation_working_set,
-        resource_manager_mod.Slice.dense_vector_block_build_working_set,
-    }) |slice| {
-        const stats = storage.resource_manager.sliceStats(slice);
-        try std.testing.expect(stats.hard_limit_bytes > 0);
-        try std.testing.expect(stats.soft_limit_bytes > 0);
-        try std.testing.expect(stats.soft_limit_bytes <= stats.hard_limit_bytes);
-    }
-
-    inline for (.{
-        resource_manager_mod.Slice.inference_model_residency,
-        resource_manager_mod.Slice.inference_kv_working_set,
-        resource_manager_mod.Slice.inference_scratch_working_set,
-    }) |slice| {
-        const stats = storage.resource_manager.sliceStats(slice);
-        try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_bytes);
-    }
-    try std.testing.expect(storage.resource_manager.snapshot().memory.hard_limit_bytes > 0);
-
-    const lsm_state = storage.resource_manager.sliceStats(.lsm_in_memory_state);
-    try std.testing.expect(lsm_state.hard_limit_bytes <= MaxSmartLsmInMemoryStateBytes);
-    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.soft_action);
-    try std.testing.expectEqual(resource_manager_mod.PressureAction.throttle_writes, lsm_state.hard_action);
+comptime {
+    if (@import("builtin").is_test) _ = implementation_tests;
 }

@@ -108,6 +108,27 @@ pub const TransformOpType = enum {
     rename,
 };
 
+/// Canonical public wire spelling for document transform operations. Keep the
+/// representation beside the value contract so routing/serialization code
+/// does not need to import the physical transform executor.
+pub fn transformOpText(op: TransformOpType) []const u8 {
+    return switch (op) {
+        .set => "$set",
+        .set_on_insert => "$setOnInsert",
+        .unset => "$unset",
+        .inc => "$inc",
+        .push => "$push",
+        .pull => "$pull",
+        .add_to_set => "$addToSet",
+        .pop => "$pop",
+        .mul => "$mul",
+        .min => "$min",
+        .max => "$max",
+        .current_date => "$currentDate",
+        .rename => "$rename",
+    };
+}
+
 pub const TransformOp = struct {
     op: TransformOpType,
     path: []const u8,
@@ -1394,7 +1415,7 @@ pub const DocumentArtifactTableReprocessResult = struct {
 pub const TxnId = transactions_mod.TxnId;
 pub const TxnStatus = transactions_mod.TxnStatus;
 pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
-pub const ByteRange = docstore_mod.ByteRange;
+pub const ByteRange = @import("../byte_range.zig").ByteRange;
 pub const SplitPhase = shard_mod.SplitPhase;
 pub const GraphEdge = graph_mod.Edge;
 pub const GraphEdgeDirection = graph_mod.EdgeDirection;
@@ -2345,11 +2366,38 @@ pub const SearchResult = struct {
     /// relying on `identity_read_generation` being globally common.
     shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
     sort_profile: ?SortProfile = null,
+    /// Decoded profiles own their strings here. Native profiles borrow static
+    /// labels; both representations follow the SearchResult's move lifetime.
+    sort_profile_storage: ?[]u8 = null,
     graph_results: []GraphSearchResult = &.{},
     graph_metric_results: []GraphMetricResult = &.{},
     graph_metric_rerank_status: ?GraphMetricStatus = null,
 
+    /// Clone all profile strings in one allocation. Reflection keeps future
+    /// string fields in the ownership contract without a second field list.
+    pub fn setOwnedSortProfile(self: *SearchResult, profile: SortProfile) !void {
+        var length: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) length = try std.math.add(usize, length, @field(profile, field.name).len);
+        }
+        const storage = try self.alloc.alloc(u8, length);
+        var owned = profile;
+        var offset: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
+            if (field.type == []const u8) {
+                const value = @field(profile, field.name);
+                @memcpy(storage[offset..][0..value.len], value);
+                @field(owned, field.name) = storage[offset..][0..value.len];
+                offset += value.len;
+            }
+        }
+        if (self.sort_profile_storage) |previous| self.alloc.free(previous);
+        self.sort_profile_storage = storage;
+        self.sort_profile = owned;
+    }
+
     pub fn deinit(self: *SearchResult) void {
+        if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
@@ -2645,6 +2693,12 @@ pub fn InlineStatusText(comptime capacity: usize) type {
 
         pub fn jsonStringify(self: @This(), jw: anytype) !void {
             try jw.write(self.slice());
+        }
+
+        pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            const value = try std.json.innerParse([]const u8, alloc, source, options);
+            if (value.len > capacity) return error.Overflow;
+            return init(value);
         }
     };
 }
@@ -3480,6 +3534,29 @@ pub const ArtifactRepairRunOptions = struct {
         if (self.cancel_check) |check| return check.requested();
         return false;
     }
+};
+
+/// Authoritative owner wake decision. A tagged state prevents `0` from
+/// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+/// boundaries while remaining available to the control-only compiler unit.
+pub const IndexRepairWake = union(enum) {
+    immediate,
+    at_realtime_ms: u64,
+    parked,
+    empty,
+
+    pub fn retryAtMs(self: @This()) u64 {
+        return switch (self) {
+            .at_realtime_ms => |deadline| deadline,
+            .immediate, .parked, .empty => 0,
+        };
+    }
+};
+
+/// Exact data-Raft entry persisted atomically with one document mutation.
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
 };
 
 pub const ArtifactRepairResult = struct {
@@ -4455,6 +4532,13 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     if (stats.indexes.len > 0) alloc.free(stats.indexes);
 }
 
+pub const NativePublicationResult = struct {
+    published: usize = 0,
+    /// No attempt was made because another owner holds an admission lane.
+    /// This is neither completed work nor evidence of zero progress.
+    busy: bool = false,
+    deferred: bool = false,
+};
 test "graph metric index stats cleanup owns nested status payloads" {
     const alloc = std.testing.allocator;
     var item: DBIndexStats = .{ .name = try alloc.dupe(u8, "graph_idx"), .kind = .graph };
@@ -4473,3 +4557,24 @@ test "graph metric index stats cleanup owns nested status payloads" {
     statuses[0].build_pages[0] = .{};
     statuses[0].build_pages[0].cursor = try alloc.dupe(u8, "page-cursor");
 }
+
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
+    index_name: []const u8,
+    kind: IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
+};
