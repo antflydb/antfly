@@ -870,14 +870,19 @@ API tests retain the existing compatible/incompatible HITS and hosted fan-in
 cases. Worker parser/supervisor assertions are moved intact into testing.
 
 VOPR `index-maintenance` runs production graph operations against in-memory LSM
-stores with an owner-supplied clock. It explores metric families and failure
-positions, checks early-claim exclusion, attempt increment/reset, stale output
+stores with an owner-supplied clock. It acquires pages before enabling
+worker-loss faults, permits healthy completion,
+and explores metric families and failure positions. Directed histories cover
+normal completion and late publication work; the campaign tracks fault coverage
+separately from safety. It checks early-claim exclusion, attempt increment/reset,
+stale output
 rejection, publication preservation, pause/resume, failed cleanup and retry
 exhaustion. `index-ownership` exercises actual DB runtime leases, takeover,
 stale owner close/tick ordering and clean lease release. That scenario shares
 the existing DB/index VOPR fixture's explicit physical-index differential
-boundary. Exact replay recreates the world; native crash/durability proof stays
-in integration tests.
+boundary. Both scenarios expose read-only logical collectors; the registry
+derives debugger capabilities from the scenario contract. Exact replay recreates
+the world; native crash/durability proof stays in integration tests.
 
 CI's `zig-base` unit aggregate includes the fixed seed. `zig-full` runs the
 broader VOPR campaign and native integration suite; compilation/cache matrices

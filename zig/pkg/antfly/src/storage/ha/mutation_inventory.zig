@@ -104,7 +104,7 @@ pub const entries = [_]Entry{
     .{ .surface = .cluster_restore, .disposition = .reject, .path_pattern = "/restore", .methods = post, .reason = "restore activation replaces local generation state outside the continuous stream" },
     .{ .surface = .table_restore, .disposition = .reject, .path_pattern = "/tables/{table}/restore", .methods = post, .reason = "table restore mutates both catalog and data outside one RemoteApply acknowledgement" },
     .{ .surface = .transaction_session, .disposition = .reject, .path_pattern = "/transactions[/... mutating operation]", .methods = post_put_delete, .reason = "durable transaction session state and savepoints are primary-local" },
-    .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
+    .{ .surface = .artifact_repair, .disposition = .reject, .path_pattern = "/tables/{table}/repair/{run|control-jobs|jobs/...}", .methods = post_delete, .reason = "repair job checkpoints and direct repair effects do not share one replicated acknowledgement" },
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "backup publication has an external side effect but no final HA authority recheck spanning snapshot and manifest publication" },
     .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
@@ -189,6 +189,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
 
     if (routes.Routes.matchTableArtifactRepairRun(path) != null or
         routes.Routes.matchTableRepairJobs(path) != null or
+        routes.Routes.matchTableRepairControlJobs(path) != null or
         routes.Routes.matchTableRepairJobAdvance(path) != null or
         routes.Routes.matchTableRepairJobCancel(path) != null)
         return rejected(.artifact_repair);
@@ -392,6 +393,7 @@ test "HA public non-GET route matrix has an explicit durability disposition" {
         // Repair/reprocess workflows and payload-dispatched protocols.
         .{ .method = .POST, .path = "/tables/docs/repair/run", .surface = .artifact_repair, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/repair/jobs", .surface = .artifact_repair, .disposition = .reject },
+        .{ .method = .POST, .path = "/tables/docs/repair/control-jobs", .surface = .artifact_repair, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/repair/jobs/1/advance", .surface = .artifact_repair, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/repair/jobs/1/cancel", .surface = .artifact_repair, .disposition = .reject },
         .{ .method = .POST, .path = "/tables/docs/artifacts/summary/reprocess", .surface = .artifact_reprocess, .disposition = .reject },

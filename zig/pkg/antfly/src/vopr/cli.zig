@@ -809,11 +809,11 @@ fn runDebugRecipeKnown(
             .suffix_seed = recorded.config.seed orelse 0,
         },
         .event_queries = &queries,
-        .collect_failure_window = antfly.domain_vopr.kindFromArtifact(recorded) != null,
+        .collect_failure_window = collectorsSupported(recorded),
         .flight = flight_config,
     }, .{
         .execution = execution,
-        .collectors = if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
+        .collectors = if (collectorsSupported(recorded))
             .{ .collect_fn = recipeCollectKnown }
         else
             null,
@@ -1051,6 +1051,10 @@ fn explainCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     });
 }
 
+fn collectorsSupported(recorded: *const vopr.trace.Trace) bool {
+    return if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| kind.supportsCollectors() else false;
+}
+
 fn collectKnownAt(
     alloc: std.mem.Allocator,
     recorded: *const vopr.trace.Trace,
@@ -1058,6 +1062,7 @@ fn collectKnownAt(
 ) !vopr.collector.Sink {
     const kind = antfly.domain_vopr.kindFromArtifact(recorded) orelse
         return error.ScenarioCollectorsUnsupported;
+    if (!kind.supportsCollectors()) return error.ScenarioCollectorsUnsupported;
     return switch (kind) {
         inline else => |known| vopr.debugger.collectAt(known.scenario(), alloc, recorded, prefix),
     };
@@ -2863,6 +2868,16 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         var artifact = try recordCampaignScenario(alloc, scenario, 0xA17F_C000 + index, transitions, 0xA17F_C000);
         defer artifact.deinit();
         try std.testing.expect(artifactMatchesScenario(&artifact, scenario));
+        if (antfly.domain_vopr.kindFromArtifact(&artifact)) |kind| {
+            try std.testing.expectEqual(kind.supportsCollectors(), collectorsSupported(&artifact));
+            if (kind.supportsCollectors()) {
+                for ([_]usize{ 0, artifact.choices.items.len / 2, artifact.choices.items.len }) |prefix| {
+                    var collected = try collectKnownAt(alloc, &artifact, prefix);
+                    defer collected.deinit();
+                    try std.testing.expect(collected.records.items.len > 0);
+                }
+            }
+        }
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
         var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();

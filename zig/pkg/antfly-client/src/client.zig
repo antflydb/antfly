@@ -299,6 +299,10 @@ pub const AntflyClient = struct {
         return self.inner.startTableRepairJob(table_name, body);
     }
 
+    pub fn startTableRepairControlJob(self: *AntflyClient, table_name: []const u8, body: openapi.types.TableRepairControlJobStartRequest) !openapi.ApiResponse(openapi.types.TableRepairJob) {
+        return self.inner.startTableRepairControlJob(table_name, body);
+    }
+
     pub fn getTableRepairJob(self: *AntflyClient, table_name: []const u8, job_id: []const u8) !openapi.ApiResponse(openapi.types.TableRepairJob) {
         return self.inner.getTableRepairJob(table_name, job_id);
     }
@@ -419,7 +423,7 @@ pub const AntflyClient = struct {
         defer self.allocator.free(json_body);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |header| &.{header} else null;
         var raw_resp = try self.inner.http.post(url, .{ .json = json_body, .headers = headers });
-        var resp = openapi.ApiResponse(openapi.types.BatchResponse).fromResponse(self.allocator, &raw_resp);
+        var resp = try openapi.ApiResponse(openapi.types.BatchResponse).fromResponse(self.allocator, &raw_resp);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

@@ -343,20 +343,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "artifact reprocess job cleanup removes recovered durable expired jobs",
             "artifact reprocess job store applies running cancellation at pass boundary",
             "artifact reprocess job store records cancel requested across stale queued token",
-            "repair job store starts and records a pass",
-            "repair job store applies running cancellation at pass boundary",
-            "repair job store records cancel requested across stale queued token",
-            "repair job store does not expire future live running heartbeat",
-            "table repair job store persists monotonic next id across stale durable writes",
-            "table repair job cleanup pages durable expired jobs",
-            "forced index repair job dispatches force only once",
-            "index repair job keeps degradation gauges as snapshots across retries",
-            "named index repair cancellation remains nonterminal until durable controls finish",
-            "named index repair cancellation restarts its durable traversal after job store recovery",
-            "durable cancellation retries transient failures with backoff",
-            "durable cancellation scan rotates past a backed off head window",
-            "table repair job recovery quarantines corrupt primary without blocking service",
-            "active repair job recovery quarantines malformed secondary entries",
+            "api.repair_jobs.",
+            "api_artifact_reprocess_jobs_test_root.",
             "api http client maps remote repair cancel unavailable",
             "api http client encodes table name for repair cancel callback",
             "public api routes compile",
@@ -959,7 +947,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db repair preflight retains a canonical generation completed after scheduler selection",
         "db coverage recovery admits a published generation after its admission marker retires",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
-        "api maintenance resumes recovered durable named index cancellation without client advance",
+        "api maintenance ",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
         "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
         "managed embedder sends antfly media parts when local provider is configured",
@@ -2410,7 +2398,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db dense counter bootstrap admission respects soft background budget",
             "managed startup catch-up advances counterless incomplete dense repair",
             "provisioned leader admission rejects uncommitted writes under dense repair pressure",
-            "api maintenance resumes recovered durable named index cancellation without client advance",
+            "api maintenance ",
             "bulk publication revalidates admission before every publish window",
         },
         .test_runner = .{
@@ -4647,7 +4635,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
-            &.{ "db default primary backend survives reopen", "index maintenance VOPR campaign exact replay" },
+            &.{ "db default primary backend survives reopen", "index maintenance VOPR " },
             &graph_metric_integration_filters,
         ),
         .test_runner = .{
@@ -4665,7 +4653,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // artifact used by the bounded base selection, including page contracts.
     integration_test_step.dependOn(graph_test_step);
     // Reuse the same storage compilation for full VOPR qualification.
-    const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR campaign exact replay"});
+    const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR "});
     vopr_test_step.dependOn(&run_index_maintenance_vopr.step);
 
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");

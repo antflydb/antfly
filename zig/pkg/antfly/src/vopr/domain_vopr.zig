@@ -1042,6 +1042,12 @@ pub const Kind = enum {
         };
     }
 
+    pub fn supportsCollectors(self: Kind) bool {
+        return switch (self) {
+            inline else => |kind| @hasDecl(kind.scenario(), "collect"),
+        };
+    }
+
     pub fn scenarioName(self: Kind) []const u8 {
         return switch (self) {
             inline else => |kind| kind.scenario().name,

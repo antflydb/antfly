@@ -259,9 +259,16 @@ advance its first bounded pass. Use the returned job ID with `maintenance status
 `maintenance advance`, or `maintenance cancel`, together with `--table` and
 `--job`. Job IDs already identify their resource; additional resource filters
 are rejected. `--once` instead runs one bounded repair pass; `--cursor` continues
-artifact repair pages. Index rebuild explicitly forces a replacement generation.
-Index `pause`, `resume`, and `cancel` control repair; `--repair-id` fences those
-controls against a newer attempt. Graph actions require `--metric` and use the
+artifact or index repair pages. Index rebuild explicitly forces a replacement
+generation.
+Index `pause`, `resume`, and `cancel` start durable control jobs. The server
+advances them across all table groups, including after restart; `--repair-id`
+fences every pass against a newer attempt. `--once` runs a bounded control pass;
+continue its `next_cursor` with `--cursor` and optionally `--limit`. Cancelling a
+control job stops its remaining work; it does not reverse controls already
+applied. Control-job creation uses `/repair/control-jobs`, so older servers
+reject it instead of mistaking it for ordinary repair. Graph actions require
+`--metric` and use the
 existing graph-index lifecycle API. Graph `delete` clears materialization and
 disables automatic maintenance; it does not drop the index configuration.
 `index maintenance status` returns the index status, including its graph metrics.

@@ -17,17 +17,19 @@ pub fn ApiResponse(comptime T: type) type {
             if (self.err_body) |b| self.allocator.free(b);
         }
 
-        pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) @This() {
+        pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {
             defer resp.deinit();
             if (resp.ok()) {
+                if (resp.status.code == 204 or resp.status.code == 205) return .{ .status_code = resp.status.code, .allocator = allocator };
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always }) catch {
-                        return .{ .status_code = resp.status.code, .allocator = allocator };
+                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
                 }
+                return error.InvalidApiResponse;
             }
-            return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| (allocator.dupe(u8, b) catch null) else null, .allocator = allocator };
+            return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| try allocator.dupe(u8, b) else null, .allocator = allocator };
         }
     };
 }
@@ -1348,6 +1350,19 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.StatefulQueryResponses).fromResponse(self.allocator, &resp);
+    }
+
+    /// Start a durable index control job
+    /// POST /db/v1/tables/{tableName}/repair/control-jobs
+    pub fn startTableRepairControlJob(self: *@This(), table_name: []const u8, body: types.TableRepairControlJobStartRequest) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/control-jobs", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
     }
 
     /// List table repair issues

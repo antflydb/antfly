@@ -8,8 +8,9 @@ const client_mod = @import("antfly-client");
 const types = client_mod.types;
 const cli = @import("mod.zig");
 
-pub const Resource = enum { index, artifact };
-const Action = enum { issues, repair, rebuild, refresh, pause, @"resume", delete, status, advance, cancel };
+const commands = @import("../../maintenance_commands.zig");
+pub const Resource = commands.Resource;
+const Action = commands.Action;
 
 const Options = struct {
     resource: Resource,
@@ -50,12 +51,17 @@ const Options = struct {
         const request = self.repairRequest();
         return .{ .target = request.target, .index = request.index, .kind = request.kind, .cursor = request.cursor, .limit = request.limit, .force = request.force, .advance = true };
     }
+
+    fn controlJobRequest(self: Options) types.TableRepairControlJobStartRequest {
+        const request = self.repairRequest();
+        return .{ .index = request.index.?, .control = request.control.?, .repair_id = request.repair_id, .cursor = request.cursor, .limit = request.limit, .advance = true };
+    }
 };
 
 fn take(args: anytype, slot: *?[]const u8) !void {
     if (slot.* != null) return error.DuplicateOption;
     const value = args.next() orelse return error.MissingOptionValue;
-    if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.MissingOptionValue;
+    if (value.len == 0 or std.mem.startsWith(u8, value, "-")) return error.MissingOptionValue;
     slot.* = value;
 }
 
@@ -124,10 +130,11 @@ fn parse(resource: Resource, args: anytype) !Options {
         else => return error.UnsupportedMaintenanceAction,
     }
     if (resource == .index and result.action != .issues and result.index == null) return error.IndexRequired;
-    if (result.once and result.action != .repair and result.action != .rebuild) return error.UnexpectedArgument;
     const control = result.action == .pause or result.action == .@"resume" or result.action == .cancel;
+    if (result.once and result.action != .repair and result.action != .rebuild and !control) return error.UnexpectedArgument;
+    if (result.repair_id) |raw| _ = std.fmt.parseInt(u128, raw, 10) catch return error.InvalidRepairId;
     if (result.repair_id != null and !control) return error.UnexpectedArgument;
-    if ((control or result.action == .status) and (result.cursor != null or result.limit != null)) return error.UnexpectedArgument;
+    if ((result.action == .status) and (result.cursor != null or result.limit != null)) return error.UnexpectedArgument;
     return result;
 }
 
@@ -159,8 +166,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyC
             defer response.deinit();
             return cli.printResponse(allocator, io, &response);
         },
-        .repair, .rebuild => if (!options.once) {
-            var response = try client.startTableRepairJob(options.table, options.jobRequest());
+        .repair, .rebuild, .pause, .@"resume", .cancel => if (!options.once) {
+            var response = if (options.repairRequest().control != null)
+                try client.startTableRepairControlJob(options.table, options.controlJobRequest())
+            else
+                try client.startTableRepairJob(options.table, options.jobRequest());
             defer response.deinit();
             return cli.printResponse(allocator, io, &response);
         },
@@ -205,10 +215,13 @@ test "maintenance rejects ambiguous scopes invalid bounds and ignored options" {
     try std.testing.expectError(error.InvalidLimit, parseText(.artifact, "issues --table docs --limit 501"));
     try std.testing.expectError(error.InvalidLimit, parseText(.artifact, "repair --table docs --limit 0"));
     try std.testing.expectError(error.UnexpectedArgument, parseText(.index, "status --table docs --job j --index x"));
-    try std.testing.expectError(error.UnexpectedArgument, parseText(.index, "pause --table docs --index x --cursor next"));
+    const continued = try parseText(.index, "pause --table docs --index x --cursor 65: --limit 4 --once");
+    try std.testing.expectEqualStrings("65:", continued.repairRequest().cursor.?);
+    try std.testing.expectEqual(@as(i64, 4), continued.repairRequest().limit.?);
     const control = try parseText(.index, "pause --table docs --index x --repair-id 17");
     try std.testing.expectEqualStrings("pause_automatic", control.repairRequest().control.?);
-    try std.testing.expectEqualStrings("17", control.repairRequest().repair_id.?);
+    try std.testing.expectEqualStrings("17", control.controlJobRequest().repair_id.?);
+    try std.testing.expectEqualStrings("pause_automatic", control.controlJobRequest().control);
 }
 
 test "maintenance public routes send scoped API requests through the client" {
@@ -224,11 +237,16 @@ test "maintenance public routes send scoped API requests through the client" {
         .{ .resource = .index, .argv = &.{ "maintenance", "rebuild", "--table", "docs", "--index", "dense" }, .path = "/db/v1/tables/docs/repair/jobs" },
         .{ .resource = .artifact, .argv = &.{ "maintenance", "repair", "--table", "docs", "--once", "--cursor", "next", "--limit", "12" }, .path = "/db/v1/tables/docs/repair/run" },
         .{ .resource = .index, .argv = &.{ "maintenance", "refresh", "--table", "docs", "--index", "graph", "--metric", "rank" }, .path = "/db/v1/tables/docs/indexes/graph/graph-metrics/rank:refresh" },
+        .{ .resource = .index, .argv = &.{ "maintenance", "pause", "--table", "docs", "--index", "dense", "--repair-id", "17", "--cursor", "65:", "--limit", "4" }, .path = "/db/v1/tables/docs/repair/control-jobs" },
         .{ .resource = .index, .argv = &.{ "maintenance", "advance", "--table", "docs", "--job", "17" }, .path = "/db/v1/tables/docs/repair/jobs/17/advance" },
     };
     const Task = struct {
         fn request(info: httpx.testing_mod.RequestInfo) !void {
-            if (std.mem.endsWith(u8, info.path, "/repair/jobs")) {
+            if (std.mem.indexOf(u8, info.body, "pause_automatic") != null) {
+                try @import("antfly-json").testing.expectSubsetJsonText(std.testing.allocator,
+                    \\{"index":"dense","control":"pause_automatic","repair_id":"17","cursor":"65:","limit":4,"advance":true}
+                , info.body);
+            } else if (std.mem.endsWith(u8, info.path, "/repair/jobs")) {
                 try @import("antfly-json").testing.expectSubsetJsonText(std.testing.allocator,
                     \\{"target":"index","index":"dense","force":true,"advance":true}
                 , info.body);
@@ -261,5 +279,116 @@ test "maintenance public routes send scoped API requests through the client" {
         try server.handleOne();
         try group.await(io);
         try std.testing.expect(success);
+    }
+}
+
+test "maintenance repair job responses retain handles and cursors and reject malformed success" {
+    const body =
+        \\{
+        \\  "job_id": 17,
+        \\  "attempt_id": 2,
+        \\  "table_name": "docs",
+        \\  "phase": "queued",
+        \\  "repair_status": "in_progress",
+        \\  "target": "index",
+        \\  "index": "dense",
+        \\  "control": "pause_automatic",
+        \\  "repair_id": "91",
+        \\  "cursor": "65:",
+        \\  "limit": 64,
+        \\  "force": false,
+        \\  "result": {
+        \\    "scanned": 0,
+        \\    "groups_scanned": 0,
+        \\    "reprocessed": 0,
+        \\    "repaired": 0,
+        \\    "missing_source_docs": 0,
+        \\    "failed": 0,
+        \\    "unsupported": 0,
+        \\    "unresolved": 0,
+        \\    "in_progress": 0,
+        \\    "indexes_rebuilt": 0,
+        \\    "indexes_degraded_before": 0,
+        \\    "indexes_degraded_after": 0,
+        \\    "controls_applied": 0,
+        \\    "limit": 0,
+        \\    "has_more": true,
+        \\    "debt_remaining": true,
+        \\    "next_cursor": "65:",
+        \\    "future_result_field": true
+        \\  },
+        \\  "cancel_requested": false,
+        \\  "next_retry_at_millis": 5000,
+        \\  "created_at_millis": 1000,
+        \\  "last_updated_at_millis": 2000,
+        \\  "expires_at_millis": 9000,
+        \\  "future_job_field": true
+        \\}
+    ;
+    const httpx = @import("httpx");
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { status: u16, body: []const u8, invalid: bool = false, control: bool = false };
+    const Task = struct {
+        fn run(c: *client_mod.AntflyClient, case: Case, failure: *?anyerror) std.Io.Cancelable!void {
+            check(c, case) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn check(c: *client_mod.AntflyClient, case: Case) !void {
+            const fetched = if (case.control) c.startTableRepairControlJob("docs", .{ .index = "dense", .control = "pause_automatic" }) else if (case.status == 202) c.startTableRepairJob("docs", .{ .target = .index, .index = "dense" }) else c.getTableRepairJob("docs", "17");
+            if (case.invalid) {
+                try std.testing.expectError(error.InvalidApiResponse, fetched);
+                return;
+            }
+            var response = try fetched;
+            defer response.deinit();
+            const data = response.data orelse return error.MissingJobResponse;
+            try std.testing.expectEqual(@as(i64, 17), data.value.job_id);
+            try std.testing.expectEqualStrings("65:", data.value.cursor.value);
+            try std.testing.expectEqual(@as(i64, 5000), data.value.next_retry_at_millis.?);
+            try std.testing.expectEqualStrings("91", data.value.repair_id.?);
+            try std.testing.expectEqualStrings("65:", data.value.result.next_cursor.value);
+        }
+    };
+    for ([_]Case{
+        .{ .status = 200, .body = body },                  .{ .status = 202, .body = body },
+        .{ .status = 200, .body = "{", .invalid = true },  .{ .status = 202, .body = "{}", .invalid = true },
+        .{ .status = 200, .body = "", .invalid = true },   .{ .status = 200, .body = body, .control = true },
+        .{ .status = 202, .body = body, .control = true },
+    }) |case| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = if (case.control or case.status == 202) .POST else .GET, .path = if (case.control) "/db/v1/tables/docs/repair/control-jobs" else if (case.status == 202) "/db/v1/tables/docs/repair/jobs" else "/db/v1/tables/docs/repair/jobs/17", .respond = .{ .status = case.status, .body = case.body } }});
+        defer server.deinit();
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer http.deinit();
+        var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        var failure: ?anyerror = null;
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        try group.concurrent(io, Task.run, .{ &client, case, &failure });
+        try server.handleOne();
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "maintenance help and nested completions share action descriptions" {
+    const completion = @import("../../completion.zig");
+    inline for (.{ Resource.index, Resource.artifact }) |resource| {
+        const usage = commands.usage(resource);
+        try std.testing.expect(std.mem.indexOf(u8, usage, "--cursor") != null);
+        inline for (commands.actions) |description| {
+            if (resource == .index or description.artifact) try std.testing.expect(std.mem.indexOf(u8, usage, description.text(resource)) != null);
+        }
+    }
+    inline for (.{ completion.Shell.bash, completion.Shell.zsh, completion.Shell.fish }) |shell| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try completion.write(shell, &out.writer);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "maintenance") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "refresh") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "advance") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "__maintenance-worker") == null);
     }
 }
