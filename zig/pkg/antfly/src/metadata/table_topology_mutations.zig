@@ -124,6 +124,8 @@ pub fn create(
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
     var normalized_req = req;
+    if (req.storage.dense_embeddings == .vector_store)
+        return error.VectorStoreRequiresLocalSingleShardTable;
     const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
         alloc,
         table_name,
@@ -178,8 +180,12 @@ pub fn create(
         if (err == error.MetadataTopologyCommandTooLarge) return error.CreateTableRequestTooLarge;
         return err;
     };
-    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
+    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
+        // This topology mutation is one atomic proposal. An applied entry
+        // with a different term proves that none of this command took effect.
+        if (err == error.MetadataProposalSuperseded) return error.MetadataMutationNotApplied;
         return afterAdmission(err);
+    };
 
     svc.verifyTableCreateProjection(alloc, table, ranges) catch |err| switch (err) {
         error.TableAlreadyExists => return err,
@@ -265,8 +271,12 @@ pub fn restore(
         if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
         return err;
     };
-    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
+    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
+        // This topology mutation is one atomic proposal. An applied entry
+        // with a different term proves that none of this command took effect.
+        if (err == error.MetadataProposalSuperseded) return error.MetadataMutationNotApplied;
         return afterAdmission(err);
+    };
     svc.verifyTableCreateProjection(alloc, table, destination_ranges) catch |err| switch (err) {
         error.TableAlreadyExists => return err,
         else => return afterAdmission(err),
@@ -307,8 +317,12 @@ pub fn drop(
         if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
         return err;
     };
-    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
+    svc.waitForTransitionAppliedWithContext(receipt, request) catch |err| {
+        // This topology mutation is one atomic proposal. An applied entry
+        // with a different term proves that none of this command took effect.
+        if (err == error.MetadataProposalSuperseded) return error.MetadataMutationNotApplied;
         return afterAdmission(err);
+    };
 
     svc.verifyTableDropProjection(alloc, admission.table_id) catch |err| switch (err) {
         error.TableTransitionActive => return err,

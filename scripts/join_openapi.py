@@ -15,14 +15,17 @@
 
 from __future__ import annotations
 
-import importlib.util
+import argparse
 import copy
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 from openapi_spec_validator import validate_spec
+
+from openapi_inputs import record_dependencies
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -229,13 +232,8 @@ def configure_for_repo_contracts(module) -> None:
     module.USERMGR_SPEC = ROOT / "specs/openapi/auth/api.yaml"
     module.ROOT_SPEC = ROOT / "openapi.yaml"
     module.GO_SCHEMA_SPEC = ROOT / "specs/openapi/antfly/schema.yaml"
-    module.GO_INDEX_SPEC = ROOT / "specs/openapi/antfly/indexes.yaml"
-    module.GO_INDEX_REF_PATHS = {
-        "indexes.yaml",
-        "specs/openapi/antfly/indexes.yaml",
-    }
     # Keep the shared joiner's rewrite rules as the single source of truth.
-    # This broader fallback is specific to the repository-level bundle and is
+    # This broader rewrite is specific to the repository-level bundle and is
     # intentionally appended after the shared rules so their narrower prefixes
     # continue to win.
     module.PATH_REWRITES = dict(module.PATH_REWRITES)
@@ -243,25 +241,16 @@ def configure_for_repo_contracts(module) -> None:
 
     def target_schema_name(source_path: Path, schema_name: str) -> str:
         if (
-            source_path.resolve() == module.GO_SCHEMA_SPEC
+            module.schema_path(source_path) == module.GO_SCHEMA_SPEC
             and schema_name == "AntflyType"
         ):
             return "AntflyType-2"
         return schema_name
 
-    def target_schema_name_for_ref(ref_path: str, schema_name: str) -> str:
-        rewritten = module.rewrite_ref_path(ref_path)
-        if (
-            module.ROOT / rewritten
-        ).resolve() == module.GO_SCHEMA_SPEC and schema_name == "AntflyType":
-            return "AntflyType-2"
-        return schema_name
-
     module.target_schema_name = target_schema_name
-    module.target_schema_name_for_ref = target_schema_name_for_ref
 
 
-def main(argv: list[str]) -> int:
+def generate(argv: list[str]) -> int:
     joiner = load_shared_joiner()
     configure_for_repo_contracts(joiner)
 
@@ -283,9 +272,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "--compare":
         target = argv[1] if len(argv) > 1 else "openapi.yaml"
         current = joiner.load_yaml(ROOT / target)
-        joined = joiner.bundle_joined_spec(
-            joiner.join_specs(metadata, usermgr), current
-        )
+        joined = joiner.bundle_joined_spec(joiner.join_specs(metadata, usermgr))
         joined.pop("security", None)
         add_redocly_tag_groups(joined)
         has_drift = joiner.compare_specs(joined, current)
@@ -304,6 +291,22 @@ def main(argv: list[str]) -> int:
     print(f"wrote {output}")
     validate_openapi_spec(joined, output)
     return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--depfile", type=Path)
+    options, args = parser.parse_known_args(argv)
+    # Other legacy modes can consult Git for ordering or validate external
+    # references. Only the modular join is a cached build producer.
+    if options.depfile is not None and args[:1] != ["--joined-only"]:
+        parser.error("--depfile requires --joined-only")
+    if options.depfile is not None and len(args) > 1:
+        # Build output paths are relative to the invoking build directory,
+        # unlike the repository-relative defaults of the interactive CLI.
+        args[1] = str(Path(args[1]).resolve())
+    with record_dependencies(options.depfile):
+        return generate(args)
 
 
 if __name__ == "__main__":

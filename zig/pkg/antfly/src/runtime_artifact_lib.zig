@@ -20,7 +20,6 @@ const builtin = @import("builtin");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const bridge = @import("runtime_bridge.zig");
-const private_error_diagnostics = @import("runtime_private_error_diagnostics.zig");
 const unit_options = @import("runtime_library_options");
 const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
 const restore_staging_exports = if (unit_options.unit == .distributed)
@@ -42,6 +41,7 @@ const cli_runtime = if (unit_options.unit == .cli) @import("cli_runtime.zig") el
 // archive does not code-generate a second copy of the HA storage closure.
 const ha_runtime = if (unit_options.unit == .distributed) @import("cmd/ha.zig") else struct {};
 const data_runtime = if (unit_options.unit == .distributed) @import("data/runtime.zig") else struct {};
+const graph_metric_maintenance_runtime = if (unit_options.unit == .distributed) @import("cmd/graph_metric_maintenance.zig") else struct {};
 const metadata_runtime = if (unit_options.unit == .distributed) @import("metadata/runtime.zig") else struct {};
 const serverless_runtime = if (unit_options.unit == .serverless) @import("cmd/serverless.zig") else struct {};
 const inference_runtime = if (unit_options.unit == .inference) @import("inference_runtime/runtime.zig") else struct {};
@@ -66,6 +66,7 @@ else
 // user-manager adapter likewise imports its storage types through this root.
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const common = @import("common/mod.zig");
 pub const backup_bundle = @import("storage/backup_bundle.zig");
 pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const backup_repository = @import("storage/backup_repository.zig");
@@ -84,6 +85,7 @@ pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
 
@@ -224,6 +226,10 @@ fn runData(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterat
     return data_runtime.runFromIterator(init, "antfly", args);
 }
 
+fn runGraphMetricMaintenance(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return graph_metric_maintenance_runtime.runFromIterator(init, "antfly", args);
+}
+
 fn runHa(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return ha_runtime.runFromIterator(init, "antfly", args);
 }
@@ -251,6 +257,10 @@ fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
 
 fn dataEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "data", runData);
+}
+
+fn graphMetricMaintenanceEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "graph_metric_maintenance", runGraphMetricMaintenance);
 }
 
 fn haEntry(context: *const bridge.Context) callconv(.c) c_int {
@@ -288,6 +298,7 @@ comptime {
             // C ABI library names link this exact compiled artifact.
             _ = storage_kernel_exports;
             exportInternal(&dataEntry, "antfly_runtime_data");
+            exportInternal(&graphMetricMaintenanceEntry, "antfly_runtime_graph_metric_maintenance");
             exportInternal(&haEntry, "antfly_runtime_ha");
             exportInternal(&metadataEntry, "antfly_runtime_metadata");
             exportInternal(&standaloneEntry, "antfly_runtime_standalone");
@@ -333,22 +344,6 @@ fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.Conf
     return .ok;
 }
 
-const inference_provider_operation_slots = 13;
-var inference_private_failure_counts = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** inference_provider_operation_slots;
-
-// Private inference errors are normalized at this archive boundary, so this is
-// the only place their original identity is available. Keep a fixed-size set
-// of per-operation/error/model counters: one noisy model must not consume the
-// first diagnostic for a different model, while model names supplied by a
-// client must never grow process memory or produce unbounded first-error logs.
-var inference_private_failure_diagnostics = [_]private_error_diagnostics.Diagnostic{.{}} ** private_error_diagnostics.slots_count;
-
-fn shouldLogInferencePrivateFailure(count: u64) bool {
-    // Keep the first few failures for diagnosis, then retain logarithmic
-    // visibility without allowing a bad model to amplify logs per request.
-    return count <= 4 or std.math.isPowerOfTwo(count);
-}
-
 fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge.ProviderInvokeContext) callconv(.c) standalone_inference_bridge.Status {
     if (!standalone_inference_bridge.validContext(
         standalone_inference_bridge.ProviderInvokeContext,
@@ -357,55 +352,12 @@ fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge
     ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
-        // Stable errors retain their exact identity at the caller, which owns
-        // the request correlation and can log them once with table context.
-        // Only private inference-unit errors need an owner-side diagnostic
-        // before they are normalized to the stable provider failure.
-        if (standalone_inference_bridge.errorHasStableDetail(err))
-            return standalone_inference_bridge.statusFromError(err);
-        const provider_operation = std.enums.fromInt(
-            standalone_inference_bridge.ProviderOperation,
+        return @import("standalone/provider_failure.zig").status(
             context.operation,
-        );
-        const operation_slot: usize = if (context.operation > 0 and context.operation < inference_provider_operation_slots)
-            @intCast(context.operation)
-        else
-            0;
-        const diagnostic_fingerprint = private_error_diagnostics.fingerprint(
-            context.operation,
-            err,
             context.request_json.slice(),
+            context.has_deadline != 0,
+            err,
         );
-        if (private_error_diagnostics.note(
-            &inference_private_failure_diagnostics,
-            diagnostic_fingerprint,
-        )) |failure_count| {
-            if (shouldLogInferencePrivateFailure(failure_count)) {
-                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_fingerprint={x} observed_diagnostic_failures={d} err={}", .{
-                    if (provider_operation) |value| @tagName(value) else "unknown",
-                    context.request_json.len,
-                    context.has_deadline != 0,
-                    diagnostic_fingerprint,
-                    failure_count,
-                    err,
-                });
-            }
-        } else {
-            // Once the bounded fingerprint table is full, retain logarithmic
-            // aggregate visibility without allocating or logging once per new
-            // client-controlled model name.
-            const failure_count = inference_private_failure_counts[operation_slot].fetchAdd(1, .monotonic) +% 1;
-            if (shouldLogInferencePrivateFailure(failure_count)) {
-                std.log.err("standalone inference bridge failed operation=invoke_provider provider_operation={s} request_bytes={d} has_deadline={} diagnostic_table_saturated=true observed_overflow_failures={d} err={}", .{
-                    if (provider_operation) |value| @tagName(value) else "unknown",
-                    context.request_json.len,
-                    context.has_deadline != 0,
-                    failure_count,
-                    err,
-                });
-            }
-        }
-        return standalone_inference_bridge.statusFromErrorWithFallback(err, error.InferenceProviderFailure);
     };
     return .ok;
 }

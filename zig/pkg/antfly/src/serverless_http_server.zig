@@ -55,8 +55,37 @@ pub const ServerlessHttpServer = struct {
             .ptr = self,
             .vtable = &.{
                 .execute = execute,
+                .execute_stream = executeStream,
             },
         };
+    }
+
+    /// Preserve the one-request snapshot contract for in-process routed scans.
+    /// The serverless handler currently owns a bounded response buffer, but the
+    /// executor still exposes it through the streaming ABI so coordinators do
+    /// not split one logical scan into independently-versioned page requests.
+    fn executeStream(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: http_common.HttpRequest,
+        writer: http_common.StreamWriter,
+    ) !bool {
+        const self: *ServerlessHttpServer = @ptrCast(@alignCast(ptr));
+        var response = try self.handle(req);
+        defer response.deinit(self.alloc);
+        const headers = try alloc.alloc(http_common.RequestHeader, response.headers.len);
+        defer alloc.free(headers);
+        for (response.headers, headers) |source, *destination| {
+            destination.* = .{ .name = source.name, .value = source.value };
+        }
+        try writer.start(alloc, .{
+            .status = response.status,
+            .content_type = response.content_type,
+            .headers = headers,
+        });
+        try writer.writeAll(response.body);
+        try writer.flush();
+        return true;
     }
 
     pub fn handle(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -144,6 +173,65 @@ pub const ServerlessHttpServer = struct {
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *ServerlessHttpServer = @ptrCast(@alignCast(ptr));
         return try self.handle(req);
+    }
+};
+
+/// Caller-owned-I/O publication of an existing serverless protocol stack.
+/// This is useful both for embedded deployments and deterministic VOPR worlds:
+/// the handler and catalog remain owned by their production stack while every
+/// listener, connection, request task, timeout, and shutdown wake borrows the
+/// supplied `std.Io`.
+pub const HttpxRuntime = struct {
+    alloc: std.mem.Allocator,
+    server: *httpx.Server,
+    listener_task: *httpx.ListenerTask,
+    base_uri: []u8,
+
+    pub fn start(alloc: std.mem.Allocator, io: std.Io, target: *ServerlessHttpServer) !HttpxRuntime {
+        const server = try alloc.create(httpx.Server);
+        errdefer alloc.destroy(server);
+        server.* = httpx.Server.initWithConfig(alloc, io, .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .header_read_timeout_ms = 0,
+            .body_read_timeout_ms = 0,
+            .response_write_timeout_ms = 0,
+            .max_connections = 16,
+            .max_request_tasks = 16,
+            .borrow_http_runtime_io = true,
+            .h1_disconnect_cancellation = .disabled,
+        });
+        errdefer server.deinit();
+        server.global(httpx.Handler.bind(target, ServerlessHttpServer.handleHttpx));
+
+        const listener_task = try alloc.create(httpx.ListenerTask);
+        errdefer alloc.destroy(listener_task);
+        listener_task.* = httpx.ListenerTask.init(server);
+        try listener_task.start();
+        errdefer {
+            listener_task.requestStop();
+            listener_task.join() catch {};
+        }
+
+        const address = server.boundAddress() orelse return error.ListenerNotStarted;
+        const base_uri = try std.fmt.allocPrint(alloc, "http://{f}", .{address});
+        return .{
+            .alloc = alloc,
+            .server = server,
+            .listener_task = listener_task,
+            .base_uri = base_uri,
+        };
+    }
+
+    pub fn deinit(self: *HttpxRuntime) void {
+        self.listener_task.requestStop();
+        self.listener_task.join() catch |err|
+            std.debug.panic("serverless HTTP listener failed: {s}", .{@errorName(err)});
+        self.alloc.destroy(self.listener_task);
+        self.server.deinit();
+        self.alloc.destroy(self.server);
+        self.alloc.free(self.base_uri);
+        self.* = undefined;
     }
 };
 
@@ -253,6 +341,55 @@ test "serverless http server passes through handler responses" {
     try std.testing.expectEqual(@as(u16, 405), resp.status);
     try std.testing.expectEqual(serverless_http_routes.HttpMethod.delete, handler.last_method.?);
     try std.testing.expectEqualStrings("/tables/docs", handler.last_path.?);
+}
+
+test "serverless http executor exposes one-request streaming" {
+    const alloc = std.testing.allocator;
+    const FakeHandler = struct {
+        alloc: std.mem.Allocator,
+
+        fn handle(self: *@This(), _: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/x-ndjson"),
+                .body = try self.alloc.dupe(u8, "{\"_id\":\"a\"}\n"),
+            };
+        }
+    };
+    const Capture = struct {
+        alloc: std.mem.Allocator,
+        status: u16 = 0,
+        body: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn start(raw: *anyopaque, _: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.status = response.status;
+        }
+        fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.body.appendSlice(self.alloc, bytes);
+        }
+        fn flush(_: *anyopaque) anyerror!void {}
+        fn writer(self: *@This()) http_common.StreamWriter {
+            return .{ .ptr = self, .vtable = &.{
+                .start = start,
+                .write_all = writeAll,
+                .flush = flush,
+            } };
+        }
+    };
+
+    var handler = FakeHandler{ .alloc = alloc };
+    var server = ServerlessHttpServer.init(alloc, .{}, &handler);
+    var capture = Capture{ .alloc = alloc };
+    defer capture.body.deinit(alloc);
+    try std.testing.expect((try server.executor().executeStream(
+        alloc,
+        .{ .method = .GET, .uri = "/internal/v1/groups/1/tables/docs/documents" },
+        capture.writer(),
+    )).?);
+    try std.testing.expectEqual(@as(u16, 200), capture.status);
+    try std.testing.expectEqualStrings("{\"_id\":\"a\"}\n", capture.body.items);
 }
 
 test "native serverless adapter preserves route path and retry metadata" {

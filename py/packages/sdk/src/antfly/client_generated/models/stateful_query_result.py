@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.query_profile import QueryProfile
     from ..models.query_result_base_aggregations import QueryResultBaseAggregations
     from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+    from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
     from ..models.stateful_graph_query_results import StatefulGraphQueryResults
 
 
@@ -31,6 +32,7 @@ class StatefulQueryResult:
             names from the request.
             Contains computed metrics or buckets depending on the aggregation type.
         analyses (QueryResultBaseAnalyses | Unset): Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results (QueryResultBaseGraphMetricResults | Unset): Results from direct graph metric reads.
         profile (QueryProfile | Unset): Detailed execution profiling for a query. Present in the response
             when the request sets `profile: true`.
         error (str | Unset): Error message if the query failed.
@@ -44,6 +46,7 @@ class StatefulQueryResult:
     hits: QueryHits | Unset = UNSET
     aggregations: QueryResultBaseAggregations | Unset = UNSET
     analyses: QueryResultBaseAnalyses | Unset = UNSET
+    graph_metric_results: QueryResultBaseGraphMetricResults | Unset = UNSET
     profile: QueryProfile | Unset = UNSET
     error: str | Unset = UNSET
     table: str | Unset = UNSET
@@ -66,6 +69,10 @@ class StatefulQueryResult:
         analyses: dict[str, Any] | Unset = UNSET
         if not isinstance(self.analyses, Unset):
             analyses = self.analyses.to_dict()
+
+        graph_metric_results: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric_results, Unset):
+            graph_metric_results = self.graph_metric_results.to_dict()
 
         profile: dict[str, Any] | Unset = UNSET
         if not isinstance(self.profile, Unset):
@@ -93,6 +100,8 @@ class StatefulQueryResult:
             field_dict["aggregations"] = aggregations
         if analyses is not UNSET:
             field_dict["analyses"] = analyses
+        if graph_metric_results is not UNSET:
+            field_dict["graph_metric_results"] = graph_metric_results
         if profile is not UNSET:
             field_dict["profile"] = profile
         if error is not UNSET:
@@ -110,6 +119,7 @@ class StatefulQueryResult:
         from ..models.query_profile import QueryProfile
         from ..models.query_result_base_aggregations import QueryResultBaseAggregations
         from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+        from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
         from ..models.stateful_graph_query_results import StatefulGraphQueryResults
 
         d = dict(src_dict)
@@ -138,6 +148,13 @@ class StatefulQueryResult:
         else:
             analyses = QueryResultBaseAnalyses.from_dict(_analyses)
 
+        _graph_metric_results = d.pop("graph_metric_results", UNSET)
+        graph_metric_results: QueryResultBaseGraphMetricResults | Unset
+        if isinstance(_graph_metric_results, Unset):
+            graph_metric_results = UNSET
+        else:
+            graph_metric_results = QueryResultBaseGraphMetricResults.from_dict(_graph_metric_results)
+
         _profile = d.pop("profile", UNSET)
         profile: QueryProfile | Unset
         if isinstance(_profile, Unset):
@@ -162,6 +179,7 @@ class StatefulQueryResult:
             hits=hits,
             aggregations=aggregations,
             analyses=analyses,
+            graph_metric_results=graph_metric_results,
             profile=profile,
             error=error,
             table=table,

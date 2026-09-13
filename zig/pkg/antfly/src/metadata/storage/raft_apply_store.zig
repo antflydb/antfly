@@ -52,9 +52,13 @@ pub const CatalogCursor = struct {
     revision: u64,
 };
 
-fn catalogProjectionDeadline(deadline_ns: ?u64) !void {
+fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
     if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        const now_ns: u64 = if (deadline_io) |borrow| blk: {
+            var receiver = try borrow.receive();
+            break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+        } else platform_time.monotonicNs();
+        if (now_ns >= deadline) return error.CatalogRoutingSnapshotTimeout;
     }
 }
 
@@ -143,7 +147,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "2";
+const derived_catalog_index_version = "3";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -168,6 +172,8 @@ pub const TableTopologyMutation = union(enum) {
         },
     },
 };
+
+const RestoreJobWrite = struct { key: []const u8, value: []const u8 };
 
 pub const TransitionCommand = union(enum) {
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
@@ -252,10 +258,9 @@ pub const TransitionCommand = union(enum) {
     remove_shuffle_join_lease: struct {
         job_id: u64,
     },
-    upsert_restore_job: struct {
-        key: []const u8,
-        value: []const u8,
-    },
+    upsert_restore_job: RestoreJobWrite,
+    create_restore_job: RestoreJobWrite,
+    remove_restore_job_if_matches: struct { key: []const u8, value_hash: []const u8 },
     remove_restore_job: struct {
         key: []const u8,
     },
@@ -381,11 +386,15 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.required_extension_name);
                 alloc.free(record.package_name);
             },
-            .upsert_restore_job => |record| {
+            .upsert_restore_job, .create_restore_job => |record| {
                 alloc.free(record.key);
                 alloc.free(record.value);
             },
             .remove_restore_job => |record| alloc.free(record.key),
+            .remove_restore_job_if_matches => |record| {
+                alloc.free(record.key);
+                alloc.free(record.value_hash);
+            },
             .remove_restore_jobs => |record| {
                 for (record.keys) |key| alloc.free(key);
                 alloc.free(record.keys);
@@ -580,11 +589,15 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.receiver_group_id);
         },
         .upsert_shuffle_join_lease => |record| try group_ids.requireDataGroupId(record.owner_group_id),
-        .upsert_restore_job => |record| {
+        .upsert_restore_job, .create_restore_job => |record| {
             try validateRestoreJobLogicalKey(record.key);
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
         },
         .remove_restore_job => |record| try validateRestoreJobLogicalKey(record.key),
+        .remove_restore_job_if_matches => |record| {
+            try validateRestoreJobLogicalKey(record.key);
+            if (record.value_hash.len != 32) return error.InvalidRestoreJobRecord;
+        },
         .remove_restore_jobs => |record| {
             if (record.keys.len == 0 or record.keys.len > 4096) return error.InvalidRestoreJobRecord;
             for (record.keys) |key| try validateRestoreJobLogicalKey(key);
@@ -1535,6 +1548,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
         .store_id = 13,
         .node_id = 1,
         .reporter_incarnation = 0x1234,
+        .dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version,
     } });
     defer std.testing.allocator.free(activate_reporter_fence);
     const reporter_fence_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
@@ -1546,11 +1560,33 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
         .commit_index = 4,
         .entries_bytes = reporter_fence_entries,
     });
-    try std.testing.expectEqual(@as(u64, 2), (try source.captureCatalogCursor(group_id)).revision);
+    try std.testing.expectEqual(@as(u64, 4), (try source.captureCatalogCursor(group_id)).revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.previous_record_version,
+        runtime_status_protocol.current_record_version,
         try source.getRuntimeStatusProtocolActivationVersion(group_id),
     );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try source.getDenseNativeStorageProtocolActivationVersion(group_id),
+    );
+    const stale_legacy_store = try encodeTransitionCommand(std.testing.allocator, .{ .register_store = .{
+        .store_id = 14,
+        .node_id = 2,
+    } });
+    defer std.testing.allocator.free(stale_legacy_store);
+    const stale_legacy_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 5, .entry_type = .normal, .data = stale_legacy_store },
+    });
+    defer std.testing.allocator.free(stale_legacy_entries);
+    try source.snapshotBuilder().applyBatch(.{
+        .group_id = group_id,
+        .commit_index = 5,
+        .entries_bytes = stale_legacy_entries,
+    });
+    const activated_stores = try source.listStores(std.testing.allocator, group_id);
+    defer source.freeStores(std.testing.allocator, activated_stores);
+    try std.testing.expectEqual(@as(usize, 1), activated_stores.len);
+    try std.testing.expectEqual(@as(u64, 13), activated_stores[0].store_id);
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, group_id);
     defer std.testing.allocator.free(snapshot);
     source.deinit();
@@ -1560,22 +1596,30 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
     try std.testing.expectEqual(first, (try reopened.getMetadataIncarnation(group_id)).?);
     const reopened_cursor = try reopened.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, reopened_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 2), reopened_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 4), reopened_cursor.revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.previous_record_version,
+        runtime_status_protocol.current_record_version,
         try reopened.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try reopened.getDenseNativeStorageProtocolActivationVersion(group_id),
     );
 
     var target = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = target_root });
     defer target.deinit();
-    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 4, snapshot));
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(std.testing.allocator, group_id, 5, snapshot));
     try std.testing.expectEqual(first, (try target.getMetadataIncarnation(group_id)).?);
     const installed_cursor = try target.captureCatalogCursor(group_id);
     try std.testing.expectEqual(first, installed_cursor.metadata_incarnation.?);
-    try std.testing.expectEqual(@as(u64, 2), installed_cursor.revision);
+    try std.testing.expectEqual(@as(u64, 4), installed_cursor.revision);
     try std.testing.expectEqual(
-        runtime_status_protocol.previous_record_version,
+        runtime_status_protocol.current_record_version,
         try target.getRuntimeStatusProtocolActivationVersion(group_id),
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        try target.getDenseNativeStorageProtocolActivationVersion(group_id),
     );
 }
 
@@ -2032,6 +2076,9 @@ fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTra
 }
 
 pub const RaftApplyStore = struct {
+    // Counts visited index rows, including rows not ultimately deleted, so
+    // regressions can assert that completion work is bounded by one range.
+    restore_cleanup_rows_visited: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     alloc: std.mem.Allocator,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
@@ -2250,6 +2297,23 @@ pub const RaftApplyStore = struct {
         };
         defer self.alloc.free(encoded);
         return (try decodeMetadataIncarnationRecord(encoded)).runtime_status_record_version;
+    }
+
+    /// Returns the durable data-plane capability floor. Unlike an observed
+    /// store snapshot, this value is monotonic and is applied in the same Raft
+    /// transaction that closes admission to legacy table-serving stores.
+    pub fn getDenseNativeStorageProtocolActivationVersion(
+        self: *RaftApplyStore,
+        group_id: u64,
+    ) !u16 {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const encoded = self.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return (try decodeMetadataIncarnationRecord(encoded)).dense_native_storage_protocol_activated_version;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -2529,7 +2593,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.TableRecord {
-        return try self.listTablesTxnUntil(alloc, txn, group_id, null);
+        return try self.listTablesTxnUntil(alloc, txn, group_id, null, null);
     }
 
     fn listTablesTxnUntil(
@@ -2538,13 +2602,14 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
     ) ![]metadata.TableRecord {
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         const out = try alloc.alloc(metadata.TableRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -2554,11 +2619,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
-            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns, deadline_io);
             out[i] = try decodeTableRecord(alloc, kv.value);
             filled = i + 1;
         }
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return out;
     }
 
@@ -2570,9 +2635,17 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         deadline_ns: ?u64,
     ) !CatalogProjectionSnapshot {
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        return self.captureCatalogProjectionWithClock(alloc, group_id, deadline_ns, null);
+    }
+
+    pub fn captureCatalogProjectionWithClock(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
+    ) !CatalogProjectionSnapshot {
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
 
@@ -2598,16 +2671,12 @@ pub const RaftApplyStore = struct {
         else
             null;
 
-        const tables = try self.listTablesTxnUntil(alloc, &txn, group_id, deadline_ns);
+        const tables = try self.listTablesTxnUntil(alloc, &txn, group_id, deadline_ns, deadline_io);
         errdefer self.freeTables(alloc, tables);
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
-        const ranges = try self.listRangesTxnUntil(alloc, &txn, group_id, deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
+        const ranges = try self.listRangesTxnUntil(alloc, &txn, group_id, deadline_ns, deadline_io);
         errdefer self.freeRanges(alloc, ranges);
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return .{
             .metadata_incarnation = incarnation,
             .catalog_revision = catalog_revision,
@@ -3257,7 +3326,7 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
     ) ![]metadata.RangeRecord {
-        return try self.listRangesTxnUntil(alloc, txn, group_id, null);
+        return try self.listRangesTxnUntil(alloc, txn, group_id, null, null);
     }
 
     fn listRangesTxnUntil(
@@ -3266,13 +3335,14 @@ pub const RaftApplyStore = struct {
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         deadline_ns: ?u64,
+        deadline_io: ?@import("../../runtime_io_abi.zig").Borrow,
     ) ![]metadata.RangeRecord {
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         var prefix_buf: [128]u8 = undefined;
         const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
         const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
         defer freeKvs(alloc, kvs);
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         const out = try alloc.alloc(metadata.RangeRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -3280,11 +3350,11 @@ pub const RaftApplyStore = struct {
             alloc.free(out);
         }
         for (kvs, 0..) |kv, i| {
-            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns);
+            if (i % 64 == 0) try catalogProjectionDeadline(deadline_ns, deadline_io);
             out[i] = try decodeRangeRecord(alloc, kv.value);
             filled = i + 1;
         }
-        try catalogProjectionDeadline(deadline_ns);
+        try catalogProjectionDeadline(deadline_ns, deadline_io);
         return out;
     }
 
@@ -3670,6 +3740,19 @@ pub const RaftApplyStore = struct {
             txn,
             try activeRestoreRangeIndexPrefixForGroup(&active_restore_prefix_buf, group_id),
         );
+        var restore_progress_prefix_buf: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try restoreProgressRangeIndexPrefixForGroup(&restore_progress_prefix_buf, group_id));
+        const progress_rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try restoreProgressPrefixForGroup(&restore_progress_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, progress_rows);
+        for (progress_rows) |row| {
+            const record = try decodeRestoreProgressRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeRestoreProgress(self.alloc, record);
+            try putRestoreProgressRangeIndexTxn(txn, group_id, record);
+        }
 
         var table_prefix_buf: [128]u8 = undefined;
         const table_rows = try docstore.DocStore.scanPrefixTxn(
@@ -3930,7 +4013,10 @@ pub const RaftApplyStore = struct {
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
-            .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range) |
+            .complete_restore_range => metadataSnapshotProjectionBit(.range) |
+                metadataSnapshotProjectionBit(.restore_progress) |
+                metadataSnapshotProjectionBit(.catalog_revision),
+            .upsert_range, .remove_range => metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) |
                 metadataSnapshotProjectionBit(.range) |
@@ -3942,7 +4028,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
-            .upsert_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
@@ -4165,6 +4251,7 @@ pub const RaftApplyStore = struct {
             &rows,
             try derivedCatalogIndexVersionKey(&prefix_buf, group_id),
         );
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, try restoreProgressRangeIndexPrefixForGroup(&prefix_buf, group_id));
         return try rows.toOwnedSlice(alloc);
     }
 
@@ -4411,6 +4498,7 @@ pub const RaftApplyStore = struct {
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
                 defer metadata_table_manager.freeStore(self.alloc, applied);
+                if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
@@ -4430,6 +4518,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
+                if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 const value = try encodeStoreRecord(self.alloc, applied);
                 defer self.alloc.free(value);
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
@@ -4561,11 +4650,32 @@ pub const RaftApplyStore = struct {
             .upsert_restore_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                if (table_name == null) return;
+                // Admission and apply can straddle completion, replacement,
+                // or drop. Only the currently active restore owns this row.
+                var range_key_buf: [160]u8 = undefined;
+                const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                const range = try decodeRangeRecord(self.alloc, encoded_range);
+                defer metadata_table_manager.freeRange(self.alloc, range);
+                if (range.table_id != record.table_id or
+                    range.restore_backup_id.len == 0 or range.restore_location.len == 0 or
+                    !std.mem.eql(u8, record.backup_id, range.restore_backup_id) or
+                    !std.mem.eql(u8, record.artifact_backup_id, range.restore_artifact_backup_id) or
+                    !std.mem.eql(u8, record.location, range.restore_location) or
+                    !std.mem.eql(u8, record.snapshot_path, range.restore_snapshot_path) or
+                    !std.mem.eql(u8, record.artifact_sha256, range.restore_artifact_sha256) or
+                    record.native_manifest_size_bytes != range.restore_native_manifest_size_bytes or
+                    !std.mem.eql(u8, record.native_manifest_sha256, range.restore_native_manifest_sha256)) return;
                 var key_buf: [224]u8 = undefined;
                 const key = try restoreProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id, record.group_id);
                 const value = try encodeRestoreProgressRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
+                try putRestoreProgressRangeIndexTxn(txn, group_id, record);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_progress,
@@ -4579,12 +4689,29 @@ pub const RaftApplyStore = struct {
             .remove_restore_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                // Legacy data-node cleanup carries no restore incarnation.
+                // It may only retire orphaned progress; an active intent owns
+                // its observations until metadata atomically completes it.
+                var range_key_buf: [160]u8 = undefined;
+                const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (encoded_range) |encoded| {
+                    const range = try decodeRangeRecord(self.alloc, encoded);
+                    defer metadata_table_manager.freeRange(self.alloc, range);
+                    if (range.table_id == record.table_id and
+                        range.restore_backup_id.len != 0 and range.restore_location.len != 0) return;
+                }
                 var key_buf: [224]u8 = undefined;
                 const key = try restoreProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id, record.group_id);
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
                 };
+                var index_key_buf: [224]u8 = undefined;
+                try txn.delete(try restoreProgressRangeIndexKey(&index_key_buf, group_id, record.table_id, record.group_id, record.node_id));
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_progress,
@@ -4671,6 +4798,10 @@ pub const RaftApplyStore = struct {
 
                 const table_name = try self.lookupTableNameTxn(txn, group_id, current.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                // Retire observations in the same durable transaction that
+                // closes their owner. Data-node cleanup is not a prerequisite
+                // for completion, including when a reporting node goes away.
+                try self.retireRangeRestoreProgressTxn(txn, group_id, current, table_name);
                 try metadata_table_manager.clearOwnedRangeRestoreIntent(self.alloc, &current);
                 const value = try encodeRangeRecord(self.alloc, current);
                 defer self.alloc.free(value);
@@ -4790,15 +4921,36 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
-            .upsert_restore_job => |record| {
+            .upsert_restore_job, .create_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                if (command == .create_restore_job) {
+                    const existing = txn.get(key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (existing != null) return;
+                }
                 try txn.put(key, record.value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .restore_job,
                     .metadata_group_id = group_id,
                 });
+            },
+            .remove_restore_job_if_matches => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                const existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(existing, &digest, .{});
+                if (!std.mem.eql(u8, &digest, record.value_hash)) return;
+                try txn.delete(key);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
             .remove_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
@@ -5037,6 +5189,37 @@ pub const RaftApplyStore = struct {
             try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
         return try ids.toOwnedSlice(alloc);
+    }
+
+    fn retireRangeRestoreProgressTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range: metadata.RangeRecord,
+        table_name: ?[]const u8,
+    ) !void {
+        var prefix_buf: [224]u8 = undefined;
+        const prefix = try restoreProgressRangeIndexPrefix(&prefix_buf, metadata_group_id, range.table_id, range.group_id);
+        const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, prefix);
+        defer freeMetadataSnapshotRows(self.alloc, rows);
+        for (rows) |row| {
+            if (builtin.is_test) self.restore_cleanup_rows_visited += 1;
+            if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+            const node_id = std.mem.readInt(u64, row.value[0..8], .little);
+            var key_buf: [224]u8 = undefined;
+            const key = try restoreProgressKeyForGroup(&key_buf, metadata_group_id, range.table_id, node_id, range.group_id);
+            try txn.delete(key);
+            try txn.delete(row.key);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = key });
+            self.notifyProjectionListeners(.{
+                .kind = .restore_progress,
+                .metadata_group_id = metadata_group_id,
+                .table_name = table_name,
+                .table_id = range.table_id,
+                .node_id = node_id,
+                .group_id = range.group_id,
+            });
+        }
     }
 
     fn indexedRangeMembershipMatchesTxn(
@@ -6719,7 +6902,8 @@ fn replicationCutoverRetirementCleared(
 const transition_magic = "afmd1";
 const group_status_record_version: u16 = 4;
 const metadata_incarnation_extension_magic = "afmi1";
-const metadata_incarnation_extension_version: u16 = 1;
+const metadata_incarnation_extension_runtime_status_version: u16 = 1;
+const metadata_incarnation_extension_version: u16 = 2;
 // Store records predate framing and are read by mixed-version metadata
 // replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
 // self-identifying for current readers, but legacy readers do not ignore them;
@@ -6728,13 +6912,15 @@ const store_record_extension_magic = "afsx1";
 const store_record_extension_legacy_version: u16 = 1;
 const store_record_extension_reporter_version: u16 = 2;
 const store_record_extension_native_restore_version: u16 = 3;
-const store_record_extension_version: u16 = 4;
+const store_record_extension_artifact_sources_version: u16 = 4;
+const store_record_extension_version: u16 = 5;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
 const MetadataIncarnationRecord = struct {
     incarnation: metadata_incarnation.MetadataClusterIncarnation,
     runtime_status_record_version: u16 = 0,
+    dense_native_storage_protocol_activated_version: u16 = 0,
 };
 
 fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationRecord {
@@ -6746,8 +6932,8 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
     if (encoded.len == incarnation_len) return .{ .incarnation = incarnation };
 
-    const extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
-    if (encoded.len != incarnation_len + extension_len or
+    const minimum_extension_len = metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
+    if (encoded.len < incarnation_len + minimum_extension_len or
         !std.mem.eql(
             u8,
             encoded[incarnation_len..][0..metadata_incarnation_extension_magic.len],
@@ -6759,18 +6945,60 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     var pos: usize = incarnation_len + metadata_incarnation_extension_magic.len;
     const extension_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
     pos += @sizeOf(u16);
-    if (extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    if (extension_version != metadata_incarnation_extension_runtime_status_version and
+        extension_version != metadata_incarnation_extension_version) return error.InvalidMetadataIncarnation;
+    const trailing_len: usize = if (extension_version >= metadata_incarnation_extension_version)
+        @sizeOf(u16)
+    else
+        0;
+    const expected_len = incarnation_len + minimum_extension_len + trailing_len;
+    if (encoded.len != expected_len) return error.InvalidMetadataIncarnation;
     const runtime_status_record_version = std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little);
-    if (!runtime_status_protocol.profileSatisfies(
-        runtime_status_record_version,
-        runtime_status_protocol.previous_record_version,
-    )) {
+    pos += @sizeOf(u16);
+    if (runtime_status_record_version != 0 and
+        !runtime_status_protocol.isSupported(runtime_status_record_version))
+    {
         return error.InvalidMetadataIncarnation;
     }
+    const dense_native_storage_protocol_activated_version = if (extension_version >= metadata_incarnation_extension_version)
+        std.mem.readInt(u16, encoded[pos..][0..@sizeOf(u16)], .little)
+    else
+        0;
+    if (dense_native_storage_protocol_activated_version >
+        metadata_table_manager.dense_native_storage_protocol_version) return error.InvalidMetadataIncarnation;
     return .{
         .incarnation = incarnation,
         .runtime_status_record_version = runtime_status_record_version,
+        .dense_native_storage_protocol_activated_version = dense_native_storage_protocol_activated_version,
     };
+}
+
+fn writeMetadataIncarnationRecordTxn(
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    record: MetadataIncarnationRecord,
+) !void {
+    var key_buf: [160]u8 = undefined;
+    const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
+    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len +
+        @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16);
+    var encoded: [encoded_len]u8 = undefined;
+    @memcpy(encoded[0..incarnation_len], &record.incarnation);
+    var pos: usize = incarnation_len;
+    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
+    pos += metadata_incarnation_extension_magic.len;
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], record.runtime_status_record_version, .little);
+    pos += @sizeOf(u16);
+    std.mem.writeInt(
+        u16,
+        encoded[pos..][0..@sizeOf(u16)],
+        record.dense_native_storage_protocol_activated_version,
+        .little,
+    );
+    try txn.put(key, &encoded);
 }
 
 test "metadata incarnation rejects unsupported runtime status activation profiles" {
@@ -6778,7 +7006,7 @@ test "metadata incarnation rejects unsupported runtime status activation profile
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
     const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
 
-    inline for ([_]u16{ 13, 14, 17 }) |unsupported_version| {
+    inline for ([_]u16{ 13, 14, 18 }) |unsupported_version| {
         var encoded: [encoded_len]u8 = undefined;
         @memcpy(encoded[0..incarnation_len], &incarnation);
         var pos: usize = incarnation_len;
@@ -6809,32 +7037,112 @@ fn activateRuntimeStatusProtocolTxn(
         error.NotFound => return,
         else => return err,
     };
-    const decoded = try decodeMetadataIncarnationRecord(existing);
-    if (!runtime_status_protocol.profileSatisfies(
-        target_version,
-        runtime_status_protocol.previous_record_version,
-    ))
+    var decoded = try decodeMetadataIncarnationRecord(existing);
+    if (!runtime_status_protocol.isSupported(target_version))
         return error.InvalidMetadataTransitionEncoding;
-    if (decoded.runtime_status_record_version != 0 and
-        runtime_status_protocol.profileSatisfies(
-            decoded.runtime_status_record_version,
-            target_version,
-        )) return;
+    if (decoded.runtime_status_record_version == target_version or
+        runtime_status_protocol.profileSatisfies(decoded.runtime_status_record_version, target_version)) return;
 
-    const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
-    const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len + @sizeOf(u16) + @sizeOf(u16);
-    var encoded: [encoded_len]u8 = undefined;
-    @memcpy(encoded[0..incarnation_len], &decoded.incarnation);
-    var pos: usize = incarnation_len;
-    @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
-    pos += metadata_incarnation_extension_magic.len;
-    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], metadata_incarnation_extension_version, .little);
-    pos += @sizeOf(u16);
-    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], target_version, .little);
-    try txn.put(key, &encoded);
+    decoded.runtime_status_record_version = target_version;
+    try writeMetadataIncarnationRecordTxn(txn, group_id, decoded);
+}
+
+/// Atomically admits a store against the durable dense-native capability
+/// floor and activates that floor when `incoming` completes a fully capable
+/// table-serving set. Returning false makes a stale, already-committed legacy
+/// registration a deterministic no-op instead of reopening an unsafe rollout
+/// window between service-side validation and Raft application.
+fn admitDenseNativeStoreTxn(
+    self: *RaftApplyStore,
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    incoming: metadata.StoreRecord,
+) !bool {
+    var incarnation_key_buf: [160]u8 = undefined;
+    const incarnation_key = try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id);
+    const encoded_incarnation = txn.get(incarnation_key) catch |err| switch (err) {
+        // Preserve direct state-machine test/embedding behavior before cluster
+        // initialization. Production registration initializes this first.
+        error.NotFound => return true,
+        else => return err,
+    };
+    var incarnation_record = try decodeMetadataIncarnationRecord(encoded_incarnation);
+    const incoming_serves_tables = metadata_table_manager.storeServesTableData(incoming.role);
+    const incoming_capable = metadata_table_manager.denseNativeStorageProtocolSupported(
+        incoming.reporter_incarnation,
+        incoming.dense_native_storage_protocol_version,
+    );
+    if (incarnation_record.dense_native_storage_protocol_activated_version >=
+        metadata_table_manager.dense_native_storage_protocol_version)
+    {
+        return !incoming_serves_tables or incoming_capable;
+    }
+    if (!incoming_serves_tables or !incoming_capable) return true;
+
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = try storePrefixForGroup(&prefix_buf, group_id);
+    var cur = try txn.openCursor();
+    defer cur.close();
+    var entry = try cur.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cur.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const store = try decodeStoreRecord(self.alloc, kv.value);
+        defer metadata_table_manager.freeStore(self.alloc, store);
+        if (store.store_id == incoming.store_id or
+            !metadata_table_manager.storeServesTableData(store.role)) continue;
+        if (!metadata_table_manager.denseNativeStorageProtocolSupported(
+            store.reporter_incarnation,
+            store.dense_native_storage_protocol_version,
+        )) return true;
+    }
+
+    incarnation_record.dense_native_storage_protocol_activated_version =
+        metadata_table_manager.dense_native_storage_protocol_version;
+    try writeMetadataIncarnationRecordTxn(txn, group_id, incarnation_record);
+    // Activation changes placement admissibility and must advance the durable
+    // catalog revision. The paired store update is otherwise status-only and
+    // deliberately does not invalidate catalog projections.
+    self.notifyProjectionListeners(.{
+        .kind = .metadata_incarnation,
+        .metadata_group_id = group_id,
+    });
+    return true;
+}
+
+fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.repair_status != null) return true;
+        }
+    }
+    return false;
+}
+
+fn storeHasVectorProjectionStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.dense_vector_projection_pending) return true;
+        }
+    }
+    return false;
+}
+
+fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.dense_native_storage_phase != .legacy) return true;
+        }
+    }
+    return false;
 }
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
+    if (record.dense_native_storage_protocol_version != 0 or
+        storeHasDenseNativeStorageStatus(record) or
+        storeHasVectorProjectionStatus(record))
+    {
+        return runtime_status_protocol.current_record_version;
+    }
     for (record.runtime_statuses) |status| {
         if (metadata_table_manager.runtimeEnrichmentHasInferenceDiagnostics(status.enrichment))
             return runtime_status_protocol.inference_diagnostics_record_version;
@@ -6895,6 +7203,8 @@ const TransitionTag = enum(u8) {
     complete_replication_source_retirement = 49,
     apply_table_topology = 50,
     apply_extension_lifecycle_v2 = 51,
+    create_restore_job = 52,
+    remove_restore_job_if_matches = 53,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -7167,10 +7477,15 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle_v2));
             try appendJsonRecord(alloc, &out, delta);
         },
-        .upsert_restore_job => |record| {
-            try out.append(alloc, @intFromEnum(TransitionTag.upsert_restore_job));
+        .upsert_restore_job, .create_restore_job => |record| {
+            try out.append(alloc, @intFromEnum(if (command == .create_restore_job) TransitionTag.create_restore_job else TransitionTag.upsert_restore_job));
             try appendRequiredString(alloc, &out, record.key);
             try appendRequiredString(alloc, &out, record.value);
+        },
+        .remove_restore_job_if_matches => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job_if_matches));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.value_hash);
         },
         .remove_restore_job => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
@@ -7514,11 +7829,25 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_extension_lifecycle_v2 => .{
             .apply_extension_lifecycle_v2 = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
         },
+        .create_restore_job => .{
+            .create_restore_job = .{
+                .key = try readRequiredString(alloc, encoded, &pos),
+                .value = try readRequiredString(alloc, encoded, &pos),
+            },
+        },
         .upsert_restore_job => .{
             .upsert_restore_job = .{
                 .key = try readRequiredString(alloc, encoded, &pos),
                 .value = try readRequiredString(alloc, encoded, &pos),
             },
+        },
+        .remove_restore_job_if_matches => blk: {
+            const key = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(key);
+            const value_hash = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(value_hash);
+            if (value_hash.len != 32 or pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = value_hash } };
         },
         .remove_restore_job => .{
             .remove_restore_job = .{ .key = try readRequiredString(alloc, encoded, &pos) },
@@ -7807,6 +8136,10 @@ fn appendStoreRecordExtensions(
         record.reporter_incarnation,
         record.artifact_sources_protocol_version,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        record.reporter_incarnation,
+        record.dense_native_storage_protocol_version,
+    )) return error.InvalidStoreReporterFence;
     var observation_count: u32 = 0;
     for (record.group_statuses) |status| {
         if (status.observed_reallocation_request_id != 0) observation_count += 1;
@@ -7814,11 +8147,15 @@ fn appendStoreRecordExtensions(
     const has_reporter_fence = record.reporter_incarnation != 0 or record.status_generation != 0;
     const has_artifact_protocol = record.artifact_sources_protocol_version != 0;
     const has_native_restore_capability = record.native_generation_restore_version != 0;
-    if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and !has_native_restore_capability) return;
+    const has_dense_native_protocol = record.dense_native_storage_protocol_version != 0;
+    if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and
+        !has_native_restore_capability and !has_dense_native_protocol) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_artifact_protocol)
+    const version: u16 = if (has_dense_native_protocol)
         store_record_extension_version
+    else if (has_artifact_protocol)
+        store_record_extension_artifact_sources_version
     else if (has_native_restore_capability)
         store_record_extension_native_restore_version
     else if (has_reporter_fence)
@@ -7833,8 +8170,10 @@ fn appendStoreRecordExtensions(
     if (version >= store_record_extension_native_restore_version) {
         try appendInt(alloc, out, u16, record.native_generation_restore_version);
     }
-    if (version >= store_record_extension_version)
+    if (version >= store_record_extension_artifact_sources_version)
         try appendInt(alloc, out, u16, record.artifact_sources_protocol_version);
+    if (version >= store_record_extension_version)
+        try appendInt(alloc, out, u16, record.dense_native_storage_protocol_version);
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -7918,6 +8257,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .status_generation = extensions.status_generation,
         .artifact_sources_protocol_version = extensions.artifact_sources_protocol_version,
         .native_generation_restore_version = extensions.native_generation_restore_version,
+        .dense_native_storage_protocol_version = extensions.dense_native_storage_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -7941,7 +8281,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0 } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -7958,6 +8298,7 @@ fn readStoreRecordExtensions(
     if (version != store_record_extension_legacy_version and
         version != store_record_extension_reporter_version and
         version != store_record_extension_native_restore_version and
+        version != store_record_extension_artifact_sources_version and
         version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
@@ -7972,13 +8313,21 @@ fn readStoreRecordExtensions(
         try readInt(encoded, pos, u16)
     else
         0;
-    const artifact_sources_protocol_version = if (version >= store_record_extension_version)
+    const artifact_sources_protocol_version = if (version >= store_record_extension_artifact_sources_version)
+        try readInt(encoded, pos, u16)
+    else
+        0;
+    const dense_native_storage_protocol_version = if (version >= store_record_extension_version)
         try readInt(encoded, pos, u16)
     else
         0;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         reporter_incarnation,
         artifact_sources_protocol_version,
+    )) return error.InvalidMetadataTransitionEncoding;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        reporter_incarnation,
+        dense_native_storage_protocol_version,
     )) return error.InvalidMetadataTransitionEncoding;
     const observation_count = try readInt(encoded, pos, u32);
     var observation_index: u32 = 0;
@@ -7996,6 +8345,7 @@ fn readStoreRecordExtensions(
         .status_generation = status_generation,
         .artifact_sources_protocol_version = artifact_sources_protocol_version,
         .native_generation_restore_version = native_generation_restore_version,
+        .dense_native_storage_protocol_version = dense_native_storage_protocol_version,
     };
 }
 
@@ -8019,7 +8369,10 @@ fn appendRuntimeGroupStatusRecord(
     try appendInt(alloc, out, u64, record.topology_generation);
     try appendInt(alloc, out, u64, record.lsm_root_generation);
     try appendInt(alloc, out, u64, record.status_generation);
-    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) {
+    if (runtime_status_protocol.profileSatisfies(
+        version,
+        runtime_status_protocol.positional_record_version,
+    )) {
         try appendInt(alloc, out, u64, record.target_observation_revision);
         try out.append(alloc, if (record.target_observation_complete) 1 else 0);
     }
@@ -8039,6 +8392,29 @@ fn appendRuntimeGroupStatusRecord(
     for (record.indexes) |index| try appendRuntimeIndexStatusRecord(alloc, out, index, version);
 }
 
+fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
+    var version = runtime_status_protocol.legacy_record_version;
+    for (record.indexes) |index| {
+        for (index.source_replay) |source| {
+            if (source.failed) {
+                version = @max(version, runtime_status_protocol.artifact_source_failure_status_record_version);
+            }
+        }
+        if (index.source_replay.len != 0) {
+            version = @max(version, runtime_status_protocol.artifact_source_status_record_version);
+        }
+        if (index.repair_status != null) {
+            version = @max(version, runtime_status_protocol.repair_status_record_version);
+        }
+        if (index.dense_vector_projection_pending) {
+            version = @max(version, runtime_status_protocol.vector_projection_record_version);
+        }
+        if (index.dense_native_storage_phase != .legacy) {
+            version = @max(version, runtime_status_protocol.dense_native_storage_record_version);
+        }
+    }
+    return version;
+}
 fn appendRuntimeEnrichmentStatusRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -8250,11 +8626,15 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
     const topology_generation = try readInt(encoded, pos, u64);
     const lsm_root_generation = try readInt(encoded, pos, u64);
     const status_generation = try readInt(encoded, pos, u64);
-    const target_observation_revision = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
+    const has_positional_profile = runtime_status_protocol.profileSatisfies(
+        version,
+        runtime_status_protocol.positional_record_version,
+    );
+    const target_observation_revision = if (has_positional_profile)
         try readInt(encoded, pos, u64)
     else
         0;
-    const target_observation_complete = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const target_observation_complete = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*] != 0;
         pos.* += 1;
@@ -8447,9 +8827,26 @@ fn appendRuntimeIndexStatusRecord(
     record: metadata.RuntimeIndexStatusReport,
     version: u16,
 ) !void {
-    // Production writers emit only released, negotiable profiles.
     if (!runtime_status_protocol.isNegotiable(version))
         return error.InvalidMetadataTransitionEncoding;
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(alloc);
+        try appendRuntimeIndexStatusRecordBody(alloc, &payload, record, version);
+        try appendInt(alloc, out, u32, std.math.cast(u32, payload.items.len) orelse
+            return error.MetadataTransitionEncodingTooLarge);
+        try out.appendSlice(alloc, payload.items);
+        return;
+    }
+    try appendRuntimeIndexStatusRecordBody(alloc, out, record, version);
+}
+
+fn appendRuntimeIndexStatusRecordBody(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: metadata.RuntimeIndexStatusReport,
+    version: u16,
+) !void {
     try appendRequiredString(alloc, out, record.name);
     try appendRequiredString(alloc, out, record.kind);
     try appendInt(alloc, out, u64, record.doc_count);
@@ -8457,20 +8854,25 @@ fn appendRuntimeIndexStatusRecord(
     try appendInt(alloc, out, u64, record.edge_count);
     try appendInt(alloc, out, u64, record.node_count);
     try appendInt(alloc, out, u64, record.root_node);
-    try appendInt(alloc, out, u64, record.coverage_produced_count);
-    try appendInt(alloc, out, u64, record.coverage_skipped_count);
-    try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
-    try appendInt(alloc, out, u64, record.coverage_generation);
-    try appendInt(alloc, out, u64, record.coverage_config_hash);
-    try out.append(alloc, if (record.coverage_identity_ready) 1 else 0);
-    try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
+    if (version >= 5) {
+        try appendInt(alloc, out, u64, record.coverage_produced_count);
+        try appendInt(alloc, out, u64, record.coverage_skipped_count);
+        try appendInt(alloc, out, u64, record.coverage_terminal_failed_count);
+    }
+    if (version >= 7) try appendInt(alloc, out, u64, record.coverage_generation);
+    if (version >= 6) try appendInt(alloc, out, u64, record.coverage_config_hash);
+    if (version >= 7) try out.append(alloc, if (record.coverage_identity_ready) 1 else 0);
+    if (version >= 6) try out.append(alloc, if (record.coverage_summary_ready) 1 else 0);
     try out.append(alloc, if (record.backfill_active) 1 else 0);
     try appendInt(alloc, out, u16, record.backfill_progress_millis);
     try appendInt(alloc, out, u64, record.replay_applied_sequence);
     try appendInt(alloc, out, u64, record.replay_target_sequence);
     try out.append(alloc, if (record.replay_catch_up_required) 1 else 0);
-    try appendOptionalString(alloc, out, record.load_error);
-    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) {
+    if (version >= 11) try appendOptionalString(alloc, out, record.load_error);
+    if (runtime_status_protocol.profileSatisfies(
+        version,
+        runtime_status_protocol.positional_record_version,
+    )) {
         // V15 is one atomic profile: safety-critical repair state and
         // publication target, and per-source replay state must never be
         // projected independently.
@@ -8493,6 +8895,22 @@ fn appendRuntimeIndexStatusRecord(
             try out.append(alloc, if (source.failed) 1 else 0);
         }
     }
+    if (version >= runtime_status_protocol.vector_projection_record_version) {
+        try out.append(alloc, if (record.dense_vector_projection_pending) 1 else 0);
+    }
+    if (version >= runtime_status_protocol.dense_native_storage_record_version) {
+        try out.append(alloc, @intFromEnum(record.dense_native_storage_phase));
+    }
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        // Optional field 1: graph counts are physical upper bounds while
+        // ownership retirement is pending. Old readers skip the extension.
+        try appendInt(alloc, out, u32, if (record.graph_counts_pending) 7 else 0);
+        if (record.graph_counts_pending) {
+            try appendInt(alloc, out, u16, 1);
+            try appendInt(alloc, out, u32, 1);
+            try out.append(alloc, 1);
+        }
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -8503,6 +8921,29 @@ fn readRuntimeIndexStatusRecord(
 ) !metadata.RuntimeIndexStatusReport {
     if (!runtime_status_protocol.isSupported(version))
         return error.InvalidMetadataTransitionEncoding;
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        const record_len = try readInt(encoded, pos, u32);
+        const end = std.math.add(usize, pos.*, record_len) catch
+            return error.InvalidMetadataTransitionEncoding;
+        if (end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        var body_pos = pos.*;
+        const record = try readRuntimeIndexStatusRecordBody(alloc, encoded[0..end], &body_pos, version);
+        if (body_pos != end) {
+            metadata_table_manager.freeRuntimeIndexStatusReport(alloc, record);
+            return error.InvalidMetadataTransitionEncoding;
+        }
+        pos.* = end;
+        return record;
+    }
+    return try readRuntimeIndexStatusRecordBody(alloc, encoded, pos, version);
+}
+
+fn readRuntimeIndexStatusRecordBody(
+    alloc: std.mem.Allocator,
+    encoded: []const u8,
+    pos: *usize,
+    version: u16,
+) !metadata.RuntimeIndexStatusReport {
     const name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(name);
     const kind = try readRequiredString(alloc, encoded, pos);
@@ -8533,25 +8974,29 @@ fn readRuntimeIndexStatusRecord(
     pos.* += 1;
     const load_error = try readOptionalString(alloc, encoded, pos);
     errdefer if (load_error) |value| alloc.free(value);
-    const publication_target_count = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
+    const has_positional_profile = runtime_status_protocol.profileSatisfies(
+        version,
+        runtime_status_protocol.positional_record_version,
+    );
+    const publication_target_count = if (has_positional_profile)
         try readInt(encoded, pos, u64)
     else
         0;
-    const publication_target_ready = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const publication_target_ready = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const serving_snapshot_ready = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const serving_snapshot_ready = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const lifecycle_work_class: metadata.IndexLifecycleWorkClass = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const lifecycle_work_class: metadata.IndexLifecycleWorkClass = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -8562,7 +9007,7 @@ fn readRuntimeIndexStatusRecord(
             else => return error.InvalidMetadataTransitionEncoding,
         };
     } else .none;
-    const repair_status: ?metadata.IndexRepairStatus = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const repair_status: ?metadata.IndexRepairStatus = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const tag = encoded[pos.*];
         pos.* += 1;
@@ -8577,14 +9022,14 @@ fn readRuntimeIndexStatusRecord(
     } else null;
     if ((repair_status != null) != (lifecycle_work_class == .repair))
         return error.InvalidMetadataTransitionEncoding;
-    const repair_active_generation_serviceable = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+    const repair_active_generation_serviceable = if (has_positional_profile) blk: {
         if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
         const value = encoded[pos.*];
         pos.* += 1;
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
-    const source_replay_count = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version))
+    const source_replay_count = if (has_positional_profile)
         try readInt(encoded, pos, u16)
     else
         0;
@@ -8599,7 +9044,7 @@ fn readRuntimeIndexStatusRecord(
         errdefer alloc.free(artifact_name);
         const published_sequence = try readInt(encoded, pos, u64);
         const target_sequence = try readInt(encoded, pos, u64);
-        const failed = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.previous_record_version)) blk: {
+        const failed = if (has_positional_profile) blk: {
             if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
             const value = encoded[pos.*];
             pos.* += 1;
@@ -8613,6 +9058,43 @@ fn readRuntimeIndexStatusRecord(
             .failed = failed,
         };
     }
+    const dense_vector_projection_pending = if (version >= runtime_status_protocol.vector_projection_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        if (value > 1) return error.InvalidMetadataTransitionEncoding;
+        break :blk value == 1;
+    } else false;
+    const dense_native_storage_phase: metadata.DenseNativeStoragePhase = if (version >= runtime_status_protocol.dense_native_storage_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        break :blk std.enums.fromInt(metadata.DenseNativeStoragePhase, value) orelse
+            return error.InvalidMetadataTransitionEncoding;
+    } else .legacy;
+    var graph_counts_pending = false;
+    if (version >= runtime_status_protocol.framed_index_status_record_version) {
+        const extensions_len = try readInt(encoded, pos, u32);
+        const extensions_end = std.math.add(usize, pos.*, extensions_len) catch
+            return error.InvalidMetadataTransitionEncoding;
+        if (extensions_end > encoded.len) return error.InvalidMetadataTransitionEncoding;
+        var seen = std.AutoHashMapUnmanaged(u16, void).empty;
+        defer seen.deinit(alloc);
+        while (pos.* < extensions_end) {
+            const field_id = try readInt(encoded[0..extensions_end], pos, u16);
+            const field_len = try readInt(encoded[0..extensions_end], pos, u32);
+            const field_end = std.math.add(usize, pos.*, field_len) catch
+                return error.InvalidMetadataTransitionEncoding;
+            if (field_id == 0 or field_end > extensions_end or seen.contains(field_id))
+                return error.InvalidMetadataTransitionEncoding;
+            try seen.put(alloc, field_id, {});
+            if (field_id == 1) {
+                if (field_len != 1 or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+                graph_counts_pending = encoded[pos.*] == 1;
+            }
+            pos.* = field_end;
+        }
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -8620,6 +9102,7 @@ fn readRuntimeIndexStatusRecord(
         .doc_count = doc_count,
         .term_count = term_count,
         .edge_count = edge_count,
+        .graph_counts_pending = graph_counts_pending,
         .node_count = node_count,
         .root_node = root_node,
         .publication_target_count = publication_target_count,
@@ -8637,6 +9120,8 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .dense_vector_projection_pending = dense_vector_projection_pending,
+        .dense_native_storage_phase = dense_native_storage_phase,
         .embedding_activity = .{},
         .source_replay = source_replay,
         .lifecycle_work_class = lifecycle_work_class,
@@ -10308,6 +10793,27 @@ pub fn restoreProgressPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_restore_progress:{d}:", .{group_id});
 }
 
+fn restoreProgressRangeIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_progress_by_range:{d}:", .{group_id});
+}
+
+fn restoreProgressRangeIndexPrefix(buf: []u8, group_id: u64, table_id: u64, range_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:restore_progress_by_range:{d}:{d}:{d}:", .{ group_id, table_id, range_id });
+}
+
+fn restoreProgressRangeIndexKey(buf: []u8, group_id: u64, table_id: u64, range_id: u64, node_id: u64) ![]const u8 {
+    const prefix = try restoreProgressRangeIndexPrefix(buf, group_id, table_id, range_id);
+    const suffix = try std.fmt.bufPrint(buf[prefix.len..], "{d}", .{node_id});
+    return buf[0 .. prefix.len + suffix.len];
+}
+
+fn putRestoreProgressRangeIndexTxn(txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.RestoreProgressRecord) !void {
+    var key_buf: [224]u8 = undefined;
+    var value: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value, record.node_id, .little);
+    try txn.put(try restoreProgressRangeIndexKey(&key_buf, group_id, record.table_id, record.group_id, record.node_id), &value);
+}
+
 pub fn replicationSourceStatusPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_replication_source_status:{d}:", .{group_id});
 }
@@ -11263,6 +11769,20 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
             platform_time.monotonicNs() -| 1,
         ),
     );
+
+    // Projection scans must retain the caller's clock across every page.
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    const clock = @import("../../runtime_io_abi.zig").Borrow.init(&vopr_io.io());
+    const deadline = 8 * std.time.ns_per_s;
+    {
+        const snapshot = try store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock);
+        defer store.freeTables(std.testing.allocator, snapshot.tables);
+        defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+        try std.testing.expectEqual(@as(u64, 4), snapshot.catalog_revision);
+    }
+    vopr_io.monotonic_ns = deadline;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureCatalogProjectionWithClock(std.testing.allocator, 41, deadline, clock));
 
     const io = store.io_impl.io();
     store.apply_mutex.lockUncancelable(io);
@@ -12889,7 +13409,11 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     );
 
     var dispatch = Dispatch{ .store = &store };
-    var dispatch_thread = try std.Thread.spawn(.{}, Dispatch.run, .{&dispatch});
+    var dispatch_thread = try std.testing.io.concurrent(Dispatch.run, .{&dispatch});
+    defer {
+        owned.release.set(std.Options.debug_io);
+        dispatch_thread.await(std.testing.io);
+    }
     owned.entered.waitUncancelable(std.Options.debug_io);
 
     var detach = Detach{ .store = &store, .registration = registration };
@@ -12902,7 +13426,12 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
         .contended = &detach_lock_contended,
     };
     defer test_lifecycle_detach_lock_barrier = null;
-    var detach_thread = try std.Thread.spawn(.{}, Detach.run, .{&detach});
+    var detach_thread = try std.testing.io.concurrent(Detach.run, .{&detach});
+    defer {
+        detach_lock_resume.set(std.Options.debug_io);
+        owned.release.set(std.Options.debug_io);
+        detach_thread.await(std.testing.io);
+    }
     detach.started.waitUncancelable(std.Options.debug_io);
     detach_lock_entered.waitUncancelable(std.Options.debug_io);
     // The detach call reached the exact apply-lock boundary while the callback
@@ -12912,8 +13441,8 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     const apply_lock_was_contended = detach_lock_contended.load(.acquire);
     detach_lock_resume.set(std.Options.debug_io);
     owned.release.set(std.Options.debug_io);
-    dispatch_thread.join();
-    detach_thread.join();
+    dispatch_thread.await(std.testing.io);
+    detach_thread.await(std.testing.io);
     try std.testing.expect(blocked_at_lock_boundary);
     try std.testing.expect(apply_lock_was_contended);
     try std.testing.expect(detach.removed);
@@ -13941,12 +14470,222 @@ test "metadata raft apply store projects shuffle join lease records from committ
     }
 }
 
+test "metadata raft apply store restore completion retires progress and rejects delayed incarnation reports" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-progress-retirement", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const original: metadata.RangeRecord = .{
+        .table_id = 41,
+        .group_id = 4101,
+        .start_key = "",
+        .end_key = null,
+        .restore_backup_id = "old",
+        .restore_artifact_backup_id = "old",
+        .restore_location = "file:///backups",
+        .restore_snapshot_path = "old/4101",
+        .restore_connection = "backups",
+        .restore_artifact_size_bytes = 1,
+        .restore_artifact_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    var replacement = original;
+    replacement.restore_backup_id = "new";
+    replacement.restore_artifact_backup_id = "new";
+    replacement.restore_snapshot_path = "new/4101";
+    const old_progress: metadata.RestoreProgressRecord = .{
+        .table_id = 41,
+        .node_id = 7,
+        .group_id = 4101,
+        .backup_id = "old",
+        .artifact_backup_id = "old",
+        .location = "file:///backups",
+        .snapshot_path = "old/4101",
+        .artifact_sha256 = original.restore_artifact_sha256,
+        .primary_restored = true,
+        .runtime_repair_complete = true,
+    };
+    var new_progress = old_progress;
+    new_progress.backup_id = "new";
+    new_progress.artifact_backup_id = "new";
+    new_progress.snapshot_path = "new/4101";
+    var sibling = original;
+    sibling.group_id = 4102;
+    sibling.restore_snapshot_path = "old/4102";
+    var sibling_progress = old_progress;
+    sibling_progress.group_id = sibling.group_id;
+    sibling_progress.snapshot_path = sibling.restore_snapshot_path;
+    const cases = [_]struct { command: TransitionCommand, count: usize }{
+        .{ .command = .{ .upsert_table = .{ .table_id = 41, .name = "docs" } }, .count = 0 },
+        .{ .command = .{ .upsert_range = original }, .count = 0 },
+        .{ .command = .{ .upsert_range = sibling }, .count = 0 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = sibling_progress }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(original) }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 1 },
+        .{ .command = .{ .upsert_range = replacement }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = new_progress }, .count = 2 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 2 },
+        .{ .command = .{ .remove_restore_progress = .{ .table_id = 41, .node_id = 7, .group_id = 4101 } }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(original) }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(replacement) }, .count = 1 },
+    };
+    for (cases, 1..) |case, index| {
+        const command = try encodeTransitionCommand(alloc, case.command);
+        defer alloc.free(command);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = command },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 41, .commit_index = index, .entries_bytes = entries });
+        const progress = try store.listRestoreProgress(alloc, 41);
+        defer store.freeRestoreProgress(alloc, progress);
+        try std.testing.expectEqual(case.count, progress.len);
+        for (progress) |record| {
+            if (record.group_id == sibling.group_id) try std.testing.expectEqualStrings("old", record.backup_id);
+            if (index >= 9 and record.group_id == original.group_id) try std.testing.expectEqualStrings("new", record.backup_id);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), store.restore_cleanup_rows_visited);
+}
+
+test "metadata raft apply store restore cleanup rebuilds legacy indexes and visits only the completed range" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-range-index", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    var committed = false;
+    defer if (!committed) txn.abort();
+    // A pre-upgrade store has primary progress and the old index version.
+    for (0..100) |range_id| {
+        for (1..4) |node_id| {
+            const record: metadata.RestoreProgressRecord = .{
+                .table_id = 41,
+                .group_id = range_id,
+                .node_id = node_id,
+                .backup_id = "backup",
+                .artifact_backup_id = "backup",
+                .location = "file:///backups",
+            };
+            var key_buf: [224]u8 = undefined;
+            const value = try encodeRestoreProgressRecord(alloc, record);
+            defer alloc.free(value);
+            try txn.put(try restoreProgressKeyForGroup(&key_buf, 1, 41, node_id, range_id), value);
+        }
+    }
+    var version_buf: [160]u8 = undefined;
+    try txn.put(try derivedCatalogIndexVersionKey(&version_buf, 1), "2");
+    try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    try std.testing.expect(!try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    const range: metadata.RangeRecord = .{ .table_id = 41, .group_id = 42, .start_key = "", .end_key = null };
+    try store.retireRangeRestoreProgressTxn(&txn, 1, range, null);
+    try std.testing.expectEqual(@as(usize, 3), store.restore_cleanup_rows_visited);
+    var prefix_buf: [160]u8 = undefined;
+    const remaining = try docstore.DocStore.scanPrefixTxn(alloc, &txn, try restoreProgressPrefixForGroup(&prefix_buf, 1));
+    defer freeMetadataSnapshotRows(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 297), remaining.len);
+    // Snapshot replacement must remove derived rows and the version marker,
+    // leaving the incoming primary rows as the sole rebuild authority.
+    const derived = try store.collectDerivedCatalogIndexRowsTxn(alloc, &txn, 1);
+    defer freeMetadataSnapshotRows(alloc, derived);
+    try std.testing.expectEqual(@as(usize, 298), derived.len);
+    for (derived) |row| try txn.delete(row.key);
+    try std.testing.expect(try store.ensureDerivedCatalogIndexesTxn(&txn, 1));
+    try store.retireRangeRestoreProgressTxn(&txn, 1, range, null);
+    try std.testing.expectEqual(@as(usize, 3), store.restore_cleanup_rows_visited);
+    try txn.commit();
+    committed = true;
+}
+
+test "metadata raft apply store restore admission never overwrites a previously claimed job" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-admission", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const commands = [_]TransitionCommand{
+        .{ .create_restore_job = .{ .key = key, .value = "queued-original" } },
+        .{ .upsert_restore_job = .{ .key = key, .value = "running-checkpoint" } },
+        .{ .create_restore_job = .{ .key = key, .value = "queued-retry" } },
+    };
+    for (commands, 1..) |command, index| {
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = encoded },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 1, .commit_index = index, .entries_bytes = entries });
+    }
+    const result = (try store.getRestoreJobValue(alloc, 1, key)).?;
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("running-checkpoint", result);
+    var running_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(result, &running_hash, .{});
+    var replacement_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("replacement", &replacement_hash, .{});
+    const expiry_commands = [_]TransitionCommand{
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &running_hash } },
+        .{ .create_restore_job = .{ .key = key, .value = "replacement" } },
+        // A delayed expiry command must not erase the replacement incarnation.
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &running_hash } },
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &replacement_hash } },
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &replacement_hash } },
+    };
+    for (expiry_commands, 4..) |command, index| {
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        var decoded = (try decodeTransitionCommand(alloc, encoded)).?;
+        defer decoded.deinit(alloc);
+        try validateTransitionCommandDataGroupIds(decoded);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = encoded },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 1, .commit_index = index, .entries_bytes = entries });
+        const current = try store.getRestoreJobValue(alloc, 1, key);
+        defer if (current) |value| alloc.free(value);
+        if (index == 5 or index == 6) {
+            try std.testing.expectEqualStrings("replacement", current.?);
+        } else try std.testing.expect(current == null);
+    }
+    try std.testing.expectError(error.InvalidRestoreJobRecord, validateTransitionCommandDataGroupIds(.{
+        .remove_restore_job_if_matches = .{ .key = key, .value_hash = "short" },
+    }));
+}
+
 test "metadata raft apply store projects restore progress records from committed entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-progress-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 41, .name = "docs" },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .table_id = 41,
+            .group_id = 4101,
+            .start_key = "",
+            .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1-artifacts",
+            .restore_location = "file:///backups",
+        },
+    });
+    defer std.testing.allocator.free(range_cmd);
 
     const progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_restore_progress = .{
@@ -13955,11 +14694,14 @@ test "metadata raft apply store projects restore progress records from committed
             .group_id = 4101,
             .backup_id = "snap1",
             .artifact_backup_id = "snap1-artifacts",
+            .location = "file:///backups",
         },
     });
     defer std.testing.allocator.free(progress_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = progress_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
@@ -14542,6 +15284,7 @@ test "metadata raft apply store transition codec preserves combined store capabi
             .reporter_incarnation = 0x1234,
             .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
             .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+            .dense_native_storage_protocol_version = metadata_table_manager.dense_native_storage_protocol_version,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -14556,6 +15299,10 @@ test "metadata raft apply store transition codec preserves combined store capabi
     try std.testing.expectEqual(
         metadata_table_manager.artifact_sources_protocol_version,
         decoded.register_store.artifact_sources_protocol_version,
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.dense_native_storage_protocol_version,
+        decoded.register_store.dense_native_storage_protocol_version,
     );
 }
 
@@ -14922,6 +15669,7 @@ test "metadata raft apply store runtime status codec preserves document identity
             .lifecycle_work_class = .repair,
             .repair_status = .rebuilding,
             .repair_active_generation_serviceable = true,
+            .dense_vector_projection_pending = true,
         }})[0..]),
     }};
 
@@ -14978,6 +15726,7 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expect(status.indexes[0].source_replay[0].failed);
     try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
     try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(status.indexes[0].dense_vector_projection_pending);
 }
 
 test "metadata runtime index status codec rejects unreleased profiles" {
@@ -14999,6 +15748,27 @@ test "metadata runtime index status codec rejects unreleased profiles" {
         error.InvalidMetadataTransitionEncoding,
         readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10),
     );
+}
+
+test "metadata runtime index status graph count uncertainty survives framed persistence" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+        .name = "graph",
+        .kind = "graph",
+        .edge_count = 12,
+        .graph_counts_pending = true,
+    }, runtime_status_protocol.current_record_version);
+    var pos: usize = 0;
+    const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version);
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+    try std.testing.expect(decoded.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), decoded.edge_count);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    encoded.items[encoded.items.len - 1] = 2;
+    pos = 0;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version));
 }
 
 test "metadata runtime index status current profile preserves source failures" {
@@ -15244,6 +16014,35 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
             ),
         );
     }
+
+    encoded.clearRetainingCapacity();
+    indexes[0].embedding_activity = .{};
+    indexes[0].dense_vector_projection_pending = true;
+    indexes[0].dense_native_storage_phase = .native_validating;
+    try appendRuntimeGroupStatusRecord(
+        alloc,
+        &encoded,
+        status,
+        runtime_status_protocol.current_record_version,
+    );
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.current_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    current_pos = 0;
+    const native_current = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &current_pos,
+        runtime_status_protocol.current_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, native_current);
+    try std.testing.expect(native_current.indexes[0].dense_vector_projection_pending);
+    try std.testing.expectEqual(
+        metadata.DenseNativeStoragePhase.native_validating,
+        native_current.indexes[0].dense_native_storage_phase,
+    );
 }
 
 test "current runtime status profile preserves convergence authority" {
@@ -15264,7 +16063,7 @@ test "current runtime status profile preserves convergence authority" {
         alloc,
         &encoded,
         pending,
-        runtime_status_protocol.current_record_version,
+        runtime_status_protocol.positional_record_version,
     );
     var pos: usize = 0;
     const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
@@ -15288,69 +16087,83 @@ test "current runtime status profile preserves convergence authority" {
     try std.testing.expect(legacy.target_observation_complete);
 }
 
-test "current runtime status profile preserves inference diagnostics" {
+test "runtime status V16 and V17 preserve inference diagnostics with distinct index framing" {
     const alloc = std.testing.allocator;
-    var encoded = std.ArrayListUnmanaged(u8).empty;
-    defer encoded.deinit(alloc);
+    inline for (.{ runtime_status_protocol.inference_diagnostics_record_version, runtime_status_protocol.current_record_version }) |version| {
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(alloc);
 
-    const status = metadata.RuntimeGroupStatusReport{
-        .table_id = 1,
-        .table_name = "docs",
-        .group_id = 7,
-        .store_id = 3,
-        .node_id = 4,
-        .enrichment = .{
-            .projection_checkpoint_identity_consistent = false,
-            .stalled = true,
-            .stall_reason = "inference_timeout",
-            .active_phase = "embedding",
-            .active_model = "BAAI/bge-m3",
-            .active_backend = "metal",
-            .active_deadline_ms = 101,
-            .last_progress_ms = 99,
-            .active_progress_completed = 7,
-            .active_progress_total = 11,
-            .inference_timeout_count = 3,
-            .inference_cancel_count = 5,
-        },
-    };
-    try appendRuntimeGroupStatusRecord(
-        alloc,
-        &encoded,
-        status,
-        runtime_status_protocol.current_record_version,
-    );
-    var pos: usize = 0;
-    const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
-    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
-    try std.testing.expectEqual(encoded.items.len, pos);
-    try std.testing.expect(!decoded.enrichment.projection_checkpoint_identity_consistent);
-    try std.testing.expectEqualStrings("inference_timeout", decoded.enrichment.stall_reason);
-    try std.testing.expectEqualStrings("embedding", decoded.enrichment.active_phase);
-    try std.testing.expectEqualStrings("BAAI/bge-m3", decoded.enrichment.active_model);
-    try std.testing.expectEqualStrings("metal", decoded.enrichment.active_backend);
-    try std.testing.expectEqual(@as(u64, 101), decoded.enrichment.active_deadline_ms);
-    try std.testing.expectEqual(@as(u64, 99), decoded.enrichment.last_progress_ms);
-    try std.testing.expectEqual(@as(u64, 7), decoded.enrichment.active_progress_completed);
-    try std.testing.expectEqual(@as(u64, 11), decoded.enrichment.active_progress_total);
-    try std.testing.expectEqual(@as(u64, 3), decoded.enrichment.inference_timeout_count);
-    try std.testing.expectEqual(@as(u64, 5), decoded.enrichment.inference_cancel_count);
+        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "dense", .kind = "dense_vector", .doc_count = 7 }};
+        const status = metadata.RuntimeGroupStatusReport{
+            .table_id = 1,
+            .table_name = "docs",
+            .group_id = 7,
+            .store_id = 3,
+            .node_id = 4,
+            .enrichment = .{
+                .projection_checkpoint_identity_consistent = false,
+                .stalled = true,
+                .stall_reason = "inference_timeout",
+                .active_phase = "embedding",
+                .active_model = "BAAI/bge-m3",
+                .active_backend = "metal",
+                .active_deadline_ms = 101,
+                .last_progress_ms = 99,
+                .active_progress_completed = 7,
+                .active_progress_total = 11,
+                .inference_timeout_count = 3,
+                .inference_cancel_count = 5,
+            },
+            .indexes = &indexes,
+        };
+        try appendRuntimeGroupStatusRecord(
+            alloc,
+            &encoded,
+            status,
+            version,
+        );
+        var pos: usize = 0;
+        const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+        defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
+        try std.testing.expectEqual(encoded.items.len, pos);
+        try std.testing.expect(!decoded.enrichment.projection_checkpoint_identity_consistent);
+        try std.testing.expectEqualStrings("inference_timeout", decoded.enrichment.stall_reason);
+        try std.testing.expectEqualStrings("embedding", decoded.enrichment.active_phase);
+        try std.testing.expectEqualStrings("BAAI/bge-m3", decoded.enrichment.active_model);
+        try std.testing.expectEqualStrings("metal", decoded.enrichment.active_backend);
+        try std.testing.expectEqual(@as(u64, 101), decoded.enrichment.active_deadline_ms);
+        try std.testing.expectEqual(@as(u64, 99), decoded.enrichment.last_progress_ms);
+        try std.testing.expectEqual(@as(u64, 7), decoded.enrichment.active_progress_completed);
+        try std.testing.expectEqual(@as(u64, 11), decoded.enrichment.active_progress_total);
+        try std.testing.expectEqual(@as(u64, 3), decoded.enrichment.inference_timeout_count);
+        try std.testing.expectEqual(@as(u64, 5), decoded.enrichment.inference_cancel_count);
+        try std.testing.expectEqual(@as(u64, 7), decoded.indexes[0].doc_count);
+        if (version == runtime_status_protocol.current_record_version) {
+            var old_pos: usize = 0;
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeGroupStatusRecordWithMaxVersion(
+                alloc,
+                encoded.items,
+                &old_pos,
+                runtime_status_protocol.inference_diagnostics_record_version,
+            ));
+        }
 
-    encoded.clearRetainingCapacity();
-    try appendRuntimeGroupStatusRecord(
-        alloc,
-        &encoded,
-        status,
-        runtime_status_protocol.previous_record_version,
-    );
-    pos = 0;
-    const previous = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
-    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, previous);
-    try std.testing.expectEqual(encoded.items.len, pos);
-    try std.testing.expect(previous.enrichment.projection_checkpoint_identity_consistent);
-    try std.testing.expectEqualStrings("", previous.enrichment.stall_reason);
-    try std.testing.expectEqualStrings("", previous.enrichment.active_phase);
-    try std.testing.expectEqual(@as(u64, 0), previous.enrichment.inference_timeout_count);
+        encoded.clearRetainingCapacity();
+        try appendRuntimeGroupStatusRecord(
+            alloc,
+            &encoded,
+            status,
+            runtime_status_protocol.previous_record_version,
+        );
+        pos = 0;
+        const previous = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
+        defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, previous);
+        try std.testing.expectEqual(encoded.items.len, pos);
+        try std.testing.expect(previous.enrichment.projection_checkpoint_identity_consistent);
+        try std.testing.expectEqualStrings("", previous.enrichment.stall_reason);
+        try std.testing.expectEqualStrings("", previous.enrichment.active_phase);
+        try std.testing.expectEqual(@as(u64, 0), previous.enrichment.inference_timeout_count);
+    }
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

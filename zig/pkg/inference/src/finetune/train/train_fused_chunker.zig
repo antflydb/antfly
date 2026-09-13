@@ -475,6 +475,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
     // Declare both backends at outer scope so their addresses are stable for
     // the ComputeBackend vtable pointer that FusedTrainer holds.
     var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer native_backend.deinit();
     const cb: ComputeBackend = native_backend.computeBackend();
 
     print("backend: native\n", .{});

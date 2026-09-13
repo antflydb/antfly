@@ -40,6 +40,7 @@ const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const resolution_runtime = @import("resolution_runtime.zig");
 const types = @import("types.zig");
+const IndexManager = @import("catalog/index_manager.zig").IndexManager;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -150,11 +151,45 @@ pub fn processResolutionArtifact(
     resolution_key: []const u8,
     sink: EntitySink,
 ) !usize {
+    return processResolutionArtifactWithCatalog(gpa, store, resolution_key, sink, null);
+}
+
+fn processResolutionArtifactWithCatalog(
+    gpa: Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolution_key: []const u8,
+    sink: EntitySink,
+    catalog: ?*IndexManager,
+) !usize {
     const raw = (try store.get(gpa, resolution_key)) orelse return 0;
     defer gpa.free(raw);
 
     var parsed = try resolver_lib.parseResolution(gpa, raw);
     defer parsed.deinit();
+
+    if (catalog) |manager| {
+        // DB catalog mutation holds this runtime's catch-up fence. Keep the
+        // generation check and the sink call in that same critical section so
+        // queued decisions from an old configuration cannot publish later.
+        const key = (try internal_keys.parseResolutionArtifactKeyAlloc(gpa, resolution_key)) orelse return 0;
+        defer gpa.free(key.doc_key);
+        defer gpa.free(key.artifact_name);
+        const resolvers = try manager.listResolvers(gpa);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(gpa);
+            gpa.free(resolvers);
+        }
+        var current = false;
+        for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.resolution_artifact, key.artifact_name) and
+                cfg.config_generation == parsed.config_generation)
+            {
+                current = true;
+                break;
+            }
+        }
+        if (!current) return 0;
+    }
 
     // Collect every resolvable entity, then commit them in one batch so a
     // document's entities promote atomically (the sink uses a multi-participant
@@ -186,7 +221,7 @@ pub fn processRecordKeys(
     changed_artifact_keys: []const []const u8,
     sink: EntitySink,
 ) !void {
-    return try processRecordKeysMaybeSink(gpa, store, changed_artifact_keys, sink);
+    return try processRecordKeysMaybeSink(gpa, store, changed_artifact_keys, sink, null);
 }
 
 fn processRecordKeysMaybeSink(
@@ -194,11 +229,12 @@ fn processRecordKeysMaybeSink(
     store: resolver_lib.ArtifactStore,
     changed_artifact_keys: []const []const u8,
     sink: ?EntitySink,
+    catalog: ?*IndexManager,
 ) !void {
     for (changed_artifact_keys) |key| {
         if (!internal_keys.isResolutionArtifactKey(key)) continue;
         const concrete_sink = sink orelse return error.PromotionSinkUnavailable;
-        _ = try processResolutionArtifact(gpa, store, key, concrete_sink);
+        _ = try processResolutionArtifactWithCatalog(gpa, store, key, concrete_sink, catalog);
     }
 }
 
@@ -230,7 +266,7 @@ pub fn catchUpWindow(
     from_sequence: u64,
     max_records: usize,
 ) !u64 {
-    const result = try catchUpWindowMaybeSink(gpa, replay_source, store, sink, from_sequence, max_records);
+    const result = try catchUpWindowMaybeSink(gpa, replay_source, store, sink, from_sequence, max_records, null);
     return result.max_seen;
 }
 
@@ -241,18 +277,20 @@ fn catchUpWindowMaybeSink(
     sink: ?EntitySink,
     from_sequence: u64,
     max_records: usize,
+    catalog: ?*IndexManager,
 ) !CatchUpWindowResult {
     const Ctx = struct {
         gpa: Allocator,
         store: resolver_lib.ArtifactStore,
         sink: ?EntitySink,
+        catalog: ?*IndexManager,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
-            try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink);
+            try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink, self.catalog);
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
     };
@@ -261,6 +299,7 @@ fn catchUpWindowMaybeSink(
         .gpa = gpa,
         .store = store,
         .sink = sink,
+        .catalog = catalog,
         .max_seen = from_sequence,
     };
     _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
@@ -279,6 +318,7 @@ fn catchUpWindowMaybeSink(
 /// sequence only after the entity upserts are durable, or when promotion is
 /// explicitly disabled by policy.
 pub const PromotionRuntime = struct {
+    catalog: ?*IndexManager = null,
     alloc: Allocator,
     store_handle: resolution_runtime.RuntimeStoreHandle,
     replay_source: replay_source_mod.Source,
@@ -302,8 +342,11 @@ pub const PromotionRuntime = struct {
     // returns immediately instead of sleeping on a missed notification.
     worker_wake_generation: std.atomic.Value(u32) = .init(0),
     worker_mutex: Io.Mutex = .init,
-    io_impl: ?*background_runtime_mod.IoImpl,
-    future: ?Io.Future(void),
+    io: ?Io,
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    scheduled_retry_generation: u64 = 0,
+    scheduled_retry_delay_ms: i64 = blocked_retry_min_interval_ms,
 
     pub fn init(
         alloc: Allocator,
@@ -332,7 +375,8 @@ pub const PromotionRuntime = struct {
             .shutdown_flag = .init(false),
             .worker_started = .init(false),
             .worker_wake_generation = .init(0),
-            .io_impl = backend_runtime.io_impl,
+            .io = backend_runtime.io(),
+            .backend_runtime = backend_runtime,
             .future = null,
         };
     }
@@ -398,25 +442,24 @@ pub const PromotionRuntime = struct {
     }
 
     pub fn start(self: *PromotionRuntime) !void {
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
         self.shutdown_flag.store(false, .release);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.propagation, self, workerStep);
         self.worker_started.store(true, .release);
         self.signalWorker(io);
     }
 
     pub fn stop(self: *PromotionRuntime) void {
         self.shutdown_flag.store(true, .release);
-        if (self.io_impl) |io_impl| {
-            self.signalWorker(io_impl.io());
+        if (self.io) |io| {
+            self.signalWorker(io);
         }
         if (self.future) |*future| {
-            if (self.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.io) |io| {
+                _ = future.await(io);
             }
             self.future = null;
         }
@@ -424,9 +467,10 @@ pub const PromotionRuntime = struct {
     }
 
     fn wakeWorker(self: *PromotionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.worker_started.load(.acquire)) return;
-        const io_impl = self.io_impl orelse return;
-        self.signalWorker(io_impl.io());
+        const io = self.io orelse return;
+        self.signalWorker(io);
     }
 
     fn recordWorkerWake(self: *PromotionRuntime) void {
@@ -469,6 +513,10 @@ pub const PromotionRuntime = struct {
     pub fn catchUp(self: *PromotionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.catchUpLocked(false);
+    }
+
+    fn catchUpLocked(self: *PromotionRuntime, single_window: bool) !void {
         errdefer _ = self.error_count.fetchAdd(1, .monotonic);
 
         while (true) {
@@ -495,6 +543,7 @@ pub const PromotionRuntime = struct {
                     // the derived workers, which pass their applied_sequence.
                     applied,
                     default_max_records_per_window,
+                    self.catalog,
                 );
             } else result: {
                 if (self.missing_sink_policy == .disabled) {
@@ -510,6 +559,7 @@ pub const PromotionRuntime = struct {
                     null,
                     applied,
                     default_max_records_per_window,
+                    self.catalog,
                 );
             };
 
@@ -531,59 +581,33 @@ pub const PromotionRuntime = struct {
             }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
             self.applied_sequence.store(max_seen, .release);
+            if (single_window) return;
         }
     }
 
-    fn workerMain(self: *PromotionRuntime) void {
-        const io = (self.io_impl orelse return).io();
-        var retry_delay_ms = blocked_retry_min_interval_ms;
-        var retry_wake_generation = self.worker_wake_generation.load(.acquire);
-        while (!self.shutdown_flag.load(.acquire)) {
-            if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) {
-                const idle_wake_generation = self.worker_wake_generation.load(.acquire);
-                if (!self.shutdown_flag.load(.acquire) and
-                    self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
-                {
-                    _ = self.waitForWorkerSignal(io, idle_wake_generation, null);
-                }
-                continue;
-            }
-            if (self.shutdown_flag.load(.acquire)) break;
-
-            if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                const wake_generation = self.worker_wake_generation.load(.acquire);
-                if (wake_generation != retry_wake_generation) {
-                    retry_delay_ms = blocked_retry_min_interval_ms;
-                    retry_wake_generation = wake_generation;
-                }
-                self.catchUp() catch |err| {
-                    std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
-                    // Persistent routing/capability failures must not turn a
-                    // durable retry queue into a log and CPU hot loop. The
-                    // bounded delay is interrupted immediately by a source,
-                    // ownership, or work-generation wake, preserving recovery
-                    // latency when the dependency becomes available.
-                    _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
-                    retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
-                    continue;
-                };
-                if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                    // Sink/owner setters reset this backoff through the wake
-                    // generation, while ownership may also change behind the
-                    // dynamic predicate without calling either setter. A
-                    // finite delay is the correctness backstop for that case.
-                    // It runs only while work is pending and backs off so
-                    // long-lived follower shards do not create a hot loop.
-                    if (self.shouldDelayBlockedRetry(wake_generation)) {
-                        _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
-                        retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
-                    }
-                } else {
-                    retry_delay_ms = blocked_retry_min_interval_ms;
-                }
-            }
+    fn workerStep(self: *PromotionRuntime) ?u64 {
+        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return null;
+        if (!self.catch_up_mutex.tryLock()) return 25;
+        defer self.catch_up_mutex.unlock();
+        const generation = self.worker_wake_generation.load(.acquire);
+        if (generation != self.scheduled_retry_generation) {
+            self.scheduled_retry_generation = generation;
+            self.scheduled_retry_delay_ms = blocked_retry_min_interval_ms;
         }
-        self.catchUp() catch {};
+        self.catchUpLocked(true) catch |err| {
+            std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
+            const delay = self.scheduled_retry_delay_ms;
+            self.scheduled_retry_delay_ms = nextBlockedRetryIntervalMs(delay);
+            return @intCast(delay);
+        };
+        if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire) and self.shouldDelayBlockedRetry(generation)) {
+            const delay = self.scheduled_retry_delay_ms;
+            self.scheduled_retry_delay_ms = nextBlockedRetryIntervalMs(delay);
+            return @intCast(delay);
+        }
+        self.scheduled_retry_delay_ms = blocked_retry_min_interval_ms;
+        return 0;
     }
 };
 
@@ -1017,7 +1041,7 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
         .target_sequence = .init(9),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1052,7 +1076,7 @@ test "PromotionRuntime stats are nonblocking while catch-up owns the mutex" {
         .target_sequence = .init(2),
         .error_count = .init(3),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
     lockMutex(&runtime.catch_up_mutex);
@@ -1107,7 +1131,7 @@ test "PromotionRuntime missing sink blocks only on pending resolution artifacts"
         .target_sequence = .init(9),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1156,7 +1180,7 @@ test "PromotionRuntime blocked retry observes sink wake generation" {
         .target_sequence = .init(1),
         .error_count = .init(0),
         .shutdown_flag = .init(false),
-        .io_impl = null,
+        .io = null,
         .future = null,
     };
 
@@ -1205,7 +1229,7 @@ test "PromotionRuntime retries pending work after dynamic leadership changes wit
     var owner = AtomicToggleOwner{};
     var backend_runtime = try background_runtime_mod.BackendRuntime.init(alloc, .{});
     defer backend_runtime.deinit();
-    const test_io = (backend_runtime.io_impl orelse return error.TestUnexpectedResult).io();
+    const test_io = backend_runtime.io() orelse return error.TestUnexpectedResult;
     var runtime = try PromotionRuntime.init(
         alloc,
         map.backendStore(),

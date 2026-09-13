@@ -37,6 +37,8 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             return error.InvalidEnrichmentExecutionConfig;
         if (execution.batch_bytes) |bytes| if (bytes == 0)
             return error.InvalidEnrichmentExecutionConfig;
+        if (execution.max_document_pages) |pages| if (pages == 0)
+            return error.InvalidEnrichmentExecutionConfig;
     }
     if (cfg.full_text_index and cfg.kind == .embedding)
         return error.InvalidEnrichmentConfig;
@@ -82,7 +84,7 @@ test "public enrichment validation rejects invalid execution and producer config
         .name = "units",
         .kind = .asset,
         .field = "url",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":true,\"render_dpi\":20,\"config\":{\"provider\":\"antfly\",\"model\":\"test-reader\"}}}}",
     }));
     try std.testing.expectError(error.InvalidEnrichmentConfig, validatePublicConfig(std.testing.allocator, .{
         .name = "chunks",

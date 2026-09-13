@@ -1179,6 +1179,40 @@ pub fn validateStoreAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void
     if (max_ordinal > 0 and next_ordinal <= max_ordinal) return error.InvalidDocIdentity;
 }
 
+/// Validate that every authoritative base row has one live identity and that
+/// the identity catalog has no extra live rows. Unlike validateStoreAlloc(),
+/// this binds identity metadata to primary data and is therefore appropriate
+/// for admitting a complete portable DB image rather than an identity-only
+/// repair batch.
+pub fn validatePrimaryDocumentCoverageAlloc(alloc: Allocator, store: *docstore_mod.DocStore) !void {
+    try validateStoreAlloc(alloc, store);
+    const identity_stats = try fullStatsFromStore(store);
+
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const Coverage = struct {
+        alloc: Allocator,
+        txn: *docstore_mod.DocStore.Txn,
+        live_documents: u64 = 0,
+
+        fn visit(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)) orelse return .@"continue";
+            defer self.alloc.free(doc_id);
+            const ordinal = (try lookupOrdinalTxn(self.alloc, self.txn, doc_id)) orelse return error.InvalidDocIdentity;
+            const state = (try lookupStateTxn(self.txn, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive()) return error.InvalidDocIdentity;
+            self.live_documents = std.math.add(u64, self.live_documents, 1) catch return error.InvalidDocIdentity;
+            return .@"continue";
+        }
+    };
+    var coverage = Coverage{ .alloc = alloc, .txn = &txn };
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    try store.scanWithContext(lower[0..], upper[0..], .{}, &coverage, Coverage.visit);
+    if (coverage.live_documents != identity_stats.live_ordinals) return error.InvalidDocIdentity;
+}
+
 fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore, txn: anytype) !void {
     const manifest_exists = try readVisibilityManifestTxn(txn);
     const ChunkScan = struct {
@@ -1416,7 +1450,7 @@ pub fn visiblePrimaryDocSetIfCompleteFromStoreAlloc(
         fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             _ = value;
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            const doc_id = (try internal_keys.decodePrimaryDocumentKeyAlloc(state.arena, key)) orelse return .@"continue";
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.arena, key)) orelse return .@"continue";
             const ordinal = state.ordinals_by_doc.get(doc_id) orelse {
                 state.inconclusive = true;
                 return .stop;
@@ -1937,7 +1971,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
 ) !void {
     if (doc_upserts.len == 0 and doc_deletes.len == 0) return;
 
-    if (try appendBatchIdentityMetadataAllNewFastPath(
+    if (try appendBatchIdentityMetadataBatchedFastPath(
         alloc,
         store,
         namespace,
@@ -2221,7 +2255,7 @@ fn identityLookupLessThan(_: void, lhs: IdentityLookup, rhs: IdentityLookup) boo
     return std.mem.lessThan(u8, lhs.key, rhs.key);
 }
 
-fn appendBatchIdentityMetadataAllNewFastPath(
+fn appendBatchIdentityMetadataBatchedFastPath(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     namespace: Namespace,
@@ -2244,22 +2278,29 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     } else true;
 
     var doc_lookups = try alloc.alloc(IdentityLookup, doc_upserts.len);
+    var doc_lookups_initialized: usize = 0;
     defer {
-        for (doc_lookups) |lookup| alloc.free(lookup.key);
+        for (doc_lookups[0..doc_lookups_initialized]) |lookup| alloc.free(lookup.key);
         alloc.free(doc_lookups);
     }
     for (doc_upserts, 0..) |doc_id, i| {
         doc_lookups[i] = .{
             .key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id),
         };
+        doc_lookups_initialized += 1;
     }
     std.sort.pdq(IdentityLookup, doc_lookups, {}, identityLookupLessThan);
     if (identityLookupsContainDuplicateKeys(doc_lookups)) return false;
-    if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, doc_lookups)) return false;
+    if (!missing_namespace) switch (try classifyIdentityUpserts(alloc, &txn, doc_lookups)) {
+        .all_new => {},
+        .unchanged => return true,
+        .needs_mutation => return false,
+    };
 
     var canonical_lookups = try alloc.alloc(IdentityLookup, doc_upserts.len);
+    var canonical_lookups_initialized: usize = 0;
     defer {
-        for (canonical_lookups) |lookup| alloc.free(lookup.key);
+        for (canonical_lookups[0..canonical_lookups_initialized]) |lookup| alloc.free(lookup.key);
         alloc.free(canonical_lookups);
     }
     for (doc_upserts, 0..) |doc_id, i| {
@@ -2267,6 +2308,7 @@ fn appendBatchIdentityMetadataAllNewFastPath(
         canonical_lookups[i] = .{
             .key = try alloc.dupe(u8, canonical_key[0..]),
         };
+        canonical_lookups_initialized += 1;
     }
     std.sort.pdq(IdentityLookup, canonical_lookups, {}, identityLookupLessThan);
     if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
@@ -2293,6 +2335,115 @@ fn appendBatchIdentityMetadataAllNewFastPath(
     try appendPendingVisibilityChunkWritesAlloc(alloc, out, visibility_deletes, &visibility_chunks);
     if (visibility_summary) |summary| try appendVisibilitySummaryWrite(alloc, out, summary);
     return true;
+}
+
+/// Ordinary document overwrites do not mutate identity. Prove that in three
+/// sorted reads on one snapshot instead of three point probes per document.
+/// Missing/deleted states and incomplete mappings retain the general repair
+/// path; a conflicting canonical mapping remains a hard correctness error.
+fn classifyIdentityUpserts(alloc: Allocator, txn: anytype, lookups: []const IdentityLookup) !enum { all_new, unchanged, needs_mutation } {
+    const keys = try alloc.alloc([]const u8, lookups.len);
+    defer alloc.free(keys);
+    const values = try alloc.alloc(?[]const u8, lookups.len);
+    defer alloc.free(values);
+    for (lookups, keys) |lookup, *key| key.* = lookup.key;
+    try txn.getManySorted(keys, values);
+    var existing: usize = 0;
+    for (values) |value| if (value != null) {
+        existing += 1;
+    };
+    if (existing == 0) return .all_new;
+    if (existing != lookups.len) return .needs_mutation;
+
+    const Probe = struct {
+        key: [10]u8 = @splat(0),
+        ordinal: DocOrdinal,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return std.mem.lessThan(u8, &lhs.key, &rhs.key);
+        }
+    };
+    const probes = try alloc.alloc(Probe, lookups.len);
+    defer alloc.free(probes);
+    for (values, probes) |value, *probe| {
+        const raw = value.?;
+        if (raw.len != @sizeOf(u32)) return error.InvalidDocIdentity;
+        probe.* = .{ .ordinal = std.mem.readInt(u32, raw[0..4], .big) };
+        const state_key = internal_keys.identityOrdinalStateKey(probe.ordinal);
+        @memcpy(probe.key[0..state_key.len], &state_key);
+    }
+    std.sort.pdq(Probe, probes, {}, Probe.lessThan);
+    for (probes, keys) |*probe, *key| key.* = probe.key[0..6];
+    try txn.getManySorted(keys, values);
+    for (probes, values) |*probe, value| {
+        const state = try decodeOrdinalState(value orelse return .needs_mutation);
+        if (!state.isLive()) return .needs_mutation;
+        probe.key = internal_keys.identityCanonicalToOrdinalKey(state.canonical_doc_id);
+    }
+    std.sort.pdq(Probe, probes, {}, Probe.lessThan);
+    for (probes, keys) |*probe, *key| key.* = &probe.key;
+    try txn.getManySorted(keys, values);
+    for (probes, values) |probe, value| {
+        const raw = value orelse return .needs_mutation;
+        if (raw.len != @sizeOf(u32) or std.mem.readInt(u32, raw[0..4], .big) != probe.ordinal)
+            return error.InvalidDocIdentity;
+    }
+    return .unchanged;
+}
+
+test "identity unchanged batch proves live state and canonical mappings with three sorted reads" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 10, &writes, &.{ "doc:z", "doc:a", "doc:m" }, &.{});
+    try store.putBatchWithReplay(null, writes.items, &.{}, null);
+
+    var lookups: [3]IdentityLookup = undefined;
+    var initialized: usize = 0;
+    defer for (lookups[0..initialized]) |lookup| alloc.free(lookup.key);
+    for ([_][]const u8{ "doc:a", "doc:m", "doc:z" }, &lookups) |doc_id, *lookup| {
+        lookup.* = .{ .key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id) };
+        initialized += 1;
+    }
+    {
+        var txn = try store.beginProbeTxn();
+        defer txn.abort();
+        const Counter = struct {
+            inner: *@TypeOf(txn),
+            calls: usize = 0,
+            pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+                self.calls += 1;
+                for (keys[1..], keys[0 .. keys.len - 1]) |key, previous|
+                    try std.testing.expect(!std.mem.lessThan(u8, key, previous));
+                try self.inner.getManySorted(keys, values);
+            }
+        };
+        var counter = Counter{ .inner = &txn };
+        try std.testing.expectEqual(.unchanged, try classifyIdentityUpserts(alloc, &counter, &lookups));
+        try std.testing.expectEqual(@as(usize, 3), counter.calls);
+    }
+    var unchanged = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &unchanged);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 20, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), unchanged.items.len);
+
+    const canonical = canonicalDocIdForNamespace(default_namespace, "doc:a");
+    const canonical_key = internal_keys.identityCanonicalToOrdinalKey(canonical);
+    // Missing mappings must be repaired rather than certifying a no-op.
+    try store.putBatchWithReplay(null, &.{}, &.{&canonical_key}, null);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 21, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), unchanged.items.len);
+    try std.testing.expectEqualSlices(u8, &canonical_key, unchanged.items[0].key);
+    try store.putBatchWithReplay(null, unchanged.items, &.{}, null);
+    // Existing but conflicting mappings remain an error, not a fast-path miss.
+    const wrong = [_]u8{ 0, 0, 0, 99 };
+    try store.putBatchWithReplay(null, &.{.{ .key = &canonical_key, .value = &wrong }}, &.{}, null);
+    try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}));
 }
 
 fn identityLookupsContainDuplicateKeys(lookups: []const IdentityLookup) bool {

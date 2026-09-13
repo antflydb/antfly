@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const chunking = @import("../../../chunking/mod.zig");
+const chunk_provider = @import("../../../chunking/provider.zig");
 const utf8_text = @import("utf8_text.zig");
 
 pub const Chunk = chunking.chunk.Chunk;
@@ -71,6 +72,15 @@ pub fn chunkTextWithConfigJson(
     text: []const u8,
     config_json: []const u8,
 ) ![]Chunk {
+    return try chunkTextWithConfigJsonAndProvider(alloc, text, config_json, null);
+}
+
+pub fn chunkTextWithConfigJsonAndProvider(
+    alloc: Allocator,
+    text: []const u8,
+    config_json: []const u8,
+    antfly_provider: ?chunk_provider.Provider,
+) ![]Chunk {
     var cfg = try chunking.types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
 
@@ -80,7 +90,7 @@ pub fn chunkTextWithConfigJson(
 
     const chunks = switch (cfg.provider) {
         .mock => try chunking.fixed.chunkText(alloc, source_text, cfg),
-        .antfly => try chunking.inference.chunkText(alloc, cfg, source_text),
+        .antfly => try chunking.inference.chunkTextWithProvider(alloc, cfg, source_text, antfly_provider),
     };
     errdefer freeChunks(alloc, chunks);
     remapChunkOffsets(&sanitized, chunks);

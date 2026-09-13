@@ -54,11 +54,77 @@ const query_contract = @import("query_contract.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
+/// Production-neutral semantic boundaries in a distributed graph request.
+/// Callers may use these to observe or suspend a request without coupling the
+/// query engine to a particular scheduler or test harness. Hooks run only
+/// after an owned intermediate result is internally consistent and hold no
+/// catalog or database lease.
+pub const LifecyclePhase = enum {
+    source_snapshot_acquired,
+    snapshot_validated,
+    expand_round_completed,
+    target_authorization_started,
+    hydration_started,
+    hydration_fanout_started,
+    hydration_completed,
+    attempt_failed,
+};
+
+pub const LifecycleEvent = struct {
+    phase: LifecyclePhase,
+    query_name: []const u8 = "",
+    depth: u32 = 0,
+    group_count: usize = 0,
+    result_count: usize = 0,
+    attempt: u32 = 0,
+    error_code: u16 = 0,
+    /// Borrowed for the synchronous hook call only.
+    table_name: []const u8 = "",
+    /// Borrowed for the synchronous hook call only. Lifecycle hooks may use
+    /// it to park at a lease-free boundary until request cancellation is
+    /// visible, but must not retain it.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const LifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: LifecycleEvent) void,
+
+    pub fn reach(self: LifecycleHook, event: LifecycleEvent) void {
+        self.reach_fn(self.ptr, event);
+    }
+};
+
+/// Production-neutral logical work boundary for routed graph operations.
+/// Deterministic runtimes can model reversible per-owner service rates without
+/// making the graph coordinator depend on VOPR. Native runtimes leave this
+/// unset and retain their ordinary request behavior.
+pub const WorkKind = enum {
+    expand,
+    hydrate,
+    get_edges,
+};
+
+pub const WorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, group_id: u64, kind: WorkKind, units: u64) anyerror!void,
+
+    /// Parallel fanout may call this concurrently. Implementations that are
+    /// not scheduler-confined must synchronize their own accounting and
+    /// reversible effect state.
+    pub fn charge(self: WorkCostPort, group_id: u64, kind: WorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, group_id, kind, units);
+    }
+};
+
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Absolute deadline in the worker's fanout clock (native when absent).
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    lifecycle_hook: ?LifecycleHook = null,
+    work_cost_port: ?WorkCostPort = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -111,6 +177,8 @@ pub const Worker = struct {
         consistency: raft_mod.ReadConsistency,
     ) !GraphExpandResponse {
         try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .expand, req.frontier.len);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -128,6 +196,8 @@ pub const Worker = struct {
         req: GraphHydrateRequest,
         consistency: raft_mod.ReadConsistency,
     ) !GraphHydrateResponse {
+        try self.ensureActive();
+        if (self.work_cost_port) |port| try port.charge(group_id, .hydrate, req.keys.len);
         try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
@@ -148,6 +218,8 @@ pub const Worker = struct {
     ) !GraphEdgesResponse {
         try self.ensureActive();
         const func = self.vtable.execute_graph_get_edges orelse return error.UnsupportedQueryRequest;
+        if (self.work_cost_port) |port| try port.charge(group_id, .get_edges, 1);
+        try self.ensureActive();
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
@@ -196,24 +268,76 @@ pub const Worker = struct {
         return func(self.ptr);
     }
 
+    pub fn reachLifecycle(self: Worker, event: LifecycleEvent) void {
+        if (self.lifecycle_hook) |hook| hook.reach(event);
+    }
+
+    fn monotonicNs(self: Worker) u64 {
+        if (self.fanoutIo()) |io| {
+            return @intCast(std.Io.Clock.now(.awake, io).nanoseconds);
+        }
+        return platform_time.monotonicNs();
+    }
+
+    fn budget(self: Worker) table_catalog.RoutingBudget {
+        return .initIo(self.execution_deadline_ns, self.fanoutIo());
+    }
+
+    fn routingDeadline(self: Worker, catalog: table_catalog.CatalogSource) ?u64 {
+        return catalog.deadlineFrom(self.budget());
+    }
+
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
         }
         if (self.execution_deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            if (self.monotonicNs() >= deadline_ns) return error.Timeout;
         }
     }
 
     fn remainingTimeoutMs(self: Worker) !?u32 {
         const deadline_ns = self.execution_deadline_ns orelse return null;
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.monotonicNs();
         if (now_ns >= deadline_ns) return error.Timeout;
         const remaining_ns = deadline_ns - now_ns;
         const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
         return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
     }
 };
+
+test "distributed graph translates native worker and catalog deadline boundaries" {
+    const Runtime = struct {
+        fn io(ptr: *anyopaque) ?std.Io {
+            return @as(*@import("vopr").vopr_io.VoprIo, @ptrCast(@alignCast(ptr))).io();
+        }
+    };
+    var runtime = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer runtime.deinit();
+    var worker = Worker{ .ptr = &runtime, .vtable = &.{
+        .execute_graph_expand = undefined,
+        .execute_graph_hydrate = undefined,
+        .fanout_io = Runtime.io,
+    } };
+    worker.execution_deadline_ns = worker.budget().deadlineFrom(.init(platform_time.monotonicNs() + std.time.ns_per_s));
+    try worker.ensureActive();
+    var catalog_io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 17 * std.time.ns_per_s });
+    defer catalog_io.deinit();
+    const catalog = table_catalog.CatalogSource{
+        .ptr = undefined,
+        .vtable = undefined,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io.io()),
+    };
+    const routed_deadline = worker.routingDeadline(catalog).?;
+    try std.testing.expect(routed_deadline > 17 * std.time.ns_per_s);
+    try std.testing.expect(routed_deadline <= 18 * std.time.ns_per_s);
+    try catalog.budget(routed_deadline).checkpoint();
+    runtime.monotonic_ns += std.time.ns_per_s;
+    try std.testing.expectError(error.Timeout, worker.ensureActive());
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(worker.routingDeadline(catalog)).checkpoint());
+}
 
 pub const IncomingSourceGroupsRequest = struct {
     index_name: []const u8,
@@ -1325,6 +1449,9 @@ pub const GraphExpandRequest = struct {
     exclude_edges: [][]u8,
     target_constraint_keys: [][]u8 = &.{},
     params: graph_query_mod.QueryParams,
+    metrics: []graph_query_mod.GraphMetricRead = &.{},
+    include_metric_status: bool = false,
+    defer_result_limit: bool = false,
     tensor_access_path: ?OwnedGraphTensorAccessPath = null,
     tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
     topology_epoch: u64 = 0,
@@ -1350,6 +1477,7 @@ pub const GraphExpandRequest = struct {
         for (self.target_constraint_keys) |key| alloc.free(key);
         if (self.target_constraint_keys.len > 0) alloc.free(self.target_constraint_keys);
         freeConstStrings(alloc, self.params.edge_types);
+        freeGraphMetricReads(alloc, self.metrics);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
         if (self.resolved_doc_filter_owned) {
@@ -1625,6 +1753,9 @@ const GraphExpandRequestJson = struct {
     exclude_nodes: []const GraphNodeIdentityJson = &.{},
     exclude_edges: []const []const u8 = &.{},
     target_constraint_keys: []const []const u8 = &.{},
+    metrics: []const GraphMetricReadJson = &.{},
+    include_metric_status: bool = false,
+    defer_result_limit: bool = false,
     topology_epoch: u64 = 0,
     identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -1659,6 +1790,11 @@ const GraphExpandParamsJson = struct {
     algebraic_semiring: bool = false,
 };
 
+const GraphMetricReadJson = struct {
+    name: []const u8,
+    freshness: []const u8 = "published",
+};
+
 const GraphTensorAccessPathJson = struct {
     owner: []const u8,
     layout: []const u8,
@@ -1678,6 +1814,7 @@ const GraphExpansionJson = struct {
     total: u32,
     nodes: []const graph_query_mod.GraphResultNode,
     hits: []const db_mod.types.SearchHit = &.{},
+    metric_status: []const db_mod.types.GraphMetricStatus = &.{},
 };
 
 const GraphHydrateRequestJson = struct {
@@ -1816,7 +1953,7 @@ fn resultHasIdentitySnapshot(
         base_result.shard_identity_read_generations.len > 0;
 }
 
-fn rejectUnstampedResultRefs(
+pub fn rejectUnstampedResultRefs(
     req: db_mod.types.SearchRequest,
     base_result: db_mod.types.SearchResult,
 ) !void {
@@ -1922,9 +2059,13 @@ pub fn executeCrossRange(
     // refresh routing. Preserve their single bounded retry here. Production
     // table reads use executeCrossRangeWithMatchAnchors and own the retry so a
     // fresh attempt also refreshes the base scan and MATCH anchor snapshots.
+    worker.reachLifecycle(.{
+        .phase = .source_snapshot_acquired,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
     var attempts: u32 = 0;
     while (true) : (attempts += 1) {
-        return executeCrossRangeWithMatchAnchors(
+        return executeCrossRangeWithMatchAnchorsLifecycle(
             alloc,
             catalog,
             worker,
@@ -1933,6 +2074,7 @@ pub fn executeCrossRange(
             base_result,
             if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
             consistency,
+            false,
         ) catch |err| switch (err) {
             error.TopologyChanged => {
                 if (attempts == 0) continue;
@@ -1953,6 +2095,30 @@ pub fn executeCrossRangeWithMatchAnchors(
     match_anchor_source: ?MatchAnchorSource,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
+    return executeCrossRangeWithMatchAnchorsLifecycle(
+        alloc,
+        catalog,
+        worker,
+        table_name,
+        req,
+        base_result,
+        match_anchor_source,
+        consistency,
+        true,
+    );
+}
+
+fn executeCrossRangeWithMatchAnchorsLifecycle(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: Worker,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    base_result: db_mod.types.SearchResult,
+    match_anchor_source: ?MatchAnchorSource,
+    consistency: raft_mod.ReadConsistency,
+    emit_source_snapshot: bool,
+) ![]db_mod.types.GraphSearchResult {
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try requireStampedCrossRangeRequest(req, base_result);
     try rejectUnstampedResultRefs(req, base_result);
@@ -1968,17 +2134,27 @@ pub fn executeCrossRangeWithMatchAnchors(
     };
 
     var request_worker = worker;
-    request_worker.execution_deadline_ns = req.execution_deadline_ns;
+    request_worker.execution_deadline_ns = worker.budget().deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
+    if (emit_source_snapshot) request_worker.reachLifecycle(.{
+        .phase = .source_snapshot_acquired,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
-    try request_worker.ensureActive();
-    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| switch (err) {
-        // UnknownGroup is topology churn from the coordinator's perspective.
-        // Let the outer table-read attempt refresh the complete routing and
-        // snapshot state instead of retrying expensive graph work in place.
-        error.UnknownGroup => error.TopologyChanged,
-        else => err,
+    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| {
+        request_worker.reachLifecycle(.{
+            .phase = .attempt_failed,
+            .error_code = @intFromError(err),
+        });
+        return switch (err) {
+            // UnknownGroup is topology churn from the coordinator's
+            // perspective. Let the outer table-read attempt refresh the
+            // complete routing and snapshot state instead of retrying
+            // expensive graph work in place.
+            error.UnknownGroup => error.TopologyChanged,
+            else => err,
+        };
     };
 }
 
@@ -2000,11 +2176,15 @@ fn executeCrossRangeOnce(
     // existing range + generation checks below to validate an unstamped
     // standalone catalog without weakening cross-shard snapshot fencing.
     try table_catalog.validateDocIdentityReadyForTable(alloc, catalog, table_name);
-    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.execution_deadline_ns);
+    try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result, worker.routingDeadline(catalog));
     if (match_anchor_source) |source| switch (source) {
-        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.execution_deadline_ns),
+        .materialized => |anchors| try validateSourceSnapshotGroupSet(alloc, catalog, table_name, anchors, worker.routingDeadline(catalog)),
         .paged => {},
     };
+    worker.reachLifecycle(.{
+        .phase = .snapshot_validated,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     const sorted_query_indexes = try graph_exec.sortGraphQueriesByDependencies(alloc, req.graph_queries);
@@ -2069,6 +2249,7 @@ const QueryState = struct {
     name: []u8,
     nodes: std.ArrayListUnmanaged(graph_query_mod.GraphResultNode) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
+    metric_status: std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus) = .empty,
     path_states: std.ArrayListUnmanaged(PathState) = .empty,
     seen: graph_node_identity.Map(void) = .{},
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
@@ -2118,6 +2299,8 @@ const QueryState = struct {
         self.nodes.deinit(alloc);
         for (self.hits.items) |*hit| hit.deinit(alloc);
         self.hits.deinit(alloc);
+        for (self.metric_status.items) |*status| status.deinit(alloc);
+        self.metric_status.deinit(alloc);
         for (self.path_states.items) |*path_state| path_state.deinit(alloc);
         self.path_states.deinit(alloc);
         self.seen.deinit(alloc);
@@ -2374,15 +2557,19 @@ const GraphNodeAdmissionContext = struct {
                 exclusion_query_json_live = true;
             }
         } else {
+            self.worker.reachLifecycle(.{
+                .phase = .target_authorization_started,
+                .table_name = table_name,
+            });
             var authorization = if (self.table_authorizer) |authorizer|
                 try authorizer.authorize(self.alloc, table_name)
             else
                 db_mod.types.GraphTableReadAuthorization{ .allowed = true };
             defer authorization.deinit(self.alloc);
             const exists = authorization.allowed and
-                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns);
+                try table_catalog.tableExistsUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog));
             topology_epoch = if (exists)
-                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.execution_deadline_ns)
+                try table_catalog.topologyEpochUntil(self.alloc, self.catalog, table_name, self.worker.routingDeadline(self.catalog))
             else
                 0;
             allowed = exists;
@@ -2759,7 +2946,7 @@ fn executeSingleCrossRange(
     request_work_budget: *graph_pattern_mod.WorkBudget,
     request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
-    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.execution_deadline_ns);
+    const topology_epoch = try table_catalog.topologyEpochUntil(alloc, catalog, table_name, worker.routingDeadline(catalog));
     const admission_req = graphNodeAdmissionRequest(req, graph_query);
     var admission = GraphNodeAdmissionContext.init(
         alloc,
@@ -2938,7 +3125,7 @@ const DistributedEdgeReader = struct {
             table_name,
             key,
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         )) orelse return error.TableNotFound;
 
         // Outgoing adjacency is colocated with its source and needs one routed
@@ -2977,7 +3164,7 @@ const DistributedEdgeReader = struct {
             "",
             "",
             table_state.topology_epoch,
-            self.worker.execution_deadline_ns,
+            self.worker.routingDeadline(self.catalog),
         );
         defer if (group_ids.len > 0) a.free(group_ids);
         if (group_ids.len == 0) return try a.alloc(graph_mod.Edge, 0);
@@ -3633,7 +3820,7 @@ fn executeDistributedConjunctivePattern(
             edge_reader.catalog,
             edge_reader.source_table,
             page,
-            edge_reader.worker.execution_deadline_ns,
+            edge_reader.worker.routingDeadline(edge_reader.catalog),
         );
         try validateMatchingSourceSnapshots(base_result, page);
         try validateMatchAnchorPageOrder(cursor_key, page.hits);
@@ -3970,7 +4157,11 @@ fn executeDistributedTraverse(
 ) !db_mod.types.GraphSearchResult {
     const include_paths = graph_query.query.params.include_paths;
     const result_limit = graph_query.query.params.max_results;
-    const collection_limit = graph_query_mod.resultCollectionLimit(result_limit);
+    const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(graph_query.query);
+    const collection_limit = if (defer_result_limit)
+        graph_query_mod.graph_metric_candidate_limit + 1
+    else
+        graph_query_mod.resultCollectionLimit(result_limit);
     const max_depth: u32 = switch (graph_query.query.query_type) {
         .neighbors => 1,
         .traverse => graph_query.query.params.max_depth,
@@ -4012,6 +4203,8 @@ fn executeDistributedTraverse(
     }
 
     while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
+        var completed_depth: u32 = 0;
+        for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
         var next_frontier = std.ArrayListUnmanaged(FrontierState).empty;
         defer {
             for (next_frontier.items) |*item| item.deinit(alloc);
@@ -4069,6 +4262,7 @@ fn executeDistributedTraverse(
                     for (step_result.expansions) |expansion| {
                         const item = frontier[expansion.frontier_id];
                         const step_graph = expansion.graph_result;
+                        try mergeGraphMetricStatuses(alloc, &state.metric_status, step_graph.metric_status);
 
                         for (step_graph.nodes) |node| {
                             const allowed = admitted[admitted_index];
@@ -4164,6 +4358,7 @@ fn executeDistributedTraverse(
                     for (step_result.expansions) |expansion| {
                         const item = frontier[expansion.frontier_id];
                         const step_graph = expansion.graph_result;
+                        try mergeGraphMetricStatuses(alloc, &state.metric_status, step_graph.metric_status);
 
                         for (step_graph.nodes) |node| {
                             const allowed = admitted[admitted_index];
@@ -4252,6 +4447,7 @@ fn executeDistributedTraverse(
                 for (step_result.expansions) |expansion| {
                     const item = frontier[expansion.frontier_id];
                     const step_graph = expansion.graph_result;
+                    try mergeGraphMetricStatuses(alloc, &state.metric_status, step_graph.metric_status);
 
                     for (step_graph.nodes) |node| {
                         const allowed = admitted[admitted_index];
@@ -4316,18 +4512,47 @@ fn executeDistributedTraverse(
             }
         }
 
+        worker.reachLifecycle(.{
+            .phase = .expand_round_completed,
+            .query_name = graph_query.name,
+            .depth = completed_depth +| 1,
+            .group_count = batch_entries.len,
+            .result_count = state.nodes.items.len,
+        });
+
         freeFrontier(alloc, frontier);
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
 
+    try validateDistributedGraphMetricExecutionStatus(
+        state.metric_status.items,
+        graph_query.query.order_by,
+        graph_query.query.where_metric,
+    );
+    try filterDistributedGraphNodesByMetric(alloc, &state.nodes, graph_query.query.where_metric);
+    try orderDistributedGraphNodesByMetric(alloc, state.nodes.items, graph_query.query.order_by);
     const truncated = graph_query_mod.resultCountIsTruncated(state.nodes.items.len, result_limit);
     if (truncated) {
         const public_len: usize = @intCast(result_limit);
         for (state.nodes.items[public_len..]) |*node| node.deinit(alloc);
         state.nodes.items.len = public_len;
     }
+    try retainDistributedGraphProjectedMetrics(alloc, &state.nodes, graph_query.query.metrics);
+    if (!graph_query.query.include_metric_status) {
+        for (state.metric_status.items) |*status| status.deinit(alloc);
+        state.metric_status.deinit(alloc);
+        state.metric_status = .empty;
+    }
 
-    const hydrated_hits = if (graphResultHydrationRequested(req, graph_query.query))
+    const hydration_requested = graphResultHydrationRequested(req, graph_query.query);
+    if (hydration_requested) {
+        worker.reachLifecycle(.{
+            .phase = .hydration_started,
+            .query_name = graph_query.name,
+            .result_count = state.nodes.items.len,
+        });
+    }
+    const hydrated_hits = if (hydration_requested)
         try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
@@ -4336,14 +4561,23 @@ fn executeDistributedTraverse(
         state.hits,
         hydrated_hits,
     );
+    if (hydration_requested) {
+        worker.reachLifecycle(.{
+            .phase = .hydration_completed,
+            .query_name = graph_query.name,
+            .result_count = state.hits.items.len,
+        });
+    }
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
     const name = state.name;
     const nodes = try state.nodes.toOwnedSlice(alloc);
     const hits = try state.hits.toOwnedSlice(alloc);
+    const metric_status = try state.metric_status.toOwnedSlice(alloc);
     state.name = try alloc.alloc(u8, 0);
     state.nodes = .empty;
     state.hits = .empty;
+    state.metric_status = .empty;
     defer {
         alloc.free(state.name);
         state.deinitTransient(alloc);
@@ -4356,6 +4590,7 @@ fn executeDistributedTraverse(
         .hits = hits,
         .total_hits = total_hits,
         .truncated = truncated,
+        .metric_status = metric_status,
     };
 }
 
@@ -5198,7 +5433,7 @@ fn findDistributedShortestPath(
             expansion_table,
             item.key,
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
@@ -5367,7 +5602,7 @@ fn batchFrontierByGroup(
                     table_name,
                     item.key,
                     table_state.topology_epoch,
-                    worker.execution_deadline_ns,
+                    worker.routingDeadline(catalog),
                 )) orelse return error.TableNotFound;
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
@@ -5381,7 +5616,7 @@ fn batchFrontierByGroup(
                         table_name,
                         item.key,
                         table_state.topology_epoch,
-                        worker.execution_deadline_ns,
+                        worker.routingDeadline(catalog),
                     )) orelse return error.TableNotFound;
                     try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
@@ -5407,7 +5642,7 @@ fn batchFrontierByGroup(
             "",
             "",
             table_state.topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         );
         defer if (group_ids.len > 0) alloc.free(group_ids);
         if (group_ids.len == 0) return error.TableNotFound;
@@ -6776,7 +7011,7 @@ fn hydrateHitsForKeys(
             table_name,
             key,
             topology_epoch,
-            worker.execution_deadline_ns,
+            worker.routingDeadline(catalog),
         )) orelse return error.TableNotFound;
         const batch = try batches.getOrPut(alloc, group_id);
         if (!batch.found_existing) batch.value_ptr.* = .empty;
@@ -6897,6 +7132,11 @@ fn hydrateHitsForKeys(
             for (entries[start..end], start..end) |entry, i| {
                 group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
             }
+            worker.reachLifecycle(.{
+                .phase = .hydration_fanout_started,
+                .group_count = end - start,
+                .cancellation = worker.cancellation,
+            });
             group.await(io) catch {};
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
@@ -6975,7 +7215,7 @@ pub fn probeIncomingEdgesForKeys(
         "",
         "",
         topology_epoch,
-        worker.execution_deadline_ns,
+        worker.routingDeadline(catalog),
     );
     defer if (group_ids.len > 0) alloc.free(group_ids);
     if (group_ids.len == 0) return error.TableNotFound;
@@ -7443,6 +7683,26 @@ pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !Gr
             .config_hash = parsed.value.incoming_index_config_hash,
         },
     };
+}
+
+test "graph hydrate response wire flattens index identity" {
+    const alloc = std.testing.allocator;
+    var response = GraphHydrateResponse{
+        .has_incoming = try alloc.dupe(bool, &.{ true, false }),
+        .incoming_index_identity = .{ .incarnation = 41, .config_hash = 99 },
+    };
+    defer response.deinit(alloc);
+
+    const encoded = try encodeGraphHydrateResponse(alloc, response);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_incarnation\":41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_config_hash\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"incoming_index_identity\"") == null);
+
+    var decoded = try parseGraphHydrateResponse(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, decoded.has_incoming);
+    try std.testing.expect(decoded.incoming_index_identity.eql(response.incoming_index_identity));
 }
 
 fn identityGenerationFromResolvedFilterEnvelope(
@@ -8773,8 +9033,13 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
     );
     defer admission.deinit();
     const edge_reader = DistributedEdgeReader{
-        .catalog = undefined,
-        .worker = undefined,
+        // Paging validates its deadline even when no edge expansion or
+        // routing snapshot is needed. Keep those clock fields initialized.
+        .catalog = .{ .ptr = undefined, .vtable = undefined },
+        .worker = .{ .ptr = undefined, .vtable = &.{
+            .execute_graph_expand = undefined,
+            .execute_graph_hydrate = undefined,
+        } },
         .source_table = "docs",
         .index_name = "graph",
         .consistency = .read_index,
@@ -9734,6 +9999,8 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
         tensor_program = try graphTraversalTensorProgramEnvelopeAlloc(alloc, named_query.query.index_name, target_constraint_keys.len > 0);
     }
 
+    const execution_metrics = try graphMetricExecutionReadsAlloc(alloc, named_query.query);
+    errdefer freeGraphMetricReads(alloc, execution_metrics);
     const name = try alloc.dupe(u8, named_query.name);
     errdefer alloc.free(name);
     const index_name = try alloc.dupe(u8, named_query.query.index_name);
@@ -9756,6 +10023,9 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
         .exclude_edges = owned_exclude_edges,
         .target_constraint_keys = owned_target_constraint_keys,
         .params = params,
+        .metrics = execution_metrics,
+        .include_metric_status = execution_metrics.len > 0,
+        .defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(named_query.query),
         .tensor_access_path = tensor_access_path,
         .tensor_program = tensor_program,
     };
@@ -9883,11 +10153,14 @@ pub fn frontierItemToSearchRequest(
     var params = req.params;
     params.edge_types = try dupConstStrings(alloc, req.params.edge_types);
     errdefer freeConstStrings(alloc, params.edge_types);
+    if (req.defer_result_limit) params.max_results = graph_query_mod.graph_metric_candidate_limit + 1;
 
     const name = try alloc.dupe(u8, req.name);
     errdefer alloc.free(name);
     const index_name = try alloc.dupe(u8, req.index_name);
     errdefer alloc.free(index_name);
+    const metrics = try dupGraphMetricReads(alloc, req.metrics);
+    errdefer freeGraphMetricReads(alloc, metrics);
 
     const graph_queries = try alloc.alloc(db_mod.types.NamedGraphQuery, 1);
     errdefer alloc.free(graph_queries);
@@ -9898,6 +10171,8 @@ pub fn frontierItemToSearchRequest(
             .index_name = index_name,
             .start_nodes = .{ .keys = frontier_keys },
             .params = params,
+            .metrics = metrics,
+            .include_metric_status = req.include_metric_status,
         },
     };
 
@@ -10005,8 +10280,121 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
             }
         }
         freeConstStrings(alloc, graph_query.query.params.edge_types);
+        freeGraphMetricReads(alloc, graph_query.query.metrics);
     }
     if (req.graph_queries.len > 0) alloc.free(req.graph_queries);
+}
+
+fn graphMetricReadJsonAlloc(
+    alloc: std.mem.Allocator,
+    metrics: []const graph_query_mod.GraphMetricRead,
+) ![]GraphMetricReadJson {
+    if (metrics.len == 0) return @constCast((&[_]GraphMetricReadJson{})[0..]);
+    const out = try alloc.alloc(GraphMetricReadJson, metrics.len);
+    for (metrics, 0..) |metric, i| {
+        out[i] = .{
+            .name = metric.name,
+            .freshness = switch (metric.freshness) {
+                .published => "published",
+                .fresh => "fresh",
+            },
+        };
+    }
+    return out;
+}
+
+fn parseGraphMetricReads(
+    alloc: std.mem.Allocator,
+    metrics: []const GraphMetricReadJson,
+) ![]graph_query_mod.GraphMetricRead {
+    if (metrics.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
+    const out = try alloc.alloc(graph_query_mod.GraphMetricRead, metrics.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |metric| alloc.free(@constCast(metric.name));
+        alloc.free(out);
+    }
+    for (metrics, 0..) |metric, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, metric.name),
+            .freshness = if (std.mem.eql(u8, metric.freshness, "fresh"))
+                .fresh
+            else if (std.mem.eql(u8, metric.freshness, "published"))
+                .published
+            else
+                return error.InvalidQueryRequest,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn dupGraphMetricReads(
+    alloc: std.mem.Allocator,
+    metrics: []const graph_query_mod.GraphMetricRead,
+) ![]graph_query_mod.GraphMetricRead {
+    if (metrics.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
+    const out = try alloc.alloc(graph_query_mod.GraphMetricRead, metrics.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |metric| alloc.free(@constCast(metric.name));
+        alloc.free(out);
+    }
+    for (metrics, 0..) |metric, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, metric.name),
+            .freshness = metric.freshness,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn graphMetricExecutionReadsAlloc(
+    alloc: std.mem.Allocator,
+    query: graph_query_mod.GraphQuery,
+) ![]graph_query_mod.GraphMetricRead {
+    var out = std.ArrayListUnmanaged(graph_query_mod.GraphMetricRead).empty;
+    errdefer {
+        for (out.items) |metric| alloc.free(@constCast(metric.name));
+        out.deinit(alloc);
+    }
+    for (query.metrics) |metric| try appendGraphMetricExecutionRead(alloc, &out, metric.name, metric.freshness);
+    for (query.order_by) |metric| try appendGraphMetricExecutionRead(alloc, &out, metric.name, metric.freshness);
+    for (query.where_metric) |metric| try appendGraphMetricExecutionRead(alloc, &out, metric.name, metric.freshness);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendGraphMetricExecutionRead(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(graph_query_mod.GraphMetricRead),
+    name: []const u8,
+    freshness: graph_query_mod.GraphMetricFreshness,
+) !void {
+    for (out.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, name)) continue;
+        existing.freshness = stricterGraphMetricFreshness(existing.freshness, freshness);
+        return;
+    }
+    try out.append(alloc, .{
+        .name = try alloc.dupe(u8, name),
+        .freshness = freshness,
+    });
+}
+
+fn stricterGraphMetricFreshness(
+    left: graph_query_mod.GraphMetricFreshness,
+    right: graph_query_mod.GraphMetricFreshness,
+) graph_query_mod.GraphMetricFreshness {
+    return if (left == .fresh or right == .fresh) .fresh else .published;
+}
+
+fn freeGraphMetricReads(
+    alloc: std.mem.Allocator,
+    metrics: []const graph_query_mod.GraphMetricRead,
+) void {
+    for (metrics) |metric| alloc.free(@constCast(metric.name));
+    if (metrics.len > 0) alloc.free(@constCast(metrics));
 }
 
 pub fn encodeGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandRequest) ![]u8 {
@@ -10038,6 +10426,8 @@ pub fn encodeGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandReques
             .distance = item.distance,
         };
     }
+    const metrics = try graphMetricReadJsonAlloc(alloc, req.metrics);
+    defer if (metrics.len > 0) alloc.free(metrics);
     const exclude_nodes = try alloc.alloc(GraphNodeIdentityJson, req.exclude_nodes.len);
     defer alloc.free(exclude_nodes);
     for (req.exclude_nodes, 0..) |identity, i| {
@@ -10050,6 +10440,9 @@ pub fn encodeGraphExpandRequest(alloc: std.mem.Allocator, req: GraphExpandReques
         .exclude_nodes = exclude_nodes,
         .exclude_edges = req.exclude_edges,
         .target_constraint_keys = req.target_constraint_keys,
+        .metrics = metrics,
+        .include_metric_status = req.include_metric_status,
+        .defer_result_limit = req.defer_result_limit,
         .topology_epoch = req.topology_epoch,
         .identity_read_generation = req.identity_read_generation,
         .params = .{
@@ -10182,6 +10575,9 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .exclude_nodes = exclude_nodes,
         .exclude_edges = exclude_edges,
         .target_constraint_keys = target_constraint_keys,
+        .metrics = try parseGraphMetricReads(alloc, parsed.value.metrics),
+        .include_metric_status = parsed.value.include_metric_status,
+        .defer_result_limit = parsed.value.defer_result_limit,
         .topology_epoch = parsed.value.topology_epoch,
         .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
@@ -10227,6 +10623,7 @@ pub fn encodeGraphExpandResponse(alloc: std.mem.Allocator, res: GraphExpandRespo
             .total = @intCast(expansion.graph_result.total_hits),
             .nodes = expansion.graph_result.nodes,
             .hits = expansion.graph_result.hits,
+            .metric_status = expansion.graph_result.metric_status,
         };
     }
     return try jsonStringifyAlloc(alloc, GraphExpandResponseJson{ .expansions = expansions });
@@ -10274,6 +10671,7 @@ pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !Gra
                 .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
                 .hits = hits,
                 .total_hits = expansion.total,
+                .metric_status = try cloneGraphMetricStatuses(alloc, expansion.metric_status),
             },
         };
         initialized += 1;
@@ -10463,6 +10861,12 @@ pub fn filterGraphSearchResult(
         if (owned_hits.len > 0) alloc.free(owned_hits);
     }
 
+    const metric_status = try cloneGraphMetricStatuses(alloc, src.metric_status);
+    errdefer {
+        for (metric_status) |*status| status.deinit(alloc);
+        if (metric_status.len > 0) alloc.free(metric_status);
+    }
+
     return .{
         .name = name,
         .nodes = owned_nodes,
@@ -10470,6 +10874,7 @@ pub fn filterGraphSearchResult(
         .matches = owned_matches,
         .hits = owned_hits,
         .total_hits = total_hits,
+        .metric_status = metric_status,
     };
 }
 
@@ -10606,7 +11011,7 @@ fn materializeResultNode(
     path_state_id: ?u32,
 ) !graph_query_mod.GraphResultNode {
     if (!include_paths) {
-        return try initGraphResultNode(
+        var result = try initGraphResultNode(
             alloc,
             node.key,
             node_table,
@@ -10616,6 +11021,9 @@ fn materializeResultNode(
             null,
             null,
         );
+        errdefer result.deinit(alloc);
+        result.metrics = try cloneGraphMetricValues(alloc, node.metrics);
+        return result;
     }
 
     const id = path_state_id orelse return error.InvalidQueryRequest;
@@ -11894,6 +12302,375 @@ fn cloneSearchHits(
     return out;
 }
 
+fn cloneGraphMetricValues(
+    alloc: std.mem.Allocator,
+    values: []const graph_query_mod.GraphMetricValue,
+) ![]graph_query_mod.GraphMetricValue {
+    if (values.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricValue{})[0..]);
+    const out = try alloc.alloc(graph_query_mod.GraphMetricValue, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*value| value.deinit(alloc);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, value.name),
+            .score = value.score,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneGraphMetricStatuses(
+    alloc: std.mem.Allocator,
+    statuses: []const db_mod.types.GraphMetricStatus,
+) ![]db_mod.types.GraphMetricStatus {
+    return db_mod.types.cloneGraphMetricStatuses(alloc, statuses);
+}
+
+fn cloneGraphMetricStatus(
+    alloc: std.mem.Allocator,
+    source: db_mod.types.GraphMetricStatus,
+) !db_mod.types.GraphMetricStatus {
+    return source.cloneAlloc(alloc);
+}
+
+fn cloneGraphMetricBuildPageStatuses(
+    alloc: std.mem.Allocator,
+    source: []const db_mod.types.GraphMetricBuildPageStatus,
+) ![]db_mod.types.GraphMetricBuildPageStatus {
+    return db_mod.types.cloneGraphMetricBuildPageStatuses(alloc, source);
+}
+
+fn mergeGraphMetricStatuses(
+    alloc: std.mem.Allocator,
+    target: *std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus),
+    statuses: []const db_mod.types.GraphMetricStatus,
+) !void {
+    for (statuses) |status| try mergeGraphMetricStatus(alloc, target, status);
+}
+
+fn mergeGraphMetricStatus(
+    alloc: std.mem.Allocator,
+    statuses: *std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus),
+    source: db_mod.types.GraphMetricStatus,
+) !void {
+    for (statuses.items) |*status| {
+        if (!std.mem.eql(u8, status.name, source.name)) continue;
+        try validateDistributedGraphMetricStatusCompatible(status.*, source);
+        if (status.published_generation != source.published_generation) return error.UnsupportedQueryRequest;
+        try mergeGraphMetricStatusInto(alloc, status, source);
+        return;
+    }
+    try statuses.append(alloc, try cloneGraphMetricStatus(alloc, source));
+}
+
+fn validateDistributedGraphMetricStatusCompatible(
+    existing: db_mod.types.GraphMetricStatus,
+    incoming: db_mod.types.GraphMetricStatus,
+) !void {
+    if (existing.metadata_version != 0 and
+        incoming.metadata_version != 0 and
+        existing.metadata_version != incoming.metadata_version)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+    if (existing.config_fingerprint != 0 and
+        incoming.config_fingerprint != 0 and
+        existing.config_fingerprint != incoming.config_fingerprint)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+    if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
+}
+
+fn mergeGraphMetricStatusInto(
+    alloc: std.mem.Allocator,
+    target: *db_mod.types.GraphMetricStatus,
+    source: db_mod.types.GraphMetricStatus,
+) !void {
+    target.state = mergeGraphMetricState(target.state, source.state);
+    target.phase = mergeGraphMetricPhase(target.phase, source.phase);
+    target.metadata_version = mergeGraphMetricMetadataVersion(target.metadata_version, source.metadata_version);
+    target.config_fingerprint = mergeComparableGeneration(target.config_fingerprint, source.config_fingerprint);
+    target.maintenance_paused = target.maintenance_paused or source.maintenance_paused;
+    target.build_queued = target.build_queued or source.build_queued;
+    target.published_generation = mergeComparableGeneration(target.published_generation, source.published_generation);
+    target.edge_generation = @max(target.edge_generation, source.edge_generation);
+    target.target_edge_generation = @max(target.target_edge_generation, source.target_edge_generation);
+    target.queued_generation = @max(target.queued_generation, source.queued_generation);
+    target.building_generation = @max(target.building_generation, source.building_generation);
+    target.build_job_id = if (target.build_job_id == 0) source.build_job_id else if (source.build_job_id == 0 or source.build_job_id == target.build_job_id) target.build_job_id else 0;
+    target.build_started_at_ms = if (target.build_started_at_ms == 0) source.build_started_at_ms else if (source.build_started_at_ms == 0 or source.build_started_at_ms == target.build_started_at_ms) target.build_started_at_ms else @min(target.build_started_at_ms, source.build_started_at_ms);
+    target.build_iteration = @max(target.build_iteration, source.build_iteration);
+    target.build_lease_expires_at_ms = @max(target.build_lease_expires_at_ms, source.build_lease_expires_at_ms);
+    target.build_completed_units = @max(target.build_completed_units, source.build_completed_units);
+    target.build_total_units = @max(target.build_total_units, source.build_total_units);
+    if (target.build_worker_id.len == 0) {
+        target.build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    } else if (source.build_worker_id.len > 0 and !std.mem.eql(u8, target.build_worker_id, source.build_worker_id)) {
+        alloc.free(@constCast(target.build_worker_id));
+        target.build_worker_id = try alloc.dupe(u8, "multiple");
+    }
+    if (target.build_cursor.len == 0 and source.build_cursor.len > 0) {
+        target.build_cursor = try alloc.dupe(u8, source.build_cursor);
+    }
+    if (target.build_pages.len == 0 and source.build_pages.len > 0) {
+        target.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, source.build_pages);
+    } else if (source.build_pages.len > 0) {
+        target.build_pages_truncated = true;
+    }
+    target.build_pages_truncated = target.build_pages_truncated or source.build_pages_truncated;
+    target.retry_count = @max(target.retry_count, source.retry_count);
+    if (target.last_error.len == 0 and source.last_error.len > 0) {
+        target.last_error = try alloc.dupe(u8, source.last_error);
+    }
+    target.progress = @min(target.progress, source.progress);
+    target.converged = target.converged and source.converged;
+    target.iterations_completed = @max(target.iterations_completed, source.iterations_completed);
+    target.delta = @max(target.delta, source.delta);
+    target.computed_at_ms = @max(target.computed_at_ms, source.computed_at_ms);
+}
+
+fn mergeGraphMetricMetadataVersion(left: u32, right: u32) u32 {
+    if (left == 0) return right;
+    if (right == 0) return left;
+    if (left == right) return left;
+    return 0;
+}
+
+fn mergeComparableGeneration(left: u64, right: u64) u64 {
+    if (left == 0) return right;
+    if (right == 0) return left;
+    if (left == right) return left;
+    return @min(left, right);
+}
+
+fn mergeGraphMetricState(
+    left: graph_mod.GraphIndex.GraphMetricState,
+    right: graph_mod.GraphIndex.GraphMetricState,
+) graph_mod.GraphIndex.GraphMetricState {
+    return if (graphMetricStateSeverity(right) > graphMetricStateSeverity(left)) right else left;
+}
+
+fn graphMetricStateSeverity(state: graph_mod.GraphIndex.GraphMetricState) u8 {
+    return switch (state) {
+        .disabled => 5,
+        .failed => 4,
+        .building => 3,
+        .not_ready => 2,
+        .stale => 1,
+        .fresh => 0,
+    };
+}
+
+fn mergeGraphMetricPhase(
+    left: graph_mod.GraphIndex.GraphMetricBuildPhase,
+    right: graph_mod.GraphIndex.GraphMetricBuildPhase,
+) graph_mod.GraphIndex.GraphMetricBuildPhase {
+    return if (graphMetricPhaseSeverity(right) > graphMetricPhaseSeverity(left)) right else left;
+}
+
+fn graphMetricPhaseSeverity(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) u8 {
+    return switch (phase) {
+        .cleanup_old_generations => 10,
+        .publish_generation, .publishing => 9,
+        .check_convergence => 8,
+        .hits_hub_reduce_ranks => 8,
+        .hits_hub_contributions => 8,
+        .reduce_ranks => 7,
+        .iterate_contributions, .computing => 6,
+        .initialize_ranks => 5,
+        .scan_edges_and_out_degree => 4,
+        .prepare_generation => 3,
+        .idle => 1,
+        .complete => 0,
+    };
+}
+
+fn validateDistributedGraphMetricExecutionStatus(
+    statuses: []const db_mod.types.GraphMetricStatus,
+    orders: []const graph_query_mod.GraphMetricOrder,
+    filters: []const graph_query_mod.GraphMetricFilter,
+) !void {
+    for (orders) |order| try validateDistributedGraphMetricStatus(statuses, order.name, order.freshness);
+    for (filters) |filter| try validateDistributedGraphMetricStatus(statuses, filter.name, filter.freshness);
+}
+
+fn validateDistributedGraphMetricStatus(
+    statuses: []const db_mod.types.GraphMetricStatus,
+    name: []const u8,
+    freshness: graph_query_mod.GraphMetricFreshness,
+) !void {
+    for (statuses) |status| {
+        if (!std.mem.eql(u8, status.name, name)) continue;
+        if (status.published_generation == 0) return error.MetricNotReady;
+        if (freshness == .fresh and status.state != .fresh) return error.MetricStale;
+        return;
+    }
+    return error.UnsupportedQueryRequest;
+}
+
+fn filterDistributedGraphNodesByMetric(
+    alloc: std.mem.Allocator,
+    nodes: *std.ArrayListUnmanaged(graph_query_mod.GraphResultNode),
+    filters: []const graph_query_mod.GraphMetricFilter,
+) !void {
+    if (filters.len == 0 or nodes.items.len == 0) return;
+    var write_index: usize = 0;
+    for (nodes.items, 0..) |*node, i| {
+        if (graphNodePassesMetricFilters(node.*, filters)) {
+            if (write_index != i) nodes.items[write_index] = node.*;
+            write_index += 1;
+        } else {
+            node.deinit(alloc);
+        }
+    }
+    nodes.items.len = write_index;
+}
+
+fn graphNodePassesMetricFilters(
+    node: graph_query_mod.GraphResultNode,
+    filters: []const graph_query_mod.GraphMetricFilter,
+) bool {
+    for (filters) |filter| {
+        const score = graphNodeMetricScore(node, filter.name) orelse return false;
+        if (!graphMetricFilterMatches(score, filter)) return false;
+    }
+    return true;
+}
+
+fn graphMetricFilterMatches(score: f64, filter: graph_query_mod.GraphMetricFilter) bool {
+    return switch (filter.op) {
+        .gt => score > filter.value,
+        .gte => score >= filter.value,
+        .lt => score < filter.value,
+        .lte => score <= filter.value,
+        .eq => score == filter.value,
+        .neq => score != filter.value,
+    };
+}
+
+const DistributedGraphMetricSortNode = struct {
+    node: graph_query_mod.GraphResultNode,
+    original_index: usize,
+};
+
+const DistributedGraphMetricSortContext = struct {
+    orders: []const graph_query_mod.GraphMetricOrder,
+    scores: []const ?f64,
+};
+
+fn orderDistributedGraphNodesByMetric(
+    alloc: std.mem.Allocator,
+    nodes: []graph_query_mod.GraphResultNode,
+    orders: []const graph_query_mod.GraphMetricOrder,
+) !void {
+    if (orders.len == 0 or nodes.len == 0) return;
+    const score_count = std.math.mul(usize, nodes.len, orders.len) catch return error.QueryCandidateBudgetExceeded;
+    const scores = try alloc.alloc(?f64, score_count);
+    defer alloc.free(scores);
+    const sortable = try alloc.alloc(DistributedGraphMetricSortNode, nodes.len);
+    defer alloc.free(sortable);
+    for (nodes, 0..) |node, i| {
+        const node_scores = scores[i * orders.len ..][0..orders.len];
+        for (orders, 0..) |order, order_index| {
+            node_scores[order_index] = graphNodeMetricScore(node, order.name);
+        }
+        sortable[i] = .{ .node = node, .original_index = i };
+    }
+    std.mem.sort(DistributedGraphMetricSortNode, sortable, DistributedGraphMetricSortContext{
+        .orders = orders,
+        .scores = scores,
+    }, distributedGraphMetricSortLessThan);
+    for (sortable, 0..) |item, i| nodes[i] = item.node;
+}
+
+fn distributedGraphMetricSortLessThan(
+    context: DistributedGraphMetricSortContext,
+    left: DistributedGraphMetricSortNode,
+    right: DistributedGraphMetricSortNode,
+) bool {
+    for (context.orders, 0..) |order, order_index| {
+        const cmp = compareOptionalGraphMetricScore(
+            context.scores[left.original_index * context.orders.len + order_index],
+            context.scores[right.original_index * context.orders.len + order_index],
+            order,
+        );
+        if (cmp) |less| return less;
+    }
+    return left.original_index < right.original_index;
+}
+
+fn compareOptionalGraphMetricScore(
+    left: ?f64,
+    right: ?f64,
+    order: graph_query_mod.GraphMetricOrder,
+) ?bool {
+    if (left == null and right == null) return null;
+    if (left == null) return order.nulls == .first;
+    if (right == null) return order.nulls != .first;
+    if (left.? == right.?) return null;
+    return if (order.direction == .desc) left.? > right.? else left.? < right.?;
+}
+
+fn graphNodeMetricScore(node: graph_query_mod.GraphResultNode, name: []const u8) ?f64 {
+    for (node.metrics) |metric| {
+        if (std.mem.eql(u8, metric.name, name)) return metric.score;
+    }
+    return null;
+}
+
+fn graphMetricPostProcessingNeedsFullCandidateSet(query: graph_query_mod.GraphQuery) bool {
+    return query.where_metric.len > 0 or query.order_by.len > 0;
+}
+
+fn limitDistributedGraphMetricPostProcessedNodes(
+    alloc: std.mem.Allocator,
+    nodes: *std.ArrayListUnmanaged(graph_query_mod.GraphResultNode),
+    max_results: u32,
+) void {
+    const keep_count: usize = @intCast(max_results);
+    if (max_results == 0 or nodes.items.len <= keep_count) return;
+    for (nodes.items[keep_count..]) |*node| node.deinit(alloc);
+    nodes.items.len = keep_count;
+}
+
+fn retainDistributedGraphProjectedMetrics(
+    alloc: std.mem.Allocator,
+    nodes: *std.ArrayListUnmanaged(graph_query_mod.GraphResultNode),
+    metrics: []const graph_query_mod.GraphMetricRead,
+) !void {
+    for (nodes.items) |*node| {
+        if (metrics.len == 0) {
+            for (node.metrics) |*value| value.deinit(alloc);
+            if (node.metrics.len > 0) alloc.free(node.metrics);
+            node.metrics = @constCast((&[_]graph_query_mod.GraphMetricValue{})[0..]);
+            continue;
+        }
+
+        const retained = try alloc.alloc(graph_query_mod.GraphMetricValue, metrics.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (retained[0..initialized]) |*value| value.deinit(alloc);
+            alloc.free(retained);
+        }
+        for (metrics, 0..) |metric, i| {
+            retained[i] = .{
+                .name = try alloc.dupe(u8, metric.name),
+                .score = graphNodeMetricScore(node.*, metric.name),
+            };
+            initialized += 1;
+        }
+
+        for (node.metrics) |*value| value.deinit(alloc);
+        if (node.metrics.len > 0) alloc.free(node.metrics);
+        node.metrics = retained;
+    }
+}
+
 fn cloneGraphNode(
     alloc: std.mem.Allocator,
     node: graph_query_mod.GraphResultNode,
@@ -11920,6 +12697,7 @@ fn cloneGraphNode(
         .path_edges = path_edges,
         .provenance = provenance,
         .table = table,
+        .metrics = try cloneGraphMetricValues(alloc, node.metrics),
     };
 }
 
@@ -12303,6 +13081,52 @@ test "distributed graph expand request carries constrained semiring target progr
 
     parsed.params.algebraic_semiring = false;
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphExpandTensorAccessPath(alloc, parsed));
+}
+
+test "distributed graph expand request bounds deferred worker metric candidates" {
+    const alloc = std.testing.allocator;
+    var frontier = [_]FrontierState{.{
+        .key = try alloc.dupe(u8, "doc:a"),
+    }};
+    defer frontier[0].deinit(alloc);
+    const frontier_ids = [_]u32{0};
+
+    var req = try makeGraphExpandRequest(alloc, .{
+        .name = "walk",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .params = .{
+                .edge_types = &.{"links"},
+                .max_depth = 3,
+                .max_results = 1,
+            },
+            .order_by = &.{.{
+                .name = "pagerank",
+                .direction = .desc,
+                .freshness = .published,
+            }},
+        },
+    }, frontier[0..], frontier_ids[0..], &.{}, &.{}, false);
+    defer req.deinit(alloc);
+    try std.testing.expect(req.defer_result_limit);
+    try std.testing.expect(req.include_metric_status);
+    try std.testing.expectEqual(@as(u32, 1), req.params.max_results);
+
+    const encoded = try encodeGraphExpandRequest(alloc, req);
+    defer alloc.free(encoded);
+    var parsed = try parseGraphExpandRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.defer_result_limit);
+    try std.testing.expectEqual(@as(u32, 1), parsed.params.max_results);
+
+    const search_req = try frontierItemToSearchRequest(alloc, parsed, parsed.frontier[0]);
+    defer freeExpandSearchRequest(alloc, search_req);
+    try std.testing.expectEqual(graph_query_mod.graph_metric_candidate_limit + 1, search_req.graph_queries[0].query.params.max_results);
+    try std.testing.expect(search_req.graph_queries[0].query.include_metric_status);
+    try std.testing.expectEqual(@as(usize, 1), search_req.graph_queries[0].query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", search_req.graph_queries[0].query.metrics[0].name);
 }
 
 test "distributed graph detects semiring-enabled graph index config" {
@@ -13546,6 +14370,9 @@ test "distributed graph traverse target nodes filter returned nodes without prun
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -13895,6 +14722,9 @@ test "distributed graph traverse routes cross-table frontier by table generation
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14098,6 +14928,9 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
+            .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
+        lifecycle_valid: bool = true,
     };
 
     const FakeCatalog = struct {
@@ -14149,11 +14982,36 @@ test "distributed graph retries once on topology change and succeeds" {
         fn iface(state: *TestState) Worker {
             return .{
                 .ptr = state,
+                .lifecycle_hook = .{ .ptr = state, .reach_fn = reachLifecycle },
                 .vtable = &.{
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
                 },
             };
+        }
+
+        fn reachLifecycle(ptr: *anyopaque, event: LifecycleEvent) void {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
+            switch (event.phase) {
+                // This fixture deliberately uses the scalar identity stamp,
+                // so it has no per-shard snapshot vector to count.
+                .source_snapshot_acquired => state.lifecycle_valid = state.lifecycle_valid and event.group_count == 0,
+                .snapshot_validated => {},
+                .target_authorization_started => state.lifecycle_valid = state.lifecycle_valid and event.table_name.len > 0,
+                .expand_round_completed => {
+                    state.lifecycle_valid = state.lifecycle_valid and
+                        std.mem.eql(u8, "walk", event.query_name) and
+                        event.depth == 1 and event.result_count == 1;
+                },
+                .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                // A scheduled fanout batch may contain one group.
+                .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
+                .attempt_failed => {
+                    state.lifecycle_valid = state.lifecycle_valid and event.attempt == 0 and
+                        event.error_code == @intFromError(error.TopologyChanged);
+                },
+            }
         }
 
         fn executeGraphExpand(
@@ -14264,6 +15122,13 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.source_snapshot_acquired)]);
+    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+    try std.testing.expect(state.lifecycle_valid);
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {
@@ -14426,6 +15291,9 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                 },
             };
         }
@@ -14614,4 +15482,147 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+}
+
+test "distributed graph metric status merge validates metadata compatibility" {
+    const alloc = std.testing.allocator;
+    const left_types = [_][]const u8{ "cites", "mentions" };
+    const reordered_types = [_][]const u8{ "mentions", "cites" };
+    const different_types = [_][]const u8{"related"};
+
+    var statuses = std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus).empty;
+    defer {
+        for (statuses.items) |*status| status.deinit(alloc);
+        statuses.deinit(alloc);
+    }
+
+    try mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &left_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    });
+
+    try mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    });
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 4,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &different_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .not_ready,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 3,
+            .published_generation = 0,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 0.0,
+            .converged = false,
+        },
+    }));
+}
+
+test "distributed graph metric post processing applies max results after filter and order" {
+    const alloc = std.testing.allocator;
+
+    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
+    defer {
+        for (nodes.items) |*node| node.deinit(alloc);
+        nodes.deinit(alloc);
+    }
+
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "B"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 1.0 },
+        }),
+    });
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "C"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 3.0 },
+        }),
+    });
+    try nodes.append(alloc, .{
+        .key = try alloc.dupe(u8, "D"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "degree"), .score = 2.0 },
+        }),
+    });
+
+    const filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "degree",
+        .op = .gte,
+        .value = 2.0,
+        .freshness = .published,
+    }};
+    const orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "degree",
+        .direction = .desc,
+        .freshness = .published,
+    }};
+
+    try filterDistributedGraphNodesByMetric(alloc, &nodes, &filters);
+    try orderDistributedGraphNodesByMetric(alloc, nodes.items, &orders);
+    limitDistributedGraphMetricPostProcessedNodes(alloc, &nodes, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), nodes.items.len);
+    try std.testing.expectEqualStrings("C", nodes.items[0].key);
 }

@@ -48,6 +48,9 @@ pub const CreatedObjectShape = enum {
     graph_context,
     graph_algebraic_planning,
     graph_bounded_traversal,
+    graph_metrics,
+    graph_metric,
+    graph_metric_filter,
     edge_types,
     edge_type,
     graph_resolvers,
@@ -94,6 +97,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "execution") or
             std.mem.eql(u8, field, "sources"),
         .graph => std.mem.eql(u8, field, "summarizer") or
+            std.mem.eql(u8, field, "metrics") or
             std.mem.eql(u8, field, "template") or
             std.mem.eql(u8, field, "edge_types") or
             std.mem.eql(u8, field, "max_edges_per_document") or
@@ -161,6 +165,8 @@ pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObje
             .graph_artifact
         else if (std.mem.eql(u8, field, "algebraic_planning"))
             .graph_algebraic_planning
+        else if (std.mem.eql(u8, field, "metrics"))
+            .graph_metrics
         else if (std.mem.eql(u8, field, "edge_types"))
             .edge_types
         else if (std.mem.eql(u8, field, "resolvers"))
@@ -203,6 +209,7 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .edge_type => &.{"name"},
         .graph_resolver => &.{ "name", "table", "source_artifact", "resolution_artifact", "key_template" },
         .graph_bounded_traversal => &.{"law"},
+        .graph_metrics, .graph_metric, .graph_metric_filter => &.{},
         .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
@@ -214,6 +221,8 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
 
 pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8) CreatedObjectShape {
     return switch (parent) {
+        .graph_metrics => .graph_metric,
+        .graph_metric => if (std.mem.eql(u8, field, "edge_filter")) .graph_metric_filter else .unrestricted,
         .enrichment => if (std.mem.eql(u8, field, "execution")) .execution_policy else .unrestricted,
         .chunker => if (std.mem.eql(u8, field, "text"))
             .chunker_text
@@ -243,6 +252,12 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
+        .graph_metrics => field.len > 0 and std.mem.indexOfScalar(u8, field, 0) == null,
+        .graph_metric => std.mem.eql(u8, field, "enabled") or std.mem.eql(u8, field, "kind") or
+            std.mem.eql(u8, field, "refresh") or std.mem.eql(u8, field, "damping") or
+            std.mem.eql(u8, field, "tolerance") or std.mem.eql(u8, field, "max_iterations") or
+            std.mem.eql(u8, field, "edge_filter"),
+        .graph_metric_filter => std.mem.eql(u8, field, "mode") or std.mem.eql(u8, field, "types"),
         .unrestricted => true,
         .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => false,
         .provider => isAllowedCreatedProviderField(field),
@@ -308,6 +323,7 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
             value == .array
         else if (std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "source") or
+            std.mem.eql(u8, field, "metrics") or
             std.mem.eql(u8, field, "artifact") or
             std.mem.eql(u8, field, "algebraic_planning"))
             value == .object
@@ -321,6 +337,12 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
 /// object. `full_text_index` is the sole intentionally dynamic subtree.
 pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, value: std.json.Value) bool {
     return switch (shape) {
+        .graph_metrics => value == .object,
+        .graph_metric => graphMetricFieldValueMatches(field, value),
+        .graph_metric_filter => if (std.mem.eql(u8, field, "types"))
+            isNonEmptyStringArray(value) and value.array.items.len > 0
+        else
+            isString(value) and std.mem.eql(u8, value.string, "all"),
         .unrestricted => true,
         .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => false,
         .provider => providerFieldValueMatches(field, value),
@@ -343,6 +365,28 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .index_execution => value == .object,
         .execution_policy => isInteger(value),
     };
+}
+
+fn graphMetricFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "enabled")) return isBool(value);
+    if (std.mem.eql(u8, field, "edge_filter")) return value == .object;
+    if (std.mem.eql(u8, field, "max_iterations")) return value == .integer and value.integer > 0 and value.integer <= 1000;
+    if (std.mem.eql(u8, field, "damping") or std.mem.eql(u8, field, "tolerance")) {
+        const number: f64 = switch (value) {
+            .integer => |v| @floatFromInt(v),
+            .float => |v| v,
+            else => return false,
+        };
+        return std.math.isFinite(number) and number > 0 and
+            (!std.mem.eql(u8, field, "damping") or number < 1);
+    }
+    if (!isString(value)) return false;
+    const allowed: []const []const u8 = if (std.mem.eql(u8, field, "refresh"))
+        &.{ "background", "manual" }
+    else
+        &.{ "pagerank", "degree", "eigenvector", "hits_authority", "hits_hub" };
+    for (allowed) |name| if (std.mem.eql(u8, value.string, name)) return true;
+    return false;
 }
 
 fn providerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
@@ -594,7 +638,9 @@ pub fn isAllowedIndexExecutionField(field: []const u8) bool {
 }
 
 pub fn isAllowedExecutionPolicyField(field: []const u8) bool {
-    return std.mem.eql(u8, field, "batch_items") or std.mem.eql(u8, field, "batch_bytes");
+    return std.mem.eql(u8, field, "batch_items") or
+        std.mem.eql(u8, field, "batch_bytes") or
+        std.mem.eql(u8, field, "max_document_pages");
 }
 
 fn isCommonField(field: []const u8) bool {

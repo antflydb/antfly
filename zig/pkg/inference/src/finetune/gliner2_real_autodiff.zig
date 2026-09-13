@@ -3513,6 +3513,7 @@ test "count-embed schema projection is invariant to span negative masking" {
         .lazy_weights = .{},
     };
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     var owned = std.ArrayListUnmanaged(CT).empty;
@@ -3646,6 +3647,7 @@ test "span_start count-embed schema projection ignores the structure BCE mask" {
         .lazy_weights = .{},
     };
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     const cb = compute.computeBackend();
 
     var owned = std.ArrayListUnmanaged(CT).empty;

@@ -46,6 +46,12 @@ pub const OpenOptions = struct {
     enrichment: ?support.enrichment_runtime.Config = null,
     inference: support.lite.backend.InferenceOpenOptions = .{},
     ttl_cleanup: ttl_runtime.Config = .{},
+    /// Optional runtime ownership supplied by an embedding host. When set,
+    /// background work and all DB-level I/O use the caller's std.Io lanes.
+    backend_runtime: ?*support.background_runtime.BackendRuntime = null,
+    /// Optional caller-owned std.Io for the native `.aflite` container. This
+    /// is normally the same interface exposed by `backend_runtime`.
+    lite_io: ?std.Io = null,
 };
 
 pub const Profile = support.lite.backend.Profile;
@@ -99,6 +105,7 @@ pub const DB = struct {
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
+            .io = liteIo(opts),
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
     }
@@ -108,6 +115,7 @@ pub const DB = struct {
         var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = opts.no_sync,
+            .io = liteIo(opts),
         });
         return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
     }
@@ -172,7 +180,7 @@ pub const DB = struct {
 
     pub fn liteStatus(self: *DB, alloc: Allocator) !LiteStatus {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
-        var status = try backend.fullStatus(alloc, &self.inner, self.profile);
+        var status = try backend.fullStatus(alloc, self.inner, self.profile);
         status.inference = self.lite_inference_status orelse status.inference;
         status.capabilities = support.lite.backend.capabilitiesForProfileWithInferenceStatus(self.profile, status.inference);
         return status;
@@ -286,14 +294,12 @@ pub const DB = struct {
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
-        if (self.owned_lite_backend != null) {
-            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, backup);
+        if (self.owned_lite_backend) |*lite_backend| {
+            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, lite_backend, backup);
             return;
         }
-        try support.portable_backup.validatePortable(alloc, backup);
-        try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
         const target_identity = self.inner.core.identity_namespace;
-        try self.inner.reassignIdentityNamespaceForInternalTransition(target_identity);
+        try self.inner.importPortableIntoEmpty(alloc, backup, target_identity);
     }
 
     pub fn checkLite(self: *DB) !LiteCheckReport {
@@ -345,6 +351,7 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         .storage = opts.storage,
         .index_backends = opts.index_backends,
         .ttl_cleanup = opts.ttl_cleanup,
+        .backend_runtime = opts.backend_runtime,
     };
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };
@@ -359,6 +366,12 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
+}
+
+fn liteIo(opts: OpenOptions) ?std.Io {
+    if (opts.lite_io) |io| return io;
+    if (opts.backend_runtime) |runtime| return runtime.io();
+    return null;
 }
 
 fn openModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
@@ -691,7 +704,7 @@ test "embedded db openLite can run ttl cleanup over aflite file" {
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
@@ -799,6 +812,45 @@ test "embedded db openLite persists schema json in aflite file" {
         defer alloc.free(loaded);
         try std.testing.expectEqualStrings(schema_json, loaded);
     }
+}
+
+test "embedded db portable relational restore is immediately readable and validated" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try testLitePath(alloc, tmp, "embedded-relational-source.aflite");
+    defer alloc.free(source_path);
+    const target_path = try testLitePath(alloc, tmp, "embedded-relational-target.aflite");
+    defer alloc.free(target_path);
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","enum":["active"]}},"required":["id","status"],"additionalProperties":false}}}}
+    ;
+
+    var backup = std.ArrayList(u8).empty;
+    defer backup.deinit(alloc);
+    {
+        var source = try DB.createLite(alloc, source_path, .{});
+        defer source.close();
+        try source.setSchemaJson(alloc, schema_json);
+        try source.batch(.{ .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"id\":\"a\",\"status\":\"active\"}",
+        }} });
+        try source.exportPortable(alloc, &backup);
+    }
+
+    var target = try DB.createLite(alloc, target_path, .{});
+    defer target.close();
+    try target.importPortable(alloc, backup.items);
+
+    var restored = (try target.lookup(alloc, "row:a", .{})) orelse return error.MissingLiteDocument;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"active\"") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, target.batch(.{ .writes = &.{.{
+        .key = "row:invalid",
+        .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
+    }} }));
 }
 
 test "embedded db openLite persists index and enrichment catalogs in aflite file" {

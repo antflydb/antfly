@@ -77,6 +77,9 @@ pub const LocalTableRuntimeStatus = struct {
     // deliberately separate from metadata.status_generation, which identifies
     // externally published store snapshots.
     cache_observation_generation: u64 = 0,
+    // A retained observation can outlive a catalog fence. Its durable target
+    // deduplicates notifications only within the epoch that accepted it.
+    cache_publication_epoch: ?TableRuntimeSnapshotCache.TableEpoch = null,
     // Identifies the filesystem observation that produced disk_bytes. Disk
     // usage has a separate causal lifetime from DB/runtime facts: a cached or
     // startup status can still carry a freshly scanned, authoritative size.
@@ -87,6 +90,7 @@ pub const LocalTableRuntimeStatus = struct {
     created_at_millis: u64 = 0,
     stats: db_mod.types.DBStats,
     lsm_storage_stats: ?LsmStorageStats = null,
+    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         db_mod.types.freeDBStats(alloc, self.stats);
@@ -97,6 +101,7 @@ pub const LocalTableRuntimeStatus = struct {
         return .{
             .group_id = self.group_id,
             .cache_observation_generation = self.cache_observation_generation,
+            .cache_publication_epoch = self.cache_publication_epoch,
             .disk_observation_generation = self.disk_observation_generation,
             .metadata = self.metadata,
             .disk_bytes = self.disk_bytes,
@@ -104,6 +109,7 @@ pub const LocalTableRuntimeStatus = struct {
             .created_at_millis = self.created_at_millis,
             .stats = try cloneDBStats(alloc, self.stats),
             .lsm_storage_stats = self.lsm_storage_stats,
+            .source_vectors = self.source_vectors,
         };
     }
 
@@ -268,6 +274,11 @@ const TargetedIndexAuthority = struct {
         // it only through its own applied replay witness. One watermark keeps
         // this bounded regardless of coalesced writes or observation gaps.
         reducing_source_sequence: u64,
+        // Accepted observation is authority for this exact requirement, not
+        // a property that a late owner snapshot may revoke. A new commit or
+        // incarnation replaces the requirement and clears this proof.
+        observed: bool = false,
+        observed_source_target_sequence: u64 = 0,
     };
 
     const TerminalFailure = struct {
@@ -899,6 +910,8 @@ pub const TableRuntimeSnapshotCache = struct {
             // Durable DB replay ordering deduplicates repeated notifications
             // and proves that the sampled source target includes the commit.
             source_target_sequence: u64,
+            observed: bool = false,
+            observed_source_target_sequence: u64 = 0,
         };
 
         ref_count: std.atomic.Value(usize) = .init(1),
@@ -955,6 +968,7 @@ pub const TableRuntimeSnapshotCache = struct {
     topology_revision: u64 = 1,
     next_invalidation_epoch: u64 = 1,
     next_observation_generation: u64 = 1,
+    stabilize_physical_duration_telemetry: bool = false,
     next_targeted_index_transition_revision: u64 = 1,
     target_observation_revision: u64 = 1,
     tables: std.StringHashMapUnmanaged(*TableState) = .empty,
@@ -1016,6 +1030,17 @@ pub const TableRuntimeSnapshotCache = struct {
         state.mutation_mutex.unlock(std.Options.debug_io);
         self.mutation_barrier.unlockShared(std.Options.debug_io);
         state.release(self.alloc);
+    }
+
+    /// Physical execution durations are useful in native production status,
+    /// but they are not logical state and cannot be replayed across fresh
+    /// worlds. A runtime with a modeled executor keeps semantic timestamps,
+    /// deadlines, counters, and readiness unchanged while stabilizing only
+    /// the diagnostic duration fields returned by snapshots.
+    pub fn setModeledRuntimeTelemetry(self: *@This(), enabled: bool) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.stabilize_physical_duration_telemetry = enabled;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -1614,6 +1639,21 @@ pub const TableRuntimeSnapshotCache = struct {
         };
     }
 
+    /// Reports whether a previously captured observation still belongs to the
+    /// current table/root lifetime. This is intentionally read-only: resource
+    /// retirement can use it to preserve an already-published immutable
+    /// snapshot without advancing the observation ordering boundary.
+    pub fn publicationTableEpochCurrent(
+        self: *@This(),
+        table_name: []const u8,
+        token: PublicationToken,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.tables.get(table_name) orelse return false;
+        return std.meta.eql(state.epoch, token.table_epoch);
+    }
+
     /// Captures all catalog tables in one lock acquisition before refresh DB
     /// inspection begins. `table_names` need only live for this call.
     pub fn captureCatalogToken(
@@ -1755,6 +1795,7 @@ pub const TableRuntimeSnapshotCache = struct {
             &owned,
             token.target_observation_revision,
         );
+        owned.cache_publication_epoch = state.epoch;
         if (current) |value| {
             retired_status = value.*;
             value.* = owned;
@@ -1776,6 +1817,7 @@ pub const TableRuntimeSnapshotCache = struct {
         if (completed_global_handoff) self.syncReadViewAuthorityLocked(table_name, state);
         if (prepared) |group| {
             group.status.cache_observation_generation = published_status.cache_observation_generation;
+            group.status.cache_publication_epoch = published_status.cache_publication_epoch;
             group.status.metadata = published_status.metadata;
             syncReadGroupAuthorityFromStateLocked(state, group);
             lockAtomic(&self.read_view_mutex);
@@ -1797,6 +1839,23 @@ pub const TableRuntimeSnapshotCache = struct {
         if (needs_topology_refresh or prepared == null)
             self.refreshReadViewPrepared(table_name, token.table_epoch);
         return .published;
+    }
+
+    /// Publishes a group observation whose caller owns the table/group
+    /// operation through status collection and publication. Visibility-only
+    /// invalidations from that operation may advance `invalidation_epoch`, but
+    /// a drop/recreate or storage-root replacement advances `root_generation`
+    /// and must still fence the old owner. Observation ordering is assigned
+    /// while holding the cache lock so an overlapping cache-only refresh cannot
+    /// make an older materialization win merely because it reserved an
+    /// observation number later.
+    pub fn publishGroupAtConsistentBoundary(
+        self: *@This(),
+        token: PublicationToken,
+        table_name: []const u8,
+        status: LocalTableRuntimeStatus,
+    ) !PublishResult {
+        return self.publishGroupsAtBoundary(token, table_name, null, null, &.{status}, true);
     }
 
     /// Publishes a bounded set of owned observations under one table-epoch
@@ -1877,6 +1936,19 @@ pub const TableRuntimeSnapshotCache = struct {
         transition_token: ?TargetedIndexTransitionToken,
         statuses: []const LocalTableRuntimeStatus,
     ) !PublishResult {
+        return self.publishGroupsAtBoundary(token, table_name, target_index_name, transition_token, statuses, false);
+    }
+
+    fn publishGroupsAtBoundary(
+        self: *@This(),
+        sampled_token: PublicationToken,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+        transition_token: ?TargetedIndexTransitionToken,
+        statuses: []const LocalTableRuntimeStatus,
+        owned_consistent: bool,
+    ) !PublishResult {
+        var token = sampled_token;
         try self.validateUniqueRuntimeStatusGroups(statuses);
         const mutation_state = self.lockExistingTableMutation(table_name) orelse return .stale_table;
         defer self.unlockTableMutation(mutation_state);
@@ -1920,6 +1992,15 @@ pub const TableRuntimeSnapshotCache = struct {
         {
             defer self.mutex.unlock();
             const state = self.tables.get(table_name) orelse return .stale_table;
+            if (owned_consistent) {
+                if (state.epoch.root_generation != sampled_token.table_epoch.root_generation)
+                    return .stale_table;
+                // The operation owner may cross visibility invalidation, never
+                // a root replacement. Preserve the sampled target revision so
+                // this cannot borrow a newer targeted-index authority.
+                token.table_epoch = state.epoch;
+                token.observation_generation = self.takeObservationGenerationLocked();
+            }
             if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
             var missing_group_count: usize = 0;
             for (statuses) |status| {
@@ -2072,12 +2153,6 @@ pub const TableRuntimeSnapshotCache = struct {
         for (owned, statuses, incoming_lookups, merge_workspaces, 0..) |*next, status, incoming_lookup, *workspace, owned_index| {
             next.cache_observation_generation = token.observation_generation;
             next.withMetadataDefaults(.live_writer_publish, now_ns);
-            self.applyTargetObservationAuthorityLocked(
-                state,
-                status.group_id,
-                next,
-                token.target_observation_revision,
-            );
             if (state.groups.getPtr(status.group_id)) |previous| {
                 if (previous.cache_observation_generation > token.observation_generation) {
                     continue;
@@ -2102,12 +2177,17 @@ pub const TableRuntimeSnapshotCache = struct {
                     true,
                 );
             }
+            // Retention can replace a coverage payload and its source witness.
+            // Certify the payload that will actually be installed, not the
+            // newer raw observation which may have been rejected above.
+            self.applyTargetObservationAuthorityLocked(state, status.group_id, next, token.target_observation_revision);
             publishable[owned_index] = true;
         }
 
         var published = false;
         for (owned, statuses, publishable, merge_workspaces, 0..) |*next, status, should_publish, *workspace, owned_index| {
             if (!should_publish) continue;
+            next.cache_publication_epoch = state.epoch;
             if (state.groups.getPtr(status.group_id)) |previous| {
                 finishMovedIndexObservationDeltaLocked(previous, next, &(workspace.* orelse unreachable));
             } else {
@@ -2227,12 +2307,15 @@ pub const TableRuntimeSnapshotCache = struct {
         state.groups = replacement;
         replacement = .empty;
         replacement_owned = false;
+        var published_groups = state.groups.valueIterator();
+        while (published_groups.next()) |status| status.cache_publication_epoch = state.epoch;
         self.clearIndexAuthoritiesLocked(state);
 
         if (prepared_read_view) |view| {
             for (view.groups) |group| {
                 const current = state.groups.get(group.status.group_id).?;
                 group.status.cache_observation_generation = current.cache_observation_generation;
+                group.status.cache_publication_epoch = current.cache_publication_epoch;
                 group.status.metadata = current.metadata;
                 syncReadGroupAuthorityFromStateLocked(state, group);
             }
@@ -2391,6 +2474,7 @@ pub const TableRuntimeSnapshotCache = struct {
     fn cloneStableTableStatuses(
         state: *const TableState,
         alloc: std.mem.Allocator,
+        stabilize_physical_duration_telemetry: bool,
     ) !?LocalTableRuntimeStatuses {
         if (state.groups.count() == 0) return null;
         const ordered = try alloc.alloc(*const LocalTableRuntimeStatus, state.groups.count());
@@ -2408,6 +2492,8 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         for (ordered) |status| {
             items[initialized] = try status.clone(alloc);
+            if (stabilize_physical_duration_telemetry)
+                stabilizePhysicalDurationTelemetry(&items[initialized].stats);
             initialized += 1;
         }
         return .{ .items = items };
@@ -2445,7 +2531,11 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         self.mutex.unlock();
 
-        var statuses = (cloneStableTableStatuses(initial_state, self.read_view_alloc) catch return) orelse return;
+        var statuses = (cloneStableTableStatuses(
+            initial_state,
+            self.read_view_alloc,
+            self.stabilize_physical_duration_telemetry,
+        ) catch return) orelse return;
         defer statuses.deinit(self.read_view_alloc);
         const prepared = ReadView.init(self.read_view_alloc, statuses) catch return;
         var prepared_owned = true;
@@ -2738,6 +2828,34 @@ pub const TableRuntimeSnapshotCache = struct {
             if (state.required_target_observation_revisions.get(group_id)) |required| {
                 if (sequence <= required.source_target_sequence) return .no_change;
             }
+            // Owner sampling can finish before the corresponding publication
+            // callback reaches this cache. That durable target is already
+            // observed even if no notification watermark was recorded yet.
+            // Do not mint a new causal fence for the delayed duplicate.
+            // Pending, cached, or synthetic observations cannot supply this proof, and
+            // null-sequence structural invalidations must always fence.
+            if (state.groups.get(group_id)) |observed| {
+                if (observed.metadata.target_observation_complete and
+                    observed.metadata.source != .cached_snapshot and
+                    observed.metadata.source != .synthetic_config and
+                    observed.cache_publication_epoch != null and
+                    std.meta.eql(observed.cache_publication_epoch.?, state.epoch) and
+                    sequence <= observed.metadata.target_observation_revision)
+                {
+                    // Retain the accepted proof even when the notification
+                    // needs no new fence. A late snapshot must not erase it.
+                    state.required_target_observation_revisions.put(self.alloc, group_id, .{
+                        .event_revision = self.target_observation_revision,
+                        .source_target_sequence = sequence,
+                        .observed = true,
+                        .observed_source_target_sequence = observed.metadata.target_observation_revision,
+                    }) catch {
+                        self.invalidateTableStateLocked(table_name, state);
+                        return .state_invalidated;
+                    };
+                    return .no_change;
+                }
+            }
         }
         self.advanceTargetObservationRevisionLocked();
         const requirement = TableState.TargetObservationRequirement{
@@ -2750,8 +2868,9 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(table_name, state);
             return .state_invalidated;
         };
-        if (state.groups.getPtr(group_id)) |status|
+        if (state.groups.getPtr(group_id)) |status| {
             status.metadata.target_observation_complete = false;
+        }
         return .group_applied;
     }
 
@@ -2915,7 +3034,9 @@ pub const TableRuntimeSnapshotCache = struct {
                 true;
         var reducing_source_sequence = if (serving_set_may_reduce) source_target_sequence else 0;
         var merged_target_sequence = source_target_sequence;
+        var event_revision: u64 = 0;
         if (authority.?.convergence_requirements.get(group_id)) |required| {
+            event_revision = required.event_revision;
             // Commit notifications run after releasing the source lock. Their
             // delivery order is not commit order: an older delete can carry
             // reduction authority that a newer additive callback did not.
@@ -2925,11 +3046,34 @@ pub const TableRuntimeSnapshotCache = struct {
                 reducing_source_sequence == required.reducing_source_sequence)
                 return .no_change;
         }
-        self.advanceTargetObservationRevisionLocked();
+        // A delayed exact callback can arrive after both source observation
+        // and index replay have covered it. Keep the durable target/reduction
+        // watermarks for future merges, but do not demand a second observation
+        // of an already-applied target in this catalog epoch.
+        const already_observed = observed: {
+            const status = current_status orelse break :observed false;
+            const position = current_position orelse break :observed false;
+            const item = status.stats.indexes[position];
+            break :observed status.metadata.target_observation_complete and
+                status.metadata.source != .cached_snapshot and
+                status.metadata.source != .synthetic_config and
+                status.cache_publication_epoch != null and
+                std.meta.eql(status.cache_publication_epoch.?, state.epoch) and
+                status.metadata.target_observation_revision >= merged_target_sequence and
+                item.runtime_target_observation_complete and
+                item.replay_target_sequence >= merged_target_sequence and
+                item.replay_applied_sequence >= merged_target_sequence;
+        };
+        if (!already_observed) {
+            self.advanceTargetObservationRevisionLocked();
+            event_revision = self.target_observation_revision;
+        }
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
-            .event_revision = self.target_observation_revision,
+            .event_revision = event_revision,
             .source_target_sequence = merged_target_sequence,
             .reducing_source_sequence = reducing_source_sequence,
+            .observed = already_observed,
+            .observed_source_target_sequence = if (already_observed) merged_target_sequence else 0,
         }) catch {
             // Exact-scope bookkeeping failed, so conservatively widen this
             // one event to the established group-wide convergence fence.
@@ -2941,10 +3085,12 @@ pub const TableRuntimeSnapshotCache = struct {
                 source_target_sequence,
             );
         };
+        if (already_observed) return .no_change;
         if (current_status) |status| {
             const item = &status.stats.indexes[current_position orelse return .index_applied];
-            if (indexMatchesTargetIdentity(item.*, identity))
+            if (indexMatchesTargetIdentity(item.*, identity)) {
                 item.runtime_target_observation_complete = false;
+            }
         }
         return .index_applied;
     }
@@ -3005,6 +3151,8 @@ pub const TableRuntimeSnapshotCache = struct {
             var cloned = try group.status.clone(alloc);
             errdefer cloned.deinit(alloc);
             try group.applyAuthority(alloc, &cloned);
+            if (self.stabilize_physical_duration_telemetry)
+                stabilizePhysicalDurationTelemetry(&cloned.stats);
             return cloned;
         }
         return null;
@@ -3026,8 +3174,10 @@ pub const TableRuntimeSnapshotCache = struct {
             status.* = cloned;
             return;
         }
-        if (status.metadata.source == .synthetic_config and runtimeStatusWorthPreserving(cached.*)) {
-            const merged = try mergeCachedStatusWithSyntheticPlaceholder(
+        if (runtimeStatusSourceIsNonAuthoritativeRefresh(status.metadata.source) and
+            runtimeStatusWorthPreserving(cached.*))
+        {
+            const merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(
                 self.alloc,
                 cached.*,
                 status.*,
@@ -3242,7 +3392,9 @@ pub const TableRuntimeSnapshotCache = struct {
                 &state.index_authorities,
                 state.active_index_transition_count != 0,
             );
+            self.applyTargetObservationAuthorityLocked(state, owned.group_id, &owned, target_observation_revision);
             self.enforceIndexAuthoritiesInStatusLocked(state, &owned);
+            owned.cache_publication_epoch = expected_epoch;
             if (replacement.getPtr(owned.group_id)) |duplicate| {
                 duplicate.deinit(self.alloc);
                 duplicate.* = owned;
@@ -3693,23 +3845,105 @@ pub const TableRuntimeSnapshotCache = struct {
         observed_revision: u64,
     ) void {
         _ = self;
-        const required = state.required_target_observation_revisions.get(group_id) orelse TableState.TargetObservationRequirement{
-            .event_revision = 0,
-            .source_target_sequence = 0,
-        };
-        status.metadata.target_observation_complete = status.metadata.target_observation_complete and
-            observed_revision >= required.event_revision and
-            status.metadata.target_observation_revision >= required.source_target_sequence;
+        if (state.required_target_observation_revisions.getPtr(group_id)) |required| {
+            const includes_target = status.metadata.target_observation_revision >= required.source_target_sequence;
+            if (status.metadata.target_observation_complete and includes_target and
+                observed_revision >= required.event_revision)
+            {
+                required.observed = true;
+                required.observed_source_target_sequence = @max(required.observed_source_target_sequence, status.metadata.target_observation_revision);
+            }
+            status.metadata.target_observation_complete = required.observed and includes_target and
+                status.metadata.target_observation_revision <= required.observed_source_target_sequence;
+        }
         for (status.stats.indexes) |*item| {
+            // A retained coverage payload cannot borrow another index's newer
+            // group observation. Older reporters without this local witness
+            // continue to rely on the enclosing metadata authority.
             item.runtime_target_observation_complete = true;
+            if (state.required_target_observation_revisions.get(group_id)) |required| {
+                if (item.runtime_coverage_source_sequence) |sequence|
+                    item.runtime_target_observation_complete =
+                        observed_revision >= required.event_revision and sequence >= required.source_target_sequence;
+            }
             const authority = state.index_authorities.get(item.name) orelse continue;
             if (!targetAuthorityAcceptsIdentity(authority, item.*)) continue;
-            const index_required = authority.convergence_requirements.get(group_id) orelse continue;
-            item.runtime_target_observation_complete = observed_revision >= index_required.event_revision and
-                item.replay_target_sequence >= index_required.source_target_sequence;
+            const index_required = authority.convergence_requirements.getPtr(group_id) orelse continue;
+            const coverage_sequence = item.runtime_coverage_source_sequence orelse item.replay_target_sequence;
+            const includes_target = coverage_sequence >= index_required.source_target_sequence;
+            if (observed_revision >= index_required.event_revision and includes_target) {
+                index_required.observed = true;
+                index_required.observed_source_target_sequence = @max(index_required.observed_source_target_sequence, coverage_sequence);
+            }
+            item.runtime_target_observation_complete = item.runtime_target_observation_complete and index_required.observed and includes_target and
+                coverage_sequence <= index_required.observed_source_target_sequence;
         }
     }
 };
+
+fn physicalDurationField(comptime name: []const u8) bool {
+    @setEvalBranchQuota(100_000);
+    const names = [_][]const u8{
+        "backpressure_ns",
+        "bulk_finish_current_window_ns",
+        "bulk_finish_max_window_ns",
+        "db_open_ns",
+        "finalize_ns",
+        "finish_ns",
+        "flush_ns",
+        "hold_ns",
+        "last_embed_batch_ns",
+        "last_merge_elapsed_ns",
+        "load_indexes_ns",
+        "lsm_open_ensuring_dirs_ns",
+        "lsm_open_initializing_storage_ns",
+        "lsm_open_manifest_ns",
+        "lsm_open_mounting_runs_ns",
+        "lsm_open_recovered_temp_cleanup_ns",
+        "lsm_open_total_ns",
+        "lsm_open_wal_replay_ns",
+        "maintenance_ns",
+        "manifest_ns",
+        "mask_build_ns",
+        "max_finalize_ns",
+        "max_finish_ns",
+        "max_flush_ns",
+        "max_hold_ns",
+        "max_maintenance_ns",
+        "max_wait_ns",
+        "merge_elapsed_ns",
+        "save_ns",
+        "sync_ns",
+        "total_embed_ns",
+        "wait_ns",
+        "wal_replay_ns",
+        "write_pressure_ns",
+    };
+    inline for (names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+fn stabilizePhysicalDurationTelemetry(value: anytype) void {
+    const pointer = @typeInfo(@TypeOf(value)).pointer;
+    const T = pointer.child;
+    switch (@typeInfo(T)) {
+        .@"struct" => inline for (std.meta.fields(T)) |field| {
+            if (comptime physicalDurationField(field.name)) {
+                @field(value.*, field.name) = 0;
+            } else {
+                stabilizePhysicalDurationTelemetry(&@field(value.*, field.name));
+            }
+        },
+        .array => for (value) |*item| stabilizePhysicalDurationTelemetry(item),
+        .optional => if (value.*) |*item| stabilizePhysicalDurationTelemetry(item),
+        .pointer => |child_pointer| {
+            if (child_pointer.size == .slice and !child_pointer.is_const) {
+                for (value.*) |*item| stabilizePhysicalDurationTelemetry(item);
+            }
+        },
+        else => {},
+    }
+}
 
 fn lessThanGroupIdPtr(_: void, lhs: *const LocalTableRuntimeStatus, rhs: *const LocalTableRuntimeStatus) bool {
     return lhs.group_id < rhs.group_id;
@@ -4111,6 +4345,7 @@ fn preserveArtifactVisibilityUsingLookup(
                 dst.coverage_skipped_count != cached.coverage_skipped_count or
                 dst.coverage_terminal_failed_count != cached.coverage_terminal_failed_count or
                 dst.coverage_summary_ready != cached.coverage_summary_ready or
+                dst.runtime_coverage_source_sequence != cached.runtime_coverage_source_sequence or
                 !std.meta.eql(dst.coverage_publication, cached.coverage_publication)))
             return error.ConflictingIndexPublication;
         // An unstamped retained dense snapshot still has a storage revision.
@@ -4173,6 +4408,20 @@ fn preserveArtifactVisibilityUsingLookup(
                 dst.coverage_produced_count < cached.coverage_produced_count or
                 dst.coverage_skipped_count < cached.coverage_skipped_count or
                 dst.coverage_terminal_failed_count < cached.coverage_terminal_failed_count);
+        // A current live owner's closed repair gate supersedes continuity,
+        // but callback completion order cannot promote an older publication.
+        // Unstamped overlays and unrecovered successor owners still carry a
+        // live closed gate: recovery proof is required to serve, not to block.
+        // Coverage has its own stamp and cannot borrow this serving decision.
+        const current_repair_gate = derived_index and
+            incoming.metadata.source == .live_writer_publish and
+            dst.index_repair_id != null and !dst.serving_snapshot_ready and
+            !dst.index_repair_active_generation_serviceable and
+            serving_order != .older;
+        if (current_repair_gate) {
+            if (coverage_settlement_regressed) preserveIndexCoverageSettlement(dst, cached.*);
+            continue;
+        }
         const applied_regressed = serving_order == null and same_projection_identity and
             dst.replay_applied_sequence < cached.replay_applied_sequence;
         const same_projection = same_projection_identity and
@@ -4293,6 +4542,7 @@ fn preserveIndexCoverageSettlement(
 ) void {
     dst.coverage_publication = cached.coverage_publication;
     dst.runtime_coverage_applied_sequence = cached.runtime_coverage_applied_sequence orelse cached.replay_applied_sequence;
+    dst.runtime_coverage_source_sequence = cached.runtime_coverage_source_sequence;
     dst.coverage_produced_count = cached.coverage_produced_count;
     dst.coverage_skipped_count = cached.coverage_skipped_count;
     dst.coverage_terminal_failed_count = cached.coverage_terminal_failed_count;
@@ -4354,6 +4604,8 @@ fn preserveIndexProjectionLifecycle(
     dst.projection_checkpoint_generation = cached.projection_checkpoint_generation;
     dst.projection_checkpoint_config_hash = cached.projection_checkpoint_config_hash;
     dst.checkpoint_replay_tail_sequence_count = cached.checkpoint_replay_tail_sequence_count;
+    dst.dense_vector_projection_pending = cached.dense_vector_projection_pending;
+    dst.dense_native_storage_phase = cached.dense_native_storage_phase;
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -4369,9 +4621,12 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
+    if (stats.graph_metric_runtime.hasRuntimeFacts()) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.repair_degraded or index.repair_issue_count != 0) return true;
+        if (index.dense_vector_projection_pending) return true;
+        if (index.dense_native_storage_phase != .legacy) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime
@@ -4792,6 +5047,7 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.doc_count = cached.doc_count;
     dst.term_count = cached.term_count;
     dst.edge_count = cached.edge_count;
+    dst.graph_counts_pending = cached.graph_counts_pending;
     dst.node_count = cached.node_count;
     dst.root_node = cached.root_node;
     dst.publication_target_count = cached.publication_target_count;
@@ -4804,7 +5060,11 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.hbc_posting = cached.hbc_posting;
 }
 
-fn mergeCachedStatusWithSyntheticPlaceholder(
+fn runtimeStatusSourceIsNonAuthoritativeRefresh(source: RuntimeStatusSource) bool {
+    return source == .synthetic_config or source == .cached_snapshot;
+}
+
+fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     alloc: std.mem.Allocator,
     previous: LocalTableRuntimeStatus,
     placeholder: LocalTableRuntimeStatus,
@@ -4859,6 +5119,10 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     // immediately erase the owner acknowledgement we are trying to retain.
     merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
 
+    // Each snapshot owns its index strings and nested arrays. Moving a deep
+    // clone preserves that ownership when the previous cache entry retires.
+    var retained = try previous.clone(alloc);
+    defer retained.deinit(alloc);
     var previous_lookup = try IndexObservationLookup.init(alloc, previous.stats.indexes);
     defer previous_lookup.deinit(alloc);
     for (merged.stats.indexes) |*dst| {
@@ -4878,9 +5142,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         else
             false;
         if (targeted and !target_facts_current) continue;
-        const owned_name = dst.name;
-        dst.* = cached;
-        dst.name = owned_name;
+        std.mem.swap(db_mod.types.DBIndexStats, dst, &retained.stats.indexes[cached_index]);
         if (targeted) {
             dst.runtime_observation_stale = false;
             dst.runtime_observation_serviceable = false;
@@ -4959,9 +5221,7 @@ fn findMatchingIndexStatus(
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn freeAlgebraicCandidateStatuses(alloc: std.mem.Allocator, candidates: []const db_mod.types.AlgebraicCandidateStatus) void {
@@ -5163,58 +5423,50 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
     };
 }
 
+test "graph metric cached index stats clone retains owned progress and survives allocation failures" {
+    try testGraphMetricStatsClone(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testGraphMetricStatsClone, .{});
+}
+
+fn testGraphMetricStatsClone(alloc: std.mem.Allocator) !void {
+    var pages = [_]db_mod.types.GraphMetricBuildPageStatus{.{
+        .worker_id = "page-worker",
+        .cursor = "page-cursor",
+        .last_error = "page-error",
+    }};
+    var metrics = [_]db_mod.types.GraphMetricStatus{.{
+        .name = @constCast("pagerank"),
+        .state = .building,
+        .published_generation = 7,
+        .build_worker_id = "worker",
+        .build_cursor = "cursor",
+        .last_error = "diagnostic",
+        .build_pages = &pages,
+    }};
+    var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph_idx", .kind = .graph, .graph_counts_pending = true, .graph_metric_status = &metrics }};
+    const cloned = try cloneDBStats(alloc, .{ .indexes = &indexes, .index_count = 1 });
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqual(@as(usize, 1), cloned.indexes[0].graph_metric_status.len);
+    try std.testing.expect(cloned.indexes[0].graph_counts_pending);
+    const status = cloned.indexes[0].graph_metric_status[0];
+    try std.testing.expectEqualStrings("pagerank", status.name);
+    try std.testing.expect(status.name.ptr != metrics[0].name.ptr);
+    try std.testing.expectEqual(@as(u64, 7), status.published_generation);
+    try std.testing.expectEqualStrings("cursor", status.build_cursor);
+    try std.testing.expect(status.build_cursor.ptr != metrics[0].build_cursor.ptr);
+    try std.testing.expectEqualStrings("page-cursor", status.build_pages[0].cursor);
+    try std.testing.expect(status.build_pages[0].cursor.ptr != pages[0].cursor.ptr);
+    try std.testing.expectEqualStrings("page-worker", status.build_pages[0].worker_id);
+    try std.testing.expectEqualStrings("page-error", status.build_pages[0].last_error);
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
     const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
     errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, stats.indexes.len);
     var initialized: usize = 0;
     errdefer {
-        for (indexes[0..initialized]) |item| {
-            alloc.free(item.name);
-            if (item.load_error) |value| alloc.free(value);
-            if (item.index_repair_last_error) |value| alloc.free(value);
-            if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-            if (item.algebraic_last_error_reason) |value| alloc.free(value);
-            if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-            if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-            if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-            if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-            if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-            if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-            if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-            if (item.algebraic_top_candidate) |candidate| {
-                alloc.free(candidate.recommendation);
-                alloc.free(candidate.materialization_id);
-                alloc.free(candidate.lifecycle);
-                alloc.free(candidate.decision);
-            }
-            if (item.algebraic_active_progress) |progress| {
-                alloc.free(progress.recommendation);
-                alloc.free(progress.materialization_id);
-                alloc.free(progress.lifecycle);
-            }
-            for (item.algebraic_candidates) |candidate| {
-                alloc.free(candidate.recommendation);
-                alloc.free(candidate.materialization_id);
-                alloc.free(candidate.lifecycle);
-                alloc.free(candidate.decision);
-            }
-            if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-            for (item.algebraic_candidate_decision_history) |entry| {
-                alloc.free(entry.recommendation);
-                alloc.free(entry.materialization_id);
-                alloc.free(entry.lifecycle);
-                alloc.free(entry.previous_decision);
-                alloc.free(entry.decision);
-            }
-            if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-            for (item.algebraic_progress) |progress| {
-                alloc.free(progress.recommendation);
-                alloc.free(progress.materialization_id);
-                alloc.free(progress.lifecycle);
-            }
-            if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-        }
+        for (indexes[0..initialized]) |item| db_mod.types.freeDBIndexStatsItem(alloc, item);
         alloc.free(indexes);
     }
 
@@ -5315,7 +5567,10 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         errdefer freeAlgebraicCandidateDecisionStatuses(alloc, algebraic_candidate_decision_history);
         const algebraic_progress = try cloneAlgebraicProgressStatuses(alloc, item.algebraic_progress);
         errdefer freeAlgebraicProgressStatuses(alloc, algebraic_progress);
+        const graph_metric_status = try db_mod.types.cloneGraphMetricStatuses(alloc, item.graph_metric_status);
+        errdefer db_mod.types.freeGraphMetricStatuses(alloc, graph_metric_status);
         indexes[i] = .{
+            .graph_metric_status = graph_metric_status,
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
             .runtime_observation_stale = item.runtime_observation_stale,
@@ -5324,12 +5579,14 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .runtime_target_observation_complete = item.runtime_target_observation_complete,
             .runtime_serving_applied_sequence = item.runtime_serving_applied_sequence,
             .runtime_coverage_applied_sequence = item.runtime_coverage_applied_sequence,
+            .runtime_coverage_source_sequence = item.runtime_coverage_source_sequence,
             .serving_publication = item.serving_publication,
             .coverage_publication = item.coverage_publication,
             .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
+            .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
             .root_node = item.root_node,
             .publication_target_count = item.publication_target_count,
@@ -5349,6 +5606,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .embedding_activity = item.embedding_activity,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .dense_vector_projection_pending = item.dense_vector_projection_pending,
+            .dense_native_storage_phase = item.dense_native_storage_phase,
             .enrichment_failed = item.enrichment_failed,
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,
@@ -5649,17 +5908,17 @@ test "runtime status snapshots never wait for mutable cache ownership" {
     };
     var snapshot = Snapshot{ .cache = &cache };
     lockAtomic(&cache.mutex);
-    const thread = try std.Thread.spawn(.{}, Snapshot.run, .{&snapshot});
+    var thread = try std.testing.io.concurrent(Snapshot.run, .{&snapshot});
     var completed_while_locked = false;
     for (0..10_000) |_| {
         if (snapshot.done.load(.acquire)) {
             completed_while_locked = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     cache.mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     try std.testing.expect(completed_while_locked);
     try std.testing.expect(!snapshot.failed.load(.acquire));
 }
@@ -5752,7 +6011,7 @@ test "blocked read payload preparation does not convoy an unrelated table" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Publish = struct {
@@ -5782,20 +6041,24 @@ test "blocked read payload preparation does not convoy an unrelated table" {
     defer test_read_group_preparation_hook = null;
     var publish_a = Publish{ .cache = &cache, .token = token_a, .table_name = "table-a", .group_id = 1 };
     var publish_b = Publish{ .cache = &cache, .token = token_b, .table_name = "table-b", .group_id = 2 };
-    const thread_a = try std.Thread.spawn(.{}, Publish.run, .{&publish_a});
-    while (!blocker.entered.load(.acquire)) std.Thread.yield() catch {};
-    const thread_b = try std.Thread.spawn(.{}, Publish.run, .{&publish_b});
+    var thread_a = try std.testing.io.concurrent(Publish.run, .{&publish_a});
+    defer {
+        blocker.release.store(true, .release);
+        thread_a.await(std.testing.io);
+    }
+    while (!blocker.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    var thread_b = try std.testing.io.concurrent(Publish.run, .{&publish_b});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish_b.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    thread_a.join();
-    thread_b.join();
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!publish_a.failed.load(.acquire));
     try std.testing.expect(!publish_b.failed.load(.acquire));
@@ -5837,7 +6100,7 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Refresh = struct {
@@ -5879,33 +6142,33 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
     defer test_read_group_preparation_hook = null;
     var refresh = Refresh{ .cache = &cache, .token = &refresh_token, .snapshots = snapshots };
     var publish = Publish{ .cache = &cache, .token = token_b };
-    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&refresh});
+    var refresh_thread = try std.testing.io.concurrent(Refresh.run, .{&refresh});
     var preparation_entered = false;
     for (0..100_000) |_| {
         if (blocker.entered.load(.acquire)) {
             preparation_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!preparation_entered) {
         blocker.release.store(true, .release);
-        refresh_thread.join();
+        refresh_thread.await(std.testing.io);
         try std.testing.expect(preparation_entered);
         return;
     }
-    const publish_thread = try std.Thread.spawn(.{}, Publish.run, .{&publish});
+    var publish_thread = try std.testing.io.concurrent(Publish.run, .{&publish});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    refresh_thread.join();
-    publish_thread.join();
+    refresh_thread.await(std.testing.io);
+    publish_thread.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!refresh.failed.load(.acquire));
     try std.testing.expect(!publish.failed.load(.acquire));
@@ -6246,6 +6509,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
     const docs_items = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 1);
     docs_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 11,
             .index_count = 1,
@@ -6271,6 +6535,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
     const refresh_docs_items = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 1);
     refresh_docs_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
         .stats = .{
             .doc_count = 99,
             .index_count = 1,
@@ -6297,6 +6562,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .doc_count = 3,
     };
     const refresh = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(refresh);
     refresh[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = refresh_docs_items },
@@ -6306,7 +6572,16 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .statuses = .{ .items = refresh_logs_items },
     };
 
-    try publishRefreshForTest(&cache, refresh);
+    // A refresh must capture its observation boundary before the live group
+    // publishes. The newer group authority survives that older refresh.
+    var refresh_token = try cache.captureCatalogToken(std.testing.allocator, &.{ "docs", "logs" }, true);
+    defer refresh_token.deinit();
+    var live = (try cache.snapshotGroupStatus(std.testing.allocator, "docs", 7)).?;
+    defer live.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try publishGroupForTest(&cache, "docs", live));
+    var result = try cache.publishRefresh(&refresh_token, refresh);
+    defer result.deinit();
+    try std.testing.expect(!result.hasRejectedTables());
 
     var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
     defer docs.deinit(std.testing.allocator);
@@ -6321,6 +6596,41 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
     try std.testing.expectEqualStrings("kw", logs.items[0].stats.indexes[0].name);
 }
 
+test "synthetic status merge owns retained index errors after previous snapshot retires" {
+    const alloc = std.testing.allocator;
+    var merged: ?LocalTableRuntimeStatus = null;
+    defer if (merged) |*value| value.deinit(alloc);
+    {
+        var previous = LocalTableRuntimeStatus{
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1) },
+        };
+        previous.stats.indexes[0] = .{
+            .name = try alloc.dupe(u8, "semantic"),
+            .kind = .dense_vector,
+            .load_error = try alloc.dupe(u8, "retained load error"),
+            .index_repair_last_error = try alloc.dupe(u8, "retained repair error"),
+        };
+        defer previous.deinit(alloc);
+        var placeholder = LocalTableRuntimeStatus{
+            .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+            .stats = .{ .index_count = 1, .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1) },
+        };
+        placeholder.stats.indexes[0] = .{
+            .name = try alloc.dupe(u8, "semantic"),
+            .kind = .dense_vector,
+            .load_error = try alloc.dupe(u8, "placeholder load error"),
+            .index_repair_last_error = try alloc.dupe(u8, "placeholder repair error"),
+        };
+        defer placeholder.deinit(alloc);
+        merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(alloc, previous, placeholder, 1, null, false);
+        try std.testing.expect(merged.?.stats.indexes[0].load_error.?.ptr != previous.stats.indexes[0].load_error.?.ptr);
+        try std.testing.expect(merged.?.stats.indexes[0].index_repair_last_error.?.ptr != previous.stats.indexes[0].index_repair_last_error.?.ptr);
+    }
+    try std.testing.expectEqualStrings("retained load error", merged.?.stats.indexes[0].load_error.?);
+    try std.testing.expectEqualStrings("retained repair error", merged.?.stats.indexes[0].index_repair_last_error.?);
+}
+
 test "table runtime snapshot cache does not replace published live status with synthetic zero" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
@@ -6332,6 +6642,10 @@ test "table runtime snapshot cache does not replace published live status with s
             .source = .live_writer_publish,
             .freshness = .fresh,
             .status_generation = 12,
+            // Synthetic status-only construction can use a different
+            // metadata sentinel even though cache publication already proved
+            // the same table/root epoch.
+            .lsm_root_generation = 7,
         },
         .stats = .{
             .doc_count = 1_000_000,
@@ -6371,6 +6685,7 @@ test "table runtime snapshot cache does not replace published live status with s
         .metadata = .{
             .source = .synthetic_config,
             .freshness = .stale,
+            .lsm_root_generation = 8,
         },
         .stats = .{
             .doc_count = 0,
@@ -6531,7 +6846,10 @@ test "table runtime snapshot cache preserving replacement does not replace live 
 
     try std.testing.expectEqual(@as(usize, 1), docs.items.len);
     try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
+    // Retained counts survive the missed refresh; its freshness and current
+    // target observation still remain conservative.
     try std.testing.expectEqual(RuntimeStatusFreshness.stale, docs.items[0].metadata.freshness);
+    try std.testing.expect(!docs.items[0].metadata.target_observation_complete);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(@as(u64, 250_000), docs.items[0].stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 2048), docs.items[0].stats.indexes[0].node_count);
@@ -6541,12 +6859,59 @@ test "table runtime snapshot cache preserving replacement does not replace live 
     try std.testing.expect(docs.items[0].stats.indexes[0].catch_up_active);
 }
 
+test "table runtime snapshot cache missed refresh retains counts without renewing freshness" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(token, "docs", .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+            .updated_at_ns = 42,
+        },
+        .stats = .{ .doc_count = 24, .source_doc_count = 24 },
+    }));
+
+    const cached_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
+    cached_items[0] = .{
+        .group_id = 7,
+        .metadata = .{
+            .source = .cached_snapshot,
+            .freshness = .stale,
+        },
+        .stats = .{},
+    };
+    const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
+    defer alloc.free(refresh);
+    refresh[0] = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .statuses = .{ .items = cached_items },
+    };
+    const refresh_started = platform_time.monotonicNs();
+    try publishRefreshForTest(&cache, refresh);
+    const refresh_finished = platform_time.monotonicNs();
+
+    var docs = (try cache.snapshot(alloc, "docs")).?;
+    defer docs.deinit(alloc);
+    try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, docs.items[0].metadata.source);
+    try std.testing.expectEqual(RuntimeStatusFreshness.stale, docs.items[0].metadata.freshness);
+    // Timestamp describes the attempted refresh, not renewed serving proof.
+    try std.testing.expect(docs.items[0].metadata.updated_at_ns >= refresh_started);
+    try std.testing.expect(docs.items[0].metadata.updated_at_ns <= refresh_finished);
+    try std.testing.expectEqual(@as(u64, 24), docs.items[0].stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 24), docs.items[0].stats.source_doc_count);
+}
+
 test "table runtime snapshot cache can clone a single group status" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
 
     const statuses = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
-    defer std.testing.allocator.free(statuses);
+    // publishRefresh consumes the nested status array; only the outer input
+    // array remains caller-owned.
     statuses[0] = .{
         .group_id = 7,
         .stats = .{ .doc_count = 1, .indexes = &.{} },
@@ -6750,6 +7115,45 @@ test "table runtime snapshot cache rejects a late stale live observation" {
     defer docs.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "consistent boundary publication supersedes later-reserved stale observation" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const completion_epoch = try cache.capturePublicationToken("docs");
+    const stale_refresh = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(stale_refresh, "docs", .{
+        .group_id = 7,
+        .stats = .{ .doc_count = 0 },
+    }));
+    // A visibility edge produced by the same admitted operation may advance
+    // the status epoch while its DB/root authority remains unchanged.
+    cache.fenceTablePublications("docs");
+
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroupAtConsistentBoundary(
+        completion_epoch,
+        "docs",
+        .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 24 },
+        },
+    ));
+    var snapshot = (try cache.snapshot(alloc, "docs")).?;
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 24), snapshot.items[0].stats.doc_count);
+
+    const retired_epoch = try cache.capturePublicationToken("docs");
+    cache.invalidateTable("docs");
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroupAtConsistentBoundary(
+        retired_epoch,
+        "docs",
+        .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 25 },
+        },
+    ));
 }
 
 test "table runtime snapshot cache preserves active managed admission proof" {
@@ -7785,6 +8189,135 @@ test "catalog identity rejects a wrong first structural observation" {
         }}),
     );
     try std.testing.expect(cache.tables.get("docs").?.index_authorities.getPtr("semantic").?.expectation == .exact);
+}
+
+test "source coverage observation is independent of artifact replay progress" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .coverage_generation = 10,
+        .coverage_config_hash = 100,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_target_sequence = 7,
+        .runtime_coverage_source_sequence = 7,
+    }};
+    const status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 8 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    };
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", status));
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{
+        .index_name = "semantic",
+        .kind = .dense_vector,
+        .incarnation = 10,
+        .config_hash = 100,
+    };
+    cache.markIndexTargetObservationPending("docs", 7, identity, 8);
+    // A newer replay overlay cannot certify older coverage counters.
+    indexes[0].replay_target_sequence = 9;
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", status));
+    {
+        var stale = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer stale.deinit(alloc);
+        try std.testing.expect(!stale.stats.indexes[0].runtime_target_observation_complete);
+    }
+    // The source is observed, even though its provider has not produced the
+    // next artifact. Cloning must retain the coverage's independent witness.
+    indexes[0].replay_target_sequence = 7;
+    indexes[0].runtime_coverage_source_sequence = 8;
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", status));
+    {
+        var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer observed.deinit(alloc);
+        try std.testing.expect(observed.stats.indexes[0].runtime_target_observation_complete);
+        try std.testing.expectEqual(@as(?u64, 8), observed.stats.indexes[0].runtime_coverage_source_sequence);
+    }
+    // A source event racing sampling remains fenced even with a sufficient
+    // numeric watermark: publication must also own the causal event revision.
+    const before_event = try cache.capturePublicationToken("docs");
+    cache.markIndexTargetObservationPending("docs", 7, identity, 9);
+    indexes[0].runtime_coverage_source_sequence = 9;
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(before_event, "docs", status));
+    var raced = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer raced.deinit(alloc);
+    try std.testing.expect(!raced.stats.indexes[0].runtime_target_observation_complete);
+
+    var retained = indexes[0];
+    retained.runtime_coverage_source_sequence = 100;
+    indexes[0].runtime_coverage_source_sequence = 8;
+    preserveIndexCoverageSettlement(&retained, indexes[0]);
+    try std.testing.expectEqual(@as(?u64, 8), retained.runtime_coverage_source_sequence);
+
+    // Unknown-scope commits fence each retained payload too, even if another
+    // index supplied the group's newer source-cardinality observation.
+    cache.markGroupTargetObservationPending("docs", 7, 10);
+    var newer_group = status;
+    newer_group.metadata.target_observation_revision = 10;
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", newer_group));
+    var mixed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer mixed.deinit(alloc);
+    try std.testing.expect(mixed.metadata.target_observation_complete);
+    try std.testing.expect(!mixed.stats.indexes[0].runtime_target_observation_complete);
+}
+
+test "retained source coverage is fenced after every publication merge" {
+    const alloc = std.testing.allocator;
+    for (0..3) |mode| {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        var indexes = [_]db_mod.types.DBIndexStats{.{
+            .name = "semantic",
+            .kind = .dense_vector,
+            .coverage_generation = 1,
+            .coverage_config_hash = 10,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+            .coverage_produced_count = 1,
+            .replay_applied_sequence = 7,
+            .replay_target_sequence = 7,
+            .runtime_coverage_source_sequence = 7,
+            .coverage_publication = .{ .owner_epoch = 1, .revision = 2, .applied_through = 7 },
+        }};
+        var status = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 7 },
+            .stats = .{ .index_count = 1, .indexes = &indexes },
+        };
+        _ = try publishGroupForTest(&cache, "docs", status);
+        cache.markIndexTargetObservationPending("docs", 7, .{
+            .index_name = "semantic",
+            .kind = .dense_vector,
+            .incarnation = 1,
+            .config_hash = 10,
+        }, 8);
+        // The stale owner observation advertises a newer source frontier but
+        // cannot replace the accepted immutable coverage publication.
+        indexes[0].coverage_publication.?.revision = 1;
+        indexes[0].runtime_coverage_source_sequence = 8;
+        status.metadata.target_observation_revision = 8;
+        switch (mode) {
+            0 => _ = try publishGroupForTest(&cache, "docs", status),
+            1 => _ = try cache.publishGroups(try cache.capturePublicationToken("docs"), "docs", &.{status}),
+            2 => {
+                var snapshots = [_]TableRuntimeSnapshot{.{
+                    .table_name = try alloc.dupe(u8, "docs"),
+                    .statuses = .{ .items = try alloc.alloc(LocalTableRuntimeStatus, 1) },
+                }};
+                snapshots[0].statuses.items[0] = try status.clone(alloc);
+                try publishRefreshForTest(&cache, &snapshots);
+            },
+            else => unreachable,
+        }
+        var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 7), observed.stats.indexes[0].runtime_coverage_source_sequence);
+        try std.testing.expect(!observed.stats.indexes[0].runtime_target_observation_complete);
+    }
 }
 
 test "exact target advances fence only their index incarnation" {
@@ -9177,6 +9710,208 @@ test "table runtime snapshot cache lifecycle transition replaces and fences obse
     try std.testing.expect(observed.metadata.target_observation_complete);
 }
 
+test "late source target notification cannot revoke an already observed target" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    const initial = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(initial, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+    });
+    // A publication callback may arrive after the owner has sampled its
+    // durable target. No pending notification has been recorded for it yet.
+    cache.markGroupTargetObservationPending("docs", 7, 6);
+    cache.markGroupTargetObservationPending("docs", 7, 5);
+    {
+        var listed = (try cache.snapshot(alloc, "docs")).?;
+        defer listed.deinit(alloc);
+        try std.testing.expect(listed.items[0].metadata.target_observation_complete);
+        var detail = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer detail.deinit(alloc);
+        try std.testing.expect(detail.metadata.target_observation_complete);
+    }
+    const before_new_target = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    _ = try cache.publishGroup(before_new_target, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+    });
+    {
+        var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.metadata.target_observation_complete);
+    }
+    const completed = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(completed, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 7 },
+    });
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    {
+        var settled = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer settled.deinit(alloc);
+        try std.testing.expect(settled.metadata.target_observation_complete);
+    }
+    // A structural fence retains serving payloads from the old epoch; those
+    // payloads cannot deduplicate a completion notification in the new epoch.
+    cache.fenceTablePublications("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 8);
+    const restored = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(restored, "docs", .{
+        .group_id = 7,
+        .stats = .{},
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 8 },
+    });
+    cache.markTableTargetObservationPending("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    var retired = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer retired.deinit(alloc);
+    try std.testing.expect(!retired.metadata.target_observation_complete);
+}
+
+test "late exact index notification preserves completed observation and reduction authority" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 6,
+        .replay_target_sequence = 6,
+    }};
+    const token = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(token, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+    };
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    {
+        var listed = (try cache.snapshot(alloc, "docs")).?;
+        defer listed.deinit(alloc);
+        try std.testing.expect(listed.items[0].stats.indexes[0].runtime_target_observation_complete);
+        var detail = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer detail.deinit(alloc);
+        try std.testing.expect(detail.stats.indexes[0].runtime_target_observation_complete);
+        const requirement = cache.tables.get("docs").?.index_authorities.get("thumbnail").?.convergence_requirements.get(7).?;
+        try std.testing.expectEqual(@as(u64, 6), requirement.source_target_sequence);
+        try std.testing.expectEqual(@as(u64, 6), requirement.reducing_source_sequence);
+    }
+    cache.markIndexTargetObservationPending("docs", 7, identity, 7);
+    var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer pending.deinit(alloc);
+    try std.testing.expect(!pending.stats.indexes[0].runtime_target_observation_complete);
+}
+
+test "late source notification cannot reuse an observation from before a catalog fence" {
+    const alloc = std.testing.allocator;
+    for ([_]?RuntimeStatusSource{ null, .cached_snapshot, .synthetic_config }) |retained_source| {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        const initial = try cache.capturePublicationToken("docs");
+        _ = try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .stats = .{},
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        });
+        cache.fenceTablePublications("docs");
+        // Relabeling retained facts in a new epoch does not sample the owner.
+        if (retained_source) |source| {
+            const current = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(current, "docs", .{
+                .group_id = 7,
+                .stats = .{},
+                .metadata = .{ .source = source, .freshness = .fresh, .target_observation_revision = 6 },
+            });
+        }
+        cache.markGroupTargetObservationPending("docs", 7, 6);
+        var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.metadata.target_observation_complete);
+    }
+}
+
+test "accepted target observation survives late snapshots but not new commit fences" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .replay_target_sequence = 6,
+    }};
+    const initial = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(initial, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{ .index_name = "thumbnail", .kind = .dense_vector, .incarnation = 42, .config_hash = 99 };
+    const before_event = try cache.capturePublicationToken("docs");
+    cache.markGroupTargetObservationPending("docs", 7, 6);
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    const current = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(current, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    // A later callback can carry a pre-event token and an already fenced
+    // metadata projection. It cannot revoke an accepted exact-target proof.
+    var late = try cache.capturePublicationToken("docs");
+    late.target_observation_revision = before_event.target_observation_revision;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 6, .target_observation_complete = false },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var settled = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer settled.deinit(alloc);
+    try std.testing.expect(settled.metadata.target_observation_complete);
+    try std.testing.expect(settled.stats.indexes[0].runtime_target_observation_complete);
+    // A proof for target 6 cannot certify a previously unseen target 7,
+    // even before its commit notification reaches the cache.
+    indexes[0].replay_target_sequence = 7;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 7, .target_observation_complete = false },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var unseen = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer unseen.deinit(alloc);
+    try std.testing.expect(!unseen.metadata.target_observation_complete);
+    try std.testing.expect(!unseen.stats.indexes[0].runtime_target_observation_complete);
+    cache.markGroupTargetObservationPending("docs", 7, 7);
+    cache.markIndexTargetObservationPending("docs", 7, identity, 7);
+    indexes[0].replay_target_sequence = 7;
+    _ = try cache.publishGroup(late, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .target_observation_revision = 7 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    var fenced = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer fenced.deinit(alloc);
+    try std.testing.expect(!fenced.metadata.target_observation_complete);
+    try std.testing.expect(!fenced.stats.indexes[0].runtime_target_observation_complete);
+}
+
 test "runtime owner retirement preserves serving snapshot and fences convergence" {
     const alloc = std.testing.allocator;
     var cache = TableRuntimeSnapshotCache.init(alloc);
@@ -9825,6 +10560,10 @@ test "owner publication stamps order all index kinds independently of counts and
         row.coverage_produced_count = 6;
         try Harness.publish(&cache, row);
         try Harness.expectCounts(&cache, 6, 6);
+        // The source frontier is part of the immutable coverage payload too.
+        row.runtime_coverage_source_sequence = 14;
+        try std.testing.expectError(error.ConflictingIndexPublication, Harness.publish(&cache, row));
+        row.runtime_coverage_source_sequence = null;
         // Replaying a stamp with different facts is rejected atomically.
         row.doc_count = 5;
         try std.testing.expectError(error.ConflictingIndexPublication, Harness.publish(&cache, row));
@@ -10033,6 +10772,115 @@ test "live writer artifact regression keeps authoritative source deletions" {
     try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
     try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.doc_count);
+}
+
+test "live repair admission supersedes cached vector serviceability only for a current publication" {
+    const alloc = std.testing.allocator;
+    const Stamp = @import("../storage/db/publication.zig").Stamp;
+    const initial = Stamp{ .owner_epoch = 2, .revision = 10, .applied_through = 12 };
+    const older = Stamp{ .owner_epoch = 2, .revision = 9, .applied_through = 12 };
+    const newer = Stamp{ .owner_epoch = 2, .revision = 11, .applied_through = 12 };
+    const Case = struct {
+        serving: ?Stamp,
+        coverage: ?Stamp = older,
+        closed: bool = false,
+        conflict: bool = false,
+    };
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        for ([_]Case{
+            .{ .serving = older },
+            .{ .serving = initial, .conflict = true },
+            .{ .serving = newer, .closed = true },
+            .{ .serving = newer, .coverage = initial, .conflict = true },
+            .{ .serving = .{ .owner_epoch = 1, .revision = 999, .applied_through = 12 } },
+            .{ .serving = .{ .owner_epoch = 3, .revision = 1, .applied_through = 12 }, .closed = true },
+            .{ .serving = .{ .owner_epoch = 3, .revision = 1, .applied_through = 12, .recovered_through = 12 }, .closed = true },
+            .{ .serving = null, .coverage = null, .closed = true },
+        }) |case| {
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var rows = [_]db_mod.types.DBIndexStats{.{
+                .name = "semantic",
+                .kind = kind,
+                .doc_count = 20,
+                .serving_snapshot_ready = true,
+                .serving_publication = initial,
+                .coverage_publication = initial,
+                .coverage_generation = 42,
+                .coverage_config_hash = 99,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .coverage_produced_count = 20,
+                .replay_applied_sequence = 12,
+                .replay_target_sequence = 12,
+            }};
+            const status = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{ .runtime_owner_id = 77, .index_count = 1, .indexes = &rows },
+            };
+            _ = try cache.publishGroup(try cache.capturePublicationToken("docs"), "docs", status);
+            rows[0].serving_publication = case.serving;
+            rows[0].coverage_publication = case.coverage;
+            rows[0].serving_snapshot_ready = false;
+            rows[0].doc_count = 18;
+            rows[0].coverage_produced_count = 18;
+            rows[0].index_repair_id = 123;
+            rows[0].index_lifecycle_work_class = .initial_build;
+            rows[0].index_repair_phase = "validating";
+            // Completion callbacks obtain their cache token after sampling.
+            // A newer token must not make an older owner payload authoritative.
+            const delayed = try cache.capturePublicationToken("docs");
+            if (case.conflict) {
+                try std.testing.expectError(error.ConflictingIndexPublication, cache.publishGroup(delayed, "docs", status));
+            } else {
+                _ = try cache.publishGroup(delayed, "docs", status);
+            }
+            var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer observed.deinit(alloc);
+            const item = observed.stats.indexes[0];
+            try std.testing.expectEqual(!case.closed, item.serving_snapshot_ready);
+            try std.testing.expectEqual(@as(u64, if (case.closed) 18 else 20), item.doc_count);
+            try std.testing.expectEqual(@as(u64, 20), item.coverage_produced_count);
+            try std.testing.expectEqual(@as(?u128, if (case.closed) 123 else null), item.index_repair_id);
+            try std.testing.expectEqual(if (case.closed) case.serving else initial, item.serving_publication);
+            try std.testing.expectEqual(initial, item.coverage_publication.?);
+        }
+    }
+}
+
+test "live repair admission supersedes cached vector serviceability" {
+    for ([_]db_mod.types.IndexKind{ .dense_vector, .sparse_vector }) |kind| {
+        var old_rows = [_]db_mod.types.DBIndexStats{.{
+            .name = "semantic_idx",
+            .kind = kind,
+            .serving_snapshot_ready = true,
+            .doc_count = 2,
+            .coverage_config_hash = 77,
+            .coverage_generation = 42,
+            .coverage_identity_ready = true,
+            .coverage_summary_ready = true,
+        }};
+        const previous = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = &old_rows },
+        };
+        var new_rows = old_rows;
+        new_rows[0].serving_snapshot_ready = false;
+        new_rows[0].index_repair_id = 123;
+        new_rows[0].index_lifecycle_work_class = .initial_build;
+        new_rows[0].index_repair_phase = "validating";
+        var incoming = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = previous.metadata,
+            .stats = .{ .index_count = 1, .indexes = &new_rows },
+        };
+        try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
+        try std.testing.expect(!new_rows[0].serving_snapshot_ready);
+        try std.testing.expect(!new_rows[0].runtime_observation_serviceable);
+        try std.testing.expectEqualStrings("validating", new_rows[0].index_repair_phase);
+    }
 }
 
 test "catching up observation preserves same-incarnation published visibility" {
@@ -10330,7 +11178,7 @@ test "synthetic relabel cannot reuse cached catch up serviceability" {
             .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
         };
 
-        var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100, null, false);
+        var merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(std.testing.allocator, previous, placeholder, 100, null, false);
         defer merged.deinit(std.testing.allocator);
         try std.testing.expectEqual(freshness, merged.metadata.freshness);
         try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);
@@ -10640,6 +11488,10 @@ test "table runtime snapshot cache preserves generic artifact visibility on sequ
         .kind = .full_text,
         .doc_count = 10_000,
         .term_count = 321,
+        .coverage_generation = 1,
+        .coverage_config_hash = 10,
+        .coverage_identity_ready = true,
+        .serving_publication = .{ .owner_epoch = 1, .revision = 1, .applied_through = 400 },
         .replay_applied_sequence = 400,
         .replay_target_sequence = 400,
     };
@@ -10658,6 +11510,9 @@ test "table runtime snapshot cache preserves generic artifact visibility on sequ
     incoming_indexes[0] = .{
         .name = try std.testing.allocator.dupe(u8, "text_idx"),
         .kind = .full_text,
+        .coverage_generation = 1,
+        .coverage_config_hash = 10,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 400,
         .replay_target_sequence = 400,
     };
@@ -10685,66 +11540,94 @@ test "table runtime snapshot cache preserves generic artifact visibility on sequ
     try std.testing.expectEqual(@as(u64, 400), docs.items[0].stats.indexes[0].replay_target_sequence);
 }
 
-test "table runtime snapshot cache preserves existing status on replacement allocation failure" {
-    const Runner = struct {
-        fn run(alloc: std.mem.Allocator) !void {
-            var cache = TableRuntimeSnapshotCache.init(alloc);
-            defer cache.deinit();
-
-            const initial_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 11,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec"),
-                .kind = .dense_vector,
-                .doc_count = 11,
-                .replay_applied_sequence = 5,
-                .replay_target_sequence = 10,
-                .replay_catch_up_required = true,
-            };
-            const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
-            defer alloc.free(snapshots);
-            snapshots[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = initial_items },
-            };
-            try publishRefreshForTest(&cache, snapshots);
-
-            var replacement = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 99,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            defer replacement.deinit(alloc);
-            replacement.stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec-replacement"),
-                .kind = .dense_vector,
-                .doc_count = 99,
-            };
-
-            _ = publishGroupForTest(&cache, "docs", replacement) catch |err| switch (err) {
+fn testStatusReplacementAllocationFailures(comptime catalog_refresh: bool) !void {
+    const alloc = std.testing.allocator;
+    // Inject only after setup. Exercise every publication allocation, then
+    // inspect using a healthy allocator; setup failures cannot mask rollback.
+    for (0..256) |offset| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        const owned_alloc = failing.allocator();
+        var cache = TableRuntimeSnapshotCache.init(owned_alloc);
+        defer cache.deinit();
+        var old_indexes = [_]db_mod.types.DBIndexStats{.{
+            .name = "vec",
+            .kind = .dense_vector,
+            .doc_count = 11,
+            .replay_applied_sequence = 5,
+            .replay_target_sequence = 10,
+        }};
+        const old = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .doc_count = 11, .index_count = 1, .indexes = &old_indexes },
+        };
+        _ = try publishGroupForTest(&cache, "docs", old);
+        _ = try publishGroupForTest(&cache, "logs", .{ .group_id = 8, .stats = .{ .doc_count = 2 } });
+        var new_indexes = [_]db_mod.types.DBIndexStats{.{
+            .name = "vec-new",
+            .kind = .dense_vector,
+            .doc_count = 99,
+            .replay_applied_sequence = 10,
+            .replay_target_sequence = 10,
+        }};
+        const replacement = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .doc_count = 99, .index_count = 1, .indexes = &new_indexes },
+        };
+        if (catalog_refresh) {
+            var token = try cache.captureCatalogToken(owned_alloc, &.{"docs"}, false);
+            defer token.deinit();
+            var snapshots = [_]TableRuntimeSnapshot{.{
+                .table_name = try owned_alloc.dupe(u8, "docs"),
+                .statuses = .{ .items = try owned_alloc.alloc(LocalTableRuntimeStatus, 1) },
+            }};
+            snapshots[0].statuses.items[0] = try replacement.clone(owned_alloc);
+            failing.fail_index = failing.alloc_index + offset;
+            if (cache.publishRefresh(&token, &snapshots)) |result| {
+                var owned_result = result;
+                defer owned_result.deinit();
+                try std.testing.expect(!owned_result.hasRejectedTables());
+            } else |err| switch (err) {
                 error.OutOfMemory => {},
+                else => return err,
+            }
+        } else {
+            const token = try cache.capturePublicationToken("docs");
+            failing.fail_index = failing.alloc_index + offset;
+            _ = cache.publishGroup(token, "docs", replacement) catch |err| switch (err) {
+                error.OutOfMemory => TableRuntimeSnapshotCache.PublishResult.stale_observation,
+                else => return err,
             };
-
-            var docs = (try cache.snapshot(alloc, "docs")).?;
-            defer docs.deinit(alloc);
-            try std.testing.expectEqual(@as(usize, 1), docs.items.len);
-            try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
-            try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
         }
-    };
+        const induced = failing.has_induced_failure;
+        failing.fail_index = std.math.maxInt(usize);
+        // An optional read-mirror allocation can fail after authoritative
+        // commit. Both an intact old view and the complete new view are legal;
+        // a partially installed payload is not.
+        var observed = (try cache.snapshot(alloc, "docs")).?;
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), observed.items.len);
+        const item = observed.items[0];
+        const new_view = item.stats.doc_count == 99;
+        try std.testing.expectEqual(@as(u64, if (new_view) 99 else 11), item.stats.doc_count);
+        try std.testing.expectEqual(item.stats.doc_count, item.stats.indexes[0].doc_count);
+        try std.testing.expectEqualStrings(if (new_view) "vec-new" else "vec", item.stats.indexes[0].name);
+        try std.testing.expectEqual(@as(u64, if (new_view) 10 else 5), item.stats.indexes[0].replay_applied_sequence);
+        var logs = (try cache.snapshot(alloc, "logs")).?;
+        defer logs.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 2), logs.items[0].stats.doc_count);
+        if (!induced) {
+            try std.testing.expect(new_view);
+            try std.testing.expect(offset > 0);
+            return;
+        }
+    }
+    return error.AllocationFailureCoverageBudgetExceeded;
+}
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+test "table runtime snapshot cache preserves existing status on replacement allocation failure" {
+    try testStatusReplacementAllocationFailures(false);
 }
 
 test "read mirror allocation failure cannot attach replacement authority to predecessor identity" {
@@ -10826,94 +11709,7 @@ test "read mirror allocation failure cannot attach replacement authority to pred
 }
 
 test "table runtime snapshot cache preserves previous snapshots when replace preserve install fails" {
-    const Runner = struct {
-        fn run(alloc: std.mem.Allocator) !void {
-            var cache = TableRuntimeSnapshotCache.init(alloc);
-            defer cache.deinit();
-
-            const initial_docs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_docs_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 11,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_docs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec"),
-                .kind = .dense_vector,
-                .doc_count = 11,
-                .replay_applied_sequence = 5,
-                .replay_target_sequence = 10,
-                .replay_catch_up_required = true,
-            };
-            const initial_logs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            initial_logs_items[0] = .{
-                .group_id = 8,
-                .stats = .{
-                    .doc_count = 2,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            initial_logs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "kw"),
-                .kind = .full_text,
-                .doc_count = 2,
-            };
-            const initial = try alloc.alloc(TableRuntimeSnapshot, 2);
-            defer alloc.free(initial);
-            initial[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = initial_docs_items },
-            };
-            initial[1] = .{
-                .table_name = try alloc.dupe(u8, "logs"),
-                .statuses = .{ .items = initial_logs_items },
-            };
-            try publishRefreshForTest(&cache, initial);
-
-            const refresh_docs_items = try alloc.alloc(LocalTableRuntimeStatus, 1);
-            refresh_docs_items[0] = .{
-                .group_id = 7,
-                .stats = .{
-                    .doc_count = 99,
-                    .index_count = 1,
-                    .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
-                },
-            };
-            refresh_docs_items[0].stats.indexes[0] = .{
-                .name = try alloc.dupe(u8, "vec-new"),
-                .kind = .dense_vector,
-                .doc_count = 99,
-            };
-            const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
-            defer alloc.free(refresh);
-            refresh[0] = .{
-                .table_name = try alloc.dupe(u8, "docs"),
-                .statuses = .{ .items = refresh_docs_items },
-            };
-
-            publishRefreshForTest(&cache, refresh) catch |err| switch (err) {
-                error.OutOfMemory => {},
-                else => return err,
-            };
-
-            var docs = (try cache.snapshot(alloc, "docs")).?;
-            defer docs.deinit(alloc);
-            try std.testing.expectEqual(@as(u64, 11), docs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("vec", docs.items[0].stats.indexes[0].name);
-            try std.testing.expectEqual(@as(u64, 5), docs.items[0].stats.indexes[0].replay_applied_sequence);
-
-            var logs = (try cache.snapshot(alloc, "logs")).?;
-            defer logs.deinit(alloc);
-            try std.testing.expectEqual(@as(u64, 2), logs.items[0].stats.doc_count);
-            try std.testing.expectEqualStrings("kw", logs.items[0].stats.indexes[0].name);
-        }
-    };
-
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try testStatusReplacementAllocationFailures(true);
 }
 
 test "table runtime snapshot cache summarizes replay debt" {
@@ -10974,6 +11770,7 @@ test "table runtime snapshot cache summarizes replay debt" {
     };
 
     const snapshots = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = docs_items },
@@ -10993,4 +11790,53 @@ test "table runtime snapshot cache summarizes replay debt" {
     try std.testing.expectEqual(@as(usize, 2), summary.indexes_with_replay_debt);
     try std.testing.expectEqual(@as(u64, 6), summary.outstanding_replay_sequences);
     try std.testing.expectEqual(@as(u64, 3), summary.max_index_replay_backlog);
+}
+
+test "modeled runtime snapshots stabilize only physical duration telemetry" {
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.setModeledRuntimeTelemetry(true);
+
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(token, "docs", .{
+            .group_id = 7,
+            .stats = .{
+                .doc_count = 3,
+                .enrichment = .{
+                    .next_retry_at_ms = 1234,
+                    .last_embed_batch_ns = 55,
+                    .total_embed_ns = 89,
+                },
+                .async_indexing = .{
+                    .startup = .{
+                        .configured_indexes = 2,
+                        .db_open_ns = 144,
+                        .load_indexes_ns = 233,
+                        .lsm_open_total_ns = 377,
+                    },
+                    .dense_catch_up = .{
+                        .current_sequence = 8,
+                        .finish_ns = 610,
+                        .max_finish_ns = 987,
+                    },
+                },
+            },
+        }),
+    );
+
+    var status = (try cache.snapshotGroupStatus(std.testing.allocator, "docs", 7)).?;
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), status.stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1234), status.stats.enrichment.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.enrichment.last_embed_batch_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.enrichment.total_embed_ns);
+    try std.testing.expectEqual(@as(u32, 2), status.stats.async_indexing.startup.configured_indexes);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.db_open_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.load_indexes_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.lsm_open_total_ns);
+    try std.testing.expectEqual(@as(u64, 8), status.stats.async_indexing.dense_catch_up.current_sequence);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.dense_catch_up.finish_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.dense_catch_up.max_finish_ns);
 }

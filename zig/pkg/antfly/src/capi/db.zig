@@ -14,8 +14,10 @@
 
 const std = @import("std");
 const antfly = @import("antfly_storage_root");
+const TestDirectory = antfly.testing.TestDirectory;
 const vector_mod = @import("antfly_vector").vector;
 const capi = @import("types.zig");
+pub const ApiTypes = capi;
 const search_wire = @import("search_wire.zig");
 
 const db_mod = antfly.db;
@@ -44,21 +46,12 @@ fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
 
-var temp_test_path_nonce: u64 = 0;
-
-fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
-    const nonce = @atomicRmw(u64, &temp_test_path_nonce, .Add, 1, .monotonic);
-    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-{s}-{d}-{d}", .{
-        label,
-        antfly.platform_time.monotonicNs(),
-        nonce,
-    });
-    defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+fn tempTestPath(alloc: Allocator, root: []const u8, label: []const u8) ![:0]u8 {
+    return try std.fmt.allocPrintSentinel(alloc, "{s}-{s}", .{ root, label }, 0);
 }
 
-fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
-    const base = try tempTestPath(alloc, label);
+fn tempTestAflitePath(alloc: Allocator, root: []const u8, label: []const u8) ![:0]u8 {
+    const base = try tempTestPath(alloc, root, label);
     defer alloc.free(base);
     const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
     defer alloc.free(path);
@@ -154,11 +147,11 @@ const ReadableLeaseHook = struct {
     callback_ctx: ?*anyopaque,
     callback: ReadableLeaseHookFn,
 
-    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadableLeaseRequester {
+    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadSafetyBarrier {
         return .{
             .ptr = @constCast(self),
             .vtable = &.{
-                .request_readable_lease = requestReadableLease,
+                .wait_read_safe = waitReadSafe,
             },
         };
     }
@@ -167,7 +160,7 @@ const ReadableLeaseHook = struct {
         return raft_mod.FeatureReads.init(self.requester());
     }
 
-    fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+    fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
         const self: *ReadableLeaseHook = @ptrCast(@alignCast(ptr));
         const code = self.callback(
             self.callback_ctx,
@@ -183,6 +176,8 @@ const ReadableLeaseHook = struct {
             .intent_conflict => return error.IntentConflict,
             .txn_not_found => return error.TxnNotFound,
             .busy => return error.WouldBlock,
+            .outcome_unknown => return error.DurabilityOutcomeUnknown,
+            .unsupported => return error.UnsupportedOperation,
             .internal => return error.Internal,
         }
     }
@@ -540,6 +535,7 @@ const JsonDBIndexStats = struct {
     doc_count: u64,
     term_count: u64,
     edge_count: u64,
+    graph_counts_pending: bool,
     node_count: u64,
     repair_degraded: bool,
     repair_issue_count: u64,
@@ -1900,24 +1896,66 @@ fn openLiteHandleAlloc(
     resolved: LiteResolvedOpenOptions,
     create: bool,
 ) !*Handle {
-    const alloc = std.heap.c_allocator;
+    return try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, resolved, create, null, null);
+}
 
+/// Zig embedding seam behind the C ABI. It constructs the same opaque handle
+/// and therefore exercises the same exported request/close/callback paths, but
+/// lets an in-process host supply deterministic std.Io and runtime ownership.
+/// The runtime and I/O interface must outlive the returned handle.
+pub const HostLiteOpenOptions = struct {
+    create: bool = false,
+    read_only: bool = false,
+    hosted: bool = true,
+    no_sync: bool = false,
+};
+
+pub fn openLiteHandleWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
+    options: HostLiteOpenOptions,
+) !*anyopaque {
+    return try openLiteHandleAllocWithRuntime(alloc, path, .{
+        .open_mode = if (options.read_only) .query_readonly else .writer,
+        .profile = if (options.hosted) .hosted else .native,
+        .no_sync = options.no_sync,
+    }, options.create, io, backend_runtime);
+}
+
+pub fn closeLiteRuntimeHandle(handle_ptr: ?*anyopaque) void {
+    const handle = asHandle(handle_ptr) orelse return;
+    closeHandle(handle);
+}
+
+fn openLiteHandleAllocWithRuntime(
+    alloc: Allocator,
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    borrowed_io: ?std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
+            .io = borrowed_io,
         });
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
+        .backend_runtime = backend_runtime,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -2164,9 +2202,8 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
-    if (!(lite_restore_staging.isImportTargetEmpty(handle.alloc, &handle.db) catch |err| return capi.mapError(err))) return .invalid_argument;
     const bytes = backup.bytes();
-    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, bytes) catch |err| return capi.mapError(err);
+    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, &handle.owned_lite_backend.?, bytes) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -2191,12 +2228,15 @@ pub export fn antfly_lite_restore_backup_json(
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
 
     const alloc = std.heap.c_allocator;
+    var encoded_report = stringifyJson(LiteRestoreReport{ .path = path }) catch return .internal;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    restorePortableBackupToLiteFile(alloc, io_impl.io(), path, backup.bytes(), replace) catch |err| return capi.mapError(err);
-    const report = LiteRestoreReport{ .path = path };
-    out.* = stringifyJson(report) catch return .internal;
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), null, path, backup.bytes(), replace, null) catch |err| {
+        antfly_buffer_free(&encoded_report);
+        return capi.mapError(err);
+    };
+    out.* = encoded_report;
     return .ok;
 }
 
@@ -2207,6 +2247,29 @@ pub export fn antfly_lite_restore_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     return antfly_lite_restore_backup_json(dest_path, backup, replace, out_buf);
+}
+
+pub export fn antfly_lite_restore_backup_file_json(
+    dest_path: ?[*:0]const u8,
+    backup_path: ?[*:0]const u8,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const destination = cStringSpan(dest_path) orelse return .invalid_argument;
+    const source = cStringSpan(backup_path) orelse return .invalid_argument;
+
+    const alloc = std.heap.c_allocator;
+    var encoded_report = stringifyJson(LiteRestoreReport{ .path = destination }) catch return .internal;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    restorePortableBackupPathToLiteFile(alloc, io_impl.io(), destination, source, replace) catch |err| {
+        antfly_buffer_free(&encoded_report);
+        return capi.mapError(err);
+    };
+    out.* = encoded_report;
+    return .ok;
 }
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
@@ -2333,21 +2396,98 @@ pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_b
     return .ok;
 }
 
-fn restorePortableBackupToLiteFile(
+pub fn restorePortableBackupToLiteFileWithRuntime(
     alloc: Allocator,
     io: std.Io,
+    backend_runtime: *db_mod.background_runtime.BackendRuntime,
     dest_path: []const u8,
     backup: []const u8,
     replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
+) !void {
+    try restorePortableBackupToLiteFile(alloc, io, backend_runtime, dest_path, backup, replace, cancel);
+}
+
+fn restorePortableBackupToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    dest_path: []const u8,
+    backup: []const u8,
+    replace: bool,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
-    try portable_backup.validatePortable(alloc, backup);
+
+    const Populate = struct {
+        fn run(context: []const u8, alloc_inner: Allocator, db: *db_mod.DB, _: std.Io) !void {
+            try lite_restore_staging.populateUnpublishedLiteDb(alloc_inner, db, context);
+        }
+    };
+    try restorePortableSourceToLiteFile(alloc, io, backend_runtime, dest_path, replace, backup, Populate.run, cancel);
+}
+
+fn restorePortableBackupPathToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    dest_path: []const u8,
+    backup_path: []const u8,
+    replace: bool,
+) !void {
+    if (!std.mem.endsWith(u8, backup_path, ".afb")) return error.InvalidArgument;
+    var file = if (std.fs.path.isAbsolute(backup_path))
+        try std.Io.Dir.openFileAbsolute(io, backup_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, backup_path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > lite_restore_staging.max_afb_file_bytes) return error.InvalidArgument;
+
+    const Context = struct {
+        file: std.Io.File,
+        file_size: u64,
+    };
+    const Populate = struct {
+        fn run(context: Context, alloc_inner: Allocator, db: *db_mod.DB, io_inner: std.Io) !void {
+            try lite_restore_staging.populateUnpublishedLiteDbFromPortableFile(
+                alloc_inner,
+                db,
+                io_inner,
+                context.file,
+                context.file_size,
+            );
+        }
+    };
+    try restorePortableSourceToLiteFile(
+        alloc,
+        io,
+        null,
+        dest_path,
+        replace,
+        Context{ .file = file, .file_size = stat.size },
+        Populate.run,
+        null,
+    );
+}
+
+fn restorePortableSourceToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    dest_path: []const u8,
+    replace: bool,
+    context: anytype,
+    comptime populate: anytype,
+    cancel: ?*const antfly.storage_maintenance.CancelToken,
+) !void {
+    if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
+    if (cancel) |token| try token.check();
 
     const dest_exists = liteCapiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
 
-    var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
+    var dest_lock = try antfly.lite.native.lockWriterPathWithIo(alloc, io, dest_path);
     defer dest_lock.close();
 
     if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
@@ -2358,23 +2498,41 @@ fn restorePortableBackupToLiteFile(
     errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
 
     {
-        var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
+        var backend = try lite_backend.Handle.createWithOptions(alloc, tmp_path, .{
+            .exclusive = true,
+            .io = io,
+        });
         defer backend.deinit();
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
             .external_derived_checkpoints = false,
+            .backend_runtime = backend_runtime,
         };
+        // A caller-supplied std.Io runtime may be cooperative (VoprIo) rather
+        // than backed by std.Io.Threaded. Restore is synchronous, so it must
+        // not select the executor variant that requires an owned Threaded
+        // implementation merely because the runtime exposes an Io interface.
+        if (backend_runtime != null) opts.executor = .{ .backend = .manual };
         try backend.configureDbOpenOptions(&opts);
 
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
         defer db.close();
-        try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
+        try populate(context, alloc, &db, io);
     }
+
+    if (cancel) |token| try token.check();
 
     liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         liteCapiDeleteFilePath(io, tmp_path) catch {};
         return err;
+    };
+    lite_restore_staging.confirmPublishedFileDurability(io, dest_path) catch |err| {
+        std.log.err(
+            "Lite restore published but crash durability could not be confirmed path={s} class={s}",
+            .{ dest_path, @errorName(err) },
+        );
+        return error.DurabilityOutcomeUnknown;
     };
 }
 
@@ -3817,6 +3975,7 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
+            .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,
@@ -6607,8 +6766,10 @@ pub export fn antfly_db_snapshot(
 }
 
 test "capi transaction lifecycle" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -6651,8 +6812,10 @@ test "capi transaction lifecycle" {
 }
 
 test "capi batch and lookup json" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-batch-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-batch-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -6702,46 +6865,50 @@ test "capi batch and lookup json" {
 }
 
 test "capi lite opens exports imports checks and vacuums aflite" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const plain_path = try tempTestPath(alloc, "capi-lite-plain");
+    const plain_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-plain");
     defer alloc.free(plain_path);
-    const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
+    const invalid_lite_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-invalid");
     defer alloc.free(invalid_lite_path);
-    const missing_readonly_path = try tempTestAflitePath(alloc, "capi-lite-missing-readonly");
+    const missing_readonly_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-missing-readonly");
     defer alloc.free(missing_readonly_path);
-    const missing_status_path = try tempTestAflitePath(alloc, "capi-lite-missing-status");
+    const missing_status_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-missing-status");
     defer alloc.free(missing_status_path);
-    const short_lite_path = try tempTestAflitePath(alloc, "capi-lite-short");
+    const short_lite_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-short");
     defer alloc.free(short_lite_path);
-    const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
+    const src_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-src");
     defer alloc.free(src_path);
-    const remote_inference_path = try tempTestAflitePath(alloc, "capi-lite-remote-inference");
+    const remote_inference_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-remote-inference");
     defer alloc.free(remote_inference_path);
-    const local_inference_path = try tempTestAflitePath(alloc, "capi-lite-local-inference");
+    const local_inference_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-local-inference");
     defer alloc.free(local_inference_path);
-    const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
+    const dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-dst");
     defer alloc.free(dst_path);
-    const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
+    const bad_dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-bad-dst");
     defer alloc.free(bad_dst_path);
-    const schema_dst_path = try tempTestAflitePath(alloc, "capi-lite-schema-dst");
+    const schema_dst_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-schema-dst");
     defer alloc.free(schema_dst_path);
-    const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
+    const snapshot_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
-    const snapshot_file_path = try tempTestAflitePath(alloc, "capi-lite-snapshot-file");
+    const snapshot_file_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-snapshot-file");
     defer alloc.free(snapshot_file_path);
-    const pinned_snapshot_path = try tempTestAflitePath(alloc, "capi-lite-pinned-snapshot");
+    const pinned_snapshot_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-pinned-snapshot");
     defer alloc.free(pinned_snapshot_path);
-    const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
+    const restore_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore");
     defer alloc.free(restore_path);
-    const restore_alias_path = try tempTestAflitePath(alloc, "capi-lite-restore-alias");
+    const restore_alias_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-alias");
     defer alloc.free(restore_alias_path);
-    const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
+    const restore_unknown_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-outcome-unknown");
+    defer alloc.free(restore_unknown_path);
+    const locked_restore_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-locked");
     defer alloc.free(locked_restore_path);
-    const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
+    const restore_malformed_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-restore-malformed");
     defer alloc.free(restore_malformed_path);
-    const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
+    const invalid_snapshot_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-snapshot-invalid");
     defer alloc.free(invalid_snapshot_path);
-    const invalid_snapshot_file_path = try tempTestPath(alloc, "capi-lite-snapshot-file-invalid");
+    const invalid_snapshot_file_path = try tempTestPath(alloc, test_tmp.path(), "capi-lite-snapshot-file-invalid");
     defer alloc.free(invalid_snapshot_file_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
@@ -6759,6 +6926,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(pinned_snapshot_path);
     cleanupTestFile(restore_path);
     cleanupTestFile(restore_alias_path);
+    cleanupTestFile(restore_unknown_path);
     cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
@@ -6779,6 +6947,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(pinned_snapshot_path);
     defer cleanupTestFile(restore_path);
     defer cleanupTestFile(restore_alias_path);
+    defer cleanupTestFile(restore_unknown_path);
     defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
@@ -6787,14 +6956,21 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(@as(u32, 1), antfly_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
     try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.outcome_unknown))));
+    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.unsupported))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "retry") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.WriterLocked));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.SourceFileChanged));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.PortableRuntimeActivationPending));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, capi.mapError(error.FileLocksUnsupported));
     try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
     try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
+    try std.testing.expectEqual(capi.ErrorCode.outcome_unknown, capi.mapError(error.DurabilityOutcomeUnknown));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.InvalidBackupManifest));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.BackupArtifactIntegrityMismatch));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(src_path, null));
@@ -7440,6 +7616,34 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(restore_report.ptr, restore_report.len);
     try std.testing.expect(std.mem.indexOf(u8, restore_report.ptr.?[0..restore_report.len], "\"format\":\"aflite\"") != null);
 
+    lite_restore_staging.failNextPublishedFileDirectorySyncForTest();
+    antfly.test_error_logs.expectErrorLogs(1);
+    var unknown_report: capi.Buffer = .{ .ptr = @constCast("stale".ptr), .len = "stale".len };
+    try std.testing.expectEqual(capi.ErrorCode.outcome_unknown, antfly_lite_restore_backup_json(restore_unknown_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &unknown_report));
+    try std.testing.expect(unknown_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), unknown_report.len);
+
+    // Publication already happened, so the destination must be inspectable
+    // and a blind retry must be rejected rather than replacing it again.
+    var unknown_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_unknown_path, &unknown_handle));
+    defer antfly_db_close(unknown_handle);
+    var unknown_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(unknown_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &unknown_lookup));
+    defer antfly_db_buffer_free(unknown_lookup.ptr, unknown_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_lookup.ptr.?[0..unknown_lookup.len], "\"second\"") != null);
+    var retry_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_unknown_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &retry_report));
+
     var restored_file_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_path, &restored_file_handle));
     defer antfly_db_close(restored_file_handle);
@@ -7519,8 +7723,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 }
 
 test "capi lite exposes hosted and status-only profiles" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestAflitePath(alloc, "capi-lite-profiles");
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-profiles");
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);
@@ -7599,8 +7805,10 @@ test "capi lite exposes hosted and status-only profiles" {
 }
 
 test "capi lite open options validate and configure ttl cleanup" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestAflitePath(alloc, "capi-lite-open-options");
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-open-options");
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);
@@ -7683,7 +7891,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     default_handle = null;
     cleanupTestFile(path);
 
-    const dir_path = try tempTestPath(alloc, "capi-generic-directory-open");
+    const dir_path = try tempTestPath(alloc, test_tmp.path(), "capi-generic-directory-open");
     defer alloc.free(dir_path);
     cleanupTestDir(dir_path);
     defer cleanupTestDir(dir_path);
@@ -7790,8 +7998,10 @@ test "capi lite open options validate and configure ttl cleanup" {
 }
 
 test "capi execute graph queries honors identity read generation" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-execute-graph-generation");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-execute-graph-generation");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -7854,8 +8064,10 @@ test "capi execute graph queries honors identity read generation" {
 }
 
 test "capi search rejects stale identity generation before readable lease hook" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-stale-generation-before-lease");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-stale-generation-before-lease");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -7926,8 +8138,10 @@ test "capi search rejects stale identity generation before readable lease hook" 
 }
 
 test "capi search json returns stamped identity generation" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-search-generation-response");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-search-generation-response");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -8015,8 +8229,10 @@ test "capi search json returns stamped identity generation" {
 }
 
 test "capi aggregate hits rejects stale identity generation before aggregation materialization" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-aggregate-stale-generation");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-aggregate-stale-generation");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -8074,8 +8290,10 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
 }
 
 test "capi request paths trigger readable lease hook" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-readable-lease");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-readable-lease");
     defer alloc.free(path);
 
     cleanupTestDir(path);
@@ -8264,8 +8482,10 @@ test "capi request paths trigger readable lease hook" {
 }
 
 test "capi artifact decode and lookup json" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-artifact-test");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-artifact-test");
     defer alloc.free(path);
     var handle_ptr: ?*anyopaque = null;
     cleanupTestDir(path);
@@ -8331,8 +8551,10 @@ test "capi artifact decode and lookup json" {
 }
 
 test "capi dense search profile breakdown" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "capi-dense-profile");
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-dense-profile");
     defer alloc.free(path);
 
     cleanupTestDir(path);

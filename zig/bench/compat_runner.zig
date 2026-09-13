@@ -21,14 +21,14 @@ const embedder_mod = db_mod.embedder;
 const raft_mod = antfly.raft;
 const schema_mod = antfly.schema;
 
-const CompatReadableLeaseObserver = struct {
+const CompatReadSafetyObserver = struct {
     request_count: usize = 0,
     last_group_id: u64 = 0,
     last_request_ctx: [64]u8 = undefined,
     last_request_ctx_len: usize = 0,
 
     fn callback(ctx: ?*anyopaque, group_id: u64, request_ctx: []const u8) !void {
-        const self: *CompatReadableLeaseObserver = @ptrCast(@alignCast(ctx.?));
+        const self: *CompatReadSafetyObserver = @ptrCast(@alignCast(ctx.?));
         self.request_count += 1;
         self.last_group_id = group_id;
         if (request_ctx.len > self.last_request_ctx.len) return error.InvalidArgument;
@@ -117,7 +117,7 @@ fn runCase(alloc: std.mem.Allocator, case_dir: []const u8) !void {
         db.close();
     }
     var txn_ids = std.StringHashMapUnmanaged(db_mod.types.TxnId).empty;
-    var lease_observer = CompatReadableLeaseObserver{};
+    var lease_observer = CompatReadSafetyObserver{};
     defer {
         var it = txn_ids.iterator();
         while (it.next()) |entry| alloc.free(entry.key_ptr.*);
@@ -416,10 +416,10 @@ fn runQueriesAndValidate(
     db: *db_mod.DB,
     txn_ids: std.StringHashMapUnmanaged(db_mod.types.TxnId),
     case_dir: []const u8,
-    lease_observer: *CompatReadableLeaseObserver,
+    lease_observer: *CompatReadSafetyObserver,
 ) !void {
-    var lease_requester = raft_mod.CallbackReadableLeaseRequester.init(lease_observer, CompatReadableLeaseObserver.callback);
-    const feature_db_reads = raft_mod.FeatureDBReads.initCallback(1, &lease_requester);
+    var read_safety_barrier = raft_mod.CallbackReadSafetyBarrier.init(lease_observer, CompatReadSafetyObserver.callback);
+    const feature_db_reads = raft_mod.FeatureDBReads.initCallback(1, &read_safety_barrier);
     const queries_path = try std.fmt.allocPrint(alloc, "{s}/queries.json", .{case_dir});
     defer alloc.free(queries_path);
     const expected_path = try std.fmt.allocPrint(alloc, "{s}/expected.json", .{case_dir});
@@ -1001,7 +1001,7 @@ fn waitForDerivedWork(db: *db_mod.DB) !void {
     try db.executor.waitForAll(sequence);
 }
 
-test "compat readable lease observer records feature db reads" {
+test "compat read safety observer records feature db reads" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-compat-read-observer";
     cleanupTempDir(path);
@@ -1026,9 +1026,9 @@ test "compat readable lease observer records feature db reads" {
         },
     });
 
-    var observer = CompatReadableLeaseObserver{};
-    var requester = raft_mod.CallbackReadableLeaseRequester.init(&observer, CompatReadableLeaseObserver.callback);
-    const reads = raft_mod.FeatureDBReads.initCallback(1, &requester);
+    var observer = CompatReadSafetyObserver{};
+    var read_safety_barrier = raft_mod.CallbackReadSafetyBarrier.init(&observer, CompatReadSafetyObserver.callback);
+    const reads = raft_mod.FeatureDBReads.initCallback(1, &read_safety_barrier);
 
     var lookup = (try reads.lookup(alloc, &db, "doc:a", .{})).?;
     defer lookup.deinit(alloc);

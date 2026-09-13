@@ -159,8 +159,10 @@ pub fn decodeAlloc(alloc: Allocator, bytes: []const u8) ![]document_segment.Entr
         const body_start = std.math.cast(usize, source.body_offset) orelse return error.InvalidDocumentSegment;
         const body_end = std.math.add(usize, body_start, source.body_len) catch return error.InvalidDocumentSegment;
         if (body_end > bytes.len) return error.InvalidDocumentSegment;
+        const doc_id = try alloc.dupe(u8, source.doc_id);
+        errdefer alloc.free(doc_id);
         entry.* = .{
-            .doc_id = try alloc.dupe(u8, source.doc_id),
+            .doc_id = doc_id,
             .body = try alloc.dupe(u8, bytes[body_start..body_end]),
             .last_lsn = source.last_lsn,
             .last_timestamp_ns = source.last_timestamp_ns,

@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const process_memory = @import("antfly_platform").process_memory;
 const hbc_mod = @import("../storage/hbc_adapter.zig");
+const db_mod = @import("../storage/db/db.zig");
 const background_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -71,6 +72,8 @@ const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
 const MinSmartShardTransitionBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartShardTransitionBytes: u64 = 512 * 1024 * 1024;
+const MinSmartVectorBlockBuildBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartVectorBlockBuildBytes: u64 = 256 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -220,6 +223,7 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
+    const vector_block_build_hard = adaptiveSliceHardLimit(total, 16, MinSmartVectorBlockBuildBytes, MaxSmartVectorBlockBuildBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -239,6 +243,8 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
     // Inference slices are logical host-plus-accelerator metrics. Their host
     // component is enforced by the aggregate budget above; ModelManager and
     // BackendRuntime retain device-aware backend admission.
@@ -270,6 +276,10 @@ pub const ProvisionedGroupStorage = struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     effective_memory_limit_bytes: u64 = 0,
     memory_limit_source: MemoryLimitSource = .unavailable,
+    /// Closed by default for provisioned databases. Metadata opens this only
+    /// after the complete table-serving store set advertises the native HBC
+    /// protocol, so a rolling old binary can never be handed native authority.
+    dense_native_authority_permitted: std.atomic.Value(bool) = .init(false),
 
     pub fn init(alloc: std.mem.Allocator) ProvisionedGroupStorage {
         return initWithProcessMemoryLimit(alloc, 0);
@@ -340,6 +350,17 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.table_eviction_hook = null;
     }
 
+    /// Install an operator/runtime-owned capacity domain before sources are
+    /// attached. Deterministic runtimes use this to keep admission and status
+    /// reporting on modeled storage instead of probing the host filesystem.
+    pub fn installCapacitySource(
+        self: *ProvisionedGroupStorage,
+        source: resource_manager_mod.CapacitySource,
+    ) !void {
+        if (self.filesystem_capacity_probe != null) return error.CapacitySourceAlreadyInstalled;
+        try self.resource_manager.installCapacitySource(source);
+    }
+
     pub fn attachSources(
         self: *ProvisionedGroupStorage,
         read_source: *table_reads.ProvisionedTableReadSource,
@@ -349,7 +370,7 @@ pub const ProvisionedGroupStorage = struct {
         // and therefore one physical capacity domain. BackendRuntime remains
         // the execution abstraction; filesystem policy and accounting stay in
         // the ResourceManager.
-        if (filesystem_capacity.supported) {
+        if (filesystem_capacity.supported and self.resource_manager.capacitySource() == null) {
             if (self.filesystem_capacity_probe) |probe| {
                 if (!std.mem.eql(u8, probe.path, write_source.replica_root_dir)) {
                     return error.CapacitySourceAlreadyInstalled;
@@ -371,6 +392,11 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = self.backend_runtime;
         self.read_cache.antfly_provider = read_source.antfly_provider;
         self.read_cache.secret_store = read_source.secret_store;
+        // Capability discovery is a storage-runtime service, not a query-only
+        // concern. Bind the same cache into writer enrichment so semantic
+        // chunking and every other remote family reuse planner/executor leases
+        // across documents.
+        _ = write_source.withRemoteCapabilityCache(&self.read_cache.remote_capability_cache);
         read_source.reranker_runtime = try self.read_cache.ensureRerankerRuntime();
         // Resident writer DBs also serve freshness-sensitive reads. Leaving
         // their cache unset makes the LSM backend retain a private decoded
@@ -384,6 +410,7 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.antfly_provider = write_source.antfly_provider;
         self.write_cache.secret_store = write_source.secret_store;
         self.write_cache.remote_content = write_source.remote_content;
+        self.write_cache.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         self.startup_write_cache.lsm_cache = &self.lsm_cache;
         self.startup_write_cache.hbc_cache = &self.hbc_cache;
         self.startup_write_cache.resource_manager = &self.resource_manager;
@@ -391,6 +418,7 @@ pub const ProvisionedGroupStorage = struct {
         self.startup_write_cache.antfly_provider = write_source.antfly_provider;
         self.startup_write_cache.secret_store = write_source.secret_store;
         self.startup_write_cache.remote_content = write_source.remote_content;
+        self.startup_write_cache.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         read_source.cache = &self.read_cache;
         read_source.runtime_status_cache = &self.runtime_status_cache;
         read_source.prepare_for_read = write_source.readPreparation();
@@ -403,7 +431,27 @@ pub const ProvisionedGroupStorage = struct {
             &self.write_cache_state_mutex,
         );
         write_source.runtime_status_cache = &self.runtime_status_cache;
+        write_source.dense_native_migration_policy_source = self.denseNativeMigrationPolicySource();
         _ = write_source.withGroupVisibleRootGeneration(self.groupVisibleRootGenerationSource());
+    }
+
+    pub fn setDenseNativeAuthorityPermitted(self: *ProvisionedGroupStorage, permitted: bool) void {
+        // Monotonic within a process. The durable per-index AUTHORITY marker is
+        // the crash-sticky decision; a transient or older catalog snapshot may
+        // never revoke it or make a later callback close the gate again.
+        if (permitted) self.dense_native_authority_permitted.store(true, .release);
+    }
+
+    fn denseNativeAuthorityPermitted(ptr: *const anyopaque) bool {
+        const self: *const ProvisionedGroupStorage = @ptrCast(@alignCast(ptr));
+        return self.dense_native_authority_permitted.load(.acquire);
+    }
+
+    pub fn denseNativeMigrationPolicySource(self: *const ProvisionedGroupStorage) db_mod.DenseNativeMigrationPolicySource {
+        return .{
+            .ptr = self,
+            .authority_permitted = denseNativeAuthorityPermitted,
+        };
     }
 
     pub fn attachBackendRuntime(
@@ -416,6 +464,7 @@ pub const ProvisionedGroupStorage = struct {
         self.read_cache.backend_runtime = runtime;
         self.write_cache.backend_runtime = runtime;
         self.startup_write_cache.backend_runtime = runtime;
+        self.runtime_status_cache.setModeledRuntimeTelemetry(runtime.usesBorrowedIo());
         read_source.backend_runtime = runtime;
         write_source.backend_runtime = runtime;
     }
@@ -510,6 +559,17 @@ pub const ProvisionedGroupStorage = struct {
         self.finishGroupVisibleRootGenerationReservation(group_id, advance);
     }
 };
+
+test "provisioned dense native authority gate is fail-closed and monotonic" {
+    var storage = ProvisionedGroupStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const source = storage.denseNativeMigrationPolicySource();
+    try std.testing.expect(!source.authorityPermitted());
+    storage.setDenseNativeAuthorityPermitted(true);
+    try std.testing.expect(source.authorityPermitted());
+    storage.setDenseNativeAuthorityPermitted(false);
+    try std.testing.expect(source.authorityPermitted());
+}
 
 test "provisioned group storage prunes stale visible root generations" {
     var storage = ProvisionedGroupStorage.init(std.testing.allocator);
@@ -625,7 +685,7 @@ test "provisioned group storage wires remote content to writer caches" {
     var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
-    }, raft_mod.read_gate.noopReadableLeaseRequester());
+    }, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
@@ -640,6 +700,7 @@ test "provisioned group storage wires remote content to writer caches" {
     try std.testing.expectEqual(&storage.lsm_cache, storage.read_cache.lsm_cache.?);
     try std.testing.expectEqual(&storage.lsm_cache, storage.write_cache.lsm_cache.?);
     try std.testing.expectEqual(&storage.lsm_cache, storage.startup_write_cache.lsm_cache.?);
+    try std.testing.expectEqual(&storage.read_cache.remote_capability_cache, write_source.remote_capability_cache.?);
 
     // Keep the production aggregate LSM admission policy covered by the API
     // module's permanent root-test filter as well as the exhaustive budget
@@ -679,6 +740,8 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.relational_preparation_working_set,
+        resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

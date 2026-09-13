@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Focused discovery root for API HTTP runtime and linked-boundary contracts.
 //! Keeping these tests out of the monolithic library root prevents transport
@@ -15,6 +26,7 @@ const openapi_contract = @import("api/openapi_contract.zig");
 const runtime_http_abi = @import("runtime_http_abi.zig");
 const runtime_http_bridge = @import("runtime_http_bridge.zig");
 const table_contract = @import("api/table_contract.zig");
+const table_read_source = @import("api/table_read_source.zig");
 
 // Some API storage adapters deliberately resolve these declarations through
 // the discovery root to avoid production import cycles.
@@ -22,6 +34,10 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
+    _ = @import("api/http_client.zig");
+    _ = @import("api/distributed_join.zig");
+    _ = @import("api/distributed_graph.zig");
+    _ = @import("inference/query_embedding_cache.zig");
     _ = @import("api/agent_tools.zig");
     _ = @import("generating/mod.zig");
     _ = @import("api/query_builder_agent.zig");
@@ -36,4 +52,5 @@ test {
     _ = runtime_http_abi;
     _ = runtime_http_bridge;
     _ = table_contract;
+    _ = table_read_source;
 }

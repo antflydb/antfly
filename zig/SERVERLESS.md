@@ -667,6 +667,43 @@ The listener is configured with:
 - `ANTFLY_SERVERLESS_BIND_PORT`
 - `ANTFLY_SERVERLESS_TICK_INTERVAL_MS`
 
+### Current-version-only storage contract
+
+Serverless is unreleased and supports only the current version. All readers and
+writers use manifest version 20; graph metric segments use version 10 and graph
+topology segments use version 5. Older
+manifests are rejected, and no legacy writer or two-phase rollout gate is kept.
+Graph metric materialization is enabled by default. Catalog reconciliation
+detects configured metrics without artifacts and schedules their publication.
+The public graph-index create/read contract exposes a typed `metrics` map;
+Go, TypeScript, Python and Zig generated models carry the same configuration.
+Metric objects and edge filters use closed field validation, while metric names
+remain user-defined. Serverless accepts `background`, not `manual`, refresh.
+Any explicit `ANTFLY_SERVERLESS_MANIFEST_WRITE_VERSION` must be `20`; other values
+fail startup. All components must run the same current release, and old
+development data must be rebuilt before use.
+
+Graph topology wire v5 retains adjacency traversal data and adds compact
+per-type local edge runs (two u32 node ordinals per edge), an authenticated type
+directory, and page offsets into the original node dictionary. Metric publication
+reads the union of requested type runs and touched dictionary pages. Nearby pages
+are coalesced into bounded range reads; dense selections use an ordinal map,
+while sparse selections sort only their endpoints. Whole-source node/edge limits
+still apply, but retained preparation memory scales with selected topology.
+Cold exact-content verification may read the whole object and is byte-accounted;
+warm verification identities permit true range-only preparation.
+
+Semantic fingerprints are produced during encoding with a bounded node-hash
+cache, without allocating a graph-wide adjacency view or digest array. The
+directory remains available for million-node graphs with ordinary type counts.
+Its 1 MiB control-size limit can still explicitly omit indexing for unusually
+large type dictionaries; those current-version artifacts use full preparation.
+
+The manifest authenticates the
+point-lookup index and the bounded ranked routing root independently. Cold
+top-K reads fetch at most 1,832 routing bytes, regardless of vector cardinality;
+point reads authenticate both tiers in one routing fetch.
+
 ## Image And CI Path
 
 The Zig runtime image is owned by `antfly-zig`, not by the Go control plane
@@ -685,15 +722,15 @@ Current binary/image split:
 Build graph steps:
 
 - `zig build antfly`
-- `zig build serverless-test`
+- `zig build antfly-serverless-test`
 
 GitHub Actions:
 
 - `.github/workflows/zig-tests.yml`
-  - PR / push coverage for `serverless-test`
+  - PR / push coverage for `antfly-serverless-test`
   - smoke checks for `antfly --help` and the nested
     `antfly serverless <role> --help` commands
-  - nightly scheduled `zig build test` + `zig build serverless-test`
+  - nightly scheduled `zig build test` + `zig build antfly-serverless-test`
 - `.github/workflows/container-smoke.yml`
   - PR / push smoke build for `Dockerfile.serverless`
   - builds `install`

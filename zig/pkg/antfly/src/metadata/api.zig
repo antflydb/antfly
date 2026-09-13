@@ -72,6 +72,10 @@ pub const MetadataStatus = struct {
     /// This may lead activation by one command and can be lower than this
     /// process's current codec during a rolling upgrade.
     runtime_status_protocol_ready_version: u16 = 0,
+    /// Highest dense-native storage protocol durably activated by the
+    /// metadata state machine after every table-serving store advertised it.
+    /// Once non-zero, legacy table stores can no longer be admitted.
+    dense_native_storage_protocol_activated_version: u16 = 0,
     /// Whether this replica currently has one capability probe in flight.
     runtime_status_protocol_probe_in_flight: bool = false,
     /// Consecutive failed probes since the last successful probe or durable
@@ -178,6 +182,31 @@ pub const MetadataStatus = struct {
     repair_placement_groups: usize = 0,
     rebalance_placement_groups: usize = 0,
 };
+
+/// Detach the only borrowed field from JSON parser and HTTP response storage.
+/// Unknown roles fail closed and remain compatible with older clients.
+pub fn stabilizeMetadataStatus(
+    status: MetadataStatus,
+) MetadataStatus {
+    var stable = status;
+    const stable_roles = [_][]const u8{
+        "absent",
+        "unknown",
+        "disabled",
+        "follower",
+        "pre_candidate",
+        "candidate",
+        "leader",
+    };
+    for (stable_roles) |role| {
+        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
+            stable.metadata_raft_role = role;
+            return stable;
+        }
+    }
+    stable.metadata_raft_role = "unknown";
+    return stable;
+}
 
 pub const MetadataHead = struct {
     metadata_group_id: u64,
@@ -375,6 +404,7 @@ pub const CatalogRouteFence = struct {
     /// excluded from the wire representation: monotonic clocks and borrowed
     /// cancellation callbacks are process-local capabilities.
     admission_deadline_ns: ?u64 = null,
+    admission_deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     admission_cancellation: CancellationToken = .none,
 
     const Wire = struct {

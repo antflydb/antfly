@@ -19,24 +19,25 @@ Current harness:
 Suggested usage:
 
 ```sh
+zig build lib-image-conformance
+```
+
+The target fetches missing JPEG seed and OpenJPEG corpora and reuses cached
+fixtures. Add `-Dconformance-fetch=false` for an offline run, or
+`-Dconformance-fixtures=/absolute/path` to change the cache directory.
+
+For JPEG-specific triage, build the runner once and invoke it directly:
+
+```sh
 zig build image-jpeg-seed-corpora-e2e
-zig build image-jpeg-seed-corpora-e2e-fetch
-zig build image-jpeg-seed-corpora-e2e-run
-zig build image-jpeg-seed-corpora-e2e-triage
+./zig-out/bin/image-jpeg-seed-corpora-e2e run /tmp/libjpeg-turbo-seed-corpora
+./zig-out/bin/image-jpeg-seed-corpora-e2e triage-djpeg /tmp/libjpeg-turbo-seed-corpora
 ```
 
 Quick local status:
 
 ```sh
 zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- status /tmp/libjpeg-turbo-seed-corpora
-```
-
-The named `zig build` run/triage steps use `--no-fetch`, so they expect an
-existing checkout at `/tmp/libjpeg-turbo-seed-corpora`. Fetch once explicitly if
-needed:
-
-```sh
-zig run lib/image/src/image_jpeg_seed_corpora_e2e.zig -- fetch /tmp/libjpeg-turbo-seed-corpora
 ```
 
 Or directly:

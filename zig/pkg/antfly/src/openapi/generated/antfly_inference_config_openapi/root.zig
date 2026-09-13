@@ -3,8 +3,6 @@
 
 pub const types = @import("types.zig");
 
-pub const A4bLoadStrategy = types.A4bLoadStrategy;
-pub const A4bPreparedPackMode = types.A4bPreparedPackMode;
 pub const A4bResidencyMode = types.A4bResidencyMode;
 pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
@@ -15,9 +13,6 @@ pub const Chunk = types.Chunk;
 pub const ChunkConfig = types.ChunkConfig;
 pub const ChunkRequest = types.ChunkRequest;
 pub const ChunkResponse = types.ChunkResponse;
-pub const ClassifyRequest = types.ClassifyRequest;
-pub const ClassifyResponse = types.ClassifyResponse;
-pub const ClassifyResult = types.ClassifyResult;
 pub const Config = types.Config;
 pub const ContentPart = types.ContentPart;
 pub const EmbedRequest = types.EmbedRequest;
@@ -73,4 +68,3 @@ pub const ToolChoice = types.ToolChoice;
 pub const TranscribeRequest = types.TranscribeRequest;
 pub const TranscribeResponse = types.TranscribeResponse;
 pub const VADOptions = types.VADOptions;
-pub const WarmModelStartupStrategy = types.WarmModelStartupStrategy;

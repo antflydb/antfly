@@ -148,7 +148,7 @@ const parity_cases = [_]RecallCase{
     .{ .dataset = "random-20d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 97.50, .inner_product = 96.50, .cosine = 97.00 } },
     .{ .dataset = "fashionminst-784d-1k.gob", .count = 1000, .expected = .{ .euclidean = 97.50, .inner_product = 86.50, .cosine = 91.00 } },
     .{ .dataset = "fashionminst-784d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 100.00, .inner_product = 99.50, .cosine = 99.00 } },
-    .{ .dataset = "fashionminst-784d-10k.gob", .count = 1000, .expected = .{ .euclidean = 94.00, .inner_product = 93.00, .cosine = 93.00 } },
+    .{ .dataset = "fashionminst-784d-10k.gob", .count = 1000, .expected = .{ .euclidean = 94.00, .inner_product = 93.00, .cosine = 94.00 } },
     .{ .dataset = "fashionminst-784d-10k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 100.00, .inner_product = 100.00, .cosine = 100.00 } },
     .{ .dataset = "laionclip-768d-1k.gob", .count = 1000, .expected = .{ .euclidean = 96.00, .inner_product = 96.50, .cosine = 89.50 } },
     .{ .dataset = "laionclip-768d-1k.gob", .randomize = true, .count = 1000, .expected = .{ .euclidean = 98.50, .inner_product = 98.50, .cosine = 97.00 } },

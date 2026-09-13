@@ -115,6 +115,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     }
     errdefer cleanup(BackendType, backend, false);
     errdefer finishOpenFailure(BackendType, backend);
+    if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
 
     if (@hasDecl(BackendType, "acquireRootLockState")) {
         try backend.acquireRootLockState(options.create_if_missing);
@@ -131,19 +132,28 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
         defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
-        break :blk try repository_mod.loadManifestIfPresentWithStorage(
+        var loaded_runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty;
+        defer {
+            for (loaded_runs.items) |*run| run.deinit(allocator);
+            loaded_runs.deinit(allocator);
+        }
+        const loaded = try repository_mod.loadManifestWithRecoveryState(
             backend.storage.?,
             allocator,
             backend.root_dir.?,
             &backend.manifest_backing,
             &backend.next_run_id,
-            &backend.runs,
+            &loaded_runs,
             &backend.obsolete_paths,
+            if (@hasField(BackendType, "recovered_manifest")) &backend.recovered_manifest else null,
         );
+        try compaction_mod.appendOwnedRuns(&backend.runs, allocator, &loaded_runs);
+        break :blk loaded;
     };
     recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
     if (loaded_manifest) {
-        for (backend.runs.items) |run| {
+        for (0..@import("run_store.zig").count(backend)) |rank| {
+            const run = @import("run_store.zig").at(backend, rank).*;
             const path = run.path orelse return error.RunStateUnavailable;
             // Check the manifest bound first so old oversized manifests retain
             // their precise FileTooBig diagnosis even when the referenced file
@@ -182,8 +192,8 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
             .{
                 backend.root_dir.?,
                 loaded_manifest,
-                backend.runs.items.len,
-                backend.obsolete_paths.items.len,
+                @import("run_store.zig").count(backend),
+                backend.obsolete_paths.count(),
                 backend.next_run_id,
             },
         );
@@ -216,7 +226,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
                     "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
                     .{
                         backend.root_dir.?,
-                        backend.mutable.entries.items.len,
+                        backend.mutable.entryCount(),
                         if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
                     },
                 );
@@ -224,8 +234,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
         const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
-        compaction_mod.sortRuns(backend.runs.items);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        // Build cold metadata before publishing the opened backend. Subsequent
+        // writes maintain this root incrementally, including before first read.
+        if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
         if (loaded_manifest and @hasDecl(BackendType, "cleanupOrphanedRunFilesForManifest")) {
             if (backend.cleanupOrphanedRunFilesForManifest()) |orphan_stats| {
                 if (orphan_stats.cleaned()) {
@@ -240,11 +253,11 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
-    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entryCount() > 0) {
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
         backend.noteRecoveredWriteMutationLocked();
-    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entries.items.len > 0) {
+    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entryCount() > 0) {
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
         backend.noteWriteMutationLocked();
@@ -256,7 +269,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     if (debug_open) {
         std.log.info(
             "lsm backend open done root={s} runs={d} mutable_entries={d}",
-            .{ backend.root_dir.?, backend.runs.items.len, backend.mutable.entries.items.len },
+            .{ backend.root_dir.?, @import("run_store.zig").count(backend), backend.mutable.entryCount() },
         );
     }
 }
@@ -279,12 +292,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
                 }
                 std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
             };
-        } else if (backend.mutable.entries.items.len > 0) {
+        } else if (backend.mutable.entryCount() > 0) {
             compaction_mod.flushMutable(BackendType, backend) catch |err| {
                 std.log.err("lsm backend close skipped mutable flush root={?s} err={}", .{ backend.root_dir, err });
             };
         }
     }
+    if (@hasDecl(BackendType, "drainRetiredLedgers")) backend.drainRetiredLedgers();
+    if (@hasDecl(BackendType, "drainRetiredMemtables")) backend.drainRetiredMemtables();
     if (@hasField(BackendType, "mutable_read_snapshot")) {
         if (backend.mutable_read_snapshot) |state| {
             state.deinit(backend.allocator);
@@ -331,16 +346,19 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "mutable_snapshot_reader_ref_by_state")) {
         backend.mutable_snapshot_reader_ref_by_state.deinit(backend.allocator);
     }
-    for (backend.runs.items) |*run| {
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
+    if (@hasDecl(BackendType, "destroyRunMetadata")) backend.destroyRunMetadata();
+    for (0..@import("run_store.zig").count(backend)) |rank| {
+        const run = @import("run_store.zig").at(backend, rank);
         if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
         if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
-        run.deinit(backend.allocator);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) run.deinit(backend.allocator);
     }
     backend.runs.deinit(backend.allocator);
     if (@hasField(BackendType, "obsolete_paths")) {
-        for (backend.obsolete_paths.items) |*obsolete| {
+        if (comptime @hasField(@TypeOf(backend.obsolete_paths), "items")) for (backend.obsolete_paths.items) |*obsolete| {
             obsolete.deinit(backend.allocator);
-        }
+        };
         backend.obsolete_paths.deinit(backend.allocator);
     }
     if (@hasField(BackendType, "obsolete_runs")) {
@@ -354,6 +372,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.obsolete_runs.deinit(backend.allocator);
     }
+    if (@hasDecl(BackendType, "deinitOutputCleanup")) backend.deinitOutputCleanup();
     if (@hasField(BackendType, "run_state_cache")) {
         for (backend.run_state_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_state_cache.deinit(backend.allocator);
@@ -373,6 +392,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "manifest_backing")) {
         if (backend.manifest_backing) |raw| backend.allocator.free(raw);
     }
+    if (@hasField(BackendType, "obsolete_reclaim_after")) {
+        if (backend.obsolete_reclaim_after) |path| backend.allocator.free(path);
+    }
     if (@hasDecl(BackendType, "releaseRootWriterLock")) {
         backend.releaseRootWriterLock();
     }
@@ -389,5 +411,14 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
     }
     if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);
+    if (@hasField(BackendType, "bulk_snapshot_accounts")) backend.bulk_snapshot_accounts.deinit(backend.allocator);
+    if (@hasField(BackendType, "retired_memory_head")) {
+        while (backend.retired_memory_head) |state| {
+            backend.retired_memory_head = state.retired_next;
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+    }
+    if (@hasDecl(BackendType, "releaseTrackedResourceUsage")) backend.releaseTrackedResourceUsage();
     backend.* = undefined;
 }

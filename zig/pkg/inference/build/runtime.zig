@@ -13,11 +13,9 @@
 // limitations under the License.
 
 const std = @import("std");
-
-pub const FfmpegPaths = struct {
-    include_dir: []const u8,
-    lib_dir: []const u8,
-};
+const onnx_build = @import("onnx_graph").support;
+pub const OnnxModules = onnx_build.Modules;
+const jit_identity = @import("jit_identity.zig");
 
 pub const BackendOptions = struct {
     enable_onnx: bool = false,
@@ -33,22 +31,24 @@ pub const BackendOptions = struct {
     enable_wasm: bool = false,
     enable_webgpu: bool = false,
     wasm_memory_model: []const u8 = "wasm32",
-    enable_ffmpeg_audio: bool = false,
-    ffmpeg_paths: ?FfmpegPaths = null,
     link_libc: bool = true,
     skip_openapi: bool = false,
-    inference_version: []const u8 = "dev",
     enable_native_quant_dispatch_stats: bool = false,
 };
 
 pub const Paths = struct {
     /// Path from the active build.zig directory to pkg/inference.
     inference_root: []const u8,
-    /// Path from the active build.zig directory to the monorepo root.
+    /// Path from the active build.zig directory to the shared Zig tree (zig/).
     shared_lib_root: []const u8,
 };
 
 pub const SharedModules = struct {
+    build_info_mod: *std.Build.Module,
+    build_info_object: *std.Build.Step.Compile,
+    tokenizer_mod: *std.Build.Module,
+    hf_tokenizer_mod: *std.Build.Module,
+    fixed_tokenizer_data_mod: *std.Build.Module,
     json: ?*std.Build.Module = null,
     httpx: ?*std.Build.Module = null,
     platform: ?*std.Build.Module = null,
@@ -59,20 +59,27 @@ pub const SharedModules = struct {
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
     image: ?*std.Build.Module = null,
-    prometheus: ?*std.Build.Module = null,
-    structlog: ?*std.Build.Module = null,
+    hash: ?*std.Build.Module = null,
+    // Entrypoints choose these implementations explicitly; missing source
+    // must fail its consumer rather than select a compatibility fallback.
+    prometheus: *std.Build.Module,
+    structlog: *std.Build.Module,
     jinja: ?*std.Build.Module = null,
-    protobuf: ?*std.Build.Module = null,
-    sentencepiece_proto: ?*std.Build.Module = null,
+    protobuf: *std.Build.Module,
+    sentencepiece_proto: *std.Build.Module,
     ml: ?*std.Build.Module = null,
     ml_tabular: ?*std.Build.Module = null,
-    onnx_graph: ?*std.Build.Module = null,
+    onnx: ?OnnxModules = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
+    inference_api_source: ?std.Build.LazyPath = null,
+    audio_openapi: ?*std.Build.Module = null,
+    s3_openapi: ?*std.Build.Module = null,
     generating_openapi: ?*std.Build.Module = null,
     chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
     extracting: ?*std.Build.Module = null,
+    reader_config: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
 
@@ -82,14 +89,18 @@ pub const Config = struct {
     optimize: std.builtin.OptimizeMode,
     paths: Paths,
     backend: BackendOptions,
-    shared: SharedModules = .{},
+    shared: SharedModules,
     register_public_modules: bool = false,
 };
 
 pub const Graph = struct {
+    build_info_mod: *std.Build.Module,
+    build_info_object: *std.Build.Step.Compile,
+    identities: jit_identity.Modules,
     build_options: *std.Build.Step.Options,
     build_options_mod: *std.Build.Module,
-    audio_open_corpus_build_options_mod: *std.Build.Module,
+    /// Explicit settings for backend qualification, including inactive backends.
+    qualification_build_options_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
@@ -106,9 +117,12 @@ pub const Graph = struct {
     sentencepiece_proto_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
     ml_tabular_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    onnx: OnnxModules,
+    pjrt_mod: ?*std.Build.Module,
+    /// Tests may qualify PJRT contracts even when the product backend is disabled.
+    qualification_pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
+    transcribing_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
@@ -120,8 +134,15 @@ pub const Graph = struct {
     chunking_api_openapi_mod: *std.Build.Module,
     extraction_openapi_mod: *std.Build.Module,
     extracting_mod: *std.Build.Module,
+    reader_config_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
+
+    /// Attach release metadata only at a final link, never to a runtime archive.
+    pub fn linkBuildInfo(self: Graph, module: *std.Build.Module) void {
+        module.addImport("build_info", self.build_info_mod);
+        module.addObject(self.build_info_object);
+    }
 };
 
 pub fn create(config: Config) Graph {
@@ -132,9 +153,15 @@ pub fn create(config: Config) Graph {
     const target = config.target;
     const optimize = config.optimize;
 
-    const build_options = addBuildOptions(b, backend, paths);
+    const build_options = addBuildOptions(b, backend);
     const build_options_mod = build_options.createModule();
-    const audio_open_corpus_build_options_mod = addAudioOpenCorpusBuildOptions(b, backend).createModule();
+    const qualification_options = addExplicitBuildOptions(b, backend);
+    // Equal generated files must share one module identity in a compilation.
+    const qualification_build_options_mod = if (std.mem.eql(u8, build_options.contents.items, qualification_options.contents.items))
+        build_options_mod
+    else
+        qualification_options.createModule();
+    const identities = jit_identity.create(b, b.path(paths.inference_root), backend.enable_metal, backend.enable_cuda);
 
     const json_mod = shared.json orelse createSharedModule(config, "lib/json/src/mod.zig");
     const httpx_mod = shared.httpx orelse blk: {
@@ -174,37 +201,35 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_regex", regex_mod);
         break :blk mod;
     };
+    const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
-    const prometheus_mod = shared.prometheus orelse createOptionalSharedModule(config, "lib/prometheus/src/root.zig", "src/compat/prometheus.zig");
-    const structlog_mod = shared.structlog orelse createOptionalSharedModule(config, "lib/structlog/src/root.zig", "src/compat/structlog.zig");
+    if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
+    const prometheus_mod = shared.prometheus;
+    const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
         .target = target,
         .optimize = optimize,
     }).module("jinja");
-    const protobuf_dep = b.dependency("protobuf", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const protobuf_mod = shared.protobuf orelse protobuf_dep.module("protobuf");
-    const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep, paths, config.register_public_modules);
+    const protobuf_mod = shared.protobuf;
+    const sentencepiece_proto_mod = shared.sentencepiece_proto;
     const ml_mod = shared.ml orelse blk: {
         const mod = createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
         mod.addImport("antfly_platform", platform_mod);
         break :blk mod;
     };
     const ml_tabular_mod = shared.ml_tabular orelse createSharedModuleNamed(config, "ml_tabular", "lib/ml/tabular/src/root.zig");
-    const onnx_graph_mod = shared.onnx_graph orelse blk: {
-        const mod = b.dependency("onnx_graph", .{
-            .target = target,
-            .optimize = optimize,
-        }).module("onnx");
-        mod.addImport("ml", ml_mod);
-        break :blk mod;
-    };
-    const pjrt_mod = shared.pjrt orelse b.dependency("pjrt", .{
+    const onnx = shared.onnx orelse onnx_build.create(b, .{
+        .root = b.path(pathJoin(b, paths.shared_lib_root, "lib/onnx")),
+        .target = target,
+        .optimize = optimize,
+        .protobuf = protobuf_mod,
+        .ml = ml_mod,
+    });
+    const qualification_pjrt_mod = shared.pjrt orelse b.dependency("pjrt", .{
         .target = target,
         .optimize = optimize,
     }).module("pjrt");
+    const pjrt_mod = if (backend.enable_pjrt) qualification_pjrt_mod else null;
 
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, config.register_public_modules, "antfly_generating_openapi", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
@@ -232,7 +257,24 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
         break :blk mod;
     };
+    const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
+    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_s3_openapi/root.zig");
+    const audio_openapi_mod = shared.audio_openapi orelse blk: {
+        const mod = createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_audio_openapi/root.zig");
+        mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+        break :blk mod;
+    };
+    const transcribing_mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/transcribing/src/mod.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
+    transcribing_mod.addImport("httpx", httpx_mod);
+    transcribing_mod.addImport("inference_api", inference_api_mod);
+    transcribing_mod.addImport("antfly_scraping", scraping_mod);
+    transcribing_mod.addImport("antfly_google", google_mod);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -244,20 +286,15 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     } else null;
 
-    const inference_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "inference_tokenizer", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/src/tokenizer.zig")),
-        .target = target,
-        .optimize = optimize,
-    });
-    inference_tokenizer_mod.addImport("protobuf", protobuf_mod);
-    inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-
-    const inference_hf_tokenizer_mod = addOrCreateModule(b, config.register_public_modules, "inference_hf_tokenizer", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/src/hf_root.zig")),
-        .target = target,
-        .optimize = optimize,
-    });
-    inference_hf_tokenizer_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
+    const inference_tokenizer_mod = shared.tokenizer_mod;
+    const inference_hf_tokenizer_mod = shared.hf_tokenizer_mod;
+    const inference_fixed_tokenizer_data_mod = shared.fixed_tokenizer_data_mod;
+    if (config.register_public_modules) {
+        b.modules.put(b.allocator, "inference_tokenizer", inference_tokenizer_mod) catch @panic("OOM");
+        b.modules.put(b.allocator, "inference_hf_tokenizer", inference_hf_tokenizer_mod) catch @panic("OOM");
+        b.modules.put(b.allocator, "inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod) catch @panic("OOM");
+        b.modules.put(b.allocator, "sentencepiece_proto", sentencepiece_proto_mod) catch @panic("OOM");
+    }
 
     const inference_linalg_mod = addOrCreateModule(b, config.register_public_modules, "inference_linalg", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg/src/mod.zig")),
@@ -265,17 +302,11 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
-    const inference_fixed_tokenizer_data_mod = addTokenizerDataModule(b, paths, config.register_public_modules);
-
     const inference_audio_mod = addOrCreateModule(b, config.register_public_modules, "inference_audio", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/audio/src/mod.zig")),
         .target = target,
         .optimize = optimize,
     });
-    inference_audio_mod.addImport("build_options", build_options_mod);
-    if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        inference_audio_mod.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-    }
 
     const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chunker/src/mod.zig")),
@@ -286,6 +317,7 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     inference_chunker_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_chunker_mod.addImport("antfly_image", image_mod);
+    inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
@@ -293,6 +325,8 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     addInferenceRootImports(inference_mod, .{
+        .build_info_mod = shared.build_info_mod,
+        .identities = identities,
         .build_options_mod = build_options_mod,
         .json_mod = json_mod,
         .httpx_mod = httpx_mod,
@@ -311,15 +345,17 @@ pub fn create(config: Config) Graph {
         .ml_tabular_mod = ml_tabular_mod,
         .prometheus_mod = prometheus_mod,
         .structlog_mod = structlog_mod,
-        .onnx_graph_mod = onnx_graph_mod,
+        .onnx = onnx,
         .pjrt_mod = pjrt_mod,
         .platform_mod = platform_mod,
         .protobuf_mod = protobuf_mod,
+        .reader_config_mod = reader_config_mod,
         .inference_client_mod = inference_client_mod,
     });
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
+    inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
     inference_mod.link_libc = backend.link_libc;
 
@@ -328,6 +364,8 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    inference_internal_mod.addImport("build_info", shared.build_info_mod);
+    identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);
     inference_internal_mod.addImport("jinja", jinja_mod);
     inference_internal_mod.addImport("inference_tokenizer", inference_tokenizer_mod);
@@ -337,20 +375,25 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("ml", ml_mod);
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
-    inference_internal_mod.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
-    inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
+    inference_internal_mod.addImport("onnx_graph", onnx.graph);
+    inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
+    inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
+        .build_info_mod = shared.build_info_mod,
+        .build_info_object = shared.build_info_object,
+        .identities = identities,
         .build_options = build_options,
         .build_options_mod = build_options_mod,
-        .audio_open_corpus_build_options_mod = audio_open_corpus_build_options_mod,
+        .qualification_build_options_mod = qualification_build_options_mod,
         .json_mod = json_mod,
         .httpx_mod = httpx_mod,
         .platform_mod = platform_mod,
@@ -367,9 +410,11 @@ pub fn create(config: Config) Graph {
         .sentencepiece_proto_mod = sentencepiece_proto_mod,
         .ml_mod = ml_mod,
         .ml_tabular_mod = ml_tabular_mod,
-        .onnx_graph_mod = onnx_graph_mod,
+        .onnx = onnx,
         .pjrt_mod = pjrt_mod,
+        .qualification_pjrt_mod = qualification_pjrt_mod,
         .inference_api_mod = inference_api_mod,
+        .transcribing_mod = transcribing_mod,
         .inference_client_mod = inference_client_mod,
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
@@ -381,6 +426,7 @@ pub fn create(config: Config) Graph {
         .chunking_api_openapi_mod = chunking_api_openapi_mod,
         .extraction_openapi_mod = extraction_openapi_mod,
         .extracting_mod = extracting_mod,
+        .reader_config_mod = reader_config_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
     };
@@ -389,22 +435,25 @@ pub fn create(config: Config) Graph {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
+        .max_rss = 7 * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
             .optimize = optimize,
         }),
     });
+    graph.linkBuildInfo(exe.root_module);
     exe.root_module.addImport("inference", graph.inference_mod);
     exe.root_module.addImport("build_options", graph.build_options_mod);
     exe.root_module.addImport("structlog", graph.structlog_mod);
     exe.root_module.addImport("antfly_platform", graph.platform_mod);
     exe.root_module.link_libc = link_libc;
-    b.installArtifact(exe);
     return exe;
 }
 
 const InferenceRootImports = struct {
+    build_info_mod: *std.Build.Module,
+    identities: jit_identity.Modules,
     build_options_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
@@ -423,14 +472,17 @@ const InferenceRootImports = struct {
     ml_tabular_mod: *std.Build.Module,
     prometheus_mod: *std.Build.Module,
     structlog_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    onnx: OnnxModules,
+    pjrt_mod: ?*std.Build.Module,
     platform_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
+    reader_config_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
 };
 
 pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
+    module.addImport("build_info", imports.build_info_mod);
+    imports.identities.addImports(module);
     module.addImport("build_options", imports.build_options_mod);
     module.addImport("antfly-json", imports.json_mod);
     module.addImport("httpx", imports.httpx_mod);
@@ -449,110 +501,35 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("ml_tabular", imports.ml_tabular_mod);
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
-    module.addImport("onnx_graph", imports.onnx_graph_mod);
-    module.addImport("pjrt", imports.pjrt_mod);
+    module.addImport("onnx_graph", imports.onnx.graph);
+    module.addImport("onnx_data", imports.onnx.data);
+    if (imports.pjrt_mod) |pjrt| module.addImport("pjrt", pjrt);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);
+    module.addImport("antfly_reader_config", imports.reader_config_mod);
     if (imports.inference_client_mod) |mod| {
         module.addImport("inference_client", mod);
     }
 }
 
-fn sourceSha256Hex(b: *std.Build, path: []const u8) []const u8 {
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        b.graph.io,
-        path,
-        b.allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch |err| std.debug.panic("cannot hash JIT identity source {s}: {s}", .{ path, @errorName(err) });
-    defer b.allocator.free(source);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return b.allocator.dupe(u8, &hex) catch @panic("out of memory hashing JIT identity source");
-}
-
-fn sourceBundleSha256Hex(b: *std.Build, paths: []const []const u8) []const u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("antfly-runtime-jit-source-bundle/v1");
-    var length: [8]u8 = undefined;
-    std.mem.writeInt(u64, &length, @intCast(paths.len), .little);
-    hasher.update(&length);
-    for (paths) |path| {
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            b.graph.io,
-            path,
-            b.allocator,
-            .limited(16 * 1024 * 1024),
-        ) catch |err| std.debug.panic("cannot hash JIT identity source {s}: {s}", .{ path, @errorName(err) });
-        defer b.allocator.free(source);
-
-        std.mem.writeInt(u64, &length, @intCast(source.len), .little);
-        hasher.update(&length);
-        hasher.update(source);
+/// Product artifacts depend only on settings for compiled backends.
+pub fn addBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
+    var active = backend;
+    if (!active.enable_cuda) {
+        active.cuda_artifacts = "fatbin";
+        active.cuda_libraries = "auto";
     }
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return b.allocator.dupe(u8, &hex) catch @panic("out of memory hashing JIT identity source bundle");
+    if (!active.enable_wasm) {
+        active.enable_webgpu = false;
+        active.wasm_memory_model = "wasm32";
+    }
+    return addExplicitBuildOptions(b, active);
 }
 
-fn addBuildOptions(b: *std.Build, backend: BackendOptions, paths: Paths) *std.Build.Step.Options {
+fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
     const options = b.addOptions();
     addCommonOptions(options, backend);
-    options.addOption(bool, "enable_ffmpeg_audio", backend.enable_ffmpeg_audio);
     options.addOption(bool, "enable_native_quant_dispatch_stats", backend.enable_native_quant_dispatch_stats);
-    options.addOption(
-        []const u8,
-        "metal_jit_baseline_implementation_sha256",
-        sourceSha256Hex(b, pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")),
-    );
-    options.addOption(
-        []const u8,
-        "metal_jit_qualification_implementation_sha256",
-        sourceBundleSha256Hex(b, &.{
-            pathJoin(b, paths.inference_root, "src/backends/metal_runtime.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/kernel_jit.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
-            pathJoin(b, paths.inference_root, "src/gguf/quant_codec.zig"),
-            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
-        }),
-    );
-    options.addOption(
-        []const u8,
-        "cuda_jit_baseline_implementation_sha256",
-        sourceSha256Hex(b, pathJoin(b, paths.inference_root, "src/ops/cuda/artifacts/inference_cuda_kernels.cu")),
-    );
-    options.addOption(
-        []const u8,
-        "cuda_jit_qualification_implementation_sha256",
-        sourceBundleSha256Hex(b, &.{
-            pathJoin(b, paths.inference_root, "src/ops/cuda/kernels.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/kernel_jit.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_cuda_renderer.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
-            pathJoin(b, paths.inference_root, "src/gguf/quant_codec.zig"),
-            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
-        }),
-    );
-    options.addOption(
-        []const u8,
-        "cuda_jit_dispatch_implementation_sha256",
-        sourceBundleSha256Hex(b, &.{
-            pathJoin(b, paths.inference_root, "src/ops/cuda/cuda_compute.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_kernel_compiler.zig"),
-            pathJoin(b, paths.inference_root, "src/graph/quant_matmul.zig"),
-            pathJoin(b, paths.inference_root, "src/gguf/tensor_types.zig"),
-        }),
-    );
-    return options;
-}
-
-fn addAudioOpenCorpusBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
-    const options = b.addOptions();
-    addCommonOptions(options, backend);
     return options;
 }
 
@@ -570,7 +547,28 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "link_libc", backend.link_libc);
     options.addOption([]const u8, "wasm_memory_model", backend.wasm_memory_model);
     options.addOption(bool, "skip_openapi", backend.skip_openapi);
-    options.addOption([]const u8, "inference_version", backend.inference_version);
+}
+
+/// Entrypoints resolve the scripts owner and share a host compiler when available.
+pub fn addInferenceApiOverride(
+    b: *std.Build,
+    comptime openapi_build: type,
+    scripts_root: std.Build.LazyPath,
+    compiler: ?*std.Build.Step.Compile,
+) ?std.Build.LazyPath {
+    const spec = b.option([]const u8, "inference-openapi-spec", "Path to the inference OpenAPI YAML spec used to generate inference_api") orelse return null;
+    return openapi_build.addGeneratedDirectory(b, .{
+        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .ReleaseSafe }).artifact("openapi-zig"),
+        .scripts_root = scripts_root,
+        .spec = b.path(spec),
+        .package_name = "inference_api",
+        .generate = "types,server,client",
+        .import_mappings = &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+        },
+    });
 }
 
 fn addInferenceApiModule(
@@ -614,13 +612,7 @@ fn addInferenceApiModule(
         return mod;
     }
 
-    const spec_path_override = b.option(
-        []const u8,
-        "inference-openapi-spec",
-        "Path to the inference OpenAPI YAML spec used to generate inference_api",
-    );
-
-    if (spec_path_override == null) {
+    if (shared.inference_api_source == null) {
         const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/api/generated/inference_api/root.zig")),
             .target = target,
@@ -633,30 +625,7 @@ fn addInferenceApiModule(
         return mod;
     }
 
-    const openapi_dep = b.dependency("openapi", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const convert = b.addSystemCommand(&.{
-        "uv",
-        "run",
-        "--directory",
-        b.fmt("{s}/scripts", .{paths.shared_lib_root}),
-        "yaml_to_json.py",
-    });
-    convert.addFileArg(b.path(spec_path_override.?));
-    const json_spec = convert.addOutputFileArg("inference.openapi.json");
-    const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
-    codegen.addArg("--spec");
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", "inference_api" });
-    codegen.addArgs(&.{ "--generate", "types,server,client" });
-    codegen.addArgs(&.{"--import-mapping"});
-    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/generating.yaml", "antfly_generating_openapi" }));
-    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" }));
-    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
-    codegen.addArg("--output");
-    const gen_dir = codegen.addOutputDirectoryArg("inference_api");
+    const gen_dir = shared.inference_api_source.?;
     const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
         .root_source_file = gen_dir.path(b, "root.zig"),
         .target = target,
@@ -701,53 +670,6 @@ fn addExtractionOpenApiModule(
     return mod;
 }
 
-fn addTokenizerDataModule(b: *std.Build, paths: Paths, register_public_modules: bool) *std.Build.Module {
-    const write_files = b.addWriteFiles();
-    _ = write_files.addCopyFile(
-        b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/testdata/embedder/tokenizer.json")),
-        "tokenizer.json",
-    );
-    const root = write_files.add(
-        "root.zig",
-        "pub const tokenizer_json = @embedFile(\"tokenizer.json\");\n",
-    );
-    return addOrCreateModule(b, register_public_modules, "inference_fixed_tokenizer_data", .{
-        .root_source_file = root,
-    });
-}
-
-fn addSentencePieceProtoModule(
-    b: *std.Build,
-    protobuf_dep: *std.Build.Dependency,
-    paths: Paths,
-    register_public_modules: bool,
-) *std.Build.Module {
-    const codegen = b.addRunArtifact(protobuf_dep.artifact("protoc-zig"));
-    codegen.addArg("--desc");
-    codegen.addFileArg(b.path(pathJoin(b, paths.shared_lib_root, "lib/tokenizer/proto/sentencepiece_model.desc")));
-    codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
-
-    const fixup_tool = b.addExecutable(.{
-        .name = "patch_sentencepiece_proto",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(pathJoin(b, paths.inference_root, "tools/patch_sentencepiece_proto.zig")),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        }),
-    });
-    const fixup_run = b.addRunArtifact(fixup_tool);
-    fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
-    fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
-
-    const mod = addOrCreateModule(b, register_public_modules, "sentencepiece_proto", .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-    mod.addImport("protobuf", protobuf_dep.module("protobuf"));
-    return mod;
-}
-
 fn createSharedModule(config: Config, relative_path: []const u8) *std.Build.Module {
     return config.b.createModule(.{
         .root_source_file = config.b.path(pathJoin(config.b, config.paths.shared_lib_root, relative_path)),
@@ -769,22 +691,6 @@ fn addOrCreateModule(b: *std.Build, register_public_modules: bool, name: []const
     return b.createModule(options);
 }
 
-fn createOptionalSharedModule(config: Config, relative_path: []const u8, fallback_path: []const u8) *std.Build.Module {
-    const shared_path = pathJoin(config.b, config.paths.shared_lib_root, relative_path);
-    if (pathExists(config.b, shared_path)) {
-        return config.b.createModule(.{
-            .root_source_file = config.b.path(shared_path),
-            .target = config.target,
-            .optimize = config.optimize,
-        });
-    }
-    return config.b.createModule(.{
-        .root_source_file = config.b.path(pathJoin(config.b, config.paths.inference_root, fallback_path)),
-        .target = config.target,
-        .optimize = config.optimize,
-    });
-}
-
 fn configureRuntimeLinks(
     b: *std.Build,
     module: *std.Build.Module,
@@ -800,15 +706,6 @@ fn configureRuntimeLinks(
     }
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
-    if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-        module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
-        module.addRPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
-        module.linkSystemLibrary("avformat", .{});
-        module.linkSystemLibrary("avcodec", .{});
-        module.linkSystemLibrary("avutil", .{});
-        module.linkSystemLibrary("swresample", .{});
-    }
 }
 
 pub fn configureSystemBlas(
@@ -837,6 +734,8 @@ pub fn configureOnnxRuntime(
     onnx_root: []const u8,
 ) void {
     if (!enable_onnx) return;
+    // Declare dependencies on the consuming module. Missing installations fail
+    // its compile/link step without blocking configuration of unrelated targets.
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
     module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
@@ -860,12 +759,6 @@ pub fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
-}
-
-fn pathExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {

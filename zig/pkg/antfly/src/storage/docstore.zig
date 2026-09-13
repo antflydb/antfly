@@ -27,9 +27,11 @@ const AtomicU64 = platform.atomic.Value(u64);
 const fs_paths = @import("../common/fs_paths.zig");
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
+const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
@@ -50,10 +52,7 @@ fn backoffWriterLockRetry(io: ?std.Io) void {
         return;
     }
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_locked_retry_sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 const replay_hints = [_]change_journal_mod.TargetHint{
@@ -373,8 +372,31 @@ pub const DocStoreOptions = struct {
     read_only: bool = false,
 };
 
+fn columnarMutationToken(txn: anytype, cached: *?internal_keys.ColumnarMutationToken) !internal_keys.ColumnarMutationToken {
+    if (cached.*) |token| return token;
+    const old = txn.get(internal_keys.relational_columnar_mutation_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const previous = if (old) |bytes| blk: {
+        if (bytes.len != 8) return error.InvalidColumnMutationVersion;
+        break :blk std.mem.readInt(u64, bytes[0..8], .little);
+    } else 0;
+    const version = std.math.add(u64, previous, 1) catch return error.ColumnMutationVersionExhausted;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, version, .little);
+    try txn.put(internal_keys.relational_columnar_mutation_key, &bytes);
+    const token = internal_keys.relationalColumnarMutationToken(version);
+    cached.* = token;
+    return token;
+}
+
 pub const DocStore = struct {
+    payload_store: ?artifact_payload.Store = null,
     alloc: Allocator,
+    /// Process-local wake hint, published only after successful row/schema
+    /// commits. Durable mutation IDs and timers remain the restart authority.
+    columnar_revision: std.atomic.Value(u64) = .init(0),
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
@@ -384,10 +406,26 @@ pub const DocStore = struct {
     lmdb_user_db_kind: LmdbUserDbKind,
     replay_index_state: std.atomic.Value(u8),
     next_replay_sequence_cached: AtomicU64,
+    // A failed portable-import rollback leaves a durable recovery marker. Once
+    // fenced, this handle must not expose the partial generation or accept
+    // writes that restart recovery would later erase. Reopening constructs a
+    // fresh handle and completes marker recovery before returning it.
+    portable_import_recovery_required: std.atomic.Value(bool) = .init(false),
+    // Directory publication and native generation adoption have a durable
+    // commit point followed by an in-memory schema/catalog rebind. Normal
+    // readers must observe neither an incremental copy nor a new keyspace
+    // through the old runtime schema. Bounded atomic admission remains
+    // substantially cheaper than taking DB's global apply lock on hot reads.
+    // The high bit closes admission and the remaining bits count admitted
+    // transactions. Packing both into one atomic makes reader admission versus
+    // publication closure a single indivisible transition.
+    portable_import_reader_state: std.atomic.Value(usize) = .init(0),
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
     const replay_index_available: u8 = 2;
+    const portable_import_publication_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+    const portable_import_reader_count_mask: usize = ~portable_import_publication_bit;
 
     const Kind = enum {
         lmdb,
@@ -404,6 +442,7 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
         raw: ?LmdbTransaction = null,
         dbi: LmdbDbi = undefined,
@@ -411,6 +450,10 @@ pub const DocStore = struct {
         probe: ?backend_erased.ProbeTxn = null,
         current_scan: ?backend_erased.CurrentScanTxn = null,
         write: ?backend_erased.WriteTxn = null,
+        portable_import_reader_owner: ?*DocStore = null,
+        columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        columnar_owner: ?*DocStore = null,
 
         pub const CursorAdapter = backend_erased.Cursor;
         pub const ReadAdapter = backend_adapter.ReadTxn(Txn, CursorAdapter, .{
@@ -428,10 +471,14 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            const reader_owner = self.portable_import_reader_owner;
+            const payload_session = self.payload_session;
+            defer if (payload_session) |session| session.release();
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -445,13 +492,22 @@ pub const DocStore = struct {
                 read.abort();
             }
             self.* = undefined;
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn commit(self: *Txn) !void {
+            const reader_owner = self.portable_import_reader_owner;
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            const payload_session = self.payload_session;
+            if (payload_session) |session| try session.stageReferenceEpoch(self);
+            if (payload_session) |session| try session.prepareCommit();
+            if (payload_session) |session| session.primary_commit_attempted = true;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
+                    if (reader_owner) |owner| owner.releasePortableImportReader();
                     return;
                 }
             }
@@ -460,10 +516,35 @@ pub const DocStore = struct {
             } else {
                 return error.ReadOnly;
             }
+            if (payload_session) |session| {
+                session.committed = true;
+                session.release();
+            }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+            if (reader_owner) |owner| owner.releasePortableImportReader();
         }
 
         pub fn get(self: *Txn, key: []const u8) ![]const u8 {
+            const value = try self.getPhysical(key);
+            return if (self.payload_session) |session| try session.get(key, value) else value;
+        }
+
+        pub fn getArtifactMetadata(self: *Txn, key: []const u8) !artifact_payload.Metadata {
+            const value = try self.getPhysical(key);
+            const metadata = try artifact_payload.Metadata.decode(value);
+            // Same-binary qualification control for the cost of reconstructing
+            // source payloads in metadata consumers. Keep the API result equal.
+            const control = if (@import("builtin").link_libc) std.c.getenv("ANTFLY_SOURCE_VECTOR_METADATA_ONLY") else null;
+            if (control) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "0")) {
+                    if (self.payload_session) |session| _ = try session.get(key, value);
+                }
+            }
+            return metadata;
+        }
+
+        fn getPhysical(self: *Txn, key: []const u8) ![]const u8 {
             if (supports_lmdb) {
                 if (self.raw) |*raw| return try raw.get(self.dbi, key);
             }
@@ -473,7 +554,41 @@ pub const DocStore = struct {
             return try self.read.?.get(key);
         }
 
+        /// Short-lived value lease, released when this transaction aborts.
+        /// Immutable LSM bytes may be pinned rather than copied.
+        pub fn getLeased(self: *Txn, key: []const u8) ![]const u8 {
+            if (self.probe) |*probe| return try probe.getLeased(key);
+            return try self.get(key);
+        }
+
+        /// Block-scoped values from this exact snapshot. Close scopes before
+        /// aborting the transaction (which also owns the portable-import fence).
+        pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
+            if (supports_lmdb) if (self.raw) |*raw| {
+                const Scope = struct {
+                    raw: *LmdbTransaction,
+                    dbi: LmdbDbi,
+                    pub fn get(scope: *@This(), key: []const u8) ![]const u8 {
+                        return scope.raw.get(scope.dbi, key);
+                    }
+                    pub fn close(_: *@This()) void {}
+                };
+                return backend_erased.readScopeFrom(alloc, Scope{ .raw = raw, .dbi = self.dbi });
+            };
+            if (self.read) |*read| return read.openReadScope(alloc);
+            return error.ReadOnly;
+        }
+
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            try self.getManySortedPhysical(keys, values);
+            if (self.payload_session) |session| {
+                for (keys, values) |key, *value| if (value.*) |raw| {
+                    value.* = try session.get(key, raw);
+                };
+            }
+        }
+
+        pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
             if (supports_lmdb) {
@@ -503,17 +618,39 @@ pub const DocStore = struct {
             return try self.read.?.getManySorted(keys, values);
         }
 
+        /// Fetch values without admitting their source data blocks to the LSM
+        /// cache. Callers should use this only when they retain a decoded or
+        /// otherwise more useful representation of every returned value.
+        pub fn getManySortedTransient(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+            if (self.probe) |*probe| {
+                try probe.getManySortedWithBlockCacheAdmission(keys, values, .transient);
+                if (self.payload_session) |session| {
+                    for (keys, values) |key, *value| if (value.*) |raw| {
+                        value.* = try session.get(key, raw);
+                    };
+                }
+                return;
+            }
+            return try self.getManySorted(keys, values);
+        }
+
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.markColumnarDirty(key, value);
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.put(self.dbi, key, value, .{});
                     return;
                 }
             }
-            try self.write.?.put(key, value);
+            const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+            try self.write.?.put(key, stored);
+            if (self.payload_session) |session| try session.recordOwnership(&self.write.?, key, stored);
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.markColumnarDirty(key, null);
+            try self.invalidateColumns(key);
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.delete(self.dbi, key);
@@ -521,6 +658,27 @@ pub const DocStore = struct {
                 }
             }
             try self.write.?.delete(key);
+            if (self.payload_session) |session| {
+                if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
+                try session.recordOwnership(&self.write.?, key, null);
+            }
+        }
+
+        fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
+            if (!internal_keys.isRelationalRowKey(key)) return;
+            const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+            defer self.alloc.free(dirty);
+            const token = try columnarMutationToken(self, &self.columnar_mutation);
+            try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
+        }
+
+        fn invalidateColumns(self: *Txn, key: []const u8) anyerror!void {
+            if (self.columns_invalidated or !internal_keys.invalidatesRelationalColumns(key)) return;
+            self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            self.columns_invalidated = true;
         }
 
         pub fn cursor(self: *Txn) !LmdbCursor {
@@ -540,6 +698,12 @@ pub const DocStore = struct {
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor_adapter = try self.openPhysicalCursorAdapter();
+            errdefer cursor_adapter.close();
+            return try wrapPayloadCursor(self.alloc, cursor_adapter, self.payload_session);
+        }
+
+        pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
             if (supports_lmdb and self.raw != null) {
                 return try backend_erased.cursorFrom(self.alloc, backend_lmdb_adapter.Cursor.init(try self.cursor()));
             }
@@ -559,13 +723,22 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        columnar_owner: ?*DocStore = null,
+        payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
+        columns_invalidated: bool = false,
+        columnar_mutation: ?internal_keys.ColumnarMutationToken = null,
+        unordered_bulk_append_puts: bool = false,
         raw: ?LmdbBatch = null,
         dbi: LmdbDbi = undefined,
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
+            payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
+            columns_invalidated: *bool,
+            columnar_mutation: *?internal_keys.ColumnarMutationToken,
+            unordered_bulk_append_puts: bool = false,
             raw: ?*LmdbTransaction = null,
             dbi: LmdbDbi = undefined,
             runtime: ?*backend_erased.Batch = null,
@@ -574,7 +747,8 @@ pub const DocStore = struct {
                 if (supports_lmdb) {
                     if (self.raw) |raw| return try raw.get(self.dbi, key);
                 }
-                return try self.runtime.?.get(key);
+                const value = try self.runtime.?.get(key);
+                return if (self.payload_session) |session| try session.get(key, value) else value;
             }
 
             pub fn getManySorted(self: @This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -591,27 +765,52 @@ pub const DocStore = struct {
                         return;
                     }
                 }
-                return try self.runtime.?.getManySorted(keys, values);
+                try self.runtime.?.getManySorted(keys, values);
+                if (self.payload_session) |session| {
+                    for (keys, values) |key, *value| if (value.*) |raw| {
+                        value.* = try session.get(key, raw);
+                    };
+                }
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.markColumnarDirty(key, value);
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.put(self.dbi, key, value, .{});
                         return;
                     }
                 }
-                try self.runtime.?.put(key, value);
+                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                try self.runtime.?.put(key, stored);
+                if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
+                    // Keep auxiliary records in the bulk arena too. A regular
+                    // put drains that arena into a sorted mutable map, causing
+                    // quadratic insertion when dirty keys precede every row.
+                    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                    defer self.alloc.free(dirty);
+                    const token = try columnarMutationToken(self, self.columnar_mutation);
+                    try self.runtime.?.appendPut(dirty, &internal_keys.relationalColumnarDirtyRecord(token, value.len));
+                } else {
+                    try self.markColumnarDirty(key, value);
+                }
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw != null) return error.Unsupported;
                 }
-                try self.runtime.?.appendPut(key, value);
+                const stored = if (self.payload_session) |session| try session.put(key, value) else value;
+                try self.runtime.?.appendPut(key, stored);
+                if (self.payload_session) |session| try session.recordOwnership(self.runtime.?, key, stored);
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.markColumnarDirty(key, null);
+                try self.invalidateColumns(key);
                 if (supports_lmdb) {
                     if (self.raw) |raw| {
                         try raw.delete(self.dbi, key);
@@ -619,6 +818,27 @@ pub const DocStore = struct {
                     }
                 }
                 try self.runtime.?.delete(key);
+                if (self.payload_session) |session| {
+                    if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
+                    try session.recordOwnership(self.runtime.?, key, null);
+                }
+            }
+
+            fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
+                if (!internal_keys.isRelationalRowKey(key)) return;
+                const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(self.alloc, key);
+                defer self.alloc.free(dirty);
+                const token = try columnarMutationToken(self, self.columnar_mutation);
+                try self.put(dirty, &internal_keys.relationalColumnarDirtyRecord(token, if (value) |bytes| bytes.len else 0));
+            }
+
+            fn invalidateColumns(self: @This(), key: []const u8) anyerror!void {
+                if (self.columns_invalidated.* or !internal_keys.invalidatesRelationalColumns(key)) return;
+                self.delete(internal_keys.relational_columnar_manifest_key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                self.columns_invalidated.* = true;
             }
 
             pub fn openCursor(self: @This()) !backend_erased.Cursor {
@@ -627,7 +847,9 @@ pub const DocStore = struct {
                         return try backend_erased.cursorFrom(self.alloc, backend_lmdb_adapter.Cursor.init(try raw.cursor(self.dbi)));
                     }
                 }
-                return try self.runtime.?.openCursor();
+                var physical = try self.runtime.?.openCursor();
+                errdefer physical.close();
+                return try wrapPayloadCursor(self.alloc, physical, self.payload_session);
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
@@ -644,6 +866,8 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Batch) void {
+            const payload_session = self.payload_session;
+            defer if (payload_session) |session| session.release();
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     raw.abort();
@@ -658,9 +882,15 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            const payload_session = self.payload_session;
+            if (payload_session) |session| try session.stageReferenceEpoch(self);
+            if (payload_session) |session| try session.prepareCommit();
+            if (payload_session) |session| session.primary_commit_attempted = true;
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     return;
                 }
@@ -668,13 +898,22 @@ pub const DocStore = struct {
             if (self.runtime) |*runtime| {
                 try runtime.commit();
             }
+            if (payload_session) |session| {
+                session.committed = true;
+                session.release();
+            }
             self.* = undefined;
+            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
+                .payload_session = self.payload_session,
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
+                .columns_invalidated = &self.columns_invalidated,
+                .columnar_mutation = &self.columnar_mutation,
+                .unordered_bulk_append_puts = self.unordered_bulk_append_puts,
                 .dbi = self.dbi,
                 .runtime = if (self.runtime) |*runtime| runtime else null,
             };
@@ -836,6 +1075,7 @@ pub const DocStore = struct {
     }
 
     pub fn sync(self: *DocStore, force: bool) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(force),
             .runtime => try self.runtime_store.sync(force),
@@ -843,6 +1083,7 @@ pub const DocStore = struct {
     }
 
     pub fn syncReplayState(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.syncReplayState(),
@@ -850,6 +1091,7 @@ pub const DocStore = struct {
     }
 
     pub fn splitRightToDir(self: *DocStore, split_key: []const u8, dest_dir: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -861,6 +1103,7 @@ pub const DocStore = struct {
     }
 
     pub fn rewriteLeftInPlace(self: *DocStore, split_key: []const u8) anyerror!bool {
+        try self.ensurePortableImportOperational();
         if (!supports_lmdb) return error.UnsupportedPlatform;
         if (self.kind != .lmdb) return error.Unsupported;
         var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -897,14 +1140,88 @@ pub const DocStore = struct {
         return true;
     }
 
+    const PayloadCursor = struct {
+        physical: backend_erased.Cursor,
+        session: *artifact_payload.Session,
+        arena: std.heap.ArenaAllocator,
+
+        pub fn close(self: *@This()) void {
+            self.physical.close();
+            self.arena.deinit();
+            self.session.release();
+        }
+        fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
+            _ = self.arena.reset(.retain_capacity);
+            const value = entry orelse return null;
+            return .{ .key = value.key, .value = try self.session.getAlloc(self.arena.allocator(), value.key, value.value) };
+        }
+        pub fn first(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.first());
+        }
+        pub fn last(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.last());
+        }
+        pub fn next(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.next());
+        }
+        pub fn prev(self: *@This()) !?backend_erased.Entry {
+            return self.resolve(try self.physical.prev());
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return self.resolve(try self.physical.seekAtOrAfter(key));
+        }
+        pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return self.resolve(try self.physical.seekAtOrBefore(key));
+        }
+        pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+            self.physical.setUpperBound(upper);
+        }
+    };
+
+    fn wrapPayloadCursor(alloc: Allocator, physical: backend_erased.Cursor, session: ?*artifact_payload.Session) !backend_erased.Cursor {
+        const owner = session orelse return physical;
+        owner.retain();
+        errdefer owner.release();
+        return try backend_erased.cursorFrom(alloc, PayloadCursor{
+            .physical = physical,
+            .session = owner,
+            .arena = std.heap.ArenaAllocator.init(alloc),
+        });
+    }
+
     pub fn beginReadTxn(self: *DocStore) !Txn {
         return try self.beginReadTxnWithBlockCacheAdmission(.retain);
+    }
+
+    /// Runtime namespaces authenticate persisted blocks before exposing value
+    /// slices (and memory namespaces are process-owned). LMDB values require an
+    /// AROW checksum at the relational boundary because its page contract does
+    /// not provide an application-visible per-value integrity witness.
+    pub fn valuesAreAuthenticated(self: *const DocStore) bool {
+        return self.kind == .runtime;
     }
 
     pub fn beginReadTxnWithBlockCacheAdmission(
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    fn beginReadTxnUnchecked(self: *DocStore) !Txn {
+        return try self.beginReadTxnUncheckedWithBlockCacheAdmission(.retain);
+    }
+
+    fn beginReadTxnUncheckedWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{ .read_only = true });
@@ -917,10 +1234,29 @@ pub const DocStore = struct {
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .read = try self.runtime_store.beginReadWithBlockCacheAdmission(admission),
             },
         };
+    }
+
+    /// Read a sorted set of keys from one committed view without cloning the
+    /// full mutable LSM state. The returned lease owns `values`; abort it after
+    /// consuming them. Only this batch is snapshot-consistent: subsequent get
+    /// calls on a live probe may see later commits. Backends without an atomic
+    /// point-batch capability use their ordinary read snapshot instead.
+    pub fn readManyConsistent(self: *DocStore, keys: []const []const u8, values: []?[]const u8) !Txn {
+        var txn = try self.beginProbeTxn();
+        if (txn.probe) |probe| {
+            if (!probe.vtable.get_many_sorted_is_atomic) {
+                txn.abort();
+                txn = try self.beginReadTxn();
+            }
+        }
+        errdefer txn.abort();
+        try txn.getManySorted(keys, values);
+        return txn;
     }
 
     /// Open a current-tip probe transaction for hot single-writer point reads.
@@ -937,13 +1273,23 @@ pub const DocStore = struct {
         self: *DocStore,
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxnWithBlockCacheAdmission(admission),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
+        var txn: Txn = switch (self.kind) {
+            // The outer probe transaction already owns the portable-import
+            // reader fence; use the unchecked LMDB path to avoid double
+            // accounting the same reader.
+            .lmdb => try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission),
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     /// Open a current-tip replay scan transaction for ordered replay walks.
@@ -952,16 +1298,47 @@ pub const DocStore = struct {
     /// append-only lanes without widening the point-probe API. LMDB keeps the
     /// normal read-only transaction because its snapshot semantics are cheap.
     pub fn beginCurrentScanTxn(self: *DocStore) !Txn {
-        return switch (self.kind) {
-            .lmdb => try self.beginReadTxn(),
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
+        var txn: Txn = switch (self.kind) {
+            .lmdb => try self.beginReadTxnUnchecked(),
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
                 .current_scan = try self.runtime_store.beginCurrentScan(),
             },
         };
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    /// Open one stable replay-lane generation. Runtime LSM implementations
+    /// narrow the mutable snapshot to this lane; callers may retain the
+    /// transaction and cursor while consuming several bounded replay chunks.
+    pub fn beginReplayLaneScanTxn(self: *DocStore, kind_ordinal: u8, from_sequence: u64) !Txn {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
+        var txn: Txn = switch (self.kind) {
+            .lmdb => try self.beginReadTxnUnchecked(),
+            .runtime => .{
+                .payload_session = payload_session,
+                .alloc = self.alloc,
+                .current_scan = try self.runtime_store.beginReplayLaneScan(kind_ordinal, from_sequence),
+            },
+        };
+        txn.portable_import_reader_owner = self;
+        return txn;
     }
 
     pub fn beginWriteTxn(self: *DocStore) !Txn {
+        try self.ensurePortableImportOperational();
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{});
@@ -969,12 +1346,15 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbTxn(self.alloc, &txn, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = txn,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .write = try self.runtime_store.beginWrite(),
             },
         };
@@ -985,6 +1365,9 @@ pub const DocStore = struct {
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
+        try self.ensurePortableImportOperational();
+        const payload_session = if (if (self.kind == .runtime) self.payload_store else null) |store| try artifact_payload.Session.create(self.alloc, store) else null;
+        errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var batch = try self.env.beginBatch();
@@ -992,18 +1375,23 @@ pub const DocStore = struct {
                 const dbi = try openConfiguredLmdbUserDbBatch(self.alloc, &batch, self.lmdb_user_db_kind, true);
                 break :blk .{
                     .alloc = self.alloc,
+                    .columnar_owner = self,
                     .raw = batch,
                     .dbi = dbi,
                 };
             } else error.UnsupportedPlatform,
             .runtime => .{
+                .payload_session = payload_session,
                 .alloc = self.alloc,
+                .columnar_owner = self,
                 .runtime = try self.runtime_store.beginBatchWithOptions(options),
+                .unordered_bulk_append_puts = options.mode == .bulk_ingest and self.runtime_store.capabilities().unordered_bulk_append_puts,
             },
         };
     }
 
     pub fn beginBulkIngestSession(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.beginBulkIngestSession(),
@@ -1011,6 +1399,7 @@ pub const DocStore = struct {
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => {},
             .runtime => try self.runtime_store.finishBulkIngestSessionWithOptions(options),
@@ -1018,6 +1407,7 @@ pub const DocStore = struct {
     }
 
     pub fn flushBufferedWritesWithOptions(self: *DocStore, options: backend_types.BulkIngestFinishOptions) !void {
+        try self.ensurePortableImportOperational();
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) try self.env.sync(false),
             .runtime => try self.runtime_store.flushBufferedWritesWithOptions(options),
@@ -1029,6 +1419,71 @@ pub const DocStore = struct {
             .lmdb => {},
             .runtime => self.runtime_store.abortBulkIngestSession(),
         }
+    }
+
+    fn ensurePortableImportOperational(self: *const DocStore) !void {
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn acquirePortableImportReader(self: *DocStore) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            if (state == portable_import_reader_count_mask) return error.PortableImportReaderLimitReached;
+            state = self.portable_import_reader_state.cmpxchgWeak(state, state + 1, .acquire, .monotonic) orelse break;
+        }
+        if (self.portable_import_recovery_required.load(.acquire)) {
+            self.releasePortableImportReader();
+            return error.PortableImportRecoveryRequired;
+        }
+    }
+
+    fn releasePortableImportReader(self: *DocStore) void {
+        const previous = self.portable_import_reader_state.fetchSub(1, .release);
+        std.debug.assert(previous & portable_import_reader_count_mask > 0);
+    }
+
+    /// Enter the short reader-visible publication fence. DB's exclusive apply
+    /// lock serializes publishers and ordinary writers; this atomic closes the
+    /// remaining lock-free read path without penalizing reads with a mutex.
+    pub fn beginPortableImportPublication(self: *DocStore, io: std.Io) !void {
+        try self.ensurePortableImportOperational();
+        var state = self.portable_import_reader_state.load(.acquire);
+        while (true) {
+            if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            state = self.portable_import_reader_state.cmpxchgWeak(
+                state,
+                state | portable_import_publication_bit,
+                .acq_rel,
+                .acquire,
+            ) orelse break;
+        }
+        while (self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0) {
+            // Publication is rare, but an admitted reader may be an std.Io
+            // fiber. Yield through that same scheduler rather than blocking an
+            // executor thread while the reader drains.
+            io.sleep(.fromNanoseconds(1), .awake) catch {};
+        }
+    }
+
+    pub fn finishPortableImportPublication(self: *DocStore) void {
+        std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
+        self.portable_import_reader_state.store(0, .release);
+    }
+
+    pub fn portableImportPublicationInProgress(self: *const DocStore) bool {
+        return self.portable_import_reader_state.load(.acquire) & portable_import_publication_bit != 0;
+    }
+
+    pub fn requirePortableImportRecovery(self: *DocStore) void {
+        self.portable_import_recovery_required.store(true, .release);
+    }
+
+    pub fn portableImportRecoveryRequired(self: *const DocStore) bool {
+        return self.portable_import_recovery_required.load(.acquire);
     }
 
     pub fn put(self: *DocStore, key: []const u8, value: []const u8) !void {
@@ -1059,11 +1514,32 @@ pub const DocStore = struct {
         return try alloc.dupe(u8, val);
     }
 
+    /// Privileged point read paired with scanPortableImportRollbackWithContext.
+    /// It keeps recovery-required fencing intact while allowing the publisher
+    /// to consult its durable rollback marker and bounded baseline journal.
+    pub fn getPortableImportRollback(self: *DocStore, alloc: Allocator, key: []const u8) ![]u8 {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
+        defer txn.abort();
+        const val = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return error.NotFound,
+            else => return err,
+        };
+        return try alloc.dupe(u8, val);
+    }
+
     pub fn delete(self: *DocStore, key: []const u8) !void {
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
         try txn.delete(key);
         try txn.commit();
+    }
+
+    /// Inspect committed artifact metadata without fetching external vectors.
+    pub fn getArtifactMetadata(self: *DocStore, key: []const u8) !artifact_payload.Metadata {
+        var txn = try self.beginProbeTxn();
+        defer txn.abort();
+        return try txn.getArtifactMetadata(key);
     }
 
     /// Atomic batch: apply all writes and deletes in a single transaction.
@@ -1074,6 +1550,27 @@ pub const DocStore = struct {
     pub const ReplayAppend = struct {
         sequence: u64,
         payload: []const u8,
+    };
+
+    pub const KeyPromotion = struct {
+        source_key: []const u8,
+        destination_key: []const u8,
+    };
+
+    /// Builds one value from the same write transaction used for key
+    /// promotions. This lets callers serialize promotion source values while
+    /// they are still borrowed and commit the derived write atomically.
+    pub const TransactionalWriteBuilder = struct {
+        ptr: *anyopaque,
+        key: []const u8,
+        build: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror![]u8,
+    };
+
+    /// Read-only predicate evaluated inside the exact write transaction that
+    /// performs promotions and replay publication.
+    pub const TransactionalGuard = struct {
+        ptr: *anyopaque,
+        validate: *const fn (ptr: *anyopaque, alloc: Allocator, txn: *Batch.BatchTxn) anyerror!void,
     };
 
     fn putBatchWithReplayOnceWithOptions(
@@ -1148,6 +1645,102 @@ pub const DocStore = struct {
 
     pub fn putBatchWithReplay(self: *DocStore, io: ?std.Io, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
         try self.putBatchWithReplayWithOptions(io, writes, deletes, replay, .{});
+    }
+
+    fn putBatchWithPromotionsAndReplayOnce(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var batch = try self.beginWriteBatchWithOptions(.{});
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        const built_value = if (transactional_write) |builder|
+            try builder.build(builder.ptr, self.alloc, &txn)
+        else
+            null;
+        defer if (built_value) |value| self.alloc.free(value);
+        if (transactional_write) |builder| try txn.put(builder.key, built_value.?);
+        var promoted_bytes: usize = 0;
+        for (promotions) |promotion| {
+            const value = txn.get(promotion.source_key) catch |err| switch (err) {
+                error.NotFound => return error.InvalidKeyPromotion,
+                else => return err,
+            };
+            promoted_bytes = std.math.add(usize, promoted_bytes, value.len) catch
+                return error.KeyPromotionBytesOverflow;
+            try txn.put(promotion.destination_key, value);
+            try txn.delete(promotion.source_key);
+        }
+        for (deletes) |key| {
+            txn.delete(key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+        for (writes) |kv| try txn.put(kv.key, kv.value);
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        // Recheck immediately before commit. A guard may contain a wall-clock
+        // lease expiry, and building a large replay value can outlive the tenure
+        // even though no competing writer can modify the record mid-transaction.
+        if (transactional_guard) |guard| try guard.validate(guard.ptr, self.alloc, &txn);
+        try batch.commit();
+        return promoted_bytes;
+    }
+
+    /// Atomically moves existing values to canonical keys while committing the
+    /// accompanying mutations and replay record. Promotion values remain
+    /// borrowed from the write transaction, so document-sized generations do
+    /// not require a second heap copy.
+    pub fn putBatchWithPromotionsAndReplay(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+    ) !usize {
+        return try self.putBatchWithPromotionsReplayAndBuiltWrite(io, writes, deletes, promotions, replay, null, null);
+    }
+
+    pub fn putBatchWithPromotionsReplayAndBuiltWrite(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        promotions: []const KeyPromotion,
+        replay: ?ReplayAppend,
+        transactional_write: ?TransactionalWriteBuilder,
+        transactional_guard: ?TransactionalGuard,
+    ) !usize {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const promoted_bytes = self.putBatchWithPromotionsAndReplayOnce(
+                writes,
+                deletes,
+                promotions,
+                replay,
+                transactional_write,
+                transactional_guard,
+            ) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+            if (replay) |entry| {
+                self.markReplayIndexAvailable();
+                self.observeCommittedReplaySequence(entry.sequence);
+            }
+            return promoted_bytes;
+        }
     }
 
     /// Update the in-memory replay watermark after a replay entry was committed
@@ -1494,33 +2087,23 @@ pub const DocStore = struct {
             deletes.deinit(alloc);
         }
 
-        {
-            var txn = try self.beginCurrentScanTxn();
+        // Replay lanes are append-only. Capturing each lane independently is
+        // sufficient below an acknowledged retirement watermark, and avoids
+        // cloning/sorting unrelated document and artifact keys after every
+        // enrichment completion. The existing atomic deletion batch remains.
+        for (0..replay_hints.len + 1) |lane| {
+            const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
+            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
             defer txn.abort();
-
             var cur = try txn.openCursor();
             defer cur.close();
-
-            for (replay_hints) |hint| {
-                const hint_ordinal = replayHintOrdinal(hint);
-                const lower = internal_keys.replayRangeLower(hint_ordinal, 0);
-                const upper = internal_keys.replayRangeUpper(hint_ordinal);
-
-                var entry = try cur.seekAtOrAfter(lower[0..]);
-                while (entry) |kv| : (entry = try cur.next()) {
-                    if (std.mem.order(u8, kv.key, upper[0..]) != .lt) break;
-                    const sequence = internal_keys.parseReplayEntrySequence(kv.key, hint_ordinal) orelse break;
-                    if (sequence > up_to_sequence) break;
-                    try deletes.append(alloc, try alloc.dupe(u8, kv.key));
-                }
-            }
-
-            const all_lower = internal_keys.replayRangeLower(internal_keys.replay_all_kind, 0);
-            const all_upper = internal_keys.replayRangeUpper(internal_keys.replay_all_kind);
-            var entry = try cur.seekAtOrAfter(all_lower[0..]);
+            const lower = internal_keys.replayRangeLower(ordinal, 0);
+            const upper = internal_keys.replayRangeUpper(ordinal);
+            cur.setUpperBound(&upper);
+            var entry = try cur.seekAtOrAfter(&lower);
             while (entry) |kv| : (entry = try cur.next()) {
-                if (std.mem.order(u8, kv.key, all_upper[0..]) != .lt) break;
-                const sequence = internal_keys.parseReplayEntrySequence(kv.key, internal_keys.replay_all_kind) orelse break;
+                if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                 if (sequence > up_to_sequence) break;
                 try deletes.append(alloc, try alloc.dupe(u8, kv.key));
             }
@@ -1640,7 +2223,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openCursor();
+        var cur = try txn.openPhysicalCursorAdapter();
         defer cur.close();
 
         var results = std.ArrayListUnmanaged([]u8).empty;
@@ -1715,7 +2298,7 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxn();
         defer txn.abort();
 
-        var cur = try txn.openCursor();
+        var cur = try txn.openPhysicalCursorAdapter();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);
 
@@ -1749,6 +2332,7 @@ pub const DocStore = struct {
     // ====================================================================
 
     pub const ScanOptions = struct {
+        physical_payloads: bool = false,
         /// Return true to skip this key (callback not invoked).
         skip_fn: ?*const fn (key: []const u8) bool = null,
         reverse: bool = false,
@@ -1799,6 +2383,126 @@ pub const DocStore = struct {
         try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
     }
 
+    /// Privileged scan used only to roll back a publication while ordinary
+    /// readers remain fenced. Recovery-required still blocks this handle.
+    pub fn scanPortableImportRollbackWithContext(
+        self: *DocStore,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        try self.ensurePortableImportOperational();
+        var txn = try self.beginReadTxnUnchecked();
+        defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
+
+    /// Row-only owner traversal. Never advance through an owner's artifact
+    /// tail: seek directly to the next encoded document prefix. Checkpoints
+    /// run once per owner, including artifact-only owners, so cancellation and
+    /// maintenance budgets do not depend on finding another live row.
+    pub fn scanRelationalRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
+        cursor.setUpperBound(end);
+        const owner_start = &[_]u8{internal_keys.user_namespace};
+        const start = if (std.mem.order(u8, lower, owner_start) == .lt) owner_start else lower;
+        if (std.mem.order(u8, start, end) != .lt) return;
+        var candidate = std.ArrayListUnmanaged(u8).empty;
+        defer candidate.deinit(self.alloc);
+        var entry = try cursor.seekAtOrAfter(start);
+        while (entry) |item| {
+            if (std.mem.order(u8, item.key, end) != .lt or !internal_keys.isInternalUserKey(item.key)) return;
+            const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
+            candidate.clearRetainingCapacity();
+            try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
+            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            if (try checkpoint(ctx, candidate.items) == .stop) return;
+            var current = item;
+            if (std.mem.order(u8, current.key, candidate.items) == .lt) {
+                current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
+                    entry = current;
+                    continue;
+                }
+            }
+            if (std.mem.eql(u8, current.key, candidate.items)) {
+                if (try callback(ctx, current.key, current.value) == .stop) return;
+            }
+            // The final byte of the escaped owner's terminator is zero.
+            // Its successor skips this owner, not documents extending its ID.
+            candidate.items.len = term + 2;
+            candidate.items[term + 1] = 1;
+            if (std.mem.order(u8, candidate.items, end) != .lt) return;
+            entry = try cursor.seekAtOrAfter(candidate.items);
+        }
+    }
+
+    /// Copy a bounded page from a caller-owned snapshot. Keeping the transaction
+    /// across pages preserves its source sequence during concurrent writes.
+    pub fn scanReadTxnPage(
+        self: *DocStore,
+        alloc: Allocator,
+        txn: *Txn,
+        lower: []const u8,
+        lower_exclusive: bool,
+        upper: []const u8,
+        max_items: usize,
+        max_bytes: usize,
+    ) !backend_scan.RangePage {
+        if (max_items == 0 or max_bytes == 0) return error.InvalidArgument;
+        const Context = struct {
+            alloc: Allocator,
+            lower: []const u8,
+            exclusive: bool,
+            max_items: usize,
+            max_bytes: usize,
+            bytes: usize = 0,
+            reached_end: bool = true,
+            items: std.ArrayListUnmanaged(backend_scan.OwnedKVPair) = .empty,
+
+            fn visit(raw: ?*anyopaque, key: []const u8, value: []const u8) anyerror!ScanAction {
+                const ctx: *@This() = @ptrCast(@alignCast(raw.?));
+                if (ctx.exclusive and std.mem.eql(u8, key, ctx.lower)) return .@"continue";
+                const bytes = std.math.add(usize, key.len, value.len) catch return error.OutOfMemory;
+                if (ctx.items.items.len > 0 and
+                    (ctx.items.items.len >= ctx.max_items or ctx.bytes > ctx.max_bytes -| bytes))
+                {
+                    ctx.reached_end = false;
+                    return .stop;
+                }
+                const owned_key = try ctx.alloc.dupe(u8, key);
+                errdefer ctx.alloc.free(owned_key);
+                const owned_value = try ctx.alloc.dupe(u8, value);
+                errdefer ctx.alloc.free(owned_value);
+                try ctx.items.append(ctx.alloc, .{ .key = owned_key, .value = owned_value });
+                ctx.bytes +|= bytes;
+                return .@"continue";
+            }
+        };
+        var ctx = Context{ .alloc = alloc, .lower = lower, .exclusive = lower_exclusive, .max_items = max_items, .max_bytes = max_bytes };
+        errdefer {
+            for (ctx.items.items) |item| {
+                alloc.free(item.key);
+                alloc.free(item.value);
+            }
+            ctx.items.deinit(alloc);
+        }
+        try self.scanReadTxnWithContext(txn, lower, upper, .{}, &ctx, Context.visit);
+        return .{ .items = try ctx.items.toOwnedSlice(alloc), .reached_end = ctx.reached_end };
+    }
+
     pub fn scanReadTxnWithContext(
         self: *DocStore,
         txn: *Txn,
@@ -1809,7 +2513,7 @@ pub const DocStore = struct {
         callback: ScanWithContextCallback,
     ) !void {
         _ = self;
-        var cur = try txn.openCursor();
+        var cur = if (options.physical_payloads) try txn.openPhysicalCursorAdapter() else try txn.openCursor();
         defer cur.close();
         if (!options.reverse) {
             cur.setUpperBound(if (upper.len > 0) upper else null);
@@ -2998,6 +3702,124 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
+test "docstore relational bulk appends retain direct ingest and atomic dirty tokens" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 2,
+    });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try std.testing.expect(txn.unordered_bulk_append_puts);
+        for (0..256) |i| {
+            var id_buf: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+            const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+            defer alloc.free(key);
+            try txn.appendPut(key, id);
+        }
+        try batch.commit();
+    }
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), store.columnar_revision.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    for (0..256) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "row:{d:0>4}", .{i});
+        const key = try internal_keys.relationalRowKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        const value = try store.get(alloc, key);
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings(id, value);
+        const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+        defer alloc.free(dirty);
+        const token = try store.get(alloc, dirty);
+        defer alloc.free(token);
+        try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(1), id.len), token);
+    }
+    const key = try internal_keys.relationalRowKeyAlloc(alloc, "row:0000");
+    defer alloc.free(key);
+    const dirty = try internal_keys.relationalColumnarDirtyKeyAlloc(alloc, key);
+    defer alloc.free(dirty);
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        errdefer batch.abort();
+        var txn = batch.asTxn();
+        try txn.appendPut(key, "first");
+        try txn.appendPut(key, "last");
+        try batch.commit();
+    }
+    {
+        var batch = try store.beginWriteBatchWithOptions(.{ .mode = .bulk_ingest });
+        defer batch.abort();
+        try batch.asTxn().appendPut(key, "aborted");
+    }
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("last", value);
+    try std.testing.expectEqual(@as(u64, 2), store.columnar_revision.load(.acquire));
+    const token = try store.get(alloc, dirty);
+    defer alloc.free(token);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(2), 4), token);
+    try store.put(key, "last");
+    const rewritten = try store.get(alloc, dirty);
+    defer alloc.free(rewritten);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(3), 4), rewritten);
+    try store.delete(key);
+    const deleted = try store.get(alloc, dirty);
+    defer alloc.free(deleted);
+    try std.testing.expectEqualSlices(u8, &internal_keys.relationalColumnarDirtyRecord(internal_keys.relationalColumnarMutationToken(4), 0), deleted);
+    var exhausted: [8]u8 = undefined;
+    std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
+    try store.put(internal_keys.relational_columnar_mutation_key, &exhausted);
+    try std.testing.expectError(error.ColumnMutationVersionExhausted, store.put(key, "must not commit"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, key));
+    const still_deleted = try store.get(alloc, dirty);
+    defer alloc.free(still_deleted);
+    try std.testing.expectEqualSlices(u8, deleted, still_deleted);
+    try std.testing.expectEqual(@as(u64, 4), store.columnar_revision.load(.acquire));
+}
+
+test "docstore snapshot pages bound copies and preserve the source epoch" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.put("a", "alpha");
+    try store.put("b", "beta");
+    try store.put("c", "gamma");
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try store.put("b", "new beta");
+    try store.put("d", "new row");
+
+    // One oversized first row must still make progress; the next row must
+    // not be copied past the page's byte budget.
+    var first = try store.scanReadTxnPage(alloc, &txn, "a", false, "z", 10, 1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), first.items.len);
+    try std.testing.expect(!first.reached_end);
+    var second = try store.scanReadTxnPage(alloc, &txn, first.items[0].key, true, "z", 1, 100);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expectEqualStrings("beta", second.items[0].value);
+    try std.testing.expect(!second.reached_end);
+    var last = try store.scanReadTxnPage(alloc, &txn, second.items[0].key, true, "z", 10, 100);
+    defer last.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), last.items.len);
+    try std.testing.expectEqualStrings("c", last.items[0].key);
+    try std.testing.expect(last.reached_end);
+    try std.testing.expectError(error.InvalidArgument, store.scanReadTxnPage(alloc, &txn, "", false, "z", 0, 100));
+}
+
 test "docstore runtime point get does not clone mutable snapshot" {
     const alloc = std.testing.allocator;
     var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
@@ -3012,6 +3834,31 @@ test "docstore runtime point get does not clone mutable snapshot" {
     const value = try store.get(alloc, "doc:a");
     defer alloc.free(value);
     try std.testing.expectEqualStrings("alpha", value);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
+}
+
+test "docstore consistent point batch owns values without cloning mutable state" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.putBatch(&.{
+        .{ .key = "counter:a", .value = "old-a" },
+        .{ .key = "counter:b", .value = "old-b" },
+    }, &.{});
+    const before = backend.snapshotMaintenanceStats();
+    var values: [3]?[]const u8 = undefined;
+    var lease = try store.readManyConsistent(&.{ "counter:a", "counter:b", "counter:missing" }, &values);
+    defer lease.abort();
+    try store.putBatch(&.{
+        .{ .key = "counter:a", .value = "new-a" },
+        .{ .key = "counter:missing", .value = "new-c" },
+    }, &.{"counter:b"});
+    try std.testing.expectEqualStrings("old-a", values[0].?);
+    try std.testing.expectEqualStrings("old-b", values[1].?);
+    try std.testing.expect(values[2] == null);
     const after = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

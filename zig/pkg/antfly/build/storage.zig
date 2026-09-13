@@ -14,8 +14,6 @@
 
 const std = @import("std");
 
-const max_openapi_spec_bytes = 2 * 1024 * 1024;
-
 pub const LmdbBackend = enum {
     c,
     zig,
@@ -39,6 +37,18 @@ pub fn makeLmdbBuildOptions(
     return options;
 }
 
+/// LMDB consumers declare their engine and optional C implementation explicitly.
+pub fn configureLmdb(b: *std.Build, module: *std.Build.Module, engine: *std.Build.Module, include_c: bool) void {
+    module.addImport("lmdb_engine", engine);
+    module.addIncludePath(b.path("lib/lmdb"));
+    if (include_c) {
+        module.addCSourceFiles(.{
+            .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
+            .flags = &lmdb_c_flags,
+        });
+    }
+}
+
 pub fn makeRootBuildOptions(
     b: *std.Build,
     backend: LmdbBackend,
@@ -47,34 +57,26 @@ pub fn makeRootBuildOptions(
     with_tla: bool,
     link_libc: bool,
     standalone_runtime_focused_test: bool,
-    lite_local_inference_runtime: bool,
     lmdb_enabled: bool,
-    antfly_version: []const u8,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
-    options.addOption([]const u8, "lmdb_backend", @tagName(backend));
-    options.addOption(bool, "lmdb_evented_async_io", evented_async_io);
+    // Disabled storage engines must not change the production module identity.
+    options.addOption([]const u8, "lmdb_backend", @tagName(if (lmdb_enabled) backend else .zig));
+    options.addOption(bool, "lmdb_evented_async_io", lmdb_enabled and evented_async_io);
     options.addOption(bool, "storage_sim_soak", storage_sim_soak);
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);
     options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
-    options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
     options.addOption(bool, "lmdb_enabled", lmdb_enabled);
     options.addOption(bool, "bench_minimal_deps", false);
-    options.addOption([]const u8, "antfly_version", antfly_version);
-    options.addOption([]const u8, "ard_openapi_ard_yaml", readBuildFileAlloc(b, "../specs/openapi/ard/api.yaml"));
-    options.addOption([]const u8, "ard_openapi_antfly_yaml", readBuildFileAlloc(b, "../openapi.yaml"));
-    options.addOption([]const u8, "ard_openapi_metadata_yaml", readBuildFileAlloc(b, "../specs/openapi/antfly/metadata.yaml"));
-    options.addOption([]const u8, "ard_openapi_extensions_yaml", readBuildFileAlloc(b, "../specs/openapi/extensions/api.yaml"));
-    options.addOption([]const u8, "ard_openapi_auth_yaml", readBuildFileAlloc(b, "../specs/openapi/auth/api.yaml"));
-    options.addOption([]const u8, "ard_openapi_inference_config_yaml", readBuildFileAlloc(b, "../specs/openapi/inference/config.yaml"));
     return options;
 }
 
-fn readBuildFileAlloc(b: *std.Build, path: []const u8) []const u8 {
-    return std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(max_openapi_spec_bytes)) catch |err| {
-        std.debug.panic("failed to read build input {s}: {}", .{ path, err });
-    };
+/// Capability advertising belongs to Lite consumers, not general DB options.
+pub fn createLiteOptions(b: *std.Build, local_inference_runtime: bool) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(bool, "local_inference_runtime", local_inference_runtime);
+    return options.createModule();
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
@@ -116,6 +118,7 @@ pub fn makeLmdbModule(
     build_options: *std.Build.Step.Options,
     lmdb_engine_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
+    hash_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path(root_path),
@@ -125,6 +128,7 @@ pub fn makeLmdbModule(
     mod.addOptions("build_options", build_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly_platform", platform_mod);
+    mod.addImport("antfly_hash", hash_mod);
     mod.addCSourceFiles(.{
         .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
         .flags = &lmdb_c_flags,

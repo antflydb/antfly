@@ -13,13 +13,20 @@
 // limitations under the License.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
+const Adler32 = @import("antfly_hash").Adler32;
 
 pub fn encodeRgba(alloc: std.mem.Allocator, width: u32, height: u32, rgba: []const u8) ![]u8 {
-    const expected = @as(usize, width) * @as(usize, height) * 4;
-    if (rgba.len != expected) return error.InvalidRgbaSize;
+    const row_bytes = std.math.mul(usize, @as(usize, width), 4) catch
+        return error.InvalidRgbaSize;
+    const expected_bytes = std.math.mul(usize, row_bytes, @as(usize, height)) catch
+        return error.InvalidRgbaSize;
+    if (rgba.len != expected_bytes) return error.InvalidRgbaSize;
 
-    const scanline_len = @as(usize, width) * 4 + 1;
-    const raw_len = scanline_len * @as(usize, height);
+    const scanline_len = std.math.add(usize, row_bytes, 1) catch
+        return error.InvalidRgbaSize;
+    const raw_len = std.math.mul(usize, scanline_len, @as(usize, height)) catch
+        return error.InvalidRgbaSize;
     const raw = try alloc.alloc(u8, raw_len);
     defer alloc.free(raw);
 
@@ -53,6 +60,25 @@ pub fn encodeRgba(alloc: std.mem.Allocator, width: u32, height: u32, rgba: []con
     return try out.toOwnedSlice(alloc);
 }
 
+/// Exact byte size of this module's deliberately uncompressed PNG encoding.
+/// Callers use it to reject an output window before allocating encoder scratch
+/// or retained result storage.
+pub fn encodedRgbaSize(width: u32, height: u32) !usize {
+    const row_bytes = std.math.mul(usize, @as(usize, width), 4) catch
+        return error.ImageTooLarge;
+    const scanline_len = std.math.add(usize, row_bytes, 1) catch
+        return error.ImageTooLarge;
+    const raw_len = std.math.mul(usize, scanline_len, @as(usize, height)) catch
+        return error.ImageTooLarge;
+    const blocks = if (raw_len == 0) 0 else 1 + ((raw_len - 1) / 65_535);
+    const block_headers = std.math.mul(usize, blocks, 5) catch
+        return error.ImageTooLarge;
+    const zlib_len = std.math.add(usize, raw_len, block_headers) catch
+        return error.ImageTooLarge;
+    // zlib header/checksum plus PNG signature and IHDR/IDAT/IEND framing.
+    return std.math.add(usize, zlib_len, 63) catch error.ImageTooLarge;
+}
+
 fn encodeZlibNoCompression(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -75,7 +101,7 @@ fn encodeZlibNoCompression(alloc: std.mem.Allocator, payload: []const u8) ![]u8 
     }
 
     var checksum: [4]u8 = undefined;
-    std.mem.writeInt(u32, &checksum, std.hash.Adler32.hash(payload), .big);
+    std.mem.writeInt(u32, &checksum, Adler32.hash(payload), .big);
     try out.appendSlice(alloc, &checksum);
 
     return try out.toOwnedSlice(alloc);
@@ -94,7 +120,7 @@ fn appendChunk(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name:
     @memcpy(crc_buf[name.len..], data);
 
     var crc: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc, std.hash.Crc32.hash(crc_buf), .big);
+    std.mem.writeInt(u32, &crc, Crc32.hash(crc_buf), .big);
     try out.appendSlice(alloc, &crc);
 }
 
@@ -104,4 +130,5 @@ test "encode rgba png writes png signature" {
     defer alloc.free(png);
 
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' }, png[0..8]);
+    try std.testing.expectEqual(png.len, try encodedRgbaSize(1, 1));
 }

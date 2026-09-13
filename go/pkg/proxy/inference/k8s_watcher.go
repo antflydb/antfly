@@ -532,7 +532,7 @@ func (w *K8sWatcher) processExternalPool(obj any) {
 
 		apiURL := serviceURL(apiService, u.GetNamespace(), apiPort)
 		healthURL := serviceURL(healthService, u.GetNamespace(), healthPort) + "/readyz"
-		w.proxy.RegisterEndpointWithHealth(apiURL, healthURL, u.GetName(), workloadType)
+		w.proxy.RegisterEndpointWithHealthInNamespace(apiURL, healthURL, u.GetNamespace(), u.GetName(), workloadType)
 		w.proxy.registry.registerBootstrapModels(apiURL, models)
 		addresses = append(addresses, apiURL)
 	}
@@ -612,7 +612,7 @@ func (w *K8sWatcher) processEndpointSlice(endpointSlice *discoveryv1.EndpointSli
 			address := fmt.Sprintf("http://%s:%d", addr, port)
 
 			if ready {
-				w.proxy.RegisterEndpoint(address, pool, workloadType)
+				w.proxy.RegisterEndpointInNamespace(address, endpointSlice.Namespace, pool, workloadType)
 			} else {
 				w.proxy.UnregisterEndpoint(address)
 			}
@@ -672,7 +672,7 @@ func (w *K8sWatcher) processPod(pod *corev1.Pod) {
 	address := fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port)
 
 	if ready {
-		w.proxy.RegisterEndpoint(address, pool, workloadType)
+		w.proxy.RegisterEndpointInNamespace(address, pod.Namespace, pool, workloadType)
 	} else {
 		w.proxy.UnregisterEndpoint(address)
 	}

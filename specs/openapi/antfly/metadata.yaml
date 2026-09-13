@@ -68,8 +68,9 @@ tags:
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
       - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
-      - **TypeScript**: `@antflydb/antfly-ts` (npm)
-      - **Python**: `antfly-python` (PyPI)
+      - **TypeScript**: `@antfly/sdk` (npm)
+      - **Python**: `antfly-sdk` (PyPI)
+      - **Rust**: `antfly-sdk` (crates.io)
 
       All SDKs are type-safe and kept in sync with the API through code generation.
 
@@ -1397,6 +1398,22 @@ components:
       schema:
         type: string
   schemas:
+    CommittedMutationOutcome:
+      type: object
+      required: [status]
+      description: |
+        The metadata mutation committed, but requested visibility or local
+        materialization is not yet fully healthy. Clients must observe status
+        instead of automatically replaying the mutation. `committed_superseded`
+        is terminal: a newer schema version became visible first.
+      properties:
+        status:
+          type: string
+          enum:
+            - committed_visibility_pending
+            - committed_superseded
+            - committed_repair_required
+            - committed_repair_unavailable
     TableSchemaPatch:
       type: object
       additionalProperties: true
@@ -1639,6 +1656,7 @@ components:
             - doc_identity_unavailable
             - read_requires_primary
             - standby_read_unavailable
+            - distributed_query_unavailable
             - storage_read_temporarily_unavailable
             - index_rebuilding
             - query_embedding_temporarily_unavailable
@@ -3791,9 +3809,21 @@ components:
       properties:
         byte_range:
           $ref: "#/components/schemas/ByteRange"
+    TableStorageSettings:
+      type: object
+      additionalProperties: false
+      description: Immutable source embedding storage selected when creating a table.
+      properties:
+        dense_embeddings:
+          type: string
+          enum: [primary_lsm, vector_store]
+          default: primary_lsm
+          description: Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
     CreateTableRequest:
       type: object
       properties:
+        storage:
+          $ref: "#/components/schemas/TableStorageSettings"
         num_shards:
           type: integer
           format: uint
@@ -3972,6 +4002,8 @@ components:
         - shards
         - indexes
       properties:
+        storage:
+          $ref: "#/components/schemas/TableStorageSettings"
         name:
           type: string
         description:
@@ -4412,6 +4444,13 @@ components:
           $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through metrics.
@@ -4701,9 +4740,324 @@ components:
         direct_bulk_ingest_fallback_below_threshold_count:
           type: integer
           format: uint64
+    VectorSourceStorageStatus:
+      type: object
+      description: Source vector payload counters and the last completed reclamation observation. Counters reset on process reopen.
+      properties:
+        directory_publications:
+          type: integer
+          format: int64
+        directory_publication_deferrals:
+          type: integer
+          format: int64
+        outer_db_batch_lock_wait_ns:
+          type: integer
+          format: int64
+        collection_mark_budget_yields:
+          type: integer
+          format: int64
+          description: Mark steps that yielded after their elapsed time budget.
+        collection_mark_busy_deferrals:
+          type: integer
+          format: int64
+          description: Concurrent scan attempts deferred to the active snapshot scanner.
+        collection_mark_outside_lock_ns:
+          type: integer
+          format: int64
+          description: Snapshot marking time spent outside the source writer lock in nanoseconds.
+        collection_mark_merge_ns:
+          type: integer
+          format: int64
+          description: Time merging bounded scan discoveries and concurrent preparation tails under the source writer lock.
+        collection_mark_max_merge_ns:
+          type: integer
+          format: int64
+          description: Longest scan tail merge under the source writer lock in nanoseconds.
+        collection_mark_steps:
+          type: integer
+          format: int64
+        collection_mark_rows:
+          type: integer
+          format: int64
+        collection_mark_max_step_rows:
+          type: integer
+          format: int64
+        collection_mark_max_step_ns:
+          type: integer
+          format: int64
+        collection_plan_ns:
+          type: integer
+          format: int64
+        collection_apply_visits_avoided:
+          type: integer
+          format: int64
+          description: Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+        inventory_rows_scanned:
+          type: integer
+          format: int64
+          description: Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+        catalog_metadata_bytes_shared:
+          type: integer
+          format: int64
+          description: Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+        catalog_metadata_bytes_copied:
+          type: integer
+          format: int64
+          description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+        inventory_wal_rows:
+          type: integer
+          format: int64
+          description: WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+        inventory_wal_retirements:
+          type: integer
+          format: int64
+          description: WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+        inventory_delta_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+        inventory_fallback_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+        inventory_policy_switches:
+          type: integer
+          format: int64
+          description: Changes between full and incremental physical inventory under the optional size cutoff.
+        inventory_incremental_active:
+          type: integer
+          format: int64
+          description: One when incremental physical inventory is currently enabled, otherwise zero.
+        mark_bitmap_bytes:
+          type: integer
+          format: int64
+          description: Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+        mark_fallback_entries:
+          type: integer
+          format: int64
+          description: Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+        collection_debt_deferrals:
+          type: integer
+          format: int64
+          description: Background mark setups deferred by the optional obsolete-debt scheduling policy.
+        obsolete_payload_debt_bytes:
+          type: integer
+          format: int64
+          description: Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
+        inventory_updates:
+          type: integer
+          format: int64
+          description: Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+        inventory_update_ns:
+          type: integer
+          format: int64
+          description: Time spent on full physical inventory scans or incremental occurrence-cache updates.
+        collection_locked_ns:
+          type: integer
+          format: int64
+          description: Total time inside the source writer lock for collection entry points; includes nested stages.
+        collection_max_locked_ns:
+          type: integer
+          format: int64
+          description: Longest collection entry point hold of the source writer lock.
+        collection_setup_ns:
+          type: integer
+          format: int64
+          description: Collection setup time, including primary sync, checkpoint and snapshot acquisition.
+        collection_max_setup_ns:
+          type: integer
+          format: int64
+          description: Longest collection setup.
+        collection_max_plan_ns:
+          type: integer
+          format: int64
+          description: Longest locked collection planning step.
+        collection_copy_ns:
+          type: integer
+          format: int64
+          description: Locked collection copy time excluding final publication.
+        collection_max_copy_ns:
+          type: integer
+          format: int64
+          description: Longest locked collection copy step.
+        collection_publish_ns:
+          type: integer
+          format: int64
+          description: Locked publication time including directory refresh, inventory, receipts and reclamation.
+        collection_max_publish_ns:
+          type: integer
+          format: int64
+          description: Longest locked publication step.
+        collection_active_scan_turns:
+          type: integer
+          format: int64
+          description: Active scan turns scheduled using the experimental wall-time duty policy.
+        collection_active_scan_pause_ns:
+          type: integer
+          format: int64
+          description: Requested pause time under the active scan policy; not measured CPU time.
+        collection_rescued_payloads:
+          type: integer
+          format: int64
+          description: Protection requests merged into marking, including repeated requests across turns.
+        deduplicated_reappend_payloads:
+          type: integer
+          format: int64
+          description: Durable payload preparations protected by marking without another append.
+        deduplicated_reappend_bytes:
+          type: integer
+          format: int64
+          description: Raw vector bytes avoided by protecting existing durable payloads during marking.
+        directory_bytes_written:
+          type: integer
+          format: int64
+        directory_entries:
+          type: integer
+          format: int64
+        directory_hits:
+          type: integer
+          format: int64
+        directory_misses:
+          type: integer
+          format: int64
+        source_segments:
+          type: integer
+          format: int64
+        ownership_index_collections:
+          type: integer
+          format: int64
+        ownership_index_entries_scanned:
+          type: integer
+          format: int64
+        prepare_requests:
+          type: integer
+          format: int64
+        prepare_lock_wait_ns:
+          type: integer
+          format: int64
+        decode_outside_lock_ns:
+          type: integer
+          format: int64
+        snapshot_read_ns:
+          type: integer
+          format: int64
+        cache_reclaimed_bytes:
+          type: integer
+          format: int64
+        retired_ann_references_skipped:
+          type: integer
+          format: int64
+        retained_payloads:
+          type: integer
+          format: uint64
+        retained_payload_bytes:
+          type: integer
+          format: uint64
+        unreferenced_payload_bytes_at_collection:
+          type: integer
+          format: uint64
+        checkpoint_bytes_read:
+          type: integer
+          format: uint64
+        checkpoint_bytes_written:
+          type: integer
+          format: uint64
+        heap_bytes:
+          type: integer
+          format: uint64
+          description: Allocator-backed source-store state charged to the shared resource manager, excluding mmap pages and request-owned buffers.
+        location_cache_hits:
+          type: integer
+          format: int64
+        location_cache_misses:
+          type: integer
+          format: int64
+        location_cache_bytes:
+          type: integer
+          format: int64
+        source_shards:
+          type: integer
+          format: int64
+        collection_steps:
+          type: integer
+          format: int64
+        collection_pending_bytes:
+          type: integer
+          format: int64
+        collection_mark_ns:
+          type: integer
+          format: int64
+        checkpoint_receipt_hits:
+          type: integer
+          format: int64
+        checkpoint_inventory_restores:
+          type: integer
+          format: int64
+        checkpoint_receipt_bytes_written:
+          type: integer
+          format: int64
+        prepare_batches:
+          type: integer
+          format: int64
+        preparation_ns:
+          type: integer
+          format: int64
+        durable_append_ns:
+          type: integer
+          format: int64
+        checkpoint_ns:
+          type: integer
+          format: int64
+        prepared_payloads:
+          type: integer
+          format: uint64
+        prepared_payload_bytes:
+          type: integer
+          format: uint64
+        wal_bytes_written:
+          type: integer
+          format: uint64
+        active_sessions:
+          type: integer
+          format: uint64
+        resolved_payloads:
+          type: integer
+          format: uint64
+        resolved_bytes:
+          type: integer
+          format: uint64
+        active_wal_bytes:
+          type: integer
+          format: uint64
+        immutable_block_bytes:
+          type: integer
+          format: uint64
+        live_payloads_at_collection:
+          type: integer
+          format: uint64
+        live_payload_bytes_at_collection:
+          type: integer
+          format: uint64
+        collections:
+          type: integer
+          format: uint64
+        collection_deferrals:
+          type: integer
+          format: uint64
+        collection_bytes_read:
+          type: integer
+          format: uint64
+        collection_bytes_written:
+          type: integer
+          format: uint64
+        unresolved_primary_commits:
+          type: integer
+          format: uint64
     StorageStatus: # common.StorageStats
       type: object
       properties:
+        source_vectors:
+          $ref: "#/components/schemas/VectorSourceStorageStatus"
         disk_usage:
           type: integer
           format: uint64
@@ -4995,8 +5349,9 @@ components:
           description: |
             Durable commit outcome. `committed_pending` means requested visibility or
             participant propagation is still completing. `committed_repair_required`
-            means the primary write committed, but a terminal enrichment failure needs
-            operator repair and will not be retried indefinitely.
+            means the primary write committed, but a terminal background materialization
+            failure needs operator repair and will not be retried indefinitely. Inspect
+            `failure` when present; retrying the document write is unnecessary.
         inserted:
           type: integer
           description: Number of documents successfully inserted
@@ -5006,6 +5361,28 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+        failure:
+          $ref: "#/components/schemas/BatchCommittedFailure"
+    BatchCommittedFailure:
+      type: object
+      description: |
+        Additive details for a committed batch that needs operator action. The
+        open string code is forward-compatible with older SDKs; clients should
+        treat unknown codes as non-retryable when `retryable` is false.
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable failure code, such as `graph_metric_materialization_rejected`.
+        message:
+          type: string
+          description: Actionable operator guidance.
+        reason:
+          type: string
+          description: Optional stable reason within the failure category, such as `build_budget_exceeded`.
+        retryable:
+          type: boolean
+          description: Whether replaying the document mutation is safe. Committed repair outcomes are false.
     DenseRepairBackpressureError:
       type: object
       description: A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
@@ -6353,13 +6730,25 @@ components:
 
     SSEError:
       type: object
-      description: Emitted when an error occurs during retrieval
-      required:
-        - error
+      description: Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
+      required: [error]
       properties:
         error:
           type: string
-          description: Error message
+          description: Error message or stable machine-readable code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum: [inference_capacity, inference_admission]
+        retryable:
+          type: boolean
+          description: Whether the failure is temporary and the request may be retried.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
 
     PruneStats:
       type: object
@@ -7167,6 +7556,8 @@ components:
                   - required: [count]
                   - required: [profile]
                   - required: [reranker]
+                  - required: [graph_metric]
+                  - required: [graph_metric_rerank]
                   - required: [analyses]
                   - required: [aggregations]
                   - required: [graph_queries]
@@ -7569,6 +7960,18 @@ components:
               "field": "content"
             }
             ```
+        graph_metric:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricQuery"
+          description: >-
+            Direct top-k read from a published graph metric generation. Results
+            are returned in graph_metric_results under the requested name or the
+            metric name when no explicit name is supplied.
+        graph_metric_rerank:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricRerank"
+          description: >-
+            Blend a published graph metric feature into ordinary search hit
+            scores. Requests may require either any published generation or a
+            generation that is fresh with respect to graph writes.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:
@@ -7946,9 +8349,42 @@ components:
         merge:
           $ref: "#/components/schemas/MergeProfile"
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphMetricProfile"
+          description: Graph metric freshness and generation details for metric-aware query work.
         sort:
           $ref: "#/components/schemas/SortProfile"
           description: Sort execution statistics (present when the query used ordered page options and profiling was enabled).
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
+          description: Published generation and freshness status observed by the query.
     SortProfile:
       type: object
       additionalProperties: false
@@ -8442,6 +8878,64 @@ components:
           items:
             $ref: "#/components/schemas/HierarchyMatchHit"
 
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: "#/components/schemas/GraphMetricRerankScoreDetails"
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -8477,6 +8971,10 @@ components:
             format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: "#/components/schemas/QueryScoreDetails"
+          description: Optional score provenance for ranking features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true # map[string]any for field values
@@ -8581,6 +9079,11 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/AnalysesResult"
           description: Analysis results like PCA and t-SNE per index embeddings.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: "indexes.yaml#/components/schemas/GraphMetricResult"
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -9086,6 +9589,12 @@ components:
             or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to
             navigate into decoded JSONB columns.
   responses: # Add reusable responses
+    CommittedMutationAccepted:
+      description: Mutation committed with pending visibility or explicit repair debt
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/CommittedMutationOutcome"
     BadRequest:
       description: Bad request
       content:
@@ -9147,6 +9656,32 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    RestoreAdmissionUnavailable:
+      description: >-
+        Restore admission could not be confirmed. If X-Antfly-Raft-Mutation-Outcome
+        is unknown-v1, the job may still commit. Poll Location or retry the identical
+        request using the returned Idempotency-Key. A missing job does not prove
+        non-admission. Supply a stable key on the first request to recover if the
+        entire response is lost. Without the unknown marker, this is a regular
+        service or validation availability failure.
+      headers:
+        Location:
+          description: Recovery job resource, present for an unknown admission outcome.
+          schema: { type: string }
+        Idempotency-Key:
+          description: Reuse this key with the identical request and authenticated principal.
+          schema: { type: string }
+        X-Antfly-Raft-Mutation-Outcome:
+          description: An unknown-v1 value prohibits replay with a new key.
+          schema: { type: string, enum: [unknown-v1] }
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+              - $ref: "#/components/schemas/Error"
     IndexMutationServiceUnavailable:
       description: Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged.
       headers:
@@ -9266,6 +9801,21 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/QueryConflictError"
+    AgentTemporarilyUnavailable:
+      description: Agent query dependencies or inference capacity are temporarily unavailable.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum retry delay in seconds.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/QueryTemporarilyUnavailableError"
+              - $ref: "#/components/schemas/InferenceCapacityError"
     QueryTemporarilyUnavailable:
       description: A query dependency or read path is temporarily unavailable and the request is safe to retry
       headers:
@@ -9637,6 +10187,77 @@ paths:
                 type: string
         "500":
           $ref: "#/components/responses/StatelessTransactionFailure"
+  /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum: [refresh, rebuild, delete, pause, resume]
+    post:
+      summary: Execute a graph metric operational action
+      description: |
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+        graph metric. The metric configuration remains owned by the graph index.
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+        return the aggregate shard status without waiting for graph-sized work.
+        `delete` clears materialized metric state and durably disables automatic
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        "200":
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphMetricActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -10108,7 +10729,7 @@ paths:
             minLength: 1
             maxLength: 256
             x-go-type-skip-optional-pointer: false
-          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and cluster restore target. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -10119,6 +10740,9 @@ paths:
         "202":
           description: Restore job durably accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema: { type: string }
             Location:
               description: Relative URL of the durable restore job resource.
               schema: { type: string }
@@ -10140,7 +10764,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/RestoreAdmissionUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /restore/jobs:
@@ -10467,6 +11091,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
         "500":
           description: Internal server error (e.g., LLM call failed)
           content:
@@ -10546,7 +11172,7 @@ paths:
         "502":
           $ref: "#/components/responses/QueryBadGateway"
         "503":
-          $ref: "#/components/responses/QueryTemporarilyUnavailable"
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
         "504":
           $ref: "#/components/responses/QueryGatewayTimeout"
         "500":
@@ -10722,6 +11348,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Table"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
         "400":
           $ref: "#/components/responses/IndexMutationBadRequest"
         "422":
@@ -10740,6 +11368,8 @@ paths:
       responses:
         "204":
           description: Table dropped successfully
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
         "400": # If table not found
           $ref: "#/components/responses/BadRequest"
         "500":
@@ -11016,7 +11646,7 @@ paths:
             minLength: 1
             maxLength: 256
             x-go-type-skip-optional-pointer: false
-          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job and return its generated key. Reuse that key after an unknown admission outcome; supply a key initially to recover from losing the entire response.
       requestBody:
         required: true
         content:
@@ -11027,6 +11657,9 @@ paths:
         "202":
           description: Durable restore job accepted
           headers:
+            Idempotency-Key:
+              description: Recovery key for retries of this request.
+              schema: { type: string }
             Location:
               description: Relative URL of the durable restore job resource.
               schema: { type: string }
@@ -11048,7 +11681,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+          $ref: "#/components/responses/RestoreAdmissionUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/destination-authorization:
@@ -11153,6 +11786,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Table"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -11201,6 +11836,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Table"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":

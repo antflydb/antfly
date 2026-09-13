@@ -5,64 +5,6 @@ const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
-/// Loader implementation for qualified Gemma 4 26B-A4B Q4_0 loads. Auto selects the production default, pipeline requires the bounded pinned-host pipeline, and legacy selects the single-threaded loader.
-pub const A4bLoadStrategy = enum {
-    auto,
-    pipeline,
-    legacy,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .pipeline => "pipeline",
-            .legacy => "legacy",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "pipeline", .pipeline },
-            .{ "legacy", .legacy },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Prepared-pack policy for qualified A4B CUDA loads. Required fails closed unless a valid pack is installed.
-pub const A4bPreparedPackMode = enum {
-    auto,
-    off,
-    required,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .off => "off",
-            .required => "required",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "off", .off },
-            .{ "required", .required },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
 pub const A4bResidencyMode = enum {
     auto,
@@ -182,6 +124,46 @@ pub const BackendRuntimes = struct {
         if (self.wasm) |value| {
             try jw.objectField("wasm");
             try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Observed executor behavior, not a capability prediction.
+pub const BatchExecutionReport = struct {
+    requested_items: i64,
+    native_batches: i64,
+    native_items: i64,
+    serial_items: i64,
+    /// Items rejected before model execution by validation, resolution, or admission.
+    rejected_items: i64,
+    fallback_items: i64,
+    fallback_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("requested_items");
+        try jw.write(self.requested_items);
+        try jw.objectField("native_batches");
+        try jw.write(self.native_batches);
+        try jw.objectField("native_items");
+        try jw.write(self.native_items);
+        try jw.objectField("serial_items");
+        try jw.write(self.serial_items);
+        try jw.objectField("rejected_items");
+        try jw.write(self.rejected_items);
+        try jw.objectField("fallback_items");
+        try jw.write(self.fallback_items);
+        switch (self.fallback_reason) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("fallback_reason");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("fallback_reason");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -496,80 +478,6 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const ClassifyObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Classification results for this input text.
-    classifications: []const ClassifyResult,
-};
-
-pub const ClassifyRequest = struct {
-    /// Name of classifier model from models_dir/classifiers/
-    model: []const u8,
-    /// Texts to classify
-    texts: []const []const u8,
-    /// Candidate labels for zero-shot classification. The model will predict which label(s) best describe each text.
-    labels: []const []const u8,
-    /// Custom hypothesis template for NLI-based classification. Use "{}" as placeholder for the label. Default: "This example is {}."
-    hypothesis_template: ?[]const u8 = null,
-    /// If true, allows multiple labels per text (independent scoring). If false (default), scores are normalized across labels.
-    multi_label: ?bool = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "texts", "texts", false },
-        .{ "labels", "labels", false },
-        .{ "hypothesis_template", "hypothesis_template", true },
-        .{ "multi_label", "multi_label", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("texts");
-        try jw.write(self.texts);
-        try jw.objectField("labels");
-        try jw.write(self.labels);
-        if (self.hypothesis_template) |value| {
-            try jw.objectField("hypothesis_template");
-            try jw.write(value);
-        }
-        if (self.multi_label) |value| {
-            try jw.objectField("multi_label");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const ClassifyResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Classification result objects, one per input text.
-    data: []const ClassifyObject,
-    /// Name of model used for classification
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const ClassifyResult = struct {
-    /// The predicted class/category
-    label: []const u8,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
     max_concurrent_requests: ?i64 = null,
@@ -581,7 +489,7 @@ pub const Config = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
@@ -738,7 +646,7 @@ pub const ContentSecurityConfig = struct {
     max_download_size_bytes: ?i64 = null,
     /// Maximum HTTP download duration in seconds. Defaults to 30; 0 disables the deadline.
     download_timeout_seconds: ?i64 = null,
-    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation rejects multimodal content before fetch. Non-inference scraping consumers do not enforce this setting.
+    /// Maximum source-image width or height for accepted inference image inputs, including generate/chat, batch generation, dense embed, multimodal rerank, `/read`, image `/extract`, and their embedded direct APIs. Headers exceeding this limit are rejected before model execution; images are not resized. Batch generation applies the same image-header admission before model execution. Non-inference scraping consumers do not enforce this setting.
     max_image_dimension: ?i64 = null,
     /// Explicit path-prefix allowlist for inference file:// and s3:// URLs. Omission and an explicit empty list both deny all file and S3 paths. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
@@ -1536,6 +1444,39 @@ pub const GenerateBatchResponse = struct {
     object: []const u8,
     data: []const GenerateBatchResultItem,
     summary: GenerateBatchSummary,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?BatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "summary", "summary", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("summary");
+        try jw.write(self.summary);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateBatchResultItem = struct {
@@ -2521,15 +2462,6 @@ pub const ModelRef = struct {
     residency_mode: ?A4bResidencyMode = null,
     /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
     memory_budget_mb: ?i64 = null,
-    load_strategy: ?A4bLoadStrategy = null,
-    /// Bounded loader worker count for qualified A4B loads. Zero selects the runtime default.
-    load_workers: ?i64 = null,
-    /// Aggregate pinned-host staging budget in MiB. Zero selects the runtime default; explicit values must be between 64 and 1024.
-    load_staging_mb: ?i64 = null,
-    prepared_pack: ?A4bPreparedPackMode = null,
-    /// Drop clean GGUF pages from the host page cache after a successful A4B load.
-    drop_host_cache_after_load: ?bool = null,
-    startup_strategy: ?WarmModelStartupStrategy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2540,12 +2472,6 @@ pub const ModelRef = struct {
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
         .{ "memory_budget_mb", "memory_budget_mb", true },
-        .{ "load_strategy", "load_strategy", true },
-        .{ "load_workers", "load_workers", true },
-        .{ "load_staging_mb", "load_staging_mb", true },
-        .{ "prepared_pack", "prepared_pack", true },
-        .{ "drop_host_cache_after_load", "drop_host_cache_after_load", true },
-        .{ "startup_strategy", "startup_strategy", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2582,30 +2508,6 @@ pub const ModelRef = struct {
             try jw.objectField("memory_budget_mb");
             try jw.write(value);
         }
-        if (self.load_strategy) |value| {
-            try jw.objectField("load_strategy");
-            try jw.write(value);
-        }
-        if (self.load_workers) |value| {
-            try jw.objectField("load_workers");
-            try jw.write(value);
-        }
-        if (self.load_staging_mb) |value| {
-            try jw.objectField("load_staging_mb");
-            try jw.write(value);
-        }
-        if (self.prepared_pack) |value| {
-            try jw.objectField("prepared_pack");
-            try jw.write(value);
-        }
-        if (self.drop_host_cache_after_load) |value| {
-            try jw.objectField("drop_host_cache_after_load");
-            try jw.write(value);
-        }
-        if (self.startup_strategy) |value| {
-            try jw.objectField("startup_strategy");
-            try jw.write(value);
-        }
         try jw.endObject();
     }
 };
@@ -2622,8 +2524,6 @@ pub const ModelsResponse = struct {
     chunkers: std.json.ArrayHashMap(ModelInfo),
     /// Available reranking models
     rerankers: std.json.ArrayHashMap(ModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(ModelInfo),
     /// Available embedding models from models_dir/embedders/
     embedders: std.json.ArrayHashMap(ModelInfo),
     /// Available extractor models (models with 'extraction' capability)
@@ -2896,6 +2796,42 @@ pub const ReadResponse = struct {
     /// Name of model used for reading
     model: []const u8,
     usage: GenerateUsage,
+    /// Observed execution path. Omitted by older compatible servers.
+    execution: ?BatchExecutionReport = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "data", "data", false },
+        .{ "model", "model", false },
+        .{ "usage", "usage", false },
+        .{ "execution", "execution", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReadResult = struct {
@@ -3069,7 +3005,7 @@ pub const RuntimeConfig = struct {
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, and multimodal rerank, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation rejects multimodal content before fetch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
@@ -3486,8 +3422,8 @@ pub const TranscribeObject = struct {
 };
 
 pub const TranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
+    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
+    model: []const u8,
     /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
@@ -3495,7 +3431,7 @@ pub const TranscribeRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
+        .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
     };
@@ -3510,10 +3446,8 @@ pub const TranscribeRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
+        try jw.objectField("model");
+        try jw.write(self.model);
         try jw.objectField("audio");
         try jw.write(self.audio);
         if (self.language) |value| {
@@ -3549,32 +3483,6 @@ pub const TransientCapacityError = struct {
 };
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;
-
-/// Eager loads and publishes a reusable session. Prefetch only reads A4B CUDA artifact pages into the host page cache and does not publish a session.
-pub const WarmModelStartupStrategy = enum {
-    eager,
-    prefetch,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .eager => "eager",
-            .prefetch => "prefetch",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "eager", .eager },
-            .{ "prefetch", .prefetch },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
 
 /// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
 pub const SchemasConfig = struct {

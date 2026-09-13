@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const raft_engine = @import("raft_engine");
@@ -308,7 +309,7 @@ pub const PersistentReplicaState = struct {
             raw[raw.len - state_checksum_len ..][0..state_checksum_len],
             .little,
         );
-        if (std.hash.Crc32.hash(body) != expected_checksum) return error.InvalidReplicaState;
+        if (Crc32.hash(body) != expected_checksum) return error.InvalidReplicaState;
 
         var cursor: usize = 0;
         if (try readInt(u32, body, &cursor) != magic) return error.InvalidReplicaState;
@@ -380,7 +381,7 @@ pub const PersistentReplicaState = struct {
         if (buffer.items.len > max_state_body_bytes)
             return error.ReplicaStateTooLarge;
         var checksum: [state_checksum_len]u8 = undefined;
-        std.mem.writeInt(u32, &checksum, std.hash.Crc32.hash(buffer.items), .little);
+        std.mem.writeInt(u32, &checksum, Crc32.hash(buffer.items), .little);
         try buffer.appendSlice(self.alloc, &checksum);
 
         const path = try self.statePath();
@@ -656,7 +657,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     std.mem.writeInt(
         u32,
         unchecked[unchecked.len - state_checksum_len ..][0..state_checksum_len],
-        std.hash.Crc32.hash(unchecked[0 .. unchecked.len - state_checksum_len]),
+        Crc32.hash(unchecked[0 .. unchecked.len - state_checksum_len]),
         .little,
     );
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = unchecked });
@@ -678,7 +679,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendInt(u32, alloc, &invalid, std.math.maxInt(u32));
-    try PersistentReplicaState.appendInt(u32, alloc, &invalid, std.hash.Crc32.hash(invalid.items));
+    try PersistentReplicaState.appendInt(u32, alloc, &invalid, Crc32.hash(invalid.items));
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = invalid.items });
     try std.testing.expectError(
         error.InvalidReplicaState,

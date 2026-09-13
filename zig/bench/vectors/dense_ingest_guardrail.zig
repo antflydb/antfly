@@ -141,9 +141,9 @@ const IngestSummary = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
     const dataset = try makeDataset(alloc, cfg);
     defer alloc.free(dataset);
     const input_docs = try makeInputDocs(alloc, dataset, cfg);
@@ -158,21 +158,19 @@ pub fn main(init: std.process.Init) !void {
     try enforceGuardrails(cfg, summary);
 }
 
-fn parseArgs(args_in: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, "--docs");
+            cfg.docs = try parseNextUsize(args, "--docs");
         } else if (std.mem.eql(u8, arg, "--dims")) {
-            cfg.dims = try parseNextUsize(&args, "--dims");
+            cfg.dims = try parseNextUsize(args, "--dims");
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, "--batch-size");
+            cfg.batch_size = try parseNextUsize(args, "--batch-size");
         } else if (std.mem.eql(u8, arg, "--leaf-size")) {
-            cfg.leaf_size = try parseNextUsize(&args, "--leaf-size");
+            cfg.leaf_size = try parseNextUsize(args, "--leaf-size");
         } else if (std.mem.eql(u8, arg, "--branching-factor")) {
-            cfg.branching_factor = try parseNextUsize(&args, "--branching-factor");
+            cfg.branching_factor = try parseNextUsize(args, "--branching-factor");
         } else if (std.mem.eql(u8, arg, "--kmeans-backend")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.kmeans_backend = std.meta.stringToEnum(KmeansBackend, raw) orelse return error.InvalidArgument;
@@ -180,9 +178,9 @@ fn parseArgs(args_in: std.process.Args) !Config {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.kmeans_update_strategy = std.meta.stringToEnum(KmeansUpdateStrategy, raw) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--bulk-rebuild-hbc-leaf-min-members")) {
-            cfg.bulk_rebuild_hbc_leaf_min_members = try parseNextUsize(&args, "--bulk-rebuild-hbc-leaf-min-members");
+            cfg.bulk_rebuild_hbc_leaf_min_members = try parseNextUsize(args, "--bulk-rebuild-hbc-leaf-min-members");
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            cfg.seed = try parseNextU64(&args, "--seed");
+            cfg.seed = try parseNextU64(args, "--seed");
         } else if (std.mem.eql(u8, arg, "--inline-derived")) {
             cfg.inline_derived = true;
         } else if (std.mem.eql(u8, arg, "--bulk-session")) {
@@ -190,23 +188,23 @@ fn parseArgs(args_in: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--no-final-drain")) {
             cfg.final_drain = false;
         } else if (std.mem.eql(u8, arg, "--hold-before-final-drain-ms")) {
-            cfg.hold_before_final_drain_ms = try parseNextU64(&args, "--hold-before-final-drain-ms");
+            cfg.hold_before_final_drain_ms = try parseNextU64(args, "--hold-before-final-drain-ms");
         } else if (std.mem.eql(u8, arg, "--status-probe-every")) {
-            cfg.status_probe_every = try parseNextUsize(&args, "--status-probe-every");
+            cfg.status_probe_every = try parseNextUsize(args, "--status-probe-every");
         } else if (std.mem.eql(u8, arg, "--maintenance-every")) {
-            cfg.maintenance_every = try parseNextUsize(&args, "--maintenance-every");
+            cfg.maintenance_every = try parseNextUsize(args, "--maintenance-every");
         } else if (std.mem.eql(u8, arg, "--maintenance-steps")) {
-            cfg.maintenance_steps = try parseNextUsize(&args, "--maintenance-steps");
+            cfg.maintenance_steps = try parseNextUsize(args, "--maintenance-steps");
         } else if (std.mem.eql(u8, arg, "--max-write-ns-per-doc")) {
-            cfg.max_write_ns_per_doc = try parseNextU64(&args, "--max-write-ns-per-doc");
+            cfg.max_write_ns_per_doc = try parseNextU64(args, "--max-write-ns-per-doc");
         } else if (std.mem.eql(u8, arg, "--max-status-probe-ns")) {
-            cfg.max_status_probe_ns = try parseNextU64(&args, "--max-status-probe-ns");
+            cfg.max_status_probe_ns = try parseNextU64(args, "--max-status-probe-ns");
         } else if (std.mem.eql(u8, arg, "--max-dense-lsm-run-bytes")) {
-            cfg.max_dense_lsm_run_bytes = try parseNextU64(&args, "--max-dense-lsm-run-bytes");
+            cfg.max_dense_lsm_run_bytes = try parseNextU64(args, "--max-dense-lsm-run-bytes");
         } else if (std.mem.eql(u8, arg, "--max-dense-l0-runs")) {
-            cfg.max_dense_l0_runs = try parseNextU64(&args, "--max-dense-l0-runs");
+            cfg.max_dense_l0_runs = try parseNextU64(args, "--max-dense-l0-runs");
         } else if (std.mem.eql(u8, arg, "--max-hbc-quant-value-bytes")) {
-            cfg.max_hbc_quant_value_bytes = try parseNextU64(&args, "--max-hbc-quant-value-bytes");
+            cfg.max_hbc_quant_value_bytes = try parseNextU64(args, "--max-hbc-quant-value-bytes");
         } else if (std.mem.eql(u8, arg, "--sync-level")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.sync_level = db_types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;
@@ -560,10 +558,7 @@ fn deterministicNoise(seed: u64, doc_idx: usize, dim_idx: usize) f32 {
 
 fn sleepMs(duration_ms: u64) void {
     if (duration_ms == 0) return;
-    const deadline = nowNs() +| (duration_ms * std.time.ns_per_ms);
-    while (nowNs() < deadline) {
-        std.Thread.yield() catch {};
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@as(i96, duration_ms) * std.time.ns_per_ms), .awake) catch {};
 }
 
 fn normalizeInPlace(vec: []f32) void {

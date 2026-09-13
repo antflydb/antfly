@@ -925,7 +925,8 @@ fn forwardCapturingActivationsCT(
         normed_attn_cts.deinit(allocator);
     }
 
-    var hidden = try embeddingsBlock(cb, config, input_ids, total_tokens);
+    // The activation-capture path uses the separate-QKV layout's stored biases.
+    var hidden = try embeddingsBlock(cb, config, null, input_ids, total_tokens);
     // Free hidden on any error path; the happy path frees it explicitly below.
     errdefer cb.free(hidden);
 
@@ -1290,6 +1291,7 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitTestWeightStore(allocator, &store);
     var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     // This is the exact public checkpoint structure in miniature: bare

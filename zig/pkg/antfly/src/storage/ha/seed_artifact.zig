@@ -12,6 +12,7 @@
 //! or Job restarts: an existing object is accepted only when its bytes match.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -385,7 +386,7 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
         defer source.close(io);
         var reader = source.reader(io, &.{});
         var file_sha = Sha256.init(.{});
-        var file_crc = std.hash.Crc32.init();
+        var file_crc = Crc32.init();
         var streamed_bytes: u64 = 0;
         var chunk_receipts = std.ArrayListUnmanaged(ChunkReceipt).empty;
         errdefer {
@@ -1153,7 +1154,7 @@ fn checksumRemoteArtifactFile(
     limits: Limits,
 ) !RestoredFile {
     var sha = Sha256.init(.{});
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     var read_bytes: u64 = 0;
     switch (receipt_version) {
         legacy_format_version => {
@@ -1210,7 +1211,7 @@ fn checksumRemoteArtifactFile(
 
 fn absorbVerifiedBytes(
     sha: *Sha256,
-    crc: *std.hash.Crc32,
+    crc: *Crc32,
     read_bytes: *u64,
     body: []const u8,
     expected_size: u64,
@@ -1230,7 +1231,7 @@ fn checksumLocalFile(io: std.Io, path: []const u8, max_bytes: usize) !RestoredFi
     var reader = file.reader(io, &.{});
     var buffer: [64 * 1024]u8 = undefined;
     var sha = Sha256.init(.{});
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     var size: u64 = 0;
     while (true) {
         const read = try reader.interface.readSliceShort(&buffer);
@@ -1265,7 +1266,7 @@ fn restoreArtifactFile(
     errdefer std.Io.Dir.cwd().deleteFile(io, temp) catch {};
 
     var sha = Sha256.init(.{});
-    var crc = std.hash.Crc32.init();
+    var crc = Crc32.init();
     var written: u64 = 0;
     {
         var file = try std.Io.Dir.cwd().createFile(io, temp, .{ .truncate = true });
@@ -1335,7 +1336,7 @@ fn restoreArtifactFile(
 fn appendRestoredBytes(
     writer: *std.Io.Writer,
     sha: *Sha256,
-    crc: *std.hash.Crc32,
+    crc: *Crc32,
     written: *u64,
     body: []const u8,
     expected_size: u64,

@@ -459,7 +459,7 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
 
     var memory_storage = lsm_backend.MemoryStorage.init(alloc);
     defer memory_storage.deinit();
@@ -560,7 +560,7 @@ test "embedded api hosted profile drains derived indexing without native runtime
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
 
     var memory_storage = lsm_backend.MemoryStorage.init(alloc);
     defer memory_storage.deinit();
@@ -632,7 +632,7 @@ test "embedded api hosted profile persists text index across reopen over storage
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
 
     var memory_storage = lsm_backend.MemoryStorage.init(alloc);
     defer memory_storage.deinit();
@@ -1212,6 +1212,11 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         try backup_codec.writeBlock(&malformed, alloc, .document_batch, &malformed_doc_payload);
 
         try std.testing.expectError(error.Truncated, malformed_target.importPortable(alloc, malformed.items));
+
+        // A valid archive must not overlay a live target: relational restores
+        // can change the physical row namespace, so preserving old keys would
+        // make them silently unreachable after publication.
+        try std.testing.expectError(error.LiteImportTargetNotEmpty, malformed_target.importPortable(alloc, backup.items));
 
         const target_lookup = try malformed_target.lookupJson(alloc, "doc:malformed-target", "{}");
         defer alloc.free(target_lookup);

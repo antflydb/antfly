@@ -16,6 +16,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
+pub const data_uri = @import("data_uri.zig");
+
 const Allocator = std.mem.Allocator;
 const default_max_download_size_bytes: u64 = 100 * 1024 * 1024;
 const default_download_timeout_ms: u64 = 30_000;
@@ -306,7 +308,7 @@ fn downloadContentOutcomeAllocImpl(
     http_headers: ?[]const HTTPHeader,
 ) !DownloadOutcome {
     if (maybe_context) |context| try context.check();
-    if (uri.len >= "data:".len and std.ascii.eqlIgnoreCase(uri[0.."data:".len], "data:")) {
+    if (data_uri.hasScheme(uri)) {
         const maybe_ceiling: ?DownloadCeiling = if (maybe_context) |context|
             try DownloadCeiling.init(context, security)
         else
@@ -372,36 +374,7 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []u8) void {
 }
 
 pub fn dataUriDecodedSize(uri: []const u8) !usize {
-    const prefix = "data:";
-    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
-
-    const payload = uri[prefix.len..];
-    const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
-    const meta = payload[0..comma];
-    const body = payload[comma + 1 ..];
-
-    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
-        return std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
-    }
-
-    return try percentDecodedLen(body);
-}
-
-fn percentDecodedLen(value: []const u8) !usize {
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < value.len) {
-        if (value[i] == '%') {
-            if (i + 2 >= value.len) return error.InvalidDataUri;
-            _ = std.fmt.charToDigit(value[i + 1], 16) catch return error.InvalidDataUri;
-            _ = std.fmt.charToDigit(value[i + 2], 16) catch return error.InvalidDataUri;
-            i += 3;
-        } else {
-            i += 1;
-        }
-        len += 1;
-    }
-    return len;
+    return (try data_uri.parseRequired(uri)).decodedSize();
 }
 
 fn validateDownloadSize(decoded_len: usize, security: ?*const ContentSecurityConfig) !void {
@@ -420,43 +393,13 @@ fn maxDownloadSize(security: ?*const ContentSecurityConfig) usize {
 }
 
 fn parseDataUriAlloc(alloc: Allocator, uri: []const u8, security: ?*const ContentSecurityConfig) !DownloadedContent {
-    const prefix = "data:";
-    if (uri.len < prefix.len or !std.ascii.eqlIgnoreCase(uri[0..prefix.len], prefix)) return error.InvalidDataUri;
-
-    const payload = uri[prefix.len..];
-    const comma = std.mem.indexOfScalar(u8, payload, ',') orelse return error.InvalidDataUri;
-    const meta = payload[0..comma];
-    const body = payload[comma + 1 ..];
-
-    if (std.ascii.endsWithIgnoreCase(meta, ";base64")) {
-        const mime = meta[0 .. meta.len - ";base64".len];
-        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(body) catch return error.InvalidBase64;
-        try validateDownloadSize(decoded_len, security);
-        const decoded = try alloc.alloc(u8, decoded_len);
-        errdefer alloc.free(decoded);
-        std.base64.standard.Decoder.decode(decoded, body) catch return error.InvalidBase64;
-        return .{
-            .content_type = try alloc.dupe(u8, if (mime.len > 0) mime else "application/octet-stream"),
-            .data = decoded,
-        };
-    }
-
-    const decoded_len = try percentDecodedLen(body);
-    try validateDownloadSize(decoded_len, security);
-    const decoded_body_buf = try alloc.dupe(u8, body);
-    var data = decoded_body_buf;
-    errdefer alloc.free(data);
-    const decoded_body = std.Uri.percentDecodeInPlace(decoded_body_buf);
-    if (decoded_body.len != decoded_body_buf.len) {
-        const exact = try alloc.dupe(u8, decoded_body);
-        alloc.free(decoded_body_buf);
-        data = exact;
-    }
-
-    return .{
-        .content_type = try alloc.dupe(u8, if (meta.len > 0) meta else "text/plain"),
-        .data = data,
-    };
+    const parsed = try data_uri.parseRequired(uri);
+    try validateDownloadSize(try parsed.decodedSize(), security);
+    var decoded = try data_uri.decodeAlloc(alloc, uri);
+    errdefer decoded.deinit(alloc);
+    const result = DownloadedContent{ .content_type = decoded.media_type, .data = decoded.data };
+    decoded = undefined;
+    return result;
 }
 
 fn downloadHttpOutcomeAlloc(
@@ -1893,6 +1836,18 @@ const TestHttpResponseServer = struct {
         };
         defer stream.close(self.io);
 
+        // Drain the GET headers before closing the connection; unread request
+        // bytes can otherwise turn this response into a TCP reset.
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(self.io, &write_buffer);
         writer.interface.writeAll(
@@ -1944,10 +1899,9 @@ fn downloadTestHttpResponseAlloc(
         .body = body,
         .content_encoding = content_encoding,
     };
-    const thread = try std.Thread.spawn(.{}, TestHttpResponseServer.serve, .{&fixture});
-
     const uri = try std.fmt.allocPrint(alloc, "http://{f}/blob", .{server.socket.address});
     defer alloc.free(uri);
+    var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
     var security = ContentSecurityConfig{
         .block_private_ips = false,
         .max_download_size_bytes = max_download_size_bytes,
@@ -1955,10 +1909,10 @@ fn downloadTestHttpResponseAlloc(
     var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
         server.deinit(io);
         server_open = false;
-        thread.join();
+        thread.await(std.testing.io);
         return err;
     };
-    thread.join();
+    thread.await(std.testing.io);
     if (fixture.failure) |server_err| {
         downloaded.deinit(alloc);
         return server_err;

@@ -30,6 +30,7 @@ const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
 const internal_keys = @import("../internal_keys.zig");
+const relational_store = @import("relational_store.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -909,13 +910,15 @@ const PrefixCandidateProvider = struct {
         fn consume(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             const self: *ScanCtx = @ptrCast(@alignCast(ptr));
             if (self.limit > 0 and self.seen >= self.limit) return error.CandidateLimitReached;
-            const entity_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.allocator, key)) orelse return;
+            const entity_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.allocator, key)) orelse return;
             defer self.allocator.free(entity_key);
-            const resolved_key = try jsonStringFieldAlloc(self.allocator, value, "merged_into");
+            const logical_value = try self.store.materializeRow(self.allocator, key, value);
+            defer self.allocator.free(logical_value);
+            const resolved_key = try jsonStringFieldAlloc(self.allocator, logical_value, "merged_into");
             defer if (resolved_key) |rk| self.allocator.free(rk);
             const resolved_raw = if (resolved_key) |rk| try entityRawFromStore(self.allocator, self.store, rk) else null;
             defer if (resolved_raw) |rv| self.allocator.free(rv);
-            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, value, resolved_key, resolved_raw, self.out);
+            try appendEntityCandidateWithResolved(self.allocator, self.table, entity_key, logical_value, resolved_key, resolved_raw, self.out);
             self.seen += 1;
         }
     };
@@ -947,6 +950,12 @@ const PrefixCandidateProvider = struct {
 };
 
 fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.ArtifactStore, entity_key: []const u8) !?[]u8 {
+    const row_store_key = try relational_store.keyAlloc(allocator, entity_key);
+    defer allocator.free(row_store_key);
+    if (try store.get(allocator, row_store_key)) |packed_row| {
+        defer allocator.free(packed_row);
+        return try store.materializeRow(allocator, row_store_key, packed_row);
+    }
     const doc_store_key = try internal_keys.documentKeyAlloc(allocator, entity_key);
     defer allocator.free(doc_store_key);
     return try store.get(allocator, doc_store_key);
@@ -992,6 +1001,7 @@ pub fn processRecordKeys(
 
 pub const ReresolveEnqueueResult = struct {
     queued: usize = 0,
+    sequence: u64 = 0,
     complete: bool = true,
     /// Last source-index marker key scanned; caller owns it and may persist it
     /// as the exclusive resume point for the next bounded marker-index window.
@@ -1345,12 +1355,13 @@ pub fn enqueueReresolveBacklogWindow(
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
-    _ = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
+    const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
     repair_result.repair_resume_after = null;
     return .{
         .queued = asset_keys.items.len,
+        .sequence = sequence,
         .complete = complete,
         .resume_after = collector.last_index_key,
         .repair_resume_after = repair_cursor,
@@ -1596,7 +1607,7 @@ pub const ResolutionRuntime = struct {
     index_manager: *index_manager_mod.IndexManager,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
-    io_impl: ?*background_runtime_mod.IoImpl,
+    io: ?Io,
     /// Optional cross-shard candidate source injected by the api/serving layer;
     /// null means local-only blocking (the worker's own store). Must outlive the
     /// runtime.
@@ -1608,10 +1619,15 @@ pub const ResolutionRuntime = struct {
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    /// The catalog transaction owns durability; this flag is only a wake hint.
+    /// Catalog changes and cursor advancement share catch_up_mutex so an older
+    /// window cannot clear a newer configuration's restart cursor.
+    backfill_pending: std.atomic.Value(bool) = .init(false),
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
-    future: ?Io.Future(void),
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
 
     pub fn init(
         alloc: Allocator,
@@ -1634,12 +1650,15 @@ pub const ResolutionRuntime = struct {
             .index_manager = index_manager,
             .write_ctx = write_ctx,
             .write_fn = write_fn,
-            .io_impl = backend_runtime.io_impl,
+            .io = backend_runtime.io(),
+            .backend_runtime = backend_runtime,
             .candidate_source = candidate_source,
             .embedder = embedder,
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
+            .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
+                (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),
             .worker_started = .init(false),
             .future = null,
         };
@@ -1664,14 +1683,22 @@ pub const ResolutionRuntime = struct {
         if (advanced) self.wakeWorker();
     }
 
+    /// Called while catalog mutation is serialized with catch-up. The catalog
+    /// already wrote both cursors atomically; never reacquire catch_up_mutex or
+    /// execute callbacks from the metadata refresh activity.
+    pub fn notifyBackfill(self: *ResolutionRuntime) void {
+        self.backfill_pending.store(true, .release);
+        self.wakeWorker();
+    }
+
     pub fn stats(self: *ResolutionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
         return .{
-            .enabled = target > 0 or applied < target,
+            .enabled = target > 0 or applied < target or self.backfill_pending.load(.acquire),
             .target_sequence = target,
             .applied_sequence = applied,
-            .catch_up_required = applied < target,
+            .catch_up_required = applied < target or self.backfill_pending.load(.acquire),
         };
     }
 
@@ -1690,28 +1717,26 @@ pub const ResolutionRuntime = struct {
     pub fn start(self: *ResolutionRuntime) !void {
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
         self.shutdown_flag.store(false, .release);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.propagation, self, workerStep);
         self.worker_started.store(true, .release);
         self.worker_cond.broadcast(io);
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
         self.shutdown_flag.store(true, .release);
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
+        if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
             self.worker_cond.broadcast(io);
             self.worker_mutex.unlock(io);
         }
         if (self.future) |*future| {
-            if (self.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.io) |io| {
+                _ = future.await(io);
             }
             self.future = null;
         }
@@ -1719,9 +1744,9 @@ pub const ResolutionRuntime = struct {
     }
 
     fn wakeWorker(self: *ResolutionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.worker_started.load(.acquire)) return;
-        const io_impl = self.io_impl orelse return;
-        const io = io_impl.io();
+        const io = self.io orelse return;
         self.worker_mutex.lockUncancelable(io);
         self.worker_cond.broadcast(io);
         self.worker_mutex.unlock(io);
@@ -1735,11 +1760,20 @@ pub const ResolutionRuntime = struct {
     pub fn catchUp(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.catchUpLocked(false);
+    }
 
+    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
-            if (applied >= target) return;
+            if (applied >= target) {
+                if (!self.backfill_pending.load(.acquire)) return;
+                var tick = try self.runReresolveBacklogWindowLocked();
+                tick.deinit(self.alloc);
+                if (single_window) return;
+                continue;
+            }
 
             const resolvers = try self.index_manager.listResolvers(self.alloc);
             defer {
@@ -1753,7 +1787,10 @@ pub const ResolutionRuntime = struct {
                 return;
             }
 
-            var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+            var das = DbArtifactStore(backend_erased.Store){
+                .store = &self.store_handle.store,
+                .index_manager = self.index_manager,
+            };
             const max_seen = try catchUpWindow(
                 self.alloc,
                 self.replay_source,
@@ -1777,6 +1814,7 @@ pub const ResolutionRuntime = struct {
             }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
             self.applied_sequence.store(max_seen, .release);
+            if (single_window) return;
             // Loop to process the next window if max_seen is still below target.
         }
     }
@@ -1786,6 +1824,7 @@ pub const ResolutionRuntime = struct {
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        defer self.notifyBackfill();
         const existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (existing) |key| self.alloc.free(key);
         if (existing == null) {
@@ -1813,12 +1852,18 @@ pub const ResolutionRuntime = struct {
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.runReresolveBacklogWindowLocked();
+    }
 
+    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime) !ReresolveEnqueueResult {
         const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (resume_key_value) |key| self.alloc.free(key);
         const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
         defer if (repair_resume_key_value) |key| self.alloc.free(key);
-        if (resume_key_value == null and repair_resume_key_value == null) return .{};
+        if (resume_key_value == null and repair_resume_key_value == null) {
+            self.backfill_pending.store(false, .release);
+            return .{};
+        }
 
         const resolvers = try self.index_manager.listResolvers(self.alloc);
         defer {
@@ -1828,10 +1873,14 @@ pub const ResolutionRuntime = struct {
         if (resolvers.len == 0) {
             try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key);
             try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
+            self.backfill_pending.store(false, .release);
             return .{};
         }
 
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        var das = DbArtifactStore(backend_erased.Store){
+            .store = &self.store_handle.store,
+            .index_manager = self.index_manager,
+        };
         var result = try enqueueReresolveBacklogWindow(
             self.alloc,
             das.artifactStore(),
@@ -1853,6 +1902,8 @@ pub const ResolutionRuntime = struct {
         } else if (result.repair_resume_after) |key| {
             try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key, key);
         }
+        if (result.sequence > 0) self.notifySequence(result.sequence);
+        self.backfill_pending.store(!result.complete, .release);
         return result;
     }
 
@@ -1879,41 +1930,29 @@ pub const ResolutionRuntime = struct {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(resolvers);
         }
-        var das = DbArtifactStore(backend_erased.Store){ .store = &self.store_handle.store };
+        var das = DbArtifactStore(backend_erased.Store){
+            .store = &self.store_handle.store,
+            .index_manager = self.index_manager,
+        };
         return listPendingReviews(alloc, das.artifactStore(), resolvers);
     }
 
-    fn workerMain(self: *ResolutionRuntime) void {
-        const io = (self.io_impl orelse return).io();
-        while (!self.shutdown_flag.load(.acquire)) {
-            self.worker_mutex.lockUncancelable(io);
-            while (!self.shutdown_flag.load(.acquire) and
-                self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
-            {
-                self.worker_cond.waitUncancelable(io, &self.worker_mutex);
-            }
-            self.worker_mutex.unlock(io);
-            if (self.shutdown_flag.load(.acquire)) break;
-
-            if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                self.catchUp() catch |err| {
-                    std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
-                    io.sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
-                };
-            }
-        }
-        self.catchUp() catch {};
+    fn workerStep(self: *ResolutionRuntime) ?u64 {
+        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire) and
+            !self.backfill_pending.load(.acquire)) return null;
+        if (!self.catch_up_mutex.tryLock()) return 25;
+        defer self.catch_up_mutex.unlock();
+        self.catchUpLocked(true) catch |err| {
+            std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
+            return 50;
+        };
+        return 0;
     }
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 const testing = std.testing;
@@ -1926,6 +1965,7 @@ const testing = std.testing;
 pub fn DbArtifactStore(comptime Store: type) type {
     return struct {
         store: *Store,
+        index_manager: ?*index_manager_mod.IndexManager = null,
 
         const Self = @This();
 
@@ -1940,7 +1980,19 @@ pub fn DbArtifactStore(comptime Store: type) type {
             .put = putFn,
             .delete = deleteFn,
             .scan_prefix = if (Store == backend_erased.Store) scanPrefixFn else null,
+            .materialize_row = materializeRowFn,
         };
+
+        fn materializeRowFn(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            key: []const u8,
+            value: []const u8,
+        ) anyerror![]u8 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.index_manager) |manager| return manager.materializeStoredValueAlloc(allocator, key, value);
+            return relational_store.materializeStoredValueAlloc(allocator, key, value);
+        }
 
         fn scanPrefixFn(
             ptr: *anyopaque,

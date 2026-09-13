@@ -49,6 +49,15 @@ pub const PublishedGeneration = struct {
     built_at_ns: u64,
     wal_start_lsn: u64,
     wal_end_lsn: u64,
+    /// True when `publication_parent_version` records the exact HEAD from
+    /// which this immutable candidate was built. False is reserved for
+    /// manifests written before publication lineage was encoded.
+    publication_lineage_tracked: bool = false,
+    publication_parent_version: ?u64 = null,
+    /// Exact HEAD ownership epoch that created this immutable candidate.
+    /// GC uses it to retire unpublished candidates after a fencing barrier,
+    /// even when their graph roots were reused from older publications.
+    publication_fencing_token: u64 = 0,
     base_source: ?BaseSourceDescriptor = null,
     stats: PublishedGenerationStats,
     artifacts: []ArtifactRef,
@@ -120,6 +129,22 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
         .artifact_id = artifact_id,
         .byte_len = artifact.byte_len,
         .checksum = checksum,
+        .metadata_version = artifact.metadata_version,
+        .published_generation = artifact.published_generation,
+        .edge_generation = artifact.edge_generation,
+        .computed_at_ms = artifact.computed_at_ms,
+        .materializer_fingerprint = artifact.materializer_fingerprint,
+        .graph_metric_control_len = artifact.graph_metric_control_len,
+        .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
+        .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+        .graph_topology_control_checksum = artifact.graph_topology_control_checksum,
+        .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
+        .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
+        .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
+        .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_topology_checksum = artifact.graph_metric_topology_checksum,
+        .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
+        .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };
 }
 
@@ -139,12 +164,26 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
         null;
     errdefer if (base_source_copy) |*descriptor| base_source.freeOwnedDescriptor(alloc, descriptor);
 
+    var published_sources = try search_sources.clonePublishedSearchSourcesAlloc(alloc, src.stats.published_search_sources);
+    errdefer search_sources.deinitPublishedSearchSources(alloc, &published_sources);
+    var derived_outputs = try search_sources.cloneMaterializedDerivedOutputsAlloc(alloc, src.stats.derived_outputs);
+    errdefer search_sources.deinitMaterializedDerivedOutputs(alloc, &derived_outputs);
+    const schema_json: []u8 = if (src.stats.schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.schema_json);
+    errdefer if (schema_json.len != 0) alloc.free(schema_json);
+    const read_schema_json: []u8 = if (src.stats.read_schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.read_schema_json);
+    errdefer if (read_schema_json.len != 0) alloc.free(read_schema_json);
+    const indexes_json: []u8 = if (src.stats.indexes_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.indexes_json);
+    errdefer if (indexes_json.len != 0) alloc.free(indexes_json);
+
     return .{
         .namespace = namespace,
         .version = src.version,
         .built_at_ns = src.built_at_ns,
         .wal_start_lsn = src.wal_start_lsn,
         .wal_end_lsn = src.wal_end_lsn,
+        .publication_lineage_tracked = src.publication_lineage_tracked,
+        .publication_parent_version = src.publication_parent_version,
+        .publication_fencing_token = src.publication_fencing_token,
         .base_source = base_source_copy,
         .stats = .{
             .document_count = src.stats.document_count,
@@ -154,18 +193,12 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
             .vector_segment_count = src.stats.vector_segment_count,
             .sparse_segment_count = src.stats.sparse_segment_count,
             .graph_segment_count = src.stats.graph_segment_count,
-            .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
-                alloc,
-                src.stats.published_search_sources,
-            ),
-            .derived_outputs = try search_sources.cloneMaterializedDerivedOutputsAlloc(
-                alloc,
-                src.stats.derived_outputs,
-            ),
+            .published_search_sources = published_sources,
+            .derived_outputs = derived_outputs,
             .policy = src.stats.policy,
-            .schema_json = if (src.stats.schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.schema_json),
-            .read_schema_json = if (src.stats.read_schema_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.read_schema_json),
-            .indexes_json = if (src.stats.indexes_json.len == 0) &.{} else try alloc.dupe(u8, src.stats.indexes_json),
+            .schema_json = schema_json,
+            .read_schema_json = read_schema_json,
+            .indexes_json = indexes_json,
         },
         .artifacts = artifacts,
     };

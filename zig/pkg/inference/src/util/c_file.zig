@@ -20,17 +20,16 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 
-pub const link_libc = build_options.link_libc;
+pub const link_libc = builtin.link_libc;
 
 /// This advisory-I/O implementation is currently enabled only on Linux;
 /// Darwin does not export `posix_fadvise`. Keep capability selection in one
 /// compile-time constant so another libc target cannot accidentally retain an
 /// unresolved reference.
-pub const supports_posix_file_advice = build_options.link_libc and builtin.os.tag == .linux;
+pub const supports_posix_file_advice = builtin.link_libc and builtin.os.tag == .linux;
 
-pub const c = if (build_options.link_libc) PosixC else struct {};
+pub const c = if (builtin.link_libc) PosixC else struct {};
 
 const PosixC = struct {
     pub const DIR = std.c.DIR;
@@ -233,7 +232,7 @@ pub const MmapRegion = struct {
 };
 
 pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []const u8) !MmapRegion {
-    if (!comptime build_options.link_libc) return error.UnsupportedPlatform;
+    if (!comptime builtin.link_libc) return error.UnsupportedPlatform;
     if (bytes.len == 0) return error.EmptyFile;
 
     const nonce = mmap_temp_counter.fetchAdd(1, .monotonic);
@@ -500,6 +499,7 @@ pub const FilePrefetchResult = struct {
 /// server startup prefetch, where CUDA admission happens later and consumes
 /// the warmed pages through the normal validated loader.
 pub fn prefetchFile(
+    io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     requested_workers: u8,
@@ -513,7 +513,10 @@ pub fn prefetchFile(
     const file_size = try fileSizeFromFd(fd);
     if (file_size == 0) return .{ .bytes = 0, .workers = @intCast(workers) };
     _ = c.posix_fadvise(fd, 0, @intCast(file_size), c.POSIX_FADV_WILLNEED);
+    return prefetchFileContents(io, allocator, fd, file_size, workers);
+}
 
+fn prefetchFileContents(io: std.Io, allocator: std.mem.Allocator, fd: std.posix.fd_t, file_size: u64, workers: usize) !FilePrefetchResult {
     const Worker = struct {
         fd: std.posix.fd_t,
         start: u64,
@@ -557,21 +560,17 @@ pub fn prefetchFile(
 
     const states = try allocator.alloc(Worker, workers);
     defer allocator.free(states);
-    const threads = try allocator.alloc(std.Thread, workers);
-    defer allocator.free(threads);
-    var spawned: usize = 0;
-    defer for (threads[0..spawned]) |thread| thread.join();
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
     for (states, 0..) |*state, index| {
         const start = (@as(u64, file_size) * @as(u64, @intCast(index))) /
             @as(u64, @intCast(workers));
         const end = (@as(u64, file_size) * @as(u64, @intCast(index + 1))) /
             @as(u64, @intCast(workers));
         state.* = .{ .fd = fd, .start = start, .end = end };
-        threads[index] = try std.Thread.spawn(.{}, Worker.run, .{state});
-        spawned += 1;
+        group.async(io, Worker.run, .{state});
     }
-    for (threads[0..spawned]) |thread| thread.join();
-    spawned = 0;
+    try group.await(io);
 
     var total: u64 = 0;
     for (states) |state| {
@@ -659,7 +658,7 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
                 else => return error.StatFailed,
             }
         }
-    } else if (comptime build_options.link_libc) {
+    } else if (comptime builtin.link_libc) {
         var stat_buf: c.struct_stat = undefined;
         if (c.fstat(fd, &stat_buf) != 0) return error.StatFailed;
         return @intCast(statSize(stat_buf));
@@ -686,7 +685,7 @@ fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
 }
 
 fn closeFd(fd: std.posix.fd_t) void {
-    if (comptime build_options.link_libc) {
+    if (comptime builtin.link_libc) {
         _ = c.close(fd);
     } else {
         _ = std.posix.system.close(fd);
@@ -706,7 +705,7 @@ fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
             }
         }
     }
-    if (comptime build_options.link_libc) {
+    if (comptime builtin.link_libc) {
         const n = c.pread(fd, buf.ptr, buf.len, @intCast(offset));
         if (n < 0) return error.ReadFailed;
         return @intCast(n);
@@ -718,7 +717,7 @@ fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
     var total: usize = 0;
     while (total < bytes.len) {
         const write_off = try std.math.add(u64, offset, total);
-        const n = if (comptime build_options.link_libc) blk: {
+        const n = if (comptime builtin.link_libc) blk: {
             const rc = c.pwrite(fd, bytes.ptr + total, bytes.len - total, @intCast(write_off));
             if (rc < 0) return error.WriteFailed;
             break :blk @as(usize, @intCast(rc));
@@ -741,7 +740,7 @@ fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
 }
 
 fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
-    if (comptime build_options.link_libc) {
+    if (comptime builtin.link_libc) {
         const c_advice: u32 = switch (advice) {
             .sequential => c.MADV_SEQUENTIAL,
             .random => c.MADV_RANDOM,
@@ -839,7 +838,7 @@ test "mmapTempCopy maps unlinked temp data" {
 }
 
 test "prefetchFile reads every byte with bounded workers" {
-    if (comptime !supports_posix_file_advice) return error.SkipZigTest;
+    if (comptime !link_libc or builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const path = try std.fmt.allocPrint(
         allocator,
@@ -855,7 +854,23 @@ test "prefetchFile reads every byte with bounded workers" {
     try file.writeStreamingAll(std.testing.io, payload);
     file.close(std.testing.io);
 
-    const result = try prefetchFile(allocator, path, 4);
-    try std.testing.expectEqual(@as(u64, payload.len), result.bytes);
-    try std.testing.expectEqual(@as(u8, 4), result.workers);
+    var inline_io = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        for ([_]u8{ 0, 4, 32 }) |workers| {
+            const result = if (comptime supports_posix_file_advice)
+                try prefetchFile(io, allocator, path, workers)
+            else blk: {
+                // Darwin lacks posix_fadvise but exercises the same bounded
+                // pread/group implementation through an already-open file.
+                const path_z = try allocator.dupeZ(u8, path);
+                defer allocator.free(path_z);
+                const fd = try openReadOnlyZ(path_z);
+                defer closeFd(fd);
+                break :blk try prefetchFileContents(io, allocator, fd, try fileSizeFromFd(fd), std.math.clamp(@as(usize, workers), 1, 8));
+            };
+            try std.testing.expectEqual(@as(u64, payload.len), result.bytes);
+            try std.testing.expectEqual(std.math.clamp(workers, 1, 8), result.workers);
+        }
+    }
 }

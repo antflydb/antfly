@@ -79,6 +79,7 @@ pub const RuntimeDocSetPlanningStatusReport = table_manager.RuntimeDocSetPlannin
 pub const RuntimeIndexStatusReport = table_manager.RuntimeIndexStatusReport;
 pub const RuntimeEmbeddingActivityStatusReport = table_manager.RuntimeEmbeddingActivityStatusReport;
 pub const IndexRepairStatus = table_manager.IndexRepairStatus;
+pub const DenseNativeStoragePhase = table_manager.DenseNativeStoragePhase;
 pub const SchemaProgressRecord = table_manager.SchemaProgressRecord;
 pub const RestoreProgressRecord = table_manager.RestoreProgressRecord;
 pub const ReplicationSourceStatusRecord = table_manager.ReplicationSourceStatusRecord;
@@ -138,6 +139,7 @@ pub const TransitionStepResult = transition_driver.StepResult;
 pub const TransitionDriver = transition_driver.TransitionDriver;
 
 test "metadata module compiles" {
+    _ = runtime_status_protocol;
     _ = storage;
     _ = runtime;
     _ = api;

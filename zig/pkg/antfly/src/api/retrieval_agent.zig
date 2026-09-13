@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const connections_api = @import("connections.zig");
 const agent_tools = @import("agent_tools.zig");
 const ant_json = @import("antfly-json");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
@@ -588,12 +589,20 @@ fn failAgentResult(
     kind: enum { retrieval, generation },
 ) !EncodedResponse {
     if (format == .json) return err;
+    if (err == error.GenerationCapacityUnavailable) {
+        const payload = connections_api.generationCapacityFailure();
+        try live.emitValue("error", payload);
+        return .{
+            .content_type = "text/event-stream",
+            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
+        };
+    }
     // Generation callbacks may originate in a separately compiled runtime.
     const name = if (kind == .generation) "GenerationFailed" else @errorName(err);
     try live.emitValue("error", .{ .@"error" = name });
     return .{
         .content_type = "text/event-stream",
-        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, name),
+        .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, .{ .@"error" = name }),
     };
 }
 
@@ -5884,11 +5893,11 @@ fn stepProgressPhase(
 
 fn encodeSseError(
     alloc: std.mem.Allocator,
-    message: []const u8,
+    payload: anytype,
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendSseEventValue(alloc, &out, "error", .{ .@"error" = message });
+    try appendSseEventValue(alloc, &out, "error", payload);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -6014,14 +6023,8 @@ fn buildMandatoryPredicates(
             predicates.filter_query = try combineMandatoryPredicate(alloc, predicates.filter_query, constraints.filter, "conjuncts");
             predicates.exclusion_query = try combineMandatoryPredicate(alloc, predicates.exclusion_query, constraints.exclusion, "disjuncts");
         }
-        const filter_query = if (query.filter_query) |raw|
-            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-        else
-            null;
-        const exclusion_query = if (query.exclusion_query) |raw|
-            try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-        else
-            null;
+        const filter_query = try rawQueryValueLeaky(alloc, query.filter_query);
+        const exclusion_query = try rawQueryValueLeaky(alloc, query.exclusion_query);
         predicates.filter_query = try combineMandatoryPredicate(
             alloc,
             predicates.filter_query,
@@ -6146,14 +6149,8 @@ fn applyMandatoryPredicates(
     query_request: *QueryRequest,
     mandatory: MandatoryPredicates,
 ) !void {
-    const existing_filter = if (query_request.filter_query) |raw|
-        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-    else
-        null;
-    const existing_exclusion = if (query_request.exclusion_query) |raw|
-        try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{})
-    else
-        null;
+    const existing_filter = try rawQueryValueLeaky(alloc, query_request.filter_query);
+    const existing_exclusion = try rawQueryValueLeaky(alloc, query_request.exclusion_query);
     const combined_filter = try combineMandatoryPredicate(
         alloc,
         existing_filter,
@@ -6172,6 +6169,14 @@ fn applyMandatoryPredicates(
 
 fn rawQueryFromValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !metadata_openapi.RawQuery {
     return .{ .bytes = try std.json.Stringify.valueAlloc(alloc, value, .{}) };
+}
+
+fn rawQueryValueLeaky(
+    alloc: std.mem.Allocator,
+    raw: ?metadata_openapi.RawQuery,
+) !?std.json.Value {
+    const value = raw orelse return null;
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, value.bytes, .{});
 }
 
 fn combineMandatoryPredicate(
@@ -7192,8 +7197,8 @@ test "retrieval agent conjoins mandatory predicates with generated predicates" {
     defer declared.deinit();
 
     try applyMandatoryPredicates(arena_impl.allocator(), &generated.value, .{
-        .filter_query = if (declared.value.filter_query) |raw| try std.json.parseFromSliceLeaky(std.json.Value, arena_impl.allocator(), raw.bytes, .{}) else null,
-        .exclusion_query = if (declared.value.exclusion_query) |raw| try std.json.parseFromSliceLeaky(std.json.Value, arena_impl.allocator(), raw.bytes, .{}) else null,
+        .filter_query = try rawQueryValueLeaky(arena_impl.allocator(), declared.value.filter_query),
+        .exclusion_query = try rawQueryValueLeaky(arena_impl.allocator(), declared.value.exclusion_query),
     });
     const encoded = try std.json.Stringify.valueAlloc(alloc, generated.value, .{});
     defer alloc.free(encoded);
@@ -9774,6 +9779,66 @@ test "retrieval agent sse uses a stable generation failure name" {
         "{\"error\":\"GenerationFailed\"}",
         firstSseEventData(events, "error").?,
     );
+}
+
+test "retrieval agent sse preserves retryable inference capacity" {
+    const FakeRunner = struct {
+        fn iface() QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FailingGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.GenerationCapacityUnavailable;
+        }
+    };
+
+    const body =
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local-generator"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:alpha"},"limit":5}]}
+    ;
+    const encoded = try execute(std.testing.allocator, FakeRunner.iface(), FailingGeneration.iface(), body);
+    defer std.testing.allocator.free(encoded.body);
+    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
+    try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"GenerationCapacityUnavailable\",\"message\":\"inference capacity temporarily unavailable\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}",
+        firstSseEventData(events, "error").?,
+    );
+
+    var transcript = SseTranscript{};
+    defer transcript.bytes.deinit(std.testing.allocator);
+    const streamed = try executeWithEventSink(std.testing.allocator, FakeRunner.iface(), FailingGeneration.iface(), body, .{
+        .ptr = &transcript,
+        .emit_json_fn = SseTranscript.emit,
+    });
+    defer std.testing.allocator.free(streamed.body);
+    try std.testing.expectEqual(@as(usize, 0), streamed.body.len);
+    const live_events = try parseSseEventsAlloc(std.testing.allocator, transcript.bytes.items);
+    defer std.testing.allocator.free(live_events);
+    try std.testing.expectEqual(@as(usize, 0), countSseEvents(live_events, "done"));
+    try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(live_events, "error").?);
 }
 
 test "retrieval agent sse emits followup events" {

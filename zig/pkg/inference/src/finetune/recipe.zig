@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 
 const grpo = @import("grpo.zig");
@@ -31,11 +32,12 @@ const reranker_head = @import("reranker_head.zig");
 const reranker_lora = @import("reranker_lora.zig");
 const reranker = @import("reranker.zig");
 const preference_harness = @import("preference_harness.zig");
-const train_eval_gemma4_lora_bundle = @import("train/train_eval_gemma4_lora_bundle.zig");
-const train_eval_layoutlmv3_lora_sequence = @import("train/train_eval_layoutlmv3_lora_sequence.zig");
-const train_eval_layoutlmv3_lora_token = @import("train/train_eval_layoutlmv3_lora_token.zig");
-const train_eval_colqwen2_lora_bundle = @import("train/train_eval_colqwen2_lora_bundle.zig");
-const train_eval_reranker_lora_top_layer_cached_surrogate = @import("train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
+const runners = @import("runners.zig");
+const train_eval_gemma4_lora_bundle = runners.train_eval_gemma4_lora_bundle;
+const train_eval_layoutlmv3_lora_sequence = runners.train_eval_layoutlmv3_lora_sequence;
+const train_eval_layoutlmv3_lora_token = runners.train_eval_layoutlmv3_lora_token;
+const train_eval_colqwen2_lora_bundle = runners.train_eval_colqwen2_lora_bundle;
+const train_eval_reranker_lora_top_layer_cached_surrogate = runners.train_eval_reranker_lora_top_layer_cached_surrogate;
 const generation = @import("../pipelines/generation.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const backends = @import("../backends/backends.zig");
@@ -2243,7 +2245,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
         .backend = .{
             .requested = recipe.backend,
             .build = .{
-                .inference_version = build_options.inference_version,
+                .inference_version = build_info.version(),
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
                 .enable_mlx = false,

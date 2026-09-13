@@ -994,9 +994,16 @@ pub fn loadFromPathWithSecrets(
     path: []const u8,
     secret_store: ?*secrets.FileStore,
 ) !Config {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    return loadFromPathWithSecretsWithIo(alloc, std.Options.debug_io, path, secret_store);
+}
+
+pub fn loadFromPathWithSecretsWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    secret_store: ?*secrets.FileStore,
+) !Config {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
     return try Config.parseFromSliceWithSecrets(alloc, raw, secret_store);
 }
@@ -1007,9 +1014,17 @@ pub fn loadFromPathWithSecretsForDeployment(
     secret_store: ?*secrets.FileStore,
     deployment_mode: DeploymentMode,
 ) !Config {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
+    return loadFromPathWithSecretsForDeploymentWithIo(alloc, std.Options.debug_io, path, secret_store, deployment_mode);
+}
+
+pub fn loadFromPathWithSecretsForDeploymentWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    secret_store: ?*secrets.FileStore,
+    deployment_mode: DeploymentMode,
+) !Config {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
     return try Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode);
 }
@@ -2069,7 +2084,8 @@ fn promptCacheFromOpenApi(
         .ttl_ms = ttl_ms,
     };
 }
-fn parseInferencePreloadModels(
+// Shared by unified configuration and the standalone inference CLI loader.
+pub fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
 ) ![]Config.InferenceConfig.WarmModelConfig {
@@ -2093,20 +2109,23 @@ fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
-        out[i] = .{
-            .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
-            .name = try requiredStringFieldDup(alloc, model_object, "name"),
-            .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
-            .format = try optionalStringFieldDup(alloc, model_object, "format"),
-            .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
-            .residency_mode = try optionalEnumField(
-                Config.InferenceConfig.WarmModelConfig.ResidencyMode,
-                model_object,
-                "residency_mode",
-            ),
-            .memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb"),
-        };
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+            return error.InvalidConfig;
+        // Include the partially parsed entry in error cleanup as soon as any
+        // owned fields can be allocated (e.g. a missing name after kind).
+        out[i] = .{ .kind = &.{}, .name = &.{} };
         filled = i + 1;
+        out[i].kind = try requiredStringFieldDup(alloc, model_object, "kind");
+        out[i].name = try requiredStringFieldDup(alloc, model_object, "name");
+        out[i].backend = try optionalStringFieldDup(alloc, model_object, "backend");
+        out[i].format = try optionalStringFieldDup(alloc, model_object, "format");
+        out[i].quantization = try optionalStringFieldDup(alloc, model_object, "quantization");
+        out[i].residency_mode = try optionalEnumField(
+            Config.InferenceConfig.WarmModelConfig.ResidencyMode,
+            model_object,
+            "residency_mode",
+        );
+        out[i].memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb");
     }
     return out;
 }
@@ -2259,7 +2278,7 @@ test "common config parses provider maps" {
         \\    "embedder": { "provider": "antfly" }
         \\  },
         \\  "rerankers": {
-        \\    "reranker": { "provider": "antfly", "field": "body" }
+        \\    "reranker": { "provider": "antfly", "model": "local-reranker", "field": "body" }
         \\  },
         \\  "chunkers": {
         \\    "fixed": { "provider": "antfly" }
@@ -2468,6 +2487,24 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects model-specific and unknown preload tuning fields" {
+    const fields = .{
+        .{ "load_strategy", "\"pipeline\"" },
+        .{ "load_workers", "6" },
+        .{ "load_staging_mb", "384" },
+        .{ "prepared_pack", "\"required\"" },
+        .{ "drop_host_cache_after_load", "true" },
+        .{ "startup_strategy", "\"prefetch\"" },
+        .{ "prepared_pak", "\"required\"" },
+    };
+    inline for (fields) |field| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(
+            std.testing.allocator,
+            "{\"inference\":{\"preload\":[{\"kind\":\"generator\",\"name\":\"gemma-a4b\",\"" ++ field[0] ++ "\":" ++ field[1] ++ "}]}}",
+        ));
+    }
 }
 
 test "common config rejects invalid prompt cache policy" {

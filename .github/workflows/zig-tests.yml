@@ -113,9 +113,28 @@ jobs:
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/check_zig_checksum_usage.py \
+            scripts/ci/test_check_zig_checksum_usage.py \
             scripts/ci/toolchain-policy.json \
             .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
+            scripts/run_db_query_matrix.py \
+            scripts/test_run_db_query_matrix.py \
+            scripts/test_conformance_fixtures.py \
+            ':(glob)specs/openapi/**' \
+            openapi.yaml \
+            scripts/join_openapi.py \
+            scripts/join_public_openapi.py \
+            scripts/openapi_joiner.py \
+            scripts/openapi_inputs.py \
+            scripts/public_openapi_overlays.py \
+            scripts/yaml_to_json.py \
+            scripts/generate_graph_identifier_policy.py \
+            scripts/generate_mcp_schema_fragments.py \
+            scripts/pyproject.toml \
+            scripts/uv.lock \
+            scripts/ci/test_zig_validation_scope.py \
+            ':(glob)scripts/bench/pdf/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -130,6 +149,11 @@ jobs:
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
             scripts/ci/toolchain-policy.json \
+            ':(glob)go/pkg/operator/**' \
+            ':(glob)go/pkg/sdk/admin/**' \
+            go/pkg/sdk/go.mod \
+            go/pkg/sdk/go.sum \
+            ':(glob)specs/openapi/**' \
             .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
@@ -144,6 +168,11 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
@@ -177,6 +206,11 @@ jobs:
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             .github/workflows/zig-tests.yml
           then
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"
@@ -255,7 +289,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl xz-utils
+          sudo apt-get install -y ca-certificates curl xz-utils python3 make
           curl -fsSL \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
@@ -279,6 +313,14 @@ jobs:
           zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
 
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline ARM64 checksum runtime dispatch
+        run: |
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline -lc
+
   zig-base-tests:
     name: zig-base / x86_64
     needs: changes
@@ -288,6 +330,10 @@ jobs:
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
     timeout-minutes: 120
     env:
+      # ARC heavy pods have a 24 GiB limit but inject a 20 GiB default.
+      # Admit the 22 GiB storage compile while leaving 2 GiB for the runner
+      # and build driver. Keep this scoped to the heavy build jobs.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -323,10 +369,34 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline checksum runtime dispatch
+        working-directory: zig
+        run: |
+          zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
+          zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
+
+      - name: Test native static-musl process execution
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build lib-platform-test -Dtarget=x86_64-linux-musl --summary all 2>&1 | tee "$RUNNER_TEMP/platform-musl.log"
+          # A successful aggregate could hide a skipped process check.
+          grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
+
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Test bounded-build tooling
+      - name: Compile consolidated storage benchmark contracts
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: zig build antfly-storage-bench -Doptimize=Debug
+
+      # Keep inexpensive tooling checks beside the normal unit gate. The
+      # isolated compilation/cache matrix runs in zig-full / build-cache.
+      - name: Test build tooling
         working-directory: zig
         run: >-
           python3 -m unittest
@@ -336,10 +406,21 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+          tools/test_sync_generated.py
 
-      - name: Check inference kernel generator
-        working-directory: zig/pkg/inference
-        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+
+      - name: Check inference kernels through the root build graph
+        working-directory: zig
+        run: >-
+          zig build inference-test -Dmetal=false -Dcuda=false --
+          --test-filter "quant kernel compiler"
+          --test-filter "metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
@@ -372,11 +453,11 @@ jobs:
         run: python3 scripts/packaging/test_reproducible_tar.py
 
       # ARC may expose the shared node's memory total when the runner cgroup is
-      # unlimited. Cap the aggregate scheduler budget at 20 GiB so concurrent
+      # unlimited. Cap the aggregate scheduler budget at 22 GiB so concurrent
       # test runtimes cannot overcommit the runner while still admitting the
-      # largest individual compile step, which reserves 20 GiB. The patched
-      # 0.16 runner correctly reserves each ready step's max_rss claim as it
-      # wakes it.
+      # largest individual compile step, which reserves 22 GiB. The explicit
+      # heavy-job budget above leaves 2 GiB of pod headroom. The patched 0.16
+      # runner correctly reserves each ready step's max_rss claim as it wakes it.
       - name: Configure bounded parallel unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         id: cpus
@@ -384,7 +465,7 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 23622320128)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -506,7 +587,10 @@ jobs:
             # 15 minutes on the x86_64 ARC runner. Keep the idle watchdog below
             # the independent hard limit without killing an active cold build.
             idle_limit_secs="${ANTFLY_UNIT_WATCHDOG_IDLE_SECS:-1800}"
-            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-3600}"
+            # PR #716's DB-core execution started 52 minutes into the combined
+            # build/test step and was still progressing at the old 60m limit.
+            # Allow 90m total, retaining the 30m idle and 120m outer job limits.
+            hard_limit_secs="${ANTFLY_UNIT_WATCHDOG_HARD_SECS:-5400}"
             start_epoch="$(date +%s)"
             last_progress_epoch="$start_epoch"
             last_mtime=0
@@ -578,6 +662,8 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
+      # Same 22 GiB build budget / 2 GiB runner headroom as zig-base-tests.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -615,7 +701,9 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      - name: Test bounded-build tooling
+      # Keep inexpensive tooling checks beside the normal unit gate. The
+      # isolated compilation/cache matrix runs in zig-full / build-cache.
+      - name: Test build tooling
         working-directory: zig
         run: >-
           python3 -m unittest
@@ -625,16 +713,24 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+          tools/test_sync_generated.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
-      # memory to the pod's cgroup budget.
+      # memory to the pod's cgroup budget and the 22 GiB largest-step claim.
       - name: Configure bounded parallel heavy tests
         id: cpus
         run: |
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
-          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 21474836480)" >> "$GITHUB_OUTPUT"
+          echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 23622320128)" >> "$GITHUB_OUTPUT"
           zig_lib_dir="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\(.*\)",$/\1/p')"
           patched_runner="${RUNNER_TEMP}/zig-build-runner-maxrss.zig"
           python3 zig/tools/patch_zig_0_16_build_runner_maxrss.py \
@@ -642,7 +738,7 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
-      - name: Run full Zig unit tests
+      - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
@@ -665,7 +761,7 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           release-scale-test
-          recall-harness-build
+          recall-harness
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -681,12 +777,12 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
-      - name: Run Zig simulation tests
+      - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          sim-test
+          vopr-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -695,7 +791,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          integration-test
+          antfly-integration-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -704,7 +800,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          recall-ci-test
+          antfly-recall-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -713,9 +809,50 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          chaos-test
+          antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+  zig-build-cache-tests:
+    name: zig-full / build-cache
+    needs: changes
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 60
+    env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
+      - name: Prepare ARC Zig cache dirs
+        run: mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+      # Each test owns its temporary source overlay and local cache. Keep
+      # those isolated; only the normal global dependency cache is shared.
+      # Verbose output identifies the individual checks in the CI log.
+      - name: Test runtime compilation and cache contracts
+        working-directory: zig
+        run: python3 -u -m unittest -v tools/test_runtime_cache.py
 
   zig-base:
     name: zig-base
@@ -744,7 +881,7 @@ jobs:
 
   zig-full:
     name: zig-full
-    needs: [changes, zig-full-tests, arm64-codec]
+    needs: [changes, zig-full-tests, zig-build-cache-tests, arm64-codec]
     if: |
       always() &&
       (
@@ -759,11 +896,13 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-full-tests.result }}
+          BUILD_CACHE_RESULT: ${{ needs.zig-build-cache-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
+          test "$BUILD_CACHE_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
 
   e2e-base-build:
@@ -773,6 +912,9 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
+      # pod still has 2 GiB outside the aggregate compiler reservation.
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       ANTFLY_CI_TRACE: "1"
@@ -897,11 +1039,44 @@ jobs:
       - name: Install E2E executable
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
+      - name: Set up Go for operator runtime contract
+        if: matrix.suite == 'inference'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+
+      # Execute the SAME reconciler-generated contract as the operator job's
+      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
+      - name: Test generated inference command against candidate runtime
+        if: matrix.suite == 'inference'
+        working-directory: go/pkg/operator
+        env:
+          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+          GOWORK: 'off'
+          GOEXPERIMENT: simd
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
+          -tags runtimeintegration ./controllers/inference
+          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+
+      - name: Run inference config contract with a real CPU model
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/inference-config-models
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          UV_PROJECT_ENVIRONMENT: /tmp/antfly-ci-venv/inference
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q
+          e2e/inference/test_run_config.py
 
       - name: Run low-FD HTTP worker ratchet regression
         if: matrix.suite == 'antfly'
@@ -952,6 +1127,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
+      ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       # Keep production optimization while preserving runtime-safety checks and

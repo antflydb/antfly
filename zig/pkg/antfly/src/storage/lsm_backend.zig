@@ -26,6 +26,11 @@ const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
 const runtime_mod = @import("lsm_backend/runtime.zig");
+const run_directory_mod = @import("lsm_backend/run_directory.zig");
+const RunDirectory = run_directory_mod.Directory;
+const run_store_mod = @import("lsm_backend/run_store.zig");
+const RunStore = run_store_mod.Store;
+const output_cleanup = @import("lsm_backend/output_cleanup.zig");
 const compaction_mod = @import("lsm_backend/compaction.zig");
 const compaction_scheduler_mod = @import("lsm_backend/compaction_scheduler.zig");
 const background_runtime_mod = @import("background_runtime.zig");
@@ -40,6 +45,10 @@ const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("../common/fs_paths.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const native_artifact_sink = @import("native_artifact_sink.zig");
+
+comptime {
+    if (builtin.is_test) _ = @import("lsm_backend/physical_usage_test.zig");
+}
 
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
@@ -114,52 +123,41 @@ else
         }
     };
 
-const ObsoletePathRef = struct {
-    path: []u8,
-    count: u64,
-};
+var file_pin_release_epoch: std.atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    refs: std.ArrayListUnmanaged(ObsoletePathRef) = .empty,
+    refs: std.StringHashMapUnmanaged(u64) = .empty,
 
     fn retain(self: *ObsoletePathRefRegistry, path: []const u8) !void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        for (self.refs.items) |*ref| {
-            if (!std.mem.eql(u8, ref.path, path)) continue;
-            ref.count +|= 1;
+        if (self.refs.getPtr(path)) |count| {
+            count.* +|= 1;
             return;
         }
         const owned = try std.heap.page_allocator.dupe(u8, path);
         errdefer std.heap.page_allocator.free(owned);
-        try self.refs.append(std.heap.page_allocator, .{ .path = owned, .count = 1 });
+        try self.refs.put(std.heap.page_allocator, owned, 1);
     }
 
     fn release(self: *ObsoletePathRefRegistry, path: []const u8) void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        var i: usize = 0;
-        while (i < self.refs.items.len) : (i += 1) {
-            const ref = &self.refs.items[i];
-            if (!std.mem.eql(u8, ref.path, path)) continue;
-            if (ref.count > 1) {
-                ref.count -= 1;
-                return;
-            }
-            std.heap.page_allocator.free(ref.path);
-            _ = self.refs.swapRemove(i);
+        const count = self.refs.getPtr(path) orelse return;
+        if (count.* > 1) {
+            count.* -= 1;
             return;
         }
+        const removed = self.refs.fetchRemove(path).?;
+        std.heap.page_allocator.free(removed.key);
+        _ = file_pin_release_epoch.fetchAdd(1, .release);
     }
 
     fn isRetained(self: *ObsoletePathRefRegistry, path: []const u8) bool {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        for (self.refs.items) |ref| {
-            if (std.mem.eql(u8, ref.path, path) and ref.count > 0) return true;
-        }
-        return false;
+        return self.refs.contains(path);
     }
 };
 
@@ -190,7 +188,10 @@ const RunSnapshotRefRegistry = struct {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
         const count = self.refs.getPtr(path) orelse return;
-        if (count.* > 0) count.* -= 1;
+        if (count.* > 0) {
+            count.* -= 1;
+            if (count.* == 0) _ = file_pin_release_epoch.fetchAdd(1, .release);
+        }
     }
 
     fn isRetained(self: *RunSnapshotRefRegistry, path: []const u8) bool {
@@ -343,6 +344,8 @@ fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
 }
 
 pub const Options = struct {
+    /// Backend-owned internal cleanup sink; reset on every open/init.
+    unpublished_outputs: ?*output_cleanup.Queue = null,
     backend: backend_types.OpenOptions = .{},
     flush_threshold: usize = 8,
     flush_threshold_bytes: u64 = 0,
@@ -361,6 +364,10 @@ pub const Options = struct {
     recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
+    // Optional lower logical-byte floor for already-coalesced direct bulk
+    // transactions. Zero preserves the ordinary base flush threshold. This is
+    // intentionally independent of the larger mutable bulk flush multiplier.
+    direct_bulk_ingest_min_bytes: u64 = 0,
     compact_threshold_runs: usize = 4,
     l0_overlap_compact_threshold_runs: usize = 4,
     l0_soft_limit_runs: usize = 0,
@@ -378,15 +385,47 @@ pub const Options = struct {
     // generations to accumulate when background flush falls behind.
     max_deferred_immutable_bytes: u64 = 0,
     background_maintenance_max_steps: usize = 64,
+    manifest_publication_max_waiters: usize = 64,
+    // Aggregate logical bytes held by admitted commits, including writers
+    // waiting for SST/manifest durability. Admission precedes any WAL append.
+    manifest_commit_backlog_bytes: u64 = 256 * 1024 * 1024,
+    // Coalesce adjacent sorted immutable epochs into one streaming flush
+    // publication up to this logical-byte window. Already-sorted bulk commits
+    // may enter the same WAL-backed queue without first writing a short-lived
+    // L0 file. Zero preserves one epoch per publication and direct bulk ingest.
+    // The merge borrows the epoch arenas and does not build a second combined
+    // memtable.
+    immutable_flush_window_bytes: u64 = 0,
+    immutable_flush_window_max_memtables: usize = 16,
     direct_bulk_ingest: bool = true,
+    // Optional size-tiered L0 merge fan-in for sustained sorted publication.
+    // Zero disables it. The tier lane streams equal-sized publication
+    // generations without repeatedly rewriting the overlapping lower level.
+    bulk_ingest_tiered_l0_fan_in: usize = 0,
+    // Seal fragmented L0 generations once their bytes reach 1/N of all
+    // lower-level bytes. Zero disables ratio sealing. The seal remains in L0,
+    // excludes the largest established anchor, and must be at least twice its
+    // largest input generation, so small deltas cannot rewrite prior tiers or
+    // the lower base.
+    bulk_ingest_l0_delta_seal_ratio_denominator: usize = 0,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 1024 * 1024,
     level_target_bytes_multiplier: usize = 8,
     max_compaction_input_bytes: u64 = 0,
     max_compaction_input_allow_oversized_single_job: bool = true,
+    // Standalone GC waits for this percentage of the largest input's key
+    // count in tombstones. Summing all versions would strand deleted keys
+    // behind duplicate older values. Ordinary compaction reclaims eagerly.
+    tombstone_gc_min_percent: u8 = 50,
+    /// Sparse/skewed deletes must eventually advance even below density debt.
+    /// Age is persisted in the manifest and survives compaction and reopen.
+    tombstone_gc_max_age_ns: u64 = std.time.ns_per_hour,
+    tombstone_gc_max_input_bytes: u64 = 2 * 1024 * 1024 * 1024,
     // Preferred logical payload target used to shape runs.
     max_run_file_bytes: usize = 512 * 1024 * 1024,
+    /// Internal/output shaping cap; zero uses only byte and domain bounds.
+    max_run_file_entries: usize = 0,
     // Hard physical publication bound. Keep this no larger than the reader
     // allocation cap; tests and embedded users may lower it independently of
     // the logical target to exercise encoded-size admission.
@@ -394,6 +433,12 @@ pub const Options = struct {
     /// Finish a run when the namespace or the first N key bytes change. This
     /// only controls run layout; the persisted table-file format is unchanged.
     run_partition_prefix_bytes: usize = 0,
+    /// Optional family-aware partition identity. Pure, allocation-free, and
+    /// stable for the backend lifetime. Each identity must describe one
+    /// contiguous key interval. Controls both SST boundaries and independent
+    /// compaction input domains, never entry ordering or the persisted format.
+    /// Namespace isolation still applies. Overrides the fixed prefix.
+    run_partition_key: ?*const fn ([]const u8) []const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -406,7 +451,12 @@ pub const Options = struct {
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,
-    max_concurrent_point_block_reads: usize = 4,
+    max_concurrent_point_block_reads: usize = 16,
+    // Share sparse point-read fan-out across concurrent batches. This keeps
+    // single-query cold latency low without allowing N public queries to each
+    // issue the full per-batch width. Zero leaves the per-batch limit as the
+    // only bound.
+    target_aggregate_concurrent_point_block_reads: usize = 64,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     background_executor: ?*const BackgroundExecutor = null,
     maintenance_waker: ?MaintenanceWaker = null,
@@ -434,7 +484,8 @@ pub const Options = struct {
     root_generation: u64 = 0,
     obsolete_retention_ns: u64 = 250 * std.time.ns_per_ms,
     obsolete_delete_retry_ns: u64 = 250 * std.time.ns_per_ms,
-    read_snapshot_rotate_mutable_bytes: u64 = 256 * 1024,
+    // Root-pinned ordered snapshots need no read-triggered flush by default.
+    read_snapshot_rotate_mutable_bytes: u64 = 0,
     // Per-scan cap; 0 disables bulk current-scan mutable cloning.
     bulk_ingest_current_scan_clone_max_bytes: u64 = 256 * 1024 * 1024,
     // Aggregate active clone cap; 0 leaves aggregate admission uncapped.
@@ -462,6 +513,8 @@ pub const IoRuntime = storage_io.RuntimeKind;
 pub const Storage = storage_io.Storage;
 pub const HostStorage = storage_io.HostStorage;
 pub const NativeStorageStats = storage_io.NativeStorageStats;
+pub const NativeStorage = storage_io.NativeStorage;
+pub const NativeStorageLease = storage_io.NativeStorage.Lease;
 pub const Cache = cache_mod.Cache;
 pub const CacheStats = cache_mod.Stats;
 pub const CacheKindStats = cache_mod.KindStats;
@@ -471,6 +524,9 @@ pub const BackgroundExecutor = lsm_background_mod.Executor;
 pub const BackendHandleConfig = struct {
     background_runtime: ?background_runtime_mod.Config = null,
     internal_flush_worker: bool = false,
+    /// Borrowed scheduling capacity for internal maintenance. Must outlive
+    /// this handle; otherwise use its owned backend runtime or a one-task Io.
+    maintenance_io: ?std.Io = null,
 };
 const max_local_cached_run_blocks: usize = 64;
 const root_writer_lock_file_name = "writer.lock";
@@ -608,6 +664,11 @@ fn walOperationLockPathAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
 }
 
 pub const Backend = struct {
+    const ReclaimingMemory = struct {
+        next: ?*ReclaimingMemory,
+        versions: ?*runtime_mod.ReadVersion = null,
+    };
+    pub var test_deep_mutable_snapshots: bool = false;
     pub const OpenPhase = enum {
         idle,
         initializing_storage,
@@ -708,10 +769,22 @@ pub const Backend = struct {
         sorted_ingest_runs: u64 = 0,
         sorted_ingest_bytes: u64 = 0,
         sorted_ingest_ns: u64 = 0,
+        compactions: u64 = 0,
+        compaction_input_bytes: u64 = 0,
+        compaction_output_bytes: u64 = 0,
         compaction_ns: u64 = 0,
+        compaction_max_input_bytes: u64 = 0,
+        compaction_max_output_bytes: u64 = 0,
+        compaction_max_ns: u64 = 0,
         manifest_writes: u64 = 0,
+        manifest_checkpoints: u64 = 0,
+        manifest_edits: u64 = 0,
         manifest_bytes: u64 = 0,
         manifest_ns: u64 = 0,
+        manifest_publication_waits: u64 = 0,
+        manifest_publication_wait_ns: u64 = 0,
+        manifest_publication_coalesced: u64 = 0,
+        manifest_io_unlocked_ns: u64 = 0,
         write_pressure_events: u64 = 0,
         write_pressure_compactions: u64 = 0,
         write_pressure_compaction_steps: u64 = 0,
@@ -750,6 +823,7 @@ pub const Backend = struct {
         wal_reset_ns: u64 = 0,
         immutable_rotations: u64 = 0,
         immutable_flushes: u64 = 0,
+        immutable_flush_input_memtables: u64 = 0,
         immutable_flush_entries: u64 = 0,
         immutable_flush_ns: u64 = 0,
         bulk_append_attempts: u64 = 0,
@@ -774,6 +848,15 @@ pub const Backend = struct {
     };
 
     pub const MaintenanceStats = struct {
+        read_version_builds: u64 = 0,
+        domain_index_builds: u64 = 0,
+        tombstone_entries: u64 = 0,
+        unknown_tombstone_runs: u64 = 0,
+        tombstone_reconcile_rows: u64 = 0,
+        tombstone_reconcile_completed: u64 = 0,
+        tombstone_reconcile_failures: u64 = 0,
+        bulk_planning_jobs: u64 = 0,
+        read_version_pins: u64 = 0,
         mutable_entries: u64 = 0,
         mutable_bytes: u64 = 0,
         mutable_snapshot_clone_calls: u64 = 0,
@@ -825,6 +908,17 @@ pub const Backend = struct {
         obsolete_paths_reclaimable: u64 = 0,
         obsolete_delete_failures: u64 = 0,
         obsolete_delete_retries: u64 = 0,
+        unpublished_output_cleanup_pending: u64 = 0,
+        unpublished_output_cleanup_bytes: u64 = 0,
+        unpublished_output_cleanup_admission_failures: u64 = 0,
+        ledger_reclaim_pending: u64 = 0,
+        ledger_reclaim_slices: u64 = 0,
+        ledger_reclaim_units: u64 = 0,
+        ledger_reclaim_max_slice_ns: u64 = 0,
+        memtable_reclaim_pending: u64 = 0,
+        memtable_reclaim_slices: u64 = 0,
+        memtable_reclaim_units: u64 = 0,
+        memtable_reclaim_max_slice_ns: u64 = 0,
         active_readers: u64 = 0,
         active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
@@ -879,6 +973,15 @@ pub const Backend = struct {
     };
 
     pub fn accumulateMaintenanceStats(dst: *MaintenanceStats, src: MaintenanceStats) void {
+        dst.read_version_builds +|= src.read_version_builds;
+        dst.domain_index_builds +|= src.domain_index_builds;
+        dst.tombstone_entries +|= src.tombstone_entries;
+        dst.unknown_tombstone_runs +|= src.unknown_tombstone_runs;
+        dst.tombstone_reconcile_rows +|= src.tombstone_reconcile_rows;
+        dst.tombstone_reconcile_completed +|= src.tombstone_reconcile_completed;
+        dst.tombstone_reconcile_failures +|= src.tombstone_reconcile_failures;
+        dst.bulk_planning_jobs +|= src.bulk_planning_jobs;
+        dst.read_version_pins +|= src.read_version_pins;
         dst.mutable_entries +|= src.mutable_entries;
         dst.mutable_bytes +|= src.mutable_bytes;
         dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
@@ -933,6 +1036,17 @@ pub const Backend = struct {
         dst.obsolete_paths_reclaimable +|= src.obsolete_paths_reclaimable;
         dst.obsolete_delete_failures +|= src.obsolete_delete_failures;
         dst.obsolete_delete_retries +|= src.obsolete_delete_retries;
+        dst.unpublished_output_cleanup_pending +|= src.unpublished_output_cleanup_pending;
+        dst.unpublished_output_cleanup_bytes +|= src.unpublished_output_cleanup_bytes;
+        dst.unpublished_output_cleanup_admission_failures +|= src.unpublished_output_cleanup_admission_failures;
+        dst.ledger_reclaim_pending +|= src.ledger_reclaim_pending;
+        dst.ledger_reclaim_slices +|= src.ledger_reclaim_slices;
+        dst.ledger_reclaim_units +|= src.ledger_reclaim_units;
+        dst.ledger_reclaim_max_slice_ns = @max(dst.ledger_reclaim_max_slice_ns, src.ledger_reclaim_max_slice_ns);
+        dst.memtable_reclaim_pending +|= src.memtable_reclaim_pending;
+        dst.memtable_reclaim_slices +|= src.memtable_reclaim_slices;
+        dst.memtable_reclaim_units +|= src.memtable_reclaim_units;
+        dst.memtable_reclaim_max_slice_ns = @max(dst.memtable_reclaim_max_slice_ns, src.memtable_reclaim_max_slice_ns);
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
@@ -1011,6 +1125,11 @@ pub const Backend = struct {
         inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
             if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
                 @field(dst, field.name) |= @field(src, field.name);
+            } else if (comptime std.mem.eql(u8, field.name, "compaction_max_input_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_output_bytes") or
+                std.mem.eql(u8, field.name, "compaction_max_ns"))
+            {
+                @field(dst, field.name) = @max(@field(dst, field.name), @field(src, field.name));
             } else {
                 @field(dst, field.name) +|= @field(src, field.name);
             }
@@ -1435,7 +1554,28 @@ pub const Backend = struct {
     };
 
     allocator: Allocator,
+    /// Opt-in gate shared by every graph-store view of this backend. Durable
+    /// roots already enforce a single open writer across processes/handles.
+    serialized_write_mutex: std.atomic.Mutex = .unlocked,
     mu: std.atomic.Mutex = .unlocked,
+    // Serialize off-lock planner construction without holding the writer lock.
+    domain_index_build_mu: std.Io.Mutex = .init,
+    domain_index_build_fallback_mu: std.atomic.Mutex = .unlocked,
+    manifest_publish_mu: std.Io.Mutex = .init,
+    manifest_publish_fallback_mu: std.atomic.Mutex = .unlocked,
+    manifest_publish_in_flight: bool = false,
+    manifest_publish_allow_concurrency: bool = false,
+    manifest_publish_waiters: usize = 0,
+    manifest_admitted_commits: usize = 0,
+    // A bulk WAL record whose in-memory/SST publication failed is replayable,
+    // but cannot be proved covered by this process's live run directory.
+    manifest_recovery_required: bool = false,
+    manifest_admitted_bytes: u64 = 0,
+    manifest_admitted_wire_bytes: u64 = 0,
+    manifest_unpublished_wire_bytes: u64 = 0,
+    manifest_pending_mutation_bytes: u64 = 0,
+    manifest_reserved_mutation_bytes: u64 = 0,
+    manifest_credit_reconciled: bool = false,
     // Cached score used by best-effort maintenance scheduling and metrics.
     // A value of 1 can still mean "known debt, exact score not refreshed yet".
     cached_maintenance_hint: CounterU64 = .init(1),
@@ -1455,16 +1595,34 @@ pub const Backend = struct {
     storage_owner: ?*storage_io.NativeStorage = null,
     storage: ?storage_io.Storage = null,
     manifest_backing: ?[]u8 = null,
+    recovered_manifest: ?@import("lsm_backend/manifest_replay.zig").RecoveryState = null,
+    obsolete_reclaim_after: ?[]u8 = null,
+    obsolete_reclaim_retry_at_ns: u64 = 0,
+    obsolete_reclaim_pin_epoch: u64 = 0,
+    obsolete_reclaim_visits: u64 = 0,
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     manifest_dirty: bool = false,
-    obsolete_paths: std.ArrayListUnmanaged(ObsoletePath) = .empty,
+    obsolete_paths: repository_mod.ObsoleteLedger = .empty,
+    active_ledger_reclamations: ?*@import("lsm_backend/ledger_reclamation.zig").Job = null,
+    ledger_snapshots: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    retired_ledger_snapshots: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    retired_ledger_tail: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    ledger_reclaim_in_flight: bool = false,
+    ledger_reclaim_slices: u64 = 0,
+    ledger_reclaim_units: u64 = 0,
+    ledger_reclaim_max_slice_ns: u64 = 0,
     obsolete_manifest_dirty: bool = false,
     obsolete_delete_failures: u64 = 0,
     obsolete_delete_retries: u64 = 0,
     obsolete_runs: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Run)) = .empty,
+    obsolete_run_list_cursor: usize = 0,
+    obsolete_run_cursor: usize = 0,
+    obsolete_run_count: usize = 0,
+    obsolete_run_drain_remaining: usize = 0,
+    obsolete_run_pin_epoch: u64 = 0,
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
@@ -1477,6 +1635,41 @@ pub const Backend = struct {
     immutable_flush_build_in_flight: bool = false,
     immutable_flush_completion: ImmutableFlushCompletion = .{},
     maintenance_job_in_flight: bool = false,
+    manifest_checkpoint_build_in_flight: bool = false,
+    manifest_checkpoint_build_id: ?u64 = null,
+    manifest_checkpoint_directory: ?*RunDirectory = null,
+    planner_seed: usize = 0,
+    directory_planning_in_flight: bool = false,
+    pending_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    pending_admissions: [3]?*compaction_mod.PendingAdmission = @splat(null),
+    retired_admissions: ?*compaction_mod.PendingAdmission = null,
+    admission_in_flight: bool = false,
+    admission_reclaim_in_flight: bool = false,
+    domain_admission_retry_after_ns: u64 = 0,
+    pending_bulk_plan: ?*compaction_mod.PendingBulkPlan = null,
+    active_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
+    retired_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
+    bulk_plan_in_flight: bool = false,
+    bulk_plan_reclaim_in_flight: bool = false,
+    bulk_plan_negative_generation: ?u64 = null,
+    bulk_plan_negative_policy: compaction_mod.BulkPolicy = .{},
+    pending_tombstone_reconcile: ?*compaction_mod.PendingTombstoneReconcile = null,
+    tombstone_reconcile_in_flight: bool = false,
+    tombstone_reconcile_after_rank: usize = 0,
+    tombstone_reconcile_retry_ns: u64 = 0,
+    tombstone_reconcile_turn: u64 = 0,
+    tombstone_reconcile_rows: u64 = 0,
+    tombstone_reconcile_completed: u64 = 0,
+    tombstone_reconcile_failures: u64 = 0,
+    tombstone_reconcile_failure_streak: u64 = 0,
+    pending_l0_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    closure_service_l0_next: bool = false,
+    pending_gc: ?*compaction_mod.PendingGc = null,
+    retired_gc: ?*compaction_mod.PendingGc = null,
+    gc_reclaim_in_flight: bool = false,
+    gc_planning_next_rank: usize = 0,
+    directory_planning_slices: u64 = 0,
+    gc_debt_cache: ?compaction_mod.GcDebtCache = null,
     maintenance_io_budget_remaining: ?u64 = null,
     background_io_reserved_bytes: u64 = 0,
     background_io_denied_jobs: u64 = 0,
@@ -1496,6 +1689,7 @@ pub const Backend = struct {
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
     read_stats: AtomicReadStats = .{},
+    point_async_batches_active: CounterU64 = .init(0),
     tracked_in_memory_state_bytes: u64 = 0,
     tracked_wal_retention_bytes: u64 = 0,
     tracked_recovery_working_set_bytes: u64 = 0,
@@ -1514,9 +1708,15 @@ pub const Backend = struct {
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
+    // Physical run ids allocated at or after this value belong to the current
+    // explicit bulk window. L0 logical sequences make the boundary stable even
+    // if an older generation is physically rewritten while the window is open.
+    bulk_ingest_window_first_sequence: u64 = 0,
     mutable: ActiveMemTable = .{},
     mutable_idle_flush_deadline_ns: u64 = 0,
     mutable_idle_flush_max_deadline_ns: u64 = 0,
+    immutable_idle_flush_deadline_ns: u64 = 0,
+    immutable_idle_flush_max_deadline_ns: u64 = 0,
     mutable_wal_range: WalSegmentRange = .{},
     empty_mutable_snapshot: State = .{},
     mutable_read_snapshot: ?*State = null,
@@ -1532,9 +1732,47 @@ pub const Backend = struct {
     retired_immutable_memtables: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshots: std.ArrayListUnmanaged(*State) = .empty,
     retired_mutable_snapshot_by_state: std.AutoHashMapUnmanaged(*const State, usize) = .empty,
+    bulk_snapshot_accounts: std.AutoHashMapUnmanaged(*state_mod.memory_account.Account, usize) = .empty,
+    bulk_snapshot_unshared_bytes: u64 = 0,
     closing: std.atomic.Value(bool) = .init(false),
     recovery_replaying_wal: bool = false,
-    runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty,
+    runs: RunStore = .{ .destroy_run = destroyOwnedRun },
+    read_version: ?*runtime_mod.ReadVersion = null,
+    run_directory: ?*RunDirectory = null,
+    manifest_directory: ?*RunDirectory = null,
+    manifest_journal: repository_mod.ManifestJournal = .{},
+    run_directory_dirty: bool = true,
+    run_directory_generation: u64 = 0,
+    retired_run_directories: ?*RunDirectory = null,
+    retired_run_stores: ?*RunStore = null,
+    active_compaction_publications: ?*compaction_mod.Publication = null,
+    output_cleanup_retry_at_ns: u64 = 0,
+    output_cleanup_admission_failures: u64 = 0,
+    obsolete_reclaim_in_flight: bool = false,
+    retired_closures: ?*compaction_mod.PendingDirectoryClosure = null,
+    closure_reclaim_in_flight: bool = false,
+    store_reclaimer: ?RunStore.Reclaimer = null,
+    store_reclaim_in_flight: bool = false,
+    directory_reclaimer: ?RunDirectory.Reclaimer = null,
+    directory_reclaim_in_flight: bool = false,
+    retired_read_versions: ?*runtime_mod.ReadVersion = null,
+    live_read_versions: ?*runtime_mod.ReadVersion = null,
+    retired_memory_head: ?*State = null,
+    retired_memory_tail: ?*State = null,
+    memtable_reclaimer: ?@import("lsm_backend/memtable_reclamation.zig").Job = null,
+    memtable_reclaim_in_flight: bool = false,
+    memtable_reclaim_pending: u64 = 0,
+    memtable_reclaim_slices: u64 = 0,
+    memtable_reclaim_units: u64 = 0,
+    memtable_reclaim_max_slice_ns: u64 = 0,
+    reclaiming_memory: ?*ReclaimingMemory = null,
+    gc_maintenance_turn: u8 = 0,
+    tombstone_gc_retry_after_ns: u64 = 0,
+
+    domain_index: ?*compaction_mod.DomainIndex = null,
+    domain_index_builds: u64 = 0,
+    read_version_builds: u64 = 0,
+    read_version_pins: u64 = 0,
 
     const BoundStore = runtime_mod.BoundStore(Backend);
     const BoundReadTxn = runtime_mod.BoundReadTxn(Backend);
@@ -1565,6 +1803,78 @@ pub const Backend = struct {
             .storage_owner = null,
             .storage = options.storage,
         };
+        self.options.unpublished_outputs = null;
+    }
+
+    pub fn initOutputCleanup(self: *Backend) !void {
+        if (self.options.backend.read_only) return;
+        const queue = try self.allocator.create(output_cleanup.Queue);
+        queue.* = .{ .allocator = self.allocator, .manager = self.options.resource_manager };
+        if (self.options.maintenance_waker) |waker| {
+            queue.wake_context = waker.ptr;
+            queue.wake_fn = waker.wake_fn;
+        }
+        self.options.unpublished_outputs = queue;
+    }
+
+    pub fn deinitOutputCleanup(self: *Backend) void {
+        if (self.options.unpublished_outputs) |queue| {
+            queue.deinit();
+            self.allocator.destroy(queue);
+        }
+        self.options.unpublished_outputs = null;
+    }
+
+    fn outputCleanupDelayLocked(self: *Backend) ?u64 {
+        const queue = self.options.unpublished_outputs orelse return null;
+        if (queue.pending.load(.acquire) == 0) return null;
+        return self.output_cleanup_retry_at_ns -| self.nowNs();
+    }
+
+    /// One bounded metadata handoff. No physical deletion under Backend.mu.
+    /// Tickets are restored to the queue on OOM/admission failure without
+    /// allocating, including when the originating request was cancelled.
+    fn drainOutputCleanupSliceLocked(self: *Backend) !bool {
+        const queue = self.options.unpublished_outputs orelse return false;
+        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        var progressed = false;
+        for (0..64) |_| {
+            if (platform.time.monotonicNs() >= deadline) break;
+            const ticket = queue.pop() orelse break;
+            errdefer {
+                queue.append(ticket);
+                self.output_cleanup_admission_failures +|= 1;
+                self.output_cleanup_retry_at_ns = self.nowNs() +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
+            }
+            var credit = try self.admitCompactionMetadataBytes(32 +| ticket.path.len);
+            defer credit.release();
+            try self.obsolete_paths.ensureUnusedCapacity(self.allocator, 1);
+            if (!self.obsolete_paths.contains(ticket.path)) {
+                const path = try self.allocator.dupe(u8, ticket.path);
+                self.obsolete_paths.appendAssumeCapacity(.{ .path = path, .delete_after_ns = self.nowNs() });
+                self.obsolete_manifest_dirty = true;
+                credit.commit();
+            }
+            ticket.destroy();
+            progressed = true;
+        }
+        if (progressed) {
+            self.output_cleanup_retry_at_ns = 0;
+            self.obsolete_reclaim_retry_at_ns = 0;
+        }
+        return progressed;
+    }
+
+    fn drainOutputCleanupLocked(self: *Backend) !void {
+        while (self.outputCleanupDelayLocked() != null) {
+            _ = try self.drainOutputCleanupSliceLocked();
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            const yielded = if (self.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) else @as(anyerror!void, {});
+            _ = runtime_mod.lockBackend(Backend, self);
+            self.releaseReaderKind(.other);
+            try yielded;
+        }
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
@@ -1871,13 +2181,15 @@ pub const Backend = struct {
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
             try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
         }
-        const manifest_path = try repository_mod.manifestPath(self.allocator, root_dir);
-        defer self.allocator.free(manifest_path);
-        const manifest_bytes = try storage.readFileAlloc(self.allocator, manifest_path, 64 * 1024 * 1024);
+        // Export only the pinned generation, not a live edit stream or its
+        // obsolete-file history. Restores need no journal suffix or old SSTs.
+        const export_runs = try self.runs.project(self.allocator);
+        defer self.allocator.free(export_runs);
+        const manifest_bytes = try repository_mod.encodeManifestAlloc(self.allocator, self.next_run_id, export_runs, &.{});
         errdefer self.allocator.free(manifest_bytes);
-        const run_ids = try self.allocator.alloc(u64, self.runs.items.len);
+        const run_ids = try self.allocator.alloc(u64, self.runs.count());
         errdefer self.allocator.free(run_ids);
-        const run_paths = try self.allocator.alloc([]u8, self.runs.items.len);
+        const run_paths = try self.allocator.alloc([]u8, self.runs.count());
         var initialized: usize = 0;
         errdefer {
             for (run_paths[0..initialized]) |path| {
@@ -1886,7 +2198,7 @@ pub const Backend = struct {
             }
             self.allocator.free(run_paths);
         }
-        for (self.runs.items, 0..) |run, index| {
+        for (export_runs, 0..) |run, index| {
             const source = run.path orelse return error.InvalidTableFile;
             const owned = try self.allocator.dupe(u8, source);
             errdefer self.allocator.free(owned);
@@ -1964,13 +2276,13 @@ pub const Backend = struct {
 
     pub fn recordOpenManifestLoaded(self: *Backend, loaded_manifest: bool) void {
         self.open_stats.loaded_manifest = loaded_manifest;
-        self.open_stats.loaded_runs = @intCast(self.runs.items.len);
-        self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.items.len);
-        self.current_manifest_bytes = if (self.manifest_backing) |raw| @intCast(raw.len) else 0;
+        self.open_stats.loaded_runs = @intCast(self.runs.count());
+        self.open_stats.obsolete_paths = @intCast(self.obsolete_paths.count());
+        self.current_manifest_bytes = if (self.recovered_manifest) |recovered| recovered.valid_bytes else if (self.manifest_backing) |raw| @intCast(raw.len) else 0;
     }
 
     pub fn recordOpenReplayComplete(self: *Backend) void {
-        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entries.items.len);
+        self.open_stats.mutable_entries_after_replay = @intCast(self.mutable.entryCount());
         self.open_stats.immutable_memtables_after_replay = @intCast(self.activeImmutableMemtableCount());
         self.open_stats.wal_replay_records = self.write_stats.wal_replay_records;
         self.open_stats.wal_replay_entries = self.write_stats.wal_replay_entries;
@@ -1999,6 +2311,78 @@ pub const Backend = struct {
         return if (end_ns >= start_ns) end_ns - start_ns else 0;
     }
 
+    /// Files tracked by one captured run/cleanup inventory, not filesystem
+    /// allocated blocks or a globally atomic disk snapshot. Active SSTs are
+    /// pinned; obsolete files may disappear while they are measured. Live
+    /// manifests, unpublished outputs and unrelated files are excluded.
+    pub const PhysicalUsage = struct {
+        active_sst_bytes: u64 = 0,
+        obsolete_file_bytes: u64 = 0,
+        wal_retained_bytes: u64 = 0,
+        missing_obsolete_files: u64 = 0,
+
+        pub fn totalBytes(self: PhysicalUsage) !u64 {
+            return std.math.add(u64, try std.math.add(u64, self.active_sst_bytes, self.obsolete_file_bytes), self.wal_retained_bytes);
+        }
+    };
+
+    /// Explicit filesystem measurement, not a hot-path statistics getter.
+    /// Capture immutable metadata roots under the backend lock without cloning
+    /// the mutable memtable. SST/obsolete stat calls run off-lock, and cleanup
+    /// continues independently. Only missing obsolete files count as zero;
+    /// missing active SSTs and all other I/O errors remain failures.
+    pub fn measurePhysicalUsage(self: *Backend) !PhysicalUsage {
+        const LedgerSnapshot = @import("lsm_backend/ledger_reclamation.zig").Snapshot;
+        const captured = blk: {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            defer runtime_mod.unlockBackend(Backend, self, locked);
+            const storage = self.storage orelse return .{};
+            var wal_bytes: u64 = 0;
+            if (self.options.wal_enabled and self.root_dir != null) {
+                wal_bytes = try std.math.add(u64, (try self.cachedWalRetentionLocked()).bytes, (try self.cachedWalReplayRetentionLocked()).bytes);
+            }
+            const obsolete = try LedgerSnapshot.capture(self, &self.obsolete_paths);
+            errdefer obsolete.retire(self);
+            const version = try self.createReadVersionFromDirectory();
+            _ = version.references.fetchAdd(1, .monotonic);
+            self.read_version_pins +|= 1;
+            self.retainReaderKind(.other);
+            break :blk .{ .storage = storage, .obsolete = obsolete, .version = version, .wal_bytes = wal_bytes };
+        };
+        defer {
+            const locked = runtime_mod.lockBackend(Backend, self);
+            defer runtime_mod.unlockBackend(Backend, self, locked);
+            captured.obsolete.retire(self);
+            captured.version.release(self);
+            self.releaseReaderKind(.other);
+        }
+        var result = PhysicalUsage{ .wal_retained_bytes = captured.wal_bytes };
+        const directory = captured.version.directory.?;
+        var runs = directory.readCursor();
+        while (runs.next()) |handle| if (handle.run.path) |path| {
+            result.active_sst_bytes = try std.math.add(u64, result.active_sst_bytes, try captured.storage.fileSize(path));
+        };
+        var obsolete = captured.obsolete.value.iterator();
+        while (obsolete.next()) |entry| {
+            // A recovery ledger may still mention an active run. Account for
+            // it once, against the captured directory rather than live state.
+            if (parseRunIdFromTableFileName(std.fs.path.basename(entry.path))) |id| {
+                if (directory.byId(id)) |run| if (run.path) |path| {
+                    if (std.mem.eql(u8, path, entry.path)) continue;
+                };
+            }
+            const bytes = captured.storage.fileSize(entry.path) catch |err| switch (err) {
+                error.FileNotFound => {
+                    result.missing_obsolete_files += 1;
+                    continue;
+                },
+                else => return err,
+            };
+            result.obsolete_file_bytes = try std.math.add(u64, result.obsolete_file_bytes, bytes);
+        }
+        return result;
+    }
+
     pub fn snapshotMaintenanceStats(self: *const Backend) MaintenanceStats {
         const mutable: *Backend = @constCast(self);
         const locked = runtime_mod.lockBackend(Backend, mutable);
@@ -2012,7 +2396,10 @@ pub const Backend = struct {
 
     fn snapshotMaintenanceStatsLockedWithOptions(self: *Backend, include_retention: bool) MaintenanceStats {
         var stats = MaintenanceStats{
-            .mutable_entries = @intCast(self.mutable.entries.items.len),
+            .read_version_builds = self.read_version_builds,
+            .domain_index_builds = self.domain_index_builds,
+            .read_version_pins = self.read_version_pins,
+            .mutable_entries = @intCast(self.mutable.entryCount()),
             .mutable_bytes = estimateStateBytes(&self.mutable),
             .mutable_snapshot_clone_calls = self.mutable_snapshot_clone_calls,
             .mutable_snapshot_clone_bytes_total = self.mutable_snapshot_clone_bytes_total,
@@ -2028,8 +2415,8 @@ pub const Backend = struct {
             .immutable_memtables = @intCast(self.activeImmutableMemtableCount()),
             .retired_immutable_memtables = @intCast(self.retired_immutable_memtables.items.len),
             .immutable_pinned_generations = @intCast(self.immutable_memtable_pins.items.len),
-            .total_runs = @intCast(self.runs.items.len),
-            .obsolete_paths = @intCast(self.obsolete_paths.items.len),
+            .total_runs = @intCast(self.runs.count()),
+            .obsolete_paths = @intCast(self.obsolete_paths.count()),
             .current_manifest_bytes = self.current_manifest_bytes,
             .active_readers = (self.active_readers),
             .active_readers_by_kind = activeReaderKindStats(self.active_readers_by_kind),
@@ -2056,8 +2443,32 @@ pub const Backend = struct {
             .obsolete_delete_retries = self.obsolete_delete_retries,
         };
         const obsolete_now_ns = self.nowNs();
-        for (self.obsolete_paths.items) |obsolete| {
-            if (run_snapshot_refs.isRetained(obsolete.path)) {
+        if (self.options.unpublished_outputs) |queue| {
+            stats.unpublished_output_cleanup_pending = queue.pending.load(.acquire);
+            stats.unpublished_output_cleanup_bytes = queue.bytes.load(.acquire);
+        }
+        stats.unpublished_output_cleanup_admission_failures = self.output_cleanup_admission_failures;
+        var retired_ledger = self.retired_ledger_snapshots;
+        while (retired_ledger) |snapshot| : (retired_ledger = snapshot.retired_next) stats.ledger_reclaim_pending +|= 1;
+        stats.ledger_reclaim_slices = self.ledger_reclaim_slices;
+        stats.ledger_reclaim_units = self.ledger_reclaim_units;
+        stats.ledger_reclaim_max_slice_ns = self.ledger_reclaim_max_slice_ns;
+        stats.memtable_reclaim_pending = self.memtable_reclaim_pending;
+        stats.memtable_reclaim_slices = self.memtable_reclaim_slices;
+        stats.memtable_reclaim_units = self.memtable_reclaim_units;
+        stats.memtable_reclaim_max_slice_ns = self.memtable_reclaim_max_slice_ns;
+        stats.tombstone_reconcile_rows = self.tombstone_reconcile_rows;
+        stats.tombstone_reconcile_completed = self.tombstone_reconcile_completed;
+        stats.tombstone_reconcile_failures = self.tombstone_reconcile_failures;
+        stats.bulk_planning_jobs = @intFromBool(self.pending_bulk_plan != null);
+        var obsolete_cursor = self.obsolete_paths.iterator();
+        while (obsolete_cursor.next()) |obsolete| {
+            // An open manifest independently pins the file even when its run
+            // directory also owns a shared metadata pin. Attribute that case
+            // to the manifest, not to a nonexistent active transaction.
+            if (obsolete_path_refs.isRetained(obsolete.path)) {
+                stats.obsolete_paths_pinned_by_versions +|= 1;
+            } else if (run_snapshot_refs.isRetained(obsolete.path)) {
                 stats.obsolete_paths_pinned_by_readers +|= 1;
                 for (self.active_readers_by_kind, 0..) |active, kind_index| {
                     if (active != 0) stats.obsolete_paths_pinned_by_reader_kind[kind_index] +|= 1;
@@ -2071,11 +2482,11 @@ pub const Backend = struct {
             }
         }
         for (self.activeImmutableMemtables()) |state| {
-            stats.immutable_entries += @intCast(state.entries.items.len);
+            stats.immutable_entries += @intCast(state.entryCount());
             stats.immutable_bytes += estimateStateBytes(state);
         }
         for (self.retired_immutable_memtables.items) |state| {
-            stats.retired_immutable_entries +|= @intCast(state.entries.items.len);
+            stats.retired_immutable_entries +|= @intCast(state.entryCount());
             stats.retired_immutable_bytes +|= estimateStateBytes(state);
         }
         for (self.immutable_memtable_pins.items) |pin| {
@@ -2083,13 +2494,15 @@ pub const Backend = struct {
         }
 
         var i: usize = 0;
-        while (i < self.runs.items.len) {
-            const level = self.runs.items[i].level;
+        while (i < self.runs.count()) {
+            const level = self.runs.at(i).*.level;
             const start = i;
             var level_bytes: u64 = 0;
-            while (i < self.runs.items.len and self.runs.items[i].level == level) : (i += 1) {
-                const run = self.runs.items[i];
+            while (i < self.runs.count() and self.runs.at(i).*.level == level) : (i += 1) {
+                const run = self.runs.at(i).*;
                 level_bytes += run.size_bytes;
+                stats.tombstone_entries +|= run.tombstone_count orelse 0;
+                stats.unknown_tombstone_runs +|= @intFromBool(run.tombstone_count == null);
                 stats.total_run_logical_entry_bytes +|= run.compression_stats.logical_entry_bytes;
                 stats.total_run_physical_entry_bytes +|= run.compression_stats.physical_entry_bytes;
                 stats.total_run_compressed_blocks +|= run.compression_stats.compressed_blocks;
@@ -2116,7 +2529,7 @@ pub const Backend = struct {
                 if (level_len > target_runs) {
                     stats.level_overflow_runs += @intCast(level_len - target_runs);
                 }
-                const target_bytes = compaction_mod.levelByteTargetForRuns(self.runs.items, level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
+                const target_bytes = compaction_mod.levelByteTargetForTotals(self.runs.totalBytes(), self.runs.maxLevel(), level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
                 if (target_bytes > 0 and level_bytes > target_bytes) {
                     stats.level_overflow_bytes += level_bytes - target_bytes;
                 }
@@ -2143,6 +2556,12 @@ pub const Backend = struct {
             stats.compaction_scheduler_remembered_pending_runs = @intCast(remembered.input_runs);
             stats.compaction_scheduler_remembered_pending_bytes = remembered.input_bytes;
         }
+        for (self.pending_admissions) |pending| if (pending) |job| {
+            if (!job.denied) continue;
+            stats.compaction_scheduler_remembered_pending += 1;
+            stats.compaction_scheduler_remembered_pending_runs +|= job.work.input_runs;
+            stats.compaction_scheduler_remembered_pending_bytes +|= job.work.input_bytes;
+        };
         stats.background_io_budget_bytes = self.options.background_io_budget_bytes;
         stats.background_io_reserved_bytes = self.background_io_reserved_bytes;
         stats.background_io_denied_jobs = self.background_io_denied_jobs;
@@ -2195,6 +2614,14 @@ pub const Backend = struct {
         return owner.snapshotStats();
     }
 
+    /// Retains the internally-created native storage after this LSM backend is
+    /// closed. Backends using a caller-owned Storage return null; that caller
+    /// already owns the required lifetime.
+    pub fn acquireNativeStorageLease(self: *Backend) !?storage_io.NativeStorage.Lease {
+        const owner = self.storage_owner orelse return null;
+        return try owner.acquireLease();
+    }
+
     pub fn maintenanceDebtHint(self: *const Backend) u64 {
         return self.cached_maintenance_hint.load(.monotonic);
     }
@@ -2221,7 +2648,7 @@ pub const Backend = struct {
 
     pub fn noteWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
-            self.mutable.entries.items.len > 0 and
+            self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
             const now_ns = self.nowNs();
@@ -2250,6 +2677,46 @@ pub const Backend = struct {
         self.notePotentialMaintenanceDebtLocked();
     }
 
+    /// Apply the mutable-table idle policy to the complete, WAL-backed epochs
+    /// retained for a windowed flush. Full windows publish immediately; a
+    /// partial final window remains query-visible in memory until write
+    /// quiescence, while the maximum-age deadline prevents a quiet table from
+    /// retaining that memory and WAL indefinitely.
+    fn noteImmutableWriteMutationLocked(self: *Backend) void {
+        if (self.options.mutable_idle_flush_after_ns > 0 and
+            self.activeImmutableMemtableCount() > 0 and
+            !self.options.backend.read_only)
+        {
+            const now_ns = self.nowNs();
+            if (self.immutable_idle_flush_max_deadline_ns == 0 and
+                self.options.mutable_idle_flush_max_age_ns > 0)
+            {
+                self.immutable_idle_flush_max_deadline_ns = now_ns +| self.options.mutable_idle_flush_max_age_ns;
+            }
+
+            const idle_eligible = self.options.mutable_idle_flush_min_bytes == 0 or
+                self.activeImmutableMemtableBytes() >= self.options.mutable_idle_flush_min_bytes;
+            const idle_deadline = if (idle_eligible)
+                now_ns +| self.options.mutable_idle_flush_after_ns
+            else
+                std.math.maxInt(u64);
+            self.immutable_idle_flush_deadline_ns = if (self.immutable_idle_flush_max_deadline_ns > 0)
+                @min(idle_deadline, self.immutable_idle_flush_max_deadline_ns)
+            else if (idle_eligible)
+                idle_deadline
+            else
+                0;
+        } else {
+            self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
+        }
+    }
+
+    fn clearImmutableIdleFlushDeadlineIfEmptyLocked(self: *Backend) void {
+        if (self.activeImmutableMemtableCount() != 0) return;
+        self.immutable_idle_flush_deadline_ns = 0;
+        self.immutable_idle_flush_max_deadline_ns = 0;
+    }
+
     /// WAL replay proves this mutable state was already dirty before this
     /// process started. Its original monotonic timestamp cannot be recovered,
     /// so granting it a fresh maximum-age interval on every restart could
@@ -2258,7 +2725,7 @@ pub const Backend = struct {
     /// run/manifest/WAL checkpoint sequence.
     pub fn noteRecoveredWriteMutationLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
-            self.mutable.entries.items.len > 0 and
+            self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
         {
             const due_ns = @max(self.nowNs(), 1);
@@ -2297,53 +2764,99 @@ pub const Backend = struct {
     fn largestL0OverlapRunCountLocked(self: *Backend) usize {
         const threshold = self.options.l0_overlap_compact_threshold_runs;
         if (threshold == 0) return 0;
-        var l0_count: usize = 0;
-        while (l0_count < self.runs.items.len and self.runs.items[l0_count].level == 0) : (l0_count += 1) {}
         // Above the soft limit, normal L0 pressure already schedules
         // compaction. Exact overlap scoring is O(n^2) and runs under `mu`, so
         // performing it during overload can block point and batch reads for
         // seconds. Zero here means "not independently scored"; L0 run/byte
         // pressure remains fully represented by the surrounding metrics.
         const soft_limit = self.effectiveL0SoftLimitRuns();
-        if (soft_limit == 0 or l0_count > @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs)) return 0;
-        const l0_runs = self.runs.items[0..l0_count];
+        if (soft_limit == 0) return 0;
+        const limit = @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs);
+        const l0_count = self.overlapScoringL0Count(limit);
+        if (l0_count > limit) return 0;
+        var scratch: [compaction_mod.max_exact_l0_overlap_runs]Run = undefined;
+        const l0_runs = scratch[0..l0_count];
+        for (l0_runs, 0..) |*run, rank| run.* = self.runs.at(rank).*;
         if (self.l0_overlap_cache.lookup(l0_runs, threshold)) |cached| return cached;
         const result = compaction_mod.largestL0OverlapRunCount(l0_runs, threshold);
         self.l0_overlap_cache.store(l0_runs, threshold, result);
         return result;
     }
 
+    // Do not walk an overloaded L0 merely to decide not to score it. Ordinary
+    // publications maintain the aggregate; cold/test roots need at most
+    // limit + 1 probes, independent of the size of the backlog.
+    fn overlapScoringL0Count(self: *const Backend, limit: usize) usize {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| return directory.levelStats(0).count;
+        var count: usize = 0;
+        while (count < self.runs.count() and count <= limit and self.runs.at(count).level == 0) : (count += 1) {}
+        return count;
+    }
+
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) score +|= 1;
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) score +|= 1;
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) score +|= 1;
+        if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
+        if (self.tombstoneReconcileDelayLocked()) |delay| if (delay == 0) {
+            score +|= 1;
+        };
+        if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null or self.retired_closures != null) score += 1;
+        if (self.retired_admissions != null) score += 1;
+        for (self.pending_admissions) |pending| if (pending != null) {
+            score += 1;
+        };
+        if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
+        if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
+        if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
+        if (self.manifest_journal.checkpointDue() and self.manifest_journal.sequence != null) score += 1;
+        const directory = if (!self.run_directory_dirty) self.run_directory else null;
 
         const soft_limit_l0_runs = self.effectiveL0SoftLimitRuns();
         const hard_limit_l0_runs = self.effectiveL0HardLimitRuns();
+        const tiered_l0 = self.options.run_partition_key == null and self.options.bulk_ingest_tiered_l0_fan_in >= 2;
+        const has_l0_tier = tiered_l0 and
+            compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes });
         if (hard_limit_l0_runs > 0) {
-            const l0_runs = countLevelRuns(self.runs.items, 0);
+            const l0_runs = if (directory) |root| root.levelStats(0).count else countLevelRuns(&self.runs, 0);
             if (l0_runs > hard_limit_l0_runs) {
                 score +|= (l0_runs - hard_limit_l0_runs) * 1_000_000;
-            } else if (l0_runs > soft_limit_l0_runs) {
+            } else if (l0_runs > soft_limit_l0_runs and (!tiered_l0 or has_l0_tier)) {
                 score +|= (l0_runs - soft_limit_l0_runs) * 10_000;
             }
-            if (l0_runs > self.options.compact_threshold_runs) {
+            if (!tiered_l0 and l0_runs > self.options.compact_threshold_runs) {
                 score +|= (l0_runs - self.options.compact_threshold_runs) * 1_000;
             }
-            score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+            if (!tiered_l0) score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+        }
+        if (self.l0SoftPressureLocked() and has_l0_tier) {
+            score +|= 2_500;
         }
 
         var l0_bytes: u64 = 0;
         var level_overflow_runs: u64 = 0;
         var level_overflow_bytes: u64 = 0;
+        var has_tombstones = false;
         var i: usize = 0;
-        while (i < self.runs.items.len) {
-            const level = self.runs.items[i].level;
-            const start = i;
-            var level_bytes: u64 = 0;
-            while (i < self.runs.items.len and self.runs.items[i].level == level) : (i += 1) {
-                level_bytes += self.runs.items[i].size_bytes;
-            }
-
-            const level_len = i - start;
+        while (i < if (directory) |root| root.levelCount() else self.runs.count()) {
+            const aggregate = if (directory) |root| blk: {
+                const level = root.levelAt(i);
+                i += 1;
+                break :blk level;
+            } else blk: {
+                var level = run_directory_mod.LevelAggregate{ .level = self.runs.at(i).*.level };
+                while (i < self.runs.count() and self.runs.at(i).*.level == level.level) : (i += 1) {
+                    level.count += 1;
+                    level.bytes += self.runs.at(i).*.size_bytes;
+                    level.tombstone_runs += @intFromBool((self.runs.at(i).*.tombstone_count orelse 0) != 0);
+                }
+                break :blk level;
+            };
+            const level = aggregate.level;
+            const level_bytes = aggregate.bytes;
+            const level_len = aggregate.count;
+            has_tombstones = has_tombstones or aggregate.tombstone_runs != 0;
             if (level == 0) {
                 l0_bytes = level_bytes;
                 continue;
@@ -2353,7 +2866,10 @@ pub const Backend = struct {
             if (level_len > target_runs) {
                 level_overflow_runs +|= @intCast(level_len - target_runs);
             }
-            const target_bytes = compaction_mod.levelByteTargetForRuns(self.runs.items, level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
+            const target_bytes = if (directory) |root|
+                compaction_mod.levelByteTargetForTotals(root.total_run_bytes, root.maxLevel(), level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier)
+            else
+                compaction_mod.levelByteTargetForTotals(self.runs.totalBytes(), self.runs.maxLevel(), level, self.options.level_target_bytes_base, self.options.level_target_bytes_multiplier);
             if (target_bytes > 0 and level_bytes > target_bytes) {
                 level_overflow_bytes +|= level_bytes - target_bytes;
             }
@@ -2361,7 +2877,10 @@ pub const Backend = struct {
 
         if (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes) {
             score +|= (l0_bytes - self.options.l0_hard_limit_bytes) / 1024;
-        } else if (self.options.l0_soft_limit_bytes > 0 and l0_bytes > self.options.l0_soft_limit_bytes) {
+        } else if (self.options.l0_soft_limit_bytes > 0 and
+            l0_bytes > self.options.l0_soft_limit_bytes and
+            (!tiered_l0 or has_l0_tier))
+        {
             score +|= (l0_bytes - self.options.l0_soft_limit_bytes) / (16 * 1024);
         }
 
@@ -2373,6 +2892,7 @@ pub const Backend = struct {
 
         score +|= level_overflow_runs * 500;
         score +|= level_overflow_bytes / (64 * 1024);
+        if (has_tombstones and compaction_mod.hasTombstoneGcDebt(self)) score +|= 1;
         score +|= self.walRetentionPressureScoreLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()) score +|= 1;
         return score;
@@ -2421,15 +2941,82 @@ pub const Backend = struct {
     }
 
     fn estimateInMemoryStateBytesLocked(self: *const Backend) u64 {
-        var bytes = estimateStateBytes(&self.mutable);
+        return self.estimateInMemoryStateBytesWithCandidateLocked(null);
+    }
+
+    fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
+        const pass = state_mod.memory_account.nextPass();
+        var bytes = self.mutable.accountedMemoryBytes(pass);
+        // Tickets already own builder-slice reservations. Only the queue
+        // header belongs to this observer; charging tickets here duplicates
+        // their contribution to the resource manager's aggregate budget.
+        if (self.options.unpublished_outputs) |queue| bytes +|= queue.observedMemoryBytes();
+        var ledger_reclamation = self.active_ledger_reclamations;
+        while (ledger_reclamation) |job| : (ledger_reclamation = job.next) bytes +|= job.memoryBytes(pass);
+        var ledger_snapshot = self.ledger_snapshots;
+        while (ledger_snapshot) |snapshot| : (ledger_snapshot = snapshot.active_next) bytes +|= snapshot.memoryBytes(pass);
+        var publication = self.active_compaction_publications;
+        while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
+        bytes +|= self.runs.memoryBytes(pass);
+        var retired_store = self.retired_run_stores;
+        while (retired_store) |store| : (retired_store = store.retired_next) bytes +|= @sizeOf(RunStore) + store.memoryBytes(pass);
+        if (self.store_reclaimer) |*job| bytes +|= @sizeOf(RunStore) + job.store.memoryBytes(pass);
+        if (self.run_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
+        if (self.manifest_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
+        if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
+        if (self.pending_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
+        if (self.pending_l0_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
+        for (self.pending_admissions) |pending| if (pending) |job| {
+            bytes +|= job.accountedMemoryBytes(pass);
+        };
+        var retired_admission = self.retired_admissions;
+        while (retired_admission) |pending| : (retired_admission = pending.retired_next) bytes +|= pending.accountedMemoryBytes(pass);
+        var active_bulk = self.active_bulk_plans;
+        while (active_bulk) |pending| : (active_bulk = pending.active_next) bytes +|= pending.accountedMemoryBytes(pass);
+        if (self.pending_tombstone_reconcile) |pending| bytes +|= pending.account.chargeOnce(pass);
+        var retired_bulk = self.retired_bulk_plans;
+        while (retired_bulk) |pending| : (retired_bulk = pending.retired_next) bytes +|= pending.accountedMemoryBytes(pass);
+        var retired_closure = self.retired_closures;
+        while (retired_closure) |pending| : (retired_closure = pending.retired_next) bytes +|= pending.directory.accountedMemoryBytes(pass);
+        if (self.pending_gc) |pending| bytes +|= pending.accountedMemoryBytes(pass);
+        var retired_gc = self.retired_gc;
+        while (retired_gc) |pending| : (retired_gc = pending.retired_next) bytes +|= pending.accountedMemoryBytes(pass);
+        bytes +|= self.manifest_journal.obsolete.memoryBytes(pass);
+        bytes +|= self.obsolete_paths.memoryBytes(pass);
+        if (self.obsolete_reclaim_after) |path| bytes +|= path.len;
+        var live_version = self.live_read_versions;
+        while (live_version) |version| : (live_version = version.live_next) bytes +|= version.accountedMemoryBytes(pass);
+        bytes +|= runMetadataMemoryBytes(self.retired_run_directories, self.retired_read_versions, pass);
+        if (self.directory_reclaimer) |*job| bytes +|= job.directory.accountedMemoryBytes(pass);
+        if (self.domain_index) |index| bytes +|= index.memoryBytes();
         for (self.activeImmutableMemtables()) |state| {
-            bytes +|= estimateStateBytes(state);
+            bytes +|= state.accountedMemoryBytes(pass);
         }
         for (self.retired_immutable_memtables.items) |state| {
-            bytes +|= estimateStateBytes(state);
+            bytes +|= state.accountedMemoryBytes(pass);
         }
-        bytes +|= self.bulk_ingest_current_scan_clone_active_bytes;
-        bytes +|= self.mutableReadSnapshotBytesLocked();
+        bytes +|= self.bulk_snapshot_unshared_bytes;
+        var accounts = self.bulk_snapshot_accounts.keyIterator();
+        while (accounts.next()) |account| bytes +|= account.*.chargeOnce(pass);
+        if (self.mutable_read_snapshot) |snapshot| bytes +|= snapshot.accountedMemoryBytes(pass);
+        for (self.retired_mutable_snapshots.items) |snapshot| bytes +|= snapshot.accountedMemoryBytes(pass);
+        if (candidate) |prepared| bytes +|= prepared.accountedMemoryBytes(pass);
+        var retired = self.retired_memory_head;
+        while (retired) |state| : (retired = state.retired_next) bytes +|= @sizeOf(State) +| state.accountedMemoryBytes(pass);
+        if (self.memtable_reclaimer) |*job| bytes +|= job.memoryBytes(pass);
+        var reclaiming = self.reclaiming_memory;
+        while (reclaiming) |batch| : (reclaiming = batch.next) {
+            bytes +|= runMetadataMemoryBytes(null, batch.versions, pass);
+        }
+        return bytes;
+    }
+
+    fn runMetadataMemoryBytes(directories: ?*RunDirectory, versions: ?*runtime_mod.ReadVersion, pass: u64) u64 {
+        var bytes: u64 = 0;
+        var directory = directories;
+        while (directory) |item| : (directory = item.retired_next) bytes +|= item.accountedMemoryBytes(pass);
+        var version = versions;
+        while (version) |item| : (version = item.retired_next) bytes +|= item.accountedMemoryBytes(pass);
         return bytes;
     }
 
@@ -2444,11 +3031,26 @@ pub const Backend = struct {
         return bytes;
     }
 
-    fn releaseTrackedResourceUsage(self: *Backend) void {
+    pub fn releaseTrackedResourceUsage(self: *Backend) void {
         const manager = self.options.resource_manager orelse return;
         manager.observeUsage(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes, 0);
         manager.observeUsage(.lsm_wal_retention, &self.tracked_wal_retention_bytes, 0);
         manager.observeUsage(.lsm_recovery_working_set, &self.tracked_recovery_working_set_bytes, 0);
+    }
+
+    pub fn releaseObsoleteLedgerLocked(self: *Backend, ledger: *repository_mod.ObsoleteLedger) void {
+        @import("lsm_backend/ledger_reclamation.zig").drainLocked(self, ledger);
+    }
+
+    pub fn drainRetiredLedgers(self: *Backend) void {
+        _ = runtime_mod.lockBackend(Backend, self);
+        while (self.retired_ledger_snapshots != null) @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
+        std.debug.assert(self.ledger_snapshots == null);
+        self.mu.unlock();
+    }
+
+    pub fn drainRetiredMemtables(self: *Backend) void {
+        @import("lsm_backend/memtable_reclamation.zig").drain(self);
     }
 
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
@@ -2462,6 +3064,7 @@ pub const Backend = struct {
         if (@hasField(@TypeOf(work), "run_ids")) {
             scheduler_work.run_ids = work.run_ids;
         }
+        if (@hasField(@TypeOf(work), "run_id_index")) scheduler_work.run_id_index = work.run_id_index;
         if (@hasField(@TypeOf(work), "key_range")) {
             scheduler_work.key_range = work.key_range;
         }
@@ -2492,7 +3095,7 @@ pub const Backend = struct {
         self.background_io_oversized_jobs +|= 1;
     }
 
-    fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+    pub fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
         if (!self.canReserveMaintenanceIoBudget(io_bytes)) return false;
         self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
         return true;
@@ -2505,9 +3108,8 @@ pub const Backend = struct {
     }
 
     pub fn runMaintenanceStepBestEffort(self: *Backend) !bool {
-        if (self.options.backend.read_only) return false;
         if (!self.mu.tryLock()) return false;
-        defer self.mu.unlock();
+        defer self.unlockWithReclamation();
         return try self.runMaintenanceStepLocked();
     }
 
@@ -2520,38 +3122,102 @@ pub const Backend = struct {
     }
 
     fn runMaintenanceStepLocked(self: *Backend) !bool {
+        // Cleanup is safe even after a durability fence or under pressure.
+        // The unlock path executes one bounded FIFO reclamation turn.
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return true;
+        if (self.manifest_recovery_required) return false;
+        const reclaim_visits_before = self.obsolete_reclaim_visits;
+        const planning_slices_before = self.directory_planning_slices;
         if (self.options.backend.read_only) return false;
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) {
+            const progressed = self.drainOutputCleanupSliceLocked() catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => return false,
+                else => return err,
+            };
+            if (progressed) try self.persistManifestLocked();
+            return progressed;
+        }
+        // Admission pressure governs new work, not the lifetime of an owned
+        // continuation. Retire obsolete jobs even while foreground work owns
+        // the I/O lane; unlock reclamation drains their pins in bounded slices.
+        const bulk_retired = self.retireUnneededBulkPlanLocked();
+        compaction_mod.retireObsoleteAdmissions(self);
+        if (!self.manifest_checkpoint_build_in_flight and self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue()) {
+            return try self.manifest_journal.runCheckpoint(self);
+        }
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
             if (try self.runWalPressureMaintenanceStepLocked()) return true;
         }
-        // Bulk ingest suppresses compaction, not durability/resource bounds.
-        // This lane can only flush unpublished memtables and publish a
-        // checkpoint manifest; it deliberately cannot compact runs.
-        if (self.bulkIngestActive()) return false;
         self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
             self.options.background_io_budget_bytes
         else
             null;
         defer self.maintenance_io_budget_remaining = null;
+        // Reconciliation has its own fair lane. An unknown SST never means
+        // "zero deletes", and a large old run cannot monopolize maintenance.
+        self.tombstone_reconcile_turn +%= 1;
+        if (self.tombstone_reconcile_turn % 2 == 1 and !self.tombstone_reconcile_in_flight and
+            (self.tombstoneReconcileDelayLocked() orelse 1) == 0)
+        {
+            return try compaction_mod.reconcileTombstonesStep(self);
+        }
+        // Ordinary leveled compaction remains deferred during bulk ingest, but
+        // a pressured sorted-publication lane may stream one size-tier merge.
+        // This prevents the import from reaching hard L0 pressure and then
+        // repeatedly rewriting its entire overlapping lower-level base.
+        if (self.bulkIngestActive()) {
+            if (!self.bulkTieredL0MaintenanceDueLocked() or self.optionalMaintenanceDeferredLocked())
+                return bulk_retired or (self.tombstoneReconcileDelayLocked() orelse 1) == 0;
+            const compacted = try compaction_mod.compactBulkL0TierScheduledBeforeSequence(
+                Backend,
+                self,
+                self.options.bulk_ingest_tiered_l0_fan_in,
+                self.maintenanceScoreLocked(),
+                self.bulk_ingest_window_first_sequence,
+            );
+            if (compacted and self.root_dir != null and
+                (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+            {
+                try self.persistManifestLocked();
+            }
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return compacted;
+        }
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
-        const before_obsolete_paths = self.obsolete_paths.items.len;
+        const before_obsolete_paths = self.obsolete_paths.count();
 
         if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
             _ = self.refreshCachedMaintenanceHintLocked();
             return self.write_stats.manifest_writes != before_manifest_writes or
-                self.obsolete_paths.items.len != before_obsolete_paths;
+                self.obsolete_paths.count() != before_obsolete_paths or
+                self.obsolete_reclaim_visits != reclaim_visits_before;
         }
 
-        if (self.shouldFlushMutableForIdleLocked() or
-            self.shouldFlushMutable() or
-            try self.shouldFlushMutableForWalPressureLocked())
-        {
+        const mutable_idle_flush_required = self.shouldFlushMutableForIdleLocked();
+        const mutable_size_flush_required = self.shouldFlushMutable();
+        const mutable_wal_flush_required = try self.shouldFlushMutableForWalPressureLocked();
+        const mutable_flush_required = mutable_idle_flush_required or
+            mutable_size_flush_required or
+            mutable_wal_flush_required;
+        const immutable_flush_required = self.shouldFlushImmutableForIdleLocked();
+        if (mutable_flush_required) {
             try self.rotateMutableToImmutable();
         }
         if (self.activeImmutableMemtableCount() > 0) {
-            _ = try self.flushOldestImmutableMemtable();
+            // A size boundary ends one mutable generation, not the configured
+            // durable publication window. Keep that WAL-backed epoch visible
+            // in the immutable queue so adjacent generations can share one
+            // sorted run build. Idle and WAL pressure remain explicit durable
+            // boundaries, and disabling windowing preserves the legacy
+            // one-generation-per-flush behavior.
+            const force_partial_window = self.options.immutable_flush_window_bytes == 0 or
+                mutable_idle_flush_required or
+                mutable_wal_flush_required or
+                immutable_flush_required;
+            _ = try self.flushImmutableMemtableWindow(force_partial_window);
         } else {
             const soft_l0_runs = self.effectiveL0SoftLimitRuns();
             const score = self.maintenanceScoreLocked();
@@ -2560,17 +3226,38 @@ pub const Backend = struct {
             // pressure selection, so a 3.2x L0 backlog rewrote an 8.5x-overfull
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
-            const defer_soft_compaction = if (self.options.resource_manager) |manager|
-                manager.shouldDeferSoftCompactionForDerivedReplay()
-            else
-                false;
+            const defer_soft_compaction = self.optionalMaintenanceDeferredLocked();
             if (!defer_soft_compaction) {
-                _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
-                    Backend,
-                    self,
-                    if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
-                    score,
-                );
+                self.gc_maintenance_turn +%= 1;
+                var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
+                    try compaction_mod.compactTombstonesScheduled(Backend, self, score);
+                if (!compacted) {
+                    compacted = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                        try compaction_mod.compactBulkL0TierScheduled(
+                            Backend,
+                            self,
+                            self.options.bulk_ingest_tiered_l0_fan_in,
+                            score,
+                        )
+                    else
+                        false;
+                    if (!compacted) {
+                        const tier_owns_soft_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2 and
+                            !self.l0HardPressureLocked();
+                        if (tier_owns_soft_l0) {
+                            compacted = try compaction_mod.maybeCompactLowerLevelsScheduled(Backend, self, score);
+                        } else {
+                            compacted = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                                Backend,
+                                self,
+                                if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
+                                score,
+                            );
+                        }
+                    }
+                }
+                if (!compacted and self.pending_directory_closure == null and self.pending_l0_directory_closure == null)
+                    _ = try compaction_mod.compactTombstonesScheduled(Backend, self, score);
             }
         }
         // Hard L0/WAL bounds remain authoritative even while latency-sensitive
@@ -2578,14 +3265,86 @@ pub const Backend = struct {
         // debt crosses those limits; only optional soft compaction is deferred.
         try self.enforceWritePressure();
         if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
         }
 
         _ = self.refreshCachedMaintenanceHintLocked();
 
-        return self.compaction_stats.compactions != before_compactions or
+        return bulk_retired or self.compaction_stats.compactions != before_compactions or
+            (self.tombstoneReconcileDelayLocked() orelse 1) == 0 or
+            self.directory_planning_slices != planning_slices_before or
             self.write_stats.manifest_writes != before_manifest_writes or
-            self.obsolete_paths.items.len != before_obsolete_paths;
+            self.obsolete_paths.count() != before_obsolete_paths or
+            self.obsolete_reclaim_visits != reclaim_visits_before;
+    }
+
+    fn bulkTieredL0MaintenanceDueLocked(self: *Backend) bool {
+        const fan_in = self.options.bulk_ingest_tiered_l0_fan_in;
+        if (fan_in < 2) return false;
+        if (!self.l0SoftPressureLocked()) return false;
+        if (self.pending_bulk_plan) |pending| if (pending.retry_after_ns > self.nowNs()) return false;
+        const before_sequence = self.bulk_ingest_window_first_sequence;
+        // Explicit bulk sessions own a durable window and fence its runs for
+        // one final linear merge. Per-request bulk transactions have no such
+        // owner (sequence zero): every run in `runs` is already committed and
+        // may be size-tiered while overlapping requests keep bulk mode active.
+        // Refusing sequence zero disabled all proactive merging under a
+        // continuous public upload and left hard-pressure compaction as the
+        // only progress path.
+        if (self.options.run_partition_key != null) return true;
+        return compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = fan_in, .sequence = before_sequence, .max_bytes = self.options.max_compaction_input_bytes });
+    }
+
+    fn l0SoftPressureLocked(self: *const Backend) bool {
+        return self.l0RunSoftPressureLocked() or self.l0ByteSoftPressureLocked();
+    }
+
+    fn l0RunSoftPressureLocked(self: *const Backend) bool {
+        return self.effectiveL0SoftLimitRuns() > 0 and
+            self.runs.l0Files() > self.effectiveL0SoftLimitRuns();
+    }
+
+    fn l0ByteSoftPressureLocked(self: *const Backend) bool {
+        if (self.options.l0_soft_limit_bytes == 0) return false;
+        return self.runs.l0Bytes() > self.options.l0_soft_limit_bytes;
+    }
+
+    fn l0HardPressureLocked(self: *const Backend) bool {
+        return (self.effectiveL0HardLimitRuns() > 0 and self.runs.l0Files() > self.effectiveL0HardLimitRuns()) or
+            (self.options.l0_hard_limit_bytes > 0 and self.runs.l0Bytes() > self.options.l0_hard_limit_bytes);
+    }
+
+    const maintenance_admission_retry_ns: u64 = 100 * std.time.ns_per_ms;
+
+    pub fn optionalMaintenanceDeferredLocked(self: *const Backend) bool {
+        return if (self.options.resource_manager) |manager|
+            manager.shouldDeferSoftCompactionForDerivedReplay() or manager.shouldDeferOptionalMaintenanceForForegroundTraffic()
+        else
+            false;
+    }
+
+    fn bulkPlanNeededLocked(self: *const Backend, pending: *const compaction_mod.PendingBulkPlan) bool {
+        return self.options.bulk_ingest_tiered_l0_fan_in >= 2 and self.l0SoftPressureLocked() and
+            pending.policy.eql(.{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes, .sequence = if (self.bulkIngestActive()) self.bulk_ingest_window_first_sequence else 0 });
+    }
+
+    fn retireUnneededBulkPlanLocked(self: *Backend) bool {
+        if (self.bulk_plan_in_flight) return false;
+        const pending = self.pending_bulk_plan orelse return false;
+        if (self.bulkPlanNeededLocked(pending)) return false;
+        self.pending_bulk_plan = null;
+        self.retireBulkPlanning(pending);
+        return true;
+    }
+
+    fn bulkPlanningWakeDelayLocked(self: *Backend) ?u64 {
+        if (self.retired_bulk_plans != null) return 0;
+        if (self.pending_bulk_plan) |pending| {
+            if (self.bulk_plan_in_flight) return null;
+            if (!self.bulkPlanNeededLocked(pending)) return 0;
+            return @max(pending.retry_after_ns -| self.nowNs(), if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+        }
+        return null;
     }
 
     fn runWalPressureMaintenanceStepLocked(self: *Backend) !bool {
@@ -2729,7 +3488,7 @@ pub const Backend = struct {
     pub fn prepareReadSnapshot(self: *Backend) !void {
         if (self.mutable_read_snapshot != null) return;
         if (self.options.read_snapshot_rotate_mutable_bytes == 0) return;
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         const mutable_bytes = estimateStateBytes(&self.mutable);
         if (mutable_bytes < self.options.read_snapshot_rotate_mutable_bytes) return;
 
@@ -2742,7 +3501,7 @@ pub const Backend = struct {
     }
 
     pub fn prepareCurrentScanSnapshot(self: *Backend) !void {
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         const mutable_bytes = estimateStateBytes(&self.mutable);
         try self.rotateMutableToImmutable();
         self.read_snapshot_mutable_rotations +|= 1;
@@ -2757,9 +3516,24 @@ pub const Backend = struct {
     }
 
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
-        var snapshot = try self.mutable.cloneArena(self.allocator);
+        var snapshot = if (builtin.is_test and test_deep_mutable_snapshots)
+            try self.mutable.cloneArena(self.allocator)
+        else
+            try self.mutable.snapshot(self.allocator);
         errdefer snapshot.deinit(self.allocator);
-        const snapshot_bytes = estimateStateBytes(&snapshot);
+        snapshot.freezeMemoryAccounting();
+        self.recordMutableSnapshotClone(&snapshot, reason);
+        return snapshot;
+    }
+
+    fn recordMutableSnapshotClone(self: *Backend, snapshot: *const State, reason: MutableSnapshotReason) void {
+        // Shared values are retained, not copied. Attribute actual index and
+        // fallback owned-byte copying separately from retained-state pressure.
+        var snapshot_bytes: u64 = @as(u64, @intCast(snapshot.entries.items.len)) * @sizeOf(state_mod.OwnedEntry);
+        for (snapshot.entries.items) |entry| if (entry.shared == null) {
+            snapshot_bytes +|= entry.key.len + entry.value.len;
+            if (entry.namespace_name) |name| snapshot_bytes +|= name.len;
+        };
         self.mutable_snapshot_clone_calls +|= 1;
         self.mutable_snapshot_clone_bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_peak_bytes = @max(self.mutable_snapshot_clone_peak_bytes, snapshot_bytes);
@@ -2767,6 +3541,26 @@ pub const Backend = struct {
         self.mutable_snapshot_clone_by_reason[reason_index].calls +|= 1;
         self.mutable_snapshot_clone_by_reason[reason_index].bytes_total +|= snapshot_bytes;
         self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes = @max(self.mutable_snapshot_clone_by_reason[reason_index].peak_bytes, snapshot_bytes);
+    }
+
+    /// Snapshot only the mutable replay-lane range needed by an async-index
+    /// pass. Replay keys are append-only, so a range snapshot plus generation-
+    /// pinned immutable/run state provides the same consistency as cloning the
+    /// complete mutable memtable without duplicating unrelated user records.
+    pub fn cloneReplayLaneMutableRange(
+        self: *Backend,
+        namespace: backend_types.Namespace,
+        lower: []const u8,
+        upper: []const u8,
+    ) !State {
+        // Ordered epochs are already immutable and range-seekable. Pin their
+        // root in O(1); copying a replay lane would reintroduce a full mutable
+        // walk and allocations under the backend lock.
+        if (self.mutable.ordered_enabled) return self.cloneMutableStateWithReason(.current_scan);
+        var snapshot = try self.mutable.cloneRangeArena(self.allocator, namespace, lower, upper);
+        errdefer snapshot.deinit(self.allocator);
+        snapshot.freezeMemoryAccounting();
+        self.recordMutableSnapshotClone(&snapshot, .current_scan);
         return snapshot;
     }
 
@@ -2775,7 +3569,7 @@ pub const Backend = struct {
             self.retainMutableSnapshotReader(snapshot);
             return snapshot;
         }
-        if (self.mutable.entries.items.len == 0) return &self.empty_mutable_snapshot;
+        if (self.mutable.entryCount() == 0) return &self.empty_mutable_snapshot;
         const snapshot = try self.allocator.create(State);
         errdefer self.allocator.destroy(snapshot);
         snapshot.* = try self.cloneMutableStateWithReason(reason);
@@ -2835,7 +3629,7 @@ pub const Backend = struct {
     pub fn cloneCurrentScanMutableStateForBulkIngest(self: *Backend) !?State {
         if (!self.bulkIngestActive()) return null;
         if (self.options.bulk_ingest_current_scan_clone_max_bytes == 0) return null;
-        if (self.mutable.entries.items.len == 0) return State{};
+        if (self.mutable.entryCount() == 0) return State{ .frozen_memory_bytes = 0 };
         const mutable_bytes = estimateStateBytes(&self.mutable);
         if (mutable_bytes > self.options.bulk_ingest_current_scan_clone_max_bytes) return null;
         if (!self.canAdmitBulkIngestCurrentScanClone(mutable_bytes)) {
@@ -2852,8 +3646,14 @@ pub const Backend = struct {
         const snapshot_bytes = estimateStateBytes(&snapshot);
         if (!self.canAdmitBulkIngestCurrentScanClone(snapshot_bytes)) {
             self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
+            snapshot.deinit(self.allocator);
             return null;
         }
+        if (snapshot.account) |account| {
+            const refs = try self.bulk_snapshot_accounts.getOrPut(self.allocator, account);
+            if (!refs.found_existing) refs.value_ptr.* = 0;
+            refs.value_ptr.* += 1;
+        } else self.bulk_snapshot_unshared_bytes +|= snapshot_bytes;
         self.bulk_ingest_current_scan_clone_active_bytes +|= snapshot_bytes;
         self.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
             self.bulk_ingest_current_scan_clone_peak_active_bytes,
@@ -2872,6 +3672,11 @@ pub const Backend = struct {
 
     pub fn releaseCurrentScanMutableStateForBulkIngest(self: *Backend, snapshot: *const State) void {
         const snapshot_bytes = estimateStateBytes(snapshot);
+        if (snapshot.account) |account| {
+            const refs = self.bulk_snapshot_accounts.getPtr(account).?;
+            refs.* -= 1;
+            if (refs.* == 0) _ = self.bulk_snapshot_accounts.remove(account);
+        } else self.bulk_snapshot_unshared_bytes -|= snapshot_bytes;
         if (snapshot_bytes >= self.bulk_ingest_current_scan_clone_active_bytes) {
             self.bulk_ingest_current_scan_clone_active_bytes = 0;
         } else {
@@ -2888,13 +3693,276 @@ pub const Backend = struct {
     }
 
     fn destroyImmutableMemtable(self: *Backend, state: *State) void {
-        state.deinit(self.allocator);
-        self.allocator.destroy(state);
+        self.destroyMutableSnapshot(state);
     }
 
     fn destroyMutableSnapshot(self: *Backend, state: *State) void {
-        state.deinit(self.allocator);
-        self.allocator.destroy(state);
+        @import("lsm_backend/memtable_reclamation.zig").retire(self, state);
+    }
+
+    /// Owned replay/bulk snapshots use the same infallible handoff as shared
+    /// reader epochs. Caller holds Backend.mu and transfers the header.
+    pub fn retireOwnedMutableSnapshot(self: *Backend, state: *State) void {
+        self.destroyMutableSnapshot(state);
+    }
+
+    /// Detach retired generations while serialized; reclaim their potentially
+    /// large subtrees outside the writer lock. A lifecycle pin protects close.
+    pub fn unlockWithReclamation(self: *Backend) void {
+        @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
+        @import("lsm_backend/memtable_reclamation.zig").reclaimSliceLocked(self);
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
+        // Reclamation releases lifecycle pins only. It must not initiate a
+        // best-effort manifest write and consume a durability error belonging
+        // to the explicit sync/publication operation that unlocked us.
+        self.reclaimClosurePlanningSliceLocked();
+        self.reclaimGcPlanningSliceLocked();
+        self.reclaimBulkPlanningSliceLocked();
+        self.reclaimStoreSliceLocked();
+        self.reclaimDirectorySliceLocked();
+        var turns: usize = 0;
+        while (self.retired_read_versions != null and turns < 8) : (turns += 1) {
+            var batch = ReclaimingMemory{ .next = self.reclaiming_memory, .versions = self.retired_read_versions };
+            self.retired_read_versions = null;
+            var version = batch.versions;
+            while (version) |item| : (version = item.retired_next) {
+                if (item.directory) |dir| dir.retainAccounting();
+            }
+            self.reclaiming_memory = &batch;
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            version = batch.versions;
+            while (version) |item| : (version = item.retired_next) item.destroyContents(self);
+            _ = runtime_mod.lockBackend(Backend, self);
+            var link = &self.reclaiming_memory;
+            while (link.*.? != &batch) link = &link.*.?.next;
+            link.* = batch.next;
+            version = batch.versions;
+            while (version) |item| {
+                version = item.retired_next;
+                if (item.directory) |dir| {
+                    dir.releaseAccounting();
+                    item.allocator.destroy(dir);
+                }
+                item.allocator.destroy(item);
+            }
+            // File pins held by retired metadata have now been released. Run
+            // the usual reader-release checkpoint only after reclamation.
+            self.obsolete_reclaim_retry_at_ns = 0;
+            self.releaseReaderKind(.other);
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
+        // Small snapshot retirements normally finish in this unlock. Only
+        // residual debt warrants a worker; pre-unlock scheduling would submit
+        // an otherwise empty background job on each ordinary manifest edit.
+        if ((self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) or
+            @import("lsm_backend/memtable_reclamation.zig").pending(self)) self.scheduleMaintenanceJobLocked(true);
+        self.mu.unlock();
+    }
+
+    fn reclaimDirectorySliceLocked(self: *Backend) void {
+        if (self.directory_reclaim_in_flight) return;
+        if (self.directory_reclaimer == null and self.retired_run_directories == null) return;
+        self.directory_reclaim_in_flight = true;
+        defer self.directory_reclaim_in_flight = false;
+        var credits: usize = 2048;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            if (self.directory_reclaimer == null) {
+                const directory = self.retired_run_directories orelse break;
+                self.retired_run_directories = directory.retired_next;
+                self.directory_reclaimer = .init(directory);
+            }
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            const done = self.directory_reclaimer.?.step(self.allocator, &quantum);
+            _ = runtime_mod.lockBackend(Backend, self);
+            credits -= before - quantum;
+            if (done) {
+                self.directory_reclaimer.?.finish(self.allocator);
+                self.directory_reclaimer = null;
+            }
+            self.releaseReaderKind(.other);
+        }
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn retireRunStore(self: *Backend, store: *RunStore) void {
+        store.retired_next = self.retired_run_stores;
+        self.retired_run_stores = store;
+    }
+
+    fn reclaimStoreSliceLocked(self: *Backend) void {
+        if (self.store_reclaim_in_flight) return;
+        if (self.store_reclaimer == null and self.retired_run_stores == null) return;
+        self.store_reclaim_in_flight = true;
+        defer self.store_reclaim_in_flight = false;
+        var credits: usize = 2048;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            if (self.store_reclaimer == null) {
+                const store = self.retired_run_stores orelse break;
+                self.retired_run_stores = store.retired_next;
+                self.store_reclaimer = .init(store);
+            }
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            const done = self.store_reclaimer.?.step(self.allocator, &quantum);
+            _ = runtime_mod.lockBackend(Backend, self);
+            credits -= before - quantum;
+            if (done) {
+                self.store_reclaimer.?.finish(self.allocator);
+                self.store_reclaimer = null;
+            }
+            self.releaseReaderKind(.other);
+        }
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn retireClosurePlanning(self: *Backend, pending: *compaction_mod.PendingDirectoryClosure) void {
+        pending.retired_next = self.retired_closures;
+        self.retired_closures = pending;
+    }
+
+    pub fn retireAdmission(self: *Backend, pending: *compaction_mod.PendingAdmission) void {
+        pending.retired_next = self.retired_admissions;
+        self.retired_admissions = pending;
+    }
+
+    fn reclaimAdmissionSliceLocked(self: *Backend) void {
+        if (self.admission_reclaim_in_flight) return;
+        const pending = self.retired_admissions orelse return;
+        self.admission_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and platform_time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_admissions;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.destroy(self);
+        }
+        self.admission_reclaim_in_flight = false;
+        self.releaseReaderKind(.other);
+    }
+
+    pub fn retireBulkPlanning(self: *Backend, pending: *compaction_mod.PendingBulkPlan) void {
+        self.unregisterBulkPlanning(pending);
+        pending.retired_next = self.retired_bulk_plans;
+        self.retired_bulk_plans = pending;
+    }
+    pub fn unregisterBulkPlanning(self: *Backend, pending: *compaction_mod.PendingBulkPlan) void {
+        var link = &self.active_bulk_plans;
+        while (link.*) |active| {
+            if (active == pending) {
+                link.* = active.active_next;
+                active.active_next = null;
+                return;
+            }
+            link = &active.active_next;
+        }
+    }
+    fn reclaimBulkPlanningSliceLocked(self: *Backend) void {
+        if (self.bulk_plan_reclaim_in_flight) return;
+        const pending = self.retired_bulk_plans orelse return;
+        self.bulk_plan_reclaim_in_flight = true;
+        defer self.bulk_plan_reclaim_in_flight = false;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_bulk_plans;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.finish(self);
+        }
+        self.releaseReaderKind(.other);
+    }
+
+    fn reclaimClosurePlanningSliceLocked(self: *Backend) void {
+        self.reclaimAdmissionSliceLocked();
+        if (self.closure_reclaim_in_flight) return;
+        const pending = self.retired_closures orelse return;
+        self.closure_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_closures;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.destroy(self);
+        }
+        self.closure_reclaim_in_flight = false;
+        self.releaseReaderKind(.other);
+    }
+
+    pub fn retireGcPlanning(self: *Backend, pending: *compaction_mod.PendingGc) void {
+        pending.discardIntent(self);
+        pending.retired_next = self.retired_gc;
+        self.retired_gc = pending;
+    }
+
+    fn reclaimGcPlanningSliceLocked(self: *Backend) void {
+        if (self.gc_reclaim_in_flight) return;
+        const pending = self.retired_gc orelse return;
+        self.gc_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_gc;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.destroy(self);
+        }
+        self.gc_reclaim_in_flight = false;
+        self.releaseReaderKind(.other);
     }
 
     fn reserveImmutableMemtableRetirement(self: *Backend, state: *const State) !void {
@@ -2998,9 +4066,13 @@ pub const Backend = struct {
     }
 
     fn maybeCheckpointWalAfterManifestPublish(self: *Backend) !void {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         if (self.recovery_replaying_wal) return;
-        if (self.mutable.entries.items.len == 0 and self.activeImmutableMemtableCount() == 0) {
+        // A newer flush can finish while an older manifest is syncing. Empty
+        // memtables alone no longer prove that the WAL is covered durably.
+        if (!self.manifestCoversCurrentRuns()) return;
+        if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) {
             try self.resetWalAfterManifestCheckpoint();
             return;
         }
@@ -3018,6 +4090,7 @@ pub const Backend = struct {
     }
 
     fn estimateStateBytes(state: anytype) u64 {
+        if (comptime @hasDecl(@TypeOf(state.*), "estimatedMemoryBytes")) return state.estimatedMemoryBytes();
         var total: u64 = @as(u64, @intCast(state.entries.capacity)) * @sizeOf(state_mod.OwnedEntry);
         if (state.arena_owner) |arena| {
             // Arena frees are intentionally deferred until the whole memtable
@@ -3026,6 +4099,7 @@ pub const Backend = struct {
             total +|= arena.queryCapacity();
         } else {
             for (state.entries.items) |entry| {
+                total +|= entry.sharedOverheadBytes();
                 if (entry.namespace_name) |name| total += name.len;
                 total += entry.key.len;
                 total += entry.value.len;
@@ -3097,6 +4171,7 @@ pub const Backend = struct {
             .reverse_ranges = true,
             .cursors = true,
             .ordered_append_puts = true,
+            .unordered_bulk_append_puts = true,
             .native_namespaces = false,
             .write_batches = .atomic,
             .single_writer = true,
@@ -3147,7 +4222,7 @@ pub const Backend = struct {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
                 self.scheduleImmutableFlushJob();
-                try self.enforceDeferredImmutableBackpressure();
+                try self.enforceDeferredImmutableBackpressure(true);
             } else {
                 try self.flushMutable();
             }
@@ -3166,28 +4241,60 @@ pub const Backend = struct {
     /// This boundary can be reached while the caller holds a higher-level DB
     /// apply lock. It must therefore never sleep waiting for aggregate
     /// ResourceManager usage owned by another backend: that backend may need
-    /// the same apply lock to flush or publish its work. Soft throttling is a
-    /// local reclamation request here. If local state has been drained and the
-    /// aggregate slice is still only soft-pressured, admit the write and let
-    /// the post-commit/background paths make progress. Hard pressure remains
-    /// a non-blocking pre-WAL rejection.
+    /// the same apply lock to flush or publish its work. Pressure first asks
+    /// elastic caches and this backend's already-durable state for bounded
+    /// reclamation. If local state has been drained and aggregate hard
+    /// pressure remains, reject before WAL append. Soft aggregate pressure
+    /// owned by another backend remains advisory here.
     pub fn enforceMutableWriteAdmission(self: *Backend, incoming: *const ActiveMemTable) !void {
-        const manager = self.options.resource_manager orelse return;
-        const incoming_bytes = estimateStateBytes(incoming);
+        return try self.enforceInMemoryWriteAdmission(estimateStateBytes(incoming));
+    }
 
+    pub fn enforceSortedWriteAdmission(self: *Backend, incoming: *const State) !void {
+        return try self.enforceInMemoryWriteAdmission(estimateStateBytes(incoming));
+    }
+
+    fn enforceInMemoryWriteAdmission(self: *Backend, incoming_bytes: u64) !void {
+        const manager = self.options.resource_manager orelse return;
         while (true) {
+            // Drain against the incoming batch first. The final serialized
+            // WAL boundary admits the successor's actual unique allocations,
+            // not a multiplied worst-case charge for every shared path.
             const decision = manager.admissionDecision(.lsm_in_memory_state, incoming_bytes);
             switch (decision.action) {
                 .report, .shrink_cache, .defer_background_work => return,
-                .reject_work => return error.ResourceBudgetExceeded,
+                .reject_work => {
+                    // Aggregate hard pressure uses reject_work regardless of
+                    // this slice's normal hard policy. Give cheap derivative
+                    // caches and locally owned durable state a chance to make
+                    // this request fit before surfacing a retry to the public
+                    // API. Never wait on another owner from this boundary.
+                    _ = manager.reclaimForAllocation(.lsm_in_memory_state, incoming_bytes);
+                },
                 .throttle_writes => {},
+            }
+
+            // Soft pressure paces writes and asks this owner for bounded
+            // reclamation; it must not destroy an incomplete publication
+            // window merely because another LSM owns the remaining aggregate
+            // usage. Publish at most one complete window, or one ordinary
+            // mutable generation when windowing is disabled, then admit.
+            if (decision.pressure == .soft) {
+                if (self.activeImmutableMemtableCount() > 0) {
+                    _ = try self.flushImmutableMemtableWindow(false);
+                } else if (self.mutable.entryCount() > 0 and
+                    self.options.immutable_flush_window_bytes == 0)
+                {
+                    try self.flushMutable();
+                }
+                return;
             }
 
             if (self.activeImmutableMemtableCount() > 0) {
                 if (try self.flushOldestImmutableMemtable()) continue;
                 self.scheduleImmutableFlushJob();
                 if (self.waitForImmutableFlushBuildLocked()) continue;
-            } else if (self.mutable.entries.items.len > 0) {
+            } else if (self.mutable.entryCount() > 0) {
                 try self.flushMutable();
                 continue;
             }
@@ -3210,7 +4317,7 @@ pub const Backend = struct {
         return self.options.defer_flush_on_commit;
     }
 
-    fn enforceDeferredImmutableBackpressure(self: *Backend) !void {
+    fn enforceDeferredImmutableBackpressure(self: *Backend, include_global_pressure: bool) !void {
         const count_limit = self.options.max_deferred_immutable_memtables;
         const byte_limit = self.options.max_deferred_immutable_bytes;
         while (true) {
@@ -3224,10 +4331,21 @@ pub const Backend = struct {
             // This boundary is after the write was admitted and may already be
             // durable. A newly observed reject action therefore drains like a
             // throttle; rejection itself is handled before WAL append above.
-            const global_throttle = (resource_decision.action == .throttle_writes or
-                resource_decision.action == .reject_work) and
+            const global_throttle = include_global_pressure and
+                (resource_decision.action == .throttle_writes or
+                    resource_decision.action == .reject_work) and
                 self.activeImmutableMemtableCount() > 0;
             if (!local_pressure and !global_throttle) return;
+
+            // Soft aggregate pressure may be owned by another backend. Offer
+            // one complete local window without force-publishing a partial
+            // one, then return; the pre-WAL hard guard and local caps retain
+            // their strict behavior. This avoids turning every status-scan
+            // rotation into a tiny file during sustained ingestion.
+            if (!local_pressure and resource_decision.pressure == .soft) {
+                _ = try self.flushImmutableMemtableWindow(false);
+                return;
+            }
 
             if (!try self.flushOldestImmutableMemtable()) {
                 self.scheduleImmutableFlushJob();
@@ -3274,15 +4392,26 @@ pub const Backend = struct {
 
         try clearRunsAndFiles(&dest);
 
+        // Imported runs retain their logical L0 publication sequence. Reserve
+        // the source's sequence space before allocating child runs so later
+        // child flushes (including metadata tombstones) sort ahead of them.
+        dest.next_run_id = @max(dest.next_run_id, self.next_run_id);
+
         var wrote_any = false;
-        for (self.runs.items) |*run| {
+        // L0 precedence is encoded by run ID. Assign replacement IDs oldest
+        // first so the child keeps the source's newest-write-wins ordering.
+        var source_index = self.runs.count();
+        while (source_index > 0) {
+            source_index -= 1;
+            const run = self.runs.at(source_index);
             switch (classifyRun(run.*, split_key)) {
                 .left => {},
                 .right => {
                     const source_runs = [_]*Run{run};
                     var child_runs = try compaction_mod.makePersistedRunsFromSelectedRuns(Backend, &dest, &source_runs, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
-                    try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
+                    try compaction_mod.appendBackendRuns(&dest, &child_runs);
                     wrote_any = true;
                 },
                 .overlap => {
@@ -3292,13 +4421,13 @@ pub const Backend = struct {
                     if (split.right.entries.items.len == 0) continue;
                     var child_runs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &dest, &split.right, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
-                    try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
+                    try compaction_mod.appendBackendRuns(&dest, &child_runs);
                     wrote_any = true;
                 },
             }
         }
 
-        compaction_mod.sortRuns(dest.runs.items);
         try dest.persistManifest();
         return wrote_any;
     }
@@ -3313,11 +4442,20 @@ pub const Backend = struct {
         try self.flushMutable();
 
         const allocator = self.allocator;
-        var old_runs = self.runs;
-        self.runs = .empty;
+        // Join the publication lane before borrowing or detaching run ownership.
+        // A preceding publisher may release the backend lock during I/O; waiting
+        // here keeps readers on the complete old version until our turn begins.
+        var manifest_turn = try self.beginManifestTurn();
+        defer manifest_turn.deinit();
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        var old_store = self.runs;
+        var old_runs: std.ArrayListUnmanaged(Run) = .fromOwnedSlice(try old_store.project(allocator));
+        defer old_runs.deinit(allocator);
+        self.invalidateReadVersion();
+        self.runs = .{ .destroy_run = destroyOwnedRun };
         var ownership_committed = false;
         errdefer {
-            if (!ownership_committed) self.runs = old_runs;
+            if (!ownership_committed) self.runs = old_store;
         }
 
         const RunAction = union(enum) {
@@ -3328,9 +4466,9 @@ pub const Backend = struct {
 
         var actions = try allocator.alloc(RunAction, old_runs.items.len);
         defer allocator.free(actions);
-        var actions_initialized: usize = 0;
+        for (actions) |*action| action.* = .keep;
         errdefer {
-            for (actions[0..actions_initialized]) |*action| {
+            for (actions) |*action| {
                 switch (action.*) {
                     .replace => |*runs| compaction_mod.discardOutputRuns(Backend, self, runs),
                     .keep, .drop => {},
@@ -3339,9 +4477,18 @@ pub const Backend = struct {
         }
 
         var changed = false;
-        for (old_runs.items, 0..) |*run, i| {
+        var source_index = old_runs.items.len;
+        while (source_index > 0) {
+            source_index -= 1;
+            const i = source_index;
+            const run = &old_runs.items[i];
             switch (classifyRun(run.*, split_key)) {
-                .left => actions[i] = .keep,
+                .left => {
+                    // Physical file IDs do not define precedence. Retain every
+                    // left-only file; straddling replacements inherit their
+                    // source's logical visibility generation below.
+                    actions[i] = .keep;
+                },
                 .right => {
                     actions[i] = .drop;
                     changed = true;
@@ -3353,16 +4500,17 @@ pub const Backend = struct {
                     if (split.left.entries.items.len == 0) {
                         actions[i] = .drop;
                     } else {
-                        actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level) };
+                        const replacements = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level);
+                        compaction_mod.setL0Sequence(replacements.items, compaction_mod.l0Sequence(run.*));
+                        actions[i] = .{ .replace = replacements };
                     }
                     changed = true;
                 },
             }
-            actions_initialized = i + 1;
         }
 
         if (!changed) {
-            self.runs = old_runs;
+            self.runs = old_store;
             return false;
         }
 
@@ -3372,13 +4520,13 @@ pub const Backend = struct {
         var prospective_runs = std.ArrayListUnmanaged(Run).empty;
         defer prospective_runs.deinit(allocator);
         var prospective_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => prospective_run_count += 1,
             .drop => {},
             .replace => |replacements| prospective_run_count += replacements.items.len,
         };
         try prospective_runs.ensureTotalCapacity(allocator, prospective_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => prospective_runs.appendAssumeCapacity(run),
             .drop => {},
             .replace => |replacements| for (replacements.items) |replacement| {
@@ -3394,7 +4542,7 @@ pub const Backend = struct {
         }
         var rewritten_run_count: usize = 0;
         var obsolete_run_count: usize = 0;
-        for (actions[0..actions_initialized]) |action| switch (action) {
+        for (actions) |action| switch (action) {
             .keep => rewritten_run_count += 1,
             .drop => obsolete_run_count += 1,
             .replace => |replacements| {
@@ -3417,7 +4565,7 @@ pub const Backend = struct {
             obsolete_paths.deinit(allocator);
         }
         try obsolete_paths.ensureTotalCapacity(allocator, obsolete_run_count);
-        for (old_runs.items, actions[0..actions_initialized]) |run, action| switch (action) {
+        for (old_runs.items, actions) |run, action| switch (action) {
             .keep => {},
             .drop, .replace => if (run.path) |path| {
                 obsolete_paths.appendAssumeCapacity(try allocator.dupe(u8, path));
@@ -3426,8 +4574,27 @@ pub const Backend = struct {
         try self.obsolete_paths.ensureUnusedCapacity(allocator, obsolete_paths.items.len);
         try self.obsolete_runs.ensureUnusedCapacity(allocator, 1);
 
+        // Build both immutable roots before the durable split decision. WAL
+        // cleanup uses their shared identity, never the emptiness of the
+        // temporarily detached mutable run array, as its coverage proof.
+        var prepared_directory: ?*RunDirectory = try RunDirectory.create(allocator);
+        defer if (prepared_directory) |directory| directory.destroy(allocator);
+        for (prospective_runs.items) |run| try prepared_directory.?.put(self, run);
+        var durable_directory: ?*RunDirectory = try prepared_directory.?.fork(allocator);
+        defer if (durable_directory) |directory| directory.destroy(allocator);
+        var prepared_store = old_store.emptyLike();
+        defer prepared_store.deinit(allocator);
+        for (prospective_runs.items) |run| try prepared_store.stage(allocator, run);
+        const retired_store = try allocator.create(RunStore);
+        errdefer allocator.destroy(retired_store);
+
         const manifest_start_ns = self.writeStatsNowNs();
-        _ = try self.writeRunSetManifestSnapshotLocked(self.root_dir.?, prospective_runs.items, manifest_start_ns);
+        _ = try self.writeRunSetManifestSnapshotInTurnLocked(self.root_dir.?, prospective_runs.items, manifest_start_ns, false, manifest_turn.waited);
+
+        for (prospective_runs.items) |*run| {
+            prepared_store.adopt(run);
+            prepared_store.find(run).?.commitOutput();
+        }
 
         for (old_runs.items, 0..) |*run, i| {
             switch (actions[i]) {
@@ -3436,7 +4603,7 @@ pub const Backend = struct {
                     run.* = undefined;
                 },
                 .drop => {
-                    obsolete_runs.appendAssumeCapacity(run.*);
+                    obsolete_runs.appendAssumeCapacity(run.retainOwned());
                     run.* = undefined;
                 },
                 .replace => |*replacements| {
@@ -3447,17 +4614,22 @@ pub const Backend = struct {
                     replacements.items.len = 0;
                     replacements.deinit(allocator);
                     replacements.* = .empty;
-                    obsolete_runs.appendAssumeCapacity(run.*);
+                    obsolete_runs.appendAssumeCapacity(run.retainOwned());
                     run.* = undefined;
                 },
             }
         }
 
-        old_runs.deinit(allocator);
-        old_runs = .empty;
-        compaction_mod.sortRuns(rewritten.items);
-        self.runs = rewritten;
+        retired_store.* = old_store;
+        self.retireRunStore(retired_store);
+        self.runs = prepared_store;
+        prepared_store = .empty;
+        rewritten.deinit(allocator);
         rewritten = .empty;
+        self.publishRunDirectory(prepared_directory);
+        prepared_directory = null;
+        self.publishManifestDirectory(durable_directory);
+        durable_directory = null;
         ownership_committed = true;
         self.manifest_dirty = false;
         self.obsolete_manifest_dirty = false;
@@ -3466,8 +4638,7 @@ pub const Backend = struct {
             path.* = &.{};
         }
         obsolete_paths.items.len = 0;
-        for (obsolete_runs.items) |*run| self.releaseRunVersionRef(run);
-        self.obsolete_runs.appendAssumeCapacity(obsolete_runs);
+        self.queueObsoleteRunsAssumeCapacity(obsolete_runs);
         obsolete_runs = .empty;
         self.drainUnpinnedObsoleteRuns();
         // The run-set manifest is already durable. WAL retirement is cleanup,
@@ -3482,7 +4653,7 @@ pub const Backend = struct {
     }
 
     fn flushMutable(self: *Backend) !void {
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
         try self.flushAllImmutableMemtables();
@@ -3490,7 +4661,7 @@ pub const Backend = struct {
 
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
@@ -3504,8 +4675,26 @@ pub const Backend = struct {
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.mutable.entries.items.len == 0) return true;
+        if (self.canQueueDirectBulkStateWithPendingImmutable()) {
+            // The queued epochs remain older than the incoming sorted state.
+            // Rotate only the mutable tail; flushing the complete queue here
+            // would recreate one table publication per request boundary.
+            if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
+            return true;
+        }
+        // Direct-ingested runs are newer than every pending memtable, while
+        // readers intentionally consult mutable/immutable state before runs.
+        // Publish all older immutable epochs first so tier priority cannot let
+        // an older value shadow the new direct run. This is foreground work
+        // replacing an even more expensive mutable fallback, so it is not
+        // charged to the background maintenance-step budget.
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
+        if (self.mutable.entryCount() == 0) return true;
         if (self.activeImmutableMemtableCount() != 0) return false;
+        if (self.mutable.entryCount() == 0) return true;
         self.invalidateMutableReadSnapshot();
         var sorted = try self.mutable.toStateMove(self.allocator);
         errdefer sorted.deinit(self.allocator);
@@ -3516,8 +4705,38 @@ pub const Backend = struct {
         return true;
     }
 
+    /// Publish every older immutable epoch, then fold the current transaction
+    /// into the older mutable epoch and publish the combined state as one run.
+    /// Commit serialization supplies the epoch order; merging before sorting
+    /// preserves last-write-wins without manufacturing a small run for the old
+    /// mutable state followed immediately by another run for the new batch.
+    pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
+        if (!self.options.direct_bulk_ingest) return false;
+
+        if (self.canQueueDirectBulkStateWithPendingImmutable()) {
+            // Commit serialization orders the old mutable entries before the
+            // incoming transaction. Fold them once, sort by moving to State,
+            // then append that complete epoch after every existing immutable.
+            self.invalidateMutableReadSnapshot();
+            try state_mod.applyMutableMoveToMutable(&self.mutable, self.allocator, incoming);
+            var sorted = try self.mutable.toStateMove(self.allocator);
+            defer sorted.deinit(self.allocator);
+            return try self.enqueueOwnedSortedStateForFlush(&sorted);
+        }
+
+        const saved_budget = self.maintenance_io_budget_remaining;
+        self.maintenance_io_budget_remaining = null;
+        defer self.maintenance_io_budget_remaining = saved_budget;
+        try self.flushAllImmutableMemtables();
+        if (self.activeImmutableMemtableCount() != 0) return false;
+
+        self.invalidateMutableReadSnapshot();
+        try state_mod.applyMutableMoveToMutable(&self.mutable, self.allocator, incoming);
+        return try self.directIngestMutableAtBulkFinishIfPossible();
+    }
+
     fn rotateMutableToImmutable(self: *Backend) !void {
-        if (self.mutable.entries.items.len == 0) return;
+        if (self.mutable.entryCount() == 0) return;
         self.invalidateMutableReadSnapshot();
         const rotated_logical_bytes = self.mutable.logical_bytes;
         const rotated = try self.allocator.create(State);
@@ -3532,6 +4751,7 @@ pub const Backend = struct {
         self.mutable_idle_flush_deadline_ns = 0;
         self.mutable_idle_flush_max_deadline_ns = 0;
         self.write_stats.immutable_rotations += 1;
+        self.noteImmutableWriteMutationLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
@@ -3542,6 +4762,12 @@ pub const Backend = struct {
     fn scheduleImmutableFlushJob(self: *Backend) void {
         if (self.activeImmutableMemtableCount() == 0) return;
         if (self.closing.load(.acquire)) return;
+        // A partial window is already durable in the WAL and query-visible in
+        // the immutable queue. Do not launch a force-draining job for it: the
+        // next append, local pressure, idle deadline, explicit finish, or close
+        // will publish it. This is the batching boundary that lets adjacent
+        // sorted commits share one run build and manifest generation.
+        if (self.immutableFlushWindowCount(false) == 0) return;
         if (self.options.maintenance_waker != null) {
             self.wakeMaintenanceWorker();
             return;
@@ -3563,27 +4789,35 @@ pub const Backend = struct {
         defer runtime_mod.unlockBackend(Backend, self, locked);
         defer self.immutable_flush_job_in_flight = false;
         if (self.options.backend.read_only) return;
-        try self.flushAllImmutableMemtables();
+        while (try self.flushImmutableMemtableWindow(false)) {}
         _ = self.refreshCachedMaintenanceHintLocked();
     }
 
     fn deinitImmutableFlushJob(_: *anyopaque) void {}
 
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
+        self.scheduleMaintenanceJobLocked(false);
+    }
+
+    fn scheduleMaintenanceJobLocked(self: *Backend, after_reclamation: bool) void {
         if (self.closing.load(.acquire)) return;
-        if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and !self.wal_checkpoint_pending) return;
+        const pending_ledger = self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight;
+        const pending_memory = @import("lsm_backend/memtable_reclamation.zig").pending(self);
+        const ledger_cleanup = after_reclamation and (pending_ledger or pending_memory);
+        if (self.options.backend.read_only and !ledger_cleanup) return;
+        if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
+        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation) - @intFromBool(pending_memory and !after_reclamation);
         if (self.options.maintenance_waker != null) {
-            if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
+            if (score != 0) self.wakeMaintenanceWorker();
             return;
         }
         if (self.maintenance_job_in_flight) return;
-        if (!self.bulkIngestActive()) {
+        if (!self.bulkIngestActive() and !ledger_cleanup) {
             if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
             if (self.activeImmutableMemtableCount() > 0) return;
         }
         if (!self.background_executor.canRunDetached()) return;
-        if (!self.bulkIngestActive() and self.maintenanceScoreLocked() == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
+        if (!self.bulkIngestActive() and score == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
 
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
@@ -3623,15 +4857,40 @@ pub const Backend = struct {
 
     fn deinitMaintenanceJob(_: *anyopaque) void {}
 
+    fn immutableFlushWindowCount(self: *const Backend, force: bool) usize {
+        const active_count = self.activeImmutableMemtableCount();
+        if (active_count == 0) return 0;
+        const target_bytes = self.options.immutable_flush_window_bytes;
+        if (target_bytes == 0 or self.root_dir == null or self.storage == null) return 1;
+        const max_count = @max(@as(usize, 1), self.options.immutable_flush_window_max_memtables);
+        var logical_bytes: u64 = 0;
+        var count: usize = 0;
+        for (self.activeImmutableMemtables()[0..@min(active_count, max_count)]) |state| {
+            logical_bytes +|= estimateStateLogicalBytes(state);
+            count += 1;
+            if (logical_bytes >= target_bytes) return count;
+        }
+        return if (force or count == max_count) count else 0;
+    }
+
     fn flushOldestImmutableMemtable(self: *Backend) !bool {
-        if (self.activeImmutableMemtableCount() == 0) return false;
+        return try self.flushImmutableMemtableWindow(true);
+    }
+
+    fn flushImmutableMemtableWindow(self: *Backend, force: bool) !bool {
+        const window_count = self.immutableFlushWindowCount(force);
+        if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
-        if (!self.tryReserveMaintenanceIoBudget(estimatedFlushIoBytes(state))) return false;
+        var estimated_io_bytes: u64 = 0;
+        for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
+            estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
+        }
+        if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
-            return try self.flushOldestImmutableMemtableUnlockedBuild();
+            return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
         }
         const start_ns = self.writeStatsNowNs();
-        const input_entries = state.entries.items.len;
+        const input_entries = state.entryCount();
 
         var new_runs = try compaction_mod.makeRunsFromStateBorrowed(Backend, self, state);
         errdefer {
@@ -3641,17 +4900,23 @@ pub const Backend = struct {
         const elapsed_ns = self.writeStatsElapsedNs(start_ns);
         self.recordFlushWriteStats(input_entries, new_runs.items, elapsed_ns);
         self.write_stats.immutable_flushes += 1;
+        self.write_stats.immutable_flush_input_memtables += 1;
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         try self.reserveImmutableMemtableRetirement(state);
-        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
+        self.invalidateReadVersion();
+        try compaction_mod.appendBackendRuns(self, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
         self.noteImmutablePublishedForWal(state);
         self.immutable_head += 1;
         self.retireImmutableMemtable(state);
         self.compactImmutableMemtableQueue();
+        self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
-        compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
             if (self.writePressureDuringBulkIngestEnabled()) {
@@ -3664,19 +4929,26 @@ pub const Backend = struct {
             try self.maybeCompactRuns();
         }
         if (self.root_dir != null) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
         }
         return true;
     }
 
-    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend) !bool {
+    fn flushOldestImmutableMemtableUnlockedBuild(self: *Backend, window_count: usize) !bool {
         if (self.activeImmutableMemtableCount() == 0) return false;
         if (self.immutable_flush_build_in_flight) return false;
+        std.debug.assert(window_count > 0 and window_count <= self.activeImmutableMemtableCount());
 
         const start_ns = self.writeStatsNowNs();
         const publish_head = self.immutable_head;
-        const state = self.immutable_memtables.items[publish_head];
-        const input_entries = state.entries.items.len;
+        const window_oldest_first = self.immutable_memtables.items[publish_head .. publish_head + window_count];
+        var input_entries: usize = 0;
+        for (window_oldest_first) |window_state| input_entries += window_state.entryCount();
+        const states_newest_first = try self.allocator.alloc(*const State, window_count);
+        defer self.allocator.free(states_newest_first);
+        for (window_oldest_first, 0..) |window_state, i| {
+            states_newest_first[window_count - 1 - i] = window_state;
+        }
         const reserved_run_ids = @max(@as(u64, 1), @as(u64, @intCast(input_entries)));
         const reserved_run_id_start = self.next_run_id;
         self.next_run_id +|= reserved_run_ids;
@@ -3688,10 +4960,10 @@ pub const Backend = struct {
         var build_result: std.ArrayListUnmanaged(Run) = .empty;
         var build_result_valid = false;
         var build_err: ?anyerror = null;
-        build_result = compaction_mod.buildRunsFromStateBorrowedWithReservedIds(
+        build_result = compaction_mod.buildRunsFromStatesBorrowedWithReservedIds(
             Backend,
             self,
-            state,
+            states_newest_first,
             reserved_run_id_start,
             reserved_run_id_end,
         ) catch |err| blk: {
@@ -3702,36 +4974,60 @@ pub const Backend = struct {
 
         const relocked = runtime_mod.lockBackend(Backend, self);
         std.debug.assert(relocked);
-        defer self.finishImmutableFlushBuildLocked();
-        errdefer if (build_result_valid) compaction_mod.discardOutputRuns(Backend, self, &build_result);
+        var build_in_flight = true;
+        defer if (build_in_flight) self.finishImmutableFlushBuildLocked();
+        errdefer if (build_result_valid) compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
         if (build_err) |err| return err;
 
-        if (publish_head != self.immutable_head or
-            self.activeImmutableMemtableCount() == 0 or
-            self.immutable_memtables.items[publish_head] != state)
-        {
-            compaction_mod.discardOutputRuns(Backend, self, &build_result);
+        var window_matches = publish_head == self.immutable_head and
+            self.activeImmutableMemtableCount() >= window_count;
+        if (window_matches) {
+            for (0..window_count) |i| {
+                const window_state = states_newest_first[window_count - 1 - i];
+                if (self.immutable_memtables.items[publish_head + i] != window_state) {
+                    window_matches = false;
+                    break;
+                }
+            }
+        }
+        if (!window_matches) {
+            compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
             return false;
         }
 
         const elapsed_ns = self.writeStatsElapsedNs(start_ns);
         self.recordFlushWriteStats(input_entries, build_result.items, elapsed_ns);
         self.write_stats.immutable_flushes += 1;
+        self.write_stats.immutable_flush_input_memtables += @intCast(window_count);
         self.write_stats.immutable_flush_entries += @intCast(input_entries);
         self.write_stats.immutable_flush_ns += elapsed_ns;
         // The build ran without the backend lock, so reserve only after the
         // generation identity has been revalidated. From this point through
         // retirement, publication is allocation-free except for installing
         // the new run pointers themselves.
-        try self.reserveImmutableMemtableRetirement(state);
-        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &build_result);
-        self.noteImmutablePublishedForWal(state);
-        self.immutable_head += 1;
-        self.retireImmutableMemtable(state);
+        var pinned_retirements: usize = 0;
+        for (states_newest_first) |window_state| {
+            if (self.immutableMemtableIsPinned(window_state)) pinned_retirements += 1;
+        }
+        try self.retired_immutable_memtables.ensureUnusedCapacity(self.allocator, pinned_retirements);
+        var directory = try self.prepareRunDirectoryChange(null, build_result.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
+        self.invalidateReadVersion();
+        try compaction_mod.appendBackendRuns(self, &build_result);
+        self.publishRunDirectory(directory);
+        directory = null;
+        for (states_newest_first) |window_state| self.noteImmutablePublishedForWal(window_state);
+        self.immutable_head += window_count;
+        for (states_newest_first) |window_state| self.retireImmutableMemtable(@constCast(window_state));
         self.compactImmutableMemtableQueue();
+        self.clearImmutableIdleFlushDeadlineIfEmptyLocked();
         self.syncTrackedInMemoryStateUsageCurrentLocked();
 
-        compaction_mod.sortRuns(self.runs.items);
+        // Building and installing this SST is complete. Its durability lane
+        // may wait on fsync, but that must not hold up the next immutable's
+        // builder or overwrite a successor builder's completion flag.
+        self.finishImmutableFlushBuildLocked();
+        build_in_flight = false;
         if (self.bulkIngestActive()) {
             self.markManifestDirty();
             if (self.writePressureDuringBulkIngestEnabled()) {
@@ -3744,7 +5040,7 @@ pub const Backend = struct {
             try self.maybeCompactRuns();
         }
         if (self.root_dir != null) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
         }
         return true;
     }
@@ -3764,7 +5060,7 @@ pub const Backend = struct {
         key: []const u8,
     ) ![]const u8 {
         if (mutable.findIndex(namespace, key)) |idx| {
-            const entry = mutable.entries.items[idx];
+            const entry = mutable.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3773,23 +5069,29 @@ pub const Backend = struct {
             immutable_index -= 1;
             const immutable = self.immutable_memtables.items[immutable_index];
             if (immutable.findIndex(namespace, key)) |idx| {
-                const entry = immutable.entries.items[idx];
+                const entry = immutable.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 return entry.value;
             }
         }
 
         var run_index: usize = 0;
-        while (run_index < self.runs.items.len and self.runs.items[run_index].level == 0) : (run_index += 1) {
-            if (try self.getFromRunForPoint(&self.runs.items[run_index], namespace, key)) |value| return value;
+        while (run_index < self.runs.count() and self.runs.at(run_index).*.level == 0) : (run_index += 1) {
+            if (try self.getFromRunForPoint(self.runs.at(run_index), namespace, key)) |value| return value;
         }
 
-        while (run_index < self.runs.items.len) {
-            const level = self.runs.items[run_index].level;
+        while (run_index < self.runs.count()) {
+            const level = self.runs.at(run_index).*.level;
             const level_start = run_index;
-            while (run_index < self.runs.items.len and self.runs.items[run_index].level == level) : (run_index += 1) {}
-            const candidate = findRunIndexInSortedLevel(self.runs.items[level_start..run_index], namespace, key) orelse continue;
-            if (try self.getFromRunForPoint(&self.runs.items[level_start + candidate], namespace, key)) |value| return value;
+            while (run_index < self.runs.count() and self.runs.at(run_index).*.level == level) : (run_index += 1) {}
+            var lo = level_start;
+            var hi = run_index;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const run = self.runs.at(mid);
+                if (compareRunBound(run.largest_namespace_name, run.largest_key, namespace.name, key) == .lt) lo = mid + 1 else hi = mid;
+            }
+            if (lo < run_index) if (try self.getFromRunForPoint(self.runs.at(lo), namespace, key)) |value| return value;
         }
         return error.NotFound;
     }
@@ -3801,7 +5103,7 @@ pub const Backend = struct {
         }
         const state = try self.resolveRunState(run);
         if (state.findIndex(namespace, key)) |idx| {
-            const entry = state.entries.items[idx];
+            const entry = state.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3816,7 +5118,7 @@ pub const Backend = struct {
         key: []const u8,
     ) ![]const u8 {
         if (overlay.findIndex(namespace, key)) |idx| {
-            const entry = overlay.entries.items[idx];
+            const entry = overlay.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
             return entry.value;
         }
@@ -3831,10 +5133,10 @@ pub const Backend = struct {
         var out: State = .{};
         errdefer out.deinit(self.allocator);
 
-        var run_index = self.runs.items.len;
+        var run_index = self.runs.count();
         while (run_index > 0) {
             run_index -= 1;
-            const state = try self.resolveRunState(&self.runs.items[run_index]);
+            const state = try self.resolveRunState(self.runs.at(run_index));
             try state_mod.applyState(&out, self.allocator, state);
         }
         for (self.activeImmutableMemtables()) |immutable| {
@@ -3875,7 +5177,7 @@ pub const Backend = struct {
         if (self.options.backend.read_only) return error.ReadOnly;
         if (entries.len == 0) return;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -3887,9 +5189,13 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
-        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
+        self.invalidateReadVersion();
+        try compaction_mod.appendBackendRuns(self, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
 
-        compaction_mod.sortRuns(self.runs.items);
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
@@ -3897,16 +5203,16 @@ pub const Backend = struct {
                     try self.enforceWritePressure();
                 }
             } else {
-                try self.persistManifest();
+                try self.persistManifestLocked();
             }
         }
     }
 
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
-        if (state.entries.items.len == 0) return;
+        if (state.entryCount() == 0) return;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -3919,14 +5225,18 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
-        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
+        self.invalidateReadVersion();
+        try compaction_mod.appendBackendRuns(self, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
         self.unpublished_wal_logical_bytes +|= input_logical_bytes;
         self.unpublished_wal_max_batch_logical_bytes = @max(
             self.unpublished_wal_max_batch_logical_bytes,
             input_logical_bytes,
         );
 
-        compaction_mod.sortRuns(self.runs.items);
         if (self.root_dir != null) {
             if (self.bulkIngestActive()) {
                 self.markManifestDirty();
@@ -3934,20 +5244,20 @@ pub const Backend = struct {
                     try self.enforceWritePressure();
                 }
             } else {
-                try self.persistManifest();
+                try self.persistManifestLocked();
             }
         }
     }
 
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
-        if (state.entries.items.len == 0) return;
+        if (state.entryCount() == 0) return;
         if (self.root_dir != null) {
             try self.ingestSortedState(state);
             return;
         }
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.flushMutable();
         }
 
@@ -3973,30 +5283,96 @@ pub const Backend = struct {
         }
 
         self.recordSortedIngestWriteStats(new_runs.items, self.writeStatsElapsedNs(start_ns));
-        try compaction_mod.appendOwnedRuns(&self.runs, self.allocator, &new_runs);
+        var directory = try self.prepareRunDirectoryChange(null, new_runs.items);
+        errdefer if (directory) |owned| owned.destroy(self.allocator);
+        self.invalidateReadVersion();
+        try compaction_mod.appendBackendRuns(self, &new_runs);
+        self.publishRunDirectory(directory);
+        directory = null;
 
-        compaction_mod.sortRuns(self.runs.items);
         if (self.bulkIngestActive() and self.writePressureDuringBulkIngestEnabled()) {
             try self.enforceWritePressure();
         }
     }
 
+    /// Retain an already-sorted, WAL-backed bulk transaction as a query-visible
+    /// immutable epoch. A bounded bulk window can then stream several adjacent
+    /// transactions into one table generation and one manifest publication.
+    ///
+    /// This is intentionally opt-in through immutable_flush_window_bytes. The
+    /// caller appended the transaction WAL before entering this function, so
+    /// the mutable WAL range belongs to the moved state and is transferred at
+    /// the same lock-held visibility boundary.
+    pub fn enqueueOwnedSortedStateForFlush(self: *Backend, state: *State) !bool {
+        if (self.options.immutable_flush_window_bytes == 0 or
+            self.root_dir == null or
+            self.storage == null or
+            state.entryCount() == 0)
+        {
+            return false;
+        }
+        std.debug.assert(self.mutable.entryCount() == 0);
+
+        const logical_bytes = estimateStateLogicalBytes(state);
+        const queued = try self.allocator.create(State);
+        errdefer self.allocator.destroy(queued);
+        try self.immutable_memtables.ensureUnusedCapacity(self.allocator, 1);
+        try self.immutable_wal_ranges.ensureUnusedCapacity(self.allocator, 1);
+
+        queued.* = state.*;
+        state.* = .{};
+        self.immutable_memtables.appendAssumeCapacity(queued);
+        self.immutable_wal_ranges.appendAssumeCapacity(self.mutable_wal_range);
+        self.mutable_wal_range = .{};
+        self.active_immutable_logical_bytes +|= logical_bytes;
+        self.noteImmutableWriteMutationLocked();
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        self.scheduleImmutableFlushJob();
+        self.notePotentialMaintenanceDebtLocked();
+        // This transaction passed aggregate admission before its WAL append.
+        // Re-reading the global decision after installing it can observe the
+        // usage it just added and immediately flush every individually sorted
+        // bulk commit, defeating the bounded merge window. Enforce the local
+        // count/byte caps here; the next pre-WAL admission and the maintenance
+        // worker still react to aggregate pressure without a false-negative
+        // post-commit failure.
+        try self.enforceDeferredImmutableBackpressure(false);
+        return true;
+    }
+
+    pub fn canQueueDirectBulkStateWithPendingImmutable(self: *const Backend) bool {
+        return self.options.immutable_flush_window_bytes > 0 and
+            self.root_dir != null and
+            self.storage != null;
+    }
+
     pub fn shouldDirectIngestBulkState(self: *const Backend, state: *const State) bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        return self.stateMeetsBulkFlushThreshold(state);
+        if (self.activeImmutableMemtableCount() != 0 and
+            !self.canQueueDirectBulkStateWithPendingImmutable()) return false;
+        return self.stateMeetsDirectBulkIngestThreshold(state);
     }
 
     pub fn shouldDirectIngestBulkMutable(self: *const Backend, mutable: *const ActiveMemTable) bool {
         if (!self.options.direct_bulk_ingest) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
-        if (byte_threshold > 0) return stateMeetsByteFlushThreshold(mutable, byte_threshold);
-        return mutable.entries.items.len >= self.effectiveFlushThreshold();
+        if (self.activeImmutableMemtableCount() != 0 and
+            !self.canQueueDirectBulkStateWithPendingImmutable()) return false;
+        return self.stateMeetsDirectBulkIngestThreshold(mutable);
     }
 
     pub fn persistManifest(self: *Backend) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        try self.persistManifestLocked();
+    }
+
+    /// Caller owns the backend mutex; publication may temporarily release it.
+    pub fn persistManifestLocked(self: *Backend) !void {
         const root_dir = self.root_dir orelse return;
+        // A flush may have already installed its SSTs and retired the mutable
+        // generation. Keep publication debt visible even when append/sync
+        // fails, so a later sync cannot incorrectly report a clean store.
+        errdefer self.markManifestDirty();
         const start_ns = self.writeStatsNowNs();
 
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
@@ -4013,6 +5389,10 @@ pub const Backend = struct {
     }
 
     fn durableManifestHasNewerRunIdLocked(self: *Backend, root_dir: []const u8) bool {
+        // A mounted set behind an exclusive native writer lock cannot have
+        // been advanced by another writer. Clean sync is O(1), not a complete
+        // checkpoint/journal replay under the backend mutex.
+        if (self.root_writer_lock != null and self.manifest_journal.descriptor != null and self.manifest_journal.sequence != null) return false;
         const storage = self.storage orelse return false;
         var manifest_backing: ?[]u8 = null;
         defer if (manifest_backing) |backing| self.allocator.free(backing);
@@ -4042,31 +5422,255 @@ pub const Backend = struct {
     }
 
     fn writeManifestSnapshotLocked(self: *Backend, root_dir: []const u8, start_ns: u64) !void {
-        _ = try self.writeRunSetManifestSnapshotLocked(root_dir, self.runs.items, start_ns);
+        _ = try self.writeRunSetManifestSnapshotLocked(root_dir, &.{}, start_ns, true);
         try self.maybeCheckpointWalAfterManifestPublish();
-        self.manifest_dirty = false;
-        self.obsolete_manifest_dirty = false;
+        self.manifest_dirty = !self.manifestCoversCurrentRuns();
+        self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64) !usize {
-        try validateRunLayoutForManifest(runs);
-        const bytes = try repository_mod.persistManifestWithStorageCount(
-            self.storage.?,
-            self.allocator,
-            root_dir,
-            self.next_run_id,
-            runs,
-            self.obsolete_paths.items,
-        );
-        self.write_stats.manifest_writes += 1;
+    pub fn manifestCoordinationIo(self: *Backend) ?std.Io {
+        if (comptime builtin.os.tag == .freestanding) return null;
+        if (self.options.read_runtime) |runtime| return runtime.io;
+        if (self.storage_owner) |owner| return owner.state.threaded.io();
+        if (comptime builtin.is_test) return std.testing.io;
+        return null;
+    }
+
+    pub const ManifestTurn = struct {
+        backend: *Backend,
+        io: ?std.Io,
+        waited: bool,
+        pub fn deinit(turn: *@This()) void {
+            const backend = turn.backend;
+            backend.manifest_publish_in_flight = false;
+            backend.manifest_publish_allow_concurrency = false;
+            if (turn.io) |io| backend.manifest_publish_mu.unlock(io) else backend.manifest_publish_fallback_mu.unlock();
+            backend.releaseReaderKind(.other);
+        }
+    };
+
+    /// The lane serializes durable metadata, not readers or incoming flushes.
+    /// Waiters prepare from the latest root after admission, naturally grouping
+    /// publications accumulated during the previous fsync into one next edit.
+    pub fn beginManifestTurn(self: *Backend) !ManifestTurn {
+        const io = self.manifestCoordinationIo();
+        const acquired = if (io != null) self.manifest_publish_mu.tryLock() else self.manifest_publish_fallback_mu.tryLock();
+        // A caller reaching this lane may already have committed its WAL.
+        // Queue capacity is reserved by admitCommit, before that boundary;
+        // never convert lane contention into a post-commit admission failure.
+        self.retainReaderKind(.other);
+        if (!acquired) {
+            self.manifest_publish_waiters += 1;
+            const started = self.writeStatsNowNs();
+            runtime_mod.unlockBackend(Backend, self, true);
+            if (io) |runtime| self.manifest_publish_mu.lockUncancelable(runtime) else platform.sync.lockYielding(&self.manifest_publish_fallback_mu);
+            _ = runtime_mod.lockBackend(Backend, self);
+            self.manifest_publish_waiters -= 1;
+            self.write_stats.manifest_publication_waits +|= 1;
+            self.write_stats.manifest_publication_wait_ns +|= self.writeStatsElapsedNs(started);
+        }
+        self.manifest_publish_in_flight = true;
+        return .{ .backend = self, .io = io, .waited = !acquired };
+    }
+
+    pub const CommitAdmission = struct {
+        backend: *Backend,
+        bytes: u64,
+        wire_bytes: u64 = 0,
+        counted: bool,
+
+        pub fn retainDebt(ticket: @This()) void {
+            const backend = ticket.backend;
+            if (!backend.manifest_recovery_required and backend.mutable.entryCount() == 0 and backend.activeImmutableMemtableCount() == 0 and backend.manifestCoversCurrentRuns()) return;
+            backend.manifest_unpublished_wire_bytes +|= ticket.wire_bytes;
+        }
+
+        pub fn release(ticket: @This()) void {
+            if (!ticket.counted) return;
+            const backend = ticket.backend;
+            std.debug.assert(backend.manifest_admitted_commits != 0);
+            std.debug.assert(backend.manifest_admitted_bytes >= ticket.bytes);
+            backend.manifest_admitted_commits -= 1;
+            backend.manifest_admitted_bytes -= ticket.bytes;
+            backend.manifest_admitted_wire_bytes -= 2 * ticket.wire_bytes;
+        }
+    };
+
+    /// Caller owns the backend mutex. The owned ticket follows the commit
+    /// across unlocked SST/fsync work and is released on every exit path.
+    pub fn admitCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State) !CommitAdmission {
+        return self.admitPreparedCommit(incoming, bulk, try self.prepareManifestCredit(incoming, bulk));
+    }
+
+    pub fn fenceFailedBulkWal(self: *Backend) void {
+        if (self.root_dir == null or !self.options.wal_enabled) return;
+        self.manifest_recovery_required = true;
+        self.markManifestDirty();
+    }
+
+    pub fn prepareManifestCredit(self: *const Backend, incoming: anytype, bulk: anytype) !u64 {
+        if (self.root_dir == null) return 0;
+        if (self.options.resource_manager) |manager| {
+            var budget = resource_manager_mod.BudgetedAllocator.init(manager, .lsm_table_builder_working_set, self.allocator, 1);
+            defer budget.deinit();
+            return @import("lsm_backend/manifest_credit.zig").estimate(budget.allocator(), self.options, self.root_dir.?.len, incoming, bulk) catch |err| {
+                if (budget.budget_denied) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        }
+        return @import("lsm_backend/manifest_credit.zig").estimate(self.allocator, self.options, self.root_dir.?.len, incoming, bulk);
+    }
+
+    fn manifestCreditFits(self: *const Backend, extra: u64) bool {
+        if (self.root_dir == null) return true;
+        if (self.manifest_journal.segment_count >= @import("lsm_backend/manifest_set.zig").max_segments - 1) return false;
+        const lifecycle = 4096 + 3 * 64 * (self.root_dir.?.len + 128);
+        const checkpoint = 76 +| self.runs.manifestBytes() +| self.obsolete_paths.manifestBytes();
+        const frontier = @max(self.manifest_journal.bytes, checkpoint +| self.manifest_journal.edit_bytes);
+        const committed = frontier +| lifecycle +| self.manifest_unpublished_wire_bytes +| self.manifest_pending_mutation_bytes;
+        const reserved = self.manifest_admitted_wire_bytes +| self.manifest_reserved_mutation_bytes +| extra;
+        return committed <= repository_mod.maxManifestReadBytes() and reserved <= repository_mod.maxManifestReadBytes() - committed;
+    }
+
+    fn reconcileManifestCredit(self: *Backend) void {
+        if (self.manifest_recovery_required) return;
+        if (!self.manifestCoversCurrentRuns()) return;
+        self.manifest_pending_mutation_bytes = 0;
+        if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) self.manifest_unpublished_wire_bytes = 0;
+    }
+
+    pub const MetadataCredit = struct {
+        backend: *Backend,
+        bytes: u64,
+        pub fn commit(self: *@This()) void {
+            self.backend.manifest_pending_mutation_bytes +|= self.bytes;
+            self.release();
+        }
+        pub fn release(self: *@This()) void {
+            self.backend.manifest_reserved_mutation_bytes -= self.bytes;
+            self.bytes = 0;
+        }
+    };
+
+    pub fn reserveGcMetadata(self: *Backend, bytes: u64) !u64 {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.root_dir == null or bytes == 0) return 0;
+        self.reconcileManifestCredit();
+        if (!self.manifestCreditFits(bytes)) return error.ResourceBudgetExceeded;
+        self.manifest_reserved_mutation_bytes += bytes;
+        return bytes;
+    }
+
+    pub fn admitCompactionMetadata(self: *Backend, plan: compaction_mod.CompactionPlan, outputs: []const Run) !MetadataCredit {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.root_dir == null) return .{ .backend = self, .bytes = 0 };
+        var wire: u64 = 128;
+        for (outputs) |run| wire +|= 192 +| (if (run.path) |path| path.len else 0) +| run.smallest_key.len +| run.largest_key.len +|
+            (if (run.smallest_namespace_name) |name| name.len else 0) +| (if (run.largest_namespace_name) |name| name.len else 0);
+        for (0..plan.source_len + plan.target_len) |i| {
+            wire +|= 20 +| (if (run_store_mod.planAt(self, plan, i).path) |path| path.len else 0);
+        }
+        return self.admitCompactionMetadataBytes(wire);
+    }
+
+    pub fn admitCompactionMetadataBytes(self: *Backend, wire: u64) !MetadataCredit {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.root_dir == null) return .{ .backend = self, .bytes = 0 };
+        self.reconcileManifestCredit();
+        if (!self.manifestCreditFits(wire)) return error.ResourceBudgetExceeded;
+        self.manifest_reserved_mutation_bytes += wire;
+        return .{ .backend = self, .bytes = wire };
+    }
+
+    pub fn admitPreparedCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State, wire: u64) !CommitAdmission {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        const counted = incoming.entryCount() != 0 or bulk.entryCount() != 0;
+        if (!counted) return .{ .backend = self, .bytes = 0, .counted = false };
+        const bytes = incoming.estimatedLogicalBytes() +| bulk.estimatedLogicalBytes();
+        if (self.manifest_admitted_commits >= self.options.manifest_publication_max_waiters +| 1 or
+            bytes > self.options.manifest_commit_backlog_bytes -| self.manifest_admitted_bytes) return error.ResourceBudgetExceeded;
+        if (!self.manifest_credit_reconciled) {
+            // Writable recovery already streamed the catalog; reconstruct
+            // only the unflushed WAL generation's future metadata obligation.
+            var recovered = try self.prepareManifestCredit(&self.mutable, &@as(State, .{}));
+            for (self.activeImmutableMemtables()) |state| recovered +|= try self.prepareManifestCredit(state, &@as(State, .{}));
+            self.manifest_unpublished_wire_bytes = recovered;
+            self.manifest_credit_reconciled = true;
+        }
+        self.reconcileManifestCredit();
+        const credit = std.math.mul(u64, 2, wire) catch return error.ResourceBudgetExceeded;
+        if (!self.manifestCreditFits(credit)) {
+            // Relieve history and coalesced WAL debt before admitting another
+            // mutation. Never wait for this after its WAL has been committed.
+            if (self.manifest_admitted_commits != 0 or self.manifest_publish_in_flight or self.manifest_checkpoint_build_in_flight) return error.ResourceBudgetExceeded;
+            try self.flushMutable();
+            try self.persistManifestLocked();
+            if (self.manifest_journal.sequence != null) _ = try self.manifest_journal.runCheckpoint(self);
+            self.reconcileManifestCredit();
+            if (!self.manifestCreditFits(credit)) return error.ResourceBudgetExceeded;
+        }
+        self.manifest_admitted_commits += 1;
+        self.manifest_admitted_bytes += bytes;
+        self.manifest_admitted_wire_bytes += credit;
+        return .{ .backend = self, .bytes = bytes, .wire_bytes = wire, .counted = true };
+    }
+
+    fn manifestCoversCurrentRuns(self: *const Backend) bool {
+        if (self.run_directory_dirty or self.manifest_journal.sequence == null) return false;
+        const live = self.run_directory orelse return false;
+        const durable = self.manifest_directory orelse return false;
+        return live.tree.root == durable.tree.root;
+    }
+
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !usize {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        var turn = try self.beginManifestTurn();
+        defer turn.deinit();
+        return self.writeRunSetManifestSnapshotInTurnLocked(root_dir, runs, start_ns, live, turn.waited);
+    }
+
+    /// Caller owns the publication lane and backend lock. Administrative callers
+    /// acquire that lane before constructing their prospective ownership graph.
+    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !usize {
+        std.debug.assert(self.manifest_publish_in_flight);
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        self.manifest_publish_allow_concurrency = live;
+        // Live publication is identified explicitly, never by a borrowed
+        // writer-array address that could have changed while waiting.
+        const current_runs = if (live) &.{} else runs;
+        const covered_logical_bytes = self.unpublished_wal_logical_bytes;
+        if (!self.run_directory_dirty and self.run_directory != null and self.manifest_directory != null and live) {
+            try self.run_directory.?.validateChangesSince(self.manifest_directory.?, validateRunLayoutForManifest);
+        } else if (live) {
+            var prior: ?Run = null;
+            var cursor = self.runs.cursor();
+            while (cursor.next()) |run| {
+                if (prior) |previous| try validateRunLayoutForManifest(&.{ previous, run.* }) else try validateRunLayoutForManifest(&.{run.*});
+                prior = run.*;
+            }
+        } else try validateRunLayoutForManifest(current_runs);
+        // Empty stores still need an immutable durable root. Otherwise each
+        // obsolete-path cleanup would force another checkpoint, generating
+        // new obsolete files indefinitely instead of settling to zero debt.
+        if (live) try self.ensureRunDirectory();
+        const persisted = try self.manifest_journal.persist(self, root_dir, current_runs);
+        const bytes = persisted.written;
+        if (waited and bytes == 0) self.write_stats.manifest_publication_coalesced +|= 1;
+        self.write_stats.manifest_writes += @intFromBool(bytes != 0);
+        self.write_stats.manifest_checkpoints += @intFromBool(persisted.checkpoint);
+        self.write_stats.manifest_edits += @intFromBool(bytes != 0 and !persisted.checkpoint);
         self.write_stats.manifest_bytes += bytes;
         self.write_stats.manifest_ns += self.writeStatsElapsedNs(start_ns);
-        self.current_manifest_bytes = bytes;
+        self.current_manifest_bytes = persisted.total;
         // A successfully published run-set manifest is the durable boundary
         // for every flushed/direct-ingested batch represented by this backend.
         // WAL retirement is subsequent cleanup and must not keep already
         // published bytes in the adaptive dirty-window accounting.
-        self.clearPublishedWalLogicalDebtLocked();
+        if (bytes != 0) {
+            self.unpublished_wal_logical_bytes -|= covered_logical_bytes;
+            if (self.unpublished_wal_logical_bytes == 0) self.unpublished_wal_max_batch_logical_bytes = 0;
+        }
+        self.reconcileManifestCredit();
         return bytes;
     }
 
@@ -4075,13 +5679,36 @@ pub const Backend = struct {
     }
 
     pub fn appendWalForMutable(self: *Backend, state: anytype) !void {
-        if (!self.options.wal_enabled or
-            self.root_dir == null or
-            self.options.backend.read_only or
-            state.entries.items.len == 0) return;
+        try self.appendWalWithPreparation(state, null);
+    }
+
+    pub fn prepareAndAppendWalForMutable(self: *Backend, state: *const ActiveMemTable) !ActiveMemTable {
+        var prepared: ActiveMemTable = .{};
+        errdefer prepared.deinit(self.allocator);
+        try self.appendWalWithPreparation(state, &prepared);
+        return prepared;
+    }
+
+    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
         const encoded_bytes: u64 = @intCast(wal_mod.encodedStateRecordLen(state));
-        try self.prepareWalAppendForPressureLocked(encoded_bytes);
+        if (wal_enabled) try self.prepareWalAppendForPressureLocked(encoded_bytes);
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        // Pressure relief can flush and unlock the backend. Pin/build the
+        // successor only after that work, at the final serialized boundary.
+        if (comptime @TypeOf(state.*) == ActiveMemTable) {
+            if (prepared) |candidate| {
+                candidate.* = try self.mutable.preparePublication(self.allocator, state);
+                if (self.options.resource_manager) |manager| {
+                    const actual = self.estimateInMemoryStateBytesWithCandidateLocked(candidate);
+                    const decision = manager.admissionDecision(.lsm_in_memory_state, actual -| self.tracked_in_memory_state_bytes);
+                    if (decision.action == .reject_work or (decision.action == .throttle_writes and decision.pressure == .hard)) return error.ResourceBudgetExceeded;
+                }
+            }
+        } else std.debug.assert(prepared == null);
+        if (!wal_enabled) return;
 
         const start_ns = self.writeStatsNowNs();
         var wal_write_bytes: u64 = 0;
@@ -4109,7 +5736,7 @@ pub const Backend = struct {
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
-        self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
+        self.write_stats.wal_append_entries += @intCast(state.entryCount());
         self.write_stats.wal_append_bytes += append_result.bytes;
         self.write_stats.wal_segment_syncs += append_result.segment_syncs;
         self.write_stats.wal_index_syncs += append_result.index_syncs;
@@ -4159,7 +5786,7 @@ pub const Backend = struct {
         };
         if (!self.options.backend.read_only and
             recovery_session.flushes > 0 and
-            (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0))
+            (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0))
         {
             try self.flushMutable();
             recovery_session.flushes += 1;
@@ -4170,7 +5797,7 @@ pub const Backend = struct {
             try self.maybeCheckpointWalAfterManifestPublish();
         }
         const retention = try self.cachedWalRetentionLocked();
-        self.mutable_wal_range = if (retention.segments == 0 or self.mutable.entries.items.len == 0)
+        self.mutable_wal_range = if (retention.segments == 0 or self.mutable.entryCount() == 0)
             .{}
         else
             .{
@@ -4224,11 +5851,9 @@ pub const Backend = struct {
         }
 
         fn entryAllocator(self: *@This(), default_allocator: Allocator) !Allocator {
-            // ActiveMemTable owns structural containers on the backend allocator.
-            // During recovery, entry byte copies live in the current mutable
-            // arena, which is transferred to the immutable flush window and
-            // released wholesale when that flush retires.
-            _ = try self.backend.mutable.ensureRecoveryAllocator(default_allocator);
+            // Replayed entries enter the same independently reclaimable,
+            // snapshot-shareable ownership boundary as ordinary writes.
+            _ = self;
             return default_allocator;
         }
     };
@@ -4249,6 +5874,7 @@ pub const Backend = struct {
     }
 
     fn resetWalAfterManifestCheckpoint(self: *Backend) !void {
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const start_ns = self.writeStatsNowNs();
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
@@ -4277,7 +5903,7 @@ pub const Backend = struct {
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;
 
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
         while (self.activeImmutableMemtableCount() > 0) {
@@ -4290,7 +5916,7 @@ pub const Backend = struct {
         return platform_time.monotonicNs();
     }
 
-    fn writeStatsElapsedNs(self: *Backend, start_ns: u64) u64 {
+    pub fn writeStatsElapsedNs(self: *Backend, start_ns: u64) u64 {
         const end_ns = self.writeStatsNowNs();
         return if (end_ns >= start_ns) end_ns - start_ns else 0;
     }
@@ -4310,15 +5936,36 @@ pub const Backend = struct {
         }
     }
 
-    pub fn recordCompactionWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
-        self.write_stats.compaction_ns += elapsed_ns;
+    pub fn recordCompactionWriteStats(self: *Backend, input_bytes: u64, output_runs: []const Run, elapsed_ns: u64) void {
+        var output_bytes: u64 = 0;
+        self.write_stats.compactions +|= 1;
+        self.write_stats.compaction_input_bytes +|= input_bytes;
+        self.write_stats.compaction_ns +|= elapsed_ns;
+        self.write_stats.compaction_max_input_bytes = @max(self.write_stats.compaction_max_input_bytes, input_bytes);
+        self.write_stats.compaction_max_ns = @max(self.write_stats.compaction_max_ns, elapsed_ns);
         for (output_runs) |run| {
+            output_bytes +|= run.size_bytes;
             if (run.path != null) {
                 self.write_stats.table_file_writes += 1;
                 self.write_stats.table_file_bytes += run.size_bytes;
                 self.recordTableCompressionWriteStats(run.compression_stats);
             }
         }
+        self.write_stats.compaction_output_bytes +|= output_bytes;
+        self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
+    }
+
+    pub fn recordPreparedCompactionWriteStats(self: *Backend, input_bytes: u64, output_bytes: u64, files: u64, file_bytes: u64, compression: lsm_table_file.CompressionStats, elapsed_ns: u64) void {
+        self.write_stats.compactions +|= 1;
+        self.write_stats.compaction_input_bytes +|= input_bytes;
+        self.write_stats.compaction_output_bytes +|= output_bytes;
+        self.write_stats.compaction_ns +|= elapsed_ns;
+        self.write_stats.compaction_max_input_bytes = @max(self.write_stats.compaction_max_input_bytes, input_bytes);
+        self.write_stats.compaction_max_output_bytes = @max(self.write_stats.compaction_max_output_bytes, output_bytes);
+        self.write_stats.compaction_max_ns = @max(self.write_stats.compaction_max_ns, elapsed_ns);
+        self.write_stats.table_file_writes +|= files;
+        self.write_stats.table_file_bytes +|= file_bytes;
+        self.recordTableCompressionWriteStats(compression);
     }
 
     fn recordSortedIngestWriteStats(self: *Backend, output_runs: []const Run, elapsed_ns: u64) void {
@@ -4432,12 +6079,298 @@ pub const Backend = struct {
     }
 
     pub fn registerOpenManifestRunRefs(self: *Backend) !void {
-        for (self.runs.items) |*run| {
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |record| {
+            const run = record.versionOwner();
             if (run.version_ref_pinned) continue;
             const path = run.path orelse continue;
             try obsolete_path_refs.retain(path);
             run.version_ref_pinned = true;
         }
+    }
+
+    pub fn invalidateReadVersion(self: *Backend) void {
+        self.run_directory_dirty = true;
+        self.run_directory_generation +%= 1;
+        if (self.domain_index) |index| index.destroy(self.allocator);
+        self.domain_index = null;
+        const version = self.read_version orelse return;
+        self.read_version = null;
+        version.release(self);
+    }
+
+    pub fn retireReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) void {
+        if (version.registered) {
+            var link = &self.live_read_versions;
+            while (link.* != version) link = &link.*.?.live_next;
+            link.* = version.live_next;
+            version.registered = false;
+        }
+        if (version.directory) |directory| {
+            self.retireRunDirectory(directory);
+            version.destroyProjectionHeader();
+            return;
+        }
+        version.retired_next = self.retired_read_versions;
+        self.retired_read_versions = version;
+    }
+
+    pub fn destroyRunMetadata(self: *Backend) void {
+        if (self.pending_tombstone_reconcile) |pending| pending.destroy(self);
+        self.pending_tombstone_reconcile = null;
+        if (self.pending_bulk_plan) |pending| pending.destroy(self);
+        self.pending_bulk_plan = null;
+        while (self.retired_bulk_plans) |pending| {
+            self.retired_bulk_plans = pending.retired_next;
+            pending.destroy(self);
+        }
+        if (self.pending_gc) |pending| pending.destroy(self);
+        self.pending_gc = null;
+        while (self.retired_gc) |pending| {
+            self.retired_gc = pending.retired_next;
+            pending.destroy(self);
+        }
+        if (self.directory_reclaimer) |*job| {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(self.allocator, &credits));
+            job.finish(self.allocator);
+            self.directory_reclaimer = null;
+        }
+        if (self.pending_directory_closure) |pending| pending.destroy(self);
+        for (&self.pending_admissions) |*slot| {
+            if (slot.*) |pending| pending.destroy(self);
+            slot.* = null;
+        }
+        while (self.retired_admissions) |pending| {
+            self.retired_admissions = pending.retired_next;
+            pending.destroy(self);
+        }
+        self.pending_directory_closure = null;
+        if (self.pending_l0_directory_closure) |pending| pending.destroy(self);
+        self.pending_l0_directory_closure = null;
+        while (self.retired_closures) |pending| {
+            self.retired_closures = pending.retired_next;
+            pending.destroy(self);
+        }
+        // Cancelling an unfinished GC intent retires prepared writer roots.
+        // Drain stores AFTER job destruction, otherwise close leaks every
+        // payload still owned by those newly retired candidate versions.
+        if (self.store_reclaimer) |*job| {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(self.allocator, &credits));
+            job.finish(self.allocator);
+            self.store_reclaimer = null;
+        }
+        while (self.retired_run_stores) |store| {
+            self.retired_run_stores = store.retired_next;
+            store.deinit(self.allocator);
+            self.allocator.destroy(store);
+        }
+        self.manifest_journal.deinit(self.allocator);
+        if (self.manifest_directory) |directory| directory.destroy(self.allocator);
+        self.manifest_directory = null;
+        if (self.run_directory) |directory| directory.destroy(self.allocator);
+        self.run_directory = null;
+        while (self.retired_run_directories) |directory| {
+            self.retired_run_directories = directory.retired_next;
+            directory.destroy(self.allocator);
+        }
+        while (self.retired_read_versions) |version| {
+            self.retired_read_versions = version.retired_next;
+            version.destroy(self);
+        }
+    }
+
+    fn retireRunDirectory(self: *Backend, directory: *RunDirectory) void {
+        directory.retired_next = self.retired_run_directories;
+        self.retired_run_directories = directory;
+    }
+
+    pub fn retireCheckpointDirectory(self: *Backend, directory: *RunDirectory) void {
+        self.retireRunDirectory(directory);
+    }
+
+    pub fn publishManifestDirectory(self: *Backend, prepared: ?*RunDirectory) void {
+        if (self.manifest_directory) |old| self.retireRunDirectory(old);
+        self.manifest_directory = prepared;
+    }
+
+    pub fn prepareRunDirectoryChange(self: *Backend, removed: ?compaction_mod.CompactionPlan, added: []const Run) !?*RunDirectory {
+        // Seed on the first SST publication even if the table has never been
+        // read. Otherwise write-only ingestion would defer a full rebuild to
+        // its first reader. Empty stores themselves need no directory charge.
+        if (self.run_directory_dirty and self.runs.count() != 0) try self.ensureRunDirectory();
+        const prepared = if (self.runs.count() == 0)
+            try RunDirectory.create(self.allocator)
+        else if (self.run_directory) |directory|
+            try directory.fork(self.allocator)
+        else
+            return null;
+        errdefer prepared.destroy(self.allocator);
+        if (removed) |plan| {
+            for (0..plan.source_len + plan.target_len) |i| try prepared.remove(self.allocator, run_store_mod.planAt(self, plan, i));
+        }
+        for (added) |run| try prepared.put(self, run);
+        return prepared;
+    }
+
+    pub fn prepareRunDirectoryMove(self: *Backend, source: *const Run, level: u32) !?*RunDirectory {
+        if (self.run_directory_dirty) try self.ensureRunDirectory();
+        const directory = self.run_directory orelse return null;
+        const prepared = try directory.fork(self.allocator);
+        errdefer prepared.destroy(self.allocator);
+        var run = source.*;
+        try prepared.remove(self.allocator, &run);
+        run.level = level;
+        try prepared.put(self, run);
+        return prepared;
+    }
+
+    pub fn publishRunDirectory(self: *Backend, prepared: ?*RunDirectory) void {
+        const directory = prepared orelse return;
+        if (self.run_directory) |old| self.retireRunDirectory(old);
+        self.run_directory = directory;
+        self.run_directory_dirty = false;
+    }
+
+    /// Cold initialization/full administrative rewrites rebuild once. Normal
+    /// flushes, compactions and level moves publish only their metadata delta.
+    fn ensureRunDirectory(self: *Backend) !void {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| {
+            if (directory.count() == self.runs.count()) return;
+        };
+        const directory = try RunDirectory.create(self.allocator);
+        errdefer directory.destroy(self.allocator);
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |run| try directory.put(self, run.*);
+        self.publishRunDirectory(directory);
+    }
+
+    pub fn createReadVersionFromDirectory(self: *Backend) !*runtime_mod.ReadVersion {
+        if (self.read_version) |version| return version;
+        try self.ensureRunDirectory();
+        const directory = try self.run_directory.?.fork(self.allocator);
+        errdefer directory.destroy(self.allocator);
+        const version = try self.allocator.create(runtime_mod.ReadVersion);
+        version.* = .{ .allocator = self.allocator, .directory = directory, .prepared = false, .registered = true, .live_next = self.live_read_versions };
+        self.live_read_versions = version;
+        self.read_version = version;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return version;
+    }
+
+    /// Caller owns an epoch reference and holds the backend mutex. The exact
+    /// pinned epoch is prepared once, even if publication advances meanwhile.
+    pub fn prepareReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) !void {
+        if (version.prepared) return;
+        self.retainReaderKind(.other);
+        runtime_mod.unlockBackend(Backend, self, true);
+        const build_io: ?std.Io = if (comptime builtin.os.tag == .freestanding) null else if (self.options.read_runtime) |read_runtime| read_runtime.io else null;
+        if (build_io) |io| {
+            version.build_mu.lockUncancelable(io);
+        } else {
+            platform.sync.lockYielding(&version.build_fallback_mu);
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        defer self.releaseReaderKind(.other);
+        defer if (build_io) |io| version.build_mu.unlock(io) else version.build_fallback_mu.unlock();
+        if (version.prepared) return;
+        const directory = version.directory.?;
+        const build_started = self.readStatsNowNs();
+        runtime_mod.unlockBackend(Backend, self, true);
+        var reservation: ?resource_manager_mod.Reservation = null;
+        const built = blk: {
+            if (self.options.resource_manager) |manager| {
+                reservation = manager.reserve(.lsm_in_memory_state, runtime_mod.ReadVersion.buildMemoryBound(directory.count())) catch |err| break :blk @as(anyerror!*runtime_mod.ReadVersion, err);
+            }
+            break :blk runtime_mod.ReadVersion.createFromDirectory(self.allocator, directory);
+        };
+        _ = runtime_mod.lockBackend(Backend, self);
+        defer if (reservation) |*lease| lease.release();
+        const projection = try built;
+        // Transfer only the projection. The epoch already owns this root.
+        version.runs = projection.runs;
+        version.l0_groups = projection.l0_groups;
+        version.levels = projection.levels;
+        version.projection_bytes = projection.projection_bytes;
+        self.allocator.destroy(projection);
+        version.prepared = true;
+        self.read_version_builds +|= 1;
+        self.recordRunGroupBuild(version.runs.len, if (version.levels.len != 0) version.levels[0].start_index else version.runs.len, self.readStatsElapsedNs(build_started));
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn mountRunDirectory(self: *Backend) !void {
+        if (self.runs.count() == 0 and self.manifest_backing == null and self.recovered_manifest == null) return;
+        try self.ensureRunDirectory();
+        try self.manifest_journal.recoverState(self);
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+
+    pub fn domainIndex(self: *Backend) !*const compaction_mod.DomainIndex {
+        if (self.domain_index) |index| return index;
+        // Small indexes are already single-flight under the backend mutex.
+        if (self.runs.count() <= 64) {
+            var reservation: ?resource_manager_mod.Reservation = null;
+            defer if (reservation) |*lease| lease.release();
+            if (self.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_in_memory_state, compaction_mod.DomainIndex.buildMemoryBound(self.runs.count()));
+            self.domain_index = try compaction_mod.DomainIndex.create(self);
+            self.domain_index_builds +|= 1;
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+            return self.domain_index.?;
+        }
+        self.retainReaderKind(.compaction);
+        runtime_mod.unlockBackend(Backend, self, true);
+        const build_io: ?std.Io = if (comptime builtin.os.tag == .freestanding) null else if (self.options.read_runtime) |read_runtime| read_runtime.io else null;
+        if (build_io) |io| self.domain_index_build_mu.lockUncancelable(io) else platform.sync.lockYielding(&self.domain_index_build_fallback_mu);
+        _ = runtime_mod.lockBackend(Backend, self);
+        defer self.releaseReaderKind(.compaction);
+        defer if (build_io) |io| self.domain_index_build_mu.unlock(io) else self.domain_index_build_fallback_mu.unlock();
+        if (self.domain_index == null) {
+            var reservation: ?resource_manager_mod.Reservation = null;
+            defer if (reservation) |*lease| lease.release();
+            if (self.runs.count() <= 64) {
+                if (self.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_in_memory_state, compaction_mod.DomainIndex.buildMemoryBound(self.runs.count()));
+                self.domain_index = try compaction_mod.DomainIndex.create(self);
+            } else {
+                if (self.read_version == null) {
+                    self.read_version = try runtime_mod.ReadVersion.create(self);
+                }
+                const version = self.read_version.?;
+                _ = version.references.fetchAdd(1, .monotonic);
+                defer version.release(self);
+                try self.prepareReadVersion(version);
+                if (self.read_version != version) return error.CompactionPlanningStale;
+                if (self.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_in_memory_state, compaction_mod.DomainIndex.buildMemoryBound(version.runs.len));
+                self.retainReaderKind(.compaction);
+                var snapshot = .{ .allocator = self.allocator, .options = self.options, .planning_directory = version.directory, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0 } };
+                runtime_mod.unlockBackend(Backend, self, true);
+                const built = compaction_mod.DomainIndex.create(&snapshot);
+                _ = runtime_mod.lockBackend(Backend, self);
+                defer self.releaseReaderKind(.compaction);
+                const index = try built;
+                if (self.domain_index) |current| {
+                    index.destroy(self.allocator);
+                    return current;
+                }
+                if (self.read_version != version) {
+                    index.destroy(self.allocator);
+                    return error.CompactionPlanningStale;
+                }
+                // Rebind borrowed metadata to the live version before releasing
+                // the temporary pin. Publication invalidates this cache first.
+                for (index.order, 0..) |run_index, i| index.runs[i] = self.runs.at(run_index).*;
+                self.domain_index = index;
+            }
+            self.domain_index_builds +|= 1;
+            self.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+        return self.domain_index.?;
+    }
+
+    pub fn planningDirectory(self: *Backend) !*const RunDirectory {
+        try self.ensureRunDirectory();
+        return self.run_directory.?;
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -4447,6 +6380,10 @@ pub const Backend = struct {
     }
 
     pub fn releaseRunSnapshotRef(_: *Backend, run: *Run) void {
+        releaseDirectoryRunSnapshotRef(run);
+    }
+
+    pub fn releaseDirectoryRunSnapshotRef(run: *Run) void {
         if (!run.version_ref_pinned) return;
         if (run.path) |path| run_snapshot_refs.release(path);
         run.version_ref_pinned = false;
@@ -4458,13 +6395,23 @@ pub const Backend = struct {
 
     pub fn releaseRunVersionRef(self: *Backend, run: *Run) void {
         _ = self;
-        if (!run.version_ref_pinned) return;
-        if (run.path) |path| obsolete_path_refs.release(path);
-        run.version_ref_pinned = false;
+        const owned = run.versionOwner();
+        if (!owned.version_ref_pinned) return;
+        if (owned.path) |path| obsolete_path_refs.release(path);
+        owned.version_ref_pinned = false;
+    }
+
+    fn destroyOwnedRun(run: *Run, allocator: Allocator) void {
+        if (run.version_ref_pinned) if (run.path) |path| obsolete_path_refs.release(path);
+        if (run.path) |path| run_snapshot_refs.forget(path);
+        run.deinit(allocator);
     }
 
     fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {
-        _ = self;
+        if (self.manifest_journal.protectsPath(path)) return true;
+        if (repository_mod.manifest_set.identify(path)) |file| {
+            if (self.manifest_checkpoint_build_id == file.id) return true;
+        }
         return obsolete_path_refs.isRetained(path) or run_snapshot_refs.isRetained(path);
     }
 
@@ -4599,6 +6546,27 @@ pub const Backend = struct {
     pub fn recordPointRunAsyncBatch(self: *Backend, reads_issued: usize) void {
         _ = self.read_stats.point_run_async_batches.fetchAdd(1, .monotonic);
         _ = self.read_stats.point_run_async_reads_issued.fetchAdd(@intCast(reads_issued), .monotonic);
+    }
+
+    /// Reserve a fair, non-blocking share of the backend-wide sparse-read
+    /// pipeline. Existing batches retain their width; later arrivals see the
+    /// increased active count and narrow themselves. The harmonic admission
+    /// curve avoids a convoy while bounding fan-out far below
+    /// `queries * max_concurrent_point_block_reads` under load.
+    pub fn acquirePointAsyncBatchLimit(self: *Backend, stack_limit: usize) usize {
+        const per_batch = @min(self.options.max_concurrent_point_block_reads, stack_limit);
+        if (per_batch < 2) return per_batch;
+        const previous = self.point_async_batches_active.fetchAdd(1, .acq_rel);
+        const active = previous + 1;
+        const aggregate = self.options.target_aggregate_concurrent_point_block_reads;
+        if (aggregate == 0) return per_batch;
+        const fair = std.math.divCeil(u64, aggregate, active) catch 1;
+        return @min(per_batch, @as(usize, @intCast(@min(fair, std.math.maxInt(usize)))));
+    }
+
+    pub fn releasePointAsyncBatchLimit(self: *Backend) void {
+        const previous = self.point_async_batches_active.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
     }
 
     pub fn recordPointRunAsyncCancel(self: *Backend) void {
@@ -4738,6 +6706,10 @@ pub const Backend = struct {
         std.debug.assert(self.active_readers_by_kind[index] > 0);
         self.active_readers -= 1;
         self.active_readers_by_kind[index] -= 1;
+        switch (kind) {
+            .bound_read_txn, .namespace_read_txn, .current_scan, .probe_txn => self.obsolete_reclaim_retry_at_ns = 0,
+            else => {},
+        }
         self.drainUnpinnedObsoleteRuns();
         if (self.activeVersionReaders() == 0) {
             self.drainRetiredImmutableMemtables();
@@ -4756,10 +6728,18 @@ pub const Backend = struct {
     }
 
     pub fn queueObsoleteFilePathAssumeCapacity(self: *Backend, path: []u8) void {
+        self.obsolete_reclaim_retry_at_ns = 0;
+        // The active run set no longer references this path. Shed its shared
+        // cache residency immediately instead of letting indexes and blocks
+        // from every compacted generation accumulate until cache pressure.
+        // Existing handles remain valid: Cache.invalidatePath marks pinned
+        // entries and destroys them only after the last handle is released.
+        // A snapshot reader may reload the still-retained file, so physical
+        // reclamation invalidates the path a second time below.
+        if (self.options.cache) |cache| cache.invalidatePath(path);
         const delete_after_ns = self.nowNs() +| self.options.obsolete_retention_ns;
-        for (self.obsolete_paths.items) |*obsolete| {
-            if (!std.mem.eql(u8, obsolete.path, path)) continue;
-            if (obsolete.delete_after_ns < delete_after_ns) obsolete.delete_after_ns = delete_after_ns;
+        if (self.obsolete_paths.get(path)) |obsolete| {
+            if (obsolete.delete_after_ns < delete_after_ns) self.obsolete_paths.setDeadlinePrepared(path, delete_after_ns);
             self.allocator.free(path);
             self.obsolete_manifest_dirty = true;
             self.notePotentialMaintenanceDebtLocked();
@@ -4790,6 +6770,8 @@ pub const Backend = struct {
         // Snapshot readers now carry their own per-run pins.
         for (retired.items) |*run| self.releaseRunVersionRef(run);
         self.obsolete_runs.appendAssumeCapacity(retired);
+        self.obsolete_run_count += retired.items.len;
+        self.obsolete_run_drain_remaining = self.obsolete_run_count + self.obsolete_runs.items.len + 1;
         self.drainUnpinnedObsoleteRuns();
     }
 
@@ -5010,30 +6992,45 @@ pub const Backend = struct {
     }
 
     fn drainUnpinnedObsoleteRuns(self: *Backend) void {
-        var list_index: usize = 0;
-        while (list_index < self.obsolete_runs.items.len) {
-            var runs = &self.obsolete_runs.items[list_index];
-            var run_index: usize = 0;
-            while (run_index < runs.items.len) {
-                const run = &runs.items[run_index];
-                if (run.path) |path| {
-                    if (run_snapshot_refs.isRetained(path)) {
-                        run_index += 1;
-                        continue;
-                    }
-                    // File retention is tracked separately by obsolete_paths;
-                    // this releases only metadata and local cache handles.
-                    self.evictLocalCachesForRun(path, run.id);
-                }
-                var removed = runs.orderedRemove(run_index);
+        const epoch = file_pin_release_epoch.load(.acquire);
+        if (epoch != self.obsolete_run_pin_epoch) {
+            self.obsolete_run_pin_epoch = epoch;
+            self.obsolete_run_drain_remaining = self.obsolete_run_count + self.obsolete_runs.items.len + 1;
+        }
+        var visits: usize = 0;
+        while (self.obsolete_runs.items.len != 0 and visits < 128 and self.obsolete_run_drain_remaining != 0) : (visits += 1) {
+            self.obsolete_run_drain_remaining -= 1;
+            self.obsolete_run_list_cursor %= self.obsolete_runs.items.len;
+            var runs = &self.obsolete_runs.items[self.obsolete_run_list_cursor];
+            if (runs.items.len == 0) {
+                var removed = self.obsolete_runs.swapRemove(self.obsolete_run_list_cursor);
                 removed.deinit(self.allocator);
-            }
-            if (runs.items.len != 0) {
-                list_index += 1;
+                self.obsolete_run_cursor = 0;
                 continue;
             }
-            var removed_list = self.obsolete_runs.orderedRemove(list_index);
-            removed_list.deinit(self.allocator);
+            if (self.obsolete_run_cursor >= runs.items.len) {
+                self.obsolete_run_cursor = 0;
+                self.obsolete_run_list_cursor += 1;
+                continue;
+            }
+            const run = &runs.items[self.obsolete_run_cursor];
+            if (run.path) |path| {
+                if (run_snapshot_refs.isRetained(path)) {
+                    self.obsolete_run_cursor += 1;
+                    continue;
+                }
+                self.evictLocalCachesForRun(path, run.id);
+            }
+            // Retirement order is not read precedence. Swap removal avoids
+            // quadratically shifting a broad compaction's retired inputs.
+            var removed = runs.swapRemove(self.obsolete_run_cursor);
+            self.obsolete_run_count -= 1;
+            removed.deinit(self.allocator);
+            if (runs.items.len == 0) {
+                var empty = self.obsolete_runs.swapRemove(self.obsolete_run_list_cursor);
+                empty.deinit(self.allocator);
+                self.obsolete_run_cursor = 0;
+            }
         }
     }
 
@@ -5048,7 +7045,7 @@ pub const Backend = struct {
             self.bulkIngestActive() or
             self.root_dir == null or
             self.options.backend.read_only) return;
-        try self.persistManifest();
+        try self.persistManifestLocked();
     }
 
     pub fn finalizeReadReaderRelease(self: *Backend) void {
@@ -5057,12 +7054,16 @@ pub const Backend = struct {
 
     pub fn finalizeReadReaderReleaseKind(self: *Backend, kind: ReaderPinKind) void {
         self.releaseReaderKind(kind);
+        // Reclamation can release its lifecycle pin while the publication
+        // lane drops the backend mutex. Do not recursively enter that lane;
+        // the publisher retains and subsequently settles this metadata debt.
+        if (self.manifest_publish_in_flight) return;
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.bulkIngestActive() or
             self.root_dir == null or
             self.options.backend.read_only) return;
-        self.persistManifest() catch {};
+        self.persistManifestLocked() catch {};
     }
 
     pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) void {
@@ -5098,33 +7099,60 @@ pub const Backend = struct {
     fn stateMeetsBulkFlushThreshold(self: *const Backend, state: *const State) bool {
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(state, byte_threshold);
-        return state.entries.items.len >= self.effectiveFlushThreshold();
+        return state.entryCount() >= self.effectiveFlushThreshold();
+    }
+
+    fn stateMeetsDirectBulkIngestThreshold(self: *const Backend, state: anytype) bool {
+        // A committed bulk transaction is already the coalesced unit of work.
+        // The bulk flush multiplier exists to amortize mutable flushes; applying
+        // it again here made normal concurrent batches miss direct ingest and
+        // recreate the mutable-copy hot path.
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
+        if (byte_threshold > 0 and stateMeetsByteFlushThreshold(state, byte_threshold)) return true;
+        // Snapshot publication is also a hard reason to bypass mutable state.
+        // Vector-heavy values can reach their allocator-backed snapshot bound
+        // before their encoded logical bytes reach the flush threshold.
+        if (self.options.read_snapshot_rotate_mutable_bytes > 0 and
+            estimateStateBytes(state) >= self.options.read_snapshot_rotate_mutable_bytes) return true;
+        if (byte_threshold > 0) return false;
+        return state.entryCount() >= @max(@as(usize, 1), self.options.flush_threshold);
+    }
+
+    fn directBulkIngestLogicalThresholdBytes(self: *const Backend) u64 {
+        return if (self.options.direct_bulk_ingest_min_bytes > 0)
+            self.options.direct_bulk_ingest_min_bytes
+        else
+            self.options.flush_threshold_bytes;
     }
 
     fn shouldFlushMutable(self: *const Backend) bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(&self.mutable, byte_threshold);
-        return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
+        return self.mutable.entryCount() >= self.effectiveFlushThreshold();
     }
 
     fn shouldFlushMutableForIdleLocked(self: *Backend) bool {
         return if (self.nextMutableIdleFlushDelayNsLocked()) |delay_ns| delay_ns == 0 else false;
     }
 
+    fn shouldFlushImmutableForIdleLocked(self: *Backend) bool {
+        return if (self.nextImmutableIdleFlushDelayNsLocked()) |delay_ns| delay_ns == 0 else false;
+    }
+
     fn shouldFlushMutableDuringRecoveryReplay(self: *const Backend) bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return stateMeetsByteFlushThreshold(&self.mutable, byte_threshold);
         const recovery_threshold = @max(
             self.effectiveFlushThreshold(),
             self.options.recovery_replay_flush_threshold,
         );
-        return self.mutable.entries.items.len >= recovery_threshold;
+        return self.mutable.entryCount() >= recovery_threshold;
     }
 
     fn shouldFlushMutableForWalPressureLocked(self: *Backend) !bool {
-        if (self.mutable.entries.items.len == 0) return false;
+        if (self.mutable.entryCount() == 0) return false;
         const retention = try self.snapshotWalRetentionForPressureLocked() orelse return false;
         return self.walRetentionOverSoftLimit(retention);
     }
@@ -5297,7 +7325,18 @@ pub const Backend = struct {
             self.active_immutable_logical_bytes +|
             self.unpublished_wal_max_batch_logical_bytes;
         const scaled = std.math.mul(u64, dirty_bytes, multiplier) catch std.math.maxInt(u64);
-        return @max(self.options.wal_checkpoint_dirty_bytes_floor, scaled);
+        // Retention advances only at segment boundaries. After a window is
+        // published, its newest records can share one segment with a newer
+        // immutable epoch, and that epoch can continue into the current
+        // segment. A dirty target below those two physical segments sees the
+        // unavoidable retained tail as fresh pressure and force-publishes each
+        // following partial epoch. Windowed publication therefore needs this
+        // geometry floor; hard WAL byte/segment limits remain authoritative.
+        const window_segment_floor = if (self.options.immutable_flush_window_bytes > 0)
+            std.math.mul(u64, self.options.wal_segment_bytes, 2) catch std.math.maxInt(u64)
+        else
+            0;
+        return @max(self.options.wal_checkpoint_dirty_bytes_floor, window_segment_floor, scaled);
     }
 
     fn walRetentionOverHardLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -5340,13 +7379,13 @@ pub const Backend = struct {
         self.maintenance_io_budget_remaining = null;
         defer self.maintenance_io_budget_remaining = saved_budget;
 
-        if (self.mutable.entries.items.len > 0) try self.rotateMutableToImmutable();
+        if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
         try self.flushAllImmutableMemtables();
         if (self.root_dir != null and
             (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
         {
-            try self.persistManifest();
-        } else if (self.mutable.entries.items.len == 0 and self.activeImmutableMemtableCount() == 0) {
+            try self.persistManifestLocked();
+        } else if (self.mutable.entryCount() == 0 and self.activeImmutableMemtableCount() == 0) {
             try self.resetWalAfterManifestCheckpoint();
         }
 
@@ -5512,11 +7551,17 @@ pub const Backend = struct {
     }
 
     fn snapshotL0PressureLocked(self: *const Backend) L0Pressure {
-        var pressure = L0Pressure{};
-        while (pressure.runs < self.runs.items.len and self.runs.items[pressure.runs].level == 0) : (pressure.runs += 1) {
-            pressure.bytes += self.runs.items[pressure.runs].size_bytes;
-        }
-        return pressure;
+        return .{ .runs = self.runs.l0Files(), .bytes = self.runs.l0Bytes() };
+    }
+
+    fn bulkL0DeltaSealDueLocked(self: *const Backend, l0_bytes: u64) bool {
+        const denominator = self.options.bulk_ingest_l0_delta_seal_ratio_denominator;
+        if (denominator == 0 or l0_bytes == 0) return false;
+
+        const lower_bytes = self.runs.totalBytes() -| self.runs.l0Bytes();
+        if (lower_bytes == 0) return false;
+        const threshold = lower_bytes / denominator + @intFromBool(lower_bytes % denominator != 0);
+        return l0_bytes >= threshold;
     }
 
     fn enforceWritePressure(self: *Backend) anyerror!void {
@@ -5544,7 +7589,25 @@ pub const Backend = struct {
         var steps: usize = 0;
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
-            try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            const byte_hard = hard_bytes > 0 and pressure.bytes > hard_bytes;
+            const delta_seal_due = self.bulkL0DeltaSealDueLocked(pressure.bytes);
+            const sealed = if (!byte_hard and delta_seal_due)
+                try compaction_mod.compactBulkL0DeltaSeal(Backend, self, 2)
+            else
+                false;
+            const tiered = if (!byte_hard and !sealed and
+                hard_runs > 0 and pressure.runs > hard_runs and
+                self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                try compaction_mod.compactBulkL0Tier(
+                    Backend,
+                    self,
+                    self.options.bulk_ingest_tiered_l0_fan_in,
+                )
+            else
+                false;
+            if (!sealed and !tiered) {
+                _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            }
             if (self.compaction_stats.compactions == before_step_compactions) break;
             steps += self.compaction_stats.compactions - before_step_compactions;
             pressure = self.snapshotL0PressureLocked();
@@ -5587,7 +7650,7 @@ pub const Backend = struct {
         defer self.write_pressure_enforcing = false;
         const start_ns = self.writeStatsNowNs();
 
-        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len > 0) {
+        if (self.activeImmutableMemtableCount() == 0 and self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
 
@@ -5604,7 +7667,7 @@ pub const Backend = struct {
         // no memtable to flush. Publishing its dirty manifest is the checkpoint
         // operation and must not wait for the outer bulk session to finish.
         if (self.bulkIngestActive() and self.manifest_dirty) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
             manifest_publishes = 1;
         }
         if (flushes > 0 or manifest_publishes > 0) {
@@ -5624,7 +7687,7 @@ pub const Backend = struct {
 
         const start_ns = self.writeStatsNowNs();
         var flushes: u64 = 0;
-        if (self.mutable.entries.items.len > 0) {
+        if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
 
@@ -5645,13 +7708,13 @@ pub const Backend = struct {
         // durability and resource invariant. Publish a partial durable boundary
         // before retiring WAL; compaction remains deferred until bulk exit.
         if (self.bulkIngestActive() and self.manifest_dirty) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
             self.write_stats.wal_pressure_manifest_publishes +|= 1;
             self.invalidatePrimaryWalRetentionCacheLocked();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
         }
 
-        if (!self.manifest_dirty and self.activeImmutableMemtableCount() == 0 and self.mutable.entries.items.len == 0 and self.walRetentionOverHardLimit(retention)) {
+        if (!self.manifest_dirty and self.activeImmutableMemtableCount() == 0 and self.mutable.entryCount() == 0 and self.walRetentionOverHardLimit(retention)) {
             try self.resetWalAfterManifestCheckpoint();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse retention;
         }
@@ -5667,21 +7730,20 @@ pub const Backend = struct {
     }
 
     pub fn shouldDrainMutableBeforeDirectBulkIngest(self: *const Backend, incoming: *const ActiveMemTable) bool {
-        if (self.mutable.entries.items.len == 0) return false;
-        if (self.active_bulk_ingest_batches <= 1) return false;
-        if (self.activeImmutableMemtableCount() != 0) return false;
-        const byte_threshold = self.effectiveFlushThresholdBytes();
+        const has_mutable = self.mutable.entryCount() != 0;
+        const has_immutable = self.activeImmutableMemtableCount() != 0;
+        if (!has_mutable and !has_immutable) return false;
+        const byte_threshold = self.directBulkIngestLogicalThresholdBytes();
         if (byte_threshold > 0) {
             const logical_bytes = estimateStateLogicalBytes(&self.mutable) +| estimateStateLogicalBytes(incoming);
             if (logical_bytes >= byte_threshold) return true;
-            const memory_threshold = std.math.mul(
-                u64,
-                byte_threshold,
-                mutable_memory_guard_multiplier,
-            ) catch std.math.maxInt(u64);
+            const guard_threshold = std.math.mul(u64, byte_threshold, mutable_memory_guard_multiplier) catch std.math.maxInt(u64);
+            const snapshot_threshold = self.options.read_snapshot_rotate_mutable_bytes;
+            const memory_threshold = if (snapshot_threshold > 0) @min(guard_threshold, snapshot_threshold) else guard_threshold;
             return estimateStateBytes(&self.mutable) +| estimateStateBytes(incoming) >= memory_threshold;
         }
-        return self.mutable.entries.items.len + incoming.entries.items.len >= self.effectiveFlushThreshold();
+        if (self.active_bulk_ingest_batches <= 1 and !has_immutable) return false;
+        return self.mutable.entryCount() + incoming.entryCount() >= @max(@as(usize, 1), self.options.flush_threshold);
     }
 
     fn writePressureDuringBulkIngestEnabled(self: *const Backend) bool {
@@ -5696,6 +7758,9 @@ pub const Backend = struct {
 
     fn beginBulkIngestSessionLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.active_bulk_ingest_batches == 0) {
+            self.bulk_ingest_window_first_sequence = self.next_run_id;
+        }
         self.active_bulk_ingest_batches += 1;
     }
 
@@ -5716,14 +7781,14 @@ pub const Backend = struct {
     }
 
     fn flushBufferedWritesWithOptionsLocked(self: *Backend, options: BulkIngestFinishOptions) !void {
-        if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+        if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
             try self.flushMutable();
         }
         try self.runForegroundCompactionBudget(options);
         if (options.compact) {
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = true });
         } else if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
         } else {
             _ = self.refreshCachedMaintenanceHintLocked();
         }
@@ -5733,37 +7798,58 @@ pub const Backend = struct {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         if (!options.compact and self.active_bulk_ingest_batches == 1) {
             if ((options.flush or self.shouldFlushMemtablesOnLastBulkIngestFinish()) and
-                (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0))
+                (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0))
             {
                 if (!try self.directIngestMutableAtBulkFinishIfPossible()) {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.runForegroundCompactionBudget(options);
             if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
-                try self.persistManifest();
+                try self.persistManifestLocked();
             } else {
                 _ = self.refreshCachedMaintenanceHintLocked();
             }
             self.active_bulk_ingest_batches -= 1;
             errdefer self.active_bulk_ingest_batches += 1;
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
-                try self.persistManifest();
+                try self.persistManifestLocked();
             }
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
         self.active_bulk_ingest_batches -= 1;
         errdefer self.active_bulk_ingest_batches += 1;
         if (self.active_bulk_ingest_batches == 0) {
-            if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+            if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
                 if (!try self.directIngestMutableAtBulkFinishIfPossible()) {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
         }
+    }
+
+    fn mergeBulkIngestWindowLocked(self: *Backend) !bool {
+        const first_sequence = self.bulk_ingest_window_first_sequence;
+        if (first_sequence == 0 or self.options.bulk_ingest_tiered_l0_fan_in < 2) return false;
+        const merged = try compaction_mod.compactBulkL0WindowScheduled(
+            Backend,
+            self,
+            first_sequence,
+            self.maintenanceScoreLocked(),
+        );
+        if (merged and self.root_dir != null and
+            (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+        {
+            try self.persistManifestLocked();
+        }
+        return merged;
     }
 
     fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
@@ -5787,6 +7873,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        if (self.active_bulk_ingest_batches == 0) self.bulk_ingest_window_first_sequence = 0;
         self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
@@ -5802,10 +7889,13 @@ pub const Backend = struct {
 
     fn finalizeDeferredStorageWorkLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return;
-        if (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0) {
+        try self.drainOutputCleanupLocked();
+        if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
             try self.flushMutable();
         }
         try self.finalizeDeferredRunWork(.{});
+        try self.drainOutputCleanupLocked();
+        if (self.root_dir != null and self.obsolete_manifest_dirty) try self.persistManifestLocked();
     }
 
     const DeferredRunWorkOptions = struct {
@@ -5815,7 +7905,7 @@ pub const Backend = struct {
     fn finalizeDeferredRunWork(self: *Backend, options: DeferredRunWorkOptions) !void {
         if (self.options.backend.read_only) return;
         if (self.root_dir != null and self.hasReclaimableObsoletePathsLocked()) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
             _ = self.refreshCachedMaintenanceHintLocked();
             if (!options.force_soft_compaction and !self.options.foreground_soft_compaction) return;
         }
@@ -5824,7 +7914,7 @@ pub const Backend = struct {
             try self.maybeCompactRuns();
         }
         if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
-            try self.persistManifest();
+            try self.persistManifestLocked();
         }
     }
 
@@ -5833,8 +7923,8 @@ pub const Backend = struct {
             try self.maybeCompactRuns();
             return;
         }
-        while (countLevelRuns(self.runs.items, 0) > limit) {
-            try compaction_mod.compactL0ToLimit(Backend, self, limit);
+        while (countLevelRuns(&self.runs, 0) > limit) {
+            if (!try compaction_mod.compactL0ToLimit(Backend, self, limit)) break;
         }
     }
 
@@ -5848,13 +7938,14 @@ pub const Backend = struct {
         const limit = options.max_deferred_l0_runs orelse self.effectiveL0SoftLimitRuns();
         const start_ns = self.writeStatsNowNs();
         var steps: usize = 0;
-        while (steps < max_steps) : (steps += 1) {
+        while (steps < max_steps) {
             if (options.max_foreground_compaction_ns) |budget_ns| {
                 if (budget_ns == 0) break;
                 if (self.writeStatsElapsedNs(start_ns) >= budget_ns) break;
             }
-            if (limit > 0 and countLevelRuns(self.runs.items, 0) <= limit) break;
+            if (limit > 0 and countLevelRuns(&self.runs, 0) <= limit) break;
             const score = self.maintenanceScoreLocked();
+            const slices_before = self.directory_planning_slices;
             const compacted = try compaction_mod.compactL0ToLimitScheduledWithinBudget(
                 Backend,
                 self,
@@ -5862,7 +7953,20 @@ pub const Backend = struct {
                 score,
                 options.max_foreground_compaction_input_bytes,
             );
-            if (!compacted) break;
+            if (compacted) {
+                steps += 1;
+            } else if (self.directory_planning_slices == slices_before) break;
+            // Preparation quanta do not consume an output-job allowance, but
+            // they do consume the caller's wall-time allowance. Yield between
+            // them and recheck that deadline before doing any more work.
+            if (self.manifestCoordinationIo()) |io| {
+                self.retainReaderKind(.compaction);
+                runtime_mod.unlockBackend(Backend, self, true);
+                const yielded = io.sleep(.fromNanoseconds(1), .awake);
+                _ = runtime_mod.lockBackend(Backend, self);
+                self.releaseReaderKind(.compaction);
+                try yielded;
+            }
         }
         _ = self.refreshCachedMaintenanceHintLocked();
     }
@@ -5885,14 +7989,26 @@ pub const Backend = struct {
     }
 
     fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
-        for (self.runs.items) |run| {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| return directory.byId(run_id) != null;
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
             if (run.id == run_id) return true;
         }
         return false;
     }
 
     fn pathTrackedByActiveRunsLocked(self: *Backend, path: []const u8) bool {
-        for (self.runs.items) |run| {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| {
+            if (parseRunIdFromTableFileName(std.fs.path.basename(path))) |id| {
+                const run = directory.byId(id) orelse return false;
+                return if (run.path) |active| std.mem.eql(u8, active, path) else false;
+            }
+            // Manifest files are not SSTs. Avoid a full run walk for each
+            // checkpoint/journal retirement record in a churned ledger.
+            if (repository_mod.manifest_set.identify(std.fs.path.basename(path)) != null) return false;
+        };
+        var cursor = self.runs.cursor();
+        while (cursor.next()) |run| {
             if (run.path) |active| {
                 if (std.mem.eql(u8, active, path)) return true;
             }
@@ -5902,10 +8018,7 @@ pub const Backend = struct {
 
     fn pathTrackedByManifestLocked(self: *Backend, path: []const u8) bool {
         if (self.pathTrackedByActiveRunsLocked(path)) return true;
-        for (self.obsolete_paths.items) |obsolete| {
-            if (std.mem.eql(u8, obsolete.path, path)) return true;
-        }
-        return false;
+        return self.obsolete_paths.contains(path);
     }
 
     pub fn cleanupRecoveredRunFilesForManifest(self: *Backend) !RecoveredRunFileCleanupStats {
@@ -5980,49 +8093,126 @@ pub const Backend = struct {
             stats.files_deleted +|= 1;
             stats.bytes_deleted +|= size;
         }
+        const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
+        stats.files_deleted +|= manifest_stats.files_deleted;
+        stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        return stats;
+    }
+
+    fn cleanupOrphanedManifestFilesForSet(self: *Backend, io: std.Io) !RecoveredRunFileCleanupStats {
+        // Inventory is advisory reclamation, never recovery authority. Only a
+        // validated mounted set behind the native exclusive writer lease may
+        // remove unlinked files. Read-only and custom-storage opens do not.
+        if (self.root_writer_lock == null or self.manifest_journal.descriptor == null or self.manifest_journal.sequence == null) return .{};
+        if (self.manifest_publish_in_flight or self.manifest_checkpoint_build_in_flight) return .{};
+        var dir = try std.Io.Dir.cwd().openDir(io, self.root_dir.?, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        var stats: RecoveredRunFileCleanupStats = .{};
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (repository_mod.manifest_set.identify(entry.name) == null and !repository_mod.manifest_set.isTemporaryFile(entry.name)) continue;
+            const path = try std.fs.path.join(self.allocator, &.{ self.root_dir.?, entry.name });
+            defer self.allocator.free(path);
+            if (self.obsolete_paths.contains(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
+            const size = self.storage.?.fileSize(path) catch 0;
+            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            stats.files_deleted +|= 1;
+            stats.bytes_deleted +|= size;
+        }
         return stats;
     }
 
     fn reconcileObsoletePathsForManifest(self: *Backend) !void {
+        if (self.obsolete_reclaim_in_flight) return;
+        self.obsolete_reclaim_in_flight = true;
+        defer self.obsolete_reclaim_in_flight = false;
+        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
         const now_ns = self.nowNs();
-        var i: usize = 0;
-        while (i < self.obsolete_paths.items.len) {
-            const obsolete = &self.obsolete_paths.items[i];
+        // Bound each maintenance turn, including already-due pinned files.
+        // Resume by path against the current root so churn cannot invalidate
+        // a borrowed cursor or force a restart from the first pinned file.
+        for (0..128) |_| {
+            if (platform.time.monotonicNs() >= deadline) return;
+            const obsolete = self.obsolete_paths.nextDueAfter(now_ns, self.obsolete_reclaim_after) orelse {
+                if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
+                self.obsolete_reclaim_after = null;
+                // Other backend instances may release global file pins without
+                // notifying us. A bounded periodic retry guarantees progress.
+                self.obsolete_reclaim_retry_at_ns = now_ns +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
+                return;
+            };
+            const bookmark = try self.allocator.dupe(u8, obsolete.path);
+            self.obsolete_reclaim_visits +|= 1;
+            if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
+            self.obsolete_reclaim_after = bookmark;
             if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) {
-                i += 1;
-                continue;
-            }
-            if (obsolete.delete_after_ns > now_ns) {
-                i += 1;
                 continue;
             }
 
-            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
+            // Retain the path across off-lock I/O; a failed post-I/O allocation
+            // leaves it in the durable ledger for an idempotent retry.
+            const path = try self.allocator.dupe(u8, obsolete.path);
+            defer self.allocator.free(path);
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            const deleted = repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path);
+            if (self.options.cache) |cache| cache.invalidatePath(path);
+            _ = runtime_mod.lockBackend(Backend, self);
+            self.releaseReaderKind(.other);
+            if (!self.obsolete_paths.contains(path)) continue;
+            try self.obsolete_paths.ensureUnusedCapacity(self.allocator, 1);
+            deleted catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
                     self.obsolete_delete_failures +|= 1;
                     self.obsolete_delete_retries +|= 1;
-                    obsolete.delete_after_ns = now_ns +| self.options.obsolete_delete_retry_ns;
+                    self.obsolete_paths.setDeadlinePrepared(path, self.nowNs() +| self.options.obsolete_delete_retry_ns);
                     self.obsolete_manifest_dirty = true;
-                    i += 1;
                     continue;
                 },
             };
-            run_snapshot_refs.forget(obsolete.path);
-            var removed = self.obsolete_paths.orderedRemove(i);
-            removed.deinit(self.allocator);
+            // Readers of the retired generation were allowed to repopulate
+            // the cache while the file was retained. No version pins remain
+            // at this boundary, so remove any such late entries as well.
+            run_snapshot_refs.forget(path);
+            self.obsolete_paths.removePrepared(path);
             self.obsolete_manifest_dirty = true;
         }
     }
 
     fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
-        if (self.bulkIngestActive() or self.obsolete_paths.items.len == 0) return false;
+        if (self.obsolete_reclaim_in_flight) return false;
+        if (self.bulkIngestActive() or self.obsolete_paths.count() == 0) return false;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
         const now_ns = self.nowNs();
-        for (self.obsolete_paths.items) |obsolete| {
-            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
-            if (obsolete.delete_after_ns <= now_ns) return true;
+        const epoch = file_pin_release_epoch.load(.acquire);
+        if (epoch != self.obsolete_reclaim_pin_epoch) {
+            self.obsolete_reclaim_pin_epoch = epoch;
+            self.obsolete_reclaim_retry_at_ns = 0;
         }
+        if (now_ns < self.obsolete_reclaim_retry_at_ns) return false;
+        // A hint must not publish merely because a pinned file is due: that
+        // creates more retired roots and can feed the reclamation loop itself.
+        // The bounded probe shares a live-tree bookmark with actual deletion.
+        var after: ?[]const u8 = self.obsolete_reclaim_after;
+        for (0..128) |_| {
+            const obsolete = self.obsolete_paths.nextDueAfter(now_ns, after) orelse {
+                if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
+                self.obsolete_reclaim_after = null;
+                self.obsolete_reclaim_retry_at_ns = now_ns +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
+                return false;
+            };
+            if (!self.pathTrackedByActiveRunsLocked(obsolete.path) and !self.obsoletePathPinnedByOpenVersion(obsolete.path)) return true;
+            self.obsolete_reclaim_visits +|= 1;
+            after = obsolete.path;
+        }
+        const bookmark = self.allocator.dupe(u8, after.?) catch return false;
+        if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
+        self.obsolete_reclaim_after = bookmark;
         return false;
     }
 
@@ -6035,27 +8225,78 @@ pub const Backend = struct {
     pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
+        if (@import("lsm_backend/memtable_reclamation.zig").pending(self)) return 0;
+        if (self.manifest_recovery_required) return null;
 
         // Keep the advertised deadline consistent with runMaintenanceStepLocked:
         // an open bulk session exposes only resource/durability checkpoints.
         // In particular, a due routine task must not keep an external worker
         // spinning while bulk mode intentionally suppresses that task.
-        if (self.bulkIngestActive()) return self.nextWalCheckpointRetryDelayNsLocked();
+        if (self.bulkIngestActive()) {
+            var delay = self.bulkPlanningWakeDelayLocked();
+            if (self.outputCleanupDelayLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            if (!self.bulk_plan_in_flight and self.bulkTieredL0MaintenanceDueLocked()) {
+                const candidate: u64 = if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0;
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            }
+            if (self.tombstoneReconcileDelayLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            return delay;
+        }
 
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
+        if (self.outputCleanupDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        // Retired owners still need bounded reclamation turns even after a
+        // build error or the last runnable plan disappears. Cleanup is not
+        // optional I/O and must not wait for foreground pressure to clear.
+        if ((self.retired_admissions != null and !self.admission_reclaim_in_flight) or
+            (self.retired_closures != null and !self.closure_reclaim_in_flight)) delay_ns = 0;
         if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        if (self.nextImmutableIdleFlushDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
+        if (compaction_mod.nextTombstoneGcDelay(self)) |candidate| {
+            const admitted_delay = @max(candidate, if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+            delay_ns = if (delay_ns) |current| @min(current, admitted_delay) else admitted_delay;
+        }
+        if (self.tombstoneReconcileDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        if (self.bulkPlanningWakeDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        if (!self.directory_planning_in_flight and !self.admission_in_flight) {
+            var candidate: ?u64 = if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null) 0 else null;
+            if (self.domain_admission_retry_after_ns != 0) candidate = self.domain_admission_retry_after_ns -| self.nowNs();
+            for (self.pending_admissions) |pending| if (pending) |job| {
+                const retry = job.retry_after_ns -| self.nowNs();
+                candidate = if (candidate) |current| @min(current, retry) else retry;
+            };
+            if (candidate) |due| {
+                const retry = @max(due, if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+                delay_ns = if (delay_ns) |current| @min(current, retry) else retry;
+            }
+        }
         return delay_ns;
+    }
+
+    fn tombstoneReconcileDelayLocked(self: *Backend) ?u64 {
+        if (self.options.backend.read_only or self.tombstone_reconcile_in_flight) return null;
+        if (self.pending_tombstone_reconcile != null or
+            (!self.run_directory_dirty and self.run_directory != null and self.run_directory.?.unknownTombstoneRunCount() != 0))
+            return @max(self.tombstone_reconcile_retry_ns -| self.nowNs(), if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+        return null;
     }
 
     fn nextMutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
         if (self.options.mutable_idle_flush_after_ns == 0 or
             self.mutable_idle_flush_deadline_ns == 0 or
-            self.mutable.entries.items.len == 0 or
+            self.mutable.entryCount() == 0 or
             self.root_dir == null or
             self.storage == null or
             self.options.backend.read_only or
@@ -6070,25 +8311,38 @@ pub const Backend = struct {
         return delay_ns;
     }
 
+    fn nextImmutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
+        if (self.options.mutable_idle_flush_after_ns == 0 or
+            self.immutable_idle_flush_deadline_ns == 0 or
+            self.activeImmutableMemtableCount() == 0 or
+            self.root_dir == null or
+            self.storage == null or
+            self.options.backend.read_only or
+            self.bulkIngestActive()) return null;
+
+        const now_ns = self.nowNs();
+        const delay_ns = if (self.immutable_idle_flush_deadline_ns <= now_ns)
+            0
+        else
+            self.immutable_idle_flush_deadline_ns - now_ns;
+        if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
+        return delay_ns;
+    }
+
     fn nextObsoleteReclaimDelayNsLocked(self: *Backend) ?u64 {
-        if (self.obsolete_paths.items.len == 0) return null;
+        if (self.obsolete_paths.count() == 0) return null;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return null;
         if (self.bulkIngestActive()) return null;
 
         const now_ns = self.nowNs();
-        var delay_ns: ?u64 = null;
-        var due_now = false;
-        for (self.obsolete_paths.items) |obsolete| {
-            if (self.pathTrackedByActiveRunsLocked(obsolete.path) or self.obsoletePathPinnedByOpenVersion(obsolete.path)) continue;
-            const candidate = if (obsolete.delete_after_ns <= now_ns) 0 else obsolete.delete_after_ns - now_ns;
-            if (candidate == 0) due_now = true;
-            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
-        }
-        if (due_now) self.cached_maintenance_hint.store(1, .release);
+        const deadline = self.obsolete_paths.earliestDeadline() orelse return null;
+        const retry = if (file_pin_release_epoch.load(.acquire) == self.obsolete_reclaim_pin_epoch) self.obsolete_reclaim_retry_at_ns else 0;
+        const delay_ns = @max(deadline, retry) -| now_ns;
+        if (delay_ns == 0) self.cached_maintenance_hint.store(1, .release);
         return delay_ns;
     }
 
-    fn nowNs(self: *Backend) u64 {
+    pub fn nowNs(self: *Backend) u64 {
         if (self.storage) |storage| return storage.nowNs();
         return 0;
     }
@@ -6171,6 +8425,7 @@ pub const Backend = struct {
 
 const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.single_threaded) struct {
     backend: *Backend,
+    borrowed_io: ?std.Io,
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6179,8 +8434,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
     }
 
     fn start(_: *InternalFlushWorker) !void {
@@ -6188,6 +8443,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 
     fn stopAndJoin(_: *InternalFlushWorker, _: bool) void {}
+
+    fn deinit(_: *InternalFlushWorker) void {}
 
     fn waker(self: *InternalFlushWorker) MaintenanceWaker {
         return .{ .ptr = self, .wake_fn = wake };
@@ -6200,8 +8457,11 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     }
 } else struct {
     backend: *Backend,
-    mutex: std.atomic.Mutex = .unlocked,
-    thread: ?std.Thread = null,
+    borrowed_io: ?std.Io,
+    mutex: std.Io.Mutex = .init,
+    wake_event: std.Io.Event = .unset,
+    owned_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
     wake_requested: bool = false,
@@ -6210,8 +8470,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     errors: u64 = 0,
     joined: bool = false,
 
-    const idle_obsolete_reclaim_poll_ns = 250 * std.time.ns_per_ms;
-    const idle_wake_poll_ns = 2 * std.time.ns_per_ms;
+    const Work = enum { run, drain, stop };
 
     const Stats = struct {
         wakeups: u64 = 0,
@@ -6220,24 +8479,39 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         joined: bool = false,
     };
 
-    fn init(backend: *Backend) InternalFlushWorker {
-        return .{ .backend = backend };
+    fn init(backend: *Backend, scheduling_io: ?std.Io) InternalFlushWorker {
+        return .{ .backend = backend, .borrowed_io = scheduling_io };
+    }
+
+    fn io(self: *InternalFlushWorker) std.Io {
+        return self.borrowed_io orelse self.owned_io.?.io();
     }
 
     fn start(self: *InternalFlushWorker) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (self.borrowed_io == null) {
+            self.owned_io = std.Io.Threaded.init(self.backend.allocator, .{
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            });
+        }
+        self.future = try self.io().concurrent(run, .{self});
+    }
+
+    fn deinit(self: *InternalFlushWorker) void {
+        if (self.owned_io) |*io_impl| io_impl.deinit();
     }
 
     fn stopAndJoin(self: *InternalFlushWorker, drain: bool) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.stop_requested = true;
         self.drain_on_stop = self.drain_on_stop or drain;
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
 
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.wake_event.set(self.io());
+        if (self.future) |*future| {
+            future.await(self.io());
+            self.future = null;
             self.joined = true;
         }
     }
@@ -6248,15 +8522,16 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn wake(ptr: *anyopaque) void {
         const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
         self.wakeups +|= 1;
-        self.mutex.unlock();
+        self.wake_event.set(self.io());
+        self.mutex.unlock(self.io());
     }
 
     fn snapshotStats(self: *InternalFlushWorker) Stats {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
         return .{
             .wakeups = self.wakeups,
             .maintenance_steps = self.maintenance_steps,
@@ -6268,36 +8543,50 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     fn run(self: *InternalFlushWorker) void {
         var next_reclaim_delay_ns: ?u64 = null;
         while (true) {
-            const drain_then_stop = self.waitForWork(next_reclaim_delay_ns);
-            if (drain_then_stop) {
-                _ = self.drainMaintenance();
-                return;
+            switch (self.waitForWork(next_reclaim_delay_ns)) {
+                .stop => return,
+                .drain => {
+                    _ = self.drainMaintenance();
+                    return;
+                },
+                .run => next_reclaim_delay_ns = self.drainMaintenance(),
             }
-            next_reclaim_delay_ns = self.drainMaintenance();
         }
     }
 
-    fn waitForWork(self: *InternalFlushWorker, initial_reclaim_delay_ns: ?u64) bool {
-        var reclaim_delay_ns = initial_reclaim_delay_ns;
+    fn waitForWork(self: *InternalFlushWorker, reclaim_delay_ns: ?u64) Work {
+        const io_ctx = self.io();
+        const deadline_ns = if (reclaim_delay_ns) |delay| platform.time.monotonicNs() +| delay else null;
         while (true) {
-            lockWorkerMutex(&self.mutex);
-            if (self.stop_requested or self.wake_requested) break;
-            self.mutex.unlock();
-
-            if (reclaim_delay_ns) |delay_ns| {
-                if (delay_ns == 0) return false;
-                const sleep_ns = @min(delay_ns, idle_obsolete_reclaim_poll_ns);
-                sleepForTest(sleep_ns);
-                reclaim_delay_ns = if (delay_ns <= sleep_ns) 0 else delay_ns - sleep_ns;
+            self.mutex.lockUncancelable(io_ctx);
+            if (self.stop_requested) {
+                const work: Work = if (self.drain_on_stop) .drain else .stop;
+                self.mutex.unlock(io_ctx);
+                return work;
+            }
+            if (self.wake_requested) {
+                self.wake_requested = false;
+                self.mutex.unlock(io_ctx);
+                return .run;
+            }
+            // Reset under the same mutex used to publish wakes. A wake
+            // arriving before wait remains latched and cannot be lost.
+            self.wake_event.reset();
+            self.mutex.unlock(io_ctx);
+            if (deadline_ns) |deadline| {
+                const now = platform.time.monotonicNs();
+                if (now >= deadline) return .run;
+                self.wake_event.waitTimeout(io_ctx, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline - now),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return .stop,
+                };
             } else {
-                sleepForTest(idle_wake_poll_ns);
+                self.wake_event.waitUncancelable(io_ctx);
             }
         }
-        defer self.mutex.unlock();
-        const drain_then_stop = self.stop_requested and self.drain_on_stop;
-        if (self.stop_requested and !drain_then_stop) return true;
-        self.wake_requested = false;
-        return drain_then_stop;
     }
 
     fn drainMaintenance(self: *InternalFlushWorker) ?u64 {
@@ -6310,22 +8599,22 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.wake_requested = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         return null;
     }
 
     fn recordStep(self: *InternalFlushWorker) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.maintenance_steps +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
     }
 
     fn recordError(self: *InternalFlushWorker, err: anyerror) void {
-        lockWorkerMutex(&self.mutex);
+        self.mutex.lockUncancelable(self.io());
         self.errors +|= 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io());
         std.log.warn("lsm internal flush worker failed root={?s} err={}", .{ self.backend.root_dir, err });
     }
 };
@@ -6355,6 +8644,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6371,8 +8661,9 @@ pub const BackendHandle = struct {
         }
 
         backend.* = Backend.init(allocator, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6395,6 +8686,7 @@ pub const BackendHandle = struct {
         var internal_flush_worker: ?*InternalFlushWorker = null;
         errdefer if (internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
+            worker.deinit();
             allocator.destroy(worker);
         };
 
@@ -6411,8 +8703,9 @@ pub const BackendHandle = struct {
         }
 
         try backend.openInto(allocator, root_dir, resolved_options);
+        errdefer backend.close();
         if (config.internal_flush_worker) {
-            internal_flush_worker = try startInternalFlushWorker(allocator, backend);
+            internal_flush_worker = try startInternalFlushWorker(allocator, backend, config.maintenance_io orelse if (owned_runtime) |*runtime| runtime.ptr().io() else null);
         }
         return .{
             .allocator = allocator,
@@ -6426,6 +8719,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(true);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6439,6 +8733,7 @@ pub const BackendHandle = struct {
         if (self.internal_flush_worker) |worker| {
             worker.stopAndJoin(false);
             self.backend.options.maintenance_waker = null;
+            worker.deinit();
             self.allocator.destroy(worker);
             self.internal_flush_worker = null;
         }
@@ -6472,11 +8767,12 @@ pub const BackendHandle = struct {
         return worker.snapshotStats();
     }
 
-    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend) !*InternalFlushWorker {
+    fn startInternalFlushWorker(allocator: Allocator, backend: *Backend, io: ?std.Io) !*InternalFlushWorker {
         if (backend.options.maintenance_waker != null) return error.MaintenanceWakerAlreadyConfigured;
         const worker = try allocator.create(InternalFlushWorker);
         errdefer allocator.destroy(worker);
-        worker.* = InternalFlushWorker.init(backend);
+        worker.* = InternalFlushWorker.init(backend, io);
+        errdefer worker.deinit();
         backend.options.maintenance_waker = worker.waker();
         errdefer backend.options.maintenance_waker = null;
         try worker.start();
@@ -6566,8 +8862,12 @@ fn validateRunLayoutForManifest(runs: []const Run) !void {
             }
             if (prev.level == run.level) {
                 if (prev.level == 0) {
-                    if (prev.id <= run.id) {
-                        logInvalidRunLayout("l0_id_order", prior, run);
+                    const previous_visibility = if (prev.visibility_id == 0) prev.id else prev.visibility_id;
+                    const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;
+                    if (previous_visibility < visibility or
+                        (previous_visibility == visibility and compareRunBound(prev.largest_namespace_name, prev.largest_key, run.smallest_namespace_name, run.smallest_key) != .lt))
+                    {
+                        logInvalidRunLayout("l0_visibility_order", prior, run);
                         return error.InvalidTableFile;
                     }
                 } else {
@@ -6599,12 +8899,12 @@ fn classifyRun(run: Run, split_key: []const u8) SplitSide {
 }
 
 fn clearRunsAndFiles(backend: *Backend) !void {
-    for (backend.runs.items) |*run| {
+    var cursor = backend.runs.cursor();
+    while (cursor.next()) |run| {
         if (run.path) |path| repository_mod.deleteFileAbsoluteWithStorage(backend.storage.?, path) catch {};
-        run.deinit(backend.allocator);
     }
+    backend.invalidateReadVersion();
     backend.runs.deinit(backend.allocator);
-    backend.runs = .empty;
     backend.invalidateMutableReadSnapshot();
     backend.mutable.deinit(backend.allocator);
     backend.mutable = .{};
@@ -6677,7 +8977,8 @@ fn expectLevelTargetsSatisfied(runs: []const Run, base: usize, multiplier: usize
     }
 }
 
-fn countLevelRuns(runs: []const Run, level: u32) usize {
+fn countLevelRuns(runs: anytype, level: u32) usize {
+    if (comptime @TypeOf(runs) == *RunStore or @TypeOf(runs) == *const RunStore) return runs.countLevel(level);
     var count: usize = 0;
     for (runs) |run| {
         if (run.level == level) count += 1;
@@ -6687,9 +8988,10 @@ fn countLevelRuns(runs: []const Run, level: u32) usize {
 
 fn countRunEntriesForTest(backend: *Backend) !usize {
     var count: usize = 0;
-    for (backend.runs.items) |*run| {
+    var cursor = backend.runs.cursor();
+    while (cursor.next()) |run| {
         const state = try backend.resolveRunState(run);
-        count += state.entries.items.len;
+        count += state.entryCount();
     }
     return count;
 }
@@ -6726,7 +9028,7 @@ fn appendStateLevelRunsForTest(backend: *Backend, level: u32, count: usize) !voi
         state = .{};
         try backend.runs.append(backend.allocator, run);
     }
-    compaction_mod.sortRuns(backend.runs.items);
+    try backend.runs.reindexForTest(backend.allocator);
 }
 
 fn sleepForTest(duration_ns: u64) void {
@@ -6803,6 +9105,35 @@ fn waitSignalForTest(fd: std.posix.fd_t) !void {
     }
 }
 
+test "lsm backend aggregates compaction totals and preserves per-job maxima" {
+    var aggregate: Backend.WriteStats = .{
+        .compactions = 2,
+        .compaction_input_bytes = 300,
+        .compaction_output_bytes = 200,
+        .compaction_ns = 30,
+        .compaction_max_input_bytes = 200,
+        .compaction_max_output_bytes = 125,
+        .compaction_max_ns = 20,
+    };
+    Backend.accumulateWriteStats(&aggregate, .{
+        .compactions = 1,
+        .compaction_input_bytes = 250,
+        .compaction_output_bytes = 150,
+        .compaction_ns = 40,
+        .compaction_max_input_bytes = 250,
+        .compaction_max_output_bytes = 150,
+        .compaction_max_ns = 40,
+    });
+
+    try std.testing.expectEqual(@as(u64, 3), aggregate.compactions);
+    try std.testing.expectEqual(@as(u64, 550), aggregate.compaction_input_bytes);
+    try std.testing.expectEqual(@as(u64, 350), aggregate.compaction_output_bytes);
+    try std.testing.expectEqual(@as(u64, 70), aggregate.compaction_ns);
+    try std.testing.expectEqual(@as(u64, 250), aggregate.compaction_max_input_bytes);
+    try std.testing.expectEqual(@as(u64, 150), aggregate.compaction_max_output_bytes);
+    try std.testing.expectEqual(@as(u64, 40), aggregate.compaction_max_ns);
+}
+
 test "lsm backend default base level target absorbs L0 pressure output" {
     var backend = Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -6814,6 +9145,191 @@ test "lsm backend default base level target absorbs L0 pressure output" {
     try std.testing.expectEqual(@as(u64, 28), stats.lower_level_runs);
 }
 
+test "lsm overlap scoring bounds cold fallback and uses published aggregates" {
+    var backend = Backend.init(std.testing.allocator, .{ .l0_hard_limit_runs = 16 });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 1024, 1);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.state = .{};
+    try std.testing.expectEqual(@as(usize, 9), backend.overlapScoringL0Count(8));
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    _ = try backend.planningDirectory();
+    try std.testing.expectEqual(@as(usize, 1024), backend.overlapScoringL0Count(8));
+    try std.testing.expectEqual(@as(usize, 0), backend.largestL0OverlapRunCountLocked());
+    try std.testing.expect(!backend.l0_overlap_cache.valid);
+}
+
+test "lsm overlap scoring aggregate scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const time = @import("antfly_platform").time;
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var backend = Backend.init(std.heap.smp_allocator, .{ .l0_hard_limit_runs = 16 });
+        defer backend.close();
+        try appendSyntheticLevelRunsForTest(&backend, 0, count, 1);
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| run.state = .{};
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        _ = try backend.planningDirectory();
+        var previous_ns: u64 = 0;
+        for (0..31) |_| {
+            const started = time.monotonicNs();
+            var l0_count: usize = 0;
+            while (l0_count < backend.runs.count() and backend.runs.at(l0_count).level == 0) : (l0_count += 1) {}
+            std.mem.doNotOptimizeAway(l0_count);
+            previous_ns += time.monotonicNs() - started;
+        }
+        const started = time.monotonicNs();
+        for (0..10000) |_| {
+            const result = backend.largestL0OverlapRunCountLocked();
+            std.mem.doNotOptimizeAway(result);
+        }
+        const aggregate_ns = time.monotonicNs() - started;
+        std.debug.print("l0-score runs={d} previous_mean_ns={d} aggregate_mean_ns={d}\n", .{ count, previous_ns / 31, aggregate_ns / 10000 });
+    }
+}
+
+test "lsm dependency continuation retains epochs and budgets concurrent rebases" {
+    const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{});
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 32, 1);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.state = .{};
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    const directory = try backend.planningDirectory();
+    var handles: [32]RunDirectory.Handle = undefined;
+    for (&handles, 0..) |*handle, i| handle.* = directory.at(i).retain();
+    defer for (handles) |handle| handle.release(allocator);
+    const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = &handles, .tombstone_gc = true };
+    var validation = try Validation.init(&backend, plan);
+    defer validation.deinit(&backend);
+    try std.testing.expectEqual(Validation.Result.pending, try validation.advanceBudgetedLocked(&backend, 1, 0));
+    try std.testing.expectEqual(@as(usize, 0), validation.job.index);
+    while (validation.phase != .certificate) {
+        const before = validation.job.index;
+        _ = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        try std.testing.expect(validation.job.index - before <= 1);
+    }
+    for (0..16) |i| {
+        const current = try backend.planningDirectory();
+        const changed = try current.fork(allocator);
+        errdefer changed.destroy(allocator);
+        var added = handles[0].run.*;
+        added.id = 1000 + i;
+        added.visibility_id = added.id;
+        added.owns_metadata = false;
+        try backend.runs.append(allocator, added);
+        try changed.put(&backend, added);
+        backend.publishRunDirectory(changed);
+        const before = validation.slices;
+        _ = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        try std.testing.expectEqual(before + 1, validation.slices);
+        try std.testing.expectEqual(handles.len, validation.job.index);
+    }
+    var result: Validation.Result = .pending;
+    for (0..10000) |_| {
+        result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        if (result != .pending) break;
+    }
+    try std.testing.expectEqual(Validation.Result.valid, result);
+    try std.testing.expect(validation.rebases > 1);
+    const changed = try (try backend.planningDirectory()).fork(allocator);
+    try changed.put(&backend, handles[0].run.*);
+    backend.publishRunDirectory(changed);
+    for (0..10000) |_| {
+        result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        if (result != .pending) break;
+    }
+    try std.testing.expectEqual(Validation.Result.invalid, result);
+}
+
+test "lsm dependency continuation allocation failures and partial cleanup" {
+    const Fixture = struct {
+        fn check(allocator: Allocator) !void {
+            const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+            var backend = Backend.init(allocator, .{});
+            defer backend.close();
+            try appendSyntheticLevelRunsForTest(&backend, 0, 3, 1);
+            var runs = backend.runs.cursor();
+            while (runs.next()) |run| run.state = .{};
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const directory = try backend.planningDirectory();
+            const handles = [_]RunDirectory.Handle{ directory.at(0), directory.at(1), directory.at(2) };
+            const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = &handles };
+            for (0..3) |phase| {
+                var validation = try Validation.init(&backend, plan);
+                defer validation.deinit(&backend);
+                for (0..if (phase == 0) @as(usize, 1) else 100) |_| {
+                    const result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+                    if (phase == 1 and validation.phase == .cleanup) break;
+                    if (result != .pending) break;
+                }
+                // Cancellation/retirement can occur in any phase. It must
+                // release scratch incrementally before the owning epoch.
+                while (true) {
+                    var credits: usize = 1;
+                    if (validation.cleanupStep(allocator, &credits)) break;
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "lsm close cancels an unpublished GC intent and drains its writer roots" {
+    var backend = Backend.init(std.testing.allocator, .{ .tombstone_gc_min_percent = 1 });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 0, 32);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.tombstone_count = 1;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    for (0..1000) |_| {
+        try std.testing.expect(!try compaction_mod.compactTombstonesScheduled(Backend, &backend, 0));
+        if (backend.pending_gc) |pending| if (pending.intent != null) return;
+    }
+    return error.MissingPendingGcIntent;
+}
+
+test "lsm dependency continuation slice scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+    const time = @import("antfly_platform").time;
+    const allocator = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var backend = Backend.init(allocator, .{});
+        defer backend.close();
+        try appendSyntheticLevelRunsForTest(&backend, 0, count, 1);
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| run.state = .{};
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        const directory = try backend.planningDirectory();
+        const handles = try allocator.alloc(RunDirectory.Handle, count);
+        defer allocator.free(handles);
+        var cursor = directory.readCursor();
+        for (handles) |*handle| handle.* = cursor.next().?;
+        const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = handles, .tombstone_gc = true };
+        var validation = try Validation.init(&backend, plan);
+        defer validation.deinit(&backend);
+        const started = time.monotonicNs();
+        var max_slice_ns: u64 = 0;
+        while (true) {
+            const before = time.monotonicNs();
+            const result = try validation.advanceLocked(&backend);
+            max_slice_ns = @max(max_slice_ns, time.monotonicNs() - before);
+            if (result == .invalid) return error.InvalidBenchmarkCertificate;
+            if (result == .valid) break;
+        }
+        std.debug.print("dependency-continuation inputs={d} total_ns={d} slices={d} max_slice_ns={d}\n", .{ count, time.monotonicNs() - started, validation.slices, max_slice_ns });
+    }
+}
+
 test "lsm backend caches exact L0 overlap score until immutable run IDs change" {
     var backend = Backend.init(std.testing.allocator, .{
         .l0_overlap_compact_threshold_runs = 2,
@@ -6821,7 +9337,7 @@ test "lsm backend caches exact L0 overlap score until immutable run IDs change" 
     });
     defer backend.close();
     try appendSyntheticLevelRunsForTest(&backend, 0, 4, 1024);
-    compaction_mod.sortRuns(backend.runs.items);
+    try backend.runs.reindexForTest(backend.allocator);
 
     var stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 4), stats.overlapping_l0_runs);
@@ -6831,13 +9347,13 @@ test "lsm backend caches exact L0 overlap score until immutable run IDs change" 
     // Run metadata is immutable for an ID. Changing the complete ID sequence
     // models publication of a different run set with the same count and must
     // invalidate the cached result rather than relying on length alone.
-    backend.runs.items[0].id = 99;
+    backend.runs.at(0).*.id = 99;
     stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 4), stats.overlapping_l0_runs);
     try std.testing.expectEqual(@as(u64, 99), backend.l0_overlap_cache.run_ids[0]);
 
-    backend.runs.items[0].level = 1;
-    compaction_mod.sortRuns(backend.runs.items);
+    backend.runs.at(0).*.level = 1;
+    try backend.runs.reindexForTest(backend.allocator);
     stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 3), stats.overlapping_l0_runs);
     try std.testing.expectEqual(@as(usize, 3), backend.l0_overlap_cache.run_count);
@@ -6852,7 +9368,7 @@ test "lsm backend bounds exact overlap scoring above soft L0 pressure" {
     });
     defer backend.close();
     try appendSyntheticLevelRunsForTest(&backend, 0, 5, 1024);
-    compaction_mod.sortRuns(backend.runs.items);
+    try backend.runs.reindexForTest(backend.allocator);
 
     const stats = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 5), stats.l0_runs);
@@ -6875,6 +9391,23 @@ test "lsm backend tight base level target reports lower-level overflow" {
     try std.testing.expect(stats.level_overflow_bytes > 0);
 }
 
+fn drainMaintenanceQuantaForTest(backend: *Backend) !bool {
+    const before = backend.compaction_stats.compactions;
+    var progressed = false;
+    for (0..128) |_| {
+        const step = try backend.runMaintenanceStep();
+        progressed = progressed or step;
+        if (!step or backend.compaction_stats.compactions != before) return progressed;
+    }
+    return error.MaintenanceDidNotConverge;
+}
+
+fn makeAdmissionRetriesDueForTest(backend: *Backend) void {
+    for (backend.pending_admissions) |pending| if (pending) |job| {
+        job.retry_after_ns = 0;
+    };
+}
+
 test "lsm backend scheduled compaction admits lower-level plans over scheduler run-id stack cap" {
     var backend = Backend.init(std.testing.allocator, .{
         .level_target_runs_base = 32,
@@ -6887,16 +9420,17 @@ test "lsm backend scheduled compaction admits lower-level plans over scheduler r
     defer backend.close();
 
     try appendStateLevelRunsForTest(&backend, 1, 128);
-    const before_runs = countLevelRuns(backend.runs.items, 1);
+    const before_runs = countLevelRuns(&backend.runs, 1);
     try std.testing.expectEqual(@as(usize, 128), before_runs);
 
     const progressed = blk: {
         const locked = runtime_mod.lockBackend(Backend, &backend);
         defer runtime_mod.unlockBackend(Backend, &backend, locked);
-        break :blk try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1);
+        for (0..128) |_| if (try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1)) break :blk true;
+        break :blk false;
     };
     try std.testing.expect(progressed);
-    try std.testing.expect(countLevelRuns(backend.runs.items, 1) < before_runs);
+    try std.testing.expect(countLevelRuns(&backend.runs, 1) < before_runs);
 
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
@@ -7275,7 +9809,7 @@ test "lsm backend schedules deferred immutable flush on configured background ex
 
     try std.testing.expect(lane.submitted_job != null);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
     try std.testing.expect(backend.immutable_flush_job_in_flight);
 
     var job = lane.submitted_job.?;
@@ -7285,7 +9819,154 @@ test "lsm backend schedules deferred immutable flush on configured background ex
 
     try std.testing.expect(!backend.immutable_flush_job_in_flight);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+}
+
+test "lsm backend background flush waits for and merges a complete immutable window" {
+    const FakeLane = struct {
+        submitted_job: ?background_runtime_mod.Job = null,
+
+        fn lane(self: *@This()) background_runtime_mod.DurableJobLane {
+            return .{
+                .ptr = self,
+                .vtable = &vtable,
+            };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime_mod.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.submitted_job == null);
+            self.submitted_job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        const vtable = background_runtime_mod.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = drainOwner,
+            .poll = poll,
+        };
+    };
+
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var lane = FakeLane{};
+    const executor = BackgroundExecutor.initLane(lane.lane(), 780);
+    var backend = try Backend.open(std.testing.allocator, "/lsm-background-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 2,
+        .background_executor = &executor,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "old");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expect(lane.submitted_job == null);
+    try std.testing.expect(!backend.immutable_flush_job_in_flight);
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "new");
+        try txn.put(.{}, "key:b", "visible");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expect(lane.submitted_job != null);
+    try std.testing.expect(backend.immutable_flush_job_in_flight);
+
+    var job = lane.submitted_job.?;
+    lane.submitted_job = null;
+    try job.run(job.ptr);
+    job.deinit(job.ptr);
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.immutable_idle_flush_deadline_ns);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend idle maintenance publishes a partial immutable window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-idle-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .mutable_idle_flush_after_ns = 1,
+        .mutable_idle_flush_min_bytes = 0,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    backend.immutable_idle_flush_deadline_ns = 1;
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(u64, 0), backend.immutable_idle_flush_deadline_ns);
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+}
+
+test "lsm backend size maintenance preserves a partial immutable window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-size-windowed-flush-test", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1024,
+        .defer_flush_on_commit = true,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    // Model a runtime threshold reduction after the write. Maintenance must
+    // rotate the oversized mutable generation without treating that rotation
+    // as permission to publish an intentionally incomplete merge window.
+    backend.options.flush_threshold = 1;
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_rotations);
+    try std.testing.expectEqual(@as(u64, 0), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
 }
 
 test "lsm backend close drains scheduled immutable flush before destroying backend" {
@@ -7416,7 +10097,7 @@ test "lsm backend deferred immutable queue enforces per-backend limit" {
     try std.testing.expect(lane.submitted_job != null);
     try std.testing.expect(backend.immutable_flush_job_in_flight);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
 
     {
         var txn = try backend.beginWrite();
@@ -7427,7 +10108,7 @@ test "lsm backend deferred immutable queue enforces per-backend limit" {
     try std.testing.expect(lane.submitted_job != null);
     try std.testing.expect(backend.immutable_flush_job_in_flight);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 
     var job = lane.submitted_job.?;
     lane.submitted_job = null;
@@ -7436,7 +10117,7 @@ test "lsm backend deferred immutable queue enforces per-backend limit" {
 
     try std.testing.expect(!backend.immutable_flush_job_in_flight);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
 }
 
 test "lsm backend deferred immutable queue enforces aggregate byte limit" {
@@ -7468,14 +10149,303 @@ test "lsm backend deferred immutable queue enforces aggregate byte limit" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expect(backend.activeImmutableMemtableBytes() <= one_memtable_bytes);
 }
 
+test "lsm GC splits wide sources without making older L0 deletes newer" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-gc-split-order", .{
+        .storage = storage.storage(),
+        .compact_threshold_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .level_target_bytes_base = 1024 * 1024,
+        .tombstone_gc_max_input_bytes = 24 * 1024,
+        .max_compaction_input_bytes = 24 * 1024,
+        .obsolete_retention_ns = 0,
+    });
+    defer backend.close();
+    var payload: [16 * 1024]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(51);
+    random.random().bytes(&payload);
+    for (0..4) |i| {
+        var state: State = .{};
+        errdefer state.deinit(std.testing.allocator);
+        if (i < 2) {
+            try state.upsert(std.testing.allocator, .{}, if (i == 0) "a" else "z", &payload, false);
+        } else if (i == 2) {
+            try state.upsert(std.testing.allocator, .{}, "a", &.{}, true);
+            try state.upsert(std.testing.allocator, .{}, "z", &.{}, true);
+        } else try state.upsert(std.testing.allocator, .{}, "a", "fresh", false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, if (i < 2) 1 else 0);
+        state = .{};
+        errdefer run.deinit(std.testing.allocator);
+        try backend.runs.append(std.testing.allocator, run);
+    }
+    try backend.runs.reindexForTest(backend.allocator);
+    try backend.persistManifest();
+    var pinned = try backend.beginRead();
+    defer pinned.abort();
+    try std.testing.expectEqualStrings("fresh", try pinned.get(.{}, "a"));
+    try std.testing.expectError(error.NotFound, pinned.get(.{}, "z"));
+    const before_split = backend.compaction_stats.compactions;
+    for (0..64) |_| {
+        try std.testing.expect(try backend.runMaintenanceStep());
+        if (backend.compaction_stats.compactions != before_split) break;
+    }
+    var split_outputs: usize = 0;
+    for ((try backend.runs.testItems(backend.allocator))) |run| if (run.visibility_id == 3) {
+        split_outputs += 1;
+        try std.testing.expectEqual(@as(u32, 1), run.entry_count);
+    };
+    try std.testing.expectEqual(@as(usize, 2), split_outputs);
+    // The manifest must preserve old L0 priority across a process restart.
+    {
+        var reopened = try Backend.open(std.testing.allocator, "/lsm-gc-split-order", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+        defer reopened.close();
+        try std.testing.expectEqualStrings("fresh", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+        try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "z"));
+    }
+    for (0..128) |_| {
+        const before = backend.compaction_stats.input_bytes;
+        if (!try backend.runMaintenanceStep()) break;
+        try std.testing.expect(backend.compaction_stats.input_bytes - before <= 24 * 1024);
+        try std.testing.expectEqualStrings("fresh", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "z"));
+    }
+    for ((try backend.runs.testItems(backend.allocator))) |run| try std.testing.expectEqual(@as(?u32, 0), run.tombstone_count);
+    try std.testing.expectEqualStrings("fresh", try pinned.get(.{}, "a"));
+}
+
+test "lsm aged GC below irreducible input budget schedules a retry instead of spinning" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/lsm-gc-budget-retry", .{
+        .storage = storage.storage(),
+        .tombstone_gc_max_input_bytes = 1,
+        .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+    var state: State = .{};
+    errdefer state.deinit(alloc);
+    try state.upsert(alloc, .{}, "deleted", &.{}, true);
+    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+    state = .{};
+    run.oldest_tombstone_unix_ns = 1;
+    try backend.runs.append(alloc, run);
+    try backend.persistManifest();
+    // Discovery, certification and durable intent are distinct bounded turns.
+    // Only a completed, inadmissible objective should schedule a retry.
+    for (0..64) |_| {
+        _ = try backend.runMaintenanceStep();
+        if (backend.tombstone_gc_retry_after_ns != 0) break;
+        try std.testing.expect(backend.pending_gc != null);
+    }
+    try std.testing.expect(backend.tombstone_gc_retry_after_ns != 0);
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    const deadline = backend.tombstone_gc_retry_after_ns;
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    try std.testing.expectEqual(deadline, backend.tombstone_gc_retry_after_ns);
+}
+
+test "lsm GC checkpoints bounded level progress while preserving old readers" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const options = Options{
+        .storage = storage.storage(),
+        .compact_threshold_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .level_target_bytes_base = 1024 * 1024,
+        .tombstone_gc_max_input_bytes = 24 * 1024,
+        .max_compaction_input_bytes = 24 * 1024,
+        .obsolete_retention_ns = 0,
+    };
+    var backend = try Backend.open(std.testing.allocator, "/lsm-bounded-gc-progress", options);
+    defer backend.close();
+    var payload: [16 * 1024]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().bytes(&payload);
+    for (0..3) |i| {
+        var state: State = .{};
+        errdefer state.deinit(std.testing.allocator);
+        try state.upsert(std.testing.allocator, .{}, "key", &payload, false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, @intCast(3 - i));
+        state = .{};
+        errdefer run.deinit(std.testing.allocator);
+        try backend.runs.append(std.testing.allocator, run);
+    }
+    try backend.runs.reindexForTest(backend.allocator);
+    try backend.persistManifest();
+    var old = try backend.beginRead();
+    defer old.abort();
+    try std.testing.expectEqualSlices(u8, &payload, try old.get(.{}, "key"));
+    {
+        var deleted: State = .{};
+        errdefer deleted.deinit(std.testing.allocator);
+        try deleted.upsert(std.testing.allocator, .{}, "key", &.{}, true);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, deleted, 0);
+        deleted = .{};
+        errdefer run.deinit(std.testing.allocator);
+        run.oldest_tombstone_unix_ns = 1;
+        backend.invalidateReadVersion();
+        try backend.runs.append(std.testing.allocator, run);
+        try backend.runs.reindexForTest(backend.allocator);
+        try backend.persistManifest();
+    }
+    var steps: usize = 0;
+    while (backend.runs.count() != 0 and steps < 128) : (steps += 1) {
+        const before = backend.compaction_stats.input_bytes;
+        _ = try backend.runMaintenanceStep();
+        if (backend.pending_gc != null) try std.testing.expectEqual(@as(u64, 0), backend.tombstone_gc_retry_after_ns);
+        try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+        for ((try backend.runs.testItems(backend.allocator))) |run| if ((run.tombstone_count orelse 0) != 0) {
+            try std.testing.expectEqual(@as(u64, 1), run.oldest_tombstone_unix_ns);
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expect(steps >= 3);
+    try std.testing.expectEqualSlices(u8, &payload, try old.get(.{}, "key"));
+    var reopened = try Backend.open(std.testing.allocator, "/lsm-bounded-gc-progress", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "key"));
+}
+
+test "lsm manifest wire credits cover partitioned physical outputs without per-row ordinary reservation" {
+    const allocator = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(allocator);
+    for (0..256) |i| {
+        var key: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "{d:0>4}", .{i});
+        try state.upsert(allocator, .{ .name = "docs" }, name, "value", false);
+    }
+    for (0..3) |mode| {
+        var storage = storage_io.MemoryStorage.init(allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(allocator, "/manifest-credit-shape", .{
+            .storage = storage.storage(),
+            .run_partition_prefix_bytes = if (mode == 1) 3 else 0,
+            .max_run_file_physical_bytes = if (mode == 2) 4096 else 512 * 1024 * 1024,
+            .max_run_file_entries = if (mode == 2) 7 else 0,
+        });
+        defer backend.close();
+        const wire = try backend.prepareManifestCredit(&state, &@as(State, .{}));
+        var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &state, 0);
+        defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+        const encoded = try repository_mod.encodeManifestAlloc(allocator, backend.next_run_id, outputs.items, &.{});
+        defer allocator.free(encoded);
+        try std.testing.expect(encoded.len <= wire);
+        if (mode == 0) try std.testing.expect(wire < 1024);
+    }
+}
+
+test "lsm manifest admission retains unflushed WAL debt and clears it only at coverage" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/manifest-credit-debt", .{ .storage = storage.storage(), .flush_threshold = 10000 });
+    defer backend.close();
+    var txn = try backend.beginWrite();
+    defer txn.abort();
+    try txn.put(.{}, "key", "value");
+    try txn.commit();
+    try std.testing.expect(backend.manifest_unpublished_wire_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_wire_bytes);
+    try backend.sync(true);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_unpublished_wire_bytes);
+    const before = backend.write_stats.wal_append_records;
+    backend.manifest_admitted_wire_bytes = repository_mod.maxManifestReadBytes();
+    backend.manifest_admitted_commits = 1;
+    var incoming: ActiveMemTable = .{};
+    defer incoming.deinit(std.testing.allocator);
+    try incoming.upsert(std.testing.allocator, .{}, "blocked", "value", false);
+    try std.testing.expectError(error.ResourceBudgetExceeded, backend.admitCommit(&incoming, &.{}));
+    try std.testing.expectEqual(before, backend.write_stats.wal_append_records);
+    backend.manifest_admitted_commits = 0;
+    backend.manifest_admitted_wire_bytes = 0;
+}
+
+test "lsm manifest headroom accounts every obligation and rejects before WAL during checkpoint pressure" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(allocator, "/manifest-headroom-dimensions", .{ .storage = storage.storage() });
+    defer backend.close();
+    const cap = repository_mod.maxManifestReadBytes();
+    try std.testing.expect(backend.manifestCreditFits(1));
+    try std.testing.expect(!backend.manifestCreditFits(std.math.maxInt(u64)));
+    for ([_]*u64{
+        &backend.manifest_admitted_wire_bytes,
+        &backend.manifest_unpublished_wire_bytes,
+        &backend.manifest_pending_mutation_bytes,
+        &backend.manifest_reserved_mutation_bytes,
+    }) |dimension| {
+        const saved = dimension.*;
+        dimension.* = cap;
+        try std.testing.expect(!backend.manifestCreditFits(1));
+        dimension.* = saved;
+    }
+    const segments = backend.manifest_journal.segment_count;
+    defer backend.manifest_journal.segment_count = segments;
+    backend.manifest_journal.segment_count = @import("lsm_backend/manifest_set.zig").max_segments - 1;
+    backend.manifest_checkpoint_build_in_flight = true;
+    defer backend.manifest_checkpoint_build_in_flight = false;
+    const before = backend.write_stats.wal_append_records;
+    var txn = try backend.beginWrite();
+    defer txn.abort();
+    try txn.put(.{}, "must-not-reach-wal", "value");
+    try std.testing.expectError(error.ResourceBudgetExceeded, txn.commit());
+    try std.testing.expectEqual(before, backend.write_stats.wal_append_records);
+    try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_wire_bytes);
+}
+
+test "lsm manifest credits cover mixed namespaces keys and independent output limits" {
+    const allocator = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(allocator);
+    const namespaces = [_]?[]const u8{ null, "", "docs", "namespace-with-longer-metadata" };
+    var random = std.Random.DefaultPrng.init(8013);
+    var value: [2048]u8 = undefined;
+    random.random().bytes(&value);
+    for (0..128) |i| {
+        var key: [128]u8 = @splat('k');
+        std.mem.writeInt(u64, key[0..8], i, .big);
+        const key_len = 8 + i % 121;
+        const deleted = i % 7 == 0;
+        try state.upsert(allocator, .{ .name = namespaces[i % namespaces.len] }, key[0..key_len], if (deleted) "" else value[0 .. 1 + (i * 97) % value.len], deleted);
+    }
+    for (0..8) |mode| {
+        var storage = storage_io.MemoryStorage.init(allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(allocator, "/manifest-credit-mixed", .{
+            .storage = storage.storage(),
+            .run_partition_prefix_bytes = if (mode % 2 == 0) 0 else 1,
+            .max_run_file_bytes = if (mode < 4) 512 * 1024 * 1024 else 4096,
+            .max_run_file_physical_bytes = if (mode % 3 == 0) 4096 else 128 * 1024,
+            .max_run_file_entries = if (mode % 3 == 1) 7 else 0,
+        });
+        defer backend.close();
+        const wire = try backend.prepareManifestCredit(&state, &@as(State, .{}));
+        var outputs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &backend, &state, 0);
+        defer compaction_mod.discardOutputRuns(Backend, &backend, &outputs);
+        const encoded = try repository_mod.encodeManifestAlloc(allocator, backend.next_run_id, outputs.items, &.{});
+        defer allocator.free(encoded);
+        try std.testing.expect(encoded.len <= wire);
+    }
+}
+
 test "lsm backend resource manager throttles projected immutable state" {
+    // Include enough payload for the budget to distinguish one versus two
+    // memtables while still admitting the now-accounted SST directory.
+    const value: [16 * 1024]u8 = @splat('a');
     var sample: ActiveMemTable = .{};
     defer sample.deinit(std.testing.allocator);
-    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", &value, false);
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
     try std.testing.expect(one_memtable_bytes > 0);
 
@@ -7499,22 +10469,151 @@ test "lsm backend resource manager throttles projected immutable state" {
 
     {
         var txn = try backend.beginWrite();
-        try txn.put(.{}, "key:a", "a");
+        try txn.put(.{}, "key:a", &value);
         try txn.commit();
     }
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
 
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", &value);
+        try txn.commit();
+    }
+    // Admission must drain at least the first generation. Retired metadata
+    // stays charged until the commit releases the lock, which can require
+    // draining the second generation too; no write may be lost or rejected.
+    try std.testing.expect(backend.activeImmutableMemtableCount() <= 1);
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount() + backend.runs.count());
+    const stats = manager.sliceStats(.lsm_in_memory_state);
+    try std.testing.expect(stats.used_bytes <= one_memtable_bytes + one_memtable_bytes / 2);
+    try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
+    const builder_stats = manager.sliceStats(.lsm_table_builder_working_set);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), builder_stats.hard_limit_rejections);
+}
+
+test "lsm backend aggregate soft pressure preserves a partial immutable window" {
+    var sample: ActiveMemTable = .{};
+    defer sample.deinit(std.testing.allocator);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    try std.testing.expect(one_memtable_bytes > 0);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = one_memtable_bytes * 10,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-resource-window-throttle-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 8,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    const stats = manager.sliceStats(.lsm_in_memory_state);
-    try std.testing.expect(stats.used_bytes <= one_memtable_bytes + one_memtable_bytes / 2);
-    try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
+
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend aggregate soft pressure preserves a mutable bulk window" {
+    var sample: ActiveMemTable = .{};
+    defer sample.deinit(std.testing.allocator);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    try std.testing.expect(one_memtable_bytes > 0);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = one_memtable_bytes * 10,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-resource-mutable-window-throttle-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold = 1024,
+        .defer_flush_on_commit = true,
+        .max_deferred_immutable_memtables = 8,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+    });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:a", "a");
+        try txn.commit();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "key:b", "b");
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, manager.sliceStats(.lsm_in_memory_state).pressure);
+    try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+}
+
+test "lsm backend direct bulk admission rejects before wal append" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+        .soft_limit_bytes = 1,
+        .hard_limit_bytes = 1,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-resource-admission-test", .{
+        .storage = storage.storage(),
+        .resource_manager = &manager,
+        .flush_threshold_bytes = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .immutable_flush_window_bytes = 1024,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{});
+    defer runtime.deinit();
+    var txn = try runtime.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put("key", "value");
+    try std.testing.expectError(error.ResourceBudgetExceeded, txn.commit());
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_attempts);
+    try std.testing.expectEqual(@as(u64, 0), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 0), stats.wal_append_records);
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
 }
 
 test "lsm backend does not wait on aggregate soft pressure owned elsewhere" {
@@ -7588,16 +10687,18 @@ test "lsm backend rejects aggregate hard throttle without waiting" {
     manager.observeUsage(.lsm_in_memory_state, &external_usage, 0);
 }
 
-test "lsm backend resource manager rejects before wal apply" {
-    var sample: ActiveMemTable = .{};
+test "lsm backend resource manager reclaims local durable state before rejecting" {
+    const payload = [_]u8{'a'} ** (16 * 1024);
+    var sample: ActiveMemTable = .{ .ordered_enabled = false };
     defer sample.deinit(std.testing.allocator);
-    try sample.upsert(std.testing.allocator, .{}, "key:a", "a", false);
+    try sample.upsert(std.testing.allocator, .{}, "key:a", &payload, false);
     const one_memtable_bytes = Backend.estimateStateBytes(&sample);
+    const admission_bytes = one_memtable_bytes * 16;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
-        .soft_limit_bytes = one_memtable_bytes,
-        .hard_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
+        .soft_limit_bytes = admission_bytes,
+        .hard_limit_bytes = admission_bytes + one_memtable_bytes / 2,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
     policies[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
@@ -7616,16 +10717,21 @@ test "lsm backend resource manager rejects before wal apply" {
 
     {
         var txn = try backend.beginWrite();
-        try txn.put(.{}, "key:a", "a");
+        try txn.put(.{}, "key:a", &payload);
         try txn.commit();
     }
+    // The current payload fills the slice. Reclaiming this durable immutable
+    // leaves enough space for run metadata and the next small transaction.
+    manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
-        try std.testing.expectError(error.ResourceBudgetExceeded, txn.commit());
+        try txn.commit();
     }
-    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqualSlices(u8, &payload, try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
+    try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().immutable_flushes);
 }
 
 test "lsm backend deferred immutable backpressure waits for in-flight build" {
@@ -7694,15 +10800,16 @@ test "lsm backend deferred immutable backpressure waits for in-flight build" {
             target.finishImmutableFlushBuildLocked();
         }
     };
-    const clear_thread = try std.Thread.spawn(.{}, ClearBuild.run, .{&backend});
+    var clear_thread = try std.testing.io.concurrent(ClearBuild.run, .{&backend});
+    defer clear_thread.await(std.testing.io);
     {
         var txn = try backend.beginWrite();
         try txn.put(.{}, "key:b", "b");
         try txn.commit();
     }
-    clear_thread.join();
+    clear_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 
     var job = lane.submitted_job.?;
     lane.submitted_job = null;
@@ -7711,7 +10818,7 @@ test "lsm backend deferred immutable backpressure waits for in-flight build" {
 
     try std.testing.expect(!backend.immutable_flush_job_in_flight);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
 }
 
 test "lsm backend manual runtime flush progress does not require threads" {
@@ -7739,13 +10846,13 @@ test "lsm backend manual runtime flush progress does not require threads" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
     try std.testing.expectEqual(@as(usize, 0), try backend.background_executor.poll(1));
 
     try std.testing.expect(try backend.runMaintenanceStep());
 
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
 }
 
@@ -7801,7 +10908,7 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
     }
     try std.testing.expect(lane.submitted_job == null);
     try std.testing.expect(!backend.maintenance_job_in_flight);
-    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&backend.runs, 0));
 
     {
         var txn = try backend.beginWrite();
@@ -7810,7 +10917,7 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
     }
     try std.testing.expect(lane.submitted_job != null);
     try std.testing.expect(backend.maintenance_job_in_flight);
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
 
     var job = lane.submitted_job.?;
     lane.submitted_job = null;
@@ -7819,7 +10926,7 @@ test "lsm backend schedules detached maintenance job for compaction debt" {
 
     try std.testing.expect(!backend.maintenance_job_in_flight);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
     try std.testing.expectEqualStrings("a", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:a"));
     try std.testing.expectEqualStrings("b", try backend.getMergedWithMutable(&backend.mutable, .{}, "key:b"));
 }
@@ -7878,7 +10985,7 @@ test "lsm backend note potential maintenance debt schedules detached job" {
     }
     try backend.flushAllImmutableMemtables();
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
     try std.testing.expect(backend.maintenanceScore() > 0);
 
     var lane = FakeLane{};
@@ -7959,7 +11066,7 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), lane.submitted_count);
-    try std.testing.expectEqual(@as(usize, 6), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 6), countLevelRuns(&backend.runs, 0));
 
     var first_job = lane.pop().?;
     try first_job.run(first_job.ptr);
@@ -7980,7 +11087,7 @@ test "lsm backend detached maintenance jobs reschedule while debt remains" {
 
     try std.testing.expect(!backend.maintenance_job_in_flight);
     try std.testing.expectEqual(@as(u64, 0), backend.maintenanceScore());
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
 }
 
 test "lsm backend detached no-op maintenance does not resubmit forever" {
@@ -8135,7 +11242,7 @@ test "lsm backend replays committed mutable writes from wal after crash reopen" 
         try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     backend.options.backend.read_only = true;
     backend.close();
@@ -8230,8 +11337,8 @@ test "lsm backend idle mutable deadline checkpoints retained wal" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
     try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
 
     const first_deadline = backend.mutable_idle_flush_deadline_ns;
@@ -8248,9 +11355,9 @@ test "lsm backend idle mutable deadline checkpoints retained wal" {
     try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
     try std.testing.expect(try backend.runMaintenanceStep());
 
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_deadline_ns);
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("bravo", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
 
@@ -8293,7 +11400,7 @@ test "lsm backend idle checkpoint accumulates small writes and bounds dirty age"
     }
     try std.testing.expectEqual(max_deadline, backend.mutable_idle_flush_deadline_ns);
     try std.testing.expect(!(try backend.runMaintenanceStep()));
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
 
     // Crossing the byte floor activates the short idle deadline, which is
     // renewed by another write but never beyond the original maximum age.
@@ -8317,7 +11424,7 @@ test "lsm backend idle checkpoint accumulates small writes and bounds dirty age"
     try std.testing.expectEqual(@as(u64, 450), backend.mutable_idle_flush_deadline_ns);
     storage.tick = 450;
     try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_deadline_ns);
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_idle_flush_max_deadline_ns);
 
@@ -8358,7 +11465,7 @@ test "lsm backend recovered mutable state is immediately checkpoint eligible" {
         try txn.put(.{ .name = "docs" }, "doc:a", "alpha");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     const original_max_deadline = backend.mutable_idle_flush_max_deadline_ns;
     try std.testing.expect(original_max_deadline > storage.tick);
 
@@ -8373,7 +11480,7 @@ test "lsm backend recovered mutable state is immediately checkpoint eligible" {
     try std.testing.expect(backend.write_stats.wal_replay_records > 0);
     try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
     try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
 }
 
@@ -8451,14 +11558,14 @@ test "lsm backend durable boundary checkpoint flushes mutable state and retires 
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_retained_segments);
     try std.testing.expect(maintenance.wal_retained_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     try backend.checkpointWalAfterDurableBoundary();
 
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_segments);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_retained_bytes);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
     try std.testing.expectEqualStrings("alpha", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
@@ -8484,7 +11591,7 @@ test "lsm backend accounts in-memory recovery state in the resource manager and 
     }
 
     const maintenance = backend.snapshotMaintenanceStats();
-    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes;
+    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes + @sizeOf(output_cleanup.Queue);
     try std.testing.expect(expected_in_memory_bytes > 0);
     try std.testing.expectEqual(expected_in_memory_bytes, manager.sliceStats(.lsm_in_memory_state).used_bytes);
 
@@ -8561,10 +11668,10 @@ test "lsm backend accounts table builder working set during persisted flush" {
     try std.testing.expectEqual(@as(u64, 0), builder_stats.used_bytes);
     try std.testing.expect(builder_stats.peak_bytes >= 256 * 1024);
     try std.testing.expectEqual(@as(u64, 0), compaction_work_stats.peak_bytes);
-    try std.testing.expect(backend.runs.items.len > 0);
-    try std.testing.expect(backend.runs.items[0].path != null);
+    try std.testing.expect(backend.runs.count() > 0);
+    try std.testing.expect(backend.runs.at(0).*.path != null);
 
-    var index = try repository_mod.loadRunTableIndexAllocWithStorage(storage.storage(), std.testing.allocator, backend.runs.items[0].path.?);
+    var index = try repository_mod.loadRunTableIndexAllocWithStorage(storage.storage(), std.testing.allocator, backend.runs.at(0).*.path.?);
     defer index.deinit(std.testing.allocator);
     try std.testing.expectEqual(lsm_table_file.PrefixExtractor.none, index.prefix_extractor);
 }
@@ -8737,6 +11844,26 @@ test "lsm backend wal pressure maintenance flushes and checkpoints retained segm
     try std.testing.expectEqualStrings("beta", try read.get(.{ .name = "docs" }, "doc:b"));
 }
 
+test "lsm backend windowed wal checkpoint floor covers a straddling segment tail" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .wal_segment_bytes = 64 * 1024 * 1024,
+        .wal_checkpoint_dirty_bytes_multiplier = 2,
+        .wal_checkpoint_dirty_bytes_floor = 32 * 1024 * 1024,
+        .immutable_flush_window_bytes = 256 * 1024 * 1024,
+    });
+    defer backend.close();
+
+    try std.testing.expectEqual(
+        @as(?u64, 128 * 1024 * 1024),
+        backend.walCheckpointDirtyBytesLimit(),
+    );
+    backend.options.immutable_flush_window_bytes = 0;
+    try std.testing.expectEqual(
+        @as(?u64, 32 * 1024 * 1024),
+        backend.walCheckpointDirtyBytesLimit(),
+    );
+}
+
 test "lsm backend hard wal pressure forces foreground checkpoint on commit" {
     var storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();
@@ -8894,7 +12021,7 @@ test "lsm backend dirty-byte wal pressure bounds overwrite-heavy retention" {
     try std.testing.expect(writes < 16);
     try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_flushes);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
@@ -9343,7 +12470,7 @@ test "lsm backend byte flush window coalesces hot overwrites before run publicat
     }
     try backend.finalizeDeferredStorageWork();
 
-    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&backend.runs, 0));
     try std.testing.expectEqual(@as(usize, 2000), try countRunEntriesForTest(&backend));
 
     var round: usize = 0;
@@ -9361,10 +12488,10 @@ test "lsm backend byte flush window coalesces hot overwrites before run publicat
             try txn.commit();
         }
     }
-    try std.testing.expectEqual(@as(usize, 500), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 500), backend.mutable.entryCount());
     try backend.finalizeDeferredStorageWork();
 
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
     try std.testing.expectEqual(@as(usize, 2500), try countRunEntriesForTest(&backend));
     try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000000"));
     try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000499"));
@@ -9454,8 +12581,8 @@ test "lsm backend runtime cursor seeks internal graph artifact prefix before rep
     defer read.abort();
     try std.testing.expectEqualStrings("{}", try read.get(exact_key));
 
-    try std.testing.expect(backend.runs.items.len > 0);
-    const run = &backend.runs.items[0];
+    try std.testing.expect(backend.runs.count() > 0);
+    const run = backend.runs.at(0);
     const path_str = run.path orelse return error.TestUnexpectedResult;
     const table = try backend.getCachedRunTable(path_str, run.id);
     const positioned = (try table.lowerBoundPosition(null, prefix, true)) orelse return error.TestUnexpectedResult;
@@ -9471,6 +12598,7 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
         .bulk_ingest_flush_threshold_multiplier = 4,
+        .direct_bulk_ingest = false,
     });
     defer backend.close();
 
@@ -9480,8 +12608,8 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -9489,8 +12617,8 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginWrite();
@@ -9498,9 +12626,158 @@ test "lsm backend bulk ingest batches use an elevated flush threshold" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqualStrings("C", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm point leases pin immutable values across flush and overwrite" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/lsm-point-lease", .{
+        .flush_threshold_bytes = 256,
+        .storage = storage.storage(),
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    const payload = [_]u8{'x'} ** 1024;
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", &payload);
+        try write.commit();
+    }
+    var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+    defer probe.abort();
+    const borrowed = try probe.getLeased("row");
+    try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.held_layouts.items.len);
+    const Failure = struct {
+        fn run(failing: Allocator, target: *Backend) !void {
+            var lease = try runtime_mod.BoundProbeTxn(Backend).open(target, .{});
+            defer lease.abort();
+            lease.allocator = failing;
+            lease.metadata_allocator = failing;
+            _ = try lease.getLeased("row");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{&backend});
+    try backend.finalizeDeferredStorageWork();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", "new");
+        try write.commit();
+    }
+    try std.testing.expectEqualStrings("new", try probe.get("row"));
+    try std.testing.expectEqualSlices(u8, &payload, borrowed);
+}
+
+test "lsm point leases avoid the second disk value copy" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cached| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+        defer cache.deinit();
+        var backend = try Backend.open(alloc, "/lsm-point-disk-lease", .{
+            .flush_threshold = 1,
+            .storage = storage.storage(),
+            .cache = if (cached) &cache else null,
+        });
+        defer backend.close();
+        const payload = [_]u8{'x'} ** (1024 * 1024);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "row", &payload);
+            try write.commit();
+        }
+        // Exercise a current probe, whose disk-only value owns a block/copy
+        // but must not retain a whole SST epoch for every leased point.
+        backend.options.flush_threshold = 1000;
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "pending", "mutable");
+            try write.commit();
+        }
+        var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+        defer probe.abort();
+        try std.testing.expect(!probe.stable_point_view);
+        const borrowed = try probe.getLeased("row");
+        try std.testing.expectEqual(@as(usize, 0), probe.held_layouts.items.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+        try std.testing.expect(probe.leased_values.items.len <= @as(usize, if (cached) 0 else 1));
+        if (!cached) {
+            try std.testing.expectEqual(@as(usize, 1), probe.leased_values.items.len);
+            const buffer = probe.leased_values.items[0];
+            try std.testing.expect(@intFromPtr(borrowed.ptr) >= @intFromPtr(buffer.ptr));
+            try std.testing.expect(@intFromPtr(borrowed.ptr) + borrowed.len <= @intFromPtr(buffer.ptr) + buffer.len);
+        }
+        if (cached) try std.testing.expect(probe.held_blocks.items.len > 0);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.delete(.{}, "row");
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        try std.testing.expectEqualSlices(u8, &payload, borrowed);
+    }
+}
+
+test "lsm scoped reads bound retained values and preserve one disk snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var backend = try Backend.open(alloc, path, .{ .flush_threshold = 1 });
+    defer backend.close();
+    const payload = [_]u8{'v'} ** 8192;
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        for (0..128) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "row:{d:0>4}", .{i});
+            try write.put(.{}, key, &payload);
+        }
+        try write.commit();
+    }
+    try backend.sync(true);
+    try std.testing.expect(backend.runs.count() > 0);
+    var read = try Backend.BoundReadTxn.open(&backend, .{});
+    defer read.abort();
+    for (0..128) |i| {
+        var scope = try read.openReadScope(alloc);
+        defer scope.close();
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "row:{d:0>4}", .{i});
+        try std.testing.expectEqualSlices(u8, &payload, try scope.get(key));
+        try std.testing.expect(scope.held_blocks.items.len + scope.held_values.items.len > 0);
+        try std.testing.expectEqual(@as(usize, 0), read.held_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), read.held_values.items.len);
+    }
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var erased = try runtime.beginRead();
+    var first = try erased.openReadScope(alloc);
+    defer first.close();
+    var second = try erased.openReadScope(alloc);
+    defer second.close();
+    erased.abort(); // Both scopes retain the same parent snapshot.
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row:0000", "new");
+        try write.commit();
+    }
+    try std.testing.expectEqualSlices(u8, &payload, try first.get("row:0000"));
+    try std.testing.expectEqualSlices(u8, &payload, try second.get("row:0000"));
 }
 
 test "lsm backend direct-ingests threshold-sized bulk batches" {
@@ -9520,8 +12797,8 @@ test "lsm backend direct-ingests threshold-sized bulk batches" {
     }
 
     const stats = backend.snapshotWriteStats();
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -9591,8 +12868,8 @@ test "lsm runtime bulk append after put preserves write order" {
 
 test "lsm backend direct bulk ingest drains existing mutable before threshold batch" {
     var backend = Backend.init(std.testing.allocator, .{
-        .flush_threshold = 1,
-        .bulk_ingest_flush_threshold_multiplier = 4,
+        .flush_threshold = 4,
+        .bulk_ingest_flush_threshold_multiplier = 2,
     });
     defer backend.close();
 
@@ -9607,8 +12884,8 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
 
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -9623,15 +12900,53 @@ test "lsm backend direct bulk ingest drains existing mutable before threshold ba
     bulk_active = false;
 
     const stats = backend.snapshotWriteStats();
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(u64, 2), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_attempts);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_fallback_below_threshold);
     try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("F", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:f"));
+}
+
+test "lsm backend direct bulk ingest publishes older immutable epoch first" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 2,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+    });
+    defer backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.commit();
+    }
+    try backend.rotateMutableToImmutable();
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
 }
 
 test "lsm backend direct bulk ingest cursor hides older overlapping l0 values" {
@@ -9749,7 +13064,7 @@ test "lsm backend reopens overlapping direct ingest l0 runs with newest values v
             try txn.commit();
         }
 
-        try std.testing.expect(backend.runs.items.len >= 2);
+        try std.testing.expect(backend.runs.count() >= 2);
         try backend.persistManifest();
     }
 
@@ -9799,6 +13114,122 @@ test "lsm backend reopens overlapping direct ingest l0 runs with newest values v
     }
 }
 
+test "lsm backend linear bulk window merge preserves l0 chronology tombstones and reopen" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const options = Options{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .compact_threshold_runs = 4,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 128,
+        .foreground_soft_compaction = false,
+        .storage = storage.storage(),
+    };
+
+    {
+        var backend = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        var bulk_active = true;
+        errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+        var generation: usize = 1;
+        while (generation <= 5) : (generation += 1) {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            var pad_key_buf: [32]u8 = undefined;
+            const pad_key = try std.fmt.bufPrint(&pad_key_buf, "pad:{d}", .{generation});
+            const padding = [_]u8{'p'} ** 256;
+            try txn.put(.{ .name = "docs" }, pad_key, &padding);
+            switch (generation) {
+                1 => {
+                    try txn.put(.{ .name = "docs" }, "doc:overwrite", "old");
+                    try txn.put(.{ .name = "docs" }, "doc:deleted", "present");
+                },
+                2 => try txn.put(.{ .name = "docs" }, "doc:overwrite", "new"),
+                4 => try txn.delete(.{ .name = "docs" }, "doc:deleted"),
+                5 => try txn.put(.{ .name = "docs" }, "doc:newest", "visible"),
+                else => {},
+            }
+            try txn.commit();
+        }
+        try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        bulk_active = false;
+        try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+        try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&backend.runs, 0));
+        try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:overwrite"));
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:deleted"));
+        try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:newest"));
+    }
+
+    var reopened = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&reopened.runs, 0));
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:overwrite"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:deleted"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:newest"));
+}
+
+test "lsm backend tiers committed runs while overlapping request bulk mode remains active" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/request-bulk-tiering", .{
+        .flush_threshold = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .compact_threshold_runs = 4,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 128,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const request_options: backend_types.BatchOptions = .{ .mode = .bulk_ingest };
+    // Model another overlapping public request. It keeps generic leveled
+    // compaction deferred, but unlike an explicit ingest session it owns no
+    // final window and therefore leaves the sequence fence at zero.
+    backend.beginBatchMode(request_options);
+    var request_active = true;
+    defer if (request_active) {
+        backend.finishBatchMode(request_options);
+        backend.finalizeExitedBatchMode(request_options) catch {};
+    };
+
+    for (0..5) |generation| {
+        var txn = try backend.beginBatchWithOptions(request_options);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{generation});
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
+    try std.testing.expectEqual(@as(u64, 0), backend.bulk_ingest_window_first_sequence);
+
+    try std.testing.expect(try backend.runMaintenanceStep());
+    // Selection, emission and dependency validation are distinct quanta.
+    try std.testing.expect(backend.pending_bulk_plan != null);
+    // A newer request may publish while the background plan owns its epoch.
+    // It must neither restart discovery nor change the selected chronology.
+    {
+        var txn = try backend.beginBatchWithOptions(request_options);
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:5", "newest");
+        try txn.commit();
+    }
+    for (0..32) |_| {
+        if (backend.compaction_stats.compactions != 0) break;
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+    try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+
+    backend.finishBatchMode(request_options);
+    request_active = false;
+    try backend.finalizeExitedBatchMode(request_options);
+}
+
 test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
@@ -9817,8 +13248,8 @@ test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
     }
 
     const stats = backend.snapshotWriteStats();
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), stats.sorted_ingest_runs);
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
@@ -9840,27 +13271,32 @@ test "lsm backend byte flush threshold controls mutable flushes" {
     try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
     try txn.commit();
 
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
     try std.testing.expectEqualStrings(value[0..], try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 }
 
-test "lsm backend mutable byte estimate includes arena and hash index capacity" {
+test "lsm backend mutable byte estimate includes shared ownership and ordered index capacity" {
     var mutable: ActiveMemTable = .{};
     defer mutable.deinit(std.testing.allocator);
 
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "one", false);
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:b", "two", false);
 
-    const arena_bytes: u64 = @intCast(mutable.arena_owner.?.queryCapacity());
+    var owned_bytes: u64 = 0;
+    for (0..mutable.entryCount()) |i| {
+        const entry = mutable.entryAt(i);
+        owned_bytes += entry.sharedOverheadBytes() + entry.key.len + entry.value.len;
+        if (entry.namespace_name) |name| owned_bytes += name.len;
+    }
     const entries_bytes: u64 = @as(u64, @intCast(mutable.entries.capacity)) * @sizeOf(state_mod.OwnedEntry);
     const index_bytes = mutable.estimatedIndexMemoryBytes();
     const logical_bytes = 2 * @sizeOf(state_mod.OwnedEntry) +
         2 * "docs".len + "doc:a".len + "one".len + "doc:b".len + "two".len;
     try std.testing.expect(index_bytes > 0);
     try std.testing.expectEqual(@as(u64, logical_bytes), mutable.estimatedLogicalBytes());
-    try std.testing.expectEqual(entries_bytes +| arena_bytes +| index_bytes, Backend.estimateStateBytes(&mutable));
+    try std.testing.expectEqual(entries_bytes +| owned_bytes +| index_bytes + @sizeOf(state_mod.memory_account.Account), Backend.estimateStateBytes(&mutable));
 
     try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "doc:a", "replacement", false);
     try std.testing.expectEqual(
@@ -9875,19 +13311,20 @@ test "lsm backend preserves logical flush sizing with an actual memory guard" {
 
     const value = [_]u8{'x'} ** (256 * 1024);
     for (0..8) |i| {
-        // Replacements leave the superseded value in the arena until the
-        // memtable is released, while the logical state remains one entry.
+        // Unpinned replacements reclaim the superseded allocation immediately.
         const value_len: usize = if (i % 2 == 0) 64 * 1024 else value.len;
         try mutable.upsert(std.testing.allocator, .{ .name = "docs" }, "hot-key", value[0..value_len], false);
     }
 
     const logical_bytes = Backend.estimateStateLogicalBytes(&mutable);
     const actual_bytes = Backend.estimateStateBytes(&mutable);
-    try std.testing.expect(actual_bytes >= (logical_bytes + 1) * mutable_memory_guard_multiplier);
+    try std.testing.expect(actual_bytes < (logical_bytes + 1) * mutable_memory_guard_multiplier);
 
     // Capacity alone below the guard must not change normal run geometry.
     try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, actual_bytes));
-    // Arena growth beyond 2x the logical target activates the safety flush.
+    try std.testing.expect(!Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
+    // Excess index capacity still participates in the actual memory guard.
+    try mutable.ordered.spare.ensureTotalCapacity(std.testing.allocator, 128 * 1024);
     try std.testing.expect(Backend.stateMeetsByteFlushThreshold(&mutable, logical_bytes + 1));
 }
 
@@ -9980,12 +13417,47 @@ test "lsm backend reclaims a retired immutable when its exact reader exits" {
     // The newer reader never borrowed the old immutable generation. Releasing
     // the old reader must reclaim it even though another reader remains open.
     try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
-    try std.testing.expectEqual(
-        before_old_release -| retired_bytes,
-        manager.sliceStats(.lsm_in_memory_state).used_bytes,
-    );
+    // Releasing the old epoch can additionally reclaim its read projection.
+    try std.testing.expect(manager.sliceStats(.lsm_in_memory_state).used_bytes <= before_old_release -| retired_bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), manager.sliceStats(.lsm_in_memory_state).used_bytes);
     try std.testing.expectEqualStrings(value_a[0..], try newer_reader.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings(value_b[0..], try newer_reader.get(.{ .name = "docs" }, "doc:b"));
+}
+
+test "lsm publication allocation failure leaves WAL and live keys unchanged" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var backend = try Backend.open(failing.allocator(), "/lsm-atomic-publication", .{ .storage = storage.storage(), .flush_threshold = 1000 });
+    defer backend.close();
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{}, "a", "old-a");
+        try txn.put(.{}, "b", "old-b");
+        try txn.commit();
+    }
+    var old = try backend.beginRead();
+    defer old.abort();
+    var incoming = ActiveMemTable{ .ordered_enabled = false };
+    defer incoming.deinit(alloc);
+    try incoming.upsert(alloc, .{}, "a", "new-a", false);
+    try incoming.upsert(alloc, .{}, "b", "new-b", false);
+    const before = backend.write_stats.wal_append_records;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const prepared = backend.prepareAndAppendWalForMutable(&incoming);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, prepared);
+    try std.testing.expectEqual(before, backend.write_stats.wal_append_records);
+    try std.testing.expectEqualStrings("old-a", try backend.mutable.get(.{}, "a"));
+    try std.testing.expectEqualStrings("old-b", try backend.mutable.get(.{}, "b"));
+    try std.testing.expectEqualStrings("old-a", try old.get(.{}, "a"));
+    var reopened = try Backend.open(alloc, "/lsm-atomic-publication", .{ .storage = storage.storage(), .backend = .{ .read_only = true } });
+    defer reopened.close();
+    try std.testing.expectEqualStrings("old-a", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+    try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
 }
 
 test "lsm backend pinned immutable retirement is allocation free after reservation" {
@@ -10051,7 +13523,7 @@ test "lsm backend probe owns active mutable point values across later writes" {
     const before = backend.snapshotReadStats();
     const owned_a = try probe.get("doc:a");
     try std.testing.expectEqualStrings("A", owned_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     {
@@ -10061,7 +13533,7 @@ test "lsm backend probe owns active mutable point values across later writes" {
     }
 
     try std.testing.expectEqualStrings("A", owned_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     const owned_b = try probe.get("doc:a");
@@ -10070,6 +13542,90 @@ test "lsm backend probe owns active mutable point values across later writes" {
     const after = backend.snapshotReadStats();
     try std.testing.expectEqual(@as(u64, 0), after.point_value_borrows - before.point_value_borrows);
     try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
+}
+
+test "graph metric sorted batch presence avoids value retention and respects overlays" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(alloc, "/graph-presence-batch", .{ .flush_threshold = 1, .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "graph" });
+    defer runtime.deinit();
+    const payload = [_]u8{'x'} ** (64 * 1024);
+    {
+        var write = try runtime.beginWrite();
+        errdefer write.abort();
+        try write.put("a", &payload);
+        try write.put("b", &payload);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    var batch = try runtime.beginBatch();
+    defer batch.abort();
+    try std.testing.expect(batch.vtable.contains_many_sorted != null);
+    const before = backend.snapshotReadStats();
+    var present: [4]bool = undefined;
+    try batch.containsManySorted(&.{ "a", "a", "b", "missing" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &present);
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+    try batch.delete("a");
+    try batch.put("c", "overlay");
+    try batch.containsManySorted(&.{ "a", "b", "c", "missing" }, &present);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, &present);
+    try std.testing.expectError(error.InvalidBatch, batch.containsManySorted(&.{ "b", "a" }, present[0..2]));
+    try std.testing.expectError(error.InvalidBatch, batch.containsManySorted(&.{"a"}, &present));
+    try batch.containsManySorted(&.{}, present[0..0]);
+}
+
+test "lsm backend stable probe batch borrows pinned run values without recopying" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var cache = Cache.init(std.testing.allocator, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-stable-probe-batch-borrow", .{
+        .flush_threshold = 1,
+        .storage = storage.storage(),
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    const value_a = [_]u8{'a'} ** 4096;
+    const value_b = [_]u8{'b'} ** 4096;
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", &value_a);
+        try write.put("doc:b", &value_b);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    const keys = [_][]const u8{ "doc:a", "doc:b" };
+    var values = [_]?[]const u8{ null, null };
+    const before = backend.snapshotReadStats();
+    try probe.getManySorted(&keys, &values);
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
+    try std.testing.expectEqualSlices(u8, &value_b, values[1].?);
+    try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+
+    // The probe pins the run-backed block generation, so a later replacement
+    // cannot change the views returned by the earlier batch.
+    {
+        var write = try runtime.beginWrite();
+        try write.put("doc:a", "new-a");
+        try write.commit();
+    }
+    try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
 }
 
 test "lsm backend probe owns active mutable point values during bulk ingest" {
@@ -10098,7 +13654,7 @@ test "lsm backend probe owns active mutable point values during bulk ingest" {
     const before = backend.snapshotReadStats();
     const copied_a = try probe.get("doc:a");
     try std.testing.expectEqualStrings("A", copied_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     {
@@ -10108,7 +13664,7 @@ test "lsm backend probe owns active mutable point values during bulk ingest" {
     }
 
     try std.testing.expectEqualStrings("A", copied_a);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
     const after = backend.snapshotReadStats();
@@ -10138,8 +13694,8 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
 
     var stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 
@@ -10147,7 +13703,161 @@ test "lsm backend wal backed entry threshold defers commit flush to maintenance"
     stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 1), stats.flushes);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expect(backend.runs.items.len > 0);
+    try std.testing.expect(backend.runs.count() > 0);
+}
+
+test "lsm backend streams adjacent immutable epochs into one durable publication" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root_dir = "/lsm-windowed-immutable-flush";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .storage = storage.storage(),
+    });
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.put(.{ .name = "docs" }, "doc:b", "present");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "middle");
+        try txn.delete(.{ .name = "docs" }, "doc:b");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.put(.{ .name = "docs" }, "doc:c", "visible");
+        try txn.commit();
+        try backend.rotateMutableToImmutable();
+    }
+    try std.testing.expectEqual(@as(usize, 3), backend.activeImmutableMemtableCount());
+    var window_bytes: u64 = 0;
+    for (backend.activeImmutableMemtables()) |state| window_bytes +|= Backend.estimateStateLogicalBytes(state);
+    backend.options.immutable_flush_window_bytes = window_bytes;
+
+    var pinned = try backend.beginRead();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    const manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 3), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(u64, 1), stats.flushes);
+    try std.testing.expectEqual(manifests_before + 1, stats.manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 3), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:c"));
+    try std.testing.expectEqualStrings("new", try pinned.get(.{ .name = "docs" }, "doc:a"));
+
+    pinned.abort();
+    pinned_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+    backend.close();
+    backend_open = false;
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, .{ .storage = storage.storage() });
+    defer reopened.close();
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm backend bulk session rolls preserve one wal backed flush window" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const root_dir = "/lsm-windowed-direct-bulk";
+    const options = Options{
+        .flush_threshold_bytes = 1,
+        .direct_bulk_ingest_min_bytes = 1,
+        .immutable_flush_window_bytes = std.math.maxInt(u64),
+        .immutable_flush_window_max_memtables = 8,
+        .max_deferred_immutable_memtables = 8,
+        .storage = storage.storage(),
+    };
+    var backend = try Backend.open(std.testing.allocator, root_dir, options);
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+
+    try backend.beginBulkIngestSession();
+    var bulk_open = true;
+    errdefer if (bulk_open) backend.abortBulkIngestSession();
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "old");
+        try txn.put(.{ .name = "docs" }, "doc:b", "present");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("old", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+
+    const roll_manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = false });
+    bulk_open = false;
+    try std.testing.expectEqual(roll_manifests_before, backend.snapshotWriteStats().manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("old", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+
+    try backend.beginBulkIngestSession();
+    bulk_open = true;
+
+    var pinned = try backend.beginRead();
+    var pinned_open = true;
+    defer if (pinned_open) pinned.abort();
+    {
+        var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+        try txn.put(.{ .name = "docs" }, "doc:a", "new");
+        try txn.delete(.{ .name = "docs" }, "doc:b");
+        try txn.put(.{ .name = "docs" }, "doc:c", "visible");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("old", try pinned.get(.{ .name = "docs" }, "doc:a"));
+    try std.testing.expectEqualStrings("present", try pinned.get(.{ .name = "docs" }, "doc:b"));
+
+    const manifests_before = backend.snapshotWriteStats().manifest_writes;
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
+    bulk_open = false;
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 1), stats.immutable_flushes);
+    try std.testing.expectEqual(@as(u64, 2), stats.immutable_flush_input_memtables);
+    try std.testing.expectEqual(@as(u64, 1), stats.flushes);
+    try std.testing.expectEqual(@as(u64, 0), stats.sorted_ingest_runs);
+    try std.testing.expectEqual(manifests_before + 1, stats.manifest_writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
+
+    pinned.abort();
+    pinned_open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+    backend.close();
+    backend_open = false;
+
+    var reopened = try Backend.open(std.testing.allocator, root_dir, options);
+    defer reopened.close();
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:b"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:c"));
 }
 
 test "lsm backend write stats separate wal sync latency from append latency" {
@@ -10238,7 +13948,7 @@ test "lsm backend read snapshot keeps immutable data visible after flush" {
 
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expectEqual(@as(usize, 0), backend.immutable_memtables.items.len);
-    try std.testing.expect(backend.runs.items.len > 0);
+    try std.testing.expect(backend.runs.count() > 0);
     try std.testing.expectEqualStrings(value[0..], try read.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("doc:a", (try cursor.seekAtOrAfter("doc:a")).?.key);
 }
@@ -10250,6 +13960,7 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
         .flush_threshold = 1000,
         .flush_threshold_bytes = 256,
         .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .direct_bulk_ingest = false,
         .storage = storage.storage(),
     });
     defer backend.close();
@@ -10261,8 +13972,8 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
 
     {
         var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -10271,9 +13982,70 @@ test "lsm backend bulk ingest byte threshold uses byte multiplier" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 1), backend.immutable_memtables.items.len);
+}
+
+test "lsm backend direct bulk ingest uses base byte threshold" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-bulk-byte-threshold", .{
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+        .bulk_ingest_flush_threshold_bytes_multiplier = 4,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 300;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest honors configured coalesced minimum" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold_bytes = 1024,
+        .read_snapshot_rotate_mutable_bytes = 0,
+        .direct_bulk_ingest_min_bytes = 64,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 100;
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+}
+
+test "lsm backend direct bulk ingest precedes mutable snapshot rotation" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/lsm-direct-before-snapshot-rotation", .{
+        .flush_threshold_bytes = 1024 * 1024,
+        .read_snapshot_rotate_mutable_bytes = 1,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+    try txn.put(.{ .name = "docs" }, "doc:a", "A");
+    try txn.commit();
+
+    const stats = backend.snapshotWriteStats();
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(u64, 1), stats.direct_bulk_ingest_successes);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.read_snapshot_mutable_rotations);
 }
 
 test "lsm backend write pressure compacts hard L0 debt" {
@@ -10296,7 +14068,7 @@ test "lsm backend write pressure compacts hard L0 debt" {
 
     try backend.finalizeDeferredStorageWork();
     const stats = backend.snapshotWriteStats();
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
     try std.testing.expect(stats.write_pressure_compactions > 0);
     try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
 }
@@ -10322,7 +14094,9 @@ test "lsm backend write pressure records bounded overload when input budget deni
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try backend.finalizeDeferredStorageWork();
 
     const stats = backend.snapshotWriteStats();
@@ -10332,7 +14106,7 @@ test "lsm backend write pressure records bounded overload when input budget deni
     try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
     try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.write_pressure_rejections);
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 2);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > 2);
     try std.testing.expect(backend.snapshotMaintenanceStats().write_stall_l0_run_debt > 0);
 }
 
@@ -10358,7 +14132,9 @@ test "lsm backend write pressure can reject when overload remains after budget" 
         try txn.commit();
     }
 
+    backend.options.l0_soft_limit_runs = 2;
     backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_allow_oversized_single_job = false;
     try std.testing.expectError(error.WritePressureExceeded, backend.finalizeDeferredStorageWork());
 
     const stats = backend.snapshotWriteStats();
@@ -10367,6 +14143,74 @@ test "lsm backend write pressure can reject when overload remains after budget" 
     try std.testing.expect(stats.write_pressure_l0_run_debt > 0);
     try std.testing.expect(stats.write_pressure_overload_l0_run_debt > 0);
     try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_rejections);
+}
+
+test "lsm backend write pressure honors the configured compaction input budget" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    const l0_count = countLevelRuns(&backend.runs, 0);
+    try std.testing.expectEqual(@as(usize, 10), l0_count);
+    const oldest_pair_budget = backend.runs.at(l0_count - 2).size_bytes +|
+        backend.runs.at(l0_count - 1).size_bytes;
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+    backend.options.max_compaction_input_bytes = oldest_pair_budget;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes <= oldest_pair_budget);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) < l0_count);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > backend.options.l0_hard_limit_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
+}
+
+test "lsm backend write pressure preserves oversized minimum job progress" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .write_pressure_max_compaction_steps = 1,
+        .max_compaction_input_bytes = 1,
+    });
+    defer backend.close();
+
+    const value = [_]u8{'x'} ** 64;
+    for (0..10) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, value[0..]);
+        try txn.commit();
+    }
+    backend.options.l0_soft_limit_runs = 2;
+    backend.options.l0_hard_limit_runs = 2;
+
+    try backend.finalizeDeferredStorageWork();
+
+    const stats = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_compactions);
+    try std.testing.expect(stats.compaction_max_input_bytes > backend.options.max_compaction_input_bytes);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) < 10);
+    try std.testing.expectEqual(@as(u64, 1), stats.write_pressure_overloads);
 }
 
 test "lsm backend maintenance step compacts soft L0 debt" {
@@ -10389,11 +14233,160 @@ test "lsm backend maintenance step compacts soft L0 debt" {
 
     try std.testing.expect(backend.maintenanceScore() > 0);
     while (backend.activeImmutableMemtableCount() > 0) {
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     }
     try std.testing.expect(backend.maintenanceScore() > 0);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
+}
+
+test "lsm backend tier-owned L0 avoids low-growth rewrite below hard pressure" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .l0_soft_limit_bytes = 1,
+        .l0_hard_limit_bytes = 2 * 1024 * 1024,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Three publications exceed both soft limits but cannot form a four-way
+    // carry. That is bounded read amplification, not a reason to promote and
+    // rewrite an overlapping lower-level base with less than 4x growth.
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+    const before_compactions = backend.compaction_stats.compactions;
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+
+    // Hard pressure remains authoritative and may use ordinary promotion to
+    // guarantee bounded write admission even when a complete tier is absent.
+    backend.options.l0_hard_limit_runs = 2;
     try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(backend.compaction_stats.compactions > before_compactions);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 2);
+}
+
+test "lsm backend hard run pressure prefers a complete geometric L0 carry" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Build four equally sized chronological publication generations while
+    // hard pressure is disabled. They form one complete geometric carry.
+    for (0..4) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 4), countLevelRuns(&backend.runs, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(&backend.runs, 1));
+
+    backend.options.l0_hard_limit_runs = 3;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try backend.enforceWritePressure();
+
+    try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&backend.runs, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(&backend.runs, 1));
+    try std.testing.expectEqual(@as(u64, 1), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.write_pressure_overloads);
+}
+
+test "lsm backend hard run pressure seals meaningful L0 delta without rewriting base" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .bulk_ingest_l0_delta_seal_ratio_denominator = 2,
+    });
+    defer backend.close();
+
+    // Establish an overlapping lower-level base through byte-hard pressure.
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "base");
+        try txn.commit();
+    }
+    backend.options.l0_hard_limit_bytes = 1;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+    backend.options.l0_hard_limit_bytes = 0;
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(&backend.runs, 0));
+    try std.testing.expect(countLevelRuns(&backend.runs, 1) > 0);
+    const setup_overloads = backend.write_stats.write_pressure_overloads;
+    var lower_bytes_before: u64 = 0;
+    for (try run_store_mod.oracleItems(&backend)) |run| {
+        if (run.level > 0) lower_bytes_before +|= run.size_bytes;
+    }
+
+    // Establish one dominant L0 anchor, then add four smaller newer
+    // generations. At run-hard pressure only the fragmented newer prefix must
+    // seal; neither the anchor nor L1 may be rewritten.
+    var anchor_value: [4096]u8 = undefined;
+    @memset(&anchor_value, 'a');
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", &anchor_value);
+        try txn.commit();
+    }
+    const anchor_run_id = backend.runs.at(0).id;
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "newer");
+        try txn.commit();
+    }
+    const l0_runs_before = countLevelRuns(&backend.runs, 0);
+    backend.options.l0_hard_limit_runs = 3;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+
+    // The four newer runs become one. The dominant anchor and the small L0
+    // precedence run retained by setup remain separate generations.
+    try std.testing.expectEqual(l0_runs_before - 3, countLevelRuns(&backend.runs, 0));
+    var retained_anchor = false;
+    for (try run_store_mod.oracleItems(&backend)) |run| {
+        if (run.id == anchor_run_id) retained_anchor = true;
+    }
+    try std.testing.expect(retained_anchor);
+    try std.testing.expect(countLevelRuns(&backend.runs, 1) > 0);
+    var lower_bytes_after: u64 = 0;
+    for (try run_store_mod.oracleItems(&backend)) |run| {
+        if (run.level > 0) lower_bytes_after +|= run.size_bytes;
+    }
+    try std.testing.expectEqual(lower_bytes_before, lower_bytes_after);
+    try std.testing.expectEqualStrings("newer", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
+    try std.testing.expectEqual(@as(u64, 2), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(setup_overloads, backend.write_stats.write_pressure_overloads);
 }
 
 test "lsm backend defers soft compaction behind latency-sensitive derived replay" {
@@ -10416,18 +14409,57 @@ test "lsm backend defers soft compaction behind latency-sensitive derived replay
         try txn.commit();
     }
     while (backend.activeImmutableMemtableCount() > 0) {
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     }
 
     manager.beginLatencySensitiveDerivedReplay();
     try std.testing.expect(!(try backend.runMaintenanceStep()));
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > 1);
     manager.finishLatencySensitiveDerivedReplay();
 
     try std.testing.expect(!(try backend.runMaintenanceStep()));
     sleepForTest(550 * std.time.ns_per_ms);
-    try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
+}
+
+test "lsm backend foreground query defers soft but not hard pressure compaction" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .resource_manager = &manager,
+    });
+    defer backend.close();
+
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    manager.beginForegroundQuery();
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > 1);
+
+    // Crossing the hard bound must retain the existing minimum-progress
+    // escape even while a query is active.
+    backend.options.l0_hard_limit_runs = 1;
+    platform.sync.lockYielding(&backend.mu);
+    {
+        defer backend.mu.unlock();
+        try backend.enforceWritePressure();
+    }
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
+    manager.finishForegroundQuery();
 }
 
 test "lsm backend public maintenance mutators serialize on backend mutex" {
@@ -10465,7 +14497,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             };
 
             const locked = runtime_mod.lockBackend(Backend, backend);
-            const thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+            var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
 
             while (stage.load(.acquire) == 0) {
                 platform.time.yieldBriefly();
@@ -10477,7 +14509,7 @@ test "lsm backend public maintenance mutators serialize on backend mutex" {
             const blocked_stage = stage.load(.acquire);
 
             if (locked) runtime_mod.unlockBackend(Backend, backend, locked);
-            thread.join();
+            thread.await(std.testing.io);
             try std.testing.expectEqual(@as(u8, 1), blocked_stage);
             try std.testing.expectEqual(@as(u8, 2), stage.load(.acquire));
         }
@@ -10527,10 +14559,10 @@ test "lsm backend default writes defer soft compaction to maintenance" {
 
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
     try std.testing.expect(backend.maintenanceScore() > 0);
 
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     try std.testing.expect(backend.compaction_stats.compactions > 0);
 }
 
@@ -10570,9 +14602,9 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         }
 
         try backend.finalizeDeferredStorageWork();
-        try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
-        try source_paths.ensureTotalCapacity(alloc, backend.runs.items.len);
-        for (backend.runs.items) |run| {
+        try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+        try source_paths.ensureTotalCapacity(alloc, backend.runs.count());
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             source_paths.appendAssumeCapacity(try alloc.dupe(u8, run.path.?));
         }
     }
@@ -10692,12 +14724,12 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         });
         defer backend.close();
 
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
         try std.testing.expect(backend.compaction_stats.compactions > 0);
         try std.testing.expect(counting.source_trailer_reads > 0);
         try std.testing.expect(counting.source_range_reads > 0);
         try std.testing.expectEqual(@as(usize, 0), counting.source_full_reads);
-        for (backend.runs.items) |run| {
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             try std.testing.expect(run.path != null);
             try std.testing.expect(run.state == null);
         }
@@ -10728,6 +14760,7 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
 
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -10738,7 +14771,8 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expect(maintenance.compaction_scheduler_remembered_candidates > 0);
 
     backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    makeAdmissionRetriesDueForTest(&backend);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
@@ -10774,14 +14808,14 @@ test "lsm backend background io budget defers immutable flush" {
     try std.testing.expectEqual(@as(u64, 0), maintenance.background_io_reserved_bytes);
     try std.testing.expect(maintenance.background_io_denied_jobs > 0);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
 
     backend.options.background_io_budget_bytes = 1024 * 1024;
     try std.testing.expect(try backend.runMaintenanceStep());
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
     try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 }
 
 test "lsm backend background io budget defers scheduled compaction" {
@@ -10805,7 +14839,8 @@ test "lsm backend background io budget defers scheduled compaction" {
     }
 
     try backend.finalizeDeferredStorageWork();
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -10813,10 +14848,11 @@ test "lsm backend background io budget defers scheduled compaction" {
     try std.testing.expectEqual(@as(u64, 1), maintenance.compaction_scheduler_remembered_pending);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_runs > 0);
     try std.testing.expect(maintenance.compaction_scheduler_remembered_pending_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
 
     backend.options.background_io_budget_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    makeAdmissionRetriesDueForTest(&backend);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
@@ -10844,20 +14880,20 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     }
 
     try backend.finalizeDeferredStorageWork();
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
     try std.testing.expect(maintenance.compaction_scheduler_oversized_skips > 0);
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_remembered_pending);
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
 
     backend.options.max_compaction_input_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) < 3);
 }
 
 test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
@@ -10880,12 +14916,12 @@ test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
     }
 
     try backend.finalizeDeferredStorageWork();
-    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 3);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) < 3);
 }
 
 test "lsm backend compaction scheduler reserves resource-manager work budget" {
@@ -10916,6 +14952,7 @@ test "lsm backend compaction scheduler reserves resource-manager work budget" {
     }
 
     try backend.finalizeDeferredStorageWork();
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -11035,9 +15072,9 @@ test "lsm backend bulk ingest session defers batch finalization" {
     }
 
     try std.testing.expect(backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
 
     try backend.finishBulkIngestSession();
@@ -11074,8 +15111,8 @@ test "lsm backend bulk ingest session can finish without compaction" {
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
 
     try std.testing.expect(!backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
@@ -11107,13 +15144,13 @@ test "lsm backend bulk ingest finish can flush without compaction for wal-backed
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
     bulk_active = false;
 
     try std.testing.expect(!backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
@@ -11143,11 +15180,11 @@ test "lsm backend flushes buffered writes outside bulk ingest" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.flushBufferedWritesWithOptions(.{ .compact = false });
 
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("A", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("B", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
@@ -11178,15 +15215,15 @@ test "lsm backend bulk ingest session coalesces repeated overwrites before flush
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.mutable.entryCount());
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
 
     const stats = backend.snapshotWriteStats();
     try std.testing.expectEqual(@as(u64, 0), stats.flushes);
     try std.testing.expectEqual(@as(u64, 1), stats.sorted_ingest_runs);
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(u32, 2), backend.runs.items[0].entry_count);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(u32, 2), backend.runs.at(0).*.entry_count);
     try std.testing.expectEqualStrings("A-9", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings("B-9", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:b"));
 }
@@ -11222,14 +15259,14 @@ test "lsm backend bulk ingest session publishes one manifest" {
         var stats = backend.snapshotWriteStats();
         try std.testing.expectEqual(@as(u64, 0), stats.manifest_writes);
         try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-        try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
 
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
 
         stats = backend.snapshotWriteStats();
         try std.testing.expectEqual(@as(u64, 1), stats.manifest_writes);
         try std.testing.expectEqual(@as(u64, 0), stats.flushes);
-        try std.testing.expectEqual(@as(usize, 2), countLevelRuns(backend.runs.items, 0));
+        try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
         try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
     }
 
@@ -11265,8 +15302,8 @@ test "lsm backend bulk ingest session can reopen wal-backed mutable state withou
             try txn.commit();
         }
 
-        try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
         try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
 
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
@@ -11274,8 +15311,8 @@ test "lsm backend bulk ingest session can reopen wal-backed mutable state withou
         const stats = backend.snapshotWriteStats();
         try std.testing.expectEqual(@as(u64, 0), stats.flushes);
         try std.testing.expectEqual(@as(u64, 0), stats.manifest_writes);
-        try std.testing.expectEqual(@as(usize, 0), backend.runs.items.len);
-        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        try std.testing.expectEqual(@as(usize, 1), backend.mutable.entryCount());
         try std.testing.expect(!backend.bulkIngestActive());
     }
 
@@ -11308,14 +15345,14 @@ test "lsm backend bulk ingest finish leaves L0 debt without foreground budget" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
     try backend.finishBulkIngestSessionWithOptions(.{
         .compact = false,
         .max_deferred_l0_runs = 2,
     });
     bulk_active = false;
 
-    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
     try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
     try std.testing.expect(backend.maintenanceDebtHint() > 0);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
@@ -11343,7 +15380,7 @@ test "lsm backend bulk ingest finish applies bounded foreground L0 budget" {
         try txn.commit();
     }
 
-    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
     try backend.finishBulkIngestSessionWithOptions(.{
         .compact = false,
         .max_deferred_l0_runs = 2,
@@ -11351,7 +15388,7 @@ test "lsm backend bulk ingest finish applies bounded foreground L0 budget" {
     });
     bulk_active = false;
 
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 2);
     try std.testing.expectEqual(@as(usize, 1), backend.compaction_stats.compactions);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:4"));
@@ -11385,7 +15422,7 @@ test "lsm backend hard L0 pressure applies one wide step after publish not insid
         .max_deferred_l0_runs = 1,
     });
     bulk_active = false;
-    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 5), countLevelRuns(&backend.runs, 0));
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
     try std.testing.expectEqual(@as(u64, 0), backend.snapshotWriteStats().write_pressure_compactions);
 
@@ -11393,7 +15430,7 @@ test "lsm backend hard L0 pressure applies one wide step after publish not insid
     try txn.appendPut(.{ .name = "docs" }, "normal:0", "value");
     try txn.commit();
 
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= backend.options.l0_hard_limit_runs);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) <= backend.options.l0_hard_limit_runs);
     try std.testing.expectEqual(@as(usize, 1), backend.compaction_stats.compactions);
     try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
     try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "bulk:0"));
@@ -11426,9 +15463,15 @@ test "lsm backend opt-in hard L0 pressure applies during active bulk flush" {
     }
 
     try std.testing.expect(backend.bulkIngestActive());
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) < 5);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) < 5);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    try std.testing.expect(backend.snapshotWriteStats().write_pressure_compactions > 0);
+    const write_stats = backend.snapshotWriteStats();
+    try std.testing.expect(write_stats.write_pressure_compactions > 0);
+    try std.testing.expectEqual(@as(u64, @intCast(backend.compaction_stats.compactions)), write_stats.compactions);
+    try std.testing.expect(write_stats.compaction_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_output_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_input_bytes > 0);
+    try std.testing.expect(write_stats.compaction_max_output_bytes > 0);
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
@@ -11499,16 +15542,16 @@ test "lsm backend defers bulk ingest compaction until the last batch exits" {
     try first.commit();
 
     try std.testing.expect(backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-    try std.testing.expectEqual(@as(u32, 0), backend.runs.items[0].level);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    try std.testing.expectEqual(@as(u32, 0), backend.runs.at(0).*.level);
 
     try second.put(.{ .name = "docs" }, "doc:b", "B");
     try second.commit();
 
     try std.testing.expect(!backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
-    try std.testing.expectEqual(@as(u32, 0), backend.runs.items[0].level);
-    try std.testing.expectEqual(@as(u32, 1), backend.runs.items[1].level);
+    try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+    try std.testing.expectEqual(@as(u32, 0), backend.runs.at(0).*.level);
+    try std.testing.expectEqual(@as(u32, 1), backend.runs.at(1).*.level);
 }
 
 test "lsm backend tombstones hide older run values" {
@@ -11537,6 +15580,41 @@ test "lsm backend tombstones hide older run values" {
         var cur = try txn.openCursor();
         defer cur.close();
         try std.testing.expect((try cur.first()) == null);
+    }
+}
+
+test "lsm backend reverse cursor tombstones stop lookup across levels and mutable state" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |mutable_delete| {
+        var backend = Backend.init(alloc, .{ .flush_threshold = 1 });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var txn = try runtime.beginWrite();
+            try txn.put("a", "A");
+            try txn.put("b", "old B");
+            try txn.put("c", "C");
+            try txn.commit();
+        }
+        // Keep the base below L0 so a tombstone must terminate the complete
+        // visibility search, rather than only its newest run group.
+        for (0..backend.runs.count()) |rank| backend.runs.at(rank).level = 1;
+        if (mutable_delete) backend.options.flush_threshold = 1000;
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("b");
+            try txn.commit();
+        }
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        var cur = try txn.openCursor();
+        defer cur.close();
+        try std.testing.expectEqualStrings("a", (try cur.seekAtOrBefore("b")).?.key);
+        try std.testing.expectEqualStrings("c", (try cur.last()).?.key);
+        try std.testing.expectEqualStrings("a", (try cur.prev()).?.key);
+        try std.testing.expect((try cur.prev()) == null);
+        try std.testing.expectEqualStrings("c", (try cur.seekAtOrAfter("b")).?.key);
     }
 }
 
@@ -11645,8 +15723,8 @@ test "lsm backend shared cache owns loaded table allocations" {
         }
         try txn.commit();
 
-        try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-        run_path = try test_alloc.dupe(u8, backend.runs.items[0].path.?);
+        try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+        run_path = try test_alloc.dupe(u8, backend.runs.at(0).*.path.?);
     }
 
     const Context = struct {
@@ -11840,22 +15918,22 @@ test "lsm backend refreshes stale cached run state indexes after eviction" {
         try txn.commit();
     }
 
-    try std.testing.expect(backend.runs.items.len >= 2);
-    _ = try backend.resolveRunState(&backend.runs.items[0]);
-    _ = try backend.resolveRunState(&backend.runs.items[1]);
+    try std.testing.expect(backend.runs.count() >= 2);
+    _ = try backend.resolveRunState(backend.runs.at(0));
+    _ = try backend.resolveRunState(backend.runs.at(1));
     try std.testing.expectEqual(@as(usize, 2), backend.run_state_cache.items.len);
-    try std.testing.expectEqual(@as(?usize, 1), backend.runs.items[1].cached_state_index);
+    try std.testing.expectEqual(@as(?usize, 1), backend.runs.at(1).*.cached_state_index);
 
-    const first_path = backend.runs.items[0].path orelse return error.TestUnexpectedResult;
-    backend.evictCachedRunStateForRun(first_path, backend.runs.items[0].id);
+    const first_path = backend.runs.at(0).*.path orelse return error.TestUnexpectedResult;
+    backend.evictCachedRunStateForRun(first_path, backend.runs.at(0).*.id);
     try std.testing.expectEqual(@as(usize, 1), backend.run_state_cache.items.len);
 
-    const second_state = try backend.resolveRunState(&backend.runs.items[1]);
+    const second_state = try backend.resolveRunState(backend.runs.at(1));
     try std.testing.expect(second_state.entries.items.len > 0);
-    try std.testing.expectEqual(@as(?usize, 0), backend.runs.items[1].cached_state_index);
+    try std.testing.expectEqual(@as(?usize, 0), backend.runs.at(1).*.cached_state_index);
 }
 
-test "lsm backend obsolete run cleanup does not invalidate shared cache by path" {
+test "lsm backend obsolete run cleanup invalidates shared cache by path" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
     defer backing.deinit();
@@ -11891,7 +15969,8 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
     const invalidations_before = before.run_state.invalidations +
         before.run_table_raw.invalidations +
         before.run_table_index.invalidations +
-        before.run_table_block.invalidations;
+        before.run_table_block.invalidations +
+        before.run_table_physical_block.invalidations;
     try std.testing.expect(before.entry_count > 0);
 
     {
@@ -11901,21 +15980,27 @@ test "lsm backend obsolete run cleanup does not invalidate shared cache by path"
         try txn.commit();
     }
 
+    // Persistent writer roots and obsolete files retire in bounded turns.
+    for (0..128) |_| {
+        if (!try backend.runMaintenanceStep()) break;
+    }
+    const after = cache.snapshotStats();
+    const invalidations_after = after.run_state.invalidations +
+        after.run_table_raw.invalidations +
+        after.run_table_index.invalidations +
+        after.run_table_block.invalidations +
+        after.run_table_physical_block.invalidations;
+    try std.testing.expect(invalidations_after > invalidations_before);
+    try std.testing.expect(after.entry_count < before.entry_count);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+
     {
         var txn = try runtime.beginRead();
         defer txn.abort();
         try std.testing.expectError(error.NotFound, txn.get("doc:a"));
         try std.testing.expectEqualStrings("B", try txn.get("doc:b"));
     }
-
-    const after = cache.snapshotStats();
-    const invalidations_after = after.run_state.invalidations +
-        after.run_table_raw.invalidations +
-        after.run_table_index.invalidations +
-        after.run_table_block.invalidations;
-    try std.testing.expectEqual(invalidations_before, invalidations_after);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
 }
 
 test "lsm backend cache namespaces entries by root generation" {
@@ -12025,9 +16110,9 @@ test "lsm backend reuses cached raw table bytes to avoid fragmented index reads"
         try txn.put("doc:a", "A");
         try txn.commit();
 
-        try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
-        run_path = try alloc.dupe(u8, backend.runs.items[0].path.?);
-        run_id = backend.runs.items[0].id;
+        try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+        run_path = try alloc.dupe(u8, backend.runs.at(0).*.path.?);
+        run_id = backend.runs.at(0).*.id;
     }
 
     {
@@ -12677,6 +16762,73 @@ test "lsm backend multi-block point read skips directly to one candidate block" 
     try std.testing.expectEqual(@as(usize, 1), ctx.run_file_size_reads);
 }
 
+test "lsm lazy level cursor bounds sources and IO across forward reverse and namespace boundaries" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+    var backend = try Backend.open(alloc, "/lsm-lazy-level-cursor", .{ .storage = backing.storage(), .cache = &cache, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    for (0..257) |i| {
+        var state: State = .{};
+        errdefer state.deinit(alloc);
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}", .{i});
+        try state.upsert(alloc, .{ .name = if (i == 256) "other" else "docs" }, key, "base", false);
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+        state = .{};
+        errdefer run.deinit(alloc);
+        try backend.runs.append(alloc, run);
+    }
+    var overlay: State = .{};
+    errdefer overlay.deinit(alloc);
+    try overlay.upsert(alloc, .{ .name = "docs" }, "doc:00128", "new", false);
+    try overlay.upsert(alloc, .{ .name = "docs" }, "doc:00129", "", true);
+    var newest = try compaction_mod.makeRunAtLevel(Backend, &backend, overlay, 0);
+    overlay = .{};
+    var newest_owned = true;
+    errdefer if (newest_owned) newest.deinit(alloc);
+    try backend.runs.append(alloc, newest);
+    newest_owned = false;
+    try backend.runs.reindexForTest(backend.allocator);
+    try backend.persistManifest();
+    var read = try backend.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor(.{ .name = "docs" });
+    defer cursor.close();
+    try std.testing.expectEqual(@as(usize, 3), cursor.positions.len);
+    // Three merge sources, each with a private mutable descriptor/cache hints;
+    // storage is independent of the 257 lower-level SSTs.
+    try std.testing.expect(cursor.cursor_storage.len < 4096);
+    try std.testing.expectEqual(@as(usize, 0), read.read_view.version.?.runs.len);
+    cursor.setUpperBound("doc:00131");
+    const before = backend.snapshotReadStats();
+    const first = (try cursor.seekAtOrAfter("doc:00128")).?;
+    try std.testing.expectEqualStrings("new", first.value);
+    const after = backend.snapshotReadStats();
+    try std.testing.expect(after.table_index_loads - before.table_index_loads <= 2);
+    try std.testing.expect(after.cursor_block_loads - before.cursor_block_loads <= 2);
+    try std.testing.expectEqualStrings("doc:00130", (try cursor.next()).?.key);
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expectEqualStrings("doc:00130", (try cursor.last()).?.key);
+    try std.testing.expectEqualStrings("doc:00128", (try cursor.prev()).?.key);
+    cursor.setUpperBound(null);
+    var count: usize = 0;
+    var entry = try cursor.first();
+    while (entry != null) : (entry = try cursor.next()) count += 1;
+    try std.testing.expectEqual(@as(usize, 255), count);
+    count = 0;
+    entry = try cursor.last();
+    while (entry != null) : (entry = try cursor.prev()) count += 1;
+    try std.testing.expectEqual(@as(usize, 255), count);
+    cursor.setUpperBound("doc:00005");
+    try std.testing.expectEqualStrings("doc:00004", (try cursor.last()).?.key);
+    try std.testing.expectEqualStrings("doc:00004", (try cursor.seekAtOrBefore("doc:99999")).?.key);
+    const borrowed = (try cursor.first()).?.key;
+    try std.testing.expectEqualStrings("doc:00000", (try cursor.seekAtOrAfter(borrowed)).?.key);
+}
+
 test "lsm backend cached cursor scan avoids whole-run table reads" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -13199,6 +17351,104 @@ test "lsm backend async point reads issue overlapping survivors in source order"
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
 }
 
+test "lsm backend sparse point batches pipeline independent blocks without weakening precedence" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-async-sparse-point-batch";
+    const count = 32;
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+
+        {
+            var txn = try runtime.beginWrite();
+            var key_buf: [64]u8 = undefined;
+            for (0..count) |i| {
+                const key = try std.fmt.bufPrint(&key_buf, "artifact:{d:0>8}:dense", .{i});
+                try txn.put(key, large_value);
+            }
+            try txn.commit();
+            try backend.sync(true);
+        }
+        {
+            var txn = try runtime.beginWrite();
+            try txn.delete("artifact:00000010:dense");
+            try txn.put("artifact:00000011:dense", "newest");
+            try txn.commit();
+            try backend.sync(true);
+        }
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+        .max_concurrent_point_block_reads = 4,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var key_storage: [count][64]u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
+    }
+
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    try std.testing.expectEqualSlices(u8, large_value, values[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), values[10]);
+    try std.testing.expectEqualStrings("newest", values[11].?);
+    try std.testing.expectEqualSlices(u8, large_value, values[count - 1].?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point);
+    try std.testing.expectEqual(@as(u64, count - 1), stats.get_many_sorted_hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_misses);
+    try std.testing.expect(stats.point_run_async_batches > 0);
+    try std.testing.expect(stats.point_run_async_reads_issued >= 2);
+}
+
+test "lsm backend shares sparse point read fanout across active batches" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-async-shared-fanout", .{
+        .storage = backing.storage(),
+        .max_concurrent_point_block_reads = 16,
+        .target_aggregate_concurrent_point_block_reads = 8,
+    });
+    defer backend.close();
+
+    const expected = [_]usize{ 8, 4, 3, 2, 2 };
+    for (expected) |limit| {
+        try std.testing.expectEqual(limit, backend.acquirePointAsyncBatchLimit(16));
+    }
+    for (expected) |_| backend.releasePointAsyncBatchLimit();
+
+    backend.options.target_aggregate_concurrent_point_block_reads = 0;
+    try std.testing.expectEqual(@as(usize, 16), backend.acquirePointAsyncBatchLimit(16));
+    backend.releasePointAsyncBatchLimit();
+}
+
 test "lsm backend block filter avoids candidate block read on run-bloom false positive" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -13468,7 +17718,7 @@ test "lsm backend read stats count point gets and sorted batches" {
     try std.testing.expect(stats.run_probes > 0);
 }
 
-test "lsm backend current scan reuses run grouping across cursor movement" {
+test "lsm backend current scan avoids run projection across cursor movement" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();
 
@@ -13489,7 +17739,7 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
     var scan = try runtime.beginCurrentScan();
     defer scan.abort();
     const after_open = backend.snapshotReadStats();
-    try std.testing.expectEqual(@as(u64, 1), after_open.run_group_builds - before_scan.run_group_builds);
+    try std.testing.expectEqual(@as(u64, 0), after_open.run_group_builds - before_scan.run_group_builds);
 
     var cur = try scan.openCursor();
     defer cur.close();
@@ -13504,7 +17754,7 @@ test "lsm backend current scan reuses run grouping across cursor movement" {
 
     const after_scan = backend.snapshotReadStats();
     try std.testing.expectEqual(after_open.run_group_builds, after_scan.run_group_builds);
-    try std.testing.expect(after_open.run_group_total_runs > before_scan.run_group_total_runs);
+    try std.testing.expectEqual(before_scan.run_group_total_runs, after_open.run_group_total_runs);
     try std.testing.expectEqual(after_open.run_group_total_runs, after_scan.run_group_total_runs);
     try std.testing.expectEqual(after_open.run_group_l0_runs, after_scan.run_group_l0_runs);
 }
@@ -13582,7 +17832,7 @@ test "lsm backend current probe getManySorted reuses source layout across chunks
     try probe.getManySorted(&keys, &values);
     const after_read = backend.snapshotReadStats();
 
-    try std.testing.expectEqual(@as(u64, 1), after_read.run_group_builds - before_read.run_group_builds);
+    try std.testing.expectEqual(@as(u64, 0), after_read.run_group_builds - before_read.run_group_builds);
     try std.testing.expectEqualStrings("value-0", values[0].?);
     try std.testing.expectEqualStrings("value-159", values[159].?);
 }
@@ -13782,7 +18032,7 @@ test "lsm backend bulk current scan clones mutable under memory cap" {
         try std.testing.expect(after_open.bulk_ingest_current_scan_clone_active_bytes > 0);
         try std.testing.expectEqual(after_open.bulk_ingest_current_scan_clone_active_bytes, after_open.bulk_ingest_current_scan_clone_peak_active_bytes);
         try std.testing.expectEqual(
-            after_open.mutable_bytes +| after_open.immutable_bytes +| after_open.bulk_ingest_current_scan_clone_active_bytes,
+            after_open.mutable_bytes +| after_open.immutable_bytes,
             manager.sliceStats(.lsm_in_memory_state).used_bytes,
         );
 
@@ -14112,6 +18362,40 @@ test "lsm backend namespace write batch getManySorted merges overlay and committ
     try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
 }
 
+test "lsm backend closed write transactions reject access after terminal commit failure" {
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    const namespace = backend_types.Namespace{ .name = "docs" };
+    const keys = [_][]const u8{"doc:a"};
+    var values = [_]?[]const u8{null};
+
+    var bound = try runtime_mod.BoundWriteTxn(Backend).open(&backend, namespace);
+    defer {
+        bound.closed = false;
+        bound.abort();
+    }
+    bound.closed = true;
+    try std.testing.expectError(error.TransactionClosed, bound.get("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.getManySorted(&keys, &values));
+    try std.testing.expectError(error.TransactionClosed, bound.put("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.appendPut("doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, bound.delete("doc:a"));
+    try std.testing.expectError(error.TransactionClosed, bound.openCursor());
+
+    var namespaced = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+    defer {
+        namespaced.closed = false;
+        namespaced.abort();
+    }
+    namespaced.closed = true;
+    try std.testing.expectError(error.TransactionClosed, namespaced.get(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.getManySorted(namespace, &keys, &values));
+    try std.testing.expectError(error.TransactionClosed, namespaced.put(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.appendPut(namespace, "doc:a", "A"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.delete(namespace, "doc:a"));
+    try std.testing.expectError(error.TransactionClosed, namespaced.openCursor(namespace));
+}
+
 test "lsm backend bound read txn getManySorted uses sorted-by-run path for leaf-sized sparse batches" {
     var backend = Backend.init(std.testing.allocator, .{ .flush_threshold = 1 });
     defer backend.close();
@@ -14334,16 +18618,16 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
 
     var ctx = Worker.Context{ .txn = &read };
     const locked = runtime_mod.lockBackend(Backend, &backend);
-    var thread = try std.Thread.spawn(.{}, Worker.run, .{&ctx});
+    var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
     var joined = false;
-    defer if (!joined) thread.join();
+    defer if (!joined) thread.await(std.testing.io);
 
     while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
     sleepForTest(100 * std.time.ns_per_ms);
     const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
 
     runtime_mod.unlockBackend(Backend, &backend, locked);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(completed_without_backend_lock);
@@ -14351,7 +18635,7 @@ test "lsm backend cache-backed batch probes do not require the backend mutex" {
     try std.testing.expectEqualStrings("value-0", ctx.value.?);
 }
 
-test "lsm backend getManySorted decodes prefix-compressed blocks once for batch reuse" {
+test "lsm backend getManySorted promotes repeated prefix-block reads for batch reuse" {
     const alloc = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(alloc);
     defer storage.deinit();
@@ -14409,7 +18693,128 @@ test "lsm backend getManySorted decodes prefix-compressed blocks once for batch 
     try std.testing.expectEqual(@as(u64, 0), stats.cursor_block_loads);
 
     const cache_stats = cache.snapshotStats();
+    // Adaptive compression may deliberately serve a decoded block without a
+    // distinct physical-cache insertion. This test's semantic contract is
+    // batch prefix reuse; dedicated cache tests cover physical admission.
     try std.testing.expect(cache_stats.run_table_block.inserts > 0);
+}
+
+test "lsm backend getManySorted materializes sparse large prefix values without decoded blocks" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-batch-prefix-sparse-large-values";
+    const count = 96;
+    const stride = 4;
+    const selected_count = count / stride;
+    const keys = try alloc.alloc([]u8, count);
+    defer {
+        for (keys) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    const large_value = try alloc.alloc(u8, 8 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'v');
+
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (keys, 0..) |*key_slot, i| {
+            const key = try std.fmt.allocPrint(
+                alloc,
+                "tenant:docs:artifact:very-long-shared-prefix:{d:0>6}:dense",
+                .{i},
+            );
+            key_slot.* = key;
+            try txn.put(.{ .name = "docs" }, key, large_value);
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+
+    var selected_keys: [selected_count][]const u8 = undefined;
+    for (&selected_keys, 0..) |*key, i| key.* = keys[i * stride];
+    var values: [selected_count]?[]const u8 = [_]?[]const u8{null} ** selected_count;
+
+    var read = try backend.beginRead();
+    defer read.abort();
+    try read.getManySorted(.{ .name = "docs" }, &selected_keys, &values);
+    for (values) |maybe_value| try std.testing.expectEqualSlices(u8, large_value, maybe_value.?);
+
+    const stats = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.get_many_sorted_plan_point + stats.get_many_sorted_plan_sorted_by_run);
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expect(cache_stats.run_table_physical_block.inserts > 0);
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
+}
+
+test "lsm backend erased probe honors transient block cache admission" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    const root_dir = "/lsm-probe-transient-block-admission";
+    const count = 24;
+    var keys: [count][64]u8 = undefined;
+    var key_views: [count][]const u8 = undefined;
+    {
+        var backend = try Backend.open(alloc, root_dir, .{
+            .storage = storage.storage(),
+            .flush_threshold = count + 1,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        for (&keys, &key_views, 0..) |*key_buf, *key_view, i| {
+            key_view.* = try std.fmt.bufPrint(
+                key_buf,
+                "artifact:shared-prefix:{d:0>8}:dense",
+                .{i},
+            );
+            try txn.put(.{ .name = "docs" }, key_view.*, "vector-payload");
+        }
+        try txn.commit();
+        try backend.sync(true);
+    }
+
+    var backend = try Backend.open(alloc, root_dir, .{
+        .storage = storage.storage(),
+        .flush_threshold = count + 1,
+        .table_block_compression = .snappy_adaptive,
+        .cache = &cache,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    var probe = try runtime.beginProbe();
+    defer probe.abort();
+    try probe.getManySortedWithBlockCacheAdmission(&key_views, &values, .transient);
+    for (values) |value| try std.testing.expectEqualStrings("vector-payload", value.?);
+
+    const cache_stats = cache.snapshotStats();
+    try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_block.inserts);
     try std.testing.expectEqual(@as(u64, 0), cache_stats.run_table_physical_block.inserts);
 }
 
@@ -14651,9 +19056,9 @@ test "lsm backend close drains generation readers before teardown" {
     var read = try backend.beginRead();
     var read_released = false;
     var state = CloseState{ .backend = &backend };
-    var thread = try std.Thread.spawn(.{}, CloseState.run, .{&state});
+    var thread = try std.testing.io.concurrent(CloseState.run, .{&state});
     var thread_joined = false;
-    defer if (!thread_joined) thread.join();
+    defer if (!thread_joined) thread.await(std.testing.io);
     defer if (!read_released) read.abort();
 
     while (!state.started.load(.acquire)) platform.time.yieldBriefly();
@@ -14663,7 +19068,7 @@ test "lsm backend close drains generation readers before teardown" {
 
     read.abort();
     read_released = true;
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(state.finished.load(.acquire));
 }
@@ -14688,7 +19093,10 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
 
     const with_snapshot = manager.sliceStats(.lsm_in_memory_state).used_bytes;
-    try std.testing.expect(with_snapshot > base_bytes);
+    const pass = state_mod.memory_account.nextPass();
+    const metadata_bytes = (if (backend.run_directory) |directory| directory.accountedMemoryBytes(pass) else 0) +
+        (if (backend.read_version) |version| version.accountedMemoryBytes(pass) else 0);
+    try std.testing.expectEqual(base_bytes + metadata_bytes, with_snapshot);
 
     {
         var txn = try backend.beginWrite();
@@ -14708,7 +19116,8 @@ test "lsm backend resource manager accounts pinned mutable read snapshots" {
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(after_release < with_retired);
     try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
-    try std.testing.expectEqual(maintenance.mutable_bytes +| maintenance.immutable_bytes, after_release);
+    try std.testing.expect(after_release >= maintenance.mutable_bytes +| maintenance.immutable_bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), after_release);
 }
 
 test "lsm backend reclaims mutable generations independently of unrelated probe readers" {
@@ -14778,13 +19187,13 @@ test "lsm backend rotates large mutable state for read snapshots instead of clon
         try txn.commit();
     }
 
-    try std.testing.expect(backend.mutable.entries.items.len > 0);
+    try std.testing.expect(backend.mutable.entryCount() > 0);
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
 
     var read = try backend.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("A", try read.get(.{ .name = "docs" }, "doc:a"));
-    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
     try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
     try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
     try std.testing.expectEqual(@as(u64, 0), backend.mutable_snapshot_clone_calls);
@@ -14817,7 +19226,7 @@ test "lsm backend attributes mutable snapshot clones by reader class" {
     try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_calls);
     try std.testing.expectEqual(@as(u64, 1), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].calls);
     try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.namespace_read_txn)].calls);
-    try std.testing.expect(maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total > 0);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.bound_read_txn)].bytes_total);
 
     {
         var txn = try backend.beginWrite();
@@ -15141,7 +19550,7 @@ test "lsm repository run readers request cap above 64 MiB" {
     {
         var state = try repository_mod.loadRunStateAllocWithStorage(host.storage(), alloc, run_path);
         defer state.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), state.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 1), state.entryCount());
         try std.testing.expectEqualStrings("A", state.entries.items[0].value);
     }
 
@@ -15393,7 +19802,7 @@ test "lsm backend stale instance can still read after newer instance compacts an
         try txn.put("doc:b", "B");
         try txn.commit();
 
-        try std.testing.expect(writer.obsolete_paths.items.len > 0);
+        try std.testing.expect(writer.obsolete_paths.count() > 0);
         writer.close();
     }
 
@@ -15641,7 +20050,7 @@ test "lsm backend active reader survives obsolete cache eviction after writer co
         try txn.commit();
     }
 
-    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    try std.testing.expect(backend.obsolete_paths.count() > 0);
     try std.testing.expectEqualStrings("A", try read_txn.get("doc:a"));
     try std.testing.expectEqualStrings("doc:a", (try cur.seekAtOrAfter("doc:a")).?.key);
 }
@@ -15839,6 +20248,97 @@ test "lsm backend reclaims obsolete run files after retention on a later writer 
     }
 }
 
+test "lsm commit backlog rejection precedes WAL publication and releases admission" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(allocator, "/commit-admission", .{ .storage = storage.storage(), .flush_threshold = 1, .manifest_publication_max_waiters = 0 });
+    defer backend.close();
+    var incoming: ActiveMemTable = .{};
+    defer incoming.deinit(allocator);
+    try incoming.upsert(allocator, .{}, "pending", "value", false);
+    const ticket = try backend.admitCommit(&incoming, &.{});
+    {
+        var rejected = try backend.beginWrite();
+        defer rejected.abort();
+        try rejected.put(.{}, "rejected", "value");
+        const wal_before = backend.write_stats.wal_append_bytes;
+        try std.testing.expectError(error.ResourceBudgetExceeded, rejected.commit());
+        try std.testing.expectEqual(wal_before, backend.write_stats.wal_append_bytes);
+        try std.testing.expectEqual(@as(usize, 1), backend.manifest_admitted_commits);
+    }
+    ticket.release();
+    backend.options.manifest_commit_backlog_bytes = 1;
+    {
+        var rejected = try runtime_mod.BoundWriteTxn(Backend).open(&backend, .{});
+        defer rejected.abort();
+        try rejected.put("too-large", "value");
+        try std.testing.expectError(error.ResourceBudgetExceeded, rejected.commit());
+        try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+    }
+    backend.options.manifest_commit_backlog_bytes = 1024 * 1024;
+    var accepted = try backend.beginWrite();
+    errdefer accepted.abort();
+    try accepted.put(.{}, "accepted", "value");
+    try accepted.commit();
+    try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+    try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_bytes);
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(.{}, "rejected"));
+    try std.testing.expectError(error.NotFound, read.get(.{}, "too-large"));
+    try std.testing.expectEqualStrings("value", try read.get(.{}, "accepted"));
+}
+
+test "lsm obsolete reclamation resumes beyond pinned prefixes and observes cross-handle releases" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var backend = try Backend.open(allocator, "/bounded-obsolete", .{ .storage = storage.storage(), .obsolete_retention_ns = 0 });
+    defer backend.close();
+    // Establish a durable lineage: an unknown/ambiguous journal deliberately
+    // fences deletion of every path.
+    try backend.persistManifest();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    var paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (paths.items) |path| {
+            run_snapshot_refs.release(path);
+            run_snapshot_refs.forget(path);
+            allocator.free(path);
+        }
+        paths.deinit(allocator);
+    }
+    for (0..301) |i| {
+        const path = try std.fmt.allocPrint(allocator, "/bounded-obsolete/runs/{d:0>6}.tbl", .{i + 1000});
+        paths.append(allocator, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
+        try run_snapshot_refs.retain(path);
+        try backend.queueObsoleteFilePath(try allocator.dupe(u8, path));
+    }
+    run_snapshot_refs.release(paths.items[300]);
+    try std.testing.expect(!backend.hasReclaimableObsoletePathsLocked());
+    try std.testing.expect(backend.obsolete_reclaim_after != null);
+    try std.testing.expect(!backend.hasReclaimableObsoletePathsLocked());
+    try std.testing.expect(backend.hasReclaimableObsoletePathsLocked());
+    for (0..16) |_| {
+        try backend.reconcileObsoletePathsForManifest();
+        if (!backend.obsolete_paths.contains(paths.items[300])) break;
+    }
+    try std.testing.expect(!backend.obsolete_paths.contains(paths.items[300]));
+    try std.testing.expectEqual(@as(usize, 300), backend.obsolete_paths.count());
+    try std.testing.expect(!backend.hasReclaimableObsoletePathsLocked());
+    // A different handle dropping its final pin invalidates the negative
+    // result without advancing the clock or restarting on every publication.
+    run_snapshot_refs.release(paths.items[0]);
+    try std.testing.expect(backend.hasReclaimableObsoletePathsLocked());
+    try backend.reconcileObsoletePathsForManifest();
+    try std.testing.expect(!backend.obsolete_paths.contains(paths.items[0]));
+}
+
 test "lsm backend reclaims obsolete run files when last reader releases" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -15876,7 +20376,7 @@ test "lsm backend reclaims obsolete run files when last reader releases" {
         try txn.commit();
     }
 
-    try std.testing.expect(backend.obsolete_paths.items.len > 0);
+    try std.testing.expect(backend.obsolete_paths.count() > 0);
     {
         const bytes = try backing.storage().readFileAlloc(alloc, obsolete_path, 1024);
         defer alloc.free(bytes);
@@ -15885,7 +20385,12 @@ test "lsm backend reclaims obsolete run files when last reader releases" {
 
     read_txn.abort();
     try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    // Bounded epoch cleanup progresses without requiring another write.
+    for (0..32) |_| {
+        if (backend.obsolete_paths.count() == 0) break;
+        _ = try backend.runMaintenanceStepBestEffort();
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 
     var manifest_backing: ?[]u8 = null;
@@ -15950,6 +20455,8 @@ test "lsm backend reclaims an obsolete generation while a newer reader remains a
     }
 
     var new_reader = try runtime.beginRead();
+    var new_reader_open = true;
+    defer if (new_reader_open) new_reader.abort();
     try std.testing.expectEqualStrings("B", try new_reader.get("doc:b"));
     try std.testing.expectEqual(@as(usize, 2), backend.active_readers);
     try std.testing.expect(!backend.pathTrackedByActiveRunsLocked(first_run_path));
@@ -15961,6 +20468,9 @@ test "lsm backend reclaims an obsolete generation while a newer reader remains a
 
     old_reader.abort();
     try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+    for (0..32) |_| {
+        if (!try backend.runMaintenanceStep()) break;
+    }
     try std.testing.expect(!run_snapshot_refs.isRetained(first_run_path));
     if (backing.storage().readFileAlloc(alloc, first_run_path, 1024)) |unexpected| {
         alloc.free(unexpected);
@@ -15971,6 +20481,7 @@ test "lsm backend reclaims an obsolete generation while a newer reader remains a
     try std.testing.expectEqualStrings("B", try new_reader.get("doc:b"));
 
     new_reader.abort();
+    new_reader_open = false;
     try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
 }
 
@@ -16005,6 +20516,8 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
         .backend = .{ .read_only = true },
         .obsolete_retention_ns = 0,
     });
+    var reader_open = true;
+    defer if (reader_open) reader.close();
 
     {
         var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
@@ -16015,6 +20528,9 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
         try txn.commit();
     }
 
+    // Tombstone GC is useful work even while an older manifest is pinned.
+    // Once it settles, identical pinned-obsolete manifests remain idle.
+    while (try writer.runMaintenanceStep()) {}
     var stats = writer.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths);
     try std.testing.expectEqual(@as(u64, 1), stats.obsolete_paths_pinned_by_versions);
@@ -16033,6 +20549,7 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
     }
 
     reader.close();
+    reader_open = false;
     try std.testing.expect(try writer.runMaintenanceStep());
     stats = writer.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths);
@@ -16111,6 +20628,181 @@ test "lsm backend reopen reclaim stress preserves manifest referenced runs" {
     try std.testing.expectEqualStrings("value-7-updated", try txn.get("doc:stable"));
 }
 
+test "lsm backend replay lane snapshots exclude unrelated mutable values" {
+    const alloc = std.testing.allocator;
+    var backend = Backend.init(alloc, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const unrelated = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(unrelated);
+    @memset(unrelated, 'x');
+    const full_text_lane: u8 = 1;
+    const other_lane: u8 = 2;
+    const first_key = internal_keys.replayEntryKey(full_text_lane, 1);
+    const second_key = internal_keys.replayEntryKey(full_text_lane, 3);
+    const other_key = internal_keys.replayEntryKey(other_lane, 2);
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:large", unrelated);
+        try txn.put(first_key[0..], "first");
+        try txn.put(other_key[0..], "other");
+        try txn.put(second_key[0..], "second");
+        try txn.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+    try std.testing.expect(before.mutable_bytes > unrelated.len);
+
+    const Capture = struct {
+        calls: usize = 0,
+        sequence: u64 = 0,
+        value_matches: bool = false,
+
+        fn consume(self: *@This(), sequence: u64, value: []const u8) !void {
+            self.calls += 1;
+            self.sequence = sequence;
+            self.value_matches = std.mem.eql(u8, value, "first");
+        }
+    };
+    var capture = Capture{};
+    const stats = try runtime.forEachReplayLaneFrom(
+        full_text_lane,
+        1,
+        1,
+        &capture,
+        Capture.consume,
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 1), capture.sequence);
+    try std.testing.expect(capture.value_matches);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+
+    const after = backend.snapshotMaintenanceStats();
+    const reason = after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)];
+    // Replay scans pin the immutable ordered root without copying payloads
+    // or rotating a partial mutable epoch into the publication queue.
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1,
+        reason.calls,
+    );
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].bytes_total,
+        reason.bytes_total,
+    );
+    try std.testing.expectEqual(
+        before_writes.immutable_rotations,
+        backend.snapshotWriteStats().immutable_rotations,
+    );
+    try std.testing.expectEqual(@as(u64, 0), after.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.other)].calls);
+}
+
+test "lsm backend persistent replay lane scan snapshots mutable tail once" {
+    const alloc = std.testing.allocator;
+    var backend = Backend.init(alloc, .{ .flush_threshold = 1024 * 1024 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 2;
+    const first_key = internal_keys.replayEntryKey(lane, 1);
+    const second_key = internal_keys.replayEntryKey(lane, 2);
+    const third_key = internal_keys.replayEntryKey(lane, 3);
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put("doc:unrelated", "large-enough-to-detect-a-broad-snapshot");
+        try txn.put(first_key[0..], "first");
+        try txn.put(second_key[0..], "second");
+        try txn.commit();
+    }
+
+    const before = backend.snapshotMaintenanceStats();
+    var scan = try runtime.beginReplayLaneScan(lane, 1);
+    defer scan.abort();
+    var cursor = try scan.openCursor();
+    defer cursor.close();
+
+    const lower = internal_keys.replayRangeLower(lane, 1);
+    const upper = internal_keys.replayRangeUpper(lane);
+    cursor.setUpperBound(upper[0..]);
+    const first = (try cursor.seekAtOrAfter(lower[0..])).?;
+    try std.testing.expectEqualStrings("first", first.value);
+    const after_first_window = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        before.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls + 1,
+        after_first_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+    );
+
+    // A new commit is outside this cursor's pinned generation. Advancing the
+    // existing cursor across another logical replay window neither clones the
+    // mutable table again nor observes the later generation.
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put(third_key[0..], "third");
+        try txn.commit();
+    }
+    const second = (try cursor.next()).?;
+    try std.testing.expectEqualStrings("second", second.value);
+    try std.testing.expect((try cursor.next()) == null);
+    const after_second_window = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(
+        after_first_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+        after_second_window.mutable_snapshot_clone_by_reason[mutableSnapshotReasonIndex(.current_scan)].calls,
+    );
+}
+
+test "lsm backend replay lane scans do not retain one-pass data blocks" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-replay-lane-transient-blocks", .{
+        .storage = backing.storage(),
+        .cache = &cache,
+        .flush_threshold = 1,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 1;
+    const key = internal_keys.replayEntryKey(lane, 1);
+    const value = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(value);
+    for (value, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% 17);
+    {
+        var write = try runtime.beginWrite();
+        try write.put(key[0..], value);
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    try std.testing.expect(backend.runs.count() > 0);
+
+    const Capture = struct {
+        calls: usize = 0,
+
+        fn consume(self: *@This(), _: u64, replay_value: []const u8) !void {
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 64 * 1024), replay_value.len);
+        }
+    };
+    const before = cache.snapshotStats();
+    var capture = Capture{};
+    const stats = try runtime.forEachReplayLaneFrom(lane, 1, 1, &capture, Capture.consume);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+
+    const after = cache.snapshotStats();
+    try std.testing.expectEqual(before.run_table_block.inserts, after.run_table_block.inserts);
+    try std.testing.expectEqual(before.run_table_physical_block.inserts, after.run_table_physical_block.inserts);
+}
+
 test "lsm backend reader release reclaims expired clean obsolete paths" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);
@@ -16142,7 +20834,7 @@ test "lsm backend reader release reclaims expired clean obsolete paths" {
     read_txn.abort();
 
     try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
@@ -16165,9 +20857,9 @@ test "lsm backend maintenance step reclaims expired clean obsolete paths" {
     try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
     backend.manifest_dirty = false;
 
-    try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.count());
     try std.testing.expect(try backend.runMaintenanceStep());
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
@@ -16194,7 +20886,7 @@ test "lsm backend maintenance step prioritizes due obsolete reclaim before compa
         try txn.commit();
         try backend.sync(true);
     }
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > 1);
 
     backend.options.l0_soft_limit_runs = 1;
 
@@ -16207,7 +20899,7 @@ test "lsm backend maintenance step prioritizes due obsolete reclaim before compa
     const before_compactions = backend.compaction_stats.compactions;
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
@@ -16234,7 +20926,7 @@ test "lsm backend finalization prioritizes due obsolete reclaim before compactio
         try txn.commit();
         try backend.sync(true);
     }
-    try std.testing.expect(countLevelRuns(backend.runs.items, 0) > 1);
+    try std.testing.expect(countLevelRuns(&backend.runs, 0) > 1);
 
     backend.options.l0_soft_limit_runs = 1;
 
@@ -16247,7 +20939,7 @@ test "lsm backend finalization prioritizes due obsolete reclaim before compactio
     const before_compactions = backend.compaction_stats.compactions;
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
@@ -16303,7 +20995,7 @@ test "lsm backend internal worker reclaims idle obsolete paths after retention" 
     try std.testing.expect(reclaimed);
     try std.testing.expect(worker_stats.maintenance_steps > 0);
     try std.testing.expectEqual(@as(u64, 0), worker_stats.errors);
-    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
 }
 
 test "lsm backend reloads persisted manifest and run files" {
@@ -16507,8 +21199,8 @@ test "lsm backend splits oversized flushes into persisted run segments" {
         }
         try txn.commit();
 
-        try std.testing.expect(backend.runs.items.len > 1);
-        for (backend.runs.items) |run| {
+        try std.testing.expect(backend.runs.count() > 1);
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             try std.testing.expect(run.entry_count <= 2);
             try std.testing.expect(run.state == null);
         }
@@ -16562,9 +21254,9 @@ test "lsm backend physically bounds metadata-heavy flush runs" {
     }
     try txn.commit();
 
-    try std.testing.expect(backend.runs.items.len > 1);
+    try std.testing.expect(backend.runs.count() > 1);
     var total_entries: usize = 0;
-    for (backend.runs.items) |run| {
+    for ((try backend.runs.testItems(backend.allocator))) |run| {
         try std.testing.expect(run.size_bytes <= 1024);
         total_entries += run.entry_count;
     }
@@ -16596,8 +21288,8 @@ test "lsm backend partitions persisted runs at configured key family boundaries"
         try txn.put("\x03artifact", "a");
         try txn.commit();
 
-        try std.testing.expectEqual(@as(usize, 3), backend.runs.items.len);
-        for (backend.runs.items) |run| {
+        try std.testing.expectEqual(@as(usize, 3), backend.runs.count());
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             try std.testing.expectEqual(@as(usize, 1), run.entry_count);
             try std.testing.expectEqual(run.smallest_key[0], run.largest_key[0]);
         }
@@ -16646,11 +21338,1839 @@ test "lsm backend preserves key family partitions in streaming compaction output
     }
     try backend.finalizeDeferredStorageWork();
     try std.testing.expect(backend.compaction_stats.compactions > 0);
-    for (backend.runs.items) |run| {
+    for ((try backend.runs.testItems(backend.allocator))) |run| {
         try std.testing.expect(run.smallest_key.len > 0);
         try std.testing.expect(run.largest_key.len > 0);
         try std.testing.expectEqual(run.smallest_key[0], run.largest_key[0]);
     }
+}
+
+test "lsm mutable point leases retain one immutable entry without copying its value" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/mutable-entry-lease", .{ .storage = storage.storage(), .flush_threshold = 1000 });
+    defer backend.close();
+    const bytes = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(bytes);
+    @memset(bytes, 'a');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", bytes);
+        try write.commit();
+    }
+    const original = try backend.mutable.get(.{}, "row");
+    var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+    defer probe.abort();
+    const leased = try probe.getLeased("row");
+    try std.testing.expectEqual(original.ptr, leased.ptr);
+    try std.testing.expectEqual(@as(usize, 0), probe.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.leased_entries.items.len);
+    @memset(bytes, 'b');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", bytes);
+        try write.commit();
+    }
+    try backend.sync(true);
+    try std.testing.expectEqual(@as(u8, 'a'), leased[0]);
+    try std.testing.expectEqual(@as(u8, 'a'), leased[leased.len - 1]);
+    var current = try Backend.BoundReadTxn.open(&backend, .{});
+    defer current.abort();
+    try std.testing.expectEqualSlices(u8, bytes, try current.get("row"));
+}
+
+test "lsm shared read versions reuse topology and scoped batches preserve old values" {
+    const alloc = std.testing.allocator;
+    for (0..2) |cache_mode| {
+        var cache = Cache.init(alloc, 64 * 1024);
+        defer cache.deinit();
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/shared-read-version", .{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000, .cache = if (cache_mode == 1) &cache else null });
+        defer backend.close();
+        for (0..16) |i| {
+            var name: [16]u8 = undefined;
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, try std.fmt.bufPrint(&name, "k{d:0>4}", .{i}), "old");
+            try write.commit();
+        }
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        const builds = backend.read_version_builds;
+        for (0..64) |_| {
+            var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+            defer probe.abort();
+            try std.testing.expectEqualStrings("old", try probe.getLeased("k0000"));
+        }
+        try std.testing.expectEqual(builds, backend.read_version_builds);
+        try std.testing.expect(backend.read_version_pins >= 65);
+        var scope_arena = std.heap.ArenaAllocator.init(alloc);
+        defer scope_arena.deinit();
+        var scope = try old.openReadScope(scope_arena.allocator());
+        defer scope.close();
+        const names = [_][]const u8{ "k0000", "k0001", "k0001", "missing" };
+        var values: [names.len]?[]const u8 = undefined;
+        try scope.getManySorted(&names, &values);
+        try std.testing.expectEqualStrings("old", values[0].?);
+        try std.testing.expectEqualStrings("old", values[2].?);
+        try std.testing.expect(values[3] == null);
+        // Exercise both native batch plans with a scope allocator distinct
+        // from the backend's cache-handle allocator, not just duplicate-key
+        // point fallback. Retain their values across the later publication.
+        var batch_values: [2][32]?[]const u8 = undefined;
+        const plans_before = backend.snapshotReadStats();
+        for (0..2) |mode| {
+            var key_bytes: [32][16]u8 = undefined;
+            var keys: [32][]const u8 = undefined;
+            for (&keys, 0..) |*key, i| key.* = try std.fmt.bufPrint(&key_bytes[i], "k{d:0>4}", .{if (mode == 0) i else i * 100});
+            try scope.getManySorted(&keys, &batch_values[mode]);
+            for (batch_values[mode], 0..) |value, i| {
+                if (if (mode == 0) i < 16 else i == 0) {
+                    try std.testing.expectEqualStrings("old", value.?);
+                } else try std.testing.expect(value == null);
+            }
+        }
+        const plans_after = backend.snapshotReadStats();
+        try std.testing.expectEqual(plans_before.get_many_sorted_plan_cursor + 1, plans_after.get_many_sorted_plan_cursor);
+        try std.testing.expectEqual(plans_before.get_many_sorted_plan_sorted_by_run + 1, plans_after.get_many_sorted_plan_sorted_by_run);
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "k0000", "new");
+            try write.delete(.{}, "k0001");
+            try write.commit();
+        }
+        var current = try Backend.BoundReadTxn.open(&backend, .{});
+        defer current.abort();
+        try std.testing.expectEqual(builds, backend.read_version_builds);
+        try std.testing.expect(old.read_view.version.?.directory.?.tree.root != current.read_view.version.?.directory.?.tree.root);
+        try std.testing.expectEqualStrings("new", try current.get("k0000"));
+        try std.testing.expectError(error.NotFound, current.get("k0001"));
+        try std.testing.expectEqualStrings("old", try scope.get("k0000"));
+        try std.testing.expectEqualStrings("old", values[1].?);
+        try std.testing.expectEqualStrings("old", batch_values[0][0].?);
+        try std.testing.expectEqualStrings("old", batch_values[1][0].?);
+    }
+}
+
+test "lsm journal checkpoints bound replay and backups export standalone manifests" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const options = Options{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 10000, .l0_soft_limit_runs = 10000, .l0_hard_limit_runs = 10000 };
+    var backend = try Backend.open(alloc, "/journal-checkpoint", options);
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+    for (0..270) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+    }
+    const writes = backend.snapshotWriteStats();
+    try std.testing.expectEqual(@as(u64, 1), writes.manifest_checkpoints);
+    try std.testing.expect(writes.manifest_edits >= 269);
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(backend.manifest_journal.checkpoint_sequence >= 256);
+    const bytes = try storage.storage().readFileAlloc(alloc, "/journal-checkpoint/manifest.bin", repository_mod.maxManifestReadBytes());
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, repository_mod.manifest_set.magic));
+    var checkpoint = try backend.pinNativeCheckpoint();
+    defer checkpoint.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, checkpoint.manifest_bytes, lsm_manifest.magic));
+    var decoded = try lsm_manifest.decodeAlloc(alloc, checkpoint.manifest_bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 270), decoded.runs.len);
+    backend.close();
+    backend_open = false;
+    backend = try Backend.open(alloc, "/journal-checkpoint", options);
+    backend_open = true;
+    for ([_][]const u8{ "k0000", "k0256", "k0269" }) |key| {
+        var read = try Backend.BoundReadTxn.open(&backend, .{});
+        defer read.abort();
+        try std.testing.expectEqualStrings("value", try read.get(key));
+    }
+}
+
+test "lsm cold pinned point reads avoid projection and scans share topology" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/cold-pinned-epoch", .{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000 });
+    defer backend.close();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", "old");
+        try write.commit();
+    }
+    var old = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+    defer old.abort();
+    try std.testing.expect(!old.stable_point_view_loaded);
+    const epoch = backend.read_version.?;
+    try std.testing.expect(!epoch.prepared);
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "row", "new");
+        try write.commit();
+    }
+    try std.testing.expect(backend.read_version != epoch);
+    const point_builds = backend.read_version_builds;
+    try std.testing.expectEqualStrings("old", try old.get("row"));
+    try std.testing.expect(!epoch.prepared);
+    try std.testing.expectEqual(point_builds, backend.read_version_builds);
+    var current = try Backend.BoundReadTxn.open(&backend, .{});
+    defer current.abort();
+    try std.testing.expectEqualStrings("new", try current.get("row"));
+    const builds = backend.read_version_builds;
+    for (0..8) |_| {
+        var scan = try runtime_mod.BoundCurrentScanTxn(Backend).open(&backend, .{});
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("new", (try cursor.first()).?.value);
+        var replay = try runtime_mod.BoundCurrentScanTxn(Backend).openReplay(&backend, .{});
+        defer replay.abort();
+        var write = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+        defer write.abort();
+        var write_cursor = try write.openCursor(.{});
+        defer write_cursor.close();
+        try std.testing.expectEqualStrings("new", (try write_cursor.first()).?.value);
+    }
+    try std.testing.expectEqual(builds, backend.read_version_builds);
+}
+
+test "lsm checkpoint handoff keeps concurrent edits and rejects a replaced lineage" {
+    const Hook = struct {
+        backend: *Backend,
+        replace: bool,
+        fn run(context: *anyopaque) !void {
+            const hook: *@This() = @ptrCast(@alignCast(context));
+            // Fail promptly if checkpoint encoding accidentally moves back
+            // under the writer mutex instead of deadlocking this regression.
+            try std.testing.expect(hook.backend.mu.tryLock());
+            if (hook.replace) hook.backend.manifest_journal.sequence = null;
+            hook.backend.mu.unlock();
+            var write = try hook.backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "during-checkpoint", "acknowledged");
+            try write.commit();
+            try hook.backend.sync(true);
+        }
+    };
+    for ([_]bool{ false, true }) |replace| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        const options = Options{ .storage = memory.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000 };
+        var backend = try Backend.open(std.testing.allocator, "/checkpoint-interleave", options);
+        var open = true;
+        defer if (open) backend.close();
+        var write = try backend.beginWrite();
+        try write.put(.{}, "before-checkpoint", "durable");
+        try write.commit();
+        try backend.sync(true);
+        var hook = Hook{ .backend = &backend, .replace = replace };
+        {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            repository_mod.checkpoint_test_hook = .{ .context = &hook, .run = Hook.run };
+            defer repository_mod.checkpoint_test_hook = null;
+            try std.testing.expectEqual(!replace, try backend.manifest_journal.runCheckpoint(&backend));
+        }
+        // Reopen before closing the writer: close must not repair a missing
+        // suffix and accidentally hide an installation/recovery defect.
+        var read_options = options;
+        read_options.backend.read_only = true;
+        var reopened = try Backend.open(std.testing.allocator, "/checkpoint-interleave", read_options);
+        defer reopened.close();
+        var read = try reopened.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "before-checkpoint"));
+        try std.testing.expectEqualStrings("acknowledged", try read.get(.{}, "during-checkpoint"));
+        backend.close();
+        open = false;
+    }
+}
+
+test "lsm journal obsolete identities survive staged directory relocation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |checkpoint| {
+        var source = storage_io.MemoryStorage.init(alloc);
+        defer source.deinit();
+        var destination = storage_io.MemoryStorage.init(alloc);
+        defer destination.deinit();
+        const original = "/staged-journal";
+        const moved = "/published-journal";
+        const options = Options{ .storage = source.storage(), .flush_threshold = 1, .compact_threshold_runs = 1000, .obsolete_retention_ns = std.time.ns_per_day };
+        {
+            var backend = try Backend.open(alloc, original, options);
+            defer backend.close();
+            var write = try backend.beginWrite();
+            try write.put(.{}, "key", "durable");
+            try write.commit();
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const obsolete = try repository_mod.runPath(alloc, original, 999);
+            try source.storage().writeFileAbsolute(obsolete, "obsolete");
+            try backend.queueObsoleteFilePath(obsolete);
+            try backend.persistManifestLocked();
+            if (checkpoint) try std.testing.expect(try backend.manifest_journal.runCheckpoint(&backend));
+        }
+        var files = source.files.iterator();
+        while (files.next()) |file| {
+            try std.testing.expect(std.mem.startsWith(u8, file.key_ptr.*, original));
+            const path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ moved, file.key_ptr.*[original.len..] });
+            defer alloc.free(path);
+            try destination.storage().writeFileAbsolute(path, file.value_ptr.*);
+        }
+        var moved_options = options;
+        moved_options.storage = destination.storage();
+        var backend = try Backend.open(alloc, moved, moved_options);
+        defer backend.close();
+        {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            for (0..backend.obsolete_paths.count()) |i| {
+                try backend.obsolete_paths.ensureUnusedCapacity(alloc, 1);
+                backend.obsolete_paths.setDeadlinePrepared(backend.obsolete_paths.at(i).path, 0);
+            }
+            backend.obsolete_manifest_dirty = true;
+            try backend.persistManifestLocked();
+        }
+        moved_options.backend.read_only = true;
+        var reopened = try Backend.open(alloc, moved, moved_options);
+        defer reopened.close();
+        var read = try reopened.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("durable", try read.get(.{}, "key"));
+    }
+}
+
+test "lsm missing checkpoint is corruption rather than an empty store" {
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    const root = "/missing-checkpoint";
+    try memory.storage().createDirPath(root);
+    try repository_mod.manifest_set.publish(std.testing.allocator, memory.storage(), root, .{ .checkpoint = 7, .first_segment = 7, .sequence = 0 });
+    try std.testing.expectError(error.InvalidManifest, Backend.open(std.testing.allocator, root, .{ .storage = memory.storage() }));
+}
+
+test "lsm direct planning does not materialize the domain projection" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .run_partition_key = struct {
+            fn key(bytes: []const u8) []const u8 {
+                return bytes;
+            }
+        }.key,
+        .compact_threshold_runs = 1,
+        .max_compaction_input_bytes = 1,
+        .max_compaction_input_allow_oversized_single_job = false,
+    });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 0, 16);
+    for (0..20) |_| {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    }
+    try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
+    backend.invalidateReadVersion();
+    _ = try backend.domainIndex();
+    try std.testing.expectEqual(@as(u64, 1), backend.domain_index_builds);
+}
+
+test "lsm direct planner admits bounded scratch before selecting inputs" {
+    var backend = Backend.init(std.testing.allocator, .{ .compact_threshold_runs = 1 });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 0, 16);
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    _ = try backend.planningDirectory();
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    backend.options.resource_manager = &manager;
+    defer backend.options.resource_manager = null;
+    try std.testing.expect(!compaction_mod.hasTombstoneGcDebt(&backend));
+    try std.testing.expect(!try compaction_mod.compactTombstonesScheduled(Backend, &backend, 1));
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(backend.domain_admission_retry_after_ns > backend.nowNs());
+    try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 16), backend.runs.count());
+    backend.options.compact_threshold_runs = 1000;
+    backend.options.l0_overlap_compact_threshold_runs = 0;
+    backend.domain_admission_retry_after_ns = 0;
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+}
+
+test "lsm negative GC discovery settles to idle without repeating its completed sweep" {
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{
+        .compact_threshold_runs = 100,
+        .level_target_runs_base = 100,
+        .level_target_bytes_base = 0,
+        .tombstone_gc_max_age_ns = 0,
+        .tombstone_gc_min_percent = 50,
+    });
+    defer backend.close();
+    var state: State = .{};
+    errdefer state.deinit(allocator);
+    for (0..21) |i| {
+        var key: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "row:{d:0>4}", .{i});
+        try state.upsert(allocator, .{}, name, if (i == 0) "" else "value", i == 0);
+    }
+    {
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+        state = .{};
+        errdefer run.deinit(allocator);
+        try backend.runs.append(allocator, run);
+    }
+    var settled = false;
+    for (0..32) |_| {
+        if (!try backend.runMaintenanceStep()) {
+            settled = true;
+            break;
+        }
+    }
+    try std.testing.expect(settled);
+    try std.testing.expect(!backend.gc_debt_cache.?.has_debt);
+    const visits = backend.directory_planning_slices;
+    for (0..8) |_| try std.testing.expect(!try backend.runMaintenanceStepBestEffort());
+    try std.testing.expectEqual(visits, backend.directory_planning_slices);
+}
+
+test "lsm direct planner resumes a broad closure without a global projection" {
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{
+        .compact_threshold_runs = 0,
+        .level_target_runs_base = 100000,
+        .level_target_bytes_base = 0,
+    });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 1, 5000);
+    var state: State = .{};
+    errdefer state.deinit(allocator);
+    try state.appendUpsert(allocator, .{ .name = "docs" }, "doc:0000", "new", false);
+    try state.appendUpsert(allocator, .{ .name = "docs" }, "doc:9999", "new", false);
+    {
+        var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 0);
+        state = .{};
+        errdefer run.deinit(allocator);
+        try backend.runs.append(allocator, run);
+    }
+    try backend.runs.reindexForTest(backend.allocator);
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(backend.pending_directory_closure != null);
+    const visits = backend.pending_directory_closure.?.job.visits;
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(backend.pending_directory_closure.?.job.visits - visits <= 2048);
+    // A concurrent publication replaces a selected payload while the old
+    // epoch remains pinned. Reject the stale certificate, then plan afresh.
+    const replacement = try backend.run_directory.?.fork(allocator);
+    try replacement.put(&backend, backend.runs.at(1).*);
+    backend.invalidateReadVersion();
+    backend.publishRunDirectory(replacement);
+    try std.testing.expectEqual(@as(usize, 0), try compaction_mod.directorySelectionInputCountForTest(&backend));
+    try std.testing.expectEqual(@as(usize, 5001), try compaction_mod.directorySelectionInputCountForTest(&backend));
+    try std.testing.expect(backend.directory_planning_slices > 2);
+    try std.testing.expect(backend.pending_directory_closure == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
+    try std.testing.expectEqual(@as(u64, 0), backend.read_version_builds);
+    try std.testing.expect(!backend.directory_planning_in_flight);
+    // The minimum-indivisible oversized exception uses the same continuation;
+    // close also owns cancellation cleanup of this unfinished job.
+    backend.options.max_compaction_input_bytes = 1;
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(backend.pending_directory_closure != null);
+    try std.testing.expectEqual(@as(u64, 0), backend.pending_directory_closure.?.max_bytes);
+}
+
+test "lsm planning metadata is admitted before allocation" {
+    for ([_]usize{ 16, 128 }) |run_count| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .hard_limit_bytes = 1 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        var backend = Backend.init(std.testing.allocator, .{});
+        defer backend.close();
+        try appendStateLevelRunsForTest(&backend, 0, run_count);
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        if (run_count > 64) {
+            const version = try backend.createReadVersionFromDirectory();
+            try backend.prepareReadVersion(version);
+        }
+        backend.options.resource_manager = &manager;
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        const before = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+        try std.testing.expectError(error.ResourceBudgetExceeded, backend.domainIndex());
+        try std.testing.expect(backend.domain_index == null);
+        try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
+        try std.testing.expectEqual(before, manager.sliceStats(.lsm_in_memory_state).used_bytes);
+    }
+}
+
+test "lsm bulk admission retains prepared work sleeps and certifies concurrent changes" {
+    const alloc = std.testing.allocator;
+    for (0..3) |change| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/bulk-admission-owned", .{ .storage = storage.storage(), .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.background_io_denied_jobs != 0) break;
+        }
+        const pending = backend.pending_bulk_plan.?;
+        const slices = backend.directory_planning_slices;
+        try std.testing.expectEqual(@as(u64, 1), backend.background_io_denied_jobs);
+        try std.testing.expect(pending.selected != null);
+        const ids = pending.work.run_ids.ptr;
+        for (0..32) |_| try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expectEqual(@as(u64, 1), backend.background_io_denied_jobs);
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        pending.retry_after_ns = 0;
+        try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expectEqual(@as(u64, 2), backend.background_io_denied_jobs);
+        try std.testing.expect(ids == pending.work.run_ids.ptr);
+        if (change == 1) {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.put(.{}, "unrelated", "later");
+            try txn.commit();
+        } else if (change == 2) {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const handle = pending.selected.?.plan.input_handles.?[0];
+            const source = backend.runs.find(handle.run).?;
+            const replacement = RunStore.revision(source, source.*);
+            const directory = try (try backend.planningDirectory()).fork(alloc);
+            try directory.put(&backend, replacement);
+            try backend.runs.replace(alloc, source, replacement);
+            backend.invalidateReadVersion();
+            backend.publishRunDirectory(directory);
+        }
+        pending.retry_after_ns = 0;
+        if (change == 2) {
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.pending_bulk_plan == null) break;
+            }
+            try std.testing.expect(backend.pending_bulk_plan == null);
+            try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
+        } else {
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.background_io_denied_jobs == 3) break;
+            }
+            try std.testing.expect(backend.pending_bulk_plan.? == pending);
+            try std.testing.expect(ids == pending.work.run_ids.ptr);
+            try std.testing.expectEqual(@as(u64, 3), backend.background_io_denied_jobs);
+            backend.options.background_io_budget_bytes = 1024 * 1024;
+            pending.retry_after_ns = 0;
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.compaction_stats.compactions != 0) break;
+            }
+            try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+            try std.testing.expect(backend.pending_bulk_plan == null);
+            if (change == 1) try std.testing.expectEqualStrings("later", try backend.getMergedWithMutable(&backend.mutable, .{}, "unrelated"));
+        }
+    }
+}
+
+test "lsm foreground deferred GC sleeps without suppressing durability deadlines" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var backend = try Backend.open(alloc, "/gc-foreground-admission", .{ .storage = storage.storage(), .resource_manager = &manager });
+    defer backend.close();
+    var state: State = .{};
+    try state.upsert(alloc, .{}, "deleted", "", true);
+    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+    run.oldest_tombstone_unix_ns = 1;
+    try backend.runs.append(alloc, run);
+    try backend.persistManifest();
+    manager.foreground_query_sessions.store(1, .release);
+    defer manager.foreground_query_sessions.store(0, .release);
+    for (0..128) |_| {
+        try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    }
+    backend.wal_checkpoint_pending = true;
+    backend.wal_checkpoint_retry_reason = .checkpoint_failure;
+    backend.wal_checkpoint_retry_deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    backend.wal_checkpoint_pending = false;
+    manager.foreground_query_sessions.store(0, .release);
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    for (0..64) |_| {
+        _ = try backend.runMaintenanceStep();
+        if (backend.compaction_stats.compactions != 0) break;
+    }
+    try std.testing.expect(backend.compaction_stats.compactions != 0);
+}
+
+test "lsm bulk admission preserves ownership across scheduler capacity and memory denial" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |memory_denial| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        var backend = try Backend.open(alloc, "/bulk-admission-scheduler", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .compaction_scheduler = .{ .max_in_flight_input_bytes = if (memory_denial) 1024 * 1024 else 1, .allow_oversized_single_job = false, .resource_reservation_bytes = if (memory_denial) 2048 else 0 } });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.pending_bulk_plan) |pending| if (pending.retry_after_ns != 0) break;
+        }
+        const pending = backend.pending_bulk_plan.?;
+        try std.testing.expect(pending.retry_after_ns != 0);
+        const slices = backend.directory_planning_slices;
+        for (0..16) |_| try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        if (memory_denial) {
+            try std.testing.expectEqual(@as(u64, 1), backend.compaction_scheduler.denied_resource_pressure);
+        } else try std.testing.expectEqual(@as(u64, 1), backend.compaction_scheduler.denied_capacity);
+        backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
+        backend.compaction_scheduler.options.resource_reservation_bytes = 0;
+        pending.retry_after_ns = 0;
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.compaction_stats.compactions != 0) break;
+        }
+        try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    }
+}
+
+test "lsm bulk admission prepared work scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const keys = try alloc.alloc(u8, count * 8);
+        defer alloc.free(keys);
+        var backend = Backend.init(alloc, .{ .wal_enabled = false, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 100000, .bulk_ingest_tiered_l0_fan_in = 4, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+        defer backend.close();
+        for (0..count) |i| {
+            const key = keys[i * 8 ..][0..8];
+            std.mem.writeInt(u64, key, i, .big);
+            try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count + i / (count / 4), .level = 0, .size_bytes = 1024, .path = @constCast("admission-bench.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+        }
+        _ = try backend.planningDirectory();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        var max_ns: u64 = 0;
+        for (0..4096) |turn| {
+            const start = platform_time.monotonicNs();
+            _ = try backend.runMaintenanceStep();
+            const elapsed = platform_time.monotonicNs() - start;
+            max_ns = @max(max_ns, elapsed);
+            if (backend.background_io_denied_jobs != 0) {
+                const slices = backend.directory_planning_slices;
+                const retry_start = platform_time.monotonicNs();
+                for (0..1000) |_| {
+                    backend.pending_bulk_plan.?.retry_after_ns = 0;
+                    _ = try backend.runMaintenanceStep();
+                }
+                try std.testing.expectEqual(slices, backend.directory_planning_slices);
+                std.debug.print("prepared-admission files={d} turns={d} final_ns={d} max_ns={d} retry_ns={d}\n", .{ count, turn + 1, elapsed, max_ns, (platform_time.monotonicNs() - retry_start) / 1000 });
+                break;
+            }
+        }
+        try std.testing.expect(backend.background_io_denied_jobs != 0);
+    }
+}
+
+test "lsm bulk continuation retires after pressure relief or policy change despite foreground traffic" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1, 2, 3 }) |turns| for ([_]bool{ false, true }) |change_policy| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        var backend = try Backend.open(alloc, "/bulk-continuation-retirement", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .obsolete_retention_ns = 0 });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        var bulk_active = true;
+        defer if (bulk_active) backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..turns) |_| try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(backend.pending_bulk_plan != null);
+        manager.foreground_query_sessions.store(1, .release);
+        defer manager.foreground_query_sessions.store(0, .release);
+        // A needed but deferred job sleeps instead of spinning.
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        if (change_policy) {
+            backend.options.bulk_ingest_tiered_l0_fan_in = 0;
+        } else {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            try std.testing.expect(try compaction_mod.compactBulkL0Tier(Backend, &backend, 4));
+            try backend.persistManifestLocked();
+            try std.testing.expectEqual(@as(usize, 2), backend.runs.l0Files());
+        }
+        try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.pending_bulk_plan == null);
+        try std.testing.expect(backend.retired_bulk_plans == null);
+        try std.testing.expect(backend.active_bulk_plans == null);
+        backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        bulk_active = false;
+        manager.foreground_query_sessions.store(0, .release);
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.pending_bulk_plan == null);
+        if (!change_policy) try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+    };
+}
+
+test "lsm unknown tombstone admission bounds physical reads and preserves resume state" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const root = "/reconcile-admission";
+    try writeUnknownTombstoneFixture(alloc, storage.storage(), root, 10, 5000);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var backend = try Backend.open(alloc, root, .{ .storage = storage.storage(), .resource_manager = &manager, .wal_enabled = false, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+    defer backend.close();
+    manager.foreground_query_sessions.store(1, .release);
+    defer manager.foreground_query_sessions.store(0, .release);
+    for (0..8) |_| _ = try backend.runMaintenanceStep();
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    manager.foreground_query_sessions.store(0, .release);
+    for (0..8) |_| {
+        backend.tombstone_reconcile_turn = 0;
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+    }
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.footer == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.background_io_reserved_bytes);
+    try std.testing.expect(backend.background_io_denied_jobs > 0);
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    // Admit just the fixed footer. The next denial preserves it for retry.
+    backend.options.background_io_budget_bytes = @import("lsm/table_file.zig").footer_len;
+    for (0..8) |_| {
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+    }
+    const pending = backend.pending_tombstone_reconcile.?;
+    try std.testing.expect(pending.footer != null);
+    try std.testing.expect(pending.cursor == null);
+    try std.testing.expectEqual(@as(u64, @import("lsm/table_file.zig").footer_len), backend.background_io_reserved_bytes);
+    // A quantum may admit one oversized physical unit, never the whole SST.
+    backend.options.background_io_allow_oversized_single_job = true;
+    backend.tombstone_reconcile_turn = 0;
+    backend.tombstone_reconcile_retry_ns = 0;
+    _ = try backend.runMaintenanceStep();
+    try std.testing.expect(pending.cursor != null);
+    var expected_io: u64 = @import("lsm/table_file.zig").footer_len + pending.footer.?.metadata_len;
+    var largest_block: u64 = 0;
+    var previous_offset: ?u32 = null;
+    for (pending.cursor.?.index.blocks) |block| {
+        const offset = block.window.physicalRelativeOffset();
+        if (previous_offset == null or previous_offset.? != offset) expected_io += block.window.physicalLen();
+        previous_offset = offset;
+        largest_block = @max(largest_block, block.window.physicalLen());
+    }
+    // Foreground admission also pauses an already-owned cursor without
+    // discarding its verified index or rereading it when traffic subsides.
+    manager.foreground_query_sessions.store(1, .release);
+    const reserved_before_pause = backend.background_io_reserved_bytes;
+    for (0..8) |_| _ = try backend.runMaintenanceStep();
+    try std.testing.expectEqual(reserved_before_pause, backend.background_io_reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    try std.testing.expect(backend.pending_tombstone_reconcile.? == pending);
+    manager.foreground_query_sessions.store(0, .release);
+    for (0..256) |_| {
+        if (backend.tombstone_reconcile_completed != 0) break;
+        const before = backend.tombstone_reconcile_rows;
+        const io_before = backend.background_io_reserved_bytes;
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.tombstone_reconcile_rows - before <= 2048);
+        try std.testing.expect(backend.background_io_reserved_bytes - io_before <= largest_block);
+    }
+    try std.testing.expectEqual(@as(u64, 5000), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_completed);
+    try std.testing.expect(backend.background_io_oversized_jobs > 1);
+    try std.testing.expect(backend.background_io_reserved_bytes > 5000);
+    try std.testing.expectEqual(expected_io, backend.background_io_reserved_bytes);
+    try std.testing.expectEqual(@as(?u32, 5000), backend.runs.at(0).tombstone_count);
+}
+
+test "lsm maintenance score aggregate scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const keys = try alloc.alloc(u8, count * 8);
+        defer alloc.free(keys);
+        var backend = Backend.init(alloc, .{ .wal_enabled = false, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 200000 });
+        defer backend.close();
+        for (0..count) |i| {
+            const key = keys[i * 8 ..][0..8];
+            std.mem.writeInt(u64, key, i, .big);
+            try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count, .level = 0, .size_bytes = 1024, .path = @constCast("score-benchmark.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+        }
+        _ = try backend.planningDirectory();
+        const started = platform_time.monotonicNs();
+        for (0..10000) |_| std.mem.doNotOptimizeAway(backend.maintenanceScore());
+        const ns = @as(f64, @floatFromInt(platform_time.monotonicNs() - started)) / 10000;
+        std.debug.print("maintenance-score files={d} ns={d:.1}\n", .{ count, ns });
+    }
+}
+
+fn writeUnknownTombstoneFixture(allocator: Allocator, storage: Storage, root: []const u8, format: u32, rows: usize) !void {
+    var backend = try Backend.open(allocator, root, .{ .storage = storage, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 100000 });
+    var open = true;
+    defer if (open) backend.close();
+    var txn = try backend.beginWrite();
+    defer txn.abort();
+    for (0..rows) |i| {
+        var key: [16]u8 = undefined;
+        try txn.delete(.{}, try std.fmt.bufPrint(&key, "key:{d:0>8}", .{i}));
+    }
+    try txn.commit();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    const meta = repository_mod.runMeta(backend.runs.at(0).*);
+    const manifest = try lsm_manifest.encodeMainlineFixture(allocator, .{ .next_run_id = backend.next_run_id, .runs = &.{meta} }, format);
+    defer allocator.free(manifest);
+    backend.close();
+    open = false;
+    const path = try std.fmt.allocPrint(allocator, "{s}/manifest.bin", .{root});
+    defer allocator.free(path);
+    try storage.writeFileAbsolute(path, manifest);
+}
+
+test "lsm unknown tombstone mainline reconciliation is sliced durable and collects idle garbage" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 9, 10 }) |format| {
+        var storage = storage_io.MemoryStorage.init(allocator);
+        defer storage.deinit();
+        const root = "/unknown-tombstone-mainline";
+        try writeUnknownTombstoneFixture(allocator, storage.storage(), root, format, 3001);
+        const options = Options{ .storage = storage.storage(), .wal_enabled = false, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 100000, .tombstone_gc_max_age_ns = 1, .obsolete_retention_ns = 0, .obsolete_delete_retry_ns = 0 };
+        var backend = try Backend.open(allocator, root, options);
+        var open = true;
+        defer if (open) backend.close();
+        try std.testing.expectEqual(@as(usize, 1), (try backend.planningDirectory()).unknownTombstoneRunCount());
+        try std.testing.expect(backend.maintenanceScore() > 0);
+        var slices: usize = 0;
+        while (backend.tombstone_reconcile_completed == 0 and slices < 100) : (slices += 1) {
+            const before = backend.tombstone_reconcile_rows;
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+            try std.testing.expect(backend.tombstone_reconcile_rows - before <= 2048);
+        }
+        try std.testing.expect(slices >= 3);
+        try std.testing.expectEqual(@as(u64, 3001), backend.tombstone_reconcile_rows);
+        try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_completed);
+        try std.testing.expectEqual(@as(?u32, 3001), backend.runs.at(0).tombstone_count);
+        try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
+        backend.close();
+        open = false;
+        backend = try Backend.open(allocator, root, options);
+        open = true;
+        try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).unknownTombstoneRunCount());
+        try std.testing.expectEqual(@as(?u32, 3001), backend.runs.at(0).tombstone_count);
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    }
+}
+
+test "lsm unknown tombstone reconciliation discards stale input and closes partial work" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-stale";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 20);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false });
+    defer backend.close();
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    const source = backend.runs.at(0);
+    var replacement = RunStore.revision(source, source.*);
+    replacement.gc_requested = true;
+    const directory = try (try backend.planningDirectory()).fork(allocator);
+    var directory_owned = true;
+    defer if (directory_owned) directory.destroy(allocator);
+    try directory.put(&backend, replacement);
+    try backend.runs.replace(allocator, source, replacement);
+    backend.invalidateReadVersion();
+    backend.publishRunDirectory(directory);
+    directory_owned = false;
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_completed);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    // Close owns the pinned path, sequential index and admitted scratch.
+}
+
+test "lsm unknown tombstone reconciliation keeps corrupt input unknown and backs off" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-corrupt";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false });
+    defer backend.close();
+    const bytes = storage.files.get(backend.runs.at(0).path.?).?;
+    var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage.storage(), allocator, backend.runs.at(0).path.?);
+    defer index.deinit(allocator);
+    const offset = index.entry_data_start + index.blocks[0].window.physicalRelativeOffset();
+    const old = bytes[offset];
+    bytes[offset] ^= 0xff;
+    defer bytes[offset] = old;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var failed = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch {
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_failures);
+    try std.testing.expect(backend.tombstone_reconcile_retry_ns > backend.nowNs());
+}
+
+test "lsm unknown tombstone manifest failure preserves published owners for retry" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const root = "/unknown-tombstone-manifest-failure";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false, .read_runtime = storage_io.ReadRuntime.init(io_impl.io()) });
+    defer backend.close();
+    const Hook = struct {
+        fn fail(_: *anyopaque) !void {
+            return error.InjectedPublicationFailure;
+        }
+    };
+    repository_mod.publication_test_hook = .{ .context = &backend, .run = Hook.fail };
+    defer repository_mod.publication_test_hook = null;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var failed = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch |err| {
+            try std.testing.expectEqual(error.InjectedPublicationFailure, err);
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(?u32, 3), backend.runs.at(0).tombstone_count);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).unknownTombstoneRunCount());
+    try std.testing.expect(backend.manifest_dirty);
+    repository_mod.publication_test_hook = null;
+    try backend.persistManifestLocked();
+    try std.testing.expect(!backend.manifest_dirty);
+}
+
+test "lsm unknown tombstone publication admission retains verified counts without rereading" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-admission";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false, .resource_manager = &manager });
+    defer backend.close();
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    backend.manifest_admitted_wire_bytes = repository_mod.maxManifestReadBytes();
+    defer backend.manifest_admitted_wire_bytes = 0;
+    var denied = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+            denied = true;
+            break;
+        };
+    }
+    try std.testing.expect(denied);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.complete);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.cursor == null);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.budget == null);
+    try std.testing.expectEqual(@as(u64, 3), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    backend.manifest_admitted_wire_bytes = 0;
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 3), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(?u32, 3), backend.runs.at(0).tombstone_count);
+}
+
+test "lsm tombstone GC bounds unique key churn and preserves old readers across reopen" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const options = Options{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 1000,
+        .l0_soft_limit_runs = 1000,
+        .l0_hard_limit_runs = 1000,
+        .l0_overlap_compact_threshold_runs = 0,
+        .obsolete_retention_ns = 0,
+        .obsolete_delete_retry_ns = 0,
+    };
+    var backend = try Backend.open(alloc, "/tombstone-churn", options);
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+    var retained_peak: u64 = 0;
+    for (0..24) |round| {
+        var key: [24]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "block:{d:0>6}", .{round});
+        {
+            var write = try backend.beginWrite();
+            try write.put(.{}, name, "obsolete payload");
+            try write.commit();
+        }
+        var old = try backend.beginRead();
+        var old_open = true;
+        defer if (old_open) old.abort();
+        {
+            var write = try backend.beginWrite();
+            try write.delete(.{}, name);
+            try write.commit();
+        }
+        // Below all ordinary compaction thresholds, durable tombstone debt
+        // still schedules a complete overlap component and an empty output.
+        try std.testing.expect(backend.snapshotMaintenanceStats().tombstone_entries > 0);
+        if (round == 0) {
+            var read_options = options;
+            read_options.backend.read_only = true;
+            var reopened = try Backend.open(alloc, "/tombstone-churn", read_options);
+            defer reopened.close();
+            try std.testing.expectEqual(@as(u64, 1), reopened.snapshotMaintenanceStats().tombstone_entries);
+        }
+        for (0..16) |_| {
+            if (!try backend.runMaintenanceStep()) break;
+        }
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        try std.testing.expectEqualStrings("obsolete payload", try old.get(.{}, name));
+        var retained_bytes: u64 = 0;
+        var files = storage.files.valueIterator();
+        while (files.next()) |bytes| retained_bytes += bytes.len;
+        retained_peak = @max(retained_peak, retained_bytes);
+        old.abort();
+        old_open = false;
+        for (0..16) |_| {
+            if (!try backend.runMaintenanceStep()) break;
+        }
+        try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().tombstone_entries);
+        try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, name));
+        if (round % 4 == 0) {
+            backend.close();
+            backend_open = false;
+            backend = try Backend.open(alloc, "/tombstone-churn", options);
+            backend_open = true;
+            try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        }
+    }
+    std.debug.print("\nLSM unique-key churn: 24 generations, settled SSTs=0, peak retained file bytes={d}\n", .{retained_peak});
+}
+
+test "lsm split waits for publication before detaching live run ownership" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const options = Options{
+        .storage = storage.storage(),
+        .read_runtime = storage_io.ReadRuntime.init(io),
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .compact_threshold_runs = 10000,
+    };
+    var backend = try Backend.open(alloc, "/split-publication-lane", options);
+    defer backend.close();
+    try backend.beginBulkIngestSession();
+    {
+        var txn = try backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{}, "a", "left");
+        try txn.put(.{}, "z", "right");
+        try txn.commit();
+    }
+    var old = try backend.beginRead();
+    defer old.abort();
+    const Harness = struct {
+        backend: *Backend,
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
+        calls: usize = 0,
+        publication_failure: ?anyerror = null,
+        split_failure: ?anyerror = null,
+        changed: bool = false,
+
+        fn hook(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls != 1) return;
+            self.entered.set(self.io);
+            self.proceed.waitUncancelable(self.io);
+        }
+        fn publish(self: *@This()) void {
+            self.backend.persistManifest() catch |err| {
+                self.publication_failure = err;
+            };
+        }
+        fn split(self: *@This()) void {
+            self.changed = self.backend.rewriteLeftInPlace("m") catch |err| {
+                self.split_failure = err;
+                return;
+            };
+        }
+    };
+    var harness = Harness{ .backend = &backend, .io = io };
+    repository_mod.publication_test_hook = .{ .context = &harness, .run = Harness.hook };
+    defer repository_mod.publication_test_hook = null;
+    var group: std.Io.Group = .init;
+    defer {
+        harness.proceed.set(io);
+        group.await(io) catch {};
+    }
+    try group.concurrent(io, Harness.publish, .{&harness});
+    try harness.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try group.concurrent(io, Harness.split, .{&harness});
+    var waiting = false;
+    for (0..10000) |_| {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        waiting = backend.manifest_publish_waiters == 1;
+        runtime_mod.unlockBackend(Backend, &backend, locked);
+        if (waiting) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(waiting);
+    // The queued split has not detached the graph seen by this old reader.
+    try std.testing.expectEqualStrings("right", try old.get(.{}, "z"));
+    harness.proceed.set(io);
+    try group.await(io);
+    if (harness.publication_failure) |err| return err;
+    if (harness.split_failure) |err| return err;
+    try std.testing.expect(harness.changed);
+    try std.testing.expectEqualStrings("right", try old.get(.{}, "z"));
+    try std.testing.expectEqualStrings("left", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "z"));
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    var readonly = options;
+    readonly.backend.read_only = true;
+    var reopened = try Backend.open(alloc, "/split-publication-lane", readonly);
+    defer reopened.close();
+    try std.testing.expectEqualStrings("left", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "z"));
+}
+
+test "lsm durability lane groups waiting publications without retiring newer WAL" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |fail_first| {
+        const alloc = std.testing.allocator;
+        var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        const options = Options{
+            .storage = storage.storage(),
+            .read_runtime = storage_io.ReadRuntime.init(io),
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 1,
+            .compact_threshold_runs = 10000,
+        };
+        var backend = try Backend.open(alloc, "/manifest-publication-group", options);
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        const Harness = struct {
+            backend: *Backend,
+            io: std.Io,
+            entered: std.Io.Event = .unset,
+            proceed: std.Io.Event = .unset,
+            calls: usize = 0,
+            verified_newer_wal: bool = false,
+            fail_first: bool,
+            failed: std.atomic.Value(bool) = .init(false),
+            fn publish(context: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                self.calls += 1;
+                if (self.calls == 1) {
+                    self.entered.set(self.io);
+                    self.proceed.waitUncancelable(self.io);
+                    if (self.fail_first) return error.InjectedPublicationFailure;
+                } else if (self.calls == 2) {
+                    const locked = runtime_mod.lockBackend(Backend, self.backend);
+                    defer runtime_mod.unlockBackend(Backend, self.backend, locked);
+                    if (self.fail_first) {
+                        try std.testing.expect(self.backend.manifest_directory == null);
+                        try std.testing.expect(self.backend.manifest_journal.sequence == null);
+                    } else try std.testing.expectEqual(@as(usize, 1), self.backend.manifest_directory.?.count());
+                    try std.testing.expectEqual(@as(usize, 3), self.backend.run_directory.?.count());
+                    try std.testing.expect(!self.backend.manifestCoversCurrentRuns());
+                    try self.backend.maybeCheckpointWalAfterManifestPublish();
+                    try std.testing.expectEqual(@as(u64, 0), self.backend.write_stats.wal_resets);
+                    try std.testing.expect(self.backend.unpublished_wal_logical_bytes > 0);
+                    self.verified_newer_wal = true;
+                }
+            }
+            fn write(self: *@This(), key: []const u8) void {
+                self.writeFallible(key) catch {
+                    self.failed.store(true, .release);
+                };
+            }
+            fn writeFallible(self: *@This(), key: []const u8) !void {
+                var txn = try self.backend.beginWrite();
+                errdefer txn.abort();
+                try txn.put(.{}, key, key);
+                try txn.commit();
+                try self.backend.persistManifest();
+            }
+        };
+        var harness = Harness{ .backend = &backend, .io = io, .fail_first = fail_first };
+        repository_mod.publication_test_hook = .{ .context = &harness, .run = Harness.publish };
+        defer repository_mod.publication_test_hook = null;
+        var writers: std.Io.Group = .init;
+        defer {
+            harness.proceed.set(io);
+            writers.await(io) catch {};
+        }
+        try writers.concurrent(io, Harness.write, .{ &harness, "a" });
+        try harness.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        try writers.concurrent(io, Harness.write, .{ &harness, "b" });
+        try writers.concurrent(io, Harness.write, .{ &harness, "c" });
+        var admitted = false;
+        for (0..10000) |_| {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            admitted = backend.manifest_publish_waiters == 2;
+            runtime_mod.unlockBackend(Backend, &backend, locked);
+            if (admitted) break;
+            try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(admitted);
+        harness.proceed.set(io);
+        try writers.await(io);
+        try std.testing.expectEqual(fail_first, harness.failed.load(.acquire));
+        try std.testing.expect(harness.verified_newer_wal);
+        try std.testing.expectEqual(@as(usize, 2), harness.calls);
+        try std.testing.expect(backend.write_stats.manifest_publication_coalesced >= 1);
+        try std.testing.expect(backend.manifestCoversCurrentRuns());
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        var readonly_options = options;
+        readonly_options.backend.read_only = true;
+        var reopened = try Backend.open(alloc, "/manifest-publication-group", readonly_options);
+        defer reopened.close();
+        var read = try reopened.beginRead();
+        defer read.abort();
+        for ([_][]const u8{ "a", "b", "c" }) |key| try std.testing.expectEqualStrings(key, try read.get(.{}, key));
+    }
+}
+
+test "lsm concurrent first readers pin epochs without projecting runs" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/single-flight-read-version", .{
+        .storage = storage.storage(),
+        .read_runtime = storage_io.ReadRuntime.init(io),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    const Worker = struct {
+        fn run(target: *Backend, task_io: std.Io, start: *std.Io.Event, failed: *std.atomic.Value(bool)) void {
+            start.waitUncancelable(task_io);
+            var read = target.beginRead() catch {
+                failed.store(true, .release);
+                return;
+            };
+            read.abort();
+        }
+    };
+    for (0..2) |_| {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "key", "value");
+        try write.commit();
+        try backend.finalizeDeferredStorageWork();
+        try std.testing.expect(backend.run_directory != null);
+        try std.testing.expectEqual(backend.runs.count(), backend.run_directory.?.count());
+        const before = backend.read_version_builds;
+        const groups_before = backend.snapshotReadStats().run_group_builds;
+        var start: std.Io.Event = .unset;
+        var failed = std.atomic.Value(bool).init(false);
+        var readers: std.Io.Group = .init;
+        defer {
+            start.set(io);
+            readers.await(io) catch {};
+        }
+        for (0..8) |_| try readers.concurrent(io, Worker.run, .{ &backend, io, &start, &failed });
+        start.set(io);
+        try readers.await(io);
+        try std.testing.expect(!failed.load(.acquire));
+        try std.testing.expectEqual(before, backend.read_version_builds);
+        try std.testing.expectEqual(groups_before, backend.snapshotReadStats().run_group_builds);
+    }
+}
+
+test "lsm persistent directory and lazy cursor scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const Fixture = struct {
+        allocator: Allocator = std.heap.smp_allocator,
+        retained: usize = 0,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+            self.retained += 1;
+            self.pins += 1;
+            run.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+            self.pins -= 1;
+            run.version_ref_pinned = false;
+        }
+    };
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var fixture: Fixture = .{};
+        const alloc = fixture.allocator;
+        const directory = try RunDirectory.create(alloc);
+        defer directory.destroy(alloc);
+        for (0..count) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try directory.put(&fixture, .{ .id = i + 1, .level = 1, .size_bytes = 1024, .path = @constCast("/benchmark/run.sst"), .smallest_namespace_name = @constCast("docs"), .smallest_key = &key, .largest_namespace_name = @constCast("docs"), .largest_key = &key, .entry_count = 10, .bloom_filter = null, .state = null });
+        }
+        const runs = try directory.project(alloc);
+        defer alloc.free(runs);
+        const Planner = struct {
+            allocator: Allocator,
+            runs: std.ArrayListUnmanaged(Run),
+            options: Options = .{},
+            planning_directory: ?*RunDirectory = null,
+            planner_seed: usize = 0,
+            pub fn planningDirectory(self: *@This()) !*const RunDirectory {
+                return self.planning_directory.?;
+            }
+        };
+        var planner = Planner{ .allocator = alloc, .runs = .{ .items = runs, .capacity = 0 } };
+        var planning_ns: [2][3]u64 = undefined;
+        for (0..3) |sample| for (0..2) |turn| {
+            const mode = (sample + turn) % 2;
+            planner.planning_directory = if (mode == 0) null else directory;
+            const started = platform_time.monotonicNs();
+            const index = try compaction_mod.DomainIndex.create(&planner);
+            planning_ns[mode][sample] = platform_time.monotonicNs() - started;
+            index.destroy(alloc);
+        };
+        std.debug.print("\nLSM planner runs={d} rebuilt_order_ns={any} maintained_order_ns={any}\n", .{ count, planning_ns[0], planning_ns[1] });
+        planner.planning_directory = directory;
+        planner.options.level_target_runs_base = count - 1;
+        planner.options.level_target_bytes_base = 0;
+        var direct_ns: [3]u64 = undefined;
+        for (&direct_ns) |*sample| {
+            const started = platform_time.monotonicNs();
+            for (0..100) |_| try std.testing.expectEqual(@as(usize, 1), try compaction_mod.directorySelectionInputCountForTest(&planner));
+            sample.* = (platform_time.monotonicNs() - started) / 100;
+        }
+        std.debug.print("\nLSM direct planner runs={d} selected_inputs=1 selection_ns={any}\n", .{ count, direct_ns });
+        var projection_ns: [3]u64 = undefined;
+        var pin_ns: [3]u64 = undefined;
+        var update_ns: [3]u64 = undefined;
+        for (0..3) |sample| {
+            var started = platform_time.monotonicNs();
+            for (0..1000) |_| {
+                const pin = try directory.fork(alloc);
+                pin.destroy(alloc);
+            }
+            pin_ns[sample] = (platform_time.monotonicNs() - started) / 1000;
+            const pin = try directory.fork(alloc);
+            started = platform_time.monotonicNs();
+            const version = try runtime_mod.ReadVersion.createFromDirectory(alloc, pin);
+            projection_ns[sample] = platform_time.monotonicNs() - started;
+            version.destroy(&fixture);
+            const candidate = try directory.fork(alloc);
+            const before = fixture.retained;
+            started = platform_time.monotonicNs();
+            try candidate.put(&fixture, runs[count / 2]);
+            update_ns[sample] = platform_time.monotonicNs() - started;
+            try std.testing.expectEqual(before + 1, fixture.retained);
+            candidate.destroy(alloc);
+        }
+        var empty: State = .{};
+        const started = platform_time.monotonicNs();
+        var cursor = try runtime_mod.MergeCursor(Fixture, State).initDirectory(alloc, &fixture, &empty, &.{}, directory, .{ .name = "docs" }, false);
+        const setup_ns = platform_time.monotonicNs() - started;
+        defer cursor.close();
+        try std.testing.expectEqual(@as(usize, 2), cursor.positions.len);
+        try std.testing.expectEqual(count, fixture.pins);
+        std.debug.print("\nLSM directory runs={d} directory_bytes={d} pin_ns={any} one_run_update_ns={any} off_lock_projection_ns={any} cursor_bytes={d} cursor_setup_ns={d}\n", .{ count, directory.accountedMemoryBytes(1), pin_ns, update_ns, projection_ns, cursor.cursor_storage.len, setup_ns });
+        std.debug.print("LSM endpoint index runs={d} bytes={d} node_bytes={d}\n", .{ count, directory.ends.memoryBytes(), @sizeOf(@TypeOf(directory.ends).Node) });
+        // One wide L0 source intersects the entire disjoint lower level.
+        // This exercises resumable closure traversal, not just point pruning.
+        try directory.put(&fixture, .{ .id = count + 1, .level = 0, .size_bytes = 1024, .path = @constCast("/benchmark/wide.sst"), .smallest_namespace_name = @constCast("docs"), .smallest_key = runs[0].smallest_key, .largest_namespace_name = @constCast("docs"), .largest_key = runs[count - 1].largest_key, .entry_count = 10, .bloom_filter = null, .state = null });
+        planner.options.compact_threshold_runs = 0;
+        planner.options.level_target_runs_base = count + 1;
+        var broad_ns: [3]u64 = undefined;
+        for (&broad_ns) |*sample| {
+            const broad_started = platform_time.monotonicNs();
+            try std.testing.expectEqual(count + 1, try compaction_mod.directorySelectionInputCountForTest(&planner));
+            sample.* = platform_time.monotonicNs() - broad_started;
+        }
+        std.debug.print("\nLSM broad direct planner runs={d} selected_inputs={d} selection_ns={any}\n", .{ count + 1, count + 1, broad_ns });
+        var job_ns: [3]u64 = undefined;
+        var max_slice_ns: [3]u64 = undefined;
+        var slices: usize = 0;
+        var arena_bytes: usize = 0;
+        for (0..3) |sample| {
+            const job_started = platform_time.monotonicNs();
+            var job = try @import("lsm_backend/closure_job.zig").Job.init(alloc, directory, &.{directory.at(0)}, 0, false);
+            defer job.deinit(alloc);
+            max_slice_ns[sample] = 0;
+            slices = 0;
+            while (true) {
+                const slice_started = platform_time.monotonicNs();
+                const done = try job.stepUntil(alloc, 2048, slice_started +| 2 * std.time.ns_per_ms);
+                max_slice_ns[sample] = @max(max_slice_ns[sample], platform_time.monotonicNs() - slice_started);
+                slices += 1;
+                if (done) break;
+            }
+            job_ns[sample] = platform_time.monotonicNs() - job_started;
+            arena_bytes = job.arena.queryCapacity();
+            try std.testing.expectEqual(count + 1, job.emitted);
+        }
+        std.debug.print("\nLSM sliced closure runs={d} total_ns={any} max_slice_ns={any} slices={d} arena_bytes={d}\n", .{ count + 1, job_ns, max_slice_ns, slices, arena_bytes });
+    }
+}
+
+test "lsm shared read version point setup benchmark" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/read-version-benchmark", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+        .l0_soft_limit_runs = 10000,
+        .l0_hard_limit_runs = 10000,
+    });
+    defer backend.close();
+    for (0..256) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+    }
+    defer runtime_mod.test_private_read_versions = false;
+    var times: [2][7]u64 = undefined;
+    var groups: [2]u64 = undefined;
+    for (0..7) |sample| for (0..2) |turn| {
+        const mode = (sample + turn) % 2;
+        runtime_mod.test_private_read_versions = mode == 0;
+        const before = backend.snapshotReadStats().run_group_builds;
+        const started = platform.time.monotonicNs();
+        for (0..64) |i| {
+            var key: [16]u8 = undefined;
+            var probe = try runtime_mod.BoundProbeTxn(Backend).open(&backend, .{});
+            defer probe.abort();
+            try std.testing.expectEqualStrings("value", try probe.getLeased(try std.fmt.bufPrint(&key, "k{d:0>4}", .{i * 3})));
+        }
+        times[mode][sample] = platform.time.monotonicNs() - started;
+        groups[mode] = backend.snapshotReadStats().run_group_builds - before;
+    };
+    for (&times) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("\nLSM 256 SST / 64 point reads private/shared: topology builds={d}/{d}, median ns={d}/{d}\n", .{ groups[0], groups[1], times[0][3], times[1][3] });
+    try std.testing.expectEqual(@as(u64, 64), groups[0]);
+    try std.testing.expectEqual(@as(u64, 0), groups[1]);
+}
+
+test "lsm native durability lane contention benchmark" {
+    if (builtin.mode != .ReleaseFast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Worker = struct {
+        const Reader = struct {
+            stop: std.atomic.Value(bool) = .init(false),
+            count: usize = 0,
+            times: [4096]u64 = undefined,
+        };
+        fn probe(backend: *Backend, task_io: std.Io, start: *std.Io.Event, reader: *Reader, failed: *std.atomic.Value(bool)) void {
+            start.waitUncancelable(task_io);
+            while (!reader.stop.load(.acquire)) {
+                const started = platform_time.monotonicNs();
+                readSeed(backend) catch {
+                    failed.store(true, .release);
+                    return;
+                };
+                if (reader.count < reader.times.len) {
+                    reader.times[reader.count] = platform_time.monotonicNs() - started;
+                    reader.count += 1;
+                }
+                std.Io.sleep(task_io, .fromMicroseconds(100), .awake) catch return;
+            }
+        }
+        fn readSeed(backend: *Backend) !void {
+            var txn = try backend.beginProbe();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("seed", try txn.get(.{}, "seed"));
+        }
+        fn run(backend: *Backend, task_io: std.Io, start: *std.Io.Event, worker: usize, times: []u64, failed: *std.atomic.Value(bool)) void {
+            start.waitUncancelable(task_io);
+            work(backend, worker, times) catch {
+                failed.store(true, .release);
+            };
+        }
+        fn work(backend: *Backend, worker: usize, times: []u64) !void {
+            for (times, 0..) |*elapsed, i| {
+                var key: [32]u8 = undefined;
+                const started = platform_time.monotonicNs();
+                var txn = try backend.beginWrite();
+                errdefer txn.abort();
+                try txn.put(.{}, try std.fmt.bufPrint(&key, "{d}:{d:0>4}", .{ worker, i }), "value");
+                try txn.commit();
+                elapsed.* = platform_time.monotonicNs() - started;
+            }
+        }
+    };
+    for (0..3) |trial| for ([_]bool{ trial % 2 == 0, trial % 2 != 0 }) |serialized| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        var backend = try Backend.open(alloc, path, .{
+            .read_runtime = storage_io.ReadRuntime.init(io),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 10000,
+            .l0_soft_limit_runs = 10000,
+            .l0_hard_limit_runs = 10000,
+        });
+        defer backend.close();
+        {
+            var seed = try backend.beginWrite();
+            errdefer seed.abort();
+            try seed.put(.{}, "seed", "seed");
+            try seed.commit();
+        }
+        repository_mod.publication_test_keep_backend_locked = serialized;
+        defer repository_mod.publication_test_keep_backend_locked = false;
+        var latency: [200]u64 = undefined;
+        var failed = std.atomic.Value(bool).init(false);
+        var start: std.Io.Event = .unset;
+        var workers: std.Io.Group = .init;
+        var reader: Worker.Reader = .{};
+        var readers: std.Io.Group = .init;
+        defer {
+            start.set(io);
+            reader.stop.store(true, .release);
+            workers.await(io) catch {};
+            readers.await(io) catch {};
+        }
+        try readers.concurrent(io, Worker.probe, .{ &backend, io, &start, &reader, &failed });
+        for (0..4) |worker| try workers.concurrent(io, Worker.run, .{ &backend, io, &start, worker, latency[worker * 50 ..][0..50], &failed });
+        const started = platform_time.monotonicNs();
+        start.set(io);
+        try workers.await(io);
+        const elapsed = platform_time.monotonicNs() - started;
+        reader.stop.store(true, .release);
+        try readers.await(io);
+        try std.testing.expect(!failed.load(.acquire));
+        std.mem.sort(u64, &latency, {}, std.sort.asc(u64));
+        const stats = backend.snapshotWriteStats();
+        std.mem.sort(u64, reader.times[0..reader.count], {}, std.sort.asc(u64));
+        try std.testing.expect(reader.count > 0);
+        std.debug.print("\nLSM native publication trial={d} serialized={any} rows=200 workers=4 elapsed_ns={d} p50_ns={d} p99_ns={d} manifest_writes={d} waits={d} coalesced={d} offlock_ns={d}\n", .{ trial, serialized, elapsed, latency[100], latency[198], stats.manifest_writes, stats.manifest_publication_waits, stats.manifest_publication_coalesced, stats.manifest_io_unlocked_ns });
+        std.debug.print("LSM native concurrent probes trial={d} serialized={any} samples={d} p50_ns={d} p99_ns={d}\n", .{ trial, serialized, reader.count, reader.times[reader.count / 2], reader.times[reader.count * 99 / 100] });
+        var read = try backend.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor(.{});
+        defer cursor.close();
+        var rows: usize = 0;
+        var entry = try cursor.first();
+        while (entry != null) : (entry = try cursor.next()) rows += 1;
+        try std.testing.expectEqual(@as(usize, 201), rows);
+    };
+}
+
+test "lsm incremental manifest publication benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/manifest-edit-benchmark", .{ .storage = storage.storage(), .flush_threshold = 1, .compact_threshold_runs = 10000, .l0_soft_limit_runs = 10000, .l0_hard_limit_runs = 10000 });
+    defer backend.close();
+    var full_snapshot_bytes: u64 = 0;
+    var latency: [600]u64 = undefined;
+    for (&latency, 0..) |*sample, i| {
+        var key: [16]u8 = undefined;
+        const started = platform_time.monotonicNs();
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+        sample.* = platform_time.monotonicNs() - started;
+        if (backend.manifest_journal.checkpointDue()) try std.testing.expect(try backend.runMaintenanceStep());
+        const obsolete = try backend.obsolete_paths.project(alloc);
+        defer alloc.free(obsolete);
+        const full = try repository_mod.encodeManifestAlloc(alloc, backend.next_run_id, (try backend.runs.testItems(backend.allocator)), obsolete);
+        full_snapshot_bytes += full.len;
+        alloc.free(full);
+    }
+    std.mem.sort(u64, &latency, {}, std.sort.asc(u64));
+    const stats = backend.snapshotWriteStats();
+    std.debug.print("\nLSM 600 publications: full_snapshot_equivalent_bytes={d} journal_written_bytes={d} checkpoints={d} edits={d} live_manifest_bytes={d} commit_median_ns={d} commit_p99_ns={d}\n", .{ full_snapshot_bytes, stats.manifest_bytes, stats.manifest_checkpoints, stats.manifest_edits, backend.current_manifest_bytes, latency[300], latency[594] });
+    try std.testing.expect(stats.manifest_bytes < full_snapshot_bytes / 20);
+    try std.testing.expectEqual(@as(u64, 3), stats.manifest_checkpoints);
+}
+
+test "lsm shared scan epoch setup benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var backend = try Backend.open(alloc, "/scan-epoch-benchmark", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+        .l0_soft_limit_runs = 10000,
+        .l0_hard_limit_runs = 10000,
+    });
+    defer backend.close();
+    for (0..256) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+    }
+    defer runtime_mod.test_private_read_versions = false;
+    const Kind = enum { current, replay, bound_write, namespace_write };
+    inline for (std.meta.tags(Kind)) |kind| {
+        var times: [2][7]u64 = undefined;
+        var groups: [2]u64 = undefined;
+        for (0..7) |sample| for (0..2) |turn| {
+            const mode = (sample + turn) % 2;
+            runtime_mod.test_private_read_versions = mode == 0;
+            const before = backend.snapshotReadStats().run_group_builds;
+            const started = platform.time.monotonicNs();
+            for (0..64) |_| {
+                switch (kind) {
+                    .current, .replay => {
+                        var scan = if (kind == .current)
+                            try runtime_mod.BoundCurrentScanTxn(Backend).open(&backend, .{})
+                        else
+                            try runtime_mod.BoundCurrentScanTxn(Backend).openReplay(&backend, .{});
+                        defer scan.abort();
+                        var cursor = try scan.openCursor();
+                        defer cursor.close();
+                    },
+                    .bound_write => {
+                        var write = try runtime_mod.BoundWriteTxn(Backend).open(&backend, .{});
+                        defer write.abort();
+                        var cursor = try write.openCursor();
+                        defer cursor.close();
+                    },
+                    .namespace_write => {
+                        var write = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+                        defer write.abort();
+                        var cursor = try write.openCursor(.{});
+                        defer cursor.close();
+                    },
+                }
+            }
+            times[mode][sample] = platform.time.monotonicNs() - started;
+            groups[mode] = backend.snapshotReadStats().run_group_builds - before;
+        };
+        for (&times) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("\nLSM 256 SST / 64 {s} cursor opens private/shared: topology builds={d}/{d}, median ns={d}/{d}\n", .{ @tagName(kind), groups[0], groups[1], times[0][3], times[1][3] });
+        try std.testing.expectEqual(@as(u64, 64), groups[0]);
+        try std.testing.expectEqual(@as(u64, 0), groups[1]);
+    }
+}
+
+test "lsm compaction domains bound two-sided metadata churn physical writes" {
+    const alloc = std.testing.allocator;
+    const Family = struct {
+        fn extract(key: []const u8) []const u8 {
+            return key[0..@min(key.len, 1)];
+        }
+    };
+    defer compaction_mod.test_output_partitions_only = false;
+    var written: [2]u64 = undefined;
+    for (0..2) |mode| {
+        compaction_mod.test_output_partitions_only = mode == 0;
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/two-sided-domain-churn", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+            .foreground_soft_compaction = true,
+            .level_target_runs_base = 100,
+            .level_target_bytes_base = 0,
+            .max_run_file_bytes = 8 * 1024 * 1024,
+            .run_partition_key = Family.extract,
+        });
+        defer backend.close();
+        var random = std.Random.DefaultPrng.init(187);
+        var value: [16 * 1024]u8 = undefined;
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "a:counts", "0");
+            try write.put(.{}, "z:manifest", "0");
+            for (0..64) |i| {
+                var name: [16]u8 = undefined;
+                random.random().bytes(&value);
+                try write.put(.{}, try std.fmt.bufPrint(&name, "v:{d:0>4}", .{i}), &value);
+            }
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        const before = backend.snapshotWriteStats().table_file_bytes;
+        for (0..16) |round| {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            var number: [16]u8 = undefined;
+            const bytes = try std.fmt.bufPrint(&number, "{d}", .{round + 1});
+            try write.put(.{}, "a:counts", bytes);
+            try write.put(.{}, "z:manifest", bytes);
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        written[mode] = backend.snapshotWriteStats().table_file_bytes - before;
+        try std.testing.expectEqualStrings("0", try old.get("z:manifest"));
+        try std.testing.expectEqualSlices(u8, &value, try old.get("v:0063"));
+        std.debug.print("\nLSM two-sided churn: domains={}, SST bytes written={d}\n", .{ mode == 1, written[mode] });
+    }
+    try std.testing.expect(written[1] * 4 < written[0]);
+}
+
+test "lsm payload family isolation physical churn benchmark" {
+    const alloc = std.testing.allocator;
+    const Family = struct {
+        fn extract(key: []const u8) []const u8 {
+            return key[0..(std.mem.indexOfScalar(u8, key, ':') orelse key.len)];
+        }
+    };
+    var written: [2]u64 = undefined;
+    var physical: [2]usize = undefined;
+    for (0..2) |mode| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        const options = Options{
+            .flush_threshold = 1,
+            .compact_threshold_runs = 2,
+            .foreground_soft_compaction = true,
+            .level_target_runs_base = 100,
+            .level_target_bytes_base = 0,
+            .max_run_file_bytes = 8 * 1024 * 1024,
+            .run_partition_prefix_bytes = 1,
+            .run_partition_key = if (mode == 0) null else Family.extract,
+            .storage = storage.storage(),
+        };
+        var backend = try Backend.open(alloc, "/lsm-payload-family", options);
+        defer backend.close();
+        var random = std.Random.DefaultPrng.init(401);
+        var value: [16 * 1024]u8 = undefined;
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "\x00a:metadata", "0");
+            for (0..64) |i| {
+                var name: [32]u8 = undefined;
+                random.random().bytes(&value);
+                try write.put(.{}, try std.fmt.bufPrint(&name, "\x00v:{d:0>4}", .{i}), &value);
+            }
+            try write.commit();
+        }
+        const before = backend.snapshotWriteStats().table_file_bytes;
+        var old = try Backend.BoundReadTxn.open(&backend, .{});
+        defer old.abort();
+        for (0..16) |round| {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            var number: [16]u8 = undefined;
+            try write.put(.{}, "\x00a:metadata", try std.fmt.bufPrint(&number, "{d}", .{round + 1}));
+            try write.commit();
+        }
+        try backend.finalizeDeferredStorageWork();
+        written[mode] = backend.snapshotWriteStats().table_file_bytes - before;
+        physical[mode] = 0;
+        var files = storage.files.valueIterator();
+        while (files.next()) |bytes| physical[mode] += bytes.len;
+        try std.testing.expectEqualStrings("0", try old.get("\x00a:metadata"));
+        try std.testing.expectEqualSlices(u8, &value, try old.get("\x00v:0063"));
+        if (mode == 1) for ((try backend.runs.testItems(backend.allocator))) |run| try std.testing.expectEqualStrings(Family.extract(run.smallest_key), Family.extract(run.largest_key));
+        std.debug.print("\nLSM physical metadata churn: isolated={}, SST written bytes={d}, all retained file bytes={d}, compactions={d}\n", .{ mode == 1, written[mode], physical[mode], backend.compaction_stats.compactions });
+    }
+    try std.testing.expect(written[1] * 4 < written[0]);
 }
 
 test "lsm backend splits oversized compaction output into persisted run segments" {
@@ -16688,7 +23208,7 @@ test "lsm backend splits oversized compaction output into persisted run segments
         }
 
         var level_one_runs: usize = 0;
-        for (backend.runs.items) |run| {
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             if (run.level == 1) level_one_runs += 1;
             try std.testing.expect(run.size_bytes <= 512);
             try std.testing.expect(run.state == null);
@@ -16744,20 +23264,20 @@ test "lsm backend manifest layout validation keeps WAL and bulk session when run
     }
 
     try std.testing.expect(backend.bulkIngestActive());
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
     try std.testing.expect(backend.manifest_dirty);
     const before = backend.snapshotMaintenanceStats();
     try std.testing.expect(before.wal_retained_bytes > 0);
 
-    const original_entry_count = backend.runs.items[0].entry_count;
-    backend.runs.items[0].entry_count = 0;
+    const original_entry_count = backend.runs.at(0).*.entry_count;
+    backend.runs.at(0).*.entry_count = 0;
     try std.testing.expectError(error.InvalidTableFile, backend.finishBulkIngestSessionWithOptions(.{ .compact = false }));
     try std.testing.expect(backend.bulkIngestActive());
     try std.testing.expect(backend.manifest_dirty);
     const after_failed_publish = backend.snapshotMaintenanceStats();
     try std.testing.expect(after_failed_publish.wal_retained_bytes > 0);
 
-    backend.runs.items[0].entry_count = original_entry_count;
+    backend.runs.at(0).*.entry_count = original_entry_count;
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     try std.testing.expect(!backend.bulkIngestActive());
     const after_repair = backend.snapshotMaintenanceStats();
@@ -16784,10 +23304,10 @@ test "lsm backend failed final bulk manifest publish leaves the session abortabl
         try txn.put(.{ .name = "docs" }, "doc:a", "A");
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 
-    const original_entry_count = backend.runs.items[0].entry_count;
-    backend.runs.items[0].entry_count = 0;
+    const original_entry_count = backend.runs.at(0).*.entry_count;
+    backend.runs.at(0).*.entry_count = 0;
     try backend.obsolete_paths.append(alloc, .{
         .path = try repository_mod.runPath(alloc, root_dir, 999),
         .delete_after_ns = 0,
@@ -16801,7 +23321,7 @@ test "lsm backend failed final bulk manifest publish leaves the session abortabl
     }));
     try std.testing.expect(backend.bulkIngestActive());
 
-    backend.runs.items[0].entry_count = original_entry_count;
+    backend.runs.at(0).*.entry_count = original_entry_count;
     backend.abortBulkIngestSession();
     try std.testing.expect(!backend.bulkIngestActive());
 }
@@ -16935,7 +23455,7 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
         const stats = reopened.snapshotMaintenanceStats();
         try std.testing.expectEqual(@as(u64, 0), stats.mutable_entries);
         try std.testing.expectEqual(@as(u64, 0), stats.immutable_memtables);
-        try std.testing.expect(reopened.runs.items.len > 0);
+        try std.testing.expect(reopened.runs.count() > 0);
         const write_stats = reopened.snapshotWriteStats();
         try std.testing.expect(write_stats.wal_replay_recovery_flushes > 0);
         try std.testing.expect(write_stats.wal_replay_recovery_entry_bytes > 0);
@@ -16966,7 +23486,7 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
     }
 }
 
-test "lsm backend recovery replay stores mutable entries in a flush-scoped arena" {
+test "lsm backend recovery replay stores snapshot-shareable mutable entries" {
     var memory_storage = storage_io.MemoryStorage.init(std.testing.allocator);
     defer memory_storage.deinit();
 
@@ -16992,20 +23512,18 @@ test "lsm backend recovery replay stores mutable entries in a flush-scoped arena
     });
     defer reopened.close();
 
-    try std.testing.expect(reopened.mutable.arena_owner != null);
-    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entries.items.len);
+    try std.testing.expect(reopened.mutable.arena_owner == null);
+    try std.testing.expectEqual(@as(usize, 2), reopened.mutable.entryCount());
     for (reopened.mutable.entries.items) |entry| {
-        try std.testing.expect(entry.namespace_from_arena);
-        try std.testing.expect(entry.key_from_arena);
-        try std.testing.expect(entry.value_from_arena);
+        try std.testing.expect(entry.shared != null);
     }
     try std.testing.expectEqualStrings("alpha", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:a"));
 
     try reopened.finalizeDeferredStorageWork();
     try std.testing.expect(reopened.mutable.arena_owner == null);
-    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), reopened.mutable.entryCount());
     try std.testing.expectEqual(@as(usize, 0), reopened.activeImmutableMemtableCount());
-    try std.testing.expect(reopened.runs.items.len > 0);
+    try std.testing.expect(reopened.runs.count() > 0);
 }
 
 test "lsm backend recovery replay byte threshold flushes within a large wal record" {
@@ -17044,7 +23562,7 @@ test "lsm backend recovery replay byte threshold flushes within a large wal reco
     const maintenance = reopened.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_entries);
     try std.testing.expectEqual(@as(u64, 0), maintenance.immutable_memtables);
-    try std.testing.expect(reopened.runs.items.len >= 2);
+    try std.testing.expect(reopened.runs.count() >= 2);
 
     const write_stats = reopened.snapshotWriteStats();
     try std.testing.expect(write_stats.immutable_flushes >= 2);
@@ -17295,7 +23813,7 @@ test "lsm backend compacts oldest persisted runs and reopens" {
             try txn.commit();
         }
 
-        try std.testing.expect(backend.runs.items.len <= 2);
+        try std.testing.expect(backend.runs.count() <= 2);
     }
 
     {
@@ -17306,7 +23824,7 @@ test "lsm backend compacts oldest persisted runs and reopens" {
         });
         defer reopened.close();
 
-        try std.testing.expect(reopened.runs.items.len <= 2);
+        try std.testing.expect(reopened.runs.count() <= 2);
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
         defer runtime.deinit();
@@ -17353,9 +23871,9 @@ test "lsm backend persists run levels across reopen" {
             try txn.commit();
         }
 
-        try std.testing.expectEqual(@as(usize, 2), backend.runs.items.len);
-        try expectLowerLevelsNonOverlapping(backend.runs.items);
-        for (backend.runs.items) |run| {
+        try std.testing.expectEqual(@as(usize, 2), backend.runs.count());
+        try expectLowerLevelsNonOverlapping((try backend.runs.testItems(backend.allocator)));
+        for ((try backend.runs.testItems(backend.allocator))) |run| {
             try std.testing.expect(run.size_bytes > 0);
             try expected_levels.append(std.testing.allocator, run.level);
         }
@@ -17370,9 +23888,9 @@ test "lsm backend persists run levels across reopen" {
         });
         defer reopened.close();
 
-        try std.testing.expectEqual(expected_levels.items.len, reopened.runs.items.len);
-        try expectLowerLevelsNonOverlapping(reopened.runs.items);
-        for (reopened.runs.items, expected_levels.items) |run, expected_level| {
+        try std.testing.expectEqual(expected_levels.items.len, reopened.runs.count());
+        try expectLowerLevelsNonOverlapping((try reopened.runs.testItems(reopened.allocator)));
+        for ((try reopened.runs.testItems(reopened.allocator)), expected_levels.items) |run, expected_level| {
             try std.testing.expectEqual(expected_level, run.level);
             try std.testing.expect(run.size_bytes > 0);
         }
@@ -17409,9 +23927,9 @@ test "lsm backend pressure compacts lower levels" {
             try txn.commit();
         }
 
-        try expectLowerLevelsNonOverlapping(backend.runs.items);
-        try expectLevelTargetsSatisfied(backend.runs.items, level_target_runs_base, level_target_runs_multiplier);
-        for (backend.runs.items) |run| try std.testing.expect(run.size_bytes > 0);
+        try expectLowerLevelsNonOverlapping((try backend.runs.testItems(backend.allocator)));
+        try expectLevelTargetsSatisfied((try backend.runs.testItems(backend.allocator)), level_target_runs_base, level_target_runs_multiplier);
+        for ((try backend.runs.testItems(backend.allocator))) |run| try std.testing.expect(run.size_bytes > 0);
     }
 
     {
@@ -17424,9 +23942,9 @@ test "lsm backend pressure compacts lower levels" {
         });
         defer reopened.close();
 
-        try expectLowerLevelsNonOverlapping(reopened.runs.items);
-        try expectLevelTargetsSatisfied(reopened.runs.items, level_target_runs_base, level_target_runs_multiplier);
-        for (reopened.runs.items) |run| try std.testing.expect(run.size_bytes > 0);
+        try expectLowerLevelsNonOverlapping((try reopened.runs.testItems(reopened.allocator)));
+        try expectLevelTargetsSatisfied((try reopened.runs.testItems(reopened.allocator)), level_target_runs_base, level_target_runs_multiplier);
+        for ((try reopened.runs.testItems(reopened.allocator))) |run| try std.testing.expect(run.size_bytes > 0);
     }
 }
 
@@ -17486,6 +24004,111 @@ test "lsm backend fast split prepares child and rewrites left in place" {
     }
 }
 
+test "lsm backend physical split preserves L0 overwrite and tombstone order" {
+    const alloc = std.testing.allocator;
+    var parent_buf: [256]u8 = undefined;
+    const parent_path = repository_mod.tmpPath(&parent_buf, "split-order-parent");
+    defer repository_mod.cleanupTmp(parent_path);
+    var child_buf: [256]u8 = undefined;
+    const child_path = repository_mod.tmpPath(&child_buf, "split-order-child");
+    defer repository_mod.cleanupTmp(child_path);
+    const options: Options = .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .foreground_soft_compaction = false,
+    };
+    const Check = struct {
+        fn run(backend: *Backend, left: bool) !void {
+            var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+            defer runtime.deinit();
+            var txn = try runtime.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("latest", try txn.get(if (left) "doc:a" else "doc:z"));
+            try std.testing.expectEqualStrings("revived", try txn.get(if (left) "doc:b" else "doc:y"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:c" else "doc:x"));
+            try std.testing.expectError(error.NotFound, txn.get(if (left) "doc:z" else "doc:a"));
+        }
+    };
+    {
+        var backend = try Backend.open(alloc, std.mem.span(parent_path), options);
+        defer backend.close();
+        // Model an established source whose publication sequence is much
+        // higher than the number of physical files surviving the split.
+        backend.next_run_id = 1000;
+        var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            for ([_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:x", "doc:y", "doc:z" }) |key| try txn.put(key, "old");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "middle");
+            try txn.put("doc:z", "middle");
+            for ([_][]const u8{ "doc:b", "doc:c", "doc:x", "doc:y" }) |key| try txn.delete(key);
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        // Newer left-only and right-only runs must retain precedence over
+        // replacements of older straddling runs, including old tombstones.
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:a", "latest");
+            try txn.put("doc:b", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc:z", "latest");
+            try txn.put("doc:y", "revived");
+            try txn.commit();
+        }
+        try backend.flushMutable();
+        try std.testing.expectEqual(@as(usize, 4), backend.runs.count());
+        var cursor = backend.runs.cursor();
+        while (cursor.next()) |run| try std.testing.expectEqual(@as(u32, 0), run.level);
+        try std.testing.expect(try backend.prepareSplitRightToDir("doc:m", std.mem.span(child_path), options));
+        try std.testing.expect(try backend.rewriteLeftInPlace("doc:m"));
+        try Check.run(&backend, true);
+    }
+    for ([_]bool{ true, false }) |left| {
+        var reopened = try Backend.open(alloc, std.mem.span(if (left) parent_path else child_path), options);
+        defer reopened.close();
+        try Check.run(&reopened, left);
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        try txn.put("doc:z", "child overwrite");
+        try txn.delete("doc:y");
+        try txn.put("doc:x", "child revival");
+        try txn.commit();
+        try child.flushMutable();
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("child overwrite", try txn.get("doc:z"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:y"));
+        try std.testing.expectEqualStrings("child revival", try txn.get("doc:x"));
+    }
+}
+
 test "lsm backend shard rewrites preserve the configured physical run cap" {
     var parent_buf: [256]u8 = undefined;
     const parent_path = repository_mod.tmpPath(&parent_buf, "split-bounded-parent");
@@ -17515,7 +24138,7 @@ test "lsm backend shard rewrites preserve the configured physical run cap" {
         }
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 1), backend.runs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 
     const bounded_options = Options{
         .backend = .{ .durability = .none },
@@ -17528,8 +24151,8 @@ test "lsm backend shard rewrites preserve the configured physical run cap" {
     {
         var child = try Backend.open(std.testing.allocator, std.mem.span(child_path), bounded_options);
         defer child.close();
-        try std.testing.expect(child.runs.items.len > 1);
-        for (child.runs.items) |run| try std.testing.expect(run.size_bytes <= 512);
+        try std.testing.expect(child.runs.count() > 1);
+        for ((try child.runs.testItems(child.allocator))) |run| try std.testing.expect(run.size_bytes <= 512);
         var runtime = try child.runtimeStore(std.testing.allocator, .{ .name = "docs" });
         defer runtime.deinit();
         var txn = try runtime.beginRead();
@@ -17541,8 +24164,8 @@ test "lsm backend shard rewrites preserve the configured physical run cap" {
     backend.options.max_run_file_bytes = 512;
     backend.options.max_run_file_physical_bytes = 512;
     try std.testing.expect(try backend.rewriteLeftInPlace("doc:040"));
-    try std.testing.expect(backend.runs.items.len > 1);
-    for (backend.runs.items) |run| try std.testing.expect(run.size_bytes <= 512);
+    try std.testing.expect(backend.runs.count() > 1);
+    for ((try backend.runs.testItems(backend.allocator))) |run| try std.testing.expect(run.size_bytes <= 512);
     var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
     var txn = try runtime.beginRead();
@@ -17596,7 +24219,7 @@ test "lsm backend ignores stray temp files on reopen" {
         var txn = try runtime.beginRead();
         defer txn.abort();
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
-        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
     }
 }
 
@@ -17636,7 +24259,7 @@ test "lsm backend ignores orphaned committed run files not referenced by manifes
         });
         defer reopened.close();
 
-        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
         defer runtime.deinit();
@@ -17685,7 +24308,7 @@ test "lsm backend reclaims orphaned committed run files after manifest recovery"
         });
         defer reopened.close();
 
-        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}));
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
@@ -17695,6 +24318,56 @@ test "lsm backend reclaims orphaned committed run files after manifest recovery"
         defer txn.abort();
         try std.testing.expectEqualStrings("A", try txn.get("doc:a"));
         try std.testing.expectError(error.NotFound, txn.get("doc:orphan"));
+    }
+}
+
+test "lsm mounted manifest inventory reclaims only unlinked owned files" {
+    const allocator = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "orphan-manifest-cleanup");
+    defer repository_mod.cleanupTmp(path);
+    const root = std.mem.span(path);
+    {
+        var backend = try Backend.open(allocator, root, .{ .flush_threshold = 1 });
+        defer backend.close();
+        var txn = try backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{}, "key", "value");
+        try txn.commit();
+    }
+    const orphan = try repository_mod.manifest_set.pathAlloc(allocator, root, 99999, .checkpoint);
+    defer allocator.free(orphan);
+    const unrelated = try std.fs.path.join(allocator, &.{ root, "manifest-not-owned.txt" });
+    defer allocator.free(unrelated);
+    const temporary = try std.fmt.allocPrint(allocator, "{s}.tmp-1234", .{orphan});
+    defer allocator.free(temporary);
+    const descriptor_temporary = try std.fs.path.join(allocator, &.{ root, "manifest.bin.tmp-456" });
+    defer allocator.free(descriptor_temporary);
+    const unrelated_temporary = try std.fs.path.join(allocator, &.{ root, "manifest.bin.tmp-not-a-nonce" });
+    defer allocator.free(unrelated_temporary);
+    try repository_mod.writeFileAbsolute(orphan, "interrupted checkpoint");
+    try repository_mod.writeFileAbsolute(unrelated, "leave alone");
+    try repository_mod.writeFileAbsolute(temporary, "interrupted atomic checkpoint");
+    try repository_mod.writeFileAbsolute(descriptor_temporary, "interrupted atomic descriptor");
+    try repository_mod.writeFileAbsolute(unrelated_temporary, "leave alone");
+    {
+        var reader = try Backend.open(allocator, root, .{ .backend = .{ .read_only = true } });
+        defer reader.close();
+        try std.Io.Dir.cwd().access(std.testing.io, orphan, .{});
+        try std.Io.Dir.cwd().access(std.testing.io, temporary, .{});
+        try std.Io.Dir.cwd().access(std.testing.io, descriptor_temporary, .{});
+    }
+    {
+        var writer = try Backend.open(allocator, root, .{});
+        defer writer.close();
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, temporary, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, descriptor_temporary, .{}));
+        try std.Io.Dir.cwd().access(std.testing.io, unrelated, .{});
+        try std.Io.Dir.cwd().access(std.testing.io, unrelated_temporary, .{});
+        var txn = try writer.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("value", try txn.get(.{}, "key"));
     }
 }
 
@@ -17734,7 +24407,7 @@ test "lsm backend removes expired obsolete run files on reopen" {
             std.testing.allocator,
             root_dir,
             backend.next_run_id,
-            backend.runs.items,
+            (try backend.runs.testItems(backend.allocator)),
             &obsolete,
         );
     }
@@ -17746,11 +24419,11 @@ test "lsm backend removes expired obsolete run files on reopen" {
         });
         defer reopened.close();
 
-        try std.testing.expectEqual(@as(usize, 1), reopened.runs.items.len);
-        try std.testing.expectEqual(@as(usize, 1), reopened.obsolete_paths.items.len);
+        try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
+        try std.testing.expectEqual(@as(usize, 1), reopened.obsolete_paths.count());
         try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
         try std.testing.expect(try reopened.runMaintenanceStep());
-        try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.items.len);
+        try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.count());
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
 
         var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
@@ -17826,10 +24499,59 @@ test "lsm backend obsolete publication is allocation free after reservation" {
         failing.resize_fail_index = failing.resize_index;
         backend.queueObsoleteFilePathAssumeCapacity(obsolete_path);
         backend.queueObsoleteRunsAssumeCapacity(obsolete_runs);
-        try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.items.len);
+        try std.testing.expectEqual(@as(usize, 1), backend.obsolete_paths.count());
         try std.testing.expectEqual(@as(usize, 0), backend.obsolete_runs.items.len);
         failing.fail_index = std.math.maxInt(usize);
         failing.resize_fail_index = std.math.maxInt(usize);
     }
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "lsm internal flush worker scheduling failure releases an opened backend" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = unavailable.io() },
+    ));
+    // Failed startup must also release writer ownership so the root reopens.
+    var reopened = try BackendHandle.openWithConfig(
+        std.testing.allocator,
+        "/lsm-flush-start-failure",
+        .{ .storage = storage.storage() },
+        .{ .internal_flush_worker = true, .maintenance_io = std.testing.io },
+    );
+    defer reopened.close();
+    try std.testing.expect(reopened.internal_flush_worker.?.owned_io == null);
+}
+
+test "lsm internal flush worker distinguishes stop from drain" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend: Backend = undefined;
+    try backend.openInto(std.testing.allocator, "/lsm-flush-stop-drain", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1,
+        .defer_flush_on_commit = true,
+    });
+    defer backend.close();
+    var txn = try backend.beginWrite();
+    try txn.put(.{}, "key", "value");
+    try txn.commit();
+
+    var worker = InternalFlushWorker.init(&backend, std.testing.io);
+    defer worker.deinit();
+    worker.stopAndJoin(false);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotMaintenanceStats().immutable_memtables);
+    worker.stopAndJoin(true);
+    worker.run();
+    try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().immutable_memtables);
+    try std.testing.expect(backend.snapshotMaintenanceStats().total_runs > 0);
 }

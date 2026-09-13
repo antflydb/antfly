@@ -14,13 +14,17 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const Allocator = std.mem.Allocator;
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const api_mod = @import("../api/mod.zig");
 const build_mod = @import("../build/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
+const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const RuntimeConfig = struct {
     tick_interval_ms: u64 = 25,
@@ -29,10 +33,12 @@ pub const RuntimeConfig = struct {
     compaction_enabled: bool = true,
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
+    embedder_options: managed_embedder.InitOptions = .{},
 };
 
 pub const RuntimeRunStats = struct {
     published_namespaces: usize = 0,
+    publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize = 0,
     compacted_namespaces: usize = 0,
     compact_head_conflicts: usize = 0,
@@ -48,10 +54,33 @@ pub const RuntimeRunStats = struct {
     enrichment_fallback_documents: usize = 0,
     enrichment_failed_documents: usize = 0,
     enrichment_stage_failures: usize = 0,
+    enrichment_conflicts: usize = 0,
+    work_lease_conflicts: usize = 0,
+    work_lease_takeovers: usize = 0,
+};
+
+pub const RuntimeWorkKind = enum {
+    publish_round,
+    enrichment_round,
+    compaction_round,
+    prune_round,
+};
+
+/// Optional production-neutral operation-cost boundary. Native runtimes leave
+/// it unset; deterministic embedders can charge logical service time through
+/// the same borrowed `std.Io` that owns the workflow.
+pub const RuntimeWorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, kind: RuntimeWorkKind, units: u64) anyerror!void,
+
+    pub fn charge(self: @This(), kind: RuntimeWorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, kind, units);
+    }
 };
 
 pub const ManagedRuntime = struct {
     alloc: Allocator,
+    io: std.Io,
     cfg: RuntimeConfig,
     catalog: *catalog_mod.CatalogService,
     publisher: build_mod.BackgroundPublisher,
@@ -61,20 +90,48 @@ pub const ManagedRuntime = struct {
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
-    thread: ?std.Thread = null,
+    lifecycle_mutex: std.Io.Mutex = .init,
+    future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    stop_wake: std.Io.Event = .unset,
+    run_finished: std.Io.Event = .unset,
+    failure_mu: std.atomic.Mutex = .unlocked,
+    run_failure: ?anyerror = null,
+    work_lease_provider: ?build_mod.work_lease.Provider = null,
+    work_lease_owner_id: ?[]u8 = null,
+    work_lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
+    work_cost_port: ?RuntimeWorkCostPort = null,
 
     pub fn init(
         alloc: Allocator,
+        io: std.Io,
         cfg: RuntimeConfig,
         catalog: *catalog_mod.CatalogService,
         pruner: build_mod.Pruner,
     ) ManagedRuntime {
+        return initWithIo(alloc, io, cfg, catalog, pruner);
+    }
+
+    pub fn initWithIo(
+        alloc: Allocator,
+        io: std.Io,
+        cfg: RuntimeConfig,
+        catalog: *catalog_mod.CatalogService,
+        pruner: build_mod.Pruner,
+    ) ManagedRuntime {
+        var resolved_cfg = cfg;
+        resolved_cfg.embedder_options.io = io;
         return .{
             .alloc = alloc,
-            .cfg = cfg,
+            .io = io,
+            .cfg = resolved_cfg,
             .catalog = catalog,
-            .publisher = build_mod.BackgroundPublisher.init(alloc, catalog, cfg.tick_interval_ms),
+            .publisher = build_mod.BackgroundPublisher.initWithIo(
+                alloc,
+                io,
+                catalog,
+                cfg.tick_interval_ms,
+            ),
             .pruner = pruner,
         };
     }
@@ -83,40 +140,94 @@ pub const ManagedRuntime = struct {
         self.stop();
         if (self.enricher) |*enricher| enricher.deinit();
         self.publisher.deinit();
+        if (self.work_lease_owner_id) |owner_id| self.alloc.free(owner_id);
         self.* = undefined;
     }
 
     pub fn start(self: *ManagedRuntime) !void {
-        if (self.thread != null) return error.AlreadyStarted;
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
+        if (self.future != null) return error.AlreadyStarted;
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
-        self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
+        self.stop_wake.reset();
+        self.run_finished.reset();
+        lockAtomic(&self.failure_mu);
+        self.run_failure = null;
+        self.failure_mu.unlock();
+        self.future = try self.io.concurrent(runLoop, .{self});
     }
 
     pub fn stop(self: *ManagedRuntime) void {
+        self.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
+    }
+
+    pub fn stopWithDeadline(self: *ManagedRuntime, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        self.lifecycle_mutex.lockUncancelable(self.io);
+        defer self.lifecycle_mutex.unlock(self.io);
         self.stop_requested.store(true, .monotonic);
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
+        self.stop_wake.set(self.io);
+        if (self.future) |*future| {
+            var canceled = false;
+            const remaining_ms = deadline.remainingMilliseconds();
+            if (remaining_ms != 0) {
+                self.run_finished.waitTimeout(self.io, .{ .duration = .{
+                    .raw = .fromMilliseconds(@intCast(remaining_ms)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout, error.Canceled => {
+                        future.cancel(self.io);
+                        canceled = true;
+                    },
+                };
+            } else {
+                future.cancel(self.io);
+                canceled = true;
+            }
+            // Await reclaims a naturally completed future; cancel already
+            // joins a task that exceeded the caller's shared deadline.
+            if (!canceled) _ = future.await(self.io);
+            self.future = null;
         }
     }
 
+    pub fn runtimeFailure(self: *ManagedRuntime) ?anyerror {
+        lockAtomic(&self.failure_mu);
+        defer self.failure_mu.unlock();
+        return self.run_failure;
+    }
+
     pub fn runOnce(self: *ManagedRuntime) !RuntimeRunStats {
+        return try self.runOnceWithCancellation(.none);
+    }
+
+    pub fn runOnceWithCancellation(self: *ManagedRuntime, cancellation: CancellationToken) !RuntimeRunStats {
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return RuntimeRunStats{};
-        lockAtomic(&self.run_mu);
+        var pass = self.cancellationToken();
+        pass.cooperative = cancellation;
+        var bridge = maintenance_cancellation.GraphBridge{ .maintenance = pass };
+        try pass.check();
+        try lockAtomicWithCancellation(&self.run_mu, bridge.token());
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
-            const publish_stats = try self.publisher.runOnce();
+            try self.chargeWork(.publish_round, 1);
+            const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
             stats.published_namespaces = publish_stats.published_namespaces;
+            stats.publish_budget_rejected_namespaces = publish_stats.budget_rejected_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
+            stats.work_lease_conflicts += publish_stats.lease_conflicts;
+            stats.work_lease_takeovers += publish_stats.lease_takeovers;
         }
+        try self.cancellationCheckpoint();
 
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         for (namespaces) |namespace| {
+            try cancellation.check();
+            try self.cancellationCheckpoint();
             const policy = self.catalog.getPolicy(namespace.name) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 else => return err,
@@ -126,69 +237,52 @@ pub const ManagedRuntime = struct {
                 else => return err,
             };
             defer status.deinit(self.alloc);
-            var effective_policy = policy;
-            effective_policy.enrichment_enabled = status.enrichment_enabled;
-            effective_policy.chunk_preview_enabled = status.chunk_preview_enabled;
-            effective_policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
-            effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
-
-            if (self.enricher) |*enricher| {
-                const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace.name) catch |err| switch (err) {
-                    error.FileNotFound => null,
-                    else => return err,
-                };
-                if (maybe_table_record) |table_record| {
-                    var table = table_record;
-                    defer table.deinit(self.alloc);
-
-                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
-                        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                        defer parsed.deinit();
-                        const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
-                        try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
-                    } else {
-                        enricher.clearSparseEmbedder();
-                    }
-
-                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
-                        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
-                        defer parsed.deinit();
-                        const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
-                        const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
-                        try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
-                    } else {
-                        enricher.clearChunkEmbedder();
-                    }
-                }
-
-                if (self.cfg.enrichment_enabled and status.enrichment_active_stage != null) {
-                    const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(status.enrichment_active_stage.?) orelse continue;
-                    const enrichment = enricher.runNamespaceWithConfig(namespace.name, .{
-                        .batch_size = policy.enrichment_batch_size,
-                        .pipeline_version = stage_spec.pipeline_version,
-                        .stage = status.enrichment_active_stage.?,
-                        .model_preference = stage_spec.model_preference,
-                        .failure_policy = policy.enrichment_failure_policy,
-                    }) catch |err| switch (err) {
-                        error.FileNotFound => continue,
-                        else => return err,
-                    };
-                    stats.enriched_namespaces += enrichment.enriched_namespaces;
-                    stats.enriched_documents += enrichment.enriched_documents;
-                    stats.enrichment_wal_appends += enrichment.wal_appends;
-                    stats.enrichment_model_documents += enrichment.model_documents;
-                    stats.enrichment_fallback_documents += enrichment.fallback_documents;
-                    stats.enrichment_failed_documents += enrichment.failed_documents;
-                    stats.enrichment_stage_failures += enrichment.stage_failures;
-                }
-            }
+            if (!try self.enrichNamespaceWithStatus(namespace.name, policy, status, cancellation, &stats)) continue;
 
             if (self.compactor) |*compactor| {
+                try self.cancellationCheckpoint();
                 if (self.cfg.compaction_enabled) {
                     if (status.compaction_recommended) {
-                        var compacted = compactor.compactHead(namespace.name) catch |err| switch (err) {
+                        var held_lease: ?build_mod.work_lease.HeldLease = null;
+                        if (self.work_lease_provider) |provider| {
+                            held_lease = try build_mod.work_lease.acquireHeld(
+                                provider,
+                                self.io,
+                                namespace.name,
+                                self.work_lease_owner_id orelse return error.MissingLeaseOwner,
+                                self.work_lease_ttl_ns,
+                            );
+                            if (held_lease == null) {
+                                stats.work_lease_conflicts += 1;
+                                continue;
+                            }
+                            if (held_lease.?.acquisition.took_over) {
+                                stats.work_lease_takeovers += 1;
+                            }
+                        }
+                        defer if (held_lease) |*lease| {
+                            _ = lease.release() catch {};
+                        };
+                        const publication_guard = if (held_lease) |*lease|
+                            lease.guard()
+                        else
+                            null;
+                        const compaction_cancellation = if (held_lease) |*lease|
+                            lease.cancellation(pass)
+                        else
+                            pass;
+                        try self.chargeWork(.compaction_round, 1);
+                        var compacted = compactor.compactHeadGuardedUntil(
+                            namespace.name,
+                            publication_guard,
+                            compaction_cancellation,
+                        ) catch |err| switch (err) {
                             error.HeadChanged => {
                                 stats.compact_head_conflicts += 1;
+                                continue;
+                            },
+                            error.WorkLeaseLost => {
+                                stats.work_lease_conflicts += 1;
                                 continue;
                             },
                             error.FileNotFound => continue,
@@ -201,13 +295,20 @@ pub const ManagedRuntime = struct {
             }
 
             if (self.cfg.prune_enabled) {
-                var result = self.pruner.pruneNamespace(namespace.name, policy.keep_latest_versions) catch |err| switch (err) {
+                try self.cancellationCheckpoint();
+                try self.chargeWork(.prune_round, 1);
+                var result = self.pruner.pruneNamespaceUntil(
+                    namespace.name,
+                    policy.keep_latest_versions,
+                    pass,
+                ) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
                 defer result.deinit(self.alloc);
                 if (result.gc_watermark_conflict) stats.prune_gc_conflicts += 1;
-                if (result.deleted_versions == 0 and result.wal_records_removed == 0) continue;
+                if (result.work_lease_conflict) stats.work_lease_conflicts += 1;
+                if (result.deleted_versions == 0 and result.wal_records_removed == 0 and result.deleted_artifacts == 0) continue;
                 stats.pruned_namespaces += 1;
                 stats.deleted_versions += result.deleted_versions;
                 stats.deleted_artifacts += result.deleted_artifacts;
@@ -216,6 +317,40 @@ pub const ManagedRuntime = struct {
         }
         self.recordStats(stats);
         return stats;
+    }
+
+    /// Runs only the request-visible background materialization stage for one
+    /// namespace. It deliberately excludes publication, compaction, pruning,
+    /// and catalog-wide enumeration; those remain owned by the background
+    /// runtime and must not be amplified by synchronous HTTP requests.
+    pub fn runNamespaceMaterializationOnceWithCancellation(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        cancellation: CancellationToken,
+    ) !RuntimeRunStats {
+        if (!self.supportsSynchronousMaterialization()) return error.MaterializationUnavailable;
+        if (namespace.len == 0) return error.InvalidNamespace;
+        try cancellation.check();
+        try lockAtomicWithCancellation(&self.run_mu, cancellation);
+        defer self.run_mu.unlock();
+
+        const policy = try self.catalog.getPolicy(namespace);
+        var status = try self.catalog.buildStatus(namespace);
+        defer status.deinit(self.alloc);
+        var stats = RuntimeRunStats{};
+        if (!try self.enrichNamespaceWithStatus(namespace, policy, status, cancellation, &stats)) {
+            return error.MaterializationUnavailable;
+        }
+        try cancellation.check();
+        self.recordStats(stats);
+        return stats;
+    }
+
+    pub fn supportsSynchronousMaterialization(self: *const ManagedRuntime) bool {
+        return self.cfg.role != .query_only and
+            self.cfg.role != .api_only and
+            self.cfg.enrichment_enabled and
+            self.enricher != null;
     }
 
     pub fn metricsSnapshot(self: *ManagedRuntime) RuntimeRunStats {
@@ -232,10 +367,160 @@ pub const ManagedRuntime = struct {
         self.enricher = enricher;
     }
 
+    /// Returns false when the namespace disappeared or its active stage is no
+    /// longer representable, matching the full-sweep behavior of skipping the
+    /// remainder of that namespace for this tick.
+    fn enrichNamespaceWithStatus(
+        self: *ManagedRuntime,
+        namespace: []const u8,
+        policy: catalog_mod.NamespacePolicy,
+        status: catalog_mod.BuildStatus,
+        cancellation: CancellationToken,
+        stats: *RuntimeRunStats,
+    ) !bool {
+        try cancellation.check();
+        if (!self.cfg.enrichment_enabled or status.enrichment_active_stage == null) return true;
+        const enricher = if (self.enricher) |*value| value else return true;
+
+        var effective_policy = policy;
+        effective_policy.enrichment_enabled = status.enrichment_enabled;
+        effective_policy.chunk_preview_enabled = status.chunk_preview_enabled;
+        effective_policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
+        effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
+        const stage = status.enrichment_active_stage.?;
+        const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
+
+        var held_lease: ?build_mod.work_lease.HeldLease = null;
+        if (self.work_lease_provider) |provider| {
+            held_lease = try build_mod.work_lease.acquireHeld(provider, self.io, namespace, self.work_lease_owner_id orelse return error.MissingLeaseOwner, self.work_lease_ttl_ns);
+            if (held_lease == null) {
+                stats.enrichment_conflicts += 1;
+                stats.work_lease_conflicts += 1;
+                return true;
+            }
+            if (held_lease.?.acquisition.took_over) stats.work_lease_takeovers += 1;
+        }
+        defer if (held_lease) |*lease| {
+            _ = lease.release() catch {};
+        };
+        var maintenance = self.cancellationToken();
+        maintenance.cooperative = cancellation;
+        if (held_lease) |*lease| maintenance = lease.cancellation(maintenance);
+        try self.chargeWork(.enrichment_round, 1);
+        try maintenance.check();
+
+        const maybe_table_record = self.catalog.getTableForNamespaceAlloc(self.alloc, namespace) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (maybe_table_record) |table_record| {
+            var table = table_record;
+            defer table.deinit(self.alloc);
+
+            // Only model-backed stages need an embedder. Parse once and build
+            // only the relevant provider set so deterministic stages avoid
+            // configuration churn and an unrelated provider cannot block the
+            // active stage.
+            switch (stage) {
+                .lexical_sparse => {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                    defer parsed.deinit();
+                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, parsed.value, self.cfg.embedder_options)) |sparse_embedder| {
+                        const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
+                        var embedder_owned = true;
+                        errdefer if (embedder_owned) sparse_embedder.deinit(self.alloc);
+                        try enricher.setSparseEmbedder(sparse_embedder, sparse_name);
+                        embedder_owned = false;
+                    } else {
+                        enricher.clearSparseEmbedder();
+                    }
+                },
+                .chunk_embeddings => {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
+                    defer parsed.deinit();
+                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, parsed.value, self.cfg.embedder_options)) |dense_embedder| {
+                        const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;
+                        const dense_name = firstDenseIndexNameFromIndexesJson(parsed.value) orelse "serverless_chunk";
+                        var embedder_owned = true;
+                        errdefer if (embedder_owned) dense_embedder.deinit(self.alloc);
+                        try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
+                        embedder_owned = false;
+                    } else {
+                        enricher.clearChunkEmbedder();
+                    }
+                },
+                .chunk_preview, .rerank_terms => {},
+            }
+        } else {
+            // Namespace-only records predate the table catalog. Preserve their
+            // fallback enrichment behavior without retaining a previous
+            // namespace's managed embedder configuration.
+            enricher.clearSparseEmbedder();
+            enricher.clearChunkEmbedder();
+        }
+
+        try cancellation.check();
+        const enrichment = enricher.runNamespaceWithConfigUntil(namespace, .{
+            .batch_size = policy.enrichment_batch_size,
+            .pipeline_version = stage_spec.pipeline_version,
+            .stage = stage,
+            .model_preference = stage_spec.model_preference,
+            .failure_policy = policy.enrichment_failure_policy,
+            .cancellation = cancellation,
+        }, maintenance) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            error.EnrichmentProgressChanged, error.EnrichmentPolicyChanged => {
+                stats.enrichment_conflicts += 1;
+                return true;
+            },
+            error.WorkLeaseLost => {
+                stats.enrichment_conflicts += 1;
+                stats.work_lease_conflicts += 1;
+                return true;
+            },
+            else => return err,
+        };
+        stats.enriched_namespaces += enrichment.enriched_namespaces;
+        stats.enriched_documents += enrichment.enriched_documents;
+        stats.enrichment_wal_appends += enrichment.wal_appends;
+        stats.enrichment_model_documents += enrichment.model_documents;
+        stats.enrichment_fallback_documents += enrichment.fallback_documents;
+        stats.enrichment_failed_documents += enrichment.failed_documents;
+        stats.enrichment_stage_failures += enrichment.stage_failures;
+        return true;
+    }
+
+    pub fn setWorkCostPort(self: *ManagedRuntime, port: ?RuntimeWorkCostPort) void {
+        self.work_cost_port = port;
+    }
+
+    fn chargeWork(self: *ManagedRuntime, kind: RuntimeWorkKind, units: u64) !void {
+        if (self.work_cost_port) |port| try port.charge(kind, units);
+    }
+
+    pub fn configureWorkLease(
+        self: *ManagedRuntime,
+        provider: build_mod.work_lease.Provider,
+        owner_id: []const u8,
+        ttl_ns: u64,
+    ) !void {
+        if (self.future != null) return error.AlreadyStarted;
+        if (owner_id.len == 0) return error.InvalidLeaseOwner;
+        if (ttl_ns == 0) return error.InvalidLeaseTtl;
+        const owned_owner = try self.alloc.dupe(u8, owner_id);
+        errdefer self.alloc.free(owned_owner);
+        try self.publisher.configureLease(provider, owner_id, ttl_ns);
+        if (self.work_lease_owner_id) |current| self.alloc.free(current);
+        self.work_lease_owner_id = owned_owner;
+        self.work_lease_provider = provider;
+        self.work_lease_ttl_ns = ttl_ns;
+    }
+
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
         self.cumulative_stats.published_namespaces += stats.published_namespaces;
+        self.cumulative_stats.publish_budget_rejected_namespaces += stats.publish_budget_rejected_namespaces;
         self.cumulative_stats.publish_head_conflicts += stats.publish_head_conflicts;
         self.cumulative_stats.compacted_namespaces += stats.compacted_namespaces;
         self.cumulative_stats.compact_head_conflicts += stats.compact_head_conflicts;
@@ -251,13 +536,41 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.enrichment_fallback_documents += stats.enrichment_fallback_documents;
         self.cumulative_stats.enrichment_failed_documents += stats.enrichment_failed_documents;
         self.cumulative_stats.enrichment_stage_failures += stats.enrichment_stage_failures;
+        self.cumulative_stats.enrichment_conflicts += stats.enrichment_conflicts;
+        self.cumulative_stats.work_lease_conflicts += stats.work_lease_conflicts;
+        self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
 
     fn runLoop(self: *ManagedRuntime) void {
+        defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
-            _ = self.runOnce() catch RuntimeRunStats{};
-            sleepMs(@max(self.cfg.tick_interval_ms, 1));
+            _ = self.runOnce() catch |err| {
+                if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
+                lockAtomic(&self.failure_mu);
+                if (self.run_failure == null) self.run_failure = err;
+                self.failure_mu.unlock();
+                return;
+            };
+            self.stop_wake.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return,
+            };
+            return;
         }
+    }
+
+    fn cancellationCheckpoint(self: *ManagedRuntime) !void {
+        try self.cancellationToken().check();
+    }
+
+    fn cancellationToken(self: *ManagedRuntime) maintenance_cancellation.Token {
+        return .{
+            .io = self.io,
+            .requested = &self.stop_requested,
+        };
     }
 };
 
@@ -313,7 +626,7 @@ fn firstSparseIndexNameFromIndexesJson(root: std.json.Value) ?[]const u8 {
     return null;
 }
 
-test "managed runtime publishes and prunes based on namespace policy" {
+test "serverless managed runtime publishes and prunes based on namespace policy" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -380,15 +693,28 @@ test "managed runtime publishes and prunes based on namespace policy" {
     var ingest_c = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 300, .mutations = &batch_c });
     defer ingest_c.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 1), stats.published_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_namespaces);
-    try std.testing.expectEqual(@as(usize, 2), stats.deleted_versions);
-    try std.testing.expectEqual(@as(usize, 6), stats.deleted_artifacts);
+    // The publishing pass pins its source; GC must not reclaim that source
+    // until the shared read right expires, even after the writer returns.
+    try std.testing.expectEqual(@as(usize, 0), stats.deleted_versions);
     try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("docs"));
+
+    const lease = @import("../manifest/read_lease.zig");
+    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
+        fn now(ptr: *const anyopaque) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    }.now };
+    const collected = try runtime.runOnce();
+    try std.testing.expectEqual(@as(usize, 0), collected.published_namespaces);
+    try std.testing.expectEqual(@as(usize, 2), collected.deleted_versions);
+    try std.testing.expect(collected.deleted_artifacts >= 6);
 
     const versions = try manifest_store.listVersionsAlloc("docs");
     defer alloc.free(versions);
@@ -396,10 +722,34 @@ test "managed runtime publishes and prunes based on namespace policy" {
 
     const cumulative = runtime.metricsSnapshot();
     try std.testing.expectEqual(stats.published_namespaces, cumulative.published_namespaces);
-    try std.testing.expectEqual(stats.pruned_namespaces, cumulative.pruned_namespaces);
+    try std.testing.expectEqual(stats.pruned_namespaces + collected.pruned_namespaces, cumulative.pruned_namespaces);
+
+    // An already-expired shutdown budget cancels and joins the background
+    // task without converting expected teardown into a runtime failure.
+    try runtime.start();
+    runtime.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMillisecondsWithIo(runtime.io, 0));
+    try std.testing.expectEqual(@as(?anyerror, null), runtime.runtimeFailure());
+    {
+        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        defer unavailable.deinit();
+        runtime.io = unavailable.io();
+        defer {
+            runtime.stop();
+            runtime.io = std.testing.io;
+        }
+        try std.testing.expectError(error.ConcurrencyUnavailable, runtime.start());
+        try std.testing.expect(runtime.future == null);
+    }
+    runtime.cfg.tick_interval_ms = 60_000;
+    for (0..2) |_| {
+        try runtime.start();
+        try std.testing.expectError(error.AlreadyStarted, runtime.start());
+        runtime.stop();
+        try std.testing.expect(runtime.future == null);
+    }
 }
 
-test "managed runtime query-only role skips maintenance work" {
+test "serverless managed runtime query-only role skips maintenance work" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -447,7 +797,7 @@ test "managed runtime query-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .query_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -458,7 +808,7 @@ test "managed runtime query-only role skips maintenance work" {
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime api-only role skips maintenance work" {
+test "serverless managed runtime api-only role skips maintenance work" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -506,7 +856,7 @@ test "managed runtime api-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .role = .api_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -514,14 +864,14 @@ test "managed runtime api-only role skips maintenance work" {
 
     try runtime.start();
     defer runtime.stop();
-    try std.testing.expect(runtime.thread == null);
+    try std.testing.expect(runtime.future == null);
 
     const stats = try runtime.runOnce();
     try std.testing.expectEqual(@as(usize, 0), stats.published_namespaces);
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime honors maintenance feature flags" {
+test "serverless managed runtime honors maintenance feature flags" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -569,7 +919,7 @@ test "managed runtime honors maintenance feature flags" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
         .tick_interval_ms = 1,
         .publish_enabled = false,
         .compaction_enabled = false,
@@ -586,7 +936,7 @@ test "managed runtime honors maintenance feature flags" {
     try std.testing.expectError(error.FileNotFound, progress_store.getHead("docs"));
 }
 
-test "managed runtime compacts head when namespace exceeds compaction threshold" {
+test "serverless managed runtime compacts head when namespace exceeds compaction threshold" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -647,7 +997,7 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
     var build_second = try builder.publishNamespace("docs");
     defer build_second.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setCompactor(build_mod.Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store));
     defer runtime.deinit();
 
@@ -657,12 +1007,14 @@ test "managed runtime compacts head when namespace exceeds compaction threshold"
 
     var compacted = try manifest_store.getAlloc("docs", 3);
     defer compacted.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), compacted.artifacts.len);
+    try std.testing.expectEqual(@as(usize, 4), compacted.artifacts.len);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.document_segment, compacted.artifacts[0].kind);
     try std.testing.expectEqual(manifest_mod.ArtifactKind.text_segment, compacted.artifacts[1].kind);
+    try std.testing.expect(@import("../build/builder.zig").findArtifactIndex(compacted, .document_facts) != null);
+    try std.testing.expect(@import("../build/builder.zig").findArtifactIndex(compacted, .graph_segment) != null);
 }
 
-test "managed runtime runs sparse enrichment for opted-in namespaces" {
+test "serverless managed runtime targets request-driven enrichment without global maintenance" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -701,10 +1053,17 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
     var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
     defer catalog.deinit();
-    try std.testing.expect(try catalog.ensureNamespaceWithPolicy("docs", 100, .{
-        .enrichment_enabled = true,
-        .keep_latest_versions = 2,
-    }));
+    try std.testing.expect(try catalog.ensureTableWithDefinition(
+        "docs",
+        100,
+        .{
+            .enrichment_enabled = true,
+            .keep_latest_versions = 2,
+        },
+        "",
+        "",
+        "{}",
+    ));
 
     var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
     const batch = [_]@import("../api/types.zig").DocumentMutation{
@@ -712,14 +1071,18 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     };
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
     defer ingest.deinit(alloc);
-    var build = try builder.publishNamespace("docs");
+    var build = try catalog.buildNamespace("docs");
     defer build.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setEnricher(enrichment_mod.SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
-    const stats = try runtime.runOnce();
+    try std.testing.expect(runtime.supportsSynchronousMaterialization());
+    const stats = try runtime.runNamespaceMaterializationOnceWithCancellation("docs", .none);
+    try std.testing.expectEqual(@as(usize, 0), stats.published_namespaces);
+    try std.testing.expectEqual(@as(usize, 0), stats.compacted_namespaces);
+    try std.testing.expectEqual(@as(usize, 0), stats.pruned_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.enriched_namespaces);
     try std.testing.expectEqual(@as(usize, 1), stats.enriched_documents);
     try std.testing.expectEqual(@as(usize, 1), stats.enrichment_wal_appends);
@@ -727,6 +1090,7 @@ test "managed runtime runs sparse enrichment for opted-in namespaces" {
     const tail = try wal_store.readFromAlloc("docs", 2);
     defer @import("../wal/mod.zig").freeRecords(alloc, tail);
     try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
@@ -758,15 +1122,13 @@ fn cleanupTmp(path: [*:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
-fn sleepMs(ms: u64) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Clock.Duration.sleep(.{
-        .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(if (ms == 0) @as(u64, 1) else ms)),
-    }, io_impl.io()) catch {};
-}
-
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: CancellationToken) !void {
+    while (!mutex.tryLock()) {
+        try cancellation.check();
+        platform_time.yieldBriefly();
+    }
 }

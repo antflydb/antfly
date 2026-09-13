@@ -110,7 +110,7 @@ standalone SIMD DOM/on-demand parser yet.
 
 ## Benchmark Snapshot
 
-The first `zig build json-bench` run on local `aarch64-macos` shows:
+The first `zig build json-bench && ./zig-out/bin/json_bench` run on local `aarch64-macos` shows:
 
 - tiny typed payloads should stay on `stdlib`; explicit `.simd` is slower there
 - medium typed payloads already benefit from the custom backend, though the

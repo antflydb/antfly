@@ -14,7 +14,20 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const platform = @import("antfly_platform");
+/// Borrowed queue synchronization. The queue must stay at its final address
+/// and outlive every handle, just as it outlives the weights it guards.
+pub const LockHandle = struct {
+    io: std.Io,
+    mutex: *std.Io.Mutex,
+
+    pub fn lock(self: LockHandle) void {
+        self.mutex.lockUncancelable(self.io);
+    }
+
+    pub fn unlock(self: LockHandle) void {
+        self.mutex.unlock(self.io);
+    }
+};
 
 pub fn Queue(comptime Item: type) type {
     return struct {
@@ -22,9 +35,17 @@ pub fn Queue(comptime Item: type) type {
 
         allocator: std.mem.Allocator,
         items: std.ArrayListUnmanaged(Item) = .empty,
-        mutex: std.atomic.Mutex = .unlocked,
-        worker: ?std.Thread = null,
-        stop_worker: bool = false,
+        io_impl: std.Io.Threaded,
+        mutex: std.Io.Mutex = .init,
+        lifecycle_mutex: std.Io.Mutex = .init,
+        wake: std.Io.Event = .unset,
+        idle: std.Io.Condition = .init,
+        worker: ?std.Io.Future(void) = null,
+        // Reserve one task for this queue's lifetime. Future completion can
+        // precede executor capacity release, so stop/start must not resubmit.
+        worker_enabled: bool = false,
+        worker_processing: bool = false,
+        closing: bool = false,
         process_ctx: *anyopaque,
         process_fn: *const fn (ctx: *anyopaque, item: Item) void,
         priority_fn: ?*const fn (item: Item) u64 = null,
@@ -37,6 +58,10 @@ pub fn Queue(comptime Item: type) type {
         ) Self {
             return .{
                 .allocator = allocator,
+                .io_impl = std.Io.Threaded.init(allocator, .{
+                    .async_limit = .nothing,
+                    .concurrent_limit = .limited(1),
+                }),
                 .process_ctx = process_ctx,
                 .process_fn = process_fn,
             };
@@ -66,25 +91,29 @@ pub fn Queue(comptime Item: type) type {
 
         pub fn deinit(self: *Self) void {
             self.stop();
+            self.lock();
+            self.closing = true;
+            self.signal();
+            self.unlock();
+            if (self.worker) |*worker| worker.await(self.io_impl.io());
             self.items.deinit(self.allocator);
+            self.io_impl.deinit();
         }
 
-        pub fn mutexPtr(self: *Self) *std.atomic.Mutex {
-            return &self.mutex;
+        pub fn lockHandle(self: *Self) LockHandle {
+            return .{ .io = self.io_impl.io(), .mutex = &self.mutex };
         }
 
         pub fn lock(self: *Self) void {
-            while (!self.mutex.tryLock()) {
-                platform.time.yieldBriefly();
-            }
+            self.lockHandle().lock();
         }
 
         pub fn unlock(self: *Self) void {
-            self.mutex.unlock();
+            self.lockHandle().unlock();
         }
 
         pub fn signal(self: *Self) void {
-            _ = self;
+            self.wake.set(self.io_impl.io());
         }
 
         pub fn appendLocked(self: *Self, item: Item) !void {
@@ -92,26 +121,41 @@ pub fn Queue(comptime Item: type) type {
         }
 
         pub fn start(self: *Self) !void {
-            if (builtin.is_test or self.worker != null) return;
-            self.stop_worker = false;
-            self.worker = try std.Thread.spawn(.{}, workerMain, .{self});
+            if (builtin.is_test) return;
+            try self.startWorker();
+        }
+
+        fn startWorker(self: *Self) !void {
+            const io = self.io_impl.io();
+            self.lifecycle_mutex.lockUncancelable(io);
+            defer self.lifecycle_mutex.unlock(io);
+            self.lock();
+            defer self.unlock();
+            if (self.worker_enabled) return;
+            if (self.worker == null) self.worker = try io.concurrent(workerMain, .{self});
+            self.worker_enabled = true;
+            self.signal();
         }
 
         pub fn stop(self: *Self) void {
-            if (self.worker) |worker| {
-                self.lock();
-                self.stop_worker = true;
-                self.unlock();
-                worker.join();
-                self.worker = null;
-                self.stop_worker = false;
-            }
+            const io = self.io_impl.io();
+            self.lifecycle_mutex.lockUncancelable(io);
+            defer self.lifecycle_mutex.unlock(io);
+            self.lock();
+            defer self.unlock();
+            self.worker_enabled = false;
+            // An unlocked processor may still own the weights. Wait for that
+            // callback, while keeping the dormant task and its capacity owned.
+            while (self.worker_processing) self.idle.waitUncancelable(io, &self.mutex);
         }
 
         pub fn drainBudget(self: *Self, max_items: usize) void {
+            const io = self.io_impl.io();
+            self.lifecycle_mutex.lockUncancelable(io);
+            defer self.lifecycle_mutex.unlock(io);
             self.lock();
             defer self.unlock();
-            if (self.worker != null) {
+            if (self.worker_enabled) {
                 return;
             }
             self.drainBudgetLocked(max_items);
@@ -120,24 +164,30 @@ pub fn Queue(comptime Item: type) type {
         fn workerMain(self: *Self) void {
             while (true) {
                 self.lock();
-                if (self.stop_worker) {
+                if (self.closing) {
                     self.unlock();
                     return;
                 }
-                if (self.items.items.len > 0) {
+                if (self.worker_enabled and self.items.items.len > 0) {
                     const item = self.items.orderedRemove(self.pickIndexLocked());
+                    self.worker_processing = true;
                     if (self.process_with_lock) {
                         self.process_fn(self.process_ctx, item);
                     } else {
                         self.unlock();
                         self.process_fn(self.process_ctx, item);
-                        continue;
+                        self.lock();
                     }
+                    self.worker_processing = false;
+                    self.idle.broadcast(self.io_impl.io());
                     self.unlock();
                     continue;
                 }
+                // Reset while holding the append/stop mutex so an arriving
+                // notification remains latched through the following wait.
+                self.wake.reset();
                 self.unlock();
-                platform.time.yieldBriefly();
+                self.wake.waitUncancelable(self.io_impl.io());
             }
         }
 
@@ -195,4 +245,165 @@ test "prefetch queue drains inline without worker in tests" {
     queue.lock();
     try std.testing.expectEqual(@as(usize, 1), queue.items.items.len);
     queue.unlock();
+}
+
+test "prefetch queue background wake stop and restart preserve lock policy" {
+    const QueueU32 = Queue(u32);
+    const Context = struct {
+        queue: *QueueU32 = undefined,
+        unlocked: bool,
+        total: std.atomic.Value(u32) = .init(0),
+        done: std.Io.Event = .unset,
+
+        fn process(ptr: *anyopaque, item: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.unlocked) {
+                self.queue.lock();
+                self.queue.unlock();
+            }
+            _ = self.total.fetchAdd(item, .monotonic);
+            self.done.set(std.testing.io);
+        }
+    };
+    for ([_]bool{ false, true }) |unlocked| {
+        var ctx = Context{ .unlocked = unlocked };
+        var queue = QueueU32.init(std.testing.allocator, &ctx, Context.process);
+        defer queue.deinit();
+        ctx.queue = &queue;
+        queue.process_with_lock = !unlocked;
+        for (0..2) |round| {
+            ctx.done.reset();
+            try queue.startWorker();
+            // Restart is a logical resume of the owned worker, even when the
+            // executor admits no new tasks. No capacity retry or sleep is used.
+            queue.io_impl.concurrent_limit = .nothing;
+            queue.lock();
+            queue.appendLocked(7) catch |err| {
+                queue.unlock();
+                return err;
+            };
+            queue.signal();
+            queue.unlock();
+            try ctx.done.waitTimeout(std.testing.io, .{ .duration = .{
+                .raw = .fromSeconds(5),
+                .clock = .awake,
+            } });
+            queue.stop();
+            try std.testing.expect(!queue.worker_enabled);
+            try std.testing.expect(queue.worker != null);
+            try std.testing.expectEqual(@as(u32, @intCast((round + 1) * 7)), ctx.total.load(.monotonic));
+        }
+    }
+}
+
+test "prefetch queue stop quiesces unlocked processing and preserves pending work" {
+    const QueueU32 = Queue(u32);
+    const Context = struct {
+        queue: *QueueU32 = undefined,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        stopped: std.atomic.Value(bool) = .init(false),
+        total: u32 = 0,
+
+        fn process(ptr: *anyopaque, item: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
+            self.total += item;
+        }
+
+        fn stop(self: *@This()) void {
+            self.queue.stop();
+            self.stopped.store(true, .release);
+        }
+    };
+    var ctx = Context{};
+    var queue = QueueU32.init(std.testing.allocator, &ctx, Context.process);
+    defer queue.deinit();
+    // Also release on an assertion failure before waiting for queue teardown.
+    defer ctx.release.set(std.testing.io);
+    ctx.queue = &queue;
+    queue.process_with_lock = false;
+    try queue.appendLocked(3);
+    try queue.startWorker();
+    try ctx.entered.waitTimeout(std.testing.io, .{ .duration = .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    } });
+    const stopper = try std.Thread.spawn(.{}, Context.stop, .{&ctx});
+    defer {
+        ctx.release.set(std.testing.io);
+        stopper.join();
+    }
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (true) {
+        queue.lock();
+        const enabled = queue.worker_enabled;
+        queue.unlock();
+        if (!enabled) break;
+        try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds() < 5 * std.time.ns_per_s);
+        try std.Thread.yield();
+    }
+    // stop has withdrawn admission but cannot return while the callback still
+    // owns its resources. Work appended here belongs to the next resume/drain.
+    try std.testing.expect(!ctx.stopped.load(.acquire));
+    queue.lock();
+    queue.appendLocked(7) catch |err| {
+        queue.unlock();
+        return err;
+    };
+    queue.signal();
+    queue.unlock();
+    ctx.release.set(std.testing.io);
+    // A second stop serializes behind the first and observes its quiescence.
+    queue.stop();
+    try std.testing.expectEqual(@as(u32, 3), ctx.total);
+    queue.drainBudget(1);
+    try std.testing.expectEqual(@as(u32, 10), ctx.total);
+    try std.testing.expectEqual(@as(usize, 0), queue.items.items.len);
+}
+
+test "prefetch queue scheduling failure retains pending work for manual draining" {
+    const Context = struct {
+        fn process(ptr: *anyopaque, item: u32) void {
+            const total: *u32 = @ptrCast(@alignCast(ptr));
+            total.* += item;
+        }
+    };
+    var total: u32 = 0;
+    var queue = Queue(u32).init(std.testing.allocator, &total, Context.process);
+    defer queue.deinit();
+    queue.io_impl.concurrent_limit = .nothing;
+    try queue.appendLocked(9);
+    try std.testing.expectError(error.ConcurrencyUnavailable, queue.startWorker());
+    try std.testing.expect(queue.worker == null);
+    queue.drainBudget(1);
+    try std.testing.expectEqual(@as(u32, 9), total);
+}
+
+test "prefetch queue manual draining honors priority and budget" {
+    const Context = struct {
+        values: [3]u32 = undefined,
+        len: usize = 0,
+        fn process(ptr: *anyopaque, item: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.values[self.len] = item;
+            self.len += 1;
+        }
+        fn priority(item: u32) u64 {
+            return item;
+        }
+    };
+    var ctx = Context{};
+    var queue = Queue(u32).initWithPriority(std.testing.allocator, &ctx, Context.process, Context.priority);
+    defer queue.deinit();
+    try queue.start();
+    try std.testing.expect(queue.worker == null);
+    try queue.appendLocked(1);
+    try queue.appendLocked(3);
+    try queue.appendLocked(2);
+    queue.drainBudget(2);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 2 }, ctx.values[0..ctx.len]);
+    queue.drainBudget(2);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, ctx.values[0..ctx.len]);
 }

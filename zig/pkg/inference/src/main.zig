@@ -15,6 +15,7 @@
 const std = @import("std");
 const structlog = @import("structlog");
 const inference = @import("inference");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
@@ -47,12 +48,6 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
         residency_mode: ?inference.ops.A4bResidencyMode = null,
         memory_budget_mb: ?u32 = null,
-        load_strategy: ?inference.ops.A4bLoadStrategy = null,
-        load_workers: ?u8 = null,
-        load_staging_mb: ?u32 = null,
-        prepared_pack: ?inference.ops.A4bPreparedPackMode = null,
-        drop_host_cache_after_load: bool = false,
-        startup_strategy: inference.server.WarmModelStartupStrategy = .eager,
     };
 
     const PromptCacheConfig = struct {
@@ -279,12 +274,6 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .quantization = value.quantization,
             .residency_mode = value.residency_mode,
             .memory_budget_mb = value.memory_budget_mb,
-            .load_strategy = value.load_strategy,
-            .load_workers = value.load_workers,
-            .load_staging_mb = value.load_staging_mb,
-            .prepared_pack = value.prepared_pack,
-            .drop_host_cache_after_load = value.drop_host_cache_after_load,
-            .startup_strategy = value.startup_strategy,
         };
     }
     return out;
@@ -567,7 +556,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         }
     }
 
-    print("antfly inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_info.version()});
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
@@ -784,7 +773,7 @@ fn isPredictorPull(args: []const []const u8) bool {
 }
 
 pub fn printVersion() void {
-    print("antfly inference v{s}\n", .{build_options.inference_version});
+    print("antfly inference v{s}\n", .{build_info.version()});
     print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
@@ -955,21 +944,41 @@ test "run config accepts canonical and legacy inference admission spellings" {
     );
 }
 
-test "run config preserves A4B CUDA load and prefetch policy" {
+test "run config uses automatic loading policy for CUDA preload" {
     const parsed = try parseRunConfig(std.testing.allocator,
-        \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384,"load_strategy":"pipeline","load_workers":6,"load_staging_mb":384,"prepared_pack":"required","drop_host_cache_after_load":true,"startup_strategy":"prefetch"}]}
+        \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384}]}
     );
     defer parsed.deinit();
     const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.preload);
     defer std.testing.allocator.free(models);
     try std.testing.expectEqual(@as(usize, 1), models.len);
     try std.testing.expectEqual(inference.backends.BackendType.cuda, models[0].backend.?);
-    try std.testing.expectEqual(inference.ops.A4bLoadStrategy.pipeline, models[0].load_strategy.?);
-    try std.testing.expectEqual(@as(?u8, 6), models[0].load_workers);
-    try std.testing.expectEqual(@as(?u32, 384), models[0].load_staging_mb);
-    try std.testing.expectEqual(inference.ops.A4bPreparedPackMode.required, models[0].prepared_pack.?);
-    try std.testing.expect(models[0].drop_host_cache_after_load);
-    try std.testing.expectEqual(inference.server.WarmModelStartupStrategy.prefetch, models[0].startup_strategy);
+    const request = models[0].a4bRequest().?;
+    try std.testing.expectEqual(inference.ops.A4bResidencyMode.resident, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 16384), request.memory_budget_mb);
+    try std.testing.expectEqual(inference.ops.A4bLoadStrategy.auto, request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 0), request.load_workers);
+    try std.testing.expectEqual(@as(u32, 0), request.load_staging_mb);
+    try std.testing.expectEqual(inference.ops.A4bPreparedPackMode.auto, request.prepared_pack);
+    try std.testing.expect(!request.drop_host_cache_after_load);
+    try std.testing.expectEqual(inference.server.WarmModelStartupStrategy.eager, models[0].startup_strategy);
+}
+
+test "run config rejects model-specific preload tuning fields" {
+    const fields = .{
+        .{ "load_strategy", "\"pipeline\"" },
+        .{ "load_workers", "6" },
+        .{ "load_staging_mb", "384" },
+        .{ "prepared_pack", "\"required\"" },
+        .{ "drop_host_cache_after_load", "true" },
+        .{ "startup_strategy", "\"prefetch\"" },
+    };
+    inline for (fields) |field| {
+        try std.testing.expectError(error.InvalidInferenceConfig, parseRunConfig(
+            std.testing.allocator,
+            "{\"preload\":[{\"kind\":\"generator\",\"name\":\"gemma-a4b\",\"" ++ field[0] ++ "\":" ++ field[1] ++ "}]}",
+        ));
+    }
 }
 
 test "run config rejects unknown preload policy fields" {

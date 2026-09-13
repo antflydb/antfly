@@ -13,8 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const reranker_head = @import("../reranker_head.zig");
-const reranker_lora = @import("../reranker_lora.zig");
+const reranker_head = @import("inference_internal").finetune.reranker_head;
+const reranker_lora = @import("inference_internal").finetune.reranker_lora;
 
 const print = std.debug.print;
 

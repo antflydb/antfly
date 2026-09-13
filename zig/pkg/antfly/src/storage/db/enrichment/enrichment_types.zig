@@ -32,6 +32,7 @@ pub var interactive_generate_inflight: std.atomic.Value(u32) = std.atomic.Value(
 pub const ExecutionPolicy = struct {
     batch_items: ?usize = null,
     batch_bytes: ?usize = null,
+    max_document_pages: ?usize = null,
 };
 
 pub fn parseExecutionPolicyJson(alloc: Allocator, execution_json: []const u8) !ExecutionPolicy {
@@ -47,9 +48,14 @@ pub fn parseExecutionPolicyValue(value: std.json.Value) !ExecutionPolicy {
     var iter = value.object.iterator();
     while (iter.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "batch_items")) {
+            if (entry.value_ptr.* == .null) continue;
             out.batch_items = try parsePositiveExecutionInteger(entry.value_ptr.*);
         } else if (std.mem.eql(u8, entry.key_ptr.*, "batch_bytes")) {
+            if (entry.value_ptr.* == .null) continue;
             out.batch_bytes = try parsePositiveExecutionInteger(entry.value_ptr.*);
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "max_document_pages")) {
+            if (entry.value_ptr.* == .null) continue;
+            out.max_document_pages = try parsePositiveExecutionInteger(entry.value_ptr.*);
         } else {
             return error.InvalidEnrichmentExecutionConfig;
         }
@@ -76,11 +82,28 @@ pub fn executionBatchBytesOrDefault(alloc: Allocator, execution_json: []const u8
     return policy.batch_bytes orelse default_value;
 }
 
+test "execution policy admits a positive PDF document page ceiling" {
+    const policy = try parseExecutionPolicyJson(
+        std.testing.allocator,
+        "{\"batch_items\":4,\"batch_bytes\":1024,\"max_document_pages\":200}",
+    );
+    try std.testing.expectEqual(@as(?usize, 200), policy.max_document_pages);
+    try std.testing.expectError(
+        error.InvalidEnrichmentExecutionConfig,
+        parseExecutionPolicyJson(std.testing.allocator, "{\"max_document_pages\":0}"),
+    );
+}
+
 pub const GeneratedEnrichmentKind = enum {
     dense_embedding,
     sparse_embedding,
     chunk_text,
     asset,
+};
+
+pub const EmbeddingInput = enum {
+    text,
+    pdf_page_images,
 };
 
 pub const EmbeddingInputKind = enum {
@@ -94,6 +117,7 @@ pub const GeneratedEnrichmentRequest = struct {
     index_name: []const u8,
     artifact_name: []const u8 = "",
     embedding_name: []const u8 = "",
+    embedding_input: EmbeddingInput = .text,
     /// Exact semantic input owned by this embedding request. `artifact_name`
     /// names an embedding output for document requests and a chunk input for
     /// chunk requests, so its presence cannot safely answer this question.
@@ -116,6 +140,13 @@ pub const GeneratedEnrichmentRequest = struct {
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     execution_json: []const u8 = "",
+    /// Upstream materialized asset for a chunk-backed request, pinned with the
+    /// same catalog generation as the rest of the plan.
+    upstream_artifact_name: []const u8 = "",
+    /// Immutable, request-owned projection of the index catalog. Provider and
+    /// chunking work consumes these names without borrowing live IndexManager
+    /// arrays after the write-plan generation fence is released.
+    consumer_indexes: [][]u8 = &.{},
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
@@ -147,6 +178,9 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
+    if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
+    for (request.consumer_indexes) |name| alloc.free(name);
+    if (request.consumer_indexes.len > 0) alloc.free(request.consumer_indexes);
 }
 
 pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentRequest) !GeneratedEnrichmentRequest {
@@ -169,11 +203,25 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
+    errdefer if (execution_json.len > 0) alloc.free(execution_json);
+    const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
+    errdefer if (upstream_artifact_name.len > 0) alloc.free(upstream_artifact_name);
+    const consumer_indexes = try alloc.alloc([]u8, request.consumer_indexes.len);
+    var consumer_indexes_initialized: usize = 0;
+    errdefer {
+        for (consumer_indexes[0..consumer_indexes_initialized]) |name| alloc.free(name);
+        if (consumer_indexes.len > 0) alloc.free(consumer_indexes);
+    }
+    for (request.consumer_indexes, 0..) |name, i| {
+        consumer_indexes[i] = try alloc.dupe(u8, name);
+        consumer_indexes_initialized += 1;
+    }
     return .{
         .kind = request.kind,
         .index_name = index_name,
         .artifact_name = artifact_name,
         .embedding_name = embedding_name,
+        .embedding_input = request.embedding_input,
         .input_kind = request.input_kind,
         .doc_key = doc_key,
         .source_field = source_field,
@@ -187,13 +235,15 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .content_type = content_type,
         .producer_json = producer_json,
         .execution_json = execution_json,
+        .upstream_artifact_name = upstream_artifact_name,
+        .consumer_indexes = consumer_indexes,
         .sequence = request.sequence,
     };
 }
 
 pub fn deinitGeneratedRequests(alloc: Allocator, requests: []const GeneratedEnrichmentRequest) void {
     for (requests) |request| freeGeneratedRequest(alloc, request);
-    alloc.free(requests);
+    if (requests.len > 0) alloc.free(requests);
 }
 
 pub fn freeGeneratedRef(alloc: Allocator, request: GeneratedEnrichmentRef) void {
@@ -347,6 +397,7 @@ test "generated enrichment request clone without source_template" {
         .{
             .kind = .dense_embedding,
             .index_name = "dv_v1",
+            .embedding_input = .pdf_page_images,
             .doc_key = "doc:b",
             .source_field = "body",
             .expected_dims = 384,
@@ -356,6 +407,8 @@ test "generated enrichment request clone without source_template" {
 
     try std.testing.expectEqual(@as(usize, 1), cloned.len);
     try std.testing.expectEqualStrings("body", cloned[0].source_field);
+    try std.testing.expectEqual(EmbeddingInput.pdf_page_images, cloned[0].embedding_input);
+    try std.testing.expectEqual(EmbeddingInputKind.document, cloned[0].input_kind);
     try std.testing.expectEqual(@as(usize, 0), cloned[0].source_template.len);
 }
 

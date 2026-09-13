@@ -112,6 +112,11 @@ pub const BatchMode = enum {
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
     defer_commit_flush: bool = false,
+    // Read-throughs performed by a write batch (for example, loading exact
+    // vectors while building a derived index) may be one-pass scans. Keep the
+    // default reusable, but let those callers avoid filling the shared block
+    // cache with source blocks that already have a bounded native workspace.
+    block_cache_admission: Namespace.BlockCacheAdmission = .retain,
 };
 
 pub const BulkIngestFinishOptions = struct {
@@ -139,6 +144,8 @@ pub const BulkIngestFinishOptions = struct {
     /// the target is left for scheduled maintenance.
     max_deferred_l0_runs: ?usize = null,
     max_foreground_compaction_steps: usize = 0,
+    /// Per-job input cap; null uses the backend policy, zero admits no work.
+    /// An explicit cap never permits the oversized-single-job exception.
     max_foreground_compaction_input_bytes: ?u64 = null,
     max_foreground_compaction_ns: ?u64 = null,
     max_deferred_hbc_leaf_splits_per_publish: ?usize = null,
@@ -181,6 +188,9 @@ pub const Capabilities = struct {
     reverse_ranges: bool = false,
     cursors: bool = true,
     ordered_append_puts: bool = false,
+    /// Bulk append accepts interleaved key ranges and repeated keys with
+    /// last-write-wins semantics, without per-entry sorted insertion.
+    unordered_bulk_append_puts: bool = false,
     native_namespaces: bool = false,
     duplicate_values: bool = false,
     nested_write_transactions: bool = false,

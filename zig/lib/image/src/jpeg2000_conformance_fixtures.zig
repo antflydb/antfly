@@ -20,9 +20,8 @@
 //! The repository is cached under `/tmp/openjpeg-data` and is NOT committed
 //! to this tree. If the directory is absent and network access is allowed,
 //! we attempt a shallow `git clone` at a pinned commit. If the clone fails
-//! (offline CI, blocked network, missing git, …) the caller is expected to
-//! skip the harness with a clear log line rather than hard-failing the
-//! build.
+//! the explicit conformance target fails. Ordinary unit tests can still
+//! skip the external corpus when it is absent.
 
 const std = @import("std");
 
@@ -51,11 +50,14 @@ pub const FixtureError = error{
 /// the returned slice when `allocator` is provided; the convenience
 /// `fixtureDir()` without allocator returns a static slice.
 pub fn fixtureDir() []const u8 {
+    if (@import("builtin").is_test) {
+        if (std.testing.environ.getPosix("OPENJPEG_DATA_DIR")) |path| return path;
+    }
     return default_root_dir;
 }
 
 pub fn conformanceDirAlloc(allocator: Allocator) ![]u8 {
-    return std.fs.path.join(allocator, &.{ default_root_dir, "input", "conformance" });
+    return std.fs.path.join(allocator, &.{ fixtureDir(), "input", "conformance" });
 }
 
 /// Ensure the openjpeg-data checkout exists under `root_dir`.
@@ -65,9 +67,10 @@ pub fn conformanceDirAlloc(allocator: Allocator) ![]u8 {
 ///     immediately.
 ///   - Otherwise, if `allow_fetch` is true, attempts a shallow git clone.
 ///   - If cloning is disabled, git is unavailable, or the clone fails,
-///     returns an error so the caller can skip gracefully.
+///     returns an error so explicit conformance runs fail clearly.
 pub fn ensureFixturesAvailable(
     allocator: Allocator,
+    io: std.Io,
     root_dir: []const u8,
     allow_fetch: bool,
 ) FixtureError!void {
@@ -81,7 +84,7 @@ pub fn ensureFixturesAvailable(
         return error.FixtureDirMissing;
     }
 
-    runGitClone(allocator, root_dir) catch |err| switch (err) {
+    runGitClone(io, root_dir) catch |err| switch (err) {
         error.GitUnavailable => return error.GitUnavailable,
         else => return error.FixtureCloneFailed,
     };
@@ -107,7 +110,7 @@ const GitError = error{
     OutOfMemory,
 };
 
-fn runGitClone(allocator: Allocator, root_dir: []const u8) GitError!void {
+fn runGitClone(io: std.Io, root_dir: []const u8) GitError!void {
     const argv = &[_][]const u8{
         "git",
         "clone",
@@ -116,35 +119,29 @@ fn runGitClone(allocator: Allocator, root_dir: []const u8) GitError!void {
         root_dir,
     };
 
-    runChild(allocator, argv) catch |err| switch (err) {
+    runChild(io, argv) catch |err| switch (err) {
         error.FileNotFound => return error.GitUnavailable,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.GitFailed,
     };
 }
 
-fn runChild(allocator: Allocator, argv: []const []const u8) !void {
-    _ = allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var child = try std.process.spawn(io_impl.io(), .{
+fn runChild(io: std.Io, argv: []const []const u8) !void {
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(io_impl.io());
+    const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) return error.ChildProcessFailed,
         else => return error.ChildProcessFailed,
     }
 }
 
-/// Entry point so the helper can be built as a standalone binary
-/// (`zig build lib-image-conformance-fetch`) mirroring the JPEG
-/// seed-corpora fetcher. Keeps the network-touching path out of `zig
-/// test` by default; the test invokes the library helper instead.
+/// Setup prerequisite for `zig build lib-image-conformance`. Ordinary
+/// library tests do not invoke this helper or download fixtures.
 pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -158,7 +155,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "fetch")) {
         const root_dir = args.next() orelse default_root_dir;
-        try ensureFixturesAvailable(alloc, root_dir, true);
+        var allow_fetch = true;
+        if (args.next()) |arg| {
+            if (!std.mem.eql(u8, arg, "--no-fetch")) return error.InvalidArguments;
+            allow_fetch = false;
+        }
+        if (args.next() != null) return error.InvalidArguments;
+        try ensureFixturesAvailable(alloc, init.io, root_dir, allow_fetch);
         std.debug.print("openjpeg-data ready at {s}\n", .{root_dir});
         return;
     }
@@ -174,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print(
-        "usage: {s} fetch [root_dir]\n       {s} status [root_dir]\n",
+        "usage: {s} fetch [root_dir] [--no-fetch]\n       {s} status [root_dir]\n",
         .{ "lib-image-conformance-fetch", "lib-image-conformance-fetch" },
     );
     return error.InvalidArguments;

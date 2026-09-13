@@ -1,0 +1,222 @@
+---
+title: "Build a Support Answer Agent"
+description: "One call that answers a customer's question from your help articles, with reranking and pruning so it stays quiet when it has no evidence"
+order: 1
+---
+
+<Questions>
+- How do I build a support bot that answers from my help articles?
+- How do I use the retrieval agent to generate answers automatically?
+- How do I keep an auto-answering bot from answering off irrelevant context?
+- How do I tune pruning for RAG quality?
+</Questions>
+
+## The Result
+
+One call answers a customer's question from your help articles. It retrieves the closest articles, reranks them, drops the weak ones, and writes the answer with a local model:
+
+```bash
+antfly agents retrieval --table help \
+  --semantic-search "Can I get my money back if I cancel?" \
+  --indexes "title_content" \
+  --fields "title,content" \
+  --limit 20 \
+  --reranker '{"provider": "antfly", "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+               "field": "content", "candidate_count": 50}' \
+  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --generator '{"provider": "ollama", "model": "gemma3:4b"}' \
+  --no-streaming --generate
+```
+
+```json
+{
+  "generation": "Refunds are available within 14 days of an annual renewal; monthly plans are not refundable (refund-policy). You can cancel any time from Settings > Billing (cancel-plan).",
+  "hits": [
+    {
+      "_id": "refund-policy",
+      "_source": {
+        "title": "Refund policy",
+        "content": "..."
+      }
+    },
+    {
+      "_id": "cancel-plan",
+      "_source": {
+        "title": "Canceling your plan",
+        "content": "..."
+      }
+    }
+  ]
+}
+```
+
+## Before You Start
+
+Antfly running in standalone mode with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), and Ollama with a small model pulled:
+
+```bash
+curl -s http://127.0.0.1:8080/db/v1/status | head -c 200
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+ollama pull gemma3:4b
+```
+
+## Build It
+
+### 1. Create the Help Table
+
+One embeddings index over title and content. The embedder and chunker run on Antfly Inference, inside the same process:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help \
+  -H "Content-Type: application/json" \
+  -d '{
+    "indexes": {
+      "title_content": {
+        "type": "embeddings",
+        "template": "{{title}} {{content}}",
+        "embedder": {
+          "provider": "antfly",
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+        },
+        "chunker": {
+          "provider": "antfly",
+          "text": {
+            "target_tokens": 200,
+            "overlap_tokens": 25
+          }
+        }
+      }
+    }
+  }'
+```
+
+Every table gets a full-text index by default, so this one embeddings index is all it takes for hybrid retrieval.
+
+### 2. Load Your Help Articles
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/help/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inserts": {
+      "billing-cycles": {
+        "title": "How billing cycles work",
+        "content": "Your subscription renews on the same day each month. Invoices are issued 3 days before renewal..."
+      },
+      "cancel-plan": {
+        "title": "Canceling your plan",
+        "content": "You can cancel anytime from Settings > Billing. Your plan stays active until the end of the current cycle..."
+      },
+      "refund-policy": {
+        "title": "Refund policy",
+        "content": "Refunds are available within 14 days of an annual renewal. Monthly plans are not refundable..."
+      }
+    }
+  }'
+```
+
+Each article is chunked and embedded in the background. Wait for the index before querying it; re-insert an article under the same key to update it.
+
+```bash
+antfly index wait --table help --index title_content --until complete --timeout 10m
+```
+
+### 3. Retrieve, Rerank, Prune, Answer
+
+One request to the retrieval agent runs the whole pipeline:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
+antfly agents retrieval --table help \
+  --semantic-search "Can I get my money back if I cancel?" \
+  --indexes "title_content" \
+  --fields "title,content" \
+  --limit 20 \
+  --reranker '{
+    "provider": "antfly",
+    "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+    "field": "content",
+    "candidate_count": 50
+  }' \
+  --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
+  --generator '{
+    "provider": "ollama",
+    "model": "gemma3:4b"
+  }' \
+  --no-streaming --generate
+```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Can I get my money back if I cancel?",
+    "queries": [{
+      "table": "help",
+      "semantic_search": "Can I get my money back if I cancel?",
+      "indexes": ["title_content"],
+      "fields": ["title", "content"],
+      "limit": 20,
+      "reranker": {
+        "provider": "antfly",
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "content",
+        "candidate_count": 50
+      },
+      "pruner": {"min_score_ratio": 0.6, "max_score_gap_percent": 40}
+    }],
+    "generator": {
+      "provider": "ollama",
+      "model": "gemma3:4b"
+    },
+    "stream": false,
+    "steps": {
+      "generation": {"enabled": true}
+    }
+  }'
+```
+  </TabsContent>
+</Tabs>
+
+The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Streaming is the default: drop `"stream": false` (or `--no-streaming`) and the answer arrives as server-sent events instead of one JSON body.
+
+The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
+
+## Tradeoffs
+
+How strict the pruner is decides whether the agent answers at all when its evidence is weak.
+
+Retrieval always returns the closest matches it has. When a customer asks about something your help center does not cover, the closest match is still far away, and an answer generated from far-away context is confidently wrong. In a search results page a weak fourth result is harmless because a person skims past it. In an answer agent it becomes part of the answer.
+
+The pruner is what stops that:
+
+- `min_score_ratio: 0.6` drops anything scoring under 60% of the best match. If the best match is itself weak, everything goes, `hits` comes back empty, and your code can hand the conversation to a person instead of answering.
+- `max_score_gap_percent: 40` finds the elbow where relevance falls off and cuts there.
+
+Let the reranker see more than the model does. A `candidate_count` of 50 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker scores a wide window and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Build a support answer agent over my help table with reranking and pruning, following the Antfly skill", and use this page to judge the result.
+
+## Next Steps
+
+- [Tune Hybrid Search](/docs/guides/hybrid-search): add keyword matching so exact terms like error codes and plan names always land
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): keep the help table current from the database that already holds your articles
+- [Add Search and AI Answers to Your Site](/docs/guides/site-search-and-answers): put this answer agent behind a React answer box

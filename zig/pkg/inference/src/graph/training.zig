@@ -2685,6 +2685,7 @@ test "trainStep computes loss and gradients for linear model" {
     // Set up native backend with empty WeightStore.
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     // Create parameter CTs.
@@ -2748,6 +2749,7 @@ test "CompiledTrainSession can retain gradient tensors without host extraction" 
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
@@ -2795,6 +2797,7 @@ test "trainStep on linear-gelu chain" {
     // Set up native backend.
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     // Create parameter CTs with small positive values.
@@ -2845,6 +2848,7 @@ test "trainStep emits checkpoint summary when enabled" {
 
     var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = NativeCompute.init(allocator, &ws, null);
+    defer compute.deinit();
     var cb_val = compute.computeBackend();
 
     const x_ct = try cb_val.fromFloat32(&.{ 1, 1, 1, 1, 1, 1, 1, 1 });

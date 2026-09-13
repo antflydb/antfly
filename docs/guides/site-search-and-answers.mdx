@@ -1,0 +1,193 @@
+---
+title: "Add Search and AI Answers to Your Site"
+description: "A React page with live results and facets, plus an answer box that streams a grounded answer with sources, all on one Antfly table"
+order: 2
+---
+
+<Questions>
+- How do I add search to my React app with Antfly?
+- How do I build a faceted search page with @antfly/components?
+- How do I add an AI answer box to my site?
+- Why doesn't my answer box fire when I type?
+- How do I show sources and collect feedback on generated answers?
+</Questions>
+
+## The Result
+
+Your React app has a search page and an answer box on the same Antfly table. Type `billing` and results appear before you finish the word, with a category facet you can click to narrow. Type "how do refunds work?" into the ask box and an answer streams in, cites the documents it used, and offers a follow-up. The search page is one provider and five components; the answer box is two more.
+
+## Before You Start
+
+Antfly running with an indexed table, and Ollama with a small model pulled. The examples use a table called `docs` with an embeddings index named `body_embeddings`; the [Quickstart](/docs/guides/quickstart) shows how to create one.
+
+```bash
+curl -s http://127.0.0.1:8080/db/v1/tables/docs | head -c 300
+ollama pull gemma3:4b
+```
+
+## Build It
+
+### 1. Install the Packages
+
+```bash
+npm install @antfly/components @antfly/sdk react react-dom
+```
+
+`@antfly/sdk`, `react`, and `react-dom` are peer dependencies, so install them explicitly. Then import the stylesheet once, at your app entry point:
+
+```ts
+import '@antfly/components/styles'
+```
+
+<Callout type="warning">
+Without the stylesheet import every component renders as unstyled markup: no dropdown positioning, no facet layout. It is the most common "the library is broken" report.
+</Callout>
+
+### 2. Build the Search Page
+
+One `<Antfly>` provider holds the API URL, the table, and the auth headers. Every widget inside it contributes part of a single batched query, so you never fetch, hold state, or wire an effect:
+
+```tsx
+import {
+  ActiveFilters,
+  Antfly,
+  Autosuggest,
+  Facet,
+  QueryBox,
+  Results,
+} from '@antfly/components'
+
+const API = 'http://127.0.0.1:8080/db/v1'
+const HEADERS = { Authorization: `ApiKey ${import.meta.env.VITE_ANTFLY_KEY}` }
+
+export default function SearchPage() {
+  return (
+    <Antfly url={API} table="docs" headers={HEADERS}>
+      <QueryBox id="search" placeholder="Search the docs…">
+        <Autosuggest fields={['title']} returnFields={['title']} limit={5} />
+      </QueryBox>
+
+      <aside>
+        <Facet id="category" fields={['category']} />
+        <Facet id="product" fields={['product']} />
+        <ActiveFilters />
+      </aside>
+
+      <Results
+        id="results"
+        searchBoxId="search"
+        fields={['title', 'body', 'url']}
+        semanticIndexes={['body_embeddings']}
+        itemsPerPage={10}
+        items={(hits) =>
+          hits.map(({ _id, _source }) => (
+            <article key={_id}>
+              <a href={String(_source?.url)}>{String(_source?.title)}</a>
+              <p>{String(_source?.body ?? '').slice(0, 200)}…</p>
+            </article>
+          ))
+        }
+      />
+    </Antfly>
+  )
+}
+```
+
+Three props do the work. `QueryBox` defaults to `mode="live"`, so this searches as you type. `semanticIndexes` turns on vector retrieval; without it you get keyword search only, exactly as on the API. `itemsPerPage` sizes the query. (`Results.limit` looks like the page size but only sets the retrieval limit of sibling `Facet` queries.)
+
+Facet buckets come from the stored document values at the field path you name, so use the plain field name (`category`, not `category.keyword`). Values are never tokenized: short label-like fields facet well, long prose fields do not.
+
+### 3. Add the Answer Box
+
+The answer box lives inside the same provider and gets its own input, in submit mode:
+
+```tsx
+import {
+  AnswerFeedback,
+  AnswerResults,
+  QueryBox,
+  renderThumbsUpDown,
+} from '@antfly/components'
+
+const GENERATOR = { provider: 'ollama', model: 'gemma3:4b' }
+
+export function AnswerBox() {
+  return (
+    <section>
+      <QueryBox
+        id="ask"
+        mode="submit"
+        placeholder="Ask a question…"
+        buttonLabel="Ask"
+      />
+
+      <AnswerResults
+        id="answer"
+        searchBoxId="ask"
+        fields={['title', 'body', 'url']}
+        semanticIndexes={['body_embeddings']}
+        generator={GENERATOR}
+        limit={10}
+        showHits
+      >
+        <AnswerFeedback
+          scale={1}
+          renderRating={renderThumbsUpDown}
+          onFeedback={({ feedback, query }) => {
+            void fetch('/api/answer-feedback', {
+              method: 'POST',
+              body: JSON.stringify({ query, rating: feedback.rating }),
+            })
+          }}
+        />
+      </AnswerResults>
+    </section>
+  )
+}
+```
+
+Drop `<AnswerBox />` beside `<Results>` and the page is done. The answer streams in token by token and `showHits` renders the documents it was answered from. Follow-up questions appear underneath by default; `showFollowUpQuestions={false}` tells the server to stop producing them rather than just hiding them.
+
+<Callout type="warning">
+`searchBoxId` must match the `id` of the `QueryBox` driving it: `"ask"` here, `"search"` on `<Results>`. A mismatch throws nothing and logs nothing. `AnswerResults` never fires, and a mismatched semantic `Results` contributes no query at all, which stalls the whole batched request and leaves the facets empty too. When a page goes silent, check these two strings first.
+</Callout>
+
+The retrieval agent accepts `gemini`, `vertex`, `openai`, `ollama`, and `antfly` as generator providers. Other values parse and then fail the request with a 400.
+
+### 4. Run It
+
+```bash
+antfly standalone
+npm run dev
+```
+
+Type into the search box and watch the results and facet counts move. Before the first keystroke the page shows no results and no facet counts, because a semantic `Results` with an empty query contributes nothing to the batched request; that is expected, not a wiring fault. Then ask a full question in the ask box and press Ask. If search works and the ask box does nothing, it is a `searchBoxId` typo. If both are silent, open the network tab: an empty multiquery means no widget is contributing a query.
+
+## Tradeoffs
+
+The answer box gets its own input rather than sharing the search box.
+
+Running both off one box is tempting: type once, see results and an answer. The library does not allow it.
+
+`AnswerResults` reacts only to submissions. In `mode="live"` a keystroke updates the search value but never sets a submitted timestamp, so the answer agent stays idle. Live search is a cheap indexed lookup and can run on every keystroke. An answer is retrieval plus reranking plus token generation, and running that on `h`, `ho`, `how`, `how ` spends your generation budget on prefixes of a question nobody has finished asking.
+
+It also matches how people read. Someone scanning results wants the list to move with them. Someone asking a question has composed a full sentence and expects a pause before the answer, and a separate submit makes that pause explicit.
+
+To feed a follow-up question back into the ask box, set the `QueryBox` `initialValue` to the question, add `autoSubmit`, and bump `submitSignal`; the changing signal re-fires the submit even when the same question is clicked twice.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Add an Antfly-powered search page with an AI answer box to my React app, using @antfly/components", and use this page to judge the result.
+
+## Next Steps
+
+- [React Antfly](/docs/ui/react-antfly): the full component reference, including chat, custom inputs, citations, and URL state
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): tune the retrieval behind the answer box with reranking and pruning
+- [Tune Hybrid Search](/docs/guides/hybrid-search): make exact terms like error codes land alongside semantic matches

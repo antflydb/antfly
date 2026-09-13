@@ -255,6 +255,7 @@ fn runTraining(allocator: std.mem.Allocator, opts: Options) !void {
     }
 
     var native_backend = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer native_backend.deinit();
     const cb = native_backend.computeBackend();
 
     // ------------------------------------------------------------------

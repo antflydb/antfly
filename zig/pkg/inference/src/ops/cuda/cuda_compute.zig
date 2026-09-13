@@ -159,7 +159,9 @@ const CudaA4bLoadSlot = struct {
 };
 
 const CudaA4bLoadPipelineState = struct {
-    mutex: std.atomic.Mutex = .unlocked,
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
     plan: *const CudaA4bSourceLoadPlan,
     tasks: []const CudaA4bLoadChunk,
     slots: []CudaA4bLoadSlot,
@@ -169,7 +171,7 @@ const CudaA4bLoadPipelineState = struct {
     worker_copy_ns: u64 = 0,
 
     fn lock(self: *CudaA4bLoadPipelineState) void {
-        platform.sync.lockYielding(&self.mutex);
+        self.mutex.lockUncancelable(self.io);
     }
 
     const Observation = struct {
@@ -184,7 +186,7 @@ const CudaA4bLoadPipelineState = struct {
     /// from declaring an incomplete pipeline while completed work is waiting.
     fn observe(self: *CudaA4bLoadPipelineState) Observation {
         self.lock();
-        defer self.mutex.unlock();
+        defer self.mutex.unlock(self.io);
         var result = Observation{ .workers_done = self.workers_done };
         for (self.slots, 0..) |slot, index| {
             switch (slot.state) {
@@ -201,12 +203,42 @@ const CudaA4bLoadPipelineState = struct {
         return result;
     }
 
+    fn waitForProgress(self: *CudaA4bLoadPipelineState, worker_count: usize) void {
+        self.lock();
+        defer self.mutex.unlock(self.io);
+        while (!self.stop and self.workers_done != worker_count) {
+            for (self.slots) |slot| {
+                if (slot.state == .ready or slot.state == .in_flight) return;
+            }
+            self.changed.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    fn startWorkers(self: *CudaA4bLoadPipelineState, futures: []std.Io.Future(void)) !void {
+        var started: usize = 0;
+        errdefer self.stopWorkers(futures[0..started]);
+        for (futures) |*future| {
+            future.* = self.io.concurrent(workerMain, .{self}) catch
+                return error.A4bCudaLoadWorkersUnavailable;
+            started += 1;
+        }
+    }
+
+    fn stopWorkers(self: *CudaA4bLoadPipelineState, futures: []std.Io.Future(void)) void {
+        self.lock();
+        self.stop = true;
+        self.changed.broadcast(self.io);
+        self.mutex.unlock(self.io);
+        for (futures) |*future| future.await(self.io);
+    }
+
     fn workerMain(self: *CudaA4bLoadPipelineState) void {
         while (true) {
             self.lock();
             if (self.stop or self.next_task >= self.tasks.len) {
                 self.workers_done += 1;
-                self.mutex.unlock();
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
                 return;
             }
             var slot_index: ?usize = null;
@@ -217,8 +249,8 @@ const CudaA4bLoadPipelineState = struct {
                 }
             }
             if (slot_index == null) {
-                self.mutex.unlock();
-                std.Thread.yield() catch std.atomic.spinLoopHint();
+                self.changed.waitUncancelable(self.io, &self.mutex);
+                self.mutex.unlock(self.io);
                 continue;
             }
             const task_index = self.next_task;
@@ -226,7 +258,7 @@ const CudaA4bLoadPipelineState = struct {
             const slot = &self.slots[slot_index.?];
             slot.state = .filling;
             slot.task_index = task_index;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
 
             const started_ns = platform.time.monotonicNs();
             const task = self.tasks[task_index];
@@ -241,12 +273,14 @@ const CudaA4bLoadPipelineState = struct {
             if (self.stop) {
                 slot.state = .empty;
                 self.workers_done += 1;
-                self.mutex.unlock();
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
                 return;
             }
             self.worker_copy_ns +|= elapsed_ns;
             slot.state = .ready;
-            self.mutex.unlock();
+            self.changed.broadcast(self.io);
+            self.mutex.unlock(self.io);
         }
     }
 };
@@ -2997,25 +3031,23 @@ pub const CudaCompute = struct {
             if (source.mmap_offset != null) c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
         }
 
+        // Staging producers depend on the upload consumer. Reserve their
+        // capacity independently of request work and retain it through drain.
+        var worker_io = std.Io.Threaded.init(self.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(worker_count),
+        });
+        defer worker_io.deinit();
         var state = CudaA4bLoadPipelineState{
+            .io = worker_io.io(),
             .plan = plan,
             .tasks = chunks.items,
             .slots = slots,
         };
-        const threads = try self.allocator.alloc(std.Thread, worker_count);
-        defer self.allocator.free(threads);
-        var spawned: usize = 0;
-        defer {
-            state.lock();
-            state.stop = true;
-            state.mutex.unlock();
-            for (threads[0..spawned]) |thread| thread.join();
-        }
-        for (threads) |*thread| {
-            thread.* = std.Thread.spawn(.{}, CudaA4bLoadPipelineState.workerMain, .{&state}) catch
-                return error.A4bCudaLoadWorkersUnavailable;
-            spawned += 1;
-        }
+        const futures = try self.allocator.alloc(std.Io.Future(void), worker_count);
+        defer self.allocator.free(futures);
+        try state.startWorkers(futures);
+        defer state.stopWorkers(futures);
 
         const transfer_started_ns = platform.time.monotonicNs();
         var completed: usize = 0;
@@ -3047,14 +3079,15 @@ pub const CudaCompute = struct {
                 try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
                 state.lock();
                 slot.state = .empty;
-                state.mutex.unlock();
+                state.changed.broadcast(state.io);
+                state.mutex.unlock(state.io);
                 completed += 1;
                 continue;
             }
 
             if (observation.workers_done == worker_count)
                 return error.A4bCudaIncompleteLoadPipeline;
-            std.Thread.yield() catch std.atomic.spinLoopHint();
+            state.waitForProgress(worker_count);
         }
         try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
         self.stats.a4b_load_host_stage_ns +|= state.worker_copy_ns;
@@ -8380,7 +8413,7 @@ fn installCudaLazyHostPrefetch(self: *CudaCompute, store: *native_compute_mod.We
     store.prefetch_initialized = true;
     var lazy_it = store.lazy_weights.iterator();
     while (lazy_it.next()) |entry| {
-        entry.value_ptr.guard = store.prefetch.mutexPtr();
+        entry.value_ptr.guard = store.prefetch.lockHandle();
     }
     if (store.lazy_weights.count() > 0 and !disableCudaLazyHostPrefetchWorker()) {
         try native_compute_mod.startPrefetchWorker(store);
@@ -8920,6 +8953,56 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         error.MissingWeight => error.WeightNotFound,
         else => err,
     };
+}
+
+fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight = tensorFromCt(try getWeight(ctx, name));
+    const handle = try self.allocator.create(CudaTensor);
+    errdefer self.allocator.destroy(handle);
+    handle.* = borrowedSlotTensor(weight);
+    // The resident/streaming store owns device storage. The graph owns only
+    // this handle and its shape, never the store's tensor metadata.
+    handle.shape = try self.allocator.dupe(i64, weight.shape);
+    handle.owns_shape = true;
+    handle.owned_by_tensor = true;
+    return @ptrCast(handle);
+}
+
+fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
+    // No driver is needed: acquired handles may free their metadata, but must
+    // never attempt to free the resident model's device allocations.
+    var self: CudaCompute = undefined;
+    self.allocator = allocator;
+    self.a4b_runtime = null;
+    self.resident_weights = .empty;
+    defer self.resident_weights.deinit(allocator);
+    self.lazy_device_epochs = .empty;
+    var shape = [_]i64{ 2, 2 };
+    try self.resident_weights.put(allocator, "weight", .{
+        .buffer = .{ .ptr = 0x1234, .len = 16 },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 4,
+        .owned_by_tensor = false,
+    });
+    const borrowed = try getWeight(&self, "weight");
+    const first = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, first);
+    const second = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, second);
+    try std.testing.expect(first != second and first != borrowed and second != borrowed);
+    const handle = tensorFromCt(second);
+    try std.testing.expect(!handle.owns_buffer and !handle.owns_tc_quant and !handle.owns_bf16_mirror and !handle.owns_training_upload_host);
+    try std.testing.expect(handle.owns_shape and handle.owned_by_tensor);
+    try std.testing.expect(handle.shape.ptr != shape[0..].ptr);
+    try std.testing.expectEqualSlices(i64, &shape, handle.shape);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1234), handle.buffer.ptr);
+}
+
+test "CUDA acquired weight handles have independent metadata and borrowed storage" {
+    try testAcquiredWeightHandle(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
 }
 
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
@@ -22871,6 +22954,7 @@ const vtable = ops.ComputeBackend.VTable{
     .convertDType = &convertDTypeOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
+    .acquireWeight = &acquireWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .debugProfileCheckpoint = &debugProfileCheckpoint,
@@ -23364,4 +23448,64 @@ test "cuda dense host prefetch queue removal clears pending item" {
     try std.testing.expect(!entry.pending);
     try std.testing.expectEqual(@as(usize, 0), compute.dense_host_prefetch.items.items.len);
     try std.testing.expect(!removeDenseHostPrefetchQueueItemLocked(&compute, &entry));
+}
+
+test "CUDA A4B pipeline notification observes ready slots and stop" {
+    const Waiter = struct {
+        fn run(state: *CudaA4bLoadPipelineState, entered: *std.Io.Event, done: *std.Io.Event) void {
+            entered.set(std.testing.io);
+            state.waitForProgress(1);
+            done.set(std.testing.io);
+        }
+    };
+    for ([_]bool{ false, true }) |stop| {
+        var slots = [_]CudaA4bLoadSlot{.{}};
+        var state = CudaA4bLoadPipelineState{ .plan = undefined, .tasks = &.{}, .slots = &slots };
+        var entered: std.Io.Event = .unset;
+        var done: std.Io.Event = .unset;
+        var future = try std.testing.io.concurrent(Waiter.run, .{ &state, &entered, &done });
+        defer {
+            state.lock();
+            state.stop = true;
+            state.changed.broadcast(state.io);
+            state.mutex.unlock(state.io);
+            future.await(std.testing.io);
+        }
+        entered.waitUncancelable(std.testing.io);
+        state.lock();
+        if (stop) state.stop = true else slots[0].state = .ready;
+        state.changed.broadcast(state.io);
+        state.mutex.unlock(state.io);
+        try done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        future.await(std.testing.io);
+    }
+}
+
+test "CUDA A4B pipeline rolls back partial worker startup and drains blocked producers" {
+    for (0..3) |capacity| {
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(capacity),
+        });
+        defer io_impl.deinit();
+        // A full slot parks producers before they can access source data or
+        // GPU buffers, exercising the real startup/stop path without a device.
+        var slots = [_]CudaA4bLoadSlot{.{ .state = .in_flight }};
+        const tasks = [_]CudaA4bLoadChunk{.{ .source_index = 0, .source_offset = 0, .len = 1 }};
+        var state = CudaA4bLoadPipelineState{
+            .io = io_impl.io(),
+            .plan = undefined,
+            .tasks = &tasks,
+            .slots = &slots,
+        };
+        var futures: [2]std.Io.Future(void) = undefined;
+        if (capacity < futures.len) {
+            try std.testing.expectError(error.A4bCudaLoadWorkersUnavailable, state.startWorkers(&futures));
+        } else {
+            try state.startWorkers(&futures);
+            state.stopWorkers(&futures);
+        }
+        try std.testing.expect(state.stop);
+        try std.testing.expectEqual(capacity, state.workers_done);
+    }
 }

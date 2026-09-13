@@ -14,6 +14,11 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const cuda_identity = if (build_options.enable_cuda) @import("cuda_jit_identity") else struct {
+    pub const baseline = "0" ** 64;
+    pub const qualification = "0" ** 64;
+    pub const dispatch = "0" ** 64;
+};
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
@@ -19400,9 +19405,9 @@ fn runtimeJitQualificationKey(
             cuda_artifact.format,
             cuda_artifact.target,
             bundled_image_sha256,
-            build_options.cuda_jit_baseline_implementation_sha256,
-            build_options.cuda_jit_qualification_implementation_sha256,
-            build_options.cuda_jit_dispatch_implementation_sha256,
+            cuda_identity.baseline,
+            cuda_identity.qualification,
+            cuda_identity.dispatch,
             &conformance_hex_buffer,
         },
     ) catch unreachable;
@@ -20273,9 +20278,9 @@ test "CUDA runtime JIT cache misses then reuses exact keyed PTX and qualificatio
             artifact,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_baseline_implementation_sha256.len);
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_qualification_implementation_sha256.len);
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_dispatch_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.baseline.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.qualification.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.dispatch.len);
 }
 
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {
@@ -22262,15 +22267,19 @@ fn smokeFlorence2ChannelAttentionF32(allocator: std.mem.Allocator, ctx: *context
 }
 
 fn smokeFlorence2VisionTailSourcesF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
-    const batch: usize = 1;
+    const batch: usize = 2;
     const height: usize = 2;
     const width: usize = 2;
     const dim: usize = 4;
     const tokens_data = [_]f32{
-        1,  2,  3,  4,
-        5,  6,  7,  8,
-        9,  10, 11, 12,
-        13, 14, 15, 16,
+        1,   2,   3,   4,
+        5,   6,   7,   8,
+        9,   10,  11,  12,
+        13,  14,  15,  16,
+        101, 102, 103, 104,
+        105, 106, 107, 108,
+        109, 110, 111, 112,
+        113, 114, 115, 116,
     };
     const row_data = [_]f32{
         100, 200,
@@ -22282,11 +22291,16 @@ fn smokeFlorence2VisionTailSourcesF32(allocator: std.mem.Allocator, ctx: *contex
     };
     const temporal_data = [_]f32{ 1, 2, 3, 4 };
     const expected = [_]f32{
-        28, 40, 212, 314,
-        12, 24, 106, 208,
-        36, 48, 110, 212,
-        20, 32, 314, 416,
-        44, 56, 318, 420,
+        28,  40,  212, 314,
+        12,  24,  106, 208,
+        36,  48,  110, 212,
+        20,  32,  314, 416,
+        44,  56,  318, 420,
+        128, 140, 312, 414,
+        112, 124, 206, 308,
+        136, 148, 210, 312,
+        120, 132, 414, 516,
+        144, 156, 418, 520,
     };
 
     var tokens = try buffer_mod.DeviceBuffer.alloc(ctx, tokens_data.len * @sizeOf(f32));

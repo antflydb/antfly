@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -422,12 +423,17 @@ fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
 }
 
 fn syncPublishedParent(io: std.Io, path: []const u8) !void {
-    fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".") catch |err| switch (err) {
+    fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".") catch |narrow_err| {
+        // The generic std.Io implementation exposes a target- and backend-
+        // specific inferred error set. Widen it at this policy boundary so
+        // the portable unsupported case remains expressible even when the
+        // native backend cannot produce that tag.
+        const err: anyerror = narrow_err;
         // Platforms without durable directory sync have an explicit
         // best-effort publication policy. Do not report an ordinary write
         // failure after the atomic replacement is already visible.
-        error.DurableDirectorySyncUnsupported => return,
-        else => return error.RebuildStateDurabilityUncertain,
+        if (err == error.DurableDirectorySyncUnsupported) return;
+        return error.RebuildStateDurabilityUncertain;
     };
 }
 
@@ -459,7 +465,7 @@ fn encodeState(alloc: Allocator, owner_generation: ?u64, complete: bool, key: []
     pos += rebuild_state_key_length_bytes;
     @memcpy(encoded[pos .. pos + key.len], key);
     pos += key.len;
-    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_checksum_bytes], std.hash.Crc32.hash(encoded[0..pos]), .little);
+    std.mem.writeInt(u32, encoded[pos..][0..rebuild_state_checksum_bytes], Crc32.hash(encoded[0..pos]), .little);
     return encoded;
 }
 
@@ -501,7 +507,7 @@ fn decodeState(alloc: Allocator, encoded: []const u8) !DecodedCursor {
 
     const checksum_offset = encoded.len - rebuild_state_checksum_bytes;
     const stored_checksum = std.mem.readInt(u32, encoded[checksum_offset..][0..rebuild_state_checksum_bytes], .little);
-    if (stored_checksum != std.hash.Crc32.hash(encoded[0..checksum_offset])) {
+    if (stored_checksum != Crc32.hash(encoded[0..checksum_offset])) {
         return error.InvalidRebuildState;
     }
     const complete = flags & rebuild_state_flag_complete != 0;

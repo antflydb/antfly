@@ -109,6 +109,14 @@ pub const LoadedBackend = struct {
     }
 
     pub fn deinit(self: *LoadedBackend) void {
+        // Retire cached handles while their borrowed model storage is live.
+        switch (self.kind) {
+            .native => if (self.native_engine) |engine| {
+                engine.data = &self.native_ws.?;
+                var cb = engine.computeBackend();
+                cb.deinit();
+            },
+        }
         if (self.native_ws) |*ws| {
             native_compute.deinitPrefetchQueue(ws);
             var it = ws.resident_weights.iterator();
@@ -121,13 +129,6 @@ pub const LoadedBackend = struct {
         }
         if (self.safetensors_source) |src| src.weightSource().deinit();
         if (self.sharded_safetensors_source) |src| src.weightSource().deinit();
-        switch (self.kind) {
-            .native => if (self.native_engine) |engine| {
-                engine.data = &self.native_ws.?;
-                var cb = engine.computeBackend();
-                cb.deinit();
-            },
-        }
         self.* = undefined;
     }
 };

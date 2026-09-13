@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
 const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
@@ -71,6 +72,7 @@ fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8
 }
 
 pub const LookupResponse = struct {
+    status: u16 = 200,
     version: ?[]u8 = null,
     body: []u8,
 
@@ -236,7 +238,20 @@ pub const TransactionSavepointResponse = struct {
     }
 };
 
+pub const TableMutationOutcome = enum {
+    applied,
+    committed_visibility_pending,
+    committed_superseded,
+    committed_repair_required,
+    committed_repair_unavailable,
+    /// The server returned a committed 202 outcome newer than this client.
+    /// Retaining that boundary prevents an unsafe automatic replay.
+    committed_unknown,
+};
+
 pub const TablesResponse = struct {
+    status: u16 = 200,
+    outcome: TableMutationOutcome = .applied,
     body: []u8,
 
     pub fn deinit(self: *TablesResponse, alloc: std.mem.Allocator) void {
@@ -244,6 +259,24 @@ pub const TablesResponse = struct {
         self.* = undefined;
     }
 };
+
+fn tableMutationOutcome(alloc: std.mem.Allocator, status: u16, body: []const u8) !TableMutationOutcome {
+    if (status == 200 or status == 204) return .applied;
+    if (status != 202) return error.UnexpectedHttpStatus;
+    const Wire = struct { status: []const u8 };
+    var parsed = std.json.parseFromSlice(Wire, alloc, body, .{ .ignore_unknown_fields = true }) catch
+        return .committed_unknown;
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.status, "committed_visibility_pending"))
+        return .committed_visibility_pending;
+    if (std.mem.eql(u8, parsed.value.status, "committed_superseded"))
+        return .committed_superseded;
+    if (std.mem.eql(u8, parsed.value.status, "committed_repair_required"))
+        return .committed_repair_required;
+    if (std.mem.eql(u8, parsed.value.status, "committed_repair_unavailable"))
+        return .committed_repair_unavailable;
+    return .committed_unknown;
+}
 
 pub const LoadBalancedTablesResponse = struct {
     body: []u8,
@@ -257,6 +290,9 @@ pub const LoadBalancedTablesResponse = struct {
 };
 
 pub const EmptyResponse = struct {
+    status: u16 = 204,
+    outcome: TableMutationOutcome = .applied,
+
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
 
@@ -297,6 +333,20 @@ pub const ApiHttpClient = struct {
             self.alloc,
             self.executor,
             request,
+            self.internal_service,
+        );
+    }
+
+    pub fn executeRequestStream(
+        self: *ApiHttpClient,
+        request: http_common.HttpRequest,
+        writer: http_common.StreamWriter,
+    ) !?bool {
+        return try internal_service_auth.executeRequestStream(
+            self.alloc,
+            self.executor,
+            request,
+            writer,
             self.internal_service,
         );
     }
@@ -367,6 +417,22 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
+        var response = try self.fetchLookupResponse(base_uri, table_name, key, fields);
+        if (response.status == 200) return response;
+        response.deinit(self.alloc);
+        return error.UnexpectedHttpStatus;
+    }
+
+    /// Return the public lookup response without mapping non-200 statuses.
+    /// Composed deterministic histories retain the status and body as replay
+    /// evidence when an acknowledged write is not visible on another node.
+    pub fn fetchLookupResponse(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        key: []const u8,
+        fields: ?[]const u8,
+    ) !LookupResponse {
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
         const encoded_key = try percentEncodePathComponent(self.alloc, key);
@@ -400,12 +466,11 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
         } else null;
         return .{
+            .status = resp.status,
             .version = version,
             .body = try self.alloc.dupe(u8, resp.body),
         };
@@ -874,6 +939,85 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupScanStream(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: ?[]const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        downstream: http_common.StreamWriter,
+    ) !?bool {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.documents_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        const StatusWriter = struct {
+            alloc: std.mem.Allocator,
+            downstream: http_common.StreamWriter,
+            status: u16 = 0,
+            error_body: std.ArrayListUnmanaged(u8) = .empty,
+
+            fn deinit(adapter: *@This()) void {
+                adapter.error_body.deinit(adapter.alloc);
+            }
+
+            fn start(raw: *anyopaque, response_alloc: std.mem.Allocator, response: http_common.StreamingResponse) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                adapter.status = response.status;
+                if (response.status == 200) try adapter.downstream.start(response_alloc, response);
+            }
+
+            fn writeAll(raw: *anyopaque, bytes: []const u8) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.status == 200) return try adapter.downstream.writeAll(bytes);
+                if (adapter.error_body.items.len +| bytes.len > 64 * 1024)
+                    return error.InvalidRemoteResponse;
+                try adapter.error_body.appendSlice(adapter.alloc, bytes);
+            }
+
+            fn flush(raw: *anyopaque) anyerror!void {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                if (adapter.status == 200) try adapter.downstream.flush();
+            }
+
+            fn writer(adapter: *@This()) http_common.StreamWriter {
+                return .{ .ptr = adapter, .vtable = &.{
+                    .start = start,
+                    .write_all = writeAll,
+                    .flush = flush,
+                } };
+            }
+        };
+        var status_writer = StatusWriter{ .alloc = self.alloc, .downstream = downstream };
+        defer status_writer.deinit();
+        const handled = (try self.executeRequestStream(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = if (body != null) "application/json" else null,
+            .body = body orelse "",
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        }, status_writer.writer())) orelse return null;
+        if (!handled) return false;
+        switch (status_writer.status) {
+            200 => return true,
+            408 => return error.Canceled,
+            409 => return remoteGroupConflictError(status_writer.error_body.items),
+            503 => return remoteStorageReadUnavailableError(status_writer.error_body.items),
+            504 => return error.DeadlineExceeded,
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchQuery(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -905,6 +1049,52 @@ pub const ApiHttpClient = struct {
         resp.content_type = null;
         resp.body = &.{};
         return response;
+    }
+
+    /// Execute the public query route while preserving its HTTP status and
+    /// error body. Higher-level callers normally use `fetchQuery`; recovery
+    /// coordinators and conformance tests need the raw response to distinguish
+    /// a retryable/fail-closed response from an accidentally partial success.
+    pub fn fetchQueryRaw(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.query_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        return try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+    }
+
+    /// Execute the public global multi-query route. Each non-empty NDJSON
+    /// line names its own table; preserving the raw response lets callers
+    /// verify fail-closed status and response ordering across table owners.
+    pub fn fetchGlobalMultiQueryRaw(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
+        const uri = try self.joinRoute(base_uri, routes.Routes.query_suffix);
+        defer self.alloc.free(uri);
+
+        return try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/x-ndjson",
+            .body = body,
+        });
     }
 
     pub fn fetchRetrievalAgent(
@@ -1156,8 +1346,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            408 => return error.Timeout,
+            404 => return error.UnknownGroup,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1202,8 +1394,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            408 => return error.Timeout,
+            404 => return error.UnknownGroup,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1248,8 +1442,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            408 => return error.Timeout,
+            404 => return error.UnknownGroup,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1397,8 +1593,10 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
-            408 => return error.Timeout,
+            404 => return error.UnknownGroup,
+            408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1431,7 +1629,9 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.DistributedQueryUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
@@ -1588,6 +1788,58 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupGraphMetricMaintenance(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupGraphMetricMaintenanceWithCancellation(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupGraphMetricMaintenanceWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.graph_metric_maintenance_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => if (std.mem.eql(u8, resp.body, @errorName(error.InvalidGraphMetricAction)))
+                return error.InvalidGraphMetricAction
+            else
+                return error.InvalidGraphMetricRuntimeConfig,
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupVectorWorker(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -1647,6 +1899,27 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !BatchResponse {
+        var response = try self.fetchBatchResponse(base_uri, table_name, body);
+        switch (response.status) {
+            201, 202 => return response,
+            else => {
+                const err = remotePublicBatchError(response.status, response.body);
+                response.deinit(self.alloc);
+                return err;
+            },
+        }
+    }
+
+    /// Return the public batch wire response without mapping non-success
+    /// statuses into an error. Deterministic and integration harnesses use the
+    /// status/body pair as first-class failure evidence; ordinary callers
+    /// should prefer `fetchBatch` for the stable error contract.
+    pub fn fetchBatchResponse(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !BatchResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1663,10 +1936,6 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        switch (resp.status) {
-            201, 202 => {},
-            else => return remotePublicBatchError(resp.status, resp.body),
-        }
         return .{
             .status = resp.status,
             .body = try self.alloc.dupe(u8, resp.body),
@@ -2078,8 +2347,22 @@ pub const ApiHttpClient = struct {
                 // An executor that cannot identify its send boundary remains
                 // unknown, except for a refused connection that never existed.
                 // An explicit post-send phase always wins over the error name.
-                return error.RaftBatchWriteOutcomeUnknown;
+                // Keep transport ambiguity distinct inside the data-plane
+                // router. The public API deliberately collapses both forms
+                // to `RaftBatchWriteOutcomeUnknown`, but production
+                // diagnostics and deterministic tests need to know whether a
+                // peer explicitly reported an ambiguous proposal or whether
+                // the client lost the response after crossing its send
+                // boundary.
+                std.log.warn("internal group batch transport lost outcome group_id={} delivery={s} timeout_ms={?} err={s}", .{
+                    group_id, @tagName(delivery), timeout_ms, @errorName(err),
+                });
+                return error.RaftBatchWriteTransportOutcomeUnknown;
             }
+            // Local executor saturation is a rejected attempt only while the
+            // transport certifies that no request bytes could have been sent.
+            if (forwarding != null and delivery == .not_sent and err == error.ConcurrencyUnavailable)
+                return error.LeaderUnavailable;
             return err;
         };
         defer resp.deinit(self.alloc);
@@ -2664,6 +2947,8 @@ pub const ApiHttpClient = struct {
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
+            400 => return error.InvalidBatchRequest,
+            413 => return error.TransactionTooLarge,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -3046,8 +3331,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body);
+        return .{
+            .status = resp.status,
+            .outcome = outcome,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn dropTable(
@@ -3065,8 +3354,10 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 204 and resp.status != 202) return error.UnexpectedHttpStatus;
-        return .{};
+        return .{
+            .status = resp.status,
+            .outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body),
+        };
     }
 
     pub fn updateTableSchema(
@@ -3087,8 +3378,12 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+        const outcome = try tableMutationOutcome(self.alloc, resp.status, resp.body);
+        return .{
+            .status = resp.status,
+            .outcome = outcome,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
     }
 
     pub fn fetchTableIndexes(
@@ -3554,6 +3849,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged") or std.mem.eql(u8, body, "topology changed")) return error.TopologyChanged;
@@ -3618,6 +3914,7 @@ test "api http client preserves public batch retry safety classifications" {
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
     if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
         return error.StorageReadTemporarilyUnavailable;
     }
@@ -3786,6 +4083,17 @@ test "api http client encodes lookup route and query components" {
         "title,owner&admin",
     );
     defer response.deinit(std.testing.allocator);
+}
+
+test "api http client preserves transaction size admission failures" {
+    const Executor = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            return .{ .status = 413, .body = try alloc.dupe(u8, "transaction exceeds preparation capacity") };
+        }
+    };
+    var marker: u8 = 0;
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &marker, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.TransactionTooLarge, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "docs", "{}"));
 }
 
 test "api http client preserves retryable group transaction unavailability" {
@@ -4078,6 +4386,50 @@ test "api http client forwards internal query controls and maps remote timeout" 
     try std.testing.expectEqual(@as(usize, 14), executor.calls);
 }
 
+test "api http client preserves exact-group join unavailability and absence" {
+    const StatusExecutor = struct {
+        status: u16,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "/join-") != null);
+            return .{
+                .status = self.status,
+                .body = try alloc.dupe(u8, if (self.status == 503) "join unavailable" else "not found"),
+            };
+        }
+    };
+
+    const base_uri = "http://127.0.0.1:1";
+    var executor = StatusExecutor{ .status = 503 };
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.DistributedQueryUnavailable, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
+
+    executor.status = 404;
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.UnknownGroup, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    try std.testing.expectError(error.NotFound, client.fetchGroupJoinJobState(base_uri, 7, "docs", "{}"));
+
+    for ([_]u16{ 408, 504 }) |status| {
+        executor.status = status;
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinPartitionWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinRowsWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinUnmatchedWithTimeout(base_uri, 7, "docs", "{}", 37));
+        try std.testing.expectError(error.Timeout, client.fetchGroupJoinFinalizeWithTimeout(base_uri, 7, "docs", "{}", 37));
+    }
+}
+
 test "api http client encodes table name for repair cancel callback" {
     const CancelExecutor = struct {
         fn executor(self: *@This()) http_common.RequestExecutor {
@@ -4153,7 +4505,14 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.IdentityReadGenerationChanged, client.fetchGroupGraphExpand(base_uri, 7, "docs", "{}"));
 
+    conflict_executor.body = "IndexGenerationMismatch";
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+
     conflict_executor.status = 503;
+    conflict_executor.body = "GenerationTransitionActive";
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 
@@ -4235,6 +4594,50 @@ test "api http client forwards bounded raft batch routing context without alloca
     response.deinit(std.testing.allocator);
 }
 
+test "internal service request signing uses the transport clock authority" {
+    const alloc = std.testing.allocator;
+    const config: internal_service_auth.Config = .{
+        .secret = "0123456789abcdef0123456789abcdef",
+        .issuer = "cluster-a",
+    };
+    const expected = try internal_service_auth.tokenAlloc(alloc, config, 42);
+    defer alloc.free(expected);
+
+    const Executor = struct {
+        expected: []const u8,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+                .realtime_ns_fn = realtimeNs,
+            };
+        }
+
+        fn realtimeNs(_: *anyopaque) i128 {
+            return 42 * std.time.ns_per_s;
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(
+                self.expected,
+                request.header(internal_service_auth.header_name).?,
+            );
+            return .{ .status = 200, .body = @constCast((&[_]u8{})[0..]) };
+        }
+    };
+
+    var executor = Executor{ .expected = expected };
+    var client = ApiHttpClient.init(alloc, executor.iface());
+    _ = client.withInternalServiceAuth(config.secret, config.issuer);
+    var response = try client.executeRequest(.{
+        .method = .GET,
+        .uri = "http://node/internal/v1/status",
+    });
+    response.deinit(alloc);
+}
+
 test "api http client authenticates only the internal API namespace" {
     const CaptureExecutor = struct {
         expected_internal: bool = false,
@@ -4272,6 +4675,9 @@ test "api http client authenticates only the internal API namespace" {
         .headers = &spoofed_headers,
     });
     nested.deinit(std.testing.allocator);
+
+    var maintenance = try client.fetchGroupGraphMetricMaintenance("http://node:8080", 7, "docs", "{}");
+    maintenance.deinit(std.testing.allocator);
 
     capture.expected_internal = false;
     var public = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status" });
@@ -4371,6 +4777,8 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
             marked_timeout,
             failure_before_send,
             failure_after_send,
+            capacity_before_send,
+            capacity_after_send,
             refused_after_send,
             failure_unknown,
         };
@@ -4417,6 +4825,14 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
                     tracker.markMayHaveBeenSent();
                     return error.OutOfMemory;
                 },
+                .capacity_before_send => {
+                    tracker.markNotSent();
+                    return error.ConcurrencyUnavailable;
+                },
+                .capacity_after_send => {
+                    tracker.markMayHaveBeenSent();
+                    return error.ConcurrencyUnavailable;
+                },
                 .refused_after_send => {
                     tracker.markMayHaveBeenSent();
                     return error.ConnectionRefused;
@@ -4456,13 +4872,19 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
     try std.testing.expectError(error.OutOfMemory, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_after_send;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .capacity_before_send;
+    try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .capacity_after_send;
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .refused_after_send;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_unknown;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 }
 
 test "fenced backup forwarding treats post-send transport failure as ambiguous" {
@@ -5022,7 +5444,9 @@ test "api http client round-trips public transaction commit route" {
     const table_writes = @import("table_writes.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-txn";
+    var path_tmp = try TestDirectory.init("antfly-api-http-client-txn");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -5037,7 +5461,7 @@ test "api http client round-trips public transaction commit route" {
         .timestamp_ns = 11,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -5119,7 +5543,9 @@ test "api http client round-trips long-lived public transaction session routes" 
     const raft_mod = @import("../raft/mod.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-session-txn";
+    var path_tmp = try TestDirectory.init("antfly-api-http-client-session-txn");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -5134,7 +5560,7 @@ test "api http client round-trips long-lived public transaction session routes" 
         .timestamp_ns = 7,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -5427,5 +5853,45 @@ test "api http client transports txn resolve cancellation and visibility reason"
     try std.testing.expectError(
         error.EnrichmentWorkerFailed,
         client.fetchGroupTxnResolveWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 137, &cancellation),
+    );
+}
+
+test "table mutation outcomes preserve committed nonterminal success" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(
+        TableMutationOutcome.applied,
+        try tableMutationOutcome(alloc, 200, "{}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.applied,
+        try tableMutationOutcome(alloc, 204, ""),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_visibility_pending,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_visibility_pending\",\"poll_after_ms\":50}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_superseded,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_superseded\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_repair_required,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_repair_required\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_repair_unavailable,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"committed_repair_unavailable\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_unknown,
+        try tableMutationOutcome(alloc, 202, "{\"status\":\"future_outcome\"}"),
+    );
+    try std.testing.expectEqual(
+        TableMutationOutcome.committed_unknown,
+        try tableMutationOutcome(alloc, 202, "not-json"),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        tableMutationOutcome(alloc, 500, "{}"),
     );
 }
