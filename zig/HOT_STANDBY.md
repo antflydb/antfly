@@ -796,6 +796,41 @@ follow`, and `patronictl switchover`. The command keeps its `ha` noun; the four
 availability modes are summarized in `STORAGE.md`, and `ha` is the only one
 with hand-operated verbs.
 
+### Naming
+
+The command, config section, and admin API currently use the noun `ha`. That
+is ambiguous: Raft replication, Lite's fsync durability, and serverless
+object storage are also availability stories, and `STORAGE.md` lists all four.
+The decision for v0.3 is to rename this surface to **`standby`**:
+
+| Surface | Today | v0.3 |
+|---|---|---|
+| CLI | `antfly ha` | `antfly standby` (`ha` kept as a hidden alias for one minor) |
+| Config section | `ha:` | `hot_standby:` (covers both roles; PostgreSQL's `hot_standby` is the precedent) |
+| Admin API | `/admin/v1/ha/...`, `/ha/v1/health`, `/ha/v1/ready` | `/admin/v1/standby/...`, `/standby/v1/...`; old paths served as aliases for one minor |
+| Schemas and SDKs | `HAIdentity`, `HAFenceReceipt`, `HAStandbySnapshot`, ... | `StandbyIdentity`, `StandbyFenceReceipt`, `StandbySnapshot`, ... |
+| Operator CRD | `spec.highAvailability` | unchanged; a CRD field rename needs a new API version and conversion, and `highAvailability` remains a sensible umbrella |
+| Admin token env | `ANTFLY_HA_ADMIN_TOKEN` | kept; `ANTFLY_STANDBY_ADMIN_TOKEN` may be added with the old name as fallback |
+| Metrics | subsystem `ha` | `standby`, dual-emitted during the deprecation window |
+| Internal package | `storage/ha` | unchanged; not user-facing |
+
+`replication` was considered and rejected because it already names three
+different things in Antfly: `replication_factor` (Raft replicas of a shard),
+`replication_sources` and the `ReplicationSource*` schemas (CDC from
+PostgreSQL), and the replication slots and log of this feature. A user who
+sets `replication_sources` on a table and then runs `antfly replication
+status` would reasonably assume they are the same mechanism. `standby` is the
+one noun nothing else uses, it is what PostgreSQL's documentation calls the
+feature, and it already matches the CRD (`spec.highAvailability.standbys`),
+the schemas, and this document's filename. The verbs read as they do in
+repmgr: `antfly standby promote`, `antfly standby follow`, `antfly standby
+switchover`.
+
+Compatibility follows the same rule as every other change to this surface:
+the server accepts both spellings for one minor release, and the Kubernetes
+operator switches to the new ones only once its minimum supported server
+version has them.
+
 ### Target resolution
 
 Every `antfly ha` invocation resolves exactly one target before the verb runs.

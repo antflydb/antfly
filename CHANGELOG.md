@@ -10,6 +10,10 @@ All notable changes to Antfly will be documented in this file.
 - **Relational storage** — closed schemas with foreign keys and PostgreSQL-compatible types, with full-text, vector, sparse, graph, and algebraic indexes derived over the same rows
 - **Lake tables** — Iceberg and Parquet queried in place over object storage
 - **Graph analytics** — PageRank and eigenvector centrality in graph indexes
+- **Hot standby naming** — `antfly ha`, the `ha` config section, and the
+  `/admin/v1/ha` API become `antfly standby`, `hot_standby`, and
+  `/admin/v1/standby`, with the old spellings kept as aliases for one minor
+  release (decision recorded in `zig/HOT_STANDBY.md`, "Naming")
 - **Build system** — shorter compile times and lower build memory
 
 ## Releases
