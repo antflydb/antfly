@@ -14,6 +14,8 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const storage_source_options = @import("storage_source_options");
+const control_only_storage_sources = storage_source_options.control_only;
 const fs_paths = @import("../common/fs_paths.zig");
 const common_group_ids = @import("../common/group_ids.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -53,9 +55,12 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_operation = @import("../api/operation.zig");
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const api_table_router = @import("../api/table_router.zig");
-const api_table_writes = @import("../api/table_writes.zig");
+const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = if (control_only_storage_sources)
+    @import("../storage/db/control_root.zig")
+else
+    @import("antfly_source_root").antfly_sources.selected_db;
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
@@ -4312,6 +4317,7 @@ pub const MetadataService = struct {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         if (self.routed_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
         if (self.local_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
         var fallback = metadata_mod.FallbackLocalShardDbAdapter{
             .replica_root_dir = replica_root_dir,
@@ -6111,7 +6117,9 @@ pub const MetadataService = struct {
                 .tables = tables,
                 .ranges = ranges,
             });
-        } else owner: {
+        } else if (comptime control_only_storage_sources)
+            return error.StorageKernelOwnerUnavailable
+        else owner: {
             const backend_runtime = try self.ensureBackendRuntime();
             break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
                 self.alloc,
@@ -6144,16 +6152,25 @@ pub const MetadataService = struct {
         ranges: []const metadata_table_manager.RangeRecord,
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
+        // A control compilation unit obtains durable restore markers from the
+        // resident data/storage owner. Until that adapter is installed, retain
+        // the projected state and retry instead of treating it as absent.
+        if (comptime control_only_storage_sources) {
+            if (self.local_shard_db_adapter == null) return;
+        }
         const local_node_id = self.raft.host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressWithOptions(
             self.alloc,
-            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
             group_ids,
             tables,
             ranges,
+            .{
+                .shared_io = if (comptime control_only_storage_sources) null else (try self.ensureBackendRuntime()).io(),
+                .shard_db_adapter = self.local_shard_db_adapter,
+            },
         );
         defer {
             for (local_progress) |record| metadata_table_manager.freeRestoreProgress(self.alloc, record);
@@ -6202,6 +6219,10 @@ pub const MetadataService = struct {
             ranges,
             stores,
         )) {
+            // A control unit never opens a physical shard DB. Preserve the
+            // last projected progress until its storage-owner provider has
+            // published authoritative runtime status, then retry next round.
+            if (comptime control_only_storage_sources) return;
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
@@ -6819,6 +6840,7 @@ pub const MetadataHttpService = struct {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         if (self.routed_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
         if (self.local_shard_db_adapter) |adapter| return try adapter.fetchMedianKey(alloc, group_id);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
         var fallback = metadata_mod.FallbackLocalShardDbAdapter{
             .replica_root_dir = replica_root_dir,
@@ -10094,7 +10116,9 @@ pub const MetadataHttpService = struct {
                 .tables = inputs.tables,
                 .ranges = inputs.ranges,
             });
-        } else owner: {
+        } else if (comptime control_only_storage_sources)
+            return error.StorageKernelOwnerUnavailable
+        else owner: {
             const backend_runtime = try self.ensureBackendRuntime();
             break :owner try metadata_table_provisioner.reconcileReplicaRootWithOptions(
                 self.alloc,
@@ -10128,16 +10152,24 @@ pub const MetadataHttpService = struct {
         projected_progress: []const metadata_table_manager.RestoreProgressRecord,
     ) !void {
         const replica_root_dir = self.replica_root_dir orelse return;
+        // See the threaded service path above. Never reopen storage from the
+        // control unit merely because the owner adapter has not arrived yet.
+        if (comptime control_only_storage_sources) {
+            if (self.local_shard_db_adapter == null) return;
+        }
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressUsingIo(
+        const local_progress = try metadata_table_provisioner.collectLocalRestoreProgressWithOptions(
             self.alloc,
-            (try self.ensureBackendRuntime()).io(),
             replica_root_dir,
             self.metadata_group_id,
             local_node_id,
             group_ids,
             tables,
             ranges,
+            .{
+                .shared_io = if (comptime control_only_storage_sources) null else (try self.ensureBackendRuntime()).io(),
+                .shard_db_adapter = self.local_shard_db_adapter,
+            },
         );
         defer {
             for (local_progress) |record| metadata_table_manager.freeRestoreProgress(self.alloc, record);
@@ -10184,6 +10216,9 @@ pub const MetadataHttpService = struct {
             inputs.ranges,
             inputs.stores,
         )) {
+            // See the threaded service path above: physical fallback belongs
+            // to the compiled storage owner, never the metadata control unit.
+            if (comptime control_only_storage_sources) return;
             self.alloc.free(local_progress);
             const backend_runtime = try self.ensureBackendRuntime();
             var fallback_shard_db = metadata_mod.FallbackLocalShardDbAdapter{
@@ -12725,6 +12760,10 @@ fn collectLocalGroupStatusReport(
     split_observations: []const transition_state.SplitObservationRecord,
     merge_observations: []const transition_state.MergeObservationRecord,
 ) !?metadata_table_manager.GroupStatusReport {
+    // The normal path is the local data-runtime status provider. A control
+    // unit must not instantiate the old status-only DB fallback while that
+    // provider is starting; retain the previous observation and retry.
+    if (comptime control_only_storage_sources) return null;
     _ = stores;
     _ = merged_group_statuses;
     var db = db_mod.DB.open(alloc, db_path, .{

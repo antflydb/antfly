@@ -29,6 +29,7 @@ pub const AddTestsOptions = struct {
     run_lib_usermgr_tests: *std.Build.Step.Run,
 };
 pub const AddTestsResult = struct {
+    linked_consumer_tests: []const *std.Build.Step.Compile,
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
@@ -37,6 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_connections_tests: *std.Build.Step.Run,
     run_lib_api_storage_authority_tests: *std.Build.Step.Run,
     api_table_writes_docid_test_mod: *std.Build.Module,
+    write_implementation_tests: *std.Build.Step.Compile,
     api_table_reads_docid_test_mod: *std.Build.Module,
     run_lib_api_docid_tests: *std.Build.Step.Run,
     api_derived_coverage_test_mod: *std.Build.Module,
@@ -853,14 +855,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, api_table_writes_docid_test_mod, true, true);
+    test_imports.configureConsumer(b, api_table_writes_docid_test_mod);
     api_table_writes_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const write_implementation_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_table_writes_implementation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, write_implementation_module, true, true);
+    write_implementation_module.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    test_imports.configure(b, api_table_reads_docid_test_mod, true, true);
+    test_imports.configureConsumer(b, api_table_reads_docid_test_mod);
     api_table_reads_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
@@ -896,7 +905,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const api_table_writes_docid_tests = b.addTest(.{
+    const api_table_writes_docid_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-table-write-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = selectTestFilters(b, &.{
             "auto bulk group writes release leases so idle finish can publish",
@@ -1017,7 +1027,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const api_table_reads_docid_tests = b.addTest(.{
+    const api_table_reads_linked_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-table-read-tests",
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "table reads translate request deadlines into the routing clock",
@@ -1215,7 +1226,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
     lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
     const lib_api_distributed_query_availability_runtime_filters = &.{"distributed query transport failures become one retryable availability condition"};
-    const lib_api_distributed_query_availability_tests = b.addTest(.{
+    const lib_api_distributed_query_availability_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-distributed-query-availability-tests",
         .root_module = api_table_reads_docid_test_mod,
         .filters = lib_api_distributed_query_availability_runtime_filters,
         .test_runner = .{
@@ -1223,11 +1235,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_lib_api_distributed_query_availability_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        lib_api_distributed_query_availability_tests,
-        lib_api_distributed_query_availability_runtime_filters,
-    );
+    const run_lib_api_distributed_query_availability_tests = lib_api_distributed_query_availability_tests.run(b);
     const lib_api_distributed_query_availability_test_step = b.step(
         "lib-api-distributed-query-availability-test",
         "Run retryable distributed-query transport classification regressions",
@@ -1437,17 +1445,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         lib_serverless_docid_runtime_filters,
     );
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
+    const write_implementation_tests = b.addTest(.{
+        .name = "api-table-write-implementation-tests",
+        .root_module = write_implementation_module,
+        .filters = &.{"api.table_reads.implementationTests."},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
+    const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
-    const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
-    const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
-    const api_table_writes_production_regression_tests = b.addTest(.{
+    const api_table_writes_production_regression_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-table-write-lifecycle-tests",
         .root_module = api_table_writes_docid_test_mod,
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
@@ -1675,9 +1691,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "manual generation runtime uses an explicit filesystem io authority",
             "provisioned table write source borrows runtime IO without native fallback",
         },
-    });
-    const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
-    const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
+    }, write_implementation_tests);
+    const run_api_table_writes_production_regression_tests = api_table_writes_production_regression_tests.run(b);
+    const run_api_table_writes_production_regression_unit_tests = api_table_writes_production_regression_tests.run(b);
     // These stateful suites each open several DB/index runtimes. Keep their
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
     // aggregate memory pressure into allocator failures. Focused aliases use
@@ -1685,7 +1701,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
     const api_table_writes_production_regression_step = b.step("antfly-api-table-writes-lifecycle-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
-    const api_create_structural_retry_tests = b.addTest(.{
+    const api_create_structural_retry_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-table-create-retry-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "provisioned table write source create table provisions local indexes and schema",
@@ -1695,14 +1712,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-    });
-    const run_api_create_structural_retry_tests = addFilteredTestRunArtifact(b, api_create_structural_retry_tests);
+    }, write_implementation_tests);
+    const run_api_create_structural_retry_tests = api_create_structural_retry_tests.run(b);
     const api_create_structural_retry_step = b.step(
         "antfly-api-create-structural-retry-test",
         "Run isolated create metadata and structural-publication regressions",
     );
     api_create_structural_retry_step.dependOn(&run_api_create_structural_retry_tests.step);
-    const api_table_writes_restore_repeat_tests = b.addTest(.{
+    const api_table_writes_restore_repeat_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-table-restore-repeat-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "provisioned native backup restore repeats through shared read and write owners",
@@ -1716,8 +1734,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-    });
-    const run_api_table_writes_restore_repeat_tests = addFilteredTestRunArtifact(b, api_table_writes_restore_repeat_tests);
+    }, write_implementation_tests);
+    const run_api_table_writes_restore_repeat_tests = api_table_writes_restore_repeat_tests.run(b);
     const api_table_writes_restore_repeat_step = b.step("antfly-api-table-writes-restore-repeat-test", "Run focused native restore identity and shared-owner regressions");
     api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const lib_docid_lifecycle_runtime_filters: []const []const u8 = &.{
@@ -1841,6 +1859,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_connections_tests = run_lib_api_connections_tests,
         .run_lib_api_storage_authority_tests = run_lib_api_storage_authority_tests,
         .api_table_writes_docid_test_mod = api_table_writes_docid_test_mod,
+        .write_implementation_tests = write_implementation_tests,
         .api_table_reads_docid_test_mod = api_table_reads_docid_test_mod,
         .run_lib_api_docid_tests = run_lib_api_docid_tests,
         .api_derived_coverage_test_mod = api_derived_coverage_test_mod,
@@ -1849,6 +1868,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_table_writes_production_regression_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

@@ -17,7 +17,8 @@ const antfly = @import("../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
-const standalone_runtime = @import("../standalone/runtime.zig");
+const kernel_owner_abi = @import("kernel_owner_abi");
+const local_query_client = @import("local_query_client");
 const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
@@ -113,7 +114,10 @@ fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []c
     if (std.mem.eql(u8, subcommand, "check")) return try check(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "compact")) return try compact(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(allocator, io, args);
-    if (std.mem.eql(u8, subcommand, "serve")) return try serve(init, args);
+    if (std.mem.eql(u8, subcommand, "serve")) {
+        if (comptime antfly.build_options.linked_storage) return error.InvalidArguments;
+        return try lite_serve.run(init, args);
+    }
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -957,89 +961,14 @@ fn compactLite(lite: *LiteDb) !CompactReport {
     };
 }
 
-const ServeOptions = struct {
-    path: []const u8,
-    addr: []const u8 = "127.0.0.1:8080",
-    fsync: bool = true,
-    standalone_args: std.ArrayListUnmanaged([]const u8) = .empty,
-
-    fn deinit(self: *ServeOptions, alloc: std.mem.Allocator) void {
-        self.standalone_args.deinit(alloc);
-    }
-};
-
-const LiteListenAddress = struct {
-    host: []const u8,
-    port: u16,
-};
-
-fn serve(init: std.process.Init, args: *std.process.Args.Iterator) !void {
-    var opts = try parseServeOptions(init.gpa, args);
-    defer opts.deinit(init.gpa);
-    return try serveWithOptions(init, opts);
-}
-
-fn serveWithOptions(init: std.process.Init, opts: ServeOptions) !void {
-    try requireAflitePath(opts.path);
-    const listen = try parseLiteListenAddress(opts.addr);
-    return try standalone_runtime.runLite(init, opts.path, listen.host, listen.port, opts.fsync, opts.standalone_args.items);
-}
-
-fn parseServeOptions(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !ServeOptions {
-    const path = args.next() orelse {
-        std.debug.print("error: database path is required\n", .{});
-        return error.InvalidArguments;
-    };
-    var opts: ServeOptions = .{ .path = path };
-    errdefer opts.deinit(alloc);
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--addr")) {
-            opts.addr = args.next() orelse {
-                std.debug.print("error: --addr value is required\n", .{});
-                return error.InvalidArguments;
-            };
-        } else if (std.mem.eql(u8, arg, "--fsync")) {
-            opts.fsync = parseLiteBool(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
-        } else if (std.mem.startsWith(u8, arg, "--fsync=")) {
-            opts.fsync = parseLiteBool(arg["--fsync=".len..]) orelse return error.InvalidArguments;
-        } else if (isReservedLiteServeFlag(arg)) {
-            std.debug.print("error: {s} is controlled by antfly lite serve\n", .{arg});
-            return error.InvalidArguments;
-        } else {
-            try opts.standalone_args.append(alloc, arg);
-        }
-    }
-    return opts;
-}
-
-fn isReservedLiteServeFlag(arg: []const u8) bool {
-    for ([_][]const u8{ "--storage-engine", "--storage-path", "--host", "--port" }) |flag| {
-        if (std.mem.eql(u8, arg, flag) or (arg.len > flag.len and std.mem.startsWith(u8, arg, flag) and arg[flag.len] == '=')) return true;
-    }
-    return false;
-}
-
-fn parseLiteBool(value: []const u8) ?bool {
-    if (std.mem.eql(u8, value, "true")) return true;
-    if (std.mem.eql(u8, value, "false")) return false;
-    return null;
-}
-
-fn parseLiteListenAddress(addr: []const u8) !LiteListenAddress {
-    const sep = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return error.InvalidArguments;
-    if (sep == 0 or sep + 1 >= addr.len) return error.InvalidArguments;
-    const port = try std.fmt.parseInt(u16, addr[sep + 1 ..], 10);
-    const host = addr[0..sep];
-    if (!isLiteLocalListenHost(host)) return error.InvalidArguments;
-    return .{ .host = host, .port = port };
-}
-
-fn isLiteLocalListenHost(host: []const u8) bool {
-    return std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "127.0.0.1") or
-        std.mem.eql(u8, host, "::1") or
-        std.mem.eql(u8, host, "[::1]");
-}
+const lite_serve = if (antfly.build_options.linked_storage) struct {} else @import("antfly_source_root").antfly_sources.lite_serve;
+const ServeOptions = lite_serve.ServeOptions;
+const LiteListenAddress = lite_serve.LiteListenAddress;
+const parseServeOptions = lite_serve.parseServeOptions;
+const isReservedLiteServeFlag = lite_serve.isReservedLiteServeFlag;
+const parseLiteBool = lite_serve.parseLiteBool;
+const parseLiteListenAddress = lite_serve.parseLiteListenAddress;
+const isLiteLocalListenHost = lite_serve.isLiteLocalListenHost;
 
 fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     var owned = try batch_api.parseBatchRequest(allocator, body);
@@ -1104,6 +1033,23 @@ fn scanJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
 }
 
 fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
+    if (comptime antfly.build_options.linked_storage) {
+        var failure: kernel_owner_abi.FailureIdentity = .{};
+        const response = try local_query_client.executeJsonAlloc(
+            allocator,
+            @ptrCast(db),
+            "docs",
+            body,
+            .public,
+            .{},
+            null,
+            null,
+            null,
+            &failure,
+        );
+        return response.json;
+    }
+
     var owned = try query_api.parsePublicQueryRequest(
         allocator,
         null,

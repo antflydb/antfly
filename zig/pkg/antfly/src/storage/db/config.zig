@@ -299,14 +299,7 @@ pub const sparse_lsm_options_default = graph_reverse_lsm_options_default;
 /// transition. A missing source means the DB is a standalone owner and may
 /// cut over locally; provisioned/distributed DBs always install a source that
 /// remains closed until every possible shard owner advertises support.
-pub const DenseNativeMigrationPolicySource = struct {
-    ptr: *const anyopaque,
-    authority_permitted: *const fn (ptr: *const anyopaque) bool,
-
-    pub fn authorityPermitted(self: @This()) bool {
-        return self.authority_permitted(self.ptr);
-    }
-};
+pub const DenseNativeMigrationPolicySource = @import("runtime_callbacks.zig").DenseNativeMigrationPolicySource;
 
 pub const IndexBackendOptions = struct {
     text_main_backend: persistent_mod.MainBackend = .lsm,

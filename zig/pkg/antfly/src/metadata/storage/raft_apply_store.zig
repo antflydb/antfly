@@ -33,24 +33,13 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const AppliedMetadataBatch = struct {
-    commit_index: u64,
-    entries_bytes: []const u8,
-};
+pub const AppliedMetadataBatch = apply_contract.AppliedMetadataBatch;
 
-pub const CatalogProjectionSnapshot = struct {
-    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
-    catalog_revision: u64,
-    tables: []metadata.TableRecord,
-    ranges: []metadata.RangeRecord,
-};
-
-pub const CatalogCursor = struct {
-    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
-    revision: u64,
-};
+pub const CatalogProjectionSnapshot = apply_contract.CatalogProjectionSnapshot;
+pub const CatalogCursor = apply_contract.CatalogCursor;
 
 fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("../../runtime_io_abi.zig").Borrow) !void {
     if (deadline_ns) |deadline| {
@@ -88,6 +77,7 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
+pub const TableTransitionFence = apply_contract.TableTransitionFence;
 /// Exact predecessor wire shape for transition tag 40. Semantic preconditions
 /// must never be smuggled into this JSON object: predecessor binaries ignore
 /// unknown fields, which would let replicas make different apply decisions.
@@ -106,46 +96,8 @@ pub const ExtensionLifecycleTablePrecondition = struct {
     definition_fingerprint: metadata_table_manager.TableDefinitionFingerprint,
 };
 
-pub const TableTransitionFence = struct {
-    generation: u64 = 0,
-    active_count: u32 = 0,
-    range_membership: topology_protocol.RangeMembershipAccumulator = .{},
-
-    pub fn active(self: @This()) bool {
-        return self.active_count != 0;
-    }
-
-    pub fn membership(self: @This(), table_id: u64) topology_protocol.RangeMembership {
-        return self.range_membership.finish(table_id);
-    }
-};
-
-pub const TableRestoreAdmission = struct {
-    /// Fence value the create command must compare at apply time.
-    expected_transition_generation: u64,
-    /// Stable generation used to derive this incarnation's physical groups.
-    /// After a successful create the fence advances, so exact retries use the
-    /// predecessor generation rather than accidentally deriving new groups.
-    incarnation_generation: u64,
-    already_applied: bool,
-};
-
-pub const TableDropProjection = struct {
-    table: metadata.TableRecord,
-    fence: TableTransitionFence,
-    extension_owned: bool,
-    /// Exact range ids covered by `fence.range_membership` in the same read
-    /// transaction. The mutation keeps the compact proof on the Raft log;
-    /// callers retain these ids only as the post-commit storage cleanup
-    /// contract.
-    range_group_ids: []u64,
-
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.range_group_ids);
-        metadata_table_manager.freeTable(alloc, self.table);
-        self.* = undefined;
-    }
-};
+pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
+pub const TableDropProjection = apply_contract.TableDropProjection;
 
 const derived_catalog_index_version = "3";
 
@@ -1831,80 +1783,17 @@ pub const RaftApplyStoreConfig = struct {
     flush_threshold: usize = 64,
 };
 
-pub const ProjectionSignalKind = enum {
-    metadata_incarnation,
-    table,
-    range,
-    store,
-    placement_intent,
-    reconcile_lease,
-    shuffle_join_lease,
-    split_transition,
-    merge_transition,
-    schema_progress,
-    restore_progress,
-    restore_job,
-    replication_source_status,
-};
-
-pub const ProjectionSignal = struct {
-    kind: ProjectionSignalKind,
-    metadata_group_id: u64,
-    table_name: ?[]const u8 = null,
-    table_id: u64 = 0,
-    group_id: u64 = 0,
-    store_id: u64 = 0,
-    node_id: u64 = 0,
-};
-
-pub const ProjectionListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-    /// When set, the apply store brackets the durable commit and synchronous
-    /// notification for matching projection changes with this listener's
-    /// barrier callbacks. Correctness-sensitive consumers use this to
-    /// serialize a short external publication step with the authoritative
-    /// projection commit; ordinary listeners remain notification-only.
-    commit_barrier_kind: ?ProjectionSignalKind = null,
-
-    pub const VTable = struct {
-        on_projection_signal: *const fn (ptr: *anyopaque, signal: ProjectionSignal) void,
-        before_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
-        after_projection_commit: ?*const fn (ptr: *anyopaque) void = null,
-    };
-
-    pub fn onProjectionSignal(self: ProjectionListener, signal: ProjectionSignal) void {
-        self.vtable.on_projection_signal(self.ptr, signal);
-    }
-
-    fn beginCommitBarrier(self: ProjectionListener) void {
-        if (self.vtable.before_projection_commit) |begin| begin(self.ptr);
-    }
-
-    fn endCommitBarrier(self: ProjectionListener) void {
-        if (self.vtable.after_projection_commit) |end| end(self.ptr);
-    }
-
-    fn validate(self: ProjectionListener) !void {
-        const configured = self.commit_barrier_kind != null;
-        if ((self.vtable.before_projection_commit != null) != configured or
-            (self.vtable.after_projection_commit != null) != configured)
-            return error.InvalidProjectionCommitBarrier;
-    }
-};
-
-pub const CommittedKeySignal = struct {
-    metadata_group_id: u64,
-    key: []const u8,
-};
+pub const ProjectionSignalKind = apply_contract.ProjectionSignalKind;
+pub const ProjectionSignal = apply_contract.ProjectionSignal;
+pub const ProjectionListener = apply_contract.ProjectionListener;
+pub const CommittedKeySignal = apply_contract.CommittedKeySignal;
+pub const CommittedKeyListener = apply_contract.CommittedKeyListener;
 
 /// Stable ownership token for one atomically registered projection/key
 /// listener pair. The token is process-local and deliberately opaque to
 /// callers; teardown uses it to detach exactly the pair it owns while the
 /// apply store is still alive.
-pub const LifecycleListenerRegistration = struct {
-    id: u64,
-};
+pub const LifecycleListenerRegistration = @import("raft_apply_contract.zig").LifecycleListenerRegistration;
 
 const RegisteredProjectionListener = struct {
     registration_id: ?u64 = null,
@@ -1936,21 +1825,6 @@ fn lockLifecycleDetachApplyMutex(mutex: *std.Io.Mutex, io: std.Io) void {
     }
     mutex.lockUncancelable(io);
 }
-
-pub const CommittedKeyListener = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        matches_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) bool,
-        on_committed_key: *const fn (ptr: *anyopaque, signal: CommittedKeySignal) void,
-    };
-
-    pub fn onCommittedKey(self: CommittedKeyListener, signal: CommittedKeySignal) void {
-        if (!self.vtable.matches_key(self.ptr, signal)) return;
-        self.vtable.on_committed_key(self.ptr, signal);
-    }
-};
 
 pub const CommittedTransitionDelta = union(enum) {
     upsert_split: metadata.SplitTransitionRecord,
@@ -2344,10 +2218,13 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listPlacementIntents(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]raft_reconciler.PlacementIntent {
+        // The in-memory placement projection is updated while a committed
+        // batch holds apply_mutex. Clone it under the same lock so background
+        // snapshot readers cannot copy an intent while apply frees/replaces
+        // its owned bootstrap strings.
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-
         try self.ensurePlacementIntentsLoaded(alloc, group_id);
 
         var count: usize = 0;
@@ -2416,7 +2293,6 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-
         try self.ensurePlacementIntentsLoaded(alloc, metadata_group_id);
 
         var count: usize = 0;

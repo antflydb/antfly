@@ -24,3 +24,6 @@ test {
     _ = @import("serverless/catalog/fs_progress_store.zig");
     _ = @import("serverless/catalog/progress_store.zig");
 }
+
+/// Implementation source choices for this compilation root.
+pub const antfly_sources = @import("source_owner_physical.zig");

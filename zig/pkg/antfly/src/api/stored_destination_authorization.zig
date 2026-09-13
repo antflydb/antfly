@@ -669,3 +669,22 @@ test "stored destination envelopes cannot be forged and validate on resume" {
     try std.testing.expect(destinationConfigFingerprintMatches(raw, raw_indexes, fingerprint));
     try std.testing.expect(!destinationConfigFingerprintMatches(raw, "{}", fingerprint));
 }
+
+test "sink-free replication sources do not require destination credentials" {
+    const alloc = std.testing.allocator;
+    const source =
+        \\[{"type":"postgres","dsn":"postgres://localhost/db","postgres_table":"users"}]
+    ;
+    const live_authorizer: Authorizer = .{ .auth_enabled = true };
+
+    const sealed = try sealReplicationSourcesJsonForPrincipalAlloc(
+        alloc,
+        source,
+        "users",
+        catalog_service_principal,
+        live_authorizer,
+    );
+    defer alloc.free(sealed);
+    try authorizeReplicationSourcesJson(alloc, sealed, "users", live_authorizer);
+    try std.testing.expect(std.mem.indexOf(u8, sealed, grant_field) == null);
+}

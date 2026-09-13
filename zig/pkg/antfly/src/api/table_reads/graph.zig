@@ -15,11 +15,7 @@
 const std = @import("std");
 
 const graph_query_mod = @import("../../graph/query.zig");
-const metadata_mod = @import("../../metadata/domain.zig");
-const raft_mod = @import("../../raft/mod.zig");
-const db_mod = @import("../../storage/db/mod.zig");
-const distributed_graph = @import("../distributed_graph.zig");
-const table_catalog = @import("../table_catalog.zig");
+const db_mod = @import("../../storage/db/control_root.zig");
 
 pub const GraphMetricFanInShardRequest = struct {
     req: db_mod.types.SearchRequest,
@@ -87,150 +83,31 @@ pub fn prepareGraphMetricFanInShardRequest(
     return .{ .req = out, .graph_queries = graph_queries };
 }
 
-pub fn graphHydrateRequestHasResolvedDocFilter(req: distributed_graph.GraphHydrateRequest) bool {
-    return req.resolved_doc_filter != null;
-}
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "multi-shard reads fail closed for shard-local graph metric scores" {
+            const metric_req = db_mod.types.SearchRequest{
+                .graph_metric_queries = &.{.{
+                    .name = "central",
+                    .query = .{ .index_name = "graph_idx", .metric_name = "pagerank" },
+                }},
+            };
+            try rejectNonGlobalGraphMetricFanout(1, metric_req);
+            try std.testing.expectError(error.GraphMetricGlobalMaterializationRequired, rejectNonGlobalGraphMetricFanout(2, metric_req));
 
-pub fn requiresDistributedGraphCoordinator(
-    group_count: usize,
-    req: db_mod.types.SearchRequest,
-) bool {
-    return distributed_graph.supportsCrossRange(req) and
-        (group_count > 1 or req.graph_table_read_authorizer != null);
-}
-
-pub fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
-    if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
-    const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
-    if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
-    const generation = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-    if (generation != ctx.identity_read_generation) return error.IdentityReadGenerationChanged;
-}
-
-pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_mod.types.SearchRequest {
-    return .{
-        .query = .{ .match_all = {} },
-        .filter_query_json = req.filter_query_json,
-        .exclusion_query_json = req.exclusion_query_json,
-        .include_stored = req.include_stored,
-        .fields = req.fields,
-        .include_all_fields = req.include_all_fields,
-        .resolved_doc_filter = req.resolved_doc_filter,
-        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
-        .identity_read_generation = req.identity_read_generation,
-        .execution_deadline_ns = distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
-        .cancellation = req.cancellation,
+            const traversal_only = db_mod.types.SearchRequest{ .graph_queries = &.{.{
+                .name = "neighbors",
+                .query = .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"doc-a"} } },
+            }} };
+            try rejectNonGlobalGraphMetricFanout(2, traversal_only);
+        }
     };
+    return Suite;
 }
-
-fn prepareGraphSearchConsistency(
-    reads: raft_mod.FeatureDBReads,
-    req: db_mod.types.SearchRequest,
-    consistency: raft_mod.ReadConsistency,
-    fallback_to_stale_on_not_leader: bool,
-) !void {
-    reads.reads.prepareSearchWithConsistency(reads.group_id, req, consistency) catch |err| switch (err) {
-        error.NotLeader => {
-            if (!fallback_to_stale_on_not_leader or consistency == .stale) return err;
-            try reads.reads.prepareSearchWithConsistency(reads.group_id, req, .stale);
-        },
-        else => return err,
-    };
-}
-
-pub fn graphHydrateOnPreparedDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    req: distributed_graph.GraphHydrateRequest,
-    search_req: db_mod.types.SearchRequest,
-) !distributed_graph.GraphHydrateResponse {
-    if (req.incoming_index_name.len > 0 and !req.incoming_index_identity.valid()) return error.InvalidArgument;
-    const hits = if (req.include_hits)
-        try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
-    else
-        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-    errdefer {
-        for (hits) |*hit| hit.deinit(alloc);
-        if (hits.len > 0) alloc.free(hits);
-    }
-    return .{
-        .hits = hits,
-        .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys, .{
-                .generation = req.incoming_index_identity.incarnation,
-                .config_fingerprint = req.incoming_index_identity.config_hash,
-            }, req.identity_read_generation)
-        else
-            @constCast((&[_]bool{})[0..]),
-        .incoming_index_identity = req.incoming_index_identity,
-    };
-}
-
-pub fn graphHydrateOnOpenDb(
-    alloc: std.mem.Allocator,
-    reads: raft_mod.FeatureDBReads,
-    db: *db_mod.DB,
-    req: distributed_graph.GraphHydrateRequest,
-    consistency: raft_mod.ReadConsistency,
-    fallback_to_stale_on_not_leader: bool,
-) !distributed_graph.GraphHydrateResponse {
-    const search_req = graphHydrateSearchRequest(req);
-    try prepareGraphSearchConsistency(reads, search_req, consistency, fallback_to_stale_on_not_leader);
-    return try graphHydrateOnPreparedDb(alloc, db, req, search_req);
-}
-
-pub const OpenProvisionedQueryDbFn = fn (
-    alloc: std.mem.Allocator,
-    path: []const u8,
-    catalog: table_catalog.CatalogSource,
-    table_name: []const u8,
-    group_id: u64,
-    lsm_root_generation: u64,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-) anyerror!db_mod.DB;
-
-pub fn graphGetEdgesLocal(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    catalog: table_catalog.CatalogSource,
-    requester: raft_mod.ReadableLeaseRequester,
-    group_id: u64,
-    lsm_root_generation: u64,
-    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
-    table_name: []const u8,
-    req: distributed_graph.GraphEdgesRequest,
-    consistency: raft_mod.ReadConsistency,
-    comptime open_db: OpenProvisionedQueryDbFn,
-) anyerror!distributed_graph.GraphEdgesResponse {
-    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, req.topology_epoch);
-    try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-    var db = try open_db(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
-    defer db.close();
-    _ = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-
-    const reads = raft_mod.FeatureDBReads.init(group_id, requester);
-    try reads.reads.prepareLookupWithConsistency(group_id, req.key, .{}, consistency);
-
-    const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    return .{ .edges = try graph_entry.index.getEdgesByTypes(alloc, req.key, req.edge_types, req.direction) };
-}
-
-test "multi-shard reads fail closed for shard-local graph metric scores" {
-    const metric_req = db_mod.types.SearchRequest{
-        .graph_metric_queries = &.{.{
-            .name = "central",
-            .query = .{ .index_name = "graph_idx", .metric_name = "pagerank" },
-        }},
-    };
-    try rejectNonGlobalGraphMetricFanout(1, metric_req);
-    try std.testing.expectError(error.GraphMetricGlobalMaterializationRequired, rejectNonGlobalGraphMetricFanout(2, metric_req));
-
-    const traversal_only = db_mod.types.SearchRequest{ .graph_queries = &.{.{
-        .name = "neighbors",
-        .query = .{ .query_type = .neighbors, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"doc-a"} } },
-    }} };
-    try rejectNonGlobalGraphMetricFanout(2, traversal_only);
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

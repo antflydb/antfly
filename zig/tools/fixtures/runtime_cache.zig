@@ -197,10 +197,12 @@ pub fn build(b: *std.Build) void {
         \\extern fn probe_serverless() u64;
         \\extern fn probe_inference() u64;
         \\extern fn probe_api_kernel() u64;
+        \\extern fn probe_storage_kernel() u64;
+        \\extern fn probe_enrichment_compute() u64;
         \\pub fn main() void {
-        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x}\n", .{
+        \\    std.debug.print("CACHE_PROBE {s} {x} {x} {x} {x} {x} {x} {x}\n", .{
         \\        @import("build_info").version(), probe_cli(), probe_distributed(),
-        \\        probe_serverless(), probe_inference(), probe_api_kernel(),
+        \\        probe_serverless(), probe_inference(), probe_api_kernel(), probe_storage_kernel(), probe_enrichment_compute(),
         \\    });
         \\}
     );
@@ -282,7 +284,7 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
-        if (unit != .distributed and std.mem.eql(u8, name, "antfly_lite_options"))
+        if (unit != .distributed and unit != .storage_kernel and std.mem.eql(u8, name, "antfly_lite_options"))
             std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});

@@ -17,6 +17,8 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
+    storage_boundary: @import("storage_boundary.zig").Modules,
+    boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
@@ -252,6 +254,16 @@ pub const AntflyRootImports = struct {
         addSnowballModule(b, mod);
     }
 
+    pub fn configureEnrichment(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        const options = b.addOptions();
+        options.addOption(bool, "bench_minimal_deps", false);
+        mod.addOptions("build_options", options);
+        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
+        mod.addImport("antfly_platform", self.platform);
+        mod.link_libc = link_libc;
+        inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| self.addImport(mod, field);
+    }
+
     pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         inline for (api_imports) |field| self.addImport(mod, field);
@@ -275,6 +287,7 @@ pub const AntflyRootImports = struct {
     }
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);
         if (link_libc and !self.platform_link_libc) {

@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_edge_type = @import("../graph/edge_type.zig");
@@ -29,7 +29,7 @@ const graph_mod = @import("../graph/graph.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
 const rfc3339 = @import("../common/rfc3339.zig");
 const fusion_mod = @import("../search/fusion.zig");
-const aggregations_mod = @import("../storage/db/aggregations.zig");
+const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
 const public_search_request_mod = @import("public_search_request.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
@@ -233,30 +233,6 @@ fn expectPublicExactSortRejectionMappingForTest() !void {
     const unknown_internal = publicExactSortRejection("missing_private_planner_state", "private_detail");
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.reason);
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.detail);
-}
-
-test "public query sort tuple contract rejects unknown order_by properties" {
-    const alloc = std.testing.allocator;
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortTupleContract(
-        alloc,
-        "{\"order_by\":[{\"field\":\"created_at\",\"descc\":true}]}",
-    ));
-
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.detail);
-}
-
-test "public query sort tuple contract accepts known order_by properties" {
-    const alloc = std.testing.allocator;
-    db_mod.resetLastSortRejectionDiagnostic();
-    try validatePublicQuerySortTupleContract(
-        alloc,
-        "{\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]}",
-    );
-    try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 }
 
 pub fn parseTotalHitsRelation(value: []const u8) !db_mod.types.TotalHitsRelation {
@@ -470,64 +446,6 @@ fn graphResponseFormat(req: db_mod.types.SearchRequest) !GraphResponseFormat {
     const transport = req.graph_query_transport orelse return error.InvalidRemoteResponse;
     if (!transport.matchesOperations(req.graph_queries)) return error.InvalidRemoteResponse;
     return transport.dialect;
-}
-
-test "graph response format uses admitted metadata and fails closed on plan drift" {
-    const queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "walk",
-        .query = .{
-            .query_type = .traverse,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-        },
-    }};
-    try std.testing.expectEqual(GraphResponseFormat.canonical, try graphResponseFormat(
-        .{
-            .graph_queries = &queries,
-            .graph_query_transport = .{
-                .dialect = .canonical,
-                .operations_json = "{\"walk\":{}}",
-                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
-                .admitted_operations_len = queries.len,
-            },
-        },
-    ));
-    try std.testing.expectEqual(GraphResponseFormat.legacy, try graphResponseFormat(
-        .{
-            .graph_queries = &queries,
-            .graph_query_transport = .{
-                .dialect = .legacy,
-                .operations_json = "{\"walk\":{}}",
-                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
-                .admitted_operations_len = queries.len,
-            },
-        },
-    ));
-    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
-        .{
-            .graph_queries = &queries,
-            .graph_query_transport = .{
-                .dialect = .canonical,
-                .operations_json = "{}",
-                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
-                .admitted_operations_len = 0,
-            },
-        },
-    ));
-
-    var same_name_different_plan = queries;
-    same_name_different_plan[0].query.index_name = "other_graph_idx";
-    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
-        .{
-            .graph_queries = &same_name_different_plan,
-            .graph_query_transport = .{
-                .dialect = .canonical,
-                .operations_json = "{\"walk\":{}}",
-                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
-                .admitted_operations_len = queries.len,
-            },
-        },
-    ));
 }
 
 fn appendJsonFieldName(
@@ -2442,6 +2360,7 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
 
 const QueryBodyContractFields = struct {
     has_internal_shard_fields: bool,
+    has_embedding_limits: bool,
     has_public_doc_filter_bindings: bool,
     has_public_hierarchy_controls: bool,
     has_query_timeout: bool,
@@ -2508,13 +2427,6 @@ pub fn validateRawGraphQueriesValueAlloc(
             else => {},
         }
     }
-}
-
-test "public query envelope rejects an explicitly empty graph_queries object" {
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        queryBodyContractFields(std.testing.allocator, "{\"graph_queries\":{}}"),
-    );
 }
 
 /// Validate controls that must be rejected at every public query boundary.
@@ -2622,6 +2534,7 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
+        .has_embedding_limits = objectHasNonNullField(parsed.value.object, "_embedding_limits"),
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
         .has_public_hierarchy_controls = objectHasNonNullField(parsed.value.object, "hierarchy"),
         .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
@@ -2813,11 +2726,15 @@ pub fn parseQueryRequestWithDeadline(
     );
     try ensureQueryDeadline(execution_deadline_ns);
 
-    const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
-    errdefer vector_queries.deinit(alloc);
-    try ensureQueryDeadline(execution_deadline_ns);
-    req.dense_queries = vector_queries.dense;
-    req.sparse_queries = vector_queries.sparse;
+    {
+        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
+        errdefer vector_queries.deinit(alloc);
+        try ensureQueryDeadline(execution_deadline_ns);
+        req.dense_queries = vector_queries.dense;
+        req.sparse_queries = vector_queries.sparse;
+    }
+    if (contract_fields.has_embedding_limits)
+        try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, effective_body);
     req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, request.graph_metric_rerank);
@@ -3409,6 +3326,9 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
+        "\"_index_name\"",
+        "\"_primary_text_index_name\"",
+        "\"_embedding_limits\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -4157,22 +4077,6 @@ fn indexScoresJsonValue(
     return out;
 }
 
-test "api query contract serializes fused index scores" {
-    const alloc = std.testing.allocator;
-    const scores = [_]fusion_mod.IndexScore{
-        .{ .index_name = "text_idx", .score = 0.75 },
-        .{ .index_name = "semantic_idx", .score = 0.25 },
-    };
-
-    var value = (try indexScoresJsonValue(alloc, &scores)).?;
-    defer value.deinit(alloc);
-
-    const object = value.map;
-    try std.testing.expectEqual(@as(usize, 2), object.count());
-    try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?);
-    try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?);
-}
-
 fn expectSortProfileDiagnosticsSerializationForTest() !void {
     const alloc = std.testing.allocator;
 
@@ -4283,721 +4187,6 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expect(sort.get("distributed_shard_window") == null);
 }
 
-test "api query contract serializes sort profile diagnostics" {
-    try expectSortProfileDiagnosticsSerializationForTest();
-}
-
-test "api query contract maps public exact sort rejection diagnostics" {
-    try expectPublicExactSortRejectionMappingForTest();
-}
-
-test "api query contract serializes ordered hit sort tuple" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    const sort_values = try alloc.alloc(std.json.Value, 2);
-    sort_values[0] = .{ .integer = 42 };
-    sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = sort_values,
-    };
-
-    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
-    const sort = hit.get("_sort").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), sort.len);
-    try std.testing.expectEqual(@as(i64, 42), sort[0].integer);
-    try std.testing.expectEqualStrings("doc:a", sort[1].string);
-}
-
-test "api query contract serializes cursor-only id sort tuple" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    const sort_values = try alloc.alloc(std.json.Value, 1);
-    sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = sort_values,
-    };
-    result.sort_profile = .{
-        .plan = "id_seek",
-        .exactness = "exact",
-        .source = "primary_key_scan",
-        .cursor_support = "segment_seek",
-        .source_load = "source_free",
-        .distributed_behavior = "shard_local_only",
-        .sort_lifecycle_state = "queryable",
-    };
-
-    const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .profile = true,
-        .search_after = &cursor,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
-    const sort = hit.get("_sort").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), sort.len);
-    try std.testing.expectEqualStrings("doc:a", sort[0].string);
-
-    const profile_sort = parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
-    const emitted_order = profile_sort.get("order_by").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), emitted_order.len);
-    try std.testing.expectEqualStrings("_id", emitted_order[0].object.get("field").?.string);
-    try std.testing.expect(!emitted_order[0].object.get("desc").?.bool);
-    try std.testing.expectEqualStrings("after", profile_sort.get("cursor").?.string);
-    try std.testing.expectEqualStrings("id_seek", profile_sort.get("plan").?.string);
-
-    var before_response = try encodeQueryResponses(alloc, "docs", .{
-        .profile = true,
-        .search_before = &cursor,
-    }, .{}, result);
-    defer before_response.deinit(alloc);
-
-    var before_parsed = try std.json.parseFromSlice(std.json.Value, alloc, before_response.json, .{});
-    defer before_parsed.deinit();
-    const before_profile_sort = before_parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
-    const before_emitted_order = before_profile_sort.get("order_by").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), before_emitted_order.len);
-    try std.testing.expectEqualStrings("_id", before_emitted_order[0].object.get("field").?.string);
-    try std.testing.expect(!before_emitted_order[0].object.get("desc").?.bool);
-    try std.testing.expectEqualStrings("before", before_profile_sort.get("cursor").?.string);
-    try std.testing.expectEqualStrings("id_seek", before_profile_sort.get("plan").?.string);
-}
-
-test "api query contract validates cursor-only implicit id sort tuple" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    const sort_values = try alloc.alloc(std.json.Value, 1);
-    sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .sort_values = sort_values,
-    };
-
-    const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .search_after = &cursor,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
-    const sort = hit.get("_sort").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), sort.len);
-    try std.testing.expectEqualStrings("doc:a", sort[0].string);
-
-    var bad_result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer bad_result.deinit();
-
-    const bad_sort_values = try alloc.alloc(std.json.Value, 1);
-    bad_sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:b") };
-    bad_result.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .sort_values = bad_sort_values,
-    };
-
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .search_after = &cursor,
-    }, .{}, bad_result));
-}
-
-test "api query contract rejects ordered hits without complete sort tuple" {
-    const alloc = std.testing.allocator;
-
-    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
-
-    var missing = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer missing.deinit();
-    missing.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, missing));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
-
-    var incomplete = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer incomplete.deinit();
-    const sort_values = try alloc.alloc(std.json.Value, 1);
-    sort_values[0] = .{ .integer = 42 };
-    incomplete.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, incomplete));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
-}
-
-test "api query contract rejects ordered hits with non replayable sort tuple" {
-    const alloc = std.testing.allocator;
-
-    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
-
-    var nested = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer nested.deinit();
-    const nested_sort_values = try alloc.alloc(std.json.Value, 2);
-    nested_sort_values[0] = .{ .array = std.json.Array.init(alloc) };
-    nested_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    nested.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = nested_sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, nested));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
-
-    var null_sort = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer null_sort.deinit();
-    const null_sort_values = try alloc.alloc(std.json.Value, 2);
-    null_sort_values[0] = .null;
-    null_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    null_sort.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = null_sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, null_sort));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
-
-    var non_finite = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer non_finite.deinit();
-    const non_finite_sort_values = try alloc.alloc(std.json.Value, 2);
-    non_finite_sort_values[0] = .{ .float = std.math.inf(f64) };
-    non_finite_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    non_finite.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = non_finite_sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, non_finite));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
-
-    const score_order_by = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
-    var non_numeric_score = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer non_numeric_score.deinit();
-    const non_numeric_score_sort_values = try alloc.alloc(std.json.Value, 2);
-    non_numeric_score_sort_values[0] = .{ .string = try alloc.dupe(u8, "high") };
-    non_numeric_score_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
-    non_numeric_score.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = non_numeric_score_sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &score_order_by,
-    }, .{}, non_numeric_score));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("non_numeric_score", diagnostic.detail);
-
-    var id_mismatch = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer id_mismatch.deinit();
-    const mismatched_sort_values = try alloc.alloc(std.json.Value, 2);
-    mismatched_sort_values[0] = .{ .integer = 42 };
-    mismatched_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
-    id_mismatch.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.9,
-        .sort_values = mismatched_sort_values,
-    };
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
-    }, .{}, id_mismatch));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
-    try std.testing.expectEqualStrings("id_tiebreaker_mismatch", diagnostic.detail);
-}
-
-test "api query contract serializes derived hierarchy ancestry" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .score = 0.8,
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"source title\",\"private\":\"omit me\"}"),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "title_dense_v1"),
-            .kind = .embedding,
-        },
-        .chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, 1),
-    };
-    result.hits[0].chunk_hits[0] = .{
-        .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
-        .score = 0.7,
-        .stored_data = try alloc.dupe(u8,
-            \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1","_source_field":"body","_artifact_unit_fingerprint":"storage-only"}
-        ),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "document_chunks_v1"),
-            .kind = .chunk,
-            .chunk_id = 3,
-            .unit_id = try alloc.dupe(u8, "page:000001"),
-        },
-    };
-
-    var legacy_response = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
-    defer legacy_response.deinit(alloc);
-    var parsed_legacy = try std.json.parseFromSlice(std.json.Value, alloc, legacy_response.json, .{});
-    defer parsed_legacy.deinit();
-    const legacy_hit = parsed_legacy.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    const legacy_hierarchy = legacy_hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("source", legacy_hierarchy.object.get("level").?.string);
-    try std.testing.expectEqualStrings("title_dense_v1", legacy_hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
-    try std.testing.expect(legacy_hierarchy.object.get("artifact") == null);
-    try std.testing.expect(legacy_hierarchy.object.get("chunks") != null);
-    try std.testing.expect(legacy_hierarchy.object.get("matches") == null);
-    const legacy_chunk_source = legacy_hierarchy.object.get("chunks").?.array.items[0].object.get("_source").?.object;
-    try std.testing.expect(legacy_chunk_source.get(hierarchy_navigation.unit_fingerprint_field) == null);
-
-    const match_fields = [_][]const u8{"text"};
-    const source_hit_fields = [_][]const u8{"title"};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .parent_with_chunks,
-        .include_stored = false,
-        .defer_stored_projection = true,
-        .fields = &source_hit_fields,
-        .include_all_fields = false,
-        .hierarchy_match_fields = &match_fields,
-        .hierarchy_match_include_all_fields = false,
-        .hierarchy_grouped_matches = true,
-        .hierarchy_omit_implicit_source_ancestor_document = true,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    const hierarchy = hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("source title", hit.object.get("_source").?.object.get("title").?.string);
-    try std.testing.expect(hit.object.get("_source").?.object.get("private") == null);
-    try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
-    try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
-    try std.testing.expectEqualStrings("title_dense_v1", hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
-    const source_ancestor = hierarchy.object.get("ancestors").?.object.get("source").?.object;
-    try std.testing.expectEqualStrings("doc:a", source_ancestor.get("id").?.string);
-    try std.testing.expect(source_ancestor.get("document") == null);
-    try std.testing.expect(hierarchy.object.get("chunks") == null);
-    const matches = hierarchy.object.get("matches").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), matches.len);
-    try std.testing.expectEqualStrings("chunk text", matches[0].object.get("_source").?.object.get("text").?.string);
-    try std.testing.expect(matches[0].object.get("_source").?.object.get("_parent_doc_key") == null);
-    const chunk_hierarchy = matches[0].object.get("hierarchy").?.object;
-    try std.testing.expectEqualStrings("chunk", chunk_hierarchy.get("level").?.string);
-    try std.testing.expectEqualStrings("page:000001", chunk_hierarchy.get("parent_unit_id").?.string);
-    try std.testing.expectEqual(@as(i64, 3), chunk_hierarchy.get("artifact").?.object.get("chunk_id").?.integer);
-    const unit_ancestor = chunk_hierarchy.get("ancestors").?.object.get("unit").?.object;
-    try std.testing.expectEqualStrings("page:000001", unit_ancestor.get("id").?.string);
-    try std.testing.expectEqualStrings("document_units_v1", unit_ancestor.get("artifact_name").?.string);
-    try std.testing.expectEqualStrings("body", unit_ancestor.get("source_field").?.string);
-}
-
-test "api query contract preserves the internal grouped unit revision envelope" {
-    const alloc = std.testing.allocator;
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "unit:0"),
-        .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"unit-revision\"}"),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "document_units_v1"),
-            .kind = .asset,
-            .unit_id = try alloc.dupe(u8, "page:000001"),
-        },
-    };
-
-    const fields = [_][]const u8{"text"};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .unit_with_chunks,
-        .hierarchy_group_level = .unit,
-        .include_stored = true,
-        .include_all_fields = false,
-        .fields = &fields,
-        .defer_stored_projection = true,
-        .defer_hierarchy_child_hydration = true,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const source = parsed.value.object.get("responses").?.array.items[0]
-        .object.get("hits").?.object.get("hits").?.array.items[0]
-        .object.get("_source").?.object;
-    try std.testing.expectEqualStrings(
-        "unit-revision",
-        source.get(hierarchy_navigation.grouped_unit_revision_envelope_field).?.string,
-    );
-
-    var public_response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .unit,
-        .hierarchy_group_level = .unit,
-        .include_stored = false,
-        .include_all_fields = false,
-        .fields = &.{},
-    }, .{}, result);
-    defer public_response.deinit(alloc);
-    var parsed_public = try std.json.parseFromSlice(std.json.Value, alloc, public_response.json, .{});
-    defer parsed_public.deinit();
-    const public_source = parsed_public.value.object.get("responses").?.array.items[0]
-        .object.get("hits").?.object.get("hits").?.array.items[0]
-        .object.get("_source").?.object;
-    try std.testing.expect(public_source.get(hierarchy_navigation.grouped_unit_revision_envelope_field) == null);
-}
-
-test "api query contract serializes hydrated unit ancestor for direct unit hits" {
-    const alloc = std.testing.allocator;
-    const navigation_position = try hierarchy_navigation.positionAlloc(
-        alloc,
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "document_units_v1",
-        1,
-        0,
-        "storage-only",
-    );
-    defer alloc.free(navigation_position);
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE"),
-        .score = 0.9,
-        .stored_data = try alloc.dupe(u8,
-            \\{"unit_id":"page:000001","unit_type":"page","text":"unit text","_artifact_unit_fingerprint":"storage-only","_hierarchy":{"position":"stale-position","revision":"document_units_v1@1"},"provenance":{"method":"pdf_text","page_number":1}}
-        ),
-        .ancestor_unit_data = try alloc.dupe(u8, "{\"text\":\"independent ancestor projection\"}"),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "document_units_v1"),
-            .kind = .asset,
-            .unit_id = try alloc.dupe(u8, "page:000001"),
-        },
-        .sort_values = try db_mod.types.cloneJsonValues(alloc, &.{
-            .{ .string = navigation_position },
-            .{ .string = "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE" },
-        }),
-    };
-
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .chunk,
-        .include_stored = true,
-        .hierarchy_include_unit = true,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    const hierarchy = hit.object.get("hierarchy").?.object;
-    try std.testing.expect(hit.object.get("_source").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
-    try std.testing.expectEqualStrings("unit", hierarchy.get("level").?.string);
-    try std.testing.expect(hierarchy.get("position") == null);
-    try std.testing.expect(hierarchy.get("revision") == null);
-    const ancestors = hierarchy.get("ancestors").?.object;
-    try std.testing.expectEqualStrings("doc:a", ancestors.get("source").?.object.get("id").?.string);
-    const unit = ancestors.get("unit").?.object;
-    try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
-    try std.testing.expectEqualStrings("independent ancestor projection", unit.get("document").?.object.get("text").?.string);
-    try std.testing.expect(unit.get("document").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
-
-    alloc.free(result.hits[0].ancestor_unit_data.?);
-    result.hits[0].ancestor_unit_data = null;
-    const navigation_fields = [_][]const u8{ "text", hierarchy_navigation.unit_fingerprint_field };
-    var navigation_response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .unit,
-        .hierarchy_children = .{ .parent_id = "doc:a" },
-        .include_stored = true,
-        .include_all_fields = false,
-        .defer_stored_projection = true,
-        .fields = &navigation_fields,
-    }, .{}, result);
-    defer navigation_response.deinit(alloc);
-    var parsed_navigation = try std.json.parseFromSlice(std.json.Value, alloc, navigation_response.json, .{});
-    defer parsed_navigation.deinit();
-    const navigation_hit = parsed_navigation.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    try std.testing.expectEqualStrings("unit text", navigation_hit.object.get("_source").?.object.get("text").?.string);
-    try std.testing.expect(navigation_hit.object.get("_source").?.object.get("unit_id") == null);
-    try std.testing.expect(navigation_hit.object.get("_source").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
-    const navigation_hierarchy = navigation_hit.object.get("hierarchy").?.object;
-    try std.testing.expectEqualStrings(navigation_position, navigation_hierarchy.get("position").?.string);
-    try std.testing.expectEqualStrings(
-        "source@0000000000000000000000000000000000000000000000000000000000000000",
-        navigation_hierarchy.get("revision").?.string,
-    );
-    const navigation_unit = navigation_hierarchy.get("ancestors").?.object.get("unit").?.object;
-    try std.testing.expect(navigation_unit.get("document") == null);
-
-    var identity_result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer identity_result.deinit();
-    identity_result.hits[0] = .{
-        .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE"),
-        .score = 1,
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "document_units_v1"),
-            .kind = .asset,
-            .unit_id = try alloc.dupe(u8, "page:000001"),
-        },
-        .sort_values = try db_mod.types.cloneJsonValues(alloc, &.{
-            .{ .string = navigation_position },
-            .{ .string = "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE" },
-        }),
-    };
-    var identity_response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .unit,
-        .hierarchy_children = .{ .parent_id = "doc:a" },
-        .include_stored = false,
-        .include_all_fields = false,
-        .fields = &.{},
-    }, .{}, identity_result);
-    defer identity_response.deinit(alloc);
-    var parsed_identity = try std.json.parseFromSlice(std.json.Value, alloc, identity_response.json, .{});
-    defer parsed_identity.deinit();
-    const identity_hit = parsed_identity.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    try std.testing.expect(identity_hit.object.get("_source") == null);
-    try std.testing.expectEqualStrings(
-        navigation_position,
-        identity_hit.object.get("hierarchy").?.object.get("position").?.string,
-    );
-}
-
-test "api query contract serializes db-backed ancestors for direct chunk hits" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
-        .score = 0.7,
-        .stored_data = try alloc.dupe(u8,
-            \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1"}
-        ),
-        .ancestor_source_data = try alloc.dupe(u8, "{\"title\":\"source doc\",\"private\":\"omit me\"}"),
-        .ancestor_unit_data = try alloc.dupe(u8, "{\"unit_id\":\"page:000001\",\"text\":\"unit doc\",\"private\":\"omit me\"}"),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "document_chunks_v1"),
-            .kind = .chunk,
-            .chunk_id = 3,
-            .unit_id = try alloc.dupe(u8, "page:000001"),
-        },
-    };
-
-    const source_fields = [_][]const u8{"title"};
-    const unit_fields = [_][]const u8{"text"};
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .chunk,
-        .include_stored = true,
-        .hierarchy_source_fields = &source_fields,
-        .hierarchy_source_include_all_fields = false,
-        .hierarchy_unit_fields = &unit_fields,
-        .hierarchy_unit_include_all_fields = false,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    const hierarchy = hit.object.get("hierarchy").?.object;
-    const ancestors = hierarchy.get("ancestors").?.object;
-    const source_document = ancestors.get("source").?.object.get("document").?.object;
-    try std.testing.expectEqualStrings("source doc", source_document.get("title").?.string);
-    try std.testing.expect(source_document.get("private") == null);
-    const unit = ancestors.get("unit").?.object;
-    try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
-    const unit_document = unit.get("document").?.object;
-    try std.testing.expectEqualStrings("unit doc", unit_document.get("text").?.string);
-    try std.testing.expect(unit_document.get("unit_id") == null);
-    try std.testing.expect(unit_document.get("private") == null);
-}
-
-test "api query contract serializes mention evidence hierarchy" {
-    const alloc = std.testing.allocator;
-
-    var result = db_mod.types.SearchResult{
-        .alloc = alloc,
-        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
-        .total_hits = 1,
-    };
-    defer result.deinit();
-
-    result.hits[0] = .{
-        .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:X3Jlc29sdXRpb25fbWVudGlvbg"),
-        .score = 0.95,
-        .stored_data = try alloc.dupe(u8,
-            \\{
-            \\  "_schema":"antfly.resolution_mention.v1",
-            \\  "_parent_doc_key":"doc:a",
-            \\  "_artifact_kind":"resolution_mention",
-            \\  "_artifact_key":"mention-key",
-            \\  "source_artifact":"relations_v1",
-            \\  "source_artifact_key":"source-key",
-            \\  "resolution_artifact":"resolution_v1",
-            \\  "resolution_artifact_key":"resolution-key",
-            \\  "resolver":"kg",
-            \\  "resolver_table":"entities",
-            \\  "local_id":"e0",
-            \\  "decision":"match",
-            \\  "confidence":0.87,
-            \\  "canonical":{"table":"entities","key":"person/ada_lovelace","name":"Ada Lovelace","label":"person"},
-            \\  "mention":{"text":"Ada Lovelace","label":"person","confidence":0.91}
-            \\}
-        ),
-        .artifact_ref = .{
-            .document_id = try alloc.dupe(u8, "doc:a"),
-            .name = try alloc.dupe(u8, "_resolution_mention"),
-            .kind = .asset,
-        },
-    };
-
-    var response = try encodeQueryResponses(alloc, "docs", .{
-        .return_mode = .chunk,
-        .include_stored = true,
-    }, .{}, result);
-    defer response.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
-    defer parsed.deinit();
-    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
-    const hierarchy = hit.object.get("hierarchy").?.object;
-    try std.testing.expectEqualStrings("mention", hierarchy.get("level").?.string);
-    try std.testing.expectEqualStrings("doc:a", hierarchy.get("parent_doc_key").?.string);
-    const evidence = hierarchy.get("evidence").?.object;
-    try std.testing.expectEqualStrings("e0", evidence.get("local_id").?.string);
-    try std.testing.expectEqualStrings("match", evidence.get("decision").?.string);
-    try std.testing.expectEqualStrings("source-key", evidence.get("source_artifact_key").?.string);
-    try std.testing.expectEqualStrings("resolution-key", evidence.get("resolution_artifact_key").?.string);
-    try std.testing.expectEqualStrings("Ada Lovelace", evidence.get("mention").?.object.get("text").?.string);
-    try std.testing.expectEqualStrings("person/ada_lovelace", evidence.get("canonical").?.object.get("key").?.string);
-}
-
 fn parseStoredSourceValue(alloc: std.mem.Allocator, stored_data: []const u8) !std.json.Value {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
@@ -5041,42 +4230,6 @@ fn computeMaxScore(hits: []const db_mod.types.SearchHit) f32 {
         found = true;
     }
     return max_score;
-}
-
-test "query max score preserves negative relevance scores" {
-    const hits = [_]db_mod.types.SearchHit{
-        .{ .id = @constCast("doc:a"), .score = -0.75 },
-        .{ .id = @constCast("doc:b"), .score = -0.25 },
-        .{ .id = @constCast("doc:c") },
-    };
-    try std.testing.expectEqual(@as(f32, -0.25), computeMaxScore(&hits));
-    try std.testing.expectEqual(@as(f32, 0), computeMaxScore(&.{}));
-}
-
-test "query hit exposes relevance score and raw vector distance separately" {
-    const hit = try toOpenApiHit(std.testing.allocator, .{}, .{
-        .id = @constCast("doc:a"),
-        .score = 0.8,
-        .distance = 0.25,
-    });
-    try std.testing.expectEqual(@as(f32, 0.8), hit._score);
-    try std.testing.expectEqual(@as(f32, 0.25), hit._distance.?);
-}
-
-test "query hierarchy response conversion rejects schema drift" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        "{\"level\":\"source\",\"unmodeled_field\":true}",
-        .{},
-    );
-    defer parsed.deinit();
-
-    try std.testing.expectError(
-        error.UnknownField,
-        parseSearchHitHierarchyOpenApiValue(alloc, parsed.value),
-    );
 }
 
 pub fn parseAggregationRequestsJson(
@@ -6112,54 +5265,6 @@ fn toOpenApiGraphAggregates(
     return out;
 }
 
-test "pattern response omits paths unless requested" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const bindings = [_]db_mod.types.GraphPatternBinding{.{
-        .alias = @constCast("node"),
-        .node = .{
-            .key = @constCast("doc:a"),
-            .depth = 7,
-            .distance = 42,
-            .path = null,
-            .path_edges = null,
-        },
-    }};
-    const path = [_]graph_query_mod.PathEdgeInfo{.{
-        .source = @constCast("doc:a"),
-        .target = @constCast("doc:b"),
-        .edge_type = @constCast("links"),
-        .weight = 1,
-        .metadata = "",
-    }};
-    const matches = [_]db_mod.types.GraphPatternMatch{.{
-        .bindings = @constCast(bindings[0..]),
-        .path = @constCast(path[0..]),
-    }};
-    const graph_result = db_mod.types.GraphSearchResult{
-        .name = @constCast("pattern"),
-        .matches = @constCast(matches[0..]),
-        .hits = &.{},
-        .total_hits = 1,
-    };
-
-    var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
-    defer document_lookup.deinit(alloc);
-    const rows = try toOpenApiGraphRows(alloc, graph_result, &.{"node"}, &document_lookup);
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    try std.testing.expect(rows[0].map.get("node") != null);
-
-    const encoded = try jsonStringifyAlloc(alloc, rows);
-    var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    const node = parsed.value.array.items[0].object.get("node").?.object;
-    try std.testing.expectEqualStrings("doc:a", node.get("key").?.string);
-    try std.testing.expect(node.get("depth") == null);
-    try std.testing.expect(node.get("distance") == null);
-    try std.testing.expect(node.get("path") == null);
-}
-
 fn expectInvalidCanonicalGraphRow(
     alloc: std.mem.Allocator,
     expected_aliases: []const []const u8,
@@ -6183,601 +5288,6 @@ fn expectInvalidCanonicalGraphRow(
         error.InvalidRemoteResponse,
         toOpenApiGraphRows(alloc, graph_result, expected_aliases, &document_lookup),
     );
-}
-
-test "canonical graph binding responses require exact projected alias sets" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const node = graph_query_mod.GraphResultNode{
-        .key = @constCast("doc:a"),
-        .depth = 0,
-        .distance = 0,
-    };
-
-    const missing = [_]db_mod.types.GraphPatternBinding{
-        .{ .alias = @constCast("a"), .node = node },
-    };
-    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &missing, &.{});
-
-    const unexpected = [_]db_mod.types.GraphPatternBinding{
-        .{ .alias = @constCast("a"), .node = node },
-        .{ .alias = @constCast("c"), .node = node },
-    };
-    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &unexpected, &.{});
-
-    const duplicate = [_]db_mod.types.GraphPatternBinding{
-        .{ .alias = @constCast("a"), .node = node },
-        .{ .alias = @constCast("a"), .node = node },
-    };
-    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &duplicate, &.{});
-
-    const overlap = [_]db_mod.types.GraphPatternBinding{
-        .{ .alias = @constCast("a"), .node = node },
-    };
-    const null_aliases = [_][]u8{@constCast("a")};
-    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &overlap, &null_aliases);
-
-    try expectInvalidCanonicalGraphRow(alloc, &.{"a"}, &.{}, &.{});
-}
-
-test "graph aggregate response preserves exact decimal counts" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const requested = [_]graph_query_mod.NamedCountAggregate{.{
-        .name = "count",
-        .of = "*",
-    }};
-    const computed = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("count"),
-        .value = 9_384_729_384_729_384,
-        .exact = true,
-    }};
-    const result = try toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .pattern,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{} },
-            .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
-            .aggregates = &requested,
-        },
-        .{},
-        .{
-            .name = @constCast("counted"),
-            .aggregates = @constCast(computed[0..]),
-            .hits = &.{},
-            .total_hits = 0,
-        },
-    );
-    try std.testing.expect(result == .graph_aggregates_result);
-    const aggregate_result = result.graph_aggregates_result;
-    const aggregates = aggregate_result.aggregates;
-    const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("9384729384729384", count.value);
-    try std.testing.expect(count.exact);
-    try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
-}
-
-test "graph aggregate response fails closed on missing or inexact results" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const requested = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
-    const query = graph_query_mod.GraphQuery{
-        .query_type = .pattern,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{} },
-        .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
-        .aggregates = &requested,
-    };
-    const named_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = query }};
-    try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
-        indexes_openapi.GraphResult,
-        alloc,
-        .{ .graph_queries = &named_queries },
-        .{},
-        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
-        .canonical,
-    ));
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{ .name = @constCast("counted"), .hits = &.{}, .total_hits = 0 },
-    ));
-
-    const partial = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("count"),
-        .value = 1,
-        .exact = false,
-    }};
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{
-            .name = @constCast("counted"),
-            .aggregates = @constCast(partial[0..]),
-            .hits = &.{},
-            .total_hits = 0,
-        },
-    ));
-    const complete_aggregate = [_]db_mod.types.GraphAggregateResult{.{
-        .name = @constCast("count"),
-        .value = 1,
-        .exact = true,
-    }};
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{
-            .name = @constCast("counted"),
-            .aggregates = @constCast(complete_aggregate[0..]),
-            .hits = &.{},
-            .total_hits = 0,
-            .truncated = true,
-        },
-    ));
-}
-
-test "graph response encoding requires exactly one result per traversal operation" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const named_queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "walk",
-        .query = .{
-            .query_type = .traverse,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-        },
-    }};
-
-    try std.testing.expectError(error.InvalidRemoteResponse, encodeQueryResponses(
-        alloc,
-        "docs",
-        .{ .graph_queries = &named_queries },
-        .{},
-        .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
-    ));
-
-    const unknown_results = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("other"),
-        .hits = &.{},
-        .total_hits = 0,
-    }};
-    try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
-        indexes_openapi.GraphResult,
-        alloc,
-        .{ .graph_queries = &named_queries },
-        .{},
-        .{
-            .alloc = alloc,
-            .hits = &.{},
-            .total_hits = 0,
-            .graph_results = @constCast(unknown_results[0..]),
-        },
-        .canonical,
-    ));
-}
-
-test "canonical path responses require one terminal node per path" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var nodes = [_]graph_query_mod.GraphResultNode{
-        .{ .key = "a", .depth = 0, .distance = 0 },
-        .{ .key = "extra", .depth = 0, .distance = 0 },
-    };
-    var path_nodes = [_][]const u8{"a"};
-    var paths = [_]graph_paths_mod.Path{.{
-        .nodes = &path_nodes,
-        .edges = &.{},
-        .total_weight = 0,
-        .length = 0,
-    }};
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .shortest_path,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"a"} },
-            .target_nodes = .{ .keys = &.{"a"} },
-        },
-        .{},
-        .{
-            .name = @constCast("path"),
-            .nodes = &nodes,
-            .paths = &paths,
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .shortest_path,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"a"} },
-            .target_nodes = .{ .keys = &.{"a"} },
-        },
-        .{},
-        .{
-            .name = @constCast("path"),
-            .nodes = nodes[0..1],
-            .paths = &.{},
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .shortest_path,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"a"} },
-            .target_nodes = .{ .keys = &.{"a"} },
-        },
-        .{},
-        .{
-            .name = @constCast("path"),
-            .nodes = nodes[0..1],
-            .paths = &paths,
-            .hits = &.{},
-            .total_hits = 1,
-            .truncated = true,
-        },
-    ));
-
-    nodes[0].depth = 1;
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .shortest_path,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"a"} },
-            .target_nodes = .{ .keys = &.{"a"} },
-        },
-        .{},
-        .{
-            .name = @constCast("path"),
-            .nodes = nodes[0..1],
-            .paths = &paths,
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-
-    nodes = .{
-        .{ .key = "a", .table = "entities", .depth = 0, .distance = 0 },
-        .{ .key = "unused", .depth = 0, .distance = 0 },
-    };
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        .{
-            .query_type = .shortest_path,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"a"} },
-            .target_nodes = .{ .keys = &.{"a"} },
-        },
-        .{},
-        .{
-            .name = @constCast("path"),
-            .nodes = nodes[0..1],
-            .paths = &paths,
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-}
-
-test "canonical traversal responses keep paths on bounded result nodes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var node_path = [_][]const u8{"a"};
-    var nodes = [_]graph_query_mod.GraphResultNode{
-        .{ .key = "a", .depth = 0, .distance = 0, .path = &node_path },
-        .{ .key = "extra", .depth = 0, .distance = 0 },
-    };
-    const query = graph_query_mod.GraphQuery{
-        .query_type = .traverse,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{"a"} },
-        .params = .{ .max_results = 1, .include_paths = false },
-    };
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{
-            .name = @constCast("walk"),
-            .nodes = &nodes,
-            .hits = &.{},
-            .total_hits = 2,
-        },
-    ));
-
-    const response = try toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{
-            .name = @constCast("walk"),
-            .nodes = nodes[0..1],
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    );
-    try std.testing.expect(response.graph_nodes_result.nodes[0].path == null);
-
-    var query_with_paths = query;
-    query_with_paths.params.include_paths = true;
-    const response_with_paths = try toOpenApiGraphQueryResult(
-        alloc,
-        query_with_paths,
-        .{},
-        .{
-            .name = @constCast("walk"),
-            .nodes = nodes[0..1],
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    );
-    try std.testing.expect(response_with_paths.graph_nodes_result.nodes[0].path != null);
-    nodes[0].path = null;
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        query_with_paths,
-        .{},
-        .{
-            .name = @constCast("walk"),
-            .nodes = nodes[0..1],
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-    nodes[0].path = &node_path;
-
-    var graph_paths = [_]graph_paths_mod.Path{.{
-        .nodes = &node_path,
-        .edges = &.{},
-        .total_weight = 0,
-        .length = 0,
-    }};
-    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
-        alloc,
-        query,
-        .{},
-        .{
-            .name = @constCast("walk"),
-            .nodes = nodes[0..1],
-            .paths = &graph_paths,
-            .hits = &.{},
-            .total_hits = 1,
-        },
-    ));
-}
-
-test "deprecated graph search preserves its response envelope" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const result = try toOpenApiStatefulGraphResultWithFormat(
-        alloc,
-        .{
-            .query_type = .neighbors,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-        },
-        .{ .took_ms = 3 },
-        .{
-            .name = @constCast("neighbors"),
-            .hits = &.{},
-            .total_hits = 12,
-        },
-        .legacy,
-    );
-
-    try std.testing.expect(result == .legacy_graph_search_result);
-    const legacy = result.legacy_graph_search_result;
-    try std.testing.expect(legacy.kind == null);
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
-    try std.testing.expectEqual(@as(i64, 12), legacy.total);
-    try std.testing.expectEqual(@as(?i64, 3), legacy.took);
-
-    const named_queries = [_]db_mod.types.NamedGraphQuery{.{
-        .name = "neighbors",
-        .query = .{
-            .query_type = .neighbors,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-        },
-    }};
-    const graph_results = [_]db_mod.types.GraphSearchResult{.{
-        .name = @constCast("neighbors"),
-        .hits = &.{},
-        .total_hits = 12,
-    }};
-    var encoded = try encodeQueryResponses(
-        alloc,
-        "docs",
-        .{
-            .graph_queries = &named_queries,
-            .graph_query_transport = .{
-                .dialect = .legacy,
-                .operations_json =
-                \\{"neighbors":{"type":"neighbors"}}
-                ,
-                .admitted_operations_ptr = @ptrCast(named_queries[0..].ptr),
-                .admitted_operations_len = named_queries.len,
-            },
-        },
-        .{ .took_ms = 3 },
-        .{
-            .alloc = alloc,
-            .hits = &.{},
-            .total_hits = 0,
-            .graph_results = @constCast(graph_results[0..]),
-        },
-    );
-    defer encoded.deinit(alloc);
-    try std.testing.expectEqual(GraphResponseFormat.legacy, encoded.graph_dialect.?);
-
-    var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded.json, .{});
-    defer parsed.deinit();
-    const encoded_legacy = parsed.value.object
-        .get("responses").?.array.items[0].object
-        .get("graph_results").?.object
-        .get("neighbors").?;
-    try std.testing.expect(encoded_legacy.object.get("kind") == null);
-
-    // Model the strict v0.2 generated response type. Its decoder rejects
-    // unknown fields, so this is the compatibility direction that merely
-    // accepting pre-discriminator responses in new clients does not cover.
-    const LegacyGraphSearchResultV02 = struct {
-        type: indexes_openapi.GraphQueryType,
-        nodes: ?std.json.Value = null,
-        paths: ?std.json.Value = null,
-        matches: ?std.json.Value = null,
-        total: i64,
-        took: ?i64 = null,
-    };
-    const encoded_legacy_json = try std.json.Stringify.valueAlloc(alloc, encoded_legacy, .{});
-    defer alloc.free(encoded_legacy_json);
-    var parsed_v02 = try std.json.parseFromSlice(LegacyGraphSearchResultV02, alloc, encoded_legacy_json, .{});
-    defer parsed_v02.deinit();
-    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, parsed_v02.value.type);
-    try std.testing.expectEqual(@as(i64, 12), parsed_v02.value.total);
-}
-
-test "canonical graph paths preserve table-qualified node identities" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var path_nodes = [_][]const u8{ "doc:a", "shared" };
-    var node_tables = [_]?[]const u8{ null, "entities" };
-    var path_edges = [_]graph_paths_mod.PathEdge{.{
-        .source = "doc:a",
-        .target = "shared",
-        .edge_type = "mentions",
-        .weight = 1,
-    }};
-    var paths = [_]db_mod.types.GraphPath{.{
-        .nodes = &path_nodes,
-        .node_tables = &node_tables,
-        .edges = &path_edges,
-        .total_weight = 1,
-        .length = 1,
-    }};
-    var result_node_path_edges = [_]graph_query_mod.PathEdgeInfo{.{
-        .source = "doc:a",
-        .target = "shared",
-        .edge_type = "mentions",
-        .weight = 1,
-    }};
-    var result_nodes = [_]graph_query_mod.GraphResultNode{.{
-        .key = "shared",
-        .table = "entities",
-        .depth = 1,
-        .distance = 1,
-        .path = &path_nodes,
-        .path_tables = &node_tables,
-        .path_edges = &result_node_path_edges,
-    }};
-    const query = graph_query_mod.GraphQuery{
-        .query_type = .shortest_path,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{"doc:a"} },
-        .target_nodes = .{ .identities = &.{.{ .key = "shared", .table = "entities" }} },
-    };
-    const graph_result = db_mod.types.GraphSearchResult{
-        .name = @constCast("path"),
-        .nodes = &result_nodes,
-        .paths = &paths,
-        .hits = &.{},
-        .total_hits = 1,
-    };
-
-    const canonical = try toOpenApiGraphQueryResult(alloc, query, .{}, graph_result);
-    try std.testing.expect(canonical == .graph_paths_result);
-    const canonical_path = canonical.graph_paths_result.paths[0].path;
-    try std.testing.expectEqualStrings("shared", canonical_path.nodes[1].key);
-    try std.testing.expectEqualStrings("entities", canonical_path.nodes[1].table.?);
-    try std.testing.expectEqualStrings("doc:a", canonical_path.edges[0].from.key);
-    try std.testing.expectEqualStrings("shared", canonical_path.edges[0].to.key);
-    try std.testing.expectEqualStrings("entities", canonical_path.edges[0].to.table.?);
-    try std.testing.expectEqual(indexes_openapi.GraphPathObjective.min_hops, canonical_path.objective);
-    try std.testing.expectEqual(@as(f64, 1), canonical_path.weight_sum);
-    try std.testing.expectEqual(@as(f64, 1), canonical_path.objective_value);
-
-    const legacy = try toOpenApiStatefulGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
-    try std.testing.expect(legacy == .legacy_graph_search_result);
-    try std.testing.expectEqualStrings("shared", legacy.legacy_graph_search_result.paths.?[0].nodes.?[1]);
-}
-
-test "canonical graph path objective exposes max weight product" {
-    const edges = [_]graph_paths_mod.PathEdge{
-        .{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.8 },
-        .{ .source = "b", .target = "c", .edge_type = "e", .weight = 0.5 },
-    };
-    var nodes = [_][]const u8{ "a", "b", "c" };
-    const path = db_mod.types.GraphPath{
-        .nodes = &nodes,
-        .edges = @constCast(edges[0..]),
-        .total_weight = 1.3,
-        .length = 2,
-    };
-    try std.testing.expectApproxEqAbs(@as(f64, 0.4), graphPathObjectiveValue(path, .max_weight), 0.000001);
-}
-
-test "generated stateful graph result union decodes pre-discriminator legacy responses" {
-    const raw =
-        \\{"type":"neighbors","total":12}
-    ;
-
-    var stdlib_parsed = try std.json.parseFromSlice(
-        indexes_openapi.StatefulGraphResult,
-        std.testing.allocator,
-        raw,
-        .{},
-    );
-    defer stdlib_parsed.deinit();
-    try std.testing.expect(stdlib_parsed.value == .legacy_graph_search_result);
-    try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_search_result.total);
-
-    var simd_parsed = try ant_json.parseFromSlice(
-        indexes_openapi.StatefulGraphResult,
-        std.testing.allocator,
-        raw,
-        .{},
-    );
-    defer simd_parsed.deinit();
-    try std.testing.expect(simd_parsed.value == .legacy_graph_search_result);
-    try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_search_result.total);
-}
-
-test "generated stateful graph result union rejects an explicit null discriminator" {
-    const raw =
-        \\{"kind":null,"type":"neighbors","total":12}
-    ;
-
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
-        indexes_openapi.StatefulGraphResult,
-        std.testing.allocator,
-        raw,
-        .{},
-    ));
-    try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
-        indexes_openapi.StatefulGraphResult,
-        std.testing.allocator,
-        raw,
-        .{},
-    ));
 }
 
 fn toOpenApiGraphNodes(
@@ -6808,48 +5318,6 @@ fn toOpenApiGraphNodes(
 
 fn validateCanonicalGraphResultNode(node: graph_query_mod.GraphResultNode) !void {
     if (!graph_query_mod.isCanonicalResultNode(node)) return error.InvalidRemoteResponse;
-}
-
-test "canonical graph result nodes fail closed outside the public contract" {
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast(""),
-        .depth = 0,
-        .distance = 0,
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("node"),
-        .depth = graph_pattern_mod.max_pattern_hops + 1,
-        .distance = 0,
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("node"),
-        .depth = 0,
-        .distance = -0.1,
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("node"),
-        .depth = 0,
-        .distance = 0,
-        .path = @constCast((&[_][]const u8{})[0..]),
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("node"),
-        .depth = 0,
-        .distance = 0,
-        .path = &.{ "start", "node" },
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("wrong"),
-        .depth = 1,
-        .distance = 1,
-        .path = &.{ "start", "node" },
-    }));
-    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
-        .key = @constCast("node"),
-        .depth = 0,
-        .distance = 0,
-        .path_edges = &.{},
-    }));
 }
 
 fn toOpenApiLegacyGraphNodes(
@@ -7109,44 +5577,6 @@ fn optionalStringEqualsValue(optional: ?[]const u8, value: []const u8) bool {
     return optional != null and std.mem.eql(u8, optional.?, value);
 }
 
-test "canonical graph path edges enforce durable type policy" {
-    const edges: []const graph_query_mod.PathEdgeInfo = &.{.{
-        .source = "a",
-        .target = "b",
-        .edge_type = "x" ** (graph_edge_type.max_bytes + 1),
-        .weight = 1,
-    }};
-    try std.testing.expectError(
-        error.InvalidRemoteResponse,
-        toOpenApiGraphPathEdges(std.testing.allocator, &.{ "a", "b" }, &.{}, edges),
-    );
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    const nodes = [_][]const u8{ "shared", "shared" };
-    const tables = [_]?[]const u8{ "authors", "entities" };
-    const forward = [_]graph_paths_mod.PathEdge{.{
-        .source = "shared",
-        .target = "shared",
-        .edge_type = "knows",
-        .weight = 1,
-        .traversal_direction = .out,
-    }};
-    const reverse = [_]graph_paths_mod.PathEdge{.{
-        .source = "shared",
-        .target = "shared",
-        .edge_type = "knows",
-        .weight = 1,
-        .traversal_direction = .in,
-    }};
-
-    const encoded_forward = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &forward);
-    const encoded_reverse = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &reverse);
-    try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.out, encoded_forward[0].direction);
-    try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.in, encoded_reverse[0].direction);
-}
-
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
     if (metadata.len == 0) return null;
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
@@ -7163,22 +5593,6 @@ fn pathEdgeMetadataObjectMap(
     if (metadata.len == 0) return null;
     const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch return null;
     return if (value == .object) .{ .map = value.object } else null;
-}
-
-test "canonical graph path metadata safely reads legacy non-object records" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-
-    const object = (try pathEdgeMetadataObjectMap(alloc, "{\"kind\":\"citation\"}")) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("citation", object.map.get("kind").?.string);
-    try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "\"legacy\"")) == null);
-    try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "{")) == null);
-
-    const legacy = (try pathEdgeMetadataJsonValue(alloc, "\"legacy\"")) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("legacy", legacy.string);
 }
 
 fn graphNodeEvidenceObjectMap(
@@ -7291,158 +5705,6 @@ fn toOpenApiOptionalGraphPathEdges(
     };
     const tables = node.path_tables orelse &.{};
     return try toOpenApiGraphPathEdges(alloc, path, tables, edges);
-}
-
-test "api query contract preserves algebraic graph path provenance" {
-    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_impl.deinit();
-    const alloc = arena_impl.allocator();
-    const path_nodes: []const []const u8 = &.{ "A", "B", "C" };
-    const path_tables: []const ?[]const u8 = &.{ null, "entities", "entities" };
-    const path_edges: []const graph_query_mod.PathEdgeInfo = &.{
-        .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2,\"mention_artifact_keys\":[\"m1\",\"m2\"]}" },
-        .{ .source = "B", .target = "C", .edge_type = "e", .weight = 3.0 },
-    };
-    const provenance: []const []const u8 = &.{ "A\x1fe\x1fB", "B\x1fe\x1fC" };
-    const nodes: []const graph_query_mod.GraphResultNode = &.{.{
-        .key = "C",
-        .table = "entities",
-        .depth = 2,
-        .distance = 2.0,
-        .path = path_nodes,
-        .path_tables = path_tables,
-        .path_edges = path_edges,
-        .provenance = provenance,
-    }};
-    const graph_result = db_mod.types.GraphSearchResult{
-        .name = @constCast("shortest"),
-        .nodes = @constCast(nodes),
-        .paths = &.{},
-        .matches = &.{},
-        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
-        .total_hits = 1,
-    };
-
-    var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
-    defer document_lookup.deinit(alloc);
-    const encoded = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup, true);
-    defer {
-        if (encoded[0].path) |items| alloc.free(items);
-        if (encoded[0].path_edges) |items| alloc.free(items);
-        alloc.free(encoded);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), encoded.len);
-    try std.testing.expectEqualStrings("C", encoded[0].key);
-    try std.testing.expectEqual(@as(i64, 2), encoded[0].depth);
-    try std.testing.expectEqualStrings("A", encoded[0].path.?[0].key);
-    try std.testing.expect(encoded[0].path.?[0].table == null);
-    try std.testing.expectEqualStrings("C", encoded[0].path.?[2].key);
-    try std.testing.expectEqualStrings("entities", encoded[0].path.?[2].table.?);
-    try std.testing.expectEqual(@as(usize, 2), encoded[0].path_edges.?.len);
-    try std.testing.expectEqualStrings("A", encoded[0].path_edges.?[0].from.key);
-    try std.testing.expect(encoded[0].path_edges.?[0].from.table == null);
-    try std.testing.expectEqualStrings("B", encoded[0].path_edges.?[0].to.key);
-    try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
-    try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
-    try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
-    try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.integer);
-    try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
-    try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
-    try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
-    const evidence = encoded[0].evidence.?.map;
-    try std.testing.expectEqual(@as(usize, 2), evidence.get("provenance").?.array.items.len);
-    try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
-    const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
-    try std.testing.expectEqualStrings("A", edge_evidence.get("source").?.string);
-    try std.testing.expectEqual(@as(i64, 2), edge_evidence.get("metadata").?.object.get("mention_count").?.integer);
-    const mention_rollup = evidence.get("mention_rollup").?.object;
-    try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
-    try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
-    try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
-
-    const legacy_encoded = try toOpenApiLegacyGraphNodes(alloc, graph_result, &document_lookup);
-    defer alloc.free(legacy_encoded);
-    try std.testing.expectEqualStrings("A", legacy_encoded[0].path.?[0]);
-    try std.testing.expectEqualStrings("C", legacy_encoded[0].path.?[2]);
-}
-
-test "api query contract hydrates equal graph keys from their table namespace" {
-    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_impl.deinit();
-    const alloc = arena_impl.allocator();
-    const hits = [_]db_mod.types.SearchHit{
-        .{
-            .id = @constCast("shared"),
-            .stored_data = @constCast("{\"origin\":\"docs\"}"),
-        },
-        .{
-            .id = @constCast("shared"),
-            .source_table = @constCast("entities"),
-            .stored_data = @constCast("{\"origin\":\"entities\"}"),
-        },
-    };
-
-    var document_lookup = try GraphDocumentLookup.init(alloc, &hits, true);
-    defer document_lookup.deinit(alloc);
-
-    const local = (try document_lookup.document("shared", null)) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings(
-        "docs",
-        local.map.get("origin").?.string,
-    );
-    const external = (try document_lookup.document("shared", "entities")) orelse
-        return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings(
-        "entities",
-        external.map.get("origin").?.string,
-    );
-    try std.testing.expect(try document_lookup.document("shared", "missing") == null);
-}
-
-test "api query contract bounds hydrated graph binding cells" {
-    const body =
-        \\{
-        \\  "graph_queries": {
-        \\    "too_wide": {
-        \\      "index": "graph",
-        \\      "match": {
-        \\        "anchor": "a",
-        \\        "nodes": {"a": {}, "b": {}},
-        \\        "edges": [{"from": "a", "to": "b"}]
-        \\      },
-        \\      "return": {
-        \\        "bindings": ["a", "b"],
-        \\        "limit": 5001,
-        \\        "include_documents": true
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        parseQueryRequest(std.testing.allocator, null, "docs", body),
-    );
-}
-
-test "graph document lookup enforces its defensive hydration budget" {
-    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_impl.deinit();
-    const alloc = arena_impl.allocator();
-    const hits = [_]db_mod.types.SearchHit{.{
-        .id = @constCast("doc:a"),
-        .stored_data = @constCast("{\"title\":\"a\"}"),
-    }};
-    var lookup = try GraphDocumentLookup.init(alloc, &hits, true);
-    defer lookup.deinit(alloc);
-    lookup.remaining_bindings = 1;
-    try std.testing.expect((try lookup.document("doc:a", null)) != null);
-    try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
-        lookup.document("doc:a", null),
-    );
 }
 
 fn buildGraphMetricProfiles(
@@ -11055,12 +9317,6 @@ fn validateGraphIndexName(index: []const u8) !void {
     if (std.mem.trim(u8, index, " \t\r\n").len == 0) return error.InvalidQueryRequest;
 }
 
-test "canonical graph index names are nonblank" {
-    try validateGraphIndexName("social");
-    try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(""));
-    try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(" \t"));
-}
-
 fn graphAliasIsDeclared(
     nodes: []const graph_pattern_mod.MatchNode,
     optional: []const graph_pattern_mod.OptionalPattern,
@@ -11172,124 +9428,6 @@ fn parseGraphEdgeWeightRange(value: ?indexes_openapi.GraphEdgeWeightRange) !Grap
     if (range.min == null and range.max == null) return error.InvalidQueryRequest;
     try validateGraphWeightBounds(range.min, range.max);
     return .{ .min = range.min, .max = range.max };
-}
-
-test "canonical graph admission preserves and validates weight bounds" {
-    try validateGraphWeightBounds(0, 0);
-    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(-2, -1));
-    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(1, 0));
-    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(std.math.nan(f64), null));
-    try std.testing.expectEqual(@as(?f64, null), legacyWeightBound(0));
-    try std.testing.expectEqual(@as(?f64, 0.5), legacyWeightBound(0.5));
-}
-
-test "graph date filters accept RFC3339 offsets and reject normalized invalid dates" {
-    const utc = (try parseDateTimeOptionalToNs("2026-08-24T19:00:00Z")).?;
-    try std.testing.expectEqual(utc, (try parseDateTimeOptionalToNs("2026-08-24T12:00:00-07:00")).?);
-    try std.testing.expect((try parseDateTimeOptionalToNs("2026-02-29T00:00:00Z")) == null);
-    try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
-    try std.testing.expect((try parseRfc3339ToNs("2026-08-24")) == null);
-}
-
-test "canonical graph date filters are operation keyed and require a bound" {
-    const alloc = std.testing.allocator;
-    var owned = try parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
-    );
-    defer owned.deinit(alloc);
-
-    const filter_json = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("date_range") != null);
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
-    ));
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at"}}}}}}
-    ));
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01"}}}}}}
-    ));
-}
-
-test "canonical graph document filter variants cross the public storage boundary" {
-    const alloc = std.testing.allocator;
-    const filters = [_][]const u8{
-        "{\"term\":\"active\",\"path\":\"/status\"}",
-        "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":1}",
-        "{\"prefix\":\"doc:\",\"path\":\"/id\"}",
-        "{\"regexp\":\"go.*\",\"path\":\"/tier\"}",
-        "{\"wildcard\":\"go*\",\"path\":\"/tier\"}",
-        "{\"numeric_range\":{\"path\":\"/score\",\"min\":0}}",
-        "{\"term_range\":{\"path\":\"/status\",\"max\":\"z\"}}",
-        "{\"date_range\":{\"path\":\"/created_at\",\"start\":\"2026-01-01T00:00:00Z\"}}",
-        "{\"match_all\":{}}",
-        "{\"match_none\":{}}",
-        "{\"ids\":[\"doc:a\"]}",
-        "{\"bool_field\":{\"path\":\"/published\",\"value\":true}}",
-        "{\"must\":{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}}",
-        "{\"should\":{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}}",
-        "{\"must_not\":{\"disjuncts\":[{\"term\":\"deleted\",\"path\":\"/status\"}]}}",
-        "{\"filter\":{\"term\":\"active\",\"path\":\"/status\"}}",
-        "{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}",
-        "{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}",
-    };
-
-    for (filters, 0..) |filter, filter_index| {
-        const request = try std.mem.concat(alloc, u8, &.{
-            "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":",
-            filter,
-            "}}}}",
-        });
-        defer alloc.free(request);
-        var owned = parseQueryRequest(alloc, null, "docs", request) catch |err| {
-            std.debug.print("graph document filter {d} failed admission: {s}\n", .{ filter_index, filter });
-            return err;
-        };
-        defer owned.deinit(alloc);
-        const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json orelse
-            return error.TestUnexpectedResult;
-        try std.testing.expect(normalized.len > 0);
-    }
-
-    // Closed empty-object predicates reject misspelled or future fields at
-    // the generated-schema boundary instead of silently weakening the filter.
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"match_all":{"unexpected":true}}}}}}
-    ));
-}
-
-test "canonical graph boolean field filter has one unambiguous root" {
-    const alloc = std.testing.allocator;
-    var owned = try parseQueryRequest(alloc, null, "docs",
-        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"bool_field":{"path":"/published","value":true}}}}}}
-    );
-    defer owned.deinit(alloc);
-
-    const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
-    var parsed = try ant_json.parseFromSlice(ant_json.Value, alloc, normalized, .{});
-    defer parsed.deinit();
-    const bool_field = parsed.value.object.get("bool_field") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("/published", bool_field.object.get("path").?.string);
-    try std.testing.expect(bool_field.object.get("value").?.bool);
-}
-
-test "canonical graph path endpoints reject empty identities before allocation" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
-        .key = "",
-        .table = @as(?[]const u8, null),
-    }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
-        .key = "node",
-        .table = @as(?[]const u8, ""),
-    }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
-        .key = "node",
-        .table = @as(?[]const u8, " \t\r\n"),
-    }));
 }
 
 fn parseGraphWherePredicates(alloc: std.mem.Allocator, value: ?indexes_openapi.GraphWhereExpression) ![]const graph_pattern_mod.MatchPredicate {
@@ -12947,7 +11085,11 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
+        "_primary_text_index_name",
+        "_embedding_limits",
         "_defer_hierarchy_child_hydration",
+        "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -13282,7 +11424,11 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
+        "_primary_text_index_name",
+        "_embedding_limits",
         "_defer_hierarchy_child_hydration",
+        "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
         "_filter_doc_ids",
         "_filter_doc_ids_positive",
@@ -13650,6 +11796,32 @@ fn parseInternalFilterJsonStringAlloc(alloc: std.mem.Allocator, value: std.json.
     return try alloc.dupe(u8, value.string);
 }
 
+fn applyInternalEmbeddingLimits(alloc: std.mem.Allocator, body: []const u8, req: *db_mod.types.SearchRequest) !void {
+    // Typed parsing skips the vector payload instead of materializing a second
+    // JSON tree. Matching by index survives changes in map/dispatch order.
+    const Wire = struct { _embedding_limits: ?std.json.ArrayHashMap(u32) = null };
+    var parsed = std.json.parseFromSlice(Wire, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidQueryRequest,
+    };
+    defer parsed.deinit();
+    const limits = parsed.value._embedding_limits orelse return;
+    var it = limits.map.iterator();
+    while (it.next()) |entry| {
+        var matched = false;
+        inline for (.{ req.dense_queries, req.sparse_queries }) |queries| {
+            for (@constCast(queries)) |*named| {
+                if (std.mem.eql(u8, named.index_name, entry.key_ptr.*)) {
+                    if (matched) return error.InvalidQueryRequest;
+                    named.query.k = entry.value_ptr.*;
+                    matched = true;
+                }
+            }
+        }
+        if (!matched) return error.InvalidQueryRequest;
+    }
+}
+
 fn parseInternalDocIdConstraintsAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
@@ -13684,6 +11856,18 @@ fn parseInternalDocIdConstraintsAlloc(
         }
         req.identity_read_generation = generation;
     }
+    if (parsed.value.object.get("_index_name")) |value| {
+        if (value != .string or value.string.len == 0 or req.index_name != null) {
+            return error.InvalidQueryRequest;
+        }
+        req.index_name = try alloc.dupe(u8, value.string);
+    }
+    if (parsed.value.object.get("_primary_text_index_name")) |value| {
+        if (value != .string or value.string.len == 0 or req.primary_text_index_name != null) {
+            return error.InvalidQueryRequest;
+        }
+        req.primary_text_index_name = try alloc.dupe(u8, value.string);
+    }
     if (parsed.value.object.get("_defer_hierarchy_child_hydration")) |value| {
         const is_unit_group = req.hierarchy_group_level == .unit and
             (req.return_mode == .unit or req.return_mode == .unit_with_chunks);
@@ -13691,6 +11875,10 @@ fn parseInternalDocIdConstraintsAlloc(
             return error.InvalidQueryRequest;
         }
         req.defer_hierarchy_child_hydration = true;
+    }
+    if (parsed.value.object.get("_require_algebraic_filter_resolution")) |value| {
+        if (value != .bool or !value.bool) return error.InvalidQueryRequest;
+        req.require_algebraic_filter_resolution = true;
     }
 }
 
@@ -13952,3847 +12140,5730 @@ fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try alloc.dupe(u8, out.written());
 }
 
-test "api query contract parses direct structured boolean filters" {
-    const alloc = std.testing.allocator;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"conjuncts":[{"term":{"status":"active"}},{"term":{"tenant":"tenant-a"}}]}
-    , .{});
-    defer parsed.deinit();
-
-    const encoded = try encodeSupportedPatternFilterQueryAlloc(alloc, parsed.value);
-    defer alloc.free(encoded);
-
-    try std.testing.expectEqualStrings(
-        "{\"bool\":{\"must\":[{\"term\":{\"path\":\"status\",\"term\":\"active\"}},{\"term\":{\"path\":\"tenant\",\"term\":\"tenant-a\"}}]}}",
-        encoded,
-    );
-}
-
-test "api query contract parses direct JSON-pointer path aliases" {
-    const alloc = std.testing.allocator;
-
-    var direct_term_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"term":"gold","path":"/tier"}
-    , .{});
-    defer direct_term_json.deinit();
-    const direct_term = try parseSupportedFullTextQuery(alloc, direct_term_json.value, 10);
-    defer freeTextQuery(alloc, direct_term);
-    try std.testing.expect(direct_term == .term);
-    try std.testing.expectEqualStrings("/tier", direct_term.term.field);
-    try std.testing.expectEqualStrings("gold", direct_term.term.term);
-
-    var wrapped_term_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"term":{"path":"/tier","value":"silver"}}
-    , .{});
-    defer wrapped_term_json.deinit();
-    const wrapped_term = try parseSupportedFullTextQuery(alloc, wrapped_term_json.value, 10);
-    defer freeTextQuery(alloc, wrapped_term);
-    try std.testing.expect(wrapped_term == .term);
-    try std.testing.expectEqualStrings("/tier", wrapped_term.term.field);
-    try std.testing.expectEqualStrings("silver", wrapped_term.term.term);
-
-    var match_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"match":{"path":"/tier","text":"gold"}}
-    , .{});
-    defer match_json.deinit();
-    const match_query = try parseSupportedFullTextQuery(alloc, match_json.value, 10);
-    defer freeTextQuery(alloc, match_query);
-    try std.testing.expect(match_query == .match);
-    try std.testing.expectEqualStrings("/tier", match_query.match.field);
-    try std.testing.expectEqualStrings("gold", match_query.match.text);
-
-    var prefix_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"prefix":"go","path":"/tier"}
-    , .{});
-    defer prefix_json.deinit();
-    const prefix_query = try parseSupportedFullTextQuery(alloc, prefix_json.value, 10);
-    defer freeTextQuery(alloc, prefix_query);
-    try std.testing.expect(prefix_query == .prefix);
-    try std.testing.expectEqualStrings("/tier", prefix_query.prefix.field);
-    try std.testing.expectEqualStrings("go", prefix_query.prefix.prefix);
-
-    var wrapped_prefix_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"prefix":{"path":"/tier","value":"si"}}
-    , .{});
-    defer wrapped_prefix_json.deinit();
-    const wrapped_prefix_query = try parseSupportedFullTextQuery(alloc, wrapped_prefix_json.value, 10);
-    defer freeTextQuery(alloc, wrapped_prefix_query);
-    try std.testing.expect(wrapped_prefix_query == .prefix);
-    try std.testing.expectEqualStrings("/tier", wrapped_prefix_query.prefix.field);
-    try std.testing.expectEqualStrings("si", wrapped_prefix_query.prefix.prefix);
-
-    var wildcard_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"wildcard":{"path":"/tier","pattern":"go*"}}
-    , .{});
-    defer wildcard_json.deinit();
-    const wildcard_query = try parseSupportedFullTextQuery(alloc, wildcard_json.value, 10);
-    defer freeTextQuery(alloc, wildcard_query);
-    try std.testing.expect(wildcard_query == .wildcard);
-    try std.testing.expectEqualStrings("/tier", wildcard_query.wildcard.field);
-    try std.testing.expectEqualStrings("go*", wildcard_query.wildcard.pattern);
-
-    var regexp_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"regexp":{"path":"/tier","value":"go.*"}}
-    , .{});
-    defer regexp_json.deinit();
-    const regexp_query = try parseSupportedFullTextQuery(alloc, regexp_json.value, 10);
-    defer freeTextQuery(alloc, regexp_query);
-    try std.testing.expect(regexp_query == .regexp);
-    try std.testing.expectEqualStrings("/tier", regexp_query.regexp.field);
-    try std.testing.expectEqualStrings("go.*", regexp_query.regexp.pattern);
-
-    var fuzzy_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"fuzzy":{"path":"/tier","query":"gild","prefix_length":1,"max_edits":1}}
-    , .{});
-    defer fuzzy_json.deinit();
-    const fuzzy_query = try parseSupportedFullTextQuery(alloc, fuzzy_json.value, 10);
-    defer freeTextQuery(alloc, fuzzy_query);
-    try std.testing.expect(fuzzy_query == .fuzzy);
-    try std.testing.expectEqualStrings("/tier", fuzzy_query.fuzzy.field);
-    try std.testing.expectEqualStrings("gild", fuzzy_query.fuzzy.term);
-    try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.prefix_len);
-    try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.max_edits);
-
-    var generated_fuzzy_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"term":"gild","field":"/tier","prefix_length":1,"fuzziness":1,"boost":2}
-    , .{});
-    defer generated_fuzzy_json.deinit();
-    const generated_fuzzy_query = try parseSupportedFullTextQuery(alloc, generated_fuzzy_json.value, 10);
-    defer freeTextQuery(alloc, generated_fuzzy_query);
-    try std.testing.expect(generated_fuzzy_query == .fuzzy);
-    try std.testing.expectEqualStrings("/tier", generated_fuzzy_query.fuzzy.field);
-    try std.testing.expectEqualStrings("gild", generated_fuzzy_query.fuzzy.term);
-    try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.prefix_len);
-    try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.max_edits);
-    try std.testing.expectEqual(@as(f32, 2), generated_fuzzy_query.fuzzy.boost);
-
-    var range_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"path":"/amount","min":10,"max":20}
-    , .{});
-    defer range_json.deinit();
-    const range_query = try parseSupportedFullTextQuery(alloc, range_json.value, 10);
-    defer freeTextQuery(alloc, range_query);
-    try std.testing.expect(range_query == .numeric_range);
-    try std.testing.expectEqualStrings("/amount", range_query.numeric_range.field);
-    try std.testing.expectEqual(@as(?f64, 10), range_query.numeric_range.min);
-    try std.testing.expectEqual(@as(?f64, 20), range_query.numeric_range.max);
-
-    var mixed_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"path":"/created_at","start":"2026-01-01T00:00:00Z","min":10}
-    , .{});
-    defer mixed_range_json.deinit();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, mixed_range_json.value, 10));
-
-    var malformed_operator_with_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"term":42,"path":"/amount","min":10}
-    , .{});
-    defer malformed_operator_with_range_json.deinit();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, malformed_operator_with_range_json.value, 10));
-
-    var malformed_operator_with_date_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"term":42,"path":"/created_at","start":"2026-01-01T00:00:00Z"}
-    , .{});
-    defer malformed_operator_with_date_range_json.deinit();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, malformed_operator_with_date_range_json.value, 10));
-
-    var disjuncts_json = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"disjuncts":[{"term":"gold","path":"/tier"},{"term":{"path":"/tier","term":"bronze"}}]}
-    , .{});
-    defer disjuncts_json.deinit();
-    const disjuncts_query = try parseSupportedFullTextQuery(alloc, disjuncts_json.value, 10);
-    defer freeTextQuery(alloc, disjuncts_query);
-    try std.testing.expect(disjuncts_query == .bool_query);
-    try std.testing.expectEqual(@as(usize, 2), disjuncts_query.bool_query.should.len);
-    try std.testing.expect(disjuncts_query.bool_query.should[0] == .term);
-    try std.testing.expectEqualStrings("/tier", disjuncts_query.bool_query.should[0].term.field);
-    try std.testing.expectEqualStrings("gold", disjuncts_query.bool_query.should[0].term.term);
-    try std.testing.expect(disjuncts_query.bool_query.should[1] == .term);
-    try std.testing.expectEqualStrings("/tier", disjuncts_query.bool_query.should[1].term.field);
-    try std.testing.expectEqualStrings("bronze", disjuncts_query.bool_query.should[1].term.term);
-}
-
-test "api query contract normalizes canonical query with legacy shorthands" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "query": {
-        \\    "bool": {
-        \\      "must": [{"match":{"field":"body","text":"raft"}}],
-        \\      "filter": [
-        \\        {"term":{"path":"/tenant","value":"acme"}},
-        \\        {"terms":{"path":"/tier","values":["gold",2,true]}}
-        \\      ],
-        \\      "must_not": [
-        \\        {"exists":{"path":"/deleted_at"}},
-        \\        {"term":{"path":"/archived","value":true}}
-        \\      ]
-        \\    }
-        \\  },
-        \\  "full_text_search": {"term":{"body":"legacy"}},
-        \\  "filter_query": {"term":{"status":"published"}},
-        \\  "exclusion_query": {"term":{"status":"deleted"}}
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .bool_query);
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.full_text.?.bool_query.must.len);
-    try std.testing.expect(parsed.req.full_text.?.bool_query.must[0] == .match);
-    try std.testing.expect(parsed.req.full_text.?.bool_query.must[1] == .term);
-    try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.bool_query.must[0].match.text);
-    try std.testing.expectEqualStrings("legacy", parsed.req.full_text.?.bool_query.must[1].term.term);
-
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"must\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"values\":[\"gold\",2,true]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"term\":\"published\"") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"should\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"minimum_should_match\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"exists\":{\"path\":\"/deleted_at\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/archived\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"term\":\"deleted\"") != null);
-}
-
-test "api query contract parses public with document filter bindings" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "with": {
-        \\    "visible": {"term":{"path":"/tenant","value":"acme"}},
-        \\    "published": {"bool_field":{"field":"published","value":true}}
-        \\  },
-        \\  "query": {
-        \\    "bool": {
-        \\      "must": [
-        \\        {"match":{"field":"body","text":"raft"}},
-        \\        {"ref":"visible"}
-        \\      ],
-        \\      "filter": [{"ref":"published"}]
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.doc_filter_bindings.len);
-    try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[0].name);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}", parsed.req.doc_filter_bindings[0].filter_query_json);
-    try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[1].name);
-    try std.testing.expectEqualStrings("{\"bool_field\":{\"field\":\"published\",\"value\":true}}", parsed.req.doc_filter_bindings[1].filter_query_json);
-
-    try std.testing.expect(parsed.req.full_text.? == .match);
-    try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
-}
-
-test "api query contract expands text-index document filter bindings" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-        \\  },
-        \\  "filter_query": {"ref":"receipt"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("body", filter_text.match_phrase.field);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract keeps text-index bindings in bool must non-scoring" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-        \\  },
-        \\  "query": {
-        \\    "bool": {
-        \\      "must": [
-        \\        {"match":{"field":"body","text":"raft"}},
-        \\        {"ref":"receipt"}
-        \\      ]
-        \\    }
-        \\  }
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    const scoring = parsed.req.full_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(scoring == .match);
-    try std.testing.expectEqualStrings("raft", scoring.match.text);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract keeps full text binding references non-scoring" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-        \\  },
-        \\  "full_text_search": {"ref":"receipt"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .match_all);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract retains structured bindings beside text bindings" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "tenant": {"term":{"path":"/tenant","value":"acme"}},
-        \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-        \\  },
-        \\  "filter_query": [
-        \\    {"ref":"tenant"},
-        \\    {"ref":"receipt"}
-        \\  ]
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
-    try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
-    try std.testing.expectEqualStrings(
-        "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
-        parsed.req.doc_filter_bindings[0].filter_query_json,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"tenant\"") != null);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract retains structured dependencies of text bindings" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "tenant": {"term":{"path":"/tenant","value":"acme"}},
-        \\    "receipt": {
-        \\      "bool": {
-        \\        "must": [
-        \\          {"ref":"tenant"},
-        \\          {"match_phrase":"paid receipt","field":"body"}
-        \\        ]
-        \\      }
-        \\    }
-        \\  },
-        \\  "filter_query": {"ref":"receipt"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
-    try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"tenant\"") != null);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract classifies transitive text binding dependencies" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "receipt": {"match_phrase":"paid receipt","field":"body"},
-        \\    "paid": {"ref":"receipt"}
-        \\  },
-        \\  "filter_query": {"ref":"paid"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract rejects unused bindings with unknown syntax" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(
-        error.UnsupportedQueryRequest,
-        parseQueryRequest(
-            alloc,
-            null,
-            "docs",
-            \\{
-            \\  "with": {
-            \\    "invalid": {"unknown_operator":{"value":"silently discarded before validation"}}
-            \\  },
-            \\  "query": {"match_all":{}}
-            \\}
-            ,
-        ),
-    );
-}
-
-test "api query contract splits mixed structured and text binding conjunctions" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "visible_receipt": {
-        \\      "bool": {
-        \\        "must": [
-        \\          {"term":{"path":"/tenant","value":"acme"}},
-        \\          {"match_phrase":"paid receipt","field":"body"}
-        \\        ]
-        \\      }
-        \\    }
-        \\  },
-        \\  "filter_query": {"ref":"visible_receipt"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"value\":\"acme\"") != null);
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .match_phrase);
-    try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
-}
-
-test "api query contract binding expansion observes zero timeout" {
-    try std.testing.expectError(
-        error.Timeout,
-        parseQueryRequest(
-            std.testing.allocator,
-            null,
-            "docs",
-            \\{
-            \\  "timeout_ms": 0,
-            \\  "with": {
-            \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-            \\  },
-            \\  "filter_query": {"ref":"receipt"}
-            \\}
-            ,
-        ),
-    );
-}
-
-test "api query contract honors caller absolute deadline during normalization" {
-    try std.testing.expectError(
-        error.Timeout,
-        parsePublicQueryRequestWithDeadline(
-            std.testing.allocator,
-            null,
-            "docs",
-            \\{
-            \\  "timeout_ms": 60000,
-            \\  "with": {
-            \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
-            \\  },
-            \\  "filter_query": {"ref":"receipt"}
-            \\}
-        ,
-            0,
-        ),
-    );
-}
-
-test "api query contract expansion budget checks its absolute deadline" {
-    var budget = PublicBindingExpansionBudget{
-        .remaining_bytes = 128,
-        .deadline_ns = 0,
-    };
-    try std.testing.expectError(error.Timeout, budget.consumeNode(0));
-}
-
-test "api query contract final binding validation observes caller deadline" {
-    try std.testing.expectError(
-        error.Timeout,
-        parsePublicDocFilterBindingsAlloc(
-            std.testing.allocator,
-            \\{
-            \\  "with": {
-            \\    "visible": {"term":{"path":"/tenant","value":"acme"}}
-            \\  },
-            \\  "filter_query": {"ref":"visible"}
-            \\}
-        ,
-            10,
-            0,
-        ),
-    );
-}
-
-test "api query contract limits binding expansion growth not input size" {
-    const input_bytes = public_limits.max_request_body_bytes;
-    try std.testing.expectEqual(
-        input_bytes + public_limits.max_query_binding_expansion_growth_bytes,
-        try publicBindingExpansionOutputLimit(input_bytes),
-    );
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        publicBindingExpansionOutputLimit(std.math.maxInt(usize)),
-    );
-}
-
-test "api query contract bounds expanded binding output bytes" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        expandPublicDocFilterBindingsWithLimitAlloc(
-            alloc,
-            \\{
-            \\  "with": {
-            \\    "receipt": {"match_phrase":"paid receipt paid receipt paid receipt","field":"body"}
-            \\  },
-            \\  "filter_query": [
-            \\    {"ref":"receipt"},
-            \\    {"ref":"receipt"},
-            \\    {"ref":"receipt"},
-            \\    {"ref":"receipt"}
-            \\  ]
-            \\}
-        ,
-            256,
-        ),
-    );
-}
-
-test "api query contract orders forward document filter dependencies" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "visible": {"bool":{"must":[{"ref":"tenant"},{"ref":"published"}]}},
-        \\    "published": {"bool_field":{"field":"published","value":true}},
-        \\    "tenant": {"term":{"path":"/tenant","value":"acme"}}
-        \\  },
-        \\  "filter_query": {"ref":"visible"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 3), parsed.req.doc_filter_bindings.len);
-    try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[0].name);
-    try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[1].name);
-    try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[2].name);
-}
-
-test "api query contract rejects invalid document filter dependency graphs" {
-    const alloc = std.testing.allocator;
-    inline for ([_][]const u8{
-        \\{"with":{"visible":{"ref":"missing"}},"filter_query":{"ref":"visible"}}
-        ,
-        \\{"with":{"first":{"ref":"second"},"second":{"ref":"first"}},"filter_query":{"ref":"first"}}
-        ,
-        \\{"with":{"visible":{"match_all":{}}},"filter_query":{"ref":"missing"}}
-        ,
-        \\{"filter_query":{"ref":"missing"}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parseQueryRequest(alloc, null, "docs", body),
-        );
-    }
-}
-
-test "api query contract applies one inclusive depth limit to filter dependencies" {
-    const alloc = std.testing.allocator;
-    var by_name = std.StringHashMapUnmanaged(usize).empty;
-    defer by_name.deinit(alloc);
-    try by_name.put(alloc, "base", 0);
-
-    var body = std.ArrayListUnmanaged(u8).empty;
-    defer body.deinit(alloc);
-    for (0..public_query_max_tree_depth) |_| {
-        try body.appendSlice(alloc, "{\"conjuncts\":[");
-    }
-    try body.appendSlice(alloc, "{\"ref\":\"base\"}");
-    for (0..public_query_max_tree_depth) |_| {
-        try body.appendSlice(alloc, "]}");
-    }
-
-    var at_limit = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
-    defer at_limit.deinit();
-    try collectPublicDocFilterRefs(alloc, at_limit.value, &by_name, null);
-
-    try body.insertSlice(alloc, 0, "{\"conjuncts\":[");
-    try body.appendSlice(alloc, "]}");
-    var beyond_limit = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
-    defer beyond_limit.deinit();
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        collectPublicDocFilterRefs(alloc, beyond_limit.value, &by_name, null),
-    );
-}
-
-test "api query contract keeps compact ref fields distinct from binding references" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "with": {
-        \\    "literal_ref": {"term":{"ref":"published"}}
-        \\  },
-        \\  "filter_query": {"ref":"literal_ref"}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
-    try std.testing.expectEqualStrings("literal_ref", parsed.req.doc_filter_bindings[0].name);
-    try std.testing.expectEqualStrings(
-        "{\"term\":{\"path\":\"ref\",\"term\":\"published\"}}",
-        parsed.req.doc_filter_bindings[0].filter_query_json,
-    );
-}
-
-test "api query contract keeps ambiguous direct text operators score-bearing" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "query": {
-        \\    "bool": {
-        \\      "must": [
-        \\        {"match":{"field":"body","value":"raft"}}
-        \\      ]
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .match);
-    try std.testing.expectEqualStrings("body", parsed.req.full_text.?.match.field);
-    try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
-    try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
-}
-
-test "api query contract targets named full text retrieval without changing primary filters" {
-    const alloc = std.testing.allocator;
-    var parsed = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "docs",
-        \\{
-        \\  "full_text_index": "document_text",
-        \\  "full_text_search": {"match":"needle","field":"text"},
-        \\  "filter_query": {"term":{"path":"/tenant","value":"acme"}}
-        \\}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text == null);
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text_queries.len);
-    try std.testing.expectEqualStrings("$full_text_results", parsed.req.full_text_queries[0].name);
-    try std.testing.expectEqualStrings("document_text", parsed.req.full_text_queries[0].index_name);
-    try std.testing.expect(parsed.req.full_text_queries[0].query == .match);
-    try std.testing.expectEqualStrings("needle", parsed.req.full_text_queries[0].query.match.text);
-    try std.testing.expectEqualStrings(
-        "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
-        parsed.req.filter_query_json,
-    );
-
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        parsePublicQueryRequest(alloc, null, "docs", "{\"full_text_index\":\"document_text\",\"limit\":10}"),
-    );
-}
-
-test "api query contract rejects malformed scoring clauses before filter fallback" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "query": {
-        \\    "bool": {
-        \\      "must": [
-        \\        {"match":{"field":"body"}}
-        \\      ]
-        \\    }
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-}
-
-test "api query contract parses public hierarchy controls" {
-    const alloc = std.testing.allocator;
-    const chunk_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"return_level":"chunk"}
-        \\}
-    ;
-    var chunk = try parseQueryRequest(alloc, null, "docs", chunk_body);
-    defer chunk.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, chunk.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 0), chunk.req.max_chunks_per_parent);
-
-    const unit_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"return_level":"unit"}
-        \\}
-    ;
-    var unit = try parseQueryRequest(alloc, null, "docs", unit_body);
-    defer unit.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, unit.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 0), unit.req.max_chunks_per_parent);
-
-    const grouped_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {
-        \\    "return_level": "source",
-        \\    "rollup": "source",
-        \\    "include": ["unit", "chunk"],
-        \\    "max_children_per_parent": 2
-        \\  }
-        \\}
-    ;
-    var grouped = try parseQueryRequest(alloc, null, "docs", grouped_body);
-    defer grouped.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, grouped.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 2), grouped.req.max_chunks_per_parent);
-    try std.testing.expect(!grouped.req.hierarchy_include_source);
-    try std.testing.expect(grouped.req.hierarchy_include_unit);
-
-    const hydrate_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {
-        \\    "return_level": "chunk",
-        \\    "include": ["source", "unit"]
-        \\  }
-        \\}
-    ;
-    var hydrate = try parseQueryRequest(alloc, null, "docs", hydrate_body);
-    defer hydrate.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, hydrate.req.return_mode);
-    try std.testing.expect(hydrate.req.hierarchy_include_source);
-    try std.testing.expect(hydrate.req.hierarchy_include_unit);
-
-    const mention_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {
-        \\    "return_level": "mention",
-        \\    "include": ["source", "mention"]
-        \\  }
-        \\}
-    ;
-    var mention = try parseQueryRequest(alloc, null, "docs", mention_body);
-    defer mention.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, mention.req.return_mode);
-    try std.testing.expect(mention.req.hierarchy_include_source);
-
-    const projected_matches_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": ["text"],
-        \\  "hierarchy": {
-        \\    "ancestors": {
-        \\      "source": {"fields":["title","url"]},
-        \\      "unit": {"fields":["page"]}
-        \\    }
-        \\  }
-        \\}
-    ;
-    var projected_matches = try parseQueryRequest(alloc, null, "docs", projected_matches_body);
-    defer projected_matches.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, projected_matches.req.return_mode);
-    try std.testing.expect(projected_matches.req.hierarchy_include_source);
-    try std.testing.expect(projected_matches.req.hierarchy_include_unit);
-    try std.testing.expect(!projected_matches.req.hierarchy_source_include_all_fields);
-    try std.testing.expectEqualStrings("url", projected_matches.req.hierarchy_source_fields[1]);
-    try std.testing.expect(!projected_matches.req.hierarchy_unit_include_all_fields);
-    try std.testing.expectEqualStrings("page", projected_matches.req.hierarchy_unit_fields[0]);
-    try std.testing.expect(projected_matches.req.defer_stored_projection);
-
-    const grouped_matches_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": ["title"],
-        \\  "hierarchy": {
-        \\    "group_by": {
-        \\      "level": "source",
-        \\      "matches": {"fields":["text"]}
-        \\    }
-        \\  }
-        \\}
-    ;
-    var grouped_matches = try parseQueryRequest(alloc, null, "docs", grouped_matches_body);
-    defer grouped_matches.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, grouped_matches.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 3), grouped_matches.req.max_chunks_per_parent);
-    try std.testing.expect(grouped_matches.req.hierarchy_omit_implicit_source_ancestor_document);
-    try std.testing.expect(grouped_matches.req.hierarchy_grouped_matches);
-    try std.testing.expect(!grouped_matches.req.hierarchy_include_source);
-    try std.testing.expect(!grouped_matches.req.hierarchy_include_unit);
-    try std.testing.expect(!grouped_matches.req.hierarchy_match_include_all_fields);
-    try std.testing.expectEqualStrings("text", grouped_matches.req.hierarchy_match_fields[0]);
-    try std.testing.expect(grouped_matches.req.defer_stored_projection);
-
-    const grouped_only_body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source"}}
-        \\}
-    ;
-    var grouped_only = try parseQueryRequest(alloc, null, "docs", grouped_only_body);
-    defer grouped_only.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_only.req.return_mode);
-    try std.testing.expect(!grouped_only.req.hierarchy_grouped_matches);
-}
-
-test "api query contract validates canonical hierarchy controls" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"rollup":"mention"}
-        \\}
-    ;
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-
-    const unit_group_level =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"unit","matches":{"fields":[]}}}
-        \\}
-    ;
-    var unit_group = try parseQueryRequest(alloc, null, "docs", unit_group_level);
-    defer unit_group.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, unit_group.req.hierarchy_group_level);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.unit_with_chunks, unit_group.req.return_mode);
-    try std.testing.expect(unit_group.req.hierarchy_grouped_matches);
-
-    const sorted_unit_group =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "order_by": [{"field":"_score","desc":true}],
-        \\  "hierarchy": {"group_by":{"level":"unit"}}
-        \\}
-    ;
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", sorted_unit_group));
-    const unit_sort_diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", unit_sort_diagnostic.field);
-    try std.testing.expectEqualStrings("unsupported_exact_sort", unit_sort_diagnostic.reason);
-    try std.testing.expectEqualStrings("unsupported_exact_sort", unit_sort_diagnostic.detail);
-
-    const missing_group_level =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"matches":{"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_group_level));
-
-    const unknown_group_field =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","sort":[]}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_group_field));
-
-    const composable_group_and_unit_ancestor =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"unit":{"fields":["page"]}}}
-        \\}
-    ;
-    var composable = try parseQueryRequest(alloc, null, "docs", composable_group_and_unit_ancestor);
-    defer composable.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, composable.req.return_mode);
-    try std.testing.expect(composable.req.hierarchy_grouped_matches);
-    try std.testing.expect(!composable.req.hierarchy_include_source);
-    try std.testing.expect(composable.req.hierarchy_include_unit);
-
-    const redundant_group_source_ancestor =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"source":{"fields":["title"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", redundant_group_source_ancestor));
-
-    const mixed_contract_generations =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source"},"include":["chunk"]}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", mixed_contract_generations));
-
-    const missing_match_fields =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_match_fields));
-
-    const missing_group_projection =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_group_projection));
-
-    const missing_ancestor_fields =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"ancestors":{"source":{}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_ancestor_fields));
-
-    const children_body =
-        \\{
-        \\  "fields": ["unit_id","unit_type","text","provenance.page_number"],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
-        \\  "order_by": [{"field":"_hierarchy.position"}],
-        \\  "limit": 20
-        \\}
-    ;
-    var children = try parseQueryRequest(alloc, null, "docs", children_body);
-    defer children.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.unit, children.req.return_mode);
-    try std.testing.expectEqualStrings("doc:a", children.req.hierarchy_children.?.parent_id);
-    try std.testing.expectEqualStrings("_hierarchy.position", children.req.order_by[0].field);
-
-    const internal_children_body =
-        \\{
-        \\  "fields": [],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
-        \\  "order_by": [{"field":"_hierarchy.position"}],
-        \\  "_identity_read_generation": 42,
-        \\  "_filter_query_json": "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}"
-        \\}
-    ;
-    var internal_children = try parseQueryRequest(alloc, null, "docs", internal_children_body);
-    defer internal_children.deinit(alloc);
-    try std.testing.expectEqual(@as(?u64, 42), internal_children.req.identity_read_generation);
-    try std.testing.expect(internal_children.req.filter_query_json.len > 0);
-    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", internal_children_body));
-
-    const children_with_query =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "fields": [],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
-        \\  "order_by": [{"field":"_hierarchy.position"}]
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_query));
-
-    const children_with_ignored_filter =
-        \\{
-        \\  "filter_query": {"term":{"path":"/tenant","value":"acme"}},
-        \\  "fields": [],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
-        \\  "order_by": [{"field":"_hierarchy.position"}]
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_ignored_filter));
-
-    const children_without_order =
-        \\{
-        \\  "fields": [],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_without_order));
-
-    const stale_shaped_children_cursor =
-        \\{
-        \\  "fields": [],
-        \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
-        \\  "order_by": [{"field":"_hierarchy.position"}],
-        \\  "search_after": ["position-only"]
-        \\}
-    ;
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", stale_shaped_children_cursor));
-
-    const bounded_grouped_matches =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2,"fields":["text"]}}}
-        \\}
-    ;
-    var bounded_grouped = try parseQueryRequest(alloc, null, "docs", bounded_grouped_matches);
-    defer bounded_grouped.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, bounded_grouped.req.return_mode);
-    try std.testing.expectEqual(@as(u32, 2), bounded_grouped.req.max_chunks_per_parent);
-
-    const too_many_groups =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "limit": 101,
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_many_groups));
-
-    const too_much_grouped_work =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "limit": 100,
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":11,"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_much_grouped_work));
-
-    const unbounded_group_page =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "limit": 0,
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unbounded_group_page));
-
-    const oversized_grouped_matches =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "fields": [],
-        \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":101,"fields":["text"]}}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", oversized_grouped_matches));
-
-    const direct_matches_with_ancestors =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {"ancestors":{"source":{"fields":[]}}}
-        \\}
-    ;
-    var direct_matches = try parseQueryRequest(alloc, null, "docs", direct_matches_with_ancestors);
-    defer direct_matches.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.member, direct_matches.req.return_mode);
-    try std.testing.expect(direct_matches.req.hierarchy_include_source);
-    try std.testing.expect(!direct_matches.req.hierarchy_source_include_all_fields);
-
-    const empty_hierarchy =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": {}
-        \\}
-    ;
-    var empty_direct = try parseQueryRequest(alloc, null, "docs", empty_hierarchy);
-    defer empty_direct.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.member, empty_direct.req.return_mode);
-    try std.testing.expect(!empty_direct.req.hierarchy_include_source);
-    try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
-
-    // Canonical optional fields are non-nullable: omission selects the default
-    // result shape, while an explicit null is a malformed request.
-    const null_hierarchy =
-        \\{
-        \\  "full_text_search": {"match":"needle","field":"content"},
-        \\  "hierarchy": null
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", null_hierarchy));
-}
-
-test "api query contract keeps generated schema strict when with is present" {
-    const alloc = std.testing.allocator;
-    const unknown_body =
-        \\{
-        \\  "with": {"visible": {"match_all": {}}},
-        \\  "not_a_query_field": true,
-        \\  "query": {"match_all": {}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_body));
-
-    const generation_body =
-        \\{
-        \\  "with": {"visible": {"match_all": {}}},
-        \\  "identity_read_generation": 7,
-        \\  "query": {"match_all": {}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", generation_body));
-
-    const reassignment_body =
-        \\{
-        \\  "with": {"visible": {"match_all": {}}},
-        \\  "allow_doc_identity_reassignment": true,
-        \\  "query": {"match_all": {}}
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", reassignment_body));
-}
-
-test "api query contract public parser rejects internal shard doc identity controls" {
-    const alloc = std.testing.allocator;
-    const internal_body =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "native_doc_id_constraints": {
-        \\    "positive_filter": true,
-        \\    "include_doc_ids": ["doc:a"],
-        \\    "exclude_doc_ids": []
-        \\  },
-        \\  "_identity_read_generation": 7
-        \\}
-    ;
-
-    try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, internal_body));
-    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", internal_body));
-
-    var internal = try parseQueryRequest(alloc, null, "docs", internal_body);
-    defer internal.deinit(alloc);
-    try std.testing.expect(internal.req.filter_doc_ids_positive);
-    try std.testing.expectEqual(@as(usize, 1), internal.req.filter_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:a", internal.req.filter_doc_ids[0]);
-    try std.testing.expectEqual(@as(?u64, 7), internal.req.identity_read_generation);
-
-    const internal_unknown_body =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "native_doc_id_constraints": {
-        \\    "positive_filter": true,
-        \\    "include_doc_ids": ["doc:a"],
-        \\    "exclude_doc_ids": []
-        \\  },
-        \\  "not_a_query_field": true
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", internal_unknown_body));
-
-    const resolved_filter_body =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "_resolved_doc_filter": {
-        \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
-        \\    "identity_read_generation": 9,
-        \\    "include": {"kind": "ordinals", "values": [1, 3]},
-        \\    "exclude": {"kind": "none"}
-        \\  }
-        \\}
-    ;
-    try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, resolved_filter_body));
-    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", resolved_filter_body));
-    var resolved_internal = try parseQueryRequest(alloc, null, "docs", resolved_filter_body);
-    defer resolved_internal.deinit(alloc);
-    try std.testing.expect(resolved_internal.req.resolved_doc_filter != null);
-    try std.testing.expectEqual(@as(?u64, 9), resolved_internal.req.identity_read_generation);
-
-    const literal_body =
-        \\{"full_text_search":{"query":"mentions native_doc_id_constraints and _identity_read_generation"}}
-    ;
-    try std.testing.expect(!try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, literal_body));
-
-    const timeout_before_ns = platform_time.monotonicNs();
-    var timeout_request = try parsePublicQueryRequest(alloc, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":250}
-    );
-    defer timeout_request.deinit(alloc);
-    const timeout_after_ns = platform_time.monotonicNs();
-    const deadline_ns = timeout_request.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
-    const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
-    try std.testing.expect(deadline_origin_ns >= timeout_before_ns);
-    try std.testing.expect(deadline_origin_ns <= timeout_after_ns);
-
-    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":-1}
-    ));
-    try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":1.5}
-    ));
-}
-
-test "api query contract treats canonical typed scalar term as structured filter" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"query":{"term":{"path":"/published","value":true}}}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .match_all);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/published\",\"value\":true}}", parsed.req.filter_query_json);
-    try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
-}
-
-test "api query contract preserves the canonical query object wire kind" {
-    const alloc = std.testing.allocator;
-    inline for (.{
-        \\{"query":[]}
-        ,
-        \\{"query":"match all"}
-        ,
-        \\{"query":true}
-        ,
-        \\{"query":42}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parsePublicQueryRequest(alloc, null, "docs", body),
-        );
-    }
-}
-
-test "api query contract treats canonical string path term as structured filter" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"query":{"term":{"path":"/tier","value":"gold"}}}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .match_all);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}}", parsed.req.filter_query_json);
-    try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
-}
-
-test "api query contract includes stored source when fields are omitted" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"full_text_search":{"match":"needle","field":"content"}}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.include_all_fields);
-    try std.testing.expect(parsed.req.include_stored);
-    try std.testing.expect(!parsed.req.defer_stored_projection);
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
-}
-
-test "api query contract accepts multi_match bool_prefix full text" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":2}}}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text.? == .multi_match_bool_prefix);
-    try std.testing.expectEqualStrings("quick brown f", parsed.req.full_text.?.multi_match_bool_prefix.query);
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text.?.multi_match_bool_prefix.fields.len);
-    try std.testing.expectEqualStrings("title", parsed.req.full_text.?.multi_match_bool_prefix.fields[0].field);
-    try std.testing.expectEqual(@as(f32, 2.0), parsed.req.full_text.?.multi_match_bool_prefix.boost);
-
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        parseQueryRequest(
-            alloc,
-            null,
-            "docs",
-            \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":1e100}}}
-            ,
-        ),
-    );
-}
-
-test "api query contract projects stored source when explicit fields are supplied" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match": "needle", "field": "content"},
-        \\  "fields": ["path", "filename"]
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(!parsed.req.include_all_fields);
-    try std.testing.expect(parsed.req.include_stored);
-    try std.testing.expect(parsed.req.defer_stored_projection);
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.fields.len);
-    try std.testing.expectEqualStrings("path", parsed.req.fields[0]);
-    try std.testing.expectEqualStrings("filename", parsed.req.fields[1]);
-}
-
-test "api query contract accepts internal normalized filter json on internal query route" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match": "hello", "field": "body"},
-        \\  "_filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"published\"}}",
-        \\  "_exclusion_query_json": "{\"term\":{\"path\":\"/deleted\",\"value\":true}}"
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"published\"}}", parsed.req.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", parsed.req.exclusion_query_json);
-}
-
-test "api query contract combines public and internal filter representations losslessly" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "filter_query": {"term": "published", "field": "status"},
-        \\  "exclusion_query": {"term": "draft", "field": "status"},
-        \\  "_filter_query_json": "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
-        \\  "_exclusion_query_json": "{\"term\":{\"path\":\"/deleted\",\"value\":true}}"
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"must\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"should\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/deleted\"") != null);
-}
-
-test "api query contract normalizes public scalar filters before forwarding" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match": "hello", "field": "body"},
-        \\  "filter_query": {"term": "published", "field": "status"},
-        \\  "exclusion_query": {"term": "gamma", "field": "title"}
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"status\",\"term\":\"published\"}}", parsed.req.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"title\",\"term\":\"gamma\"}}", parsed.req.exclusion_query_json);
-}
-
-test "api query contract canonicalizes public Query filter roots and compositions" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        body: []const u8,
-        required_fragments: []const []const u8,
-        forbidden_fragments: []const []const u8 = &.{},
-    }{
-        .{
-            .body =
-            \\{"filter_query":{"prefix":"tenant/","field":"path"}}
-            ,
-            .required_fragments = &.{
-                "\"prefix\"",
-                "\"path\":\"path\"",
-                "\"prefix\":\"tenant/\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"term":"active","field":"status","fuzziness":1,"prefix_length":2}}
-            ,
-            .required_fragments = &.{
-                "\"fuzzy\"",
-                "\"path\":\"status\"",
-                "\"query\":\"active\"",
-                "\"max_edits\":1",
-                "\"prefix_length\":2",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"min":"a","max":"z","field":"name","inclusive_max":true}}
-            ,
-            .required_fragments = &.{
-                "\"term_range\"",
-                "\"path\":\"name\"",
-                "\"min\":\"a\"",
-                "\"max\":\"z\"",
-                "\"inclusive_max\":true",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"start":"2026-01-01T00:00:00Z","field":"created_at"}}
-            ,
-            .required_fragments = &.{
-                "\"date_range\"",
-                "\"path\":\"created_at\"",
-                "\"start_ns\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"bool":true,"field":"published"}}
-            ,
-            .required_fragments = &.{
-                "\"bool_field\"",
-                "\"path\":\"published\"",
-                "\"value\":true",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":1}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"should\"",
-                "\"path\":\"status\"",
-                "\"term\":\"active\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"},{"term":"gold","field":"tier"}],"min":2}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"should\"",
-                "\"minimum_should_match\":2",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"conjuncts":[{"term":"active","field":"status"}]}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"must\"",
-                "\"path\":\"status\"",
-                "\"term\":\"active\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"must_not":{"disjuncts":[{"prefix":"private/","field":"path"}]}}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"must_not\"",
-                "\"path\":\"path\"",
-                "\"prefix\":\"private/\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"must":{"conjuncts":[{"disjuncts":[{"prefix":"tenant/","field":"path"}],"min":1}]}}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"must\"",
-                "\"should\"",
-                "\"path\":\"path\"",
-                "\"prefix\":\"tenant/\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"bool":{"should":[{"term":"active","field":"status"},{"term":"gold","field":"tier"}],"minimum_should_match":2}}}
-            ,
-            .required_fragments = &.{
-                "\"bool\"",
-                "\"should\"",
-                "\"minimum_should_match\":2",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-        .{
-            .body =
-            \\{"filter_query":{"must":{"conjuncts":[{"term":"active","field":"status"}]},"must_not":{"disjuncts":[{"term":"deleted","field":"status"}],"min":1}}}
-            ,
-            .required_fragments = &.{
-                "\"must\"",
-                "\"must_not\"",
-                "\"term\":\"active\"",
-                "\"term\":\"deleted\"",
-            },
-            .forbidden_fragments = &.{"\"field\""},
-        },
-    };
-
-    for (cases) |case| {
-        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
-        defer parsed.deinit(alloc);
-        try std.testing.expect(parsed.req.full_text.? == .match_all);
-        for (case.required_fragments) |fragment| {
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        test "public query sort tuple contract rejects unknown order_by properties" {
+            const alloc = std.testing.allocator;
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortTupleContract(
+                alloc,
+                "{\"order_by\":[{\"field\":\"created_at\",\"descc\":true}]}",
+            ));
+
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.detail);
+        }
+
+        test "public query sort tuple contract accepts known order_by properties" {
+            const alloc = std.testing.allocator;
+            db_mod.resetLastSortRejectionDiagnostic();
+            try validatePublicQuerySortTupleContract(
+                alloc,
+                "{\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]}",
+            );
+            try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
+        }
+
+        test "graph response format uses admitted metadata and fails closed on plan drift" {
+            const queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                },
+            }};
+            try std.testing.expectEqual(GraphResponseFormat.canonical, try graphResponseFormat(
+                .{
+                    .graph_queries = &queries,
+                    .graph_query_transport = .{
+                        .dialect = .canonical,
+                        .operations_json = "{\"walk\":{}}",
+                        .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                        .admitted_operations_len = queries.len,
+                    },
+                },
+            ));
+            try std.testing.expectEqual(GraphResponseFormat.legacy, try graphResponseFormat(
+                .{
+                    .graph_queries = &queries,
+                    .graph_query_transport = .{
+                        .dialect = .legacy,
+                        .operations_json = "{\"walk\":{}}",
+                        .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                        .admitted_operations_len = queries.len,
+                    },
+                },
+            ));
+            try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
+                .{
+                    .graph_queries = &queries,
+                    .graph_query_transport = .{
+                        .dialect = .canonical,
+                        .operations_json = "{}",
+                        .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                        .admitted_operations_len = 0,
+                    },
+                },
+            ));
+
+            var same_name_different_plan = queries;
+            same_name_different_plan[0].query.index_name = "other_graph_idx";
+            try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
+                .{
+                    .graph_queries = &same_name_different_plan,
+                    .graph_query_transport = .{
+                        .dialect = .canonical,
+                        .operations_json = "{\"walk\":{}}",
+                        .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                        .admitted_operations_len = queries.len,
+                    },
+                },
+            ));
+        }
+
+        test "public query envelope rejects an explicitly empty graph_queries object" {
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                queryBodyContractFields(std.testing.allocator, "{\"graph_queries\":{}}"),
+            );
+        }
+
+        test "api query contract serializes fused index scores" {
+            const alloc = std.testing.allocator;
+            const scores = [_]fusion_mod.IndexScore{
+                .{ .index_name = "text_idx", .score = 0.75 },
+                .{ .index_name = "semantic_idx", .score = 0.25 },
+            };
+
+            var value = (try indexScoresJsonValue(alloc, &scores)).?;
+            defer value.deinit(alloc);
+
+            const object = value.map;
+            try std.testing.expectEqual(@as(usize, 2), object.count());
+            try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?);
+            try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?);
+        }
+
+        test "api query contract serializes sort profile diagnostics" {
+            try expectSortProfileDiagnosticsSerializationForTest();
+        }
+
+        test "api query contract maps public exact sort rejection diagnostics" {
+            try expectPublicExactSortRejectionMappingForTest();
+        }
+
+        test "api query contract serializes ordered hit sort tuple" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            const sort_values = try alloc.alloc(std.json.Value, 2);
+            sort_values[0] = .{ .integer = 42 };
+            sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = sort_values,
+            };
+
+            const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+            const sort = hit.get("_sort").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), sort.len);
+            try std.testing.expectEqual(@as(i64, 42), sort[0].integer);
+            try std.testing.expectEqualStrings("doc:a", sort[1].string);
+        }
+
+        test "api query contract serializes cursor-only id sort tuple" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            const sort_values = try alloc.alloc(std.json.Value, 1);
+            sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = sort_values,
+            };
+            result.sort_profile = .{
+                .plan = "id_seek",
+                .exactness = "exact",
+                .source = "primary_key_scan",
+                .cursor_support = "segment_seek",
+                .source_load = "source_free",
+                .distributed_behavior = "shard_local_only",
+                .sort_lifecycle_state = "queryable",
+            };
+
+            const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .profile = true,
+                .search_after = &cursor,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+            const sort = hit.get("_sort").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), sort.len);
+            try std.testing.expectEqualStrings("doc:a", sort[0].string);
+
+            const profile_sort = parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
+            const emitted_order = profile_sort.get("order_by").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), emitted_order.len);
+            try std.testing.expectEqualStrings("_id", emitted_order[0].object.get("field").?.string);
+            try std.testing.expect(!emitted_order[0].object.get("desc").?.bool);
+            try std.testing.expectEqualStrings("after", profile_sort.get("cursor").?.string);
+            try std.testing.expectEqualStrings("id_seek", profile_sort.get("plan").?.string);
+
+            var before_response = try encodeQueryResponses(alloc, "docs", .{
+                .profile = true,
+                .search_before = &cursor,
+            }, .{}, result);
+            defer before_response.deinit(alloc);
+
+            var before_parsed = try std.json.parseFromSlice(std.json.Value, alloc, before_response.json, .{});
+            defer before_parsed.deinit();
+            const before_profile_sort = before_parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
+            const before_emitted_order = before_profile_sort.get("order_by").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), before_emitted_order.len);
+            try std.testing.expectEqualStrings("_id", before_emitted_order[0].object.get("field").?.string);
+            try std.testing.expect(!before_emitted_order[0].object.get("desc").?.bool);
+            try std.testing.expectEqualStrings("before", before_profile_sort.get("cursor").?.string);
+            try std.testing.expectEqualStrings("id_seek", before_profile_sort.get("plan").?.string);
+        }
+
+        test "api query contract validates cursor-only implicit id sort tuple" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            const sort_values = try alloc.alloc(std.json.Value, 1);
+            sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .sort_values = sort_values,
+            };
+
+            const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .search_after = &cursor,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+            const sort = hit.get("_sort").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), sort.len);
+            try std.testing.expectEqualStrings("doc:a", sort[0].string);
+
+            var bad_result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer bad_result.deinit();
+
+            const bad_sort_values = try alloc.alloc(std.json.Value, 1);
+            bad_sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:b") };
+            bad_result.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .sort_values = bad_sort_values,
+            };
+
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .search_after = &cursor,
+            }, .{}, bad_result));
+        }
+
+        test "api query contract rejects ordered hits without complete sort tuple" {
+            const alloc = std.testing.allocator;
+
+            const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+
+            var missing = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer missing.deinit();
+            missing.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, missing));
+            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
+
+            var incomplete = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer incomplete.deinit();
+            const sort_values = try alloc.alloc(std.json.Value, 1);
+            sort_values[0] = .{ .integer = 42 };
+            incomplete.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, incomplete));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("sort_tuple_arity", diagnostic.detail);
+        }
+
+        test "api query contract rejects ordered hits with non replayable sort tuple" {
+            const alloc = std.testing.allocator;
+
+            const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+
+            var nested = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer nested.deinit();
+            const nested_sort_values = try alloc.alloc(std.json.Value, 2);
+            nested_sort_values[0] = .{ .array = std.json.Array.init(alloc) };
+            nested_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            nested.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = nested_sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, nested));
+            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+            var null_sort = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer null_sort.deinit();
+            const null_sort_values = try alloc.alloc(std.json.Value, 2);
+            null_sort_values[0] = .null;
+            null_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            null_sort.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = null_sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, null_sort));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+            var non_finite = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer non_finite.deinit();
+            const non_finite_sort_values = try alloc.alloc(std.json.Value, 2);
+            non_finite_sort_values[0] = .{ .float = std.math.inf(f64) };
+            non_finite_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            non_finite.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = non_finite_sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, non_finite));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+            const score_order_by = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+            var non_numeric_score = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer non_numeric_score.deinit();
+            const non_numeric_score_sort_values = try alloc.alloc(std.json.Value, 2);
+            non_numeric_score_sort_values[0] = .{ .string = try alloc.dupe(u8, "high") };
+            non_numeric_score_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:a") };
+            non_numeric_score.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = non_numeric_score_sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &score_order_by,
+            }, .{}, non_numeric_score));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("non_numeric_score", diagnostic.detail);
+
+            var id_mismatch = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer id_mismatch.deinit();
+            const mismatched_sort_values = try alloc.alloc(std.json.Value, 2);
+            mismatched_sort_values[0] = .{ .integer = 42 };
+            mismatched_sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+            id_mismatch.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.9,
+                .sort_values = mismatched_sort_values,
+            };
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+                .order_by = &order_by,
+            }, .{}, id_mismatch));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+            try std.testing.expectEqualStrings("id_tiebreaker_mismatch", diagnostic.detail);
+        }
+
+        test "api query contract serializes derived hierarchy ancestry" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "doc:a"),
+                .score = 0.8,
+                .stored_data = try alloc.dupe(u8, "{\"title\":\"source title\",\"private\":\"omit me\"}"),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "title_dense_v1"),
+                    .kind = .embedding,
+                },
+                .chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, 1),
+            };
+            result.hits[0].chunk_hits[0] = .{
+                .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
+                .score = 0.7,
+                .stored_data = try alloc.dupe(u8,
+                    \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1","_source_field":"body","_artifact_unit_fingerprint":"storage-only"}
+                ),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "document_chunks_v1"),
+                    .kind = .chunk,
+                    .chunk_id = 3,
+                    .unit_id = try alloc.dupe(u8, "page:000001"),
+                },
+            };
+
+            var legacy_response = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+            defer legacy_response.deinit(alloc);
+            var parsed_legacy = try std.json.parseFromSlice(std.json.Value, alloc, legacy_response.json, .{});
+            defer parsed_legacy.deinit();
+            const legacy_hit = parsed_legacy.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            const legacy_hierarchy = legacy_hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("source", legacy_hierarchy.object.get("level").?.string);
+            try std.testing.expectEqualStrings("title_dense_v1", legacy_hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
+            try std.testing.expect(legacy_hierarchy.object.get("artifact") == null);
+            try std.testing.expect(legacy_hierarchy.object.get("chunks") != null);
+            try std.testing.expect(legacy_hierarchy.object.get("matches") == null);
+            const legacy_chunk_source = legacy_hierarchy.object.get("chunks").?.array.items[0].object.get("_source").?.object;
+            try std.testing.expect(legacy_chunk_source.get(hierarchy_navigation.unit_fingerprint_field) == null);
+
+            const match_fields = [_][]const u8{"text"};
+            const source_hit_fields = [_][]const u8{"title"};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .parent_with_chunks,
+                .include_stored = false,
+                .defer_stored_projection = true,
+                .fields = &source_hit_fields,
+                .include_all_fields = false,
+                .hierarchy_match_fields = &match_fields,
+                .hierarchy_match_include_all_fields = false,
+                .hierarchy_grouped_matches = true,
+                .hierarchy_omit_implicit_source_ancestor_document = true,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            const hierarchy = hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("source title", hit.object.get("_source").?.object.get("title").?.string);
+            try std.testing.expect(hit.object.get("_source").?.object.get("private") == null);
+            try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
+            try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
+            try std.testing.expectEqualStrings("title_dense_v1", hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
+            const source_ancestor = hierarchy.object.get("ancestors").?.object.get("source").?.object;
+            try std.testing.expectEqualStrings("doc:a", source_ancestor.get("id").?.string);
+            try std.testing.expect(source_ancestor.get("document") == null);
+            try std.testing.expect(hierarchy.object.get("chunks") == null);
+            const matches = hierarchy.object.get("matches").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), matches.len);
+            try std.testing.expectEqualStrings("chunk text", matches[0].object.get("_source").?.object.get("text").?.string);
+            try std.testing.expect(matches[0].object.get("_source").?.object.get("_parent_doc_key") == null);
+            const chunk_hierarchy = matches[0].object.get("hierarchy").?.object;
+            try std.testing.expectEqualStrings("chunk", chunk_hierarchy.get("level").?.string);
+            try std.testing.expectEqualStrings("page:000001", chunk_hierarchy.get("parent_unit_id").?.string);
+            try std.testing.expectEqual(@as(i64, 3), chunk_hierarchy.get("artifact").?.object.get("chunk_id").?.integer);
+            const unit_ancestor = chunk_hierarchy.get("ancestors").?.object.get("unit").?.object;
+            try std.testing.expectEqualStrings("page:000001", unit_ancestor.get("id").?.string);
+            try std.testing.expectEqualStrings("document_units_v1", unit_ancestor.get("artifact_name").?.string);
+            try std.testing.expectEqualStrings("body", unit_ancestor.get("source_field").?.string);
+        }
+
+        test "api query contract preserves the internal grouped unit revision envelope" {
+            const alloc = std.testing.allocator;
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "unit:0"),
+                .stored_data = try alloc.dupe(u8, "{\"_hierarchy_unit_revision_token\":\"unit-revision\"}"),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "document_units_v1"),
+                    .kind = .asset,
+                    .unit_id = try alloc.dupe(u8, "page:000001"),
+                },
+            };
+
+            const fields = [_][]const u8{"text"};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .unit_with_chunks,
+                .hierarchy_group_level = .unit,
+                .include_stored = true,
+                .include_all_fields = false,
+                .fields = &fields,
+                .defer_stored_projection = true,
+                .defer_hierarchy_child_hydration = true,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const source = parsed.value.object.get("responses").?.array.items[0]
+                .object.get("hits").?.object.get("hits").?.array.items[0]
+                .object.get("_source").?.object;
+            try std.testing.expectEqualStrings(
+                "unit-revision",
+                source.get(hierarchy_navigation.grouped_unit_revision_envelope_field).?.string,
+            );
+
+            var public_response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .unit,
+                .hierarchy_group_level = .unit,
+                .include_stored = false,
+                .include_all_fields = false,
+                .fields = &.{},
+            }, .{}, result);
+            defer public_response.deinit(alloc);
+            var parsed_public = try std.json.parseFromSlice(std.json.Value, alloc, public_response.json, .{});
+            defer parsed_public.deinit();
+            const public_source = parsed_public.value.object.get("responses").?.array.items[0]
+                .object.get("hits").?.object.get("hits").?.array.items[0]
+                .object.get("_source").?.object;
+            try std.testing.expect(public_source.get(hierarchy_navigation.grouped_unit_revision_envelope_field) == null);
+        }
+
+        test "api query contract serializes hydrated unit ancestor for direct unit hits" {
+            const alloc = std.testing.allocator;
+            const navigation_position = try hierarchy_navigation.positionAlloc(
+                alloc,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "document_units_v1",
+                1,
+                0,
+                "storage-only",
+            );
+            defer alloc.free(navigation_position);
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE"),
+                .score = 0.9,
+                .stored_data = try alloc.dupe(u8,
+                    \\{"unit_id":"page:000001","unit_type":"page","text":"unit text","_artifact_unit_fingerprint":"storage-only","_hierarchy":{"position":"stale-position","revision":"document_units_v1@1"},"provenance":{"method":"pdf_text","page_number":1}}
+                ),
+                .ancestor_unit_data = try alloc.dupe(u8, "{\"text\":\"independent ancestor projection\"}"),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "document_units_v1"),
+                    .kind = .asset,
+                    .unit_id = try alloc.dupe(u8, "page:000001"),
+                },
+                .sort_values = try db_mod.types.cloneJsonValues(alloc, &.{
+                    .{ .string = navigation_position },
+                    .{ .string = "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE" },
+                }),
+            };
+
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .chunk,
+                .include_stored = true,
+                .hierarchy_include_unit = true,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            const hierarchy = hit.object.get("hierarchy").?.object;
+            try std.testing.expect(hit.object.get("_source").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
+            try std.testing.expectEqualStrings("unit", hierarchy.get("level").?.string);
+            try std.testing.expect(hierarchy.get("position") == null);
+            try std.testing.expect(hierarchy.get("revision") == null);
+            const ancestors = hierarchy.get("ancestors").?.object;
+            try std.testing.expectEqualStrings("doc:a", ancestors.get("source").?.object.get("id").?.string);
+            const unit = ancestors.get("unit").?.object;
+            try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
+            try std.testing.expectEqualStrings("independent ancestor projection", unit.get("document").?.object.get("text").?.string);
+            try std.testing.expect(unit.get("document").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
+
+            alloc.free(result.hits[0].ancestor_unit_data.?);
+            result.hits[0].ancestor_unit_data = null;
+            const navigation_fields = [_][]const u8{ "text", hierarchy_navigation.unit_fingerprint_field };
+            var navigation_response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .unit,
+                .hierarchy_children = .{ .parent_id = "doc:a" },
+                .include_stored = true,
+                .include_all_fields = false,
+                .defer_stored_projection = true,
+                .fields = &navigation_fields,
+            }, .{}, result);
+            defer navigation_response.deinit(alloc);
+            var parsed_navigation = try std.json.parseFromSlice(std.json.Value, alloc, navigation_response.json, .{});
+            defer parsed_navigation.deinit();
+            const navigation_hit = parsed_navigation.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            try std.testing.expectEqualStrings("unit text", navigation_hit.object.get("_source").?.object.get("text").?.string);
+            try std.testing.expect(navigation_hit.object.get("_source").?.object.get("unit_id") == null);
+            try std.testing.expect(navigation_hit.object.get("_source").?.object.get(hierarchy_navigation.unit_fingerprint_field) == null);
+            const navigation_hierarchy = navigation_hit.object.get("hierarchy").?.object;
+            try std.testing.expectEqualStrings(navigation_position, navigation_hierarchy.get("position").?.string);
+            try std.testing.expectEqualStrings(
+                "source@0000000000000000000000000000000000000000000000000000000000000000",
+                navigation_hierarchy.get("revision").?.string,
+            );
+            const navigation_unit = navigation_hierarchy.get("ancestors").?.object.get("unit").?.object;
+            try std.testing.expect(navigation_unit.get("document") == null);
+
+            var identity_result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer identity_result.deinit();
+            identity_result.hits[0] = .{
+                .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE"),
+                .score = 1,
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "document_units_v1"),
+                    .kind = .asset,
+                    .unit_id = try alloc.dupe(u8, "page:000001"),
+                },
+                .sort_values = try db_mod.types.cloneJsonValues(alloc, &.{
+                    .{ .string = navigation_position },
+                    .{ .string = "af1:asset:ZG9jOmE:ZG9jdW1lbnRfdW5pdHNfdjE:unit:cGFnZTowMDAwMDE" },
+                }),
+            };
+            var identity_response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .unit,
+                .hierarchy_children = .{ .parent_id = "doc:a" },
+                .include_stored = false,
+                .include_all_fields = false,
+                .fields = &.{},
+            }, .{}, identity_result);
+            defer identity_response.deinit(alloc);
+            var parsed_identity = try std.json.parseFromSlice(std.json.Value, alloc, identity_response.json, .{});
+            defer parsed_identity.deinit();
+            const identity_hit = parsed_identity.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            try std.testing.expect(identity_hit.object.get("_source") == null);
+            try std.testing.expectEqualStrings(
+                navigation_position,
+                identity_hit.object.get("hierarchy").?.object.get("position").?.string,
+            );
+        }
+
+        test "api query contract serializes db-backed ancestors for direct chunk hits" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "af1:chunk:ZG9jOmE:ZG9jdW1lbnRfY2h1bmtzX3Yx:3:unit:cGFnZTowMDAwMDE"),
+                .score = 0.7,
+                .stored_data = try alloc.dupe(u8,
+                    \\{"text":"chunk text","_parent_doc_key":"doc:a","_parent_unit_id":"page:000001","_source_artifact_name":"document_units_v1"}
+                ),
+                .ancestor_source_data = try alloc.dupe(u8, "{\"title\":\"source doc\",\"private\":\"omit me\"}"),
+                .ancestor_unit_data = try alloc.dupe(u8, "{\"unit_id\":\"page:000001\",\"text\":\"unit doc\",\"private\":\"omit me\"}"),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "document_chunks_v1"),
+                    .kind = .chunk,
+                    .chunk_id = 3,
+                    .unit_id = try alloc.dupe(u8, "page:000001"),
+                },
+            };
+
+            const source_fields = [_][]const u8{"title"};
+            const unit_fields = [_][]const u8{"text"};
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .chunk,
+                .include_stored = true,
+                .hierarchy_source_fields = &source_fields,
+                .hierarchy_source_include_all_fields = false,
+                .hierarchy_unit_fields = &unit_fields,
+                .hierarchy_unit_include_all_fields = false,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            const hierarchy = hit.object.get("hierarchy").?.object;
+            const ancestors = hierarchy.get("ancestors").?.object;
+            const source_document = ancestors.get("source").?.object.get("document").?.object;
+            try std.testing.expectEqualStrings("source doc", source_document.get("title").?.string);
+            try std.testing.expect(source_document.get("private") == null);
+            const unit = ancestors.get("unit").?.object;
+            try std.testing.expectEqualStrings("page:000001", unit.get("id").?.string);
+            const unit_document = unit.get("document").?.object;
+            try std.testing.expectEqualStrings("unit doc", unit_document.get("text").?.string);
+            try std.testing.expect(unit_document.get("unit_id") == null);
+            try std.testing.expect(unit_document.get("private") == null);
+        }
+
+        test "api query contract serializes mention evidence hierarchy" {
+            const alloc = std.testing.allocator;
+
+            var result = db_mod.types.SearchResult{
+                .alloc = alloc,
+                .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+                .total_hits = 1,
+            };
+            defer result.deinit();
+
+            result.hits[0] = .{
+                .id = try alloc.dupe(u8, "af1:asset:ZG9jOmE:X3Jlc29sdXRpb25fbWVudGlvbg"),
+                .score = 0.95,
+                .stored_data = try alloc.dupe(u8,
+                    \\{
+                    \\  "_schema":"antfly.resolution_mention.v1",
+                    \\  "_parent_doc_key":"doc:a",
+                    \\  "_artifact_kind":"resolution_mention",
+                    \\  "_artifact_key":"mention-key",
+                    \\  "source_artifact":"relations_v1",
+                    \\  "source_artifact_key":"source-key",
+                    \\  "resolution_artifact":"resolution_v1",
+                    \\  "resolution_artifact_key":"resolution-key",
+                    \\  "resolver":"kg",
+                    \\  "resolver_table":"entities",
+                    \\  "local_id":"e0",
+                    \\  "decision":"match",
+                    \\  "confidence":0.87,
+                    \\  "canonical":{"table":"entities","key":"person/ada_lovelace","name":"Ada Lovelace","label":"person"},
+                    \\  "mention":{"text":"Ada Lovelace","label":"person","confidence":0.91}
+                    \\}
+                ),
+                .artifact_ref = .{
+                    .document_id = try alloc.dupe(u8, "doc:a"),
+                    .name = try alloc.dupe(u8, "_resolution_mention"),
+                    .kind = .asset,
+                },
+            };
+
+            var response = try encodeQueryResponses(alloc, "docs", .{
+                .return_mode = .chunk,
+                .include_stored = true,
+            }, .{}, result);
+            defer response.deinit(alloc);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+            defer parsed.deinit();
+            const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+            const hierarchy = hit.object.get("hierarchy").?.object;
+            try std.testing.expectEqualStrings("mention", hierarchy.get("level").?.string);
+            try std.testing.expectEqualStrings("doc:a", hierarchy.get("parent_doc_key").?.string);
+            const evidence = hierarchy.get("evidence").?.object;
+            try std.testing.expectEqualStrings("e0", evidence.get("local_id").?.string);
+            try std.testing.expectEqualStrings("match", evidence.get("decision").?.string);
+            try std.testing.expectEqualStrings("source-key", evidence.get("source_artifact_key").?.string);
+            try std.testing.expectEqualStrings("resolution-key", evidence.get("resolution_artifact_key").?.string);
+            try std.testing.expectEqualStrings("Ada Lovelace", evidence.get("mention").?.object.get("text").?.string);
+            try std.testing.expectEqualStrings("person/ada_lovelace", evidence.get("canonical").?.object.get("key").?.string);
+        }
+
+        test "query max score preserves negative relevance scores" {
+            const hits = [_]db_mod.types.SearchHit{
+                .{ .id = @constCast("doc:a"), .score = -0.75 },
+                .{ .id = @constCast("doc:b"), .score = -0.25 },
+                .{ .id = @constCast("doc:c") },
+            };
+            try std.testing.expectEqual(@as(f32, -0.25), computeMaxScore(&hits));
+            try std.testing.expectEqual(@as(f32, 0), computeMaxScore(&.{}));
+        }
+
+        test "query hit exposes relevance score and raw vector distance separately" {
+            const hit = try toOpenApiHit(std.testing.allocator, .{}, .{
+                .id = @constCast("doc:a"),
+                .score = 0.8,
+                .distance = 0.25,
+            });
+            try std.testing.expectEqual(@as(f32, 0.8), hit._score);
+            try std.testing.expectEqual(@as(f32, 0.25), hit._distance.?);
+        }
+
+        test "query hierarchy response conversion rejects schema drift" {
+            const alloc = std.testing.allocator;
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                alloc,
+                "{\"level\":\"source\",\"unmodeled_field\":true}",
+                .{},
+            );
+            defer parsed.deinit();
+
+            try std.testing.expectError(
+                error.UnknownField,
+                parseSearchHitHierarchyOpenApiValue(alloc, parsed.value),
+            );
+        }
+
+        test "pattern response omits paths unless requested" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const bindings = [_]db_mod.types.GraphPatternBinding{.{
+                .alias = @constCast("node"),
+                .node = .{
+                    .key = @constCast("doc:a"),
+                    .depth = 7,
+                    .distance = 42,
+                    .path = null,
+                    .path_edges = null,
+                },
+            }};
+            const path = [_]graph_query_mod.PathEdgeInfo{.{
+                .source = @constCast("doc:a"),
+                .target = @constCast("doc:b"),
+                .edge_type = @constCast("links"),
+                .weight = 1,
+                .metadata = "",
+            }};
+            const matches = [_]db_mod.types.GraphPatternMatch{.{
+                .bindings = @constCast(bindings[0..]),
+                .path = @constCast(path[0..]),
+            }};
+            const graph_result = db_mod.types.GraphSearchResult{
+                .name = @constCast("pattern"),
+                .matches = @constCast(matches[0..]),
+                .hits = &.{},
+                .total_hits = 1,
+            };
+
+            var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
+            defer document_lookup.deinit(alloc);
+            const rows = try toOpenApiGraphRows(alloc, graph_result, &.{"node"}, &document_lookup);
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            try std.testing.expect(rows[0].map.get("node") != null);
+
+            const encoded = try jsonStringifyAlloc(alloc, rows);
+            var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+            defer parsed.deinit();
+            const node = parsed.value.array.items[0].object.get("node").?.object;
+            try std.testing.expectEqualStrings("doc:a", node.get("key").?.string);
+            try std.testing.expect(node.get("depth") == null);
+            try std.testing.expect(node.get("distance") == null);
+            try std.testing.expect(node.get("path") == null);
+        }
+
+        test "canonical graph binding responses require exact projected alias sets" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const node = graph_query_mod.GraphResultNode{
+                .key = @constCast("doc:a"),
+                .depth = 0,
+                .distance = 0,
+            };
+
+            const missing = [_]db_mod.types.GraphPatternBinding{
+                .{ .alias = @constCast("a"), .node = node },
+            };
+            try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &missing, &.{});
+
+            const unexpected = [_]db_mod.types.GraphPatternBinding{
+                .{ .alias = @constCast("a"), .node = node },
+                .{ .alias = @constCast("c"), .node = node },
+            };
+            try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &unexpected, &.{});
+
+            const duplicate = [_]db_mod.types.GraphPatternBinding{
+                .{ .alias = @constCast("a"), .node = node },
+                .{ .alias = @constCast("a"), .node = node },
+            };
+            try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &duplicate, &.{});
+
+            const overlap = [_]db_mod.types.GraphPatternBinding{
+                .{ .alias = @constCast("a"), .node = node },
+            };
+            const null_aliases = [_][]u8{@constCast("a")};
+            try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &overlap, &null_aliases);
+
+            try expectInvalidCanonicalGraphRow(alloc, &.{"a"}, &.{}, &.{});
+        }
+
+        test "graph aggregate response preserves exact decimal counts" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const requested = [_]graph_query_mod.NamedCountAggregate{.{
+                .name = "count",
+                .of = "*",
+            }};
+            const computed = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("count"),
+                .value = 9_384_729_384_729_384,
+                .exact = true,
+            }};
+            const result = try toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .pattern,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{} },
+                    .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
+                    .aggregates = &requested,
+                },
+                .{},
+                .{
+                    .name = @constCast("counted"),
+                    .aggregates = @constCast(computed[0..]),
+                    .hits = &.{},
+                    .total_hits = 0,
+                },
+            );
+            try std.testing.expect(result == .graph_aggregates_result);
+            const aggregate_result = result.graph_aggregates_result;
+            const aggregates = aggregate_result.aggregates;
+            const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("9384729384729384", count.value);
+            try std.testing.expect(count.exact);
+            try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
+        }
+
+        test "graph aggregate response fails closed on missing or inexact results" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const requested = [_]graph_query_mod.NamedCountAggregate{.{ .name = "count", .of = "*" }};
+            const query = graph_query_mod.GraphQuery{
+                .query_type = .pattern,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{} },
+                .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
+                .aggregates = &requested,
+            };
+            const named_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = query }};
+            try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+                indexes_openapi.GraphResult,
+                alloc,
+                .{ .graph_queries = &named_queries },
+                .{},
+                .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
+                .canonical,
+            ));
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{ .name = @constCast("counted"), .hits = &.{}, .total_hits = 0 },
+            ));
+
+            const partial = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("count"),
+                .value = 1,
+                .exact = false,
+            }};
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{
+                    .name = @constCast("counted"),
+                    .aggregates = @constCast(partial[0..]),
+                    .hits = &.{},
+                    .total_hits = 0,
+                },
+            ));
+            const complete_aggregate = [_]db_mod.types.GraphAggregateResult{.{
+                .name = @constCast("count"),
+                .value = 1,
+                .exact = true,
+            }};
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{
+                    .name = @constCast("counted"),
+                    .aggregates = @constCast(complete_aggregate[0..]),
+                    .hits = &.{},
+                    .total_hits = 0,
+                    .truncated = true,
+                },
+            ));
+        }
+
+        test "graph response encoding requires exactly one result per traversal operation" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const named_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                },
+            }};
+
+            try std.testing.expectError(error.InvalidRemoteResponse, encodeQueryResponses(
+                alloc,
+                "docs",
+                .{ .graph_queries = &named_queries },
+                .{},
+                .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
+            ));
+
+            const unknown_results = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("other"),
+                .hits = &.{},
+                .total_hits = 0,
+            }};
+            try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+                indexes_openapi.GraphResult,
+                alloc,
+                .{ .graph_queries = &named_queries },
+                .{},
+                .{
+                    .alloc = alloc,
+                    .hits = &.{},
+                    .total_hits = 0,
+                    .graph_results = @constCast(unknown_results[0..]),
+                },
+                .canonical,
+            ));
+        }
+
+        test "canonical path responses require one terminal node per path" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var nodes = [_]graph_query_mod.GraphResultNode{
+                .{ .key = "a", .depth = 0, .distance = 0 },
+                .{ .key = "extra", .depth = 0, .distance = 0 },
+            };
+            var path_nodes = [_][]const u8{"a"};
+            var paths = [_]graph_paths_mod.Path{.{
+                .nodes = &path_nodes,
+                .edges = &.{},
+                .total_weight = 0,
+                .length = 0,
+            }};
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"a"} },
+                    .target_nodes = .{ .keys = &.{"a"} },
+                },
+                .{},
+                .{
+                    .name = @constCast("path"),
+                    .nodes = &nodes,
+                    .paths = &paths,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"a"} },
+                    .target_nodes = .{ .keys = &.{"a"} },
+                },
+                .{},
+                .{
+                    .name = @constCast("path"),
+                    .nodes = nodes[0..1],
+                    .paths = &.{},
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"a"} },
+                    .target_nodes = .{ .keys = &.{"a"} },
+                },
+                .{},
+                .{
+                    .name = @constCast("path"),
+                    .nodes = nodes[0..1],
+                    .paths = &paths,
+                    .hits = &.{},
+                    .total_hits = 1,
+                    .truncated = true,
+                },
+            ));
+
+            nodes[0].depth = 1;
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"a"} },
+                    .target_nodes = .{ .keys = &.{"a"} },
+                },
+                .{},
+                .{
+                    .name = @constCast("path"),
+                    .nodes = nodes[0..1],
+                    .paths = &paths,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+
+            nodes = .{
+                .{ .key = "a", .table = "entities", .depth = 0, .distance = 0 },
+                .{ .key = "unused", .depth = 0, .distance = 0 },
+            };
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"a"} },
+                    .target_nodes = .{ .keys = &.{"a"} },
+                },
+                .{},
+                .{
+                    .name = @constCast("path"),
+                    .nodes = nodes[0..1],
+                    .paths = &paths,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+        }
+
+        test "canonical traversal responses keep paths on bounded result nodes" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var node_path = [_][]const u8{"a"};
+            var nodes = [_]graph_query_mod.GraphResultNode{
+                .{ .key = "a", .depth = 0, .distance = 0, .path = &node_path },
+                .{ .key = "extra", .depth = 0, .distance = 0 },
+            };
+            const query = graph_query_mod.GraphQuery{
+                .query_type = .traverse,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"a"} },
+                .params = .{ .max_results = 1, .include_paths = false },
+            };
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{
+                    .name = @constCast("walk"),
+                    .nodes = &nodes,
+                    .hits = &.{},
+                    .total_hits = 2,
+                },
+            ));
+
+            const response = try toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{
+                    .name = @constCast("walk"),
+                    .nodes = nodes[0..1],
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            );
+            try std.testing.expect(response.graph_nodes_result.nodes[0].path == null);
+
+            var query_with_paths = query;
+            query_with_paths.params.include_paths = true;
+            const response_with_paths = try toOpenApiGraphQueryResult(
+                alloc,
+                query_with_paths,
+                .{},
+                .{
+                    .name = @constCast("walk"),
+                    .nodes = nodes[0..1],
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            );
+            try std.testing.expect(response_with_paths.graph_nodes_result.nodes[0].path != null);
+            nodes[0].path = null;
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                query_with_paths,
+                .{},
+                .{
+                    .name = @constCast("walk"),
+                    .nodes = nodes[0..1],
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+            nodes[0].path = &node_path;
+
+            var graph_paths = [_]graph_paths_mod.Path{.{
+                .nodes = &node_path,
+                .edges = &.{},
+                .total_weight = 0,
+                .length = 0,
+            }};
+            try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+                alloc,
+                query,
+                .{},
+                .{
+                    .name = @constCast("walk"),
+                    .nodes = nodes[0..1],
+                    .paths = &graph_paths,
+                    .hits = &.{},
+                    .total_hits = 1,
+                },
+            ));
+        }
+
+        test "deprecated graph search preserves its response envelope" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const result = try toOpenApiStatefulGraphResultWithFormat(
+                alloc,
+                .{
+                    .query_type = .neighbors,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                },
+                .{ .took_ms = 3 },
+                .{
+                    .name = @constCast("neighbors"),
+                    .hits = &.{},
+                    .total_hits = 12,
+                },
+                .legacy,
+            );
+
+            try std.testing.expect(result == .legacy_graph_search_result);
+            const legacy = result.legacy_graph_search_result;
+            try std.testing.expect(legacy.kind == null);
+            try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
+            try std.testing.expectEqual(@as(i64, 12), legacy.total);
+            try std.testing.expectEqual(@as(?i64, 3), legacy.took);
+
+            const named_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "neighbors",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                },
+            }};
+            const graph_results = [_]db_mod.types.GraphSearchResult{.{
+                .name = @constCast("neighbors"),
+                .hits = &.{},
+                .total_hits = 12,
+            }};
+            var encoded = try encodeQueryResponses(
+                alloc,
+                "docs",
+                .{
+                    .graph_queries = &named_queries,
+                    .graph_query_transport = .{
+                        .dialect = .legacy,
+                        .operations_json =
+                        \\{"neighbors":{"type":"neighbors"}}
+                        ,
+                        .admitted_operations_ptr = @ptrCast(named_queries[0..].ptr),
+                        .admitted_operations_len = named_queries.len,
+                    },
+                },
+                .{ .took_ms = 3 },
+                .{
+                    .alloc = alloc,
+                    .hits = &.{},
+                    .total_hits = 0,
+                    .graph_results = @constCast(graph_results[0..]),
+                },
+            );
+            defer encoded.deinit(alloc);
+            try std.testing.expectEqual(GraphResponseFormat.legacy, encoded.graph_dialect.?);
+
+            var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded.json, .{});
+            defer parsed.deinit();
+            const encoded_legacy = parsed.value.object
+                .get("responses").?.array.items[0].object
+                .get("graph_results").?.object
+                .get("neighbors").?;
+            try std.testing.expect(encoded_legacy.object.get("kind") == null);
+
+            // Model the strict v0.2 generated response type. Its decoder rejects
+            // unknown fields, so this is the compatibility direction that merely
+            // accepting pre-discriminator responses in new clients does not cover.
+            const LegacyGraphSearchResultV02 = struct {
+                type: indexes_openapi.GraphQueryType,
+                nodes: ?std.json.Value = null,
+                paths: ?std.json.Value = null,
+                matches: ?std.json.Value = null,
+                total: i64,
+                took: ?i64 = null,
+            };
+            const encoded_legacy_json = try std.json.Stringify.valueAlloc(alloc, encoded_legacy, .{});
+            defer alloc.free(encoded_legacy_json);
+            var parsed_v02 = try std.json.parseFromSlice(LegacyGraphSearchResultV02, alloc, encoded_legacy_json, .{});
+            defer parsed_v02.deinit();
+            try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, parsed_v02.value.type);
+            try std.testing.expectEqual(@as(i64, 12), parsed_v02.value.total);
+        }
+
+        test "canonical graph paths preserve table-qualified node identities" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            var path_nodes = [_][]const u8{ "doc:a", "shared" };
+            var node_tables = [_]?[]const u8{ null, "entities" };
+            var path_edges = [_]graph_paths_mod.PathEdge{.{
+                .source = "doc:a",
+                .target = "shared",
+                .edge_type = "mentions",
+                .weight = 1,
+            }};
+            var paths = [_]db_mod.types.GraphPath{.{
+                .nodes = &path_nodes,
+                .node_tables = &node_tables,
+                .edges = &path_edges,
+                .total_weight = 1,
+                .length = 1,
+            }};
+            var result_node_path_edges = [_]graph_query_mod.PathEdgeInfo{.{
+                .source = "doc:a",
+                .target = "shared",
+                .edge_type = "mentions",
+                .weight = 1,
+            }};
+            var result_nodes = [_]graph_query_mod.GraphResultNode{.{
+                .key = "shared",
+                .table = "entities",
+                .depth = 1,
+                .distance = 1,
+                .path = &path_nodes,
+                .path_tables = &node_tables,
+                .path_edges = &result_node_path_edges,
+            }};
+            const query = graph_query_mod.GraphQuery{
+                .query_type = .shortest_path,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .target_nodes = .{ .identities = &.{.{ .key = "shared", .table = "entities" }} },
+            };
+            const graph_result = db_mod.types.GraphSearchResult{
+                .name = @constCast("path"),
+                .nodes = &result_nodes,
+                .paths = &paths,
+                .hits = &.{},
+                .total_hits = 1,
+            };
+
+            const canonical = try toOpenApiGraphQueryResult(alloc, query, .{}, graph_result);
+            try std.testing.expect(canonical == .graph_paths_result);
+            const canonical_path = canonical.graph_paths_result.paths[0].path;
+            try std.testing.expectEqualStrings("shared", canonical_path.nodes[1].key);
+            try std.testing.expectEqualStrings("entities", canonical_path.nodes[1].table.?);
+            try std.testing.expectEqualStrings("doc:a", canonical_path.edges[0].from.key);
+            try std.testing.expectEqualStrings("shared", canonical_path.edges[0].to.key);
+            try std.testing.expectEqualStrings("entities", canonical_path.edges[0].to.table.?);
+            try std.testing.expectEqual(indexes_openapi.GraphPathObjective.min_hops, canonical_path.objective);
+            try std.testing.expectEqual(@as(f64, 1), canonical_path.weight_sum);
+            try std.testing.expectEqual(@as(f64, 1), canonical_path.objective_value);
+
+            const legacy = try toOpenApiStatefulGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
+            try std.testing.expect(legacy == .legacy_graph_search_result);
+            try std.testing.expectEqualStrings("shared", legacy.legacy_graph_search_result.paths.?[0].nodes.?[1]);
+        }
+
+        test "canonical graph path objective exposes max weight product" {
+            const edges = [_]graph_paths_mod.PathEdge{
+                .{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.8 },
+                .{ .source = "b", .target = "c", .edge_type = "e", .weight = 0.5 },
+            };
+            var nodes = [_][]const u8{ "a", "b", "c" };
+            const path = db_mod.types.GraphPath{
+                .nodes = &nodes,
+                .edges = @constCast(edges[0..]),
+                .total_weight = 1.3,
+                .length = 2,
+            };
+            try std.testing.expectApproxEqAbs(@as(f64, 0.4), graphPathObjectiveValue(path, .max_weight), 0.000001);
+        }
+
+        test "generated stateful graph result union decodes pre-discriminator legacy responses" {
+            const raw =
+                \\{"type":"neighbors","total":12}
+            ;
+
+            var stdlib_parsed = try std.json.parseFromSlice(
+                indexes_openapi.StatefulGraphResult,
+                std.testing.allocator,
+                raw,
+                .{},
+            );
+            defer stdlib_parsed.deinit();
+            try std.testing.expect(stdlib_parsed.value == .legacy_graph_search_result);
+            try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_search_result.total);
+
+            var simd_parsed = try ant_json.parseFromSlice(
+                indexes_openapi.StatefulGraphResult,
+                std.testing.allocator,
+                raw,
+                .{},
+            );
+            defer simd_parsed.deinit();
+            try std.testing.expect(simd_parsed.value == .legacy_graph_search_result);
+            try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_search_result.total);
+        }
+
+        test "generated stateful graph result union rejects an explicit null discriminator" {
+            const raw =
+                \\{"kind":null,"type":"neighbors","total":12}
+            ;
+
+            try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
+                indexes_openapi.StatefulGraphResult,
+                std.testing.allocator,
+                raw,
+                .{},
+            ));
+            try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
+                indexes_openapi.StatefulGraphResult,
+                std.testing.allocator,
+                raw,
+                .{},
+            ));
+        }
+
+        test "canonical graph result nodes fail closed outside the public contract" {
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast(""),
+                .depth = 0,
+                .distance = 0,
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("node"),
+                .depth = graph_pattern_mod.max_pattern_hops + 1,
+                .distance = 0,
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("node"),
+                .depth = 0,
+                .distance = -0.1,
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("node"),
+                .depth = 0,
+                .distance = 0,
+                .path = @constCast((&[_][]const u8{})[0..]),
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("node"),
+                .depth = 0,
+                .distance = 0,
+                .path = &.{ "start", "node" },
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("wrong"),
+                .depth = 1,
+                .distance = 1,
+                .path = &.{ "start", "node" },
+            }));
+            try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+                .key = @constCast("node"),
+                .depth = 0,
+                .distance = 0,
+                .path_edges = &.{},
+            }));
+        }
+
+        test "canonical graph path edges enforce durable type policy" {
+            const edges: []const graph_query_mod.PathEdgeInfo = &.{.{
+                .source = "a",
+                .target = "b",
+                .edge_type = "x" ** (graph_edge_type.max_bytes + 1),
+                .weight = 1,
+            }};
+            try std.testing.expectError(
+                error.InvalidRemoteResponse,
+                toOpenApiGraphPathEdges(std.testing.allocator, &.{ "a", "b" }, &.{}, edges),
+            );
+
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const alloc = arena_state.allocator();
+            const nodes = [_][]const u8{ "shared", "shared" };
+            const tables = [_]?[]const u8{ "authors", "entities" };
+            const forward = [_]graph_paths_mod.PathEdge{.{
+                .source = "shared",
+                .target = "shared",
+                .edge_type = "knows",
+                .weight = 1,
+                .traversal_direction = .out,
+            }};
+            const reverse = [_]graph_paths_mod.PathEdge{.{
+                .source = "shared",
+                .target = "shared",
+                .edge_type = "knows",
+                .weight = 1,
+                .traversal_direction = .in,
+            }};
+
+            const encoded_forward = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &forward);
+            const encoded_reverse = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &reverse);
+            try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.out, encoded_forward[0].direction);
+            try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.in, encoded_reverse[0].direction);
+        }
+
+        test "canonical graph path metadata safely reads legacy non-object records" {
+            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_state.deinit();
+            const alloc = arena_state.allocator();
+
+            const object = (try pathEdgeMetadataObjectMap(alloc, "{\"kind\":\"citation\"}")) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("citation", object.map.get("kind").?.string);
+            try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "\"legacy\"")) == null);
+            try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "{")) == null);
+
+            const legacy = (try pathEdgeMetadataJsonValue(alloc, "\"legacy\"")) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("legacy", legacy.string);
+        }
+
+        test "api query contract preserves algebraic graph path provenance" {
+            var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_impl.deinit();
+            const alloc = arena_impl.allocator();
+            const path_nodes: []const []const u8 = &.{ "A", "B", "C" };
+            const path_tables: []const ?[]const u8 = &.{ null, "entities", "entities" };
+            const path_edges: []const graph_query_mod.PathEdgeInfo = &.{
+                .{ .source = "A", .target = "B", .edge_type = "e", .weight = 2.0, .metadata = "{\"mention_count\":2,\"mention_artifact_keys\":[\"m1\",\"m2\"]}" },
+                .{ .source = "B", .target = "C", .edge_type = "e", .weight = 3.0 },
+            };
+            const provenance: []const []const u8 = &.{ "A\x1fe\x1fB", "B\x1fe\x1fC" };
+            const nodes: []const graph_query_mod.GraphResultNode = &.{.{
+                .key = "C",
+                .table = "entities",
+                .depth = 2,
+                .distance = 2.0,
+                .path = path_nodes,
+                .path_tables = path_tables,
+                .path_edges = path_edges,
+                .provenance = provenance,
+            }};
+            const graph_result = db_mod.types.GraphSearchResult{
+                .name = @constCast("shortest"),
+                .nodes = @constCast(nodes),
+                .paths = &.{},
+                .matches = &.{},
+                .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+                .total_hits = 1,
+            };
+
+            var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
+            defer document_lookup.deinit(alloc);
+            const encoded = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup, true);
+            defer {
+                if (encoded[0].path) |items| alloc.free(items);
+                if (encoded[0].path_edges) |items| alloc.free(items);
+                alloc.free(encoded);
+            }
+
+            try std.testing.expectEqual(@as(usize, 1), encoded.len);
+            try std.testing.expectEqualStrings("C", encoded[0].key);
+            try std.testing.expectEqual(@as(i64, 2), encoded[0].depth);
+            try std.testing.expectEqualStrings("A", encoded[0].path.?[0].key);
+            try std.testing.expect(encoded[0].path.?[0].table == null);
+            try std.testing.expectEqualStrings("C", encoded[0].path.?[2].key);
+            try std.testing.expectEqualStrings("entities", encoded[0].path.?[2].table.?);
+            try std.testing.expectEqual(@as(usize, 2), encoded[0].path_edges.?.len);
+            try std.testing.expectEqualStrings("A", encoded[0].path_edges.?[0].from.key);
+            try std.testing.expect(encoded[0].path_edges.?[0].from.table == null);
+            try std.testing.expectEqualStrings("B", encoded[0].path_edges.?[0].to.key);
+            try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
+            try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
+            try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
+            try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.integer);
+            try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
+            try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
+            try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
+            const evidence = encoded[0].evidence.?.map;
+            try std.testing.expectEqual(@as(usize, 2), evidence.get("provenance").?.array.items.len);
+            try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
+            const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
+            try std.testing.expectEqualStrings("A", edge_evidence.get("source").?.string);
+            try std.testing.expectEqual(@as(i64, 2), edge_evidence.get("metadata").?.object.get("mention_count").?.integer);
+            const mention_rollup = evidence.get("mention_rollup").?.object;
+            try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
+            try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
+            try std.testing.expectEqualStrings("m2", mention_rollup.get("mention_artifact_keys").?.array.items[1].string);
+
+            const legacy_encoded = try toOpenApiLegacyGraphNodes(alloc, graph_result, &document_lookup);
+            defer alloc.free(legacy_encoded);
+            try std.testing.expectEqualStrings("A", legacy_encoded[0].path.?[0]);
+            try std.testing.expectEqualStrings("C", legacy_encoded[0].path.?[2]);
+        }
+
+        test "api query contract hydrates equal graph keys from their table namespace" {
+            var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_impl.deinit();
+            const alloc = arena_impl.allocator();
+            const hits = [_]db_mod.types.SearchHit{
+                .{
+                    .id = @constCast("shared"),
+                    .stored_data = @constCast("{\"origin\":\"docs\"}"),
+                },
+                .{
+                    .id = @constCast("shared"),
+                    .source_table = @constCast("entities"),
+                    .stored_data = @constCast("{\"origin\":\"entities\"}"),
+                },
+            };
+
+            var document_lookup = try GraphDocumentLookup.init(alloc, &hits, true);
+            defer document_lookup.deinit(alloc);
+
+            const local = (try document_lookup.document("shared", null)) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(
+                "docs",
+                local.map.get("origin").?.string,
+            );
+            const external = (try document_lookup.document("shared", "entities")) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(
+                "entities",
+                external.map.get("origin").?.string,
+            );
+            try std.testing.expect(try document_lookup.document("shared", "missing") == null);
+        }
+
+        test "api query contract bounds hydrated graph binding cells" {
+            const body =
+                \\{
+                \\  "graph_queries": {
+                \\    "too_wide": {
+                \\      "index": "graph",
+                \\      "match": {
+                \\        "anchor": "a",
+                \\        "nodes": {"a": {}, "b": {}},
+                \\        "edges": [{"from": "a", "to": "b"}]
+                \\      },
+                \\      "return": {
+                \\        "bindings": ["a", "b"],
+                \\        "limit": 5001,
+                \\        "include_documents": true
+                \\      }
+                \\    }
+                \\  }
+                \\}
+            ;
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                parseQueryRequest(std.testing.allocator, null, "docs", body),
+            );
+        }
+
+        test "graph document lookup enforces its defensive hydration budget" {
+            var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_impl.deinit();
+            const alloc = arena_impl.allocator();
+            const hits = [_]db_mod.types.SearchHit{.{
+                .id = @constCast("doc:a"),
+                .stored_data = @constCast("{\"title\":\"a\"}"),
+            }};
+            var lookup = try GraphDocumentLookup.init(alloc, &hits, true);
+            defer lookup.deinit(alloc);
+            lookup.remaining_bindings = 1;
+            try std.testing.expect((try lookup.document("doc:a", null)) != null);
+            try std.testing.expectError(
+                error.QueryCandidateBudgetExceeded,
+                lookup.document("doc:a", null),
+            );
+        }
+
+        test "canonical graph index names are nonblank" {
+            try validateGraphIndexName("social");
+            try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(""));
+            try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(" \t"));
+        }
+
+        test "canonical graph admission preserves and validates weight bounds" {
+            try validateGraphWeightBounds(0, 0);
+            try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(-2, -1));
+            try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(1, 0));
+            try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(std.math.nan(f64), null));
+            try std.testing.expectEqual(@as(?f64, null), legacyWeightBound(0));
+            try std.testing.expectEqual(@as(?f64, 0.5), legacyWeightBound(0.5));
+        }
+
+        test "graph date filters accept RFC3339 offsets and reject normalized invalid dates" {
+            const utc = (try parseDateTimeOptionalToNs("2026-08-24T19:00:00Z")).?;
+            try std.testing.expectEqual(utc, (try parseDateTimeOptionalToNs("2026-08-24T12:00:00-07:00")).?);
+            try std.testing.expect((try parseDateTimeOptionalToNs("2026-02-29T00:00:00Z")) == null);
+            try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
+            try std.testing.expect((try parseRfc3339ToNs("2026-08-24")) == null);
+        }
+
+        test "canonical graph date filters are operation keyed and require a bound" {
+            const alloc = std.testing.allocator;
+            var owned = try parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
+            );
+            defer owned.deinit(alloc);
+
+            const filter_json = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.object.get("date_range") != null);
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at"}}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01"}}}}}}
+            ));
+        }
+
+        test "canonical graph document filter variants cross the public storage boundary" {
+            const alloc = std.testing.allocator;
+            const filters = [_][]const u8{
+                "{\"term\":\"active\",\"path\":\"/status\"}",
+                "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":1}",
+                "{\"prefix\":\"doc:\",\"path\":\"/id\"}",
+                "{\"regexp\":\"go.*\",\"path\":\"/tier\"}",
+                "{\"wildcard\":\"go*\",\"path\":\"/tier\"}",
+                "{\"numeric_range\":{\"path\":\"/score\",\"min\":0}}",
+                "{\"term_range\":{\"path\":\"/status\",\"max\":\"z\"}}",
+                "{\"date_range\":{\"path\":\"/created_at\",\"start\":\"2026-01-01T00:00:00Z\"}}",
+                "{\"match_all\":{}}",
+                "{\"match_none\":{}}",
+                "{\"ids\":[\"doc:a\"]}",
+                "{\"bool_field\":{\"path\":\"/published\",\"value\":true}}",
+                "{\"must\":{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}}",
+                "{\"should\":{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}}",
+                "{\"must_not\":{\"disjuncts\":[{\"term\":\"deleted\",\"path\":\"/status\"}]}}",
+                "{\"filter\":{\"term\":\"active\",\"path\":\"/status\"}}",
+                "{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}",
+                "{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}",
+            };
+
+            for (filters, 0..) |filter, filter_index| {
+                const request = try std.mem.concat(alloc, u8, &.{
+                    "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":",
+                    filter,
+                    "}}}}",
+                });
+                defer alloc.free(request);
+                var owned = parseQueryRequest(alloc, null, "docs", request) catch |err| {
+                    std.debug.print("graph document filter {d} failed admission: {s}\n", .{ filter_index, filter });
+                    return err;
+                };
+                defer owned.deinit(alloc);
+                const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json orelse
+                    return error.TestUnexpectedResult;
+                try std.testing.expect(normalized.len > 0);
+            }
+
+            // Closed empty-object predicates reject misspelled or future fields at
+            // the generated-schema boundary instead of silently weakening the filter.
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"match_all":{"unexpected":true}}}}}}
+            ));
+        }
+
+        test "canonical graph boolean field filter has one unambiguous root" {
+            const alloc = std.testing.allocator;
+            var owned = try parseQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"bool_field":{"path":"/published","value":true}}}}}}
+            );
+            defer owned.deinit(alloc);
+
+            const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
+            var parsed = try ant_json.parseFromSlice(ant_json.Value, alloc, normalized, .{});
+            defer parsed.deinit();
+            const bool_field = parsed.value.object.get("bool_field") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("/published", bool_field.object.get("path").?.string);
+            try std.testing.expect(bool_field.object.get("value").?.bool);
+        }
+
+        test "canonical graph path endpoints reject empty identities before allocation" {
+            const alloc = std.testing.allocator;
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+                .key = "",
+                .table = @as(?[]const u8, null),
+            }));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+                .key = "node",
+                .table = @as(?[]const u8, ""),
+            }));
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+                .key = "node",
+                .table = @as(?[]const u8, " \t\r\n"),
+            }));
+        }
+
+        test "api query contract parses direct structured boolean filters" {
+            const alloc = std.testing.allocator;
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"conjuncts":[{"term":{"status":"active"}},{"term":{"tenant":"tenant-a"}}]}
+            , .{});
+            defer parsed.deinit();
+
+            const encoded = try encodeSupportedPatternFilterQueryAlloc(alloc, parsed.value);
+            defer alloc.free(encoded);
+
+            try std.testing.expectEqualStrings(
+                "{\"bool\":{\"must\":[{\"term\":{\"path\":\"status\",\"term\":\"active\"}},{\"term\":{\"path\":\"tenant\",\"term\":\"tenant-a\"}}]}}",
+                encoded,
+            );
+        }
+
+        test "api query contract parses direct JSON-pointer path aliases" {
+            const alloc = std.testing.allocator;
+
+            var direct_term_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"term":"gold","path":"/tier"}
+            , .{});
+            defer direct_term_json.deinit();
+            const direct_term = try parseSupportedFullTextQuery(alloc, direct_term_json.value, 10);
+            defer freeTextQuery(alloc, direct_term);
+            try std.testing.expect(direct_term == .term);
+            try std.testing.expectEqualStrings("/tier", direct_term.term.field);
+            try std.testing.expectEqualStrings("gold", direct_term.term.term);
+
+            var wrapped_term_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"term":{"path":"/tier","value":"silver"}}
+            , .{});
+            defer wrapped_term_json.deinit();
+            const wrapped_term = try parseSupportedFullTextQuery(alloc, wrapped_term_json.value, 10);
+            defer freeTextQuery(alloc, wrapped_term);
+            try std.testing.expect(wrapped_term == .term);
+            try std.testing.expectEqualStrings("/tier", wrapped_term.term.field);
+            try std.testing.expectEqualStrings("silver", wrapped_term.term.term);
+
+            var match_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"match":{"path":"/tier","text":"gold"}}
+            , .{});
+            defer match_json.deinit();
+            const match_query = try parseSupportedFullTextQuery(alloc, match_json.value, 10);
+            defer freeTextQuery(alloc, match_query);
+            try std.testing.expect(match_query == .match);
+            try std.testing.expectEqualStrings("/tier", match_query.match.field);
+            try std.testing.expectEqualStrings("gold", match_query.match.text);
+
+            var prefix_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"prefix":"go","path":"/tier"}
+            , .{});
+            defer prefix_json.deinit();
+            const prefix_query = try parseSupportedFullTextQuery(alloc, prefix_json.value, 10);
+            defer freeTextQuery(alloc, prefix_query);
+            try std.testing.expect(prefix_query == .prefix);
+            try std.testing.expectEqualStrings("/tier", prefix_query.prefix.field);
+            try std.testing.expectEqualStrings("go", prefix_query.prefix.prefix);
+
+            var wrapped_prefix_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"prefix":{"path":"/tier","value":"si"}}
+            , .{});
+            defer wrapped_prefix_json.deinit();
+            const wrapped_prefix_query = try parseSupportedFullTextQuery(alloc, wrapped_prefix_json.value, 10);
+            defer freeTextQuery(alloc, wrapped_prefix_query);
+            try std.testing.expect(wrapped_prefix_query == .prefix);
+            try std.testing.expectEqualStrings("/tier", wrapped_prefix_query.prefix.field);
+            try std.testing.expectEqualStrings("si", wrapped_prefix_query.prefix.prefix);
+
+            var wildcard_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"wildcard":{"path":"/tier","pattern":"go*"}}
+            , .{});
+            defer wildcard_json.deinit();
+            const wildcard_query = try parseSupportedFullTextQuery(alloc, wildcard_json.value, 10);
+            defer freeTextQuery(alloc, wildcard_query);
+            try std.testing.expect(wildcard_query == .wildcard);
+            try std.testing.expectEqualStrings("/tier", wildcard_query.wildcard.field);
+            try std.testing.expectEqualStrings("go*", wildcard_query.wildcard.pattern);
+
+            var regexp_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"regexp":{"path":"/tier","value":"go.*"}}
+            , .{});
+            defer regexp_json.deinit();
+            const regexp_query = try parseSupportedFullTextQuery(alloc, regexp_json.value, 10);
+            defer freeTextQuery(alloc, regexp_query);
+            try std.testing.expect(regexp_query == .regexp);
+            try std.testing.expectEqualStrings("/tier", regexp_query.regexp.field);
+            try std.testing.expectEqualStrings("go.*", regexp_query.regexp.pattern);
+
+            var fuzzy_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"fuzzy":{"path":"/tier","query":"gild","prefix_length":1,"max_edits":1}}
+            , .{});
+            defer fuzzy_json.deinit();
+            const fuzzy_query = try parseSupportedFullTextQuery(alloc, fuzzy_json.value, 10);
+            defer freeTextQuery(alloc, fuzzy_query);
+            try std.testing.expect(fuzzy_query == .fuzzy);
+            try std.testing.expectEqualStrings("/tier", fuzzy_query.fuzzy.field);
+            try std.testing.expectEqualStrings("gild", fuzzy_query.fuzzy.term);
+            try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.prefix_len);
+            try std.testing.expectEqual(@as(u8, 1), fuzzy_query.fuzzy.max_edits);
+
+            var generated_fuzzy_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"term":"gild","field":"/tier","prefix_length":1,"fuzziness":1,"boost":2}
+            , .{});
+            defer generated_fuzzy_json.deinit();
+            const generated_fuzzy_query = try parseSupportedFullTextQuery(alloc, generated_fuzzy_json.value, 10);
+            defer freeTextQuery(alloc, generated_fuzzy_query);
+            try std.testing.expect(generated_fuzzy_query == .fuzzy);
+            try std.testing.expectEqualStrings("/tier", generated_fuzzy_query.fuzzy.field);
+            try std.testing.expectEqualStrings("gild", generated_fuzzy_query.fuzzy.term);
+            try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.prefix_len);
+            try std.testing.expectEqual(@as(u8, 1), generated_fuzzy_query.fuzzy.max_edits);
+            try std.testing.expectEqual(@as(f32, 2), generated_fuzzy_query.fuzzy.boost);
+
+            var range_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"path":"/amount","min":10,"max":20}
+            , .{});
+            defer range_json.deinit();
+            const range_query = try parseSupportedFullTextQuery(alloc, range_json.value, 10);
+            defer freeTextQuery(alloc, range_query);
+            try std.testing.expect(range_query == .numeric_range);
+            try std.testing.expectEqualStrings("/amount", range_query.numeric_range.field);
+            try std.testing.expectEqual(@as(?f64, 10), range_query.numeric_range.min);
+            try std.testing.expectEqual(@as(?f64, 20), range_query.numeric_range.max);
+
+            var mixed_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"path":"/created_at","start":"2026-01-01T00:00:00Z","min":10}
+            , .{});
+            defer mixed_range_json.deinit();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, mixed_range_json.value, 10));
+
+            var malformed_operator_with_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"term":42,"path":"/amount","min":10}
+            , .{});
+            defer malformed_operator_with_range_json.deinit();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, malformed_operator_with_range_json.value, 10));
+
+            var malformed_operator_with_date_range_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"term":42,"path":"/created_at","start":"2026-01-01T00:00:00Z"}
+            , .{});
+            defer malformed_operator_with_date_range_json.deinit();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseSupportedFullTextQuery(alloc, malformed_operator_with_date_range_json.value, 10));
+
+            var disjuncts_json = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"disjuncts":[{"term":"gold","path":"/tier"},{"term":{"path":"/tier","term":"bronze"}}]}
+            , .{});
+            defer disjuncts_json.deinit();
+            const disjuncts_query = try parseSupportedFullTextQuery(alloc, disjuncts_json.value, 10);
+            defer freeTextQuery(alloc, disjuncts_query);
+            try std.testing.expect(disjuncts_query == .bool_query);
+            try std.testing.expectEqual(@as(usize, 2), disjuncts_query.bool_query.should.len);
+            try std.testing.expect(disjuncts_query.bool_query.should[0] == .term);
+            try std.testing.expectEqualStrings("/tier", disjuncts_query.bool_query.should[0].term.field);
+            try std.testing.expectEqualStrings("gold", disjuncts_query.bool_query.should[0].term.term);
+            try std.testing.expect(disjuncts_query.bool_query.should[1] == .term);
+            try std.testing.expectEqualStrings("/tier", disjuncts_query.bool_query.should[1].term.field);
+            try std.testing.expectEqualStrings("bronze", disjuncts_query.bool_query.should[1].term.term);
+        }
+
+        test "api query contract normalizes canonical query with legacy shorthands" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "query": {
+                \\    "bool": {
+                \\      "must": [{"match":{"field":"body","text":"raft"}}],
+                \\      "filter": [
+                \\        {"term":{"path":"/tenant","value":"acme"}},
+                \\        {"terms":{"path":"/tier","values":["gold",2,true]}}
+                \\      ],
+                \\      "must_not": [
+                \\        {"exists":{"path":"/deleted_at"}},
+                \\        {"term":{"path":"/archived","value":true}}
+                \\      ]
+                \\    }
+                \\  },
+                \\  "full_text_search": {"term":{"body":"legacy"}},
+                \\  "filter_query": {"term":{"status":"published"}},
+                \\  "exclusion_query": {"term":{"status":"deleted"}}
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .bool_query);
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.full_text.?.bool_query.must.len);
+            try std.testing.expect(parsed.req.full_text.?.bool_query.must[0] == .match);
+            try std.testing.expect(parsed.req.full_text.?.bool_query.must[1] == .term);
+            try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.bool_query.must[0].match.text);
+            try std.testing.expectEqualStrings("legacy", parsed.req.full_text.?.bool_query.must[1].term.term);
+
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"must\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"values\":[\"gold\",2,true]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"status\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"term\":\"published\"") != null);
+
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"should\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"minimum_should_match\":1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"exists\":{\"path\":\"/deleted_at\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/archived\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"status\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"term\":\"deleted\"") != null);
+        }
+
+        test "api query contract parses public with document filter bindings" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "with": {
+                \\    "visible": {"term":{"path":"/tenant","value":"acme"}},
+                \\    "published": {"bool_field":{"field":"published","value":true}}
+                \\  },
+                \\  "query": {
+                \\    "bool": {
+                \\      "must": [
+                \\        {"match":{"field":"body","text":"raft"}},
+                \\        {"ref":"visible"}
+                \\      ],
+                \\      "filter": [{"ref":"published"}]
+                \\    }
+                \\  }
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}", parsed.req.doc_filter_bindings[0].filter_query_json);
+            try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[1].name);
+            try std.testing.expectEqualStrings("{\"bool_field\":{\"field\":\"published\",\"value\":true}}", parsed.req.doc_filter_bindings[1].filter_query_json);
+
+            try std.testing.expect(parsed.req.full_text.? == .match);
+            try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+        }
+
+        test "api query contract expands text-index document filter bindings" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                \\  },
+                \\  "filter_query": {"ref":"receipt"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("body", filter_text.match_phrase.field);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract keeps text-index bindings in bool must non-scoring" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                \\  },
+                \\  "query": {
+                \\    "bool": {
+                \\      "must": [
+                \\        {"match":{"field":"body","text":"raft"}},
+                \\        {"ref":"receipt"}
+                \\      ]
+                \\    }
+                \\  }
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            const scoring = parsed.req.full_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(scoring == .match);
+            try std.testing.expectEqualStrings("raft", scoring.match.text);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract keeps full text binding references non-scoring" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                \\  },
+                \\  "full_text_search": {"ref":"receipt"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .match_all);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract retains structured bindings beside text bindings" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "tenant": {"term":{"path":"/tenant","value":"acme"}},
+                \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                \\  },
+                \\  "filter_query": [
+                \\    {"ref":"tenant"},
+                \\    {"ref":"receipt"}
+                \\  ]
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+                parsed.req.doc_filter_bindings[0].filter_query_json,
+            );
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"tenant\"") != null);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract retains structured dependencies of text bindings" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "tenant": {"term":{"path":"/tenant","value":"acme"}},
+                \\    "receipt": {
+                \\      "bool": {
+                \\        "must": [
+                \\          {"ref":"tenant"},
+                \\          {"match_phrase":"paid receipt","field":"body"}
+                \\        ]
+                \\      }
+                \\    }
+                \\  },
+                \\  "filter_query": {"ref":"receipt"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"tenant\"") != null);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract classifies transitive text binding dependencies" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "receipt": {"match_phrase":"paid receipt","field":"body"},
+                \\    "paid": {"ref":"receipt"}
+                \\  },
+                \\  "filter_query": {"ref":"paid"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract rejects unused bindings with unknown syntax" {
+            const alloc = std.testing.allocator;
+            try std.testing.expectError(
+                error.UnsupportedQueryRequest,
+                parseQueryRequest(
+                    alloc,
+                    null,
+                    "docs",
+                    \\{
+                    \\  "with": {
+                    \\    "invalid": {"unknown_operator":{"value":"silently discarded before validation"}}
+                    \\  },
+                    \\  "query": {"match_all":{}}
+                    \\}
+                    ,
+                ),
+            );
+        }
+
+        test "api query contract splits mixed structured and text binding conjunctions" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "visible_receipt": {
+                \\      "bool": {
+                \\        "must": [
+                \\          {"term":{"path":"/tenant","value":"acme"}},
+                \\          {"match_phrase":"paid receipt","field":"body"}
+                \\        ]
+                \\      }
+                \\    }
+                \\  },
+                \\  "filter_query": {"ref":"visible_receipt"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.doc_filter_bindings.len);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"value\":\"acme\"") != null);
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .match_phrase);
+            try std.testing.expectEqualStrings("paid receipt", filter_text.match_phrase.text);
+        }
+
+        test "api query contract binding expansion observes zero timeout" {
+            try std.testing.expectError(
+                error.Timeout,
+                parseQueryRequest(
+                    std.testing.allocator,
+                    null,
+                    "docs",
+                    \\{
+                    \\  "timeout_ms": 0,
+                    \\  "with": {
+                    \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                    \\  },
+                    \\  "filter_query": {"ref":"receipt"}
+                    \\}
+                    ,
+                ),
+            );
+        }
+
+        test "api query contract honors caller absolute deadline during normalization" {
+            try std.testing.expectError(
+                error.Timeout,
+                parsePublicQueryRequestWithDeadline(
+                    std.testing.allocator,
+                    null,
+                    "docs",
+                    \\{
+                    \\  "timeout_ms": 60000,
+                    \\  "with": {
+                    \\    "receipt": {"match_phrase":"paid receipt","field":"body"}
+                    \\  },
+                    \\  "filter_query": {"ref":"receipt"}
+                    \\}
+                ,
+                    0,
+                ),
+            );
+        }
+
+        test "api query contract expansion budget checks its absolute deadline" {
+            var budget = PublicBindingExpansionBudget{
+                .remaining_bytes = 128,
+                .deadline_ns = 0,
+            };
+            try std.testing.expectError(error.Timeout, budget.consumeNode(0));
+        }
+
+        test "api query contract final binding validation observes caller deadline" {
+            try std.testing.expectError(
+                error.Timeout,
+                parsePublicDocFilterBindingsAlloc(
+                    std.testing.allocator,
+                    \\{
+                    \\  "with": {
+                    \\    "visible": {"term":{"path":"/tenant","value":"acme"}}
+                    \\  },
+                    \\  "filter_query": {"ref":"visible"}
+                    \\}
+                ,
+                    10,
+                    0,
+                ),
+            );
+        }
+
+        test "api query contract limits binding expansion growth not input size" {
+            const input_bytes = public_limits.max_request_body_bytes;
+            try std.testing.expectEqual(
+                input_bytes + public_limits.max_query_binding_expansion_growth_bytes,
+                try publicBindingExpansionOutputLimit(input_bytes),
+            );
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                publicBindingExpansionOutputLimit(std.math.maxInt(usize)),
+            );
+        }
+
+        test "api query contract bounds expanded binding output bytes" {
+            const alloc = std.testing.allocator;
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                expandPublicDocFilterBindingsWithLimitAlloc(
+                    alloc,
+                    \\{
+                    \\  "with": {
+                    \\    "receipt": {"match_phrase":"paid receipt paid receipt paid receipt","field":"body"}
+                    \\  },
+                    \\  "filter_query": [
+                    \\    {"ref":"receipt"},
+                    \\    {"ref":"receipt"},
+                    \\    {"ref":"receipt"},
+                    \\    {"ref":"receipt"}
+                    \\  ]
+                    \\}
+                ,
+                    256,
+                ),
+            );
+        }
+
+        test "api query contract orders forward document filter dependencies" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "visible": {"bool":{"must":[{"ref":"tenant"},{"ref":"published"}]}},
+                \\    "published": {"bool_field":{"field":"published","value":true}},
+                \\    "tenant": {"term":{"path":"/tenant","value":"acme"}}
+                \\  },
+                \\  "filter_query": {"ref":"visible"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 3), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("published", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings("tenant", parsed.req.doc_filter_bindings[1].name);
+            try std.testing.expectEqualStrings("visible", parsed.req.doc_filter_bindings[2].name);
+        }
+
+        test "api query contract rejects invalid document filter dependency graphs" {
+            const alloc = std.testing.allocator;
+            inline for ([_][]const u8{
+                \\{"with":{"visible":{"ref":"missing"}},"filter_query":{"ref":"visible"}}
+                ,
+                \\{"with":{"first":{"ref":"second"},"second":{"ref":"first"}},"filter_query":{"ref":"first"}}
+                ,
+                \\{"with":{"visible":{"match_all":{}}},"filter_query":{"ref":"missing"}}
+                ,
+                \\{"filter_query":{"ref":"missing"}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parseQueryRequest(alloc, null, "docs", body),
+                );
+            }
+        }
+
+        test "api query contract applies one inclusive depth limit to filter dependencies" {
+            const alloc = std.testing.allocator;
+            var by_name = std.StringHashMapUnmanaged(usize).empty;
+            defer by_name.deinit(alloc);
+            try by_name.put(alloc, "base", 0);
+
+            var body = std.ArrayListUnmanaged(u8).empty;
+            defer body.deinit(alloc);
+            for (0..public_query_max_tree_depth) |_| {
+                try body.appendSlice(alloc, "{\"conjuncts\":[");
+            }
+            try body.appendSlice(alloc, "{\"ref\":\"base\"}");
+            for (0..public_query_max_tree_depth) |_| {
+                try body.appendSlice(alloc, "]}");
+            }
+
+            var at_limit = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
+            defer at_limit.deinit();
+            try collectPublicDocFilterRefs(alloc, at_limit.value, &by_name, null);
+
+            try body.insertSlice(alloc, 0, "{\"conjuncts\":[");
+            try body.appendSlice(alloc, "]}");
+            var beyond_limit = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
+            defer beyond_limit.deinit();
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                collectPublicDocFilterRefs(alloc, beyond_limit.value, &by_name, null),
+            );
+        }
+
+        test "api query contract keeps compact ref fields distinct from binding references" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "with": {
+                \\    "literal_ref": {"term":{"ref":"published"}}
+                \\  },
+                \\  "filter_query": {"ref":"literal_ref"}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.doc_filter_bindings.len);
+            try std.testing.expectEqualStrings("literal_ref", parsed.req.doc_filter_bindings[0].name);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"ref\",\"term\":\"published\"}}",
+                parsed.req.doc_filter_bindings[0].filter_query_json,
+            );
+        }
+
+        test "api query contract keeps ambiguous direct text operators score-bearing" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "query": {
+                \\    "bool": {
+                \\      "must": [
+                \\        {"match":{"field":"body","value":"raft"}}
+                \\      ]
+                \\    }
+                \\  }
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .match);
+            try std.testing.expectEqualStrings("body", parsed.req.full_text.?.match.field);
+            try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
+            try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
+        }
+
+        test "api query contract targets named full text retrieval without changing primary filters" {
+            const alloc = std.testing.allocator;
+            var parsed = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "docs",
+                \\{
+                \\  "full_text_index": "document_text",
+                \\  "full_text_search": {"match":"needle","field":"text"},
+                \\  "filter_query": {"term":{"path":"/tenant","value":"acme"}}
+                \\}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text == null);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text_queries.len);
+            try std.testing.expectEqualStrings("$full_text_results", parsed.req.full_text_queries[0].name);
+            try std.testing.expectEqualStrings("document_text", parsed.req.full_text_queries[0].index_name);
+            try std.testing.expect(parsed.req.full_text_queries[0].query == .match);
+            try std.testing.expectEqualStrings("needle", parsed.req.full_text_queries[0].query.match.text);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+                parsed.req.filter_query_json,
+            );
+
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                parsePublicQueryRequest(alloc, null, "docs", "{\"full_text_index\":\"document_text\",\"limit\":10}"),
+            );
+        }
+
+        test "api query contract rejects malformed scoring clauses before filter fallback" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "query": {
+                \\    "bool": {
+                \\      "must": [
+                \\        {"match":{"field":"body"}}
+                \\      ]
+                \\    }
+                \\  }
+                \\}
+            ;
+
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+        }
+
+        test "api query contract parses public hierarchy controls" {
+            const alloc = std.testing.allocator;
+            const chunk_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"return_level":"chunk"}
+                \\}
+            ;
+            var chunk = try parseQueryRequest(alloc, null, "docs", chunk_body);
+            defer chunk.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, chunk.req.return_mode);
+            try std.testing.expectEqual(@as(u32, 0), chunk.req.max_chunks_per_parent);
+
+            const unit_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"return_level":"unit"}
+                \\}
+            ;
+            var unit = try parseQueryRequest(alloc, null, "docs", unit_body);
+            defer unit.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, unit.req.return_mode);
+            try std.testing.expectEqual(@as(u32, 0), unit.req.max_chunks_per_parent);
+
+            const grouped_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {
+                \\    "return_level": "source",
+                \\    "rollup": "source",
+                \\    "include": ["unit", "chunk"],
+                \\    "max_children_per_parent": 2
+                \\  }
+                \\}
+            ;
+            var grouped = try parseQueryRequest(alloc, null, "docs", grouped_body);
+            defer grouped.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, grouped.req.return_mode);
+            try std.testing.expectEqual(@as(u32, 2), grouped.req.max_chunks_per_parent);
+            try std.testing.expect(!grouped.req.hierarchy_include_source);
+            try std.testing.expect(grouped.req.hierarchy_include_unit);
+
+            const hydrate_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {
+                \\    "return_level": "chunk",
+                \\    "include": ["source", "unit"]
+                \\  }
+                \\}
+            ;
+            var hydrate = try parseQueryRequest(alloc, null, "docs", hydrate_body);
+            defer hydrate.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, hydrate.req.return_mode);
+            try std.testing.expect(hydrate.req.hierarchy_include_source);
+            try std.testing.expect(hydrate.req.hierarchy_include_unit);
+
+            const mention_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {
+                \\    "return_level": "mention",
+                \\    "include": ["source", "mention"]
+                \\  }
+                \\}
+            ;
+            var mention = try parseQueryRequest(alloc, null, "docs", mention_body);
+            defer mention.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, mention.req.return_mode);
+            try std.testing.expect(mention.req.hierarchy_include_source);
+
+            const projected_matches_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": ["text"],
+                \\  "hierarchy": {
+                \\    "ancestors": {
+                \\      "source": {"fields":["title","url"]},
+                \\      "unit": {"fields":["page"]}
+                \\    }
+                \\  }
+                \\}
+            ;
+            var projected_matches = try parseQueryRequest(alloc, null, "docs", projected_matches_body);
+            defer projected_matches.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, projected_matches.req.return_mode);
+            try std.testing.expect(projected_matches.req.hierarchy_include_source);
+            try std.testing.expect(projected_matches.req.hierarchy_include_unit);
+            try std.testing.expect(!projected_matches.req.hierarchy_source_include_all_fields);
+            try std.testing.expectEqualStrings("url", projected_matches.req.hierarchy_source_fields[1]);
+            try std.testing.expect(!projected_matches.req.hierarchy_unit_include_all_fields);
+            try std.testing.expectEqualStrings("page", projected_matches.req.hierarchy_unit_fields[0]);
+            try std.testing.expect(projected_matches.req.defer_stored_projection);
+
+            const grouped_matches_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": ["title"],
+                \\  "hierarchy": {
+                \\    "group_by": {
+                \\      "level": "source",
+                \\      "matches": {"fields":["text"]}
+                \\    }
+                \\  }
+                \\}
+            ;
+            var grouped_matches = try parseQueryRequest(alloc, null, "docs", grouped_matches_body);
+            defer grouped_matches.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, grouped_matches.req.return_mode);
+            try std.testing.expectEqual(@as(u32, 3), grouped_matches.req.max_chunks_per_parent);
+            try std.testing.expect(grouped_matches.req.hierarchy_omit_implicit_source_ancestor_document);
+            try std.testing.expect(grouped_matches.req.hierarchy_grouped_matches);
+            try std.testing.expect(!grouped_matches.req.hierarchy_include_source);
+            try std.testing.expect(!grouped_matches.req.hierarchy_include_unit);
+            try std.testing.expect(!grouped_matches.req.hierarchy_match_include_all_fields);
+            try std.testing.expectEqualStrings("text", grouped_matches.req.hierarchy_match_fields[0]);
+            try std.testing.expect(grouped_matches.req.defer_stored_projection);
+
+            const grouped_only_body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source"}}
+                \\}
+            ;
+            var grouped_only = try parseQueryRequest(alloc, null, "docs", grouped_only_body);
+            defer grouped_only.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_only.req.return_mode);
+            try std.testing.expect(!grouped_only.req.hierarchy_grouped_matches);
+        }
+
+        test "api query contract validates canonical hierarchy controls" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"rollup":"mention"}
+                \\}
+            ;
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+
+            const unit_group_level =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"unit","matches":{"fields":[]}}}
+                \\}
+            ;
+            var unit_group = try parseQueryRequest(alloc, null, "docs", unit_group_level);
+            defer unit_group.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.HierarchyGroupLevel.unit, unit_group.req.hierarchy_group_level);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.unit_with_chunks, unit_group.req.return_mode);
+            try std.testing.expect(unit_group.req.hierarchy_grouped_matches);
+
+            const sorted_unit_group =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "order_by": [{"field":"_score","desc":true}],
+                \\  "hierarchy": {"group_by":{"level":"unit"}}
+                \\}
+            ;
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", sorted_unit_group));
+            const unit_sort_diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", unit_sort_diagnostic.field);
+            try std.testing.expectEqualStrings("unsupported_exact_sort", unit_sort_diagnostic.reason);
+            try std.testing.expectEqualStrings("unsupported_exact_sort", unit_sort_diagnostic.detail);
+
+            const missing_group_level =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"matches":{"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_group_level));
+
+            const unknown_group_field =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","sort":[]}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_group_field));
+
+            const composable_group_and_unit_ancestor =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"unit":{"fields":["page"]}}}
+                \\}
+            ;
+            var composable = try parseQueryRequest(alloc, null, "docs", composable_group_and_unit_ancestor);
+            defer composable.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, composable.req.return_mode);
+            try std.testing.expect(composable.req.hierarchy_grouped_matches);
+            try std.testing.expect(!composable.req.hierarchy_include_source);
+            try std.testing.expect(composable.req.hierarchy_include_unit);
+
+            const redundant_group_source_ancestor =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}},"ancestors":{"source":{"fields":["title"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", redundant_group_source_ancestor));
+
+            const mixed_contract_generations =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source"},"include":["chunk"]}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", mixed_contract_generations));
+
+            const missing_match_fields =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_match_fields));
+
+            const missing_group_projection =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_group_projection));
+
+            const missing_ancestor_fields =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"ancestors":{"source":{}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", missing_ancestor_fields));
+
+            const children_body =
+                \\{
+                \\  "fields": ["unit_id","unit_type","text","provenance.page_number"],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
+                \\  "order_by": [{"field":"_hierarchy.position"}],
+                \\  "limit": 20
+                \\}
+            ;
+            var children = try parseQueryRequest(alloc, null, "docs", children_body);
+            defer children.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.unit, children.req.return_mode);
+            try std.testing.expectEqualStrings("doc:a", children.req.hierarchy_children.?.parent_id);
+            try std.testing.expectEqualStrings("_hierarchy.position", children.req.order_by[0].field);
+
+            const internal_children_body =
+                \\{
+                \\  "fields": [],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
+                \\  "order_by": [{"field":"_hierarchy.position"}],
+                \\  "_identity_read_generation": 42,
+                \\  "_filter_query_json": "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}"
+                \\}
+            ;
+            var internal_children = try parseQueryRequest(alloc, null, "docs", internal_children_body);
+            defer internal_children.deinit(alloc);
+            try std.testing.expectEqual(@as(?u64, 42), internal_children.req.identity_read_generation);
+            try std.testing.expect(internal_children.req.filter_query_json.len > 0);
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", internal_children_body));
+
+            const children_with_query =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "fields": [],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
+                \\  "order_by": [{"field":"_hierarchy.position"}]
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_query));
+
+            const children_with_ignored_filter =
+                \\{
+                \\  "filter_query": {"term":{"path":"/tenant","value":"acme"}},
+                \\  "fields": [],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
+                \\  "order_by": [{"field":"_hierarchy.position"}]
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_with_ignored_filter));
+
+            const children_without_order =
+                \\{
+                \\  "fields": [],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", children_without_order));
+
+            const stale_shaped_children_cursor =
+                \\{
+                \\  "fields": [],
+                \\  "hierarchy": {"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},
+                \\  "order_by": [{"field":"_hierarchy.position"}],
+                \\  "search_after": ["position-only"]
+                \\}
+            ;
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", stale_shaped_children_cursor));
+
+            const bounded_grouped_matches =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":2,"fields":["text"]}}}
+                \\}
+            ;
+            var bounded_grouped = try parseQueryRequest(alloc, null, "docs", bounded_grouped_matches);
+            defer bounded_grouped.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, bounded_grouped.req.return_mode);
+            try std.testing.expectEqual(@as(u32, 2), bounded_grouped.req.max_chunks_per_parent);
+
+            const too_many_groups =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "limit": 101,
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_many_groups));
+
+            const too_much_grouped_work =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "limit": 100,
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":11,"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", too_much_grouped_work));
+
+            const unbounded_group_page =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "limit": 0,
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":1,"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unbounded_group_page));
+
+            const oversized_grouped_matches =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "fields": [],
+                \\  "hierarchy": {"group_by":{"level":"source","matches":{"limit":101,"fields":["text"]}}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", oversized_grouped_matches));
+
+            const direct_matches_with_ancestors =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {"ancestors":{"source":{"fields":[]}}}
+                \\}
+            ;
+            var direct_matches = try parseQueryRequest(alloc, null, "docs", direct_matches_with_ancestors);
+            defer direct_matches.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.member, direct_matches.req.return_mode);
+            try std.testing.expect(direct_matches.req.hierarchy_include_source);
+            try std.testing.expect(!direct_matches.req.hierarchy_source_include_all_fields);
+
+            const empty_hierarchy =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": {}
+                \\}
+            ;
+            var empty_direct = try parseQueryRequest(alloc, null, "docs", empty_hierarchy);
+            defer empty_direct.deinit(alloc);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.member, empty_direct.req.return_mode);
+            try std.testing.expect(!empty_direct.req.hierarchy_include_source);
+            try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
+
+            // Canonical optional fields are non-nullable: omission selects the default
+            // result shape, while an explicit null is a malformed request.
+            const null_hierarchy =
+                \\{
+                \\  "full_text_search": {"match":"needle","field":"content"},
+                \\  "hierarchy": null
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", null_hierarchy));
+        }
+
+        test "api query contract keeps generated schema strict when with is present" {
+            const alloc = std.testing.allocator;
+            const unknown_body =
+                \\{
+                \\  "with": {"visible": {"match_all": {}}},
+                \\  "not_a_query_field": true,
+                \\  "query": {"match_all": {}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", unknown_body));
+
+            const generation_body =
+                \\{
+                \\  "with": {"visible": {"match_all": {}}},
+                \\  "identity_read_generation": 7,
+                \\  "query": {"match_all": {}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", generation_body));
+
+            const reassignment_body =
+                \\{
+                \\  "with": {"visible": {"match_all": {}}},
+                \\  "allow_doc_identity_reassignment": true,
+                \\  "query": {"match_all": {}}
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", reassignment_body));
+        }
+
+        test "api query contract public parser rejects internal shard doc identity controls" {
+            const alloc = std.testing.allocator;
+            const internal_body =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "native_doc_id_constraints": {
+                \\    "positive_filter": true,
+                \\    "include_doc_ids": ["doc:a"],
+                \\    "exclude_doc_ids": []
+                \\  },
+                \\  "_identity_read_generation": 7
+                \\}
+            ;
+
+            try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, internal_body));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", internal_body));
+
+            var internal = try parseQueryRequest(alloc, null, "docs", internal_body);
+            defer internal.deinit(alloc);
+            try std.testing.expect(internal.req.filter_doc_ids_positive);
+            try std.testing.expectEqual(@as(usize, 1), internal.req.filter_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:a", internal.req.filter_doc_ids[0]);
+            try std.testing.expectEqual(@as(?u64, 7), internal.req.identity_read_generation);
+
+            const internal_unknown_body =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "native_doc_id_constraints": {
+                \\    "positive_filter": true,
+                \\    "include_doc_ids": ["doc:a"],
+                \\    "exclude_doc_ids": []
+                \\  },
+                \\  "not_a_query_field": true
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", internal_unknown_body));
+
+            const resolved_filter_body =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "_resolved_doc_filter": {
+                \\    "namespace": {"table_id": 1, "shard_id": 2, "range_id": 3},
+                \\    "identity_read_generation": 9,
+                \\    "include": {"kind": "ordinals", "values": [1, 3]},
+                \\    "exclude": {"kind": "none"}
+                \\  }
+                \\}
+            ;
+            try std.testing.expect(try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, resolved_filter_body));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs", resolved_filter_body));
+            var resolved_internal = try parseQueryRequest(alloc, null, "docs", resolved_filter_body);
+            defer resolved_internal.deinit(alloc);
+            try std.testing.expect(resolved_internal.req.resolved_doc_filter != null);
+            try std.testing.expectEqual(@as(?u64, 9), resolved_internal.req.identity_read_generation);
+
+            const literal_body =
+                \\{"full_text_search":{"query":"mentions native_doc_id_constraints and _identity_read_generation"}}
+            ;
+            try std.testing.expect(!try testing.bodyHasForbiddenPublicDocIdentityControls(alloc, literal_body));
+
+            const timeout_before_ns = platform_time.monotonicNs();
+            var timeout_request = try parsePublicQueryRequest(alloc, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":250}
+            );
+            defer timeout_request.deinit(alloc);
+            const timeout_after_ns = platform_time.monotonicNs();
+            const deadline_ns = timeout_request.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+            const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
+            try std.testing.expect(deadline_origin_ns >= timeout_before_ns);
+            try std.testing.expect(deadline_origin_ns <= timeout_after_ns);
+
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":-1}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":1.5}
+            ));
+        }
+
+        test "api query contract treats canonical typed scalar term as structured filter" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"query":{"term":{"path":"/published","value":true}}}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .match_all);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/published\",\"value\":true}}", parsed.req.filter_query_json);
+            try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+        }
+
+        test "api query contract preserves the canonical query object wire kind" {
+            const alloc = std.testing.allocator;
+            inline for (.{
+                \\{"query":[]}
+                ,
+                \\{"query":"match all"}
+                ,
+                \\{"query":true}
+                ,
+                \\{"query":42}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "docs", body),
+                );
+            }
+        }
+
+        test "api query contract treats canonical string path term as structured filter" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"query":{"term":{"path":"/tier","value":"gold"}}}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .match_all);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}}", parsed.req.filter_query_json);
+            try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+        }
+
+        test "api query contract includes stored source when fields are omitted" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"full_text_search":{"match":"needle","field":"content"}}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.include_all_fields);
+            try std.testing.expect(parsed.req.include_stored);
+            try std.testing.expect(!parsed.req.defer_stored_projection);
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+        }
+
+        test "api query contract accepts multi_match bool_prefix full text" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":2}}}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text.? == .multi_match_bool_prefix);
+            try std.testing.expectEqualStrings("quick brown f", parsed.req.full_text.?.multi_match_bool_prefix.query);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text.?.multi_match_bool_prefix.fields.len);
+            try std.testing.expectEqualStrings("title", parsed.req.full_text.?.multi_match_bool_prefix.fields[0].field);
+            try std.testing.expectEqual(@as(f32, 2.0), parsed.req.full_text.?.multi_match_bool_prefix.boost);
+
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                parseQueryRequest(
+                    alloc,
+                    null,
+                    "docs",
+                    \\{"full_text_search":{"multi_match":{"query":"quick brown f","type":"bool_prefix","fields":["title"],"boost":1e100}}}
+                    ,
+                ),
+            );
+        }
+
+        test "api query contract projects stored source when explicit fields are supplied" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match": "needle", "field": "content"},
+                \\  "fields": ["path", "filename"]
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(!parsed.req.include_all_fields);
+            try std.testing.expect(parsed.req.include_stored);
+            try std.testing.expect(parsed.req.defer_stored_projection);
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.fields.len);
+            try std.testing.expectEqualStrings("path", parsed.req.fields[0]);
+            try std.testing.expectEqualStrings("filename", parsed.req.fields[1]);
+        }
+
+        test "api query contract accepts internal normalized filter json on internal query route" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match": "hello", "field": "body"},
+                \\  "_filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"published\"}}",
+                \\  "_exclusion_query_json": "{\"term\":{\"path\":\"/deleted\",\"value\":true}}"
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"published\"}}", parsed.req.filter_query_json);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", parsed.req.exclusion_query_json);
+        }
+
+        test "api query contract combines public and internal filter representations losslessly" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "filter_query": {"term": "published", "field": "status"},
+                \\  "exclusion_query": {"term": "draft", "field": "status"},
+                \\  "_filter_query_json": "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+                \\  "_exclusion_query_json": "{\"term\":{\"path\":\"/deleted\",\"value\":true}}"
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"must\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"status\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"path\":\"/tenant\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"should\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"status\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, parsed.req.exclusion_query_json, "\"path\":\"/deleted\"") != null);
+        }
+
+        test "api query contract normalizes public scalar filters before forwarding" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match": "hello", "field": "body"},
+                \\  "filter_query": {"term": "published", "field": "status"},
+                \\  "exclusion_query": {"term": "gamma", "field": "title"}
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"status\",\"term\":\"published\"}}", parsed.req.filter_query_json);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"title\",\"term\":\"gamma\"}}", parsed.req.exclusion_query_json);
+        }
+
+        test "api query contract canonicalizes public Query filter roots and compositions" {
+            const alloc = std.testing.allocator;
+            const cases = [_]struct {
+                body: []const u8,
+                required_fragments: []const []const u8,
+                forbidden_fragments: []const []const u8 = &.{},
+            }{
+                .{
+                    .body =
+                    \\{"filter_query":{"prefix":"tenant/","field":"path"}}
+                    ,
+                    .required_fragments = &.{
+                        "\"prefix\"",
+                        "\"path\":\"path\"",
+                        "\"prefix\":\"tenant/\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"term":"active","field":"status","fuzziness":1,"prefix_length":2}}
+                    ,
+                    .required_fragments = &.{
+                        "\"fuzzy\"",
+                        "\"path\":\"status\"",
+                        "\"query\":\"active\"",
+                        "\"max_edits\":1",
+                        "\"prefix_length\":2",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"min":"a","max":"z","field":"name","inclusive_max":true}}
+                    ,
+                    .required_fragments = &.{
+                        "\"term_range\"",
+                        "\"path\":\"name\"",
+                        "\"min\":\"a\"",
+                        "\"max\":\"z\"",
+                        "\"inclusive_max\":true",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"start":"2026-01-01T00:00:00Z","field":"created_at"}}
+                    ,
+                    .required_fragments = &.{
+                        "\"date_range\"",
+                        "\"path\":\"created_at\"",
+                        "\"start_ns\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"bool":true,"field":"published"}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool_field\"",
+                        "\"path\":\"published\"",
+                        "\"value\":true",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":1}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"should\"",
+                        "\"path\":\"status\"",
+                        "\"term\":\"active\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"},{"term":"gold","field":"tier"}],"min":2}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"should\"",
+                        "\"minimum_should_match\":2",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"conjuncts":[{"term":"active","field":"status"}]}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"must\"",
+                        "\"path\":\"status\"",
+                        "\"term\":\"active\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"must_not":{"disjuncts":[{"prefix":"private/","field":"path"}]}}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"must_not\"",
+                        "\"path\":\"path\"",
+                        "\"prefix\":\"private/\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"must":{"conjuncts":[{"disjuncts":[{"prefix":"tenant/","field":"path"}],"min":1}]}}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"must\"",
+                        "\"should\"",
+                        "\"path\":\"path\"",
+                        "\"prefix\":\"tenant/\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"bool":{"should":[{"term":"active","field":"status"},{"term":"gold","field":"tier"}],"minimum_should_match":2}}}
+                    ,
+                    .required_fragments = &.{
+                        "\"bool\"",
+                        "\"should\"",
+                        "\"minimum_should_match\":2",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"must":{"conjuncts":[{"term":"active","field":"status"}]},"must_not":{"disjuncts":[{"term":"deleted","field":"status"}],"min":1}}}
+                    ,
+                    .required_fragments = &.{
+                        "\"must\"",
+                        "\"must_not\"",
+                        "\"term\":\"active\"",
+                        "\"term\":\"deleted\"",
+                    },
+                    .forbidden_fragments = &.{"\"field\""},
+                },
+            };
+
+            for (cases) |case| {
+                var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+                defer parsed.deinit(alloc);
+                try std.testing.expect(parsed.req.full_text.? == .match_all);
+                for (case.required_fragments) |fragment| {
+                    try std.testing.expect(std.mem.indexOf(
+                        u8,
+                        parsed.req.filter_query_json,
+                        fragment,
+                    ) != null);
+                }
+                for (case.forbidden_fragments) |fragment| {
+                    try std.testing.expect(std.mem.indexOf(
+                        u8,
+                        parsed.req.filter_query_json,
+                        fragment,
+                    ) == null);
+                }
+                var canonical = try std.json.parseFromSlice(
+                    std.json.Value,
+                    alloc,
+                    parsed.req.filter_query_json,
+                    .{},
+                );
+                defer canonical.deinit();
+                try db_mod.validateStructuredFilterValueAlloc(alloc, canonical.value);
+            }
+
+            try std.testing.expectError(
+                error.InvalidFilterQueryRequest,
+                parsePublicQueryRequest(
+                    alloc,
+                    null,
+                    "files",
+                    \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":1.5}}
+                    ,
+                ),
+            );
+            try std.testing.expectError(
+                error.InvalidFilterQueryRequest,
+                parsePublicQueryRequest(
+                    alloc,
+                    null,
+                    "files",
+                    \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":2}}
+                    ,
+                ),
+            );
+        }
+
+        test "api query contract bounds public fuzzy integers without narrowing traps" {
+            const alloc = std.testing.allocator;
+            inline for ([_][]const u8{
+                \\{"filter_query":{"term":"active","field":"status","fuzziness":-1}}
+                ,
+                \\{"filter_query":{"term":"active","field":"status","fuzziness":3}}
+                ,
+                \\{"filter_query":{"term":"active","field":"status","prefix_length":-1}}
+                ,
+                \\{"filter_query":{"term":"active","field":"status","prefix_length":256}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidFilterQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "files", body),
+                );
+            }
+        }
+
+        test "api query contract preserves supported match options and rejects semantic loss" {
+            const alloc = std.testing.allocator;
+            var filtered = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"filter_query":{"match":"active user","field":"status","analyzer":"tenant_search"}}
+                ,
+            );
+            defer filtered.deinit(alloc);
+            try std.testing.expectEqualStrings(
+                "{\"match\":{\"path\":\"status\",\"text\":\"active user\",\"analyzer\":\"tenant_search\"}}",
+                filtered.req.filter_query_json,
+            );
+
+            var scored = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"full_text_search":{"match":"active user","field":"status","analyzer":"tenant_search","boost":2}}
+                ,
+            );
+            defer scored.deinit(alloc);
+            try std.testing.expect(scored.req.full_text.? == .match);
+            try std.testing.expectEqualStrings("tenant_search", scored.req.full_text.?.match.analyzer.?);
+            try std.testing.expectEqual(@as(f32, 2), scored.req.full_text.?.match.boost);
+
+            inline for ([_][]const u8{
+                \\{"filter_query":{"match":"active","field":"status","fuzziness":1}}
+                ,
+                \\{"filter_query":{"match":"active","field":"status","prefix_length":1}}
+                ,
+                \\{"filter_query":{"match":"active","field":"status","operator":"or"}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.UnsupportedFilterQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "files", body),
+                );
+            }
+        }
+
+        test "api query contract preserves nested direct boosts and rejects ambiguous scoring roots" {
+            const alloc = std.testing.allocator;
+            inline for ([_]struct {
+                body: []const u8,
+                tag: std.meta.Tag(db_mod.types.TextQuery),
+                expected_boost: f32,
+            }{
+                .{
+                    .body =
+                    \\{"full_text_search":{"term":{"field":"body","term":"invoice","boost":2}}}
+                    ,
+                    .tag = .term,
+                    .expected_boost = 2,
+                },
+                .{
+                    .body =
+                    \\{"full_text_search":{"match":{"field":"body","text":"paid invoice","boost":3}}}
+                    ,
+                    .tag = .match,
+                    .expected_boost = 3,
+                },
+                .{
+                    .body =
+                    \\{"full_text_search":{"match_phrase":{"field":"body","text":"paid invoice","boost":4}}}
+                    ,
+                    .tag = .match_phrase,
+                    .expected_boost = 4,
+                },
+            }) |case| {
+                var parsed = try parsePublicQueryRequest(
+                    alloc,
+                    null,
+                    "files",
+                    case.body,
+                );
+                defer parsed.deinit(alloc);
+                const full_text = parsed.req.full_text orelse
+                    return error.TestExpectedEqual;
+                try std.testing.expectEqual(case.tag, std.meta.activeTag(full_text));
+                const actual_boost = switch (full_text) {
+                    .term => |value| value.boost,
+                    .match => |value| value.boost,
+                    .match_phrase => |value| value.boost,
+                    else => unreachable,
+                };
+                try std.testing.expectEqual(case.expected_boost, actual_boost);
+            }
+
+            inline for ([_][]const u8{
+                \\{"full_text_search":{"term":"invoice","match":"paid","field":"body"}}
+                ,
+                \\{"full_text_search":{"terms":["paid","invoice"],"cidr":"10.0.0.0/8","field":"body"}}
+                ,
+                \\{"full_text_search":{"location":[-122.4,37.8],"distance":"10km","min_lat":30,"min_lon":-130,"max_lat":40,"max_lon":-120,"field":"location"}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "files", body),
+                );
+            }
+        }
+
+        test "api query contract accepts explicit empty public boolean branches" {
+            const alloc = std.testing.allocator;
+            const cases = [_]struct {
+                body: []const u8,
+                required: []const u8,
+                forbidden: ?[]const u8 = null,
+            }{
+                .{
+                    .body =
+                    \\{"filter_query":{"must":{"conjuncts":[]},"must_not":{"disjuncts":[{"term":"deleted","field":"status"}]}}}
+                    ,
+                    .required = "\"must_not\"",
+                    .forbidden = "\"must\"",
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"must":{"conjuncts":[{"term":"active","field":"status"}]},"must_not":{"disjuncts":[]}}}
+                    ,
+                    .required = "\"must\"",
+                    .forbidden = "\"must_not\"",
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"must":{"conjuncts":[]},"should":{"disjuncts":[]},"must_not":{"disjuncts":[]}}}
+                    ,
+                    .required = "\"match_all\"",
+                },
+            };
+            for (cases) |case| {
+                var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+                defer parsed.deinit(alloc);
+                try std.testing.expect(std.mem.indexOf(
+                    u8,
+                    parsed.req.filter_query_json,
+                    case.required,
+                ) != null);
+                if (case.forbidden) |forbidden| {
+                    try std.testing.expect(std.mem.indexOf(
+                        u8,
+                        parsed.req.filter_query_json,
+                        forbidden,
+                    ) == null);
+                }
+            }
+
+            try std.testing.expectError(
+                error.InvalidFilterQueryRequest,
+                parsePublicQueryRequest(
+                    alloc,
+                    null,
+                    "files",
+                    \\{"filter_query":{"should":{"disjuncts":[],"min":1}}}
+                    ,
+                ),
+            );
+        }
+
+        test "api query contract preserves schema-dependent canonical ranges" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"filter_query":{"range":{"price":{"gte":10,"lt":20}}}}
+            ;
+            var parsed = try parsePublicQueryRequest(alloc, null, "products", body);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings(
+                "{\"range\":{\"price\":{\"gte\":10,\"lt\":20}}}",
+                parsed.req.filter_query_json,
+            );
+
+            inline for ([_][]const u8{
+                \\{"filter_query":{"range":{"price":{"gte":null}}}}
+                ,
+                \\{"filter_query":{"range":{"price":{"gte":10}},"term":{"path":"status","term":"active"}}}
+                ,
+            }) |invalid_body| {
+                try std.testing.expectError(
+                    error.InvalidFilterQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "products", invalid_body),
+                );
+            }
+        }
+
+        test "api query contract rejects ambiguous canonical query roots" {
+            const alloc = std.testing.allocator;
+            inline for ([_][]const u8{
+                \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}]},"term":{"path":"tier","value":"gold"}}}
+                ,
+                \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"unknown":true}}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "files", body),
+                );
+            }
+        }
+
+        test "api query contract accepts text-index queries in canonical boolean filters" {
+            const alloc = std.testing.allocator;
+            var parsed = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"query":{"bool":{"filter":[{"terms":["quick","fox"],"field":"body"}],"must_not":[{"match_phrase":"bad wolf","field":"body"}]}}}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(filter_text == .phrase);
+            try std.testing.expectEqualStrings("quick", filter_text.phrase.terms[0]);
+            try std.testing.expectEqualStrings("fox", filter_text.phrase.terms[1]);
+            const exclusion_text = parsed.req.exclusion_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(exclusion_text == .match_phrase);
+            try std.testing.expectEqualStrings("bad wolf", exclusion_text.match_phrase.text);
+            try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
+            try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+        }
+
+        test "api query contract preserves canonical boolean boost scope" {
+            const alloc = std.testing.allocator;
+            var parsed = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":2}},"full_text_search":{"match":"storage","field":"body"}}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(full_text == .bool_query);
+            try std.testing.expectEqual(@as(usize, 2), full_text.bool_query.must.len);
+            try std.testing.expect(full_text.bool_query.must[0] == .bool_query);
+            try std.testing.expectEqual(@as(f32, 2), full_text.bool_query.must[0].bool_query.boost);
+            try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.must[0].bool_query.must.len);
+            try std.testing.expect(full_text.bool_query.must[0].bool_query.must[0] == .match);
+            try std.testing.expect(full_text.bool_query.must[1] == .match);
+        }
+
+        test "api query contract preserves schema-valid canonical boolean boosts" {
+            const alloc = std.testing.allocator;
+            var null_boost = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":null}}}
+                ,
+            );
+            defer null_boost.deinit(alloc);
+            try std.testing.expect(null_boost.req.full_text.? == .match);
+
+            inline for ([_]struct {
+                body: []const u8,
+                expected: f32,
+            }{
+                .{
+                    .body =
+                    \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":0}}}
+                    ,
+                    .expected = 0,
+                },
+                .{
+                    .body =
+                    \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":-1}}}
+                    ,
+                    .expected = -1,
+                },
+            }) |case| {
+                var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+                defer parsed.deinit(alloc);
+                const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+                try std.testing.expect(full_text == .bool_query);
+                try std.testing.expectEqual(case.expected, full_text.bool_query.boost);
+            }
+        }
+
+        test "api query contract rejects unrepresentable canonical boolean boosts" {
+            const alloc = std.testing.allocator;
+            inline for ([_][]const u8{
+                \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":"bad"}}}
+                ,
+                \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":1e100}}}
+                ,
+            }) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parsePublicQueryRequest(alloc, null, "files", body),
+                );
+            }
+        }
+
+        test "api query contract keeps should optional beside required filters" {
+            const alloc = std.testing.allocator;
+            var parsed = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"should":[{"match":{"field":"body","text":"computer"}}]}}}
+                ,
+            );
+            defer parsed.deinit(alloc);
+
+            const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+            try std.testing.expect(full_text == .bool_query);
+            try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+            try std.testing.expect(full_text.bool_query.pure_should_optional);
+            try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
+            try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
+            try std.testing.expect(full_text.bool_query.should[0] == .match);
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 parsed.req.filter_query_json,
-                fragment,
+                "\"status\"",
             ) != null);
         }
-        for (case.forbidden_fragments) |fragment| {
+
+        test "api query contract distinguishes explicit zero from implicit pure should minimum" {
+            const alloc = std.testing.allocator;
+            inline for ([_]struct {
+                body: []const u8,
+                optional: bool,
+                boost: f32 = 1.0,
+            }{
+                .{
+                    .body =
+                    \\{"full_text_search":{"should":{"disjuncts":[{"match":"computer","field":"body"}],"min":0}}}
+                    ,
+                    .optional = true,
+                },
+                .{
+                    .body =
+                    \\{"full_text_search":{"should":{"disjuncts":[{"match":"computer","field":"body"}]}}}
+                    ,
+                    .optional = false,
+                },
+                .{
+                    .body =
+                    \\{"full_text_search":{"disjuncts":[{"match":"computer","field":"body"}],"min":0,"boost":2}}
+                    ,
+                    .optional = true,
+                    .boost = 2.0,
+                },
+            }) |case| {
+                var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+                defer parsed.deinit(alloc);
+
+                const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
+                try std.testing.expect(full_text == .bool_query);
+                try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
+                try std.testing.expectEqual(case.optional, full_text.bool_query.pure_should_optional);
+                try std.testing.expectEqual(case.boost, full_text.bool_query.boost);
+                try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
+                try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
+            }
+
+            var conjunction = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"full_text_search":{"conjuncts":[{"match":"computer","field":"body"}],"boost":3}}
+                ,
+            );
+            defer conjunction.deinit(alloc);
+            try std.testing.expectEqual(
+                @as(f32, 3.0),
+                conjunction.req.full_text.?.bool_query.boost,
+            );
+
+            var match_all = try parsePublicQueryRequest(
+                alloc,
+                null,
+                "files",
+                \\{"full_text_search":{"match_all":{},"boost":4}}
+                ,
+            );
+            defer match_all.deinit(alloc);
+            try std.testing.expect(match_all.req.full_text.? == .bool_query);
+            try std.testing.expectEqual(
+                @as(f32, 4.0),
+                match_all.req.full_text.?.bool_query.boost,
+            );
+            try std.testing.expectEqual(
+                @as(usize, 1),
+                match_all.req.full_text.?.bool_query.must.len,
+            );
+            try std.testing.expect(match_all.req.full_text.?.bool_query.must[0] == .match_all);
+
+            var optional_filter = try std.json.parseFromSlice(
+                std.json.Value,
+                alloc,
+                \\{"disjuncts":[{"term":"active","field":"status"}],"min":0}
+            ,
+                .{},
+            );
+            defer optional_filter.deinit();
+            const encoded_filter = try encodeSupportedPatternFilterQueryAlloc(
+                alloc,
+                optional_filter.value,
+            );
+            defer alloc.free(encoded_filter);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                encoded_filter,
+                "\"minimum_should_match\":0",
+            ) != null);
+        }
+
+        test "api query contract preserves text native public filter variants" {
+            const alloc = std.testing.allocator;
+            inline for ([_]struct {
+                body: []const u8,
+                expected: std.meta.Tag(db_mod.types.TextQuery),
+                exclusion: bool = false,
+            }{
+                .{
+                    .body =
+                    \\{"filter_query":{"terms":["quick","fox"],"field":"body"}}
+                    ,
+                    .expected = .phrase,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"terms":[["quick","fast"],["fox"]],"field":"body"}}
+                    ,
+                    .expected = .multi_phrase,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"match_phrase":"quick fox","field":"body"}}
+                    ,
+                    .expected = .match_phrase,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"multi_match":{"query":"quick fox","type":"bool_prefix","fields":["title","body^2"]}}}
+                    ,
+                    .expected = .multi_match_bool_prefix,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"cidr":"10.0.0.0/8","field":"client_ip"}}
+                    ,
+                    .expected = .ip_range,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"location":[-122.4,37.8],"distance":"10km","field":"location"}}
+                    ,
+                    .expected = .geo_distance,
+                },
+                .{
+                    .body =
+                    \\{"filter_query":{"field":"location","min_lat":37,"min_lon":-123,"max_lat":38,"max_lon":-122}}
+                    ,
+                    .expected = .geo_bbox,
+                },
+                .{
+                    .body =
+                    \\{"exclusion_query":{"geometry":{"shape":{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,37]]]},"relation":"within"},"field":"location"}}
+                    ,
+                    .expected = .geo_shape,
+                    .exclusion = true,
+                },
+            }) |case| {
+                var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
+                defer parsed.deinit(alloc);
+                const query = if (case.exclusion)
+                    parsed.req.exclusion_text orelse return error.TestExpectedEqual
+                else
+                    parsed.req.filter_text orelse return error.TestExpectedEqual;
+                try std.testing.expectEqual(case.expected, std.meta.activeTag(query));
+            }
+        }
+
+        test "api query contract rejects public filters beyond the traversal depth budget" {
+            const alloc = std.testing.allocator;
+            var body = std.ArrayListUnmanaged(u8).empty;
+            defer body.deinit(alloc);
+            try body.appendSlice(alloc, "{\"filter_query\":");
+            for (0..public_query_max_tree_depth + 1) |_| try body.append(alloc, '[');
+            try body.appendSlice(alloc, "{\"match_all\":{}}");
+            for (0..public_query_max_tree_depth + 1) |_| try body.append(alloc, ']');
+            try body.append(alloc, '}');
+
+            try std.testing.expectError(
+                error.InvalidFilterQueryRequest,
+                parsePublicQueryRequest(alloc, null, "files", body.items),
+            );
+        }
+
+        test "api query contract preserves canonical structured compounds without speculative parsing" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"filter_query":{"conjuncts":[{"term":{"status":"active"}},{"bool_field":{"path":"/published","value":true}}]}}
+            ;
+
+            var parsed = try parsePublicQueryRequest(alloc, null, "files", body);
+            defer parsed.deinit(alloc);
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 parsed.req.filter_query_json,
-                fragment,
-            ) == null);
-        }
-        var canonical = try std.json.parseFromSlice(
-            std.json.Value,
-            alloc,
-            parsed.req.filter_query_json,
-            .{},
-        );
-        defer canonical.deinit();
-        try db_mod.validateStructuredFilterValueAlloc(alloc, canonical.value);
-    }
-
-    try std.testing.expectError(
-        error.InvalidFilterQueryRequest,
-        parsePublicQueryRequest(
-            alloc,
-            null,
-            "files",
-            \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":1.5}}
-            ,
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidFilterQueryRequest,
-        parsePublicQueryRequest(
-            alloc,
-            null,
-            "files",
-            \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"}],"min":2}}
-            ,
-        ),
-    );
-}
-
-test "api query contract bounds public fuzzy integers without narrowing traps" {
-    const alloc = std.testing.allocator;
-    inline for ([_][]const u8{
-        \\{"filter_query":{"term":"active","field":"status","fuzziness":-1}}
-        ,
-        \\{"filter_query":{"term":"active","field":"status","fuzziness":3}}
-        ,
-        \\{"filter_query":{"term":"active","field":"status","prefix_length":-1}}
-        ,
-        \\{"filter_query":{"term":"active","field":"status","prefix_length":256}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidFilterQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
-    }
-}
-
-test "api query contract preserves supported match options and rejects semantic loss" {
-    const alloc = std.testing.allocator;
-    var filtered = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"filter_query":{"match":"active user","field":"status","analyzer":"tenant_search"}}
-        ,
-    );
-    defer filtered.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "{\"match\":{\"path\":\"status\",\"text\":\"active user\",\"analyzer\":\"tenant_search\"}}",
-        filtered.req.filter_query_json,
-    );
-
-    var scored = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"full_text_search":{"match":"active user","field":"status","analyzer":"tenant_search","boost":2}}
-        ,
-    );
-    defer scored.deinit(alloc);
-    try std.testing.expect(scored.req.full_text.? == .match);
-    try std.testing.expectEqualStrings("tenant_search", scored.req.full_text.?.match.analyzer.?);
-    try std.testing.expectEqual(@as(f32, 2), scored.req.full_text.?.match.boost);
-
-    inline for ([_][]const u8{
-        \\{"filter_query":{"match":"active","field":"status","fuzziness":1}}
-        ,
-        \\{"filter_query":{"match":"active","field":"status","prefix_length":1}}
-        ,
-        \\{"filter_query":{"match":"active","field":"status","operator":"or"}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.UnsupportedFilterQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
-    }
-}
-
-test "api query contract preserves nested direct boosts and rejects ambiguous scoring roots" {
-    const alloc = std.testing.allocator;
-    inline for ([_]struct {
-        body: []const u8,
-        tag: std.meta.Tag(db_mod.types.TextQuery),
-        expected_boost: f32,
-    }{
-        .{
-            .body =
-            \\{"full_text_search":{"term":{"field":"body","term":"invoice","boost":2}}}
-            ,
-            .tag = .term,
-            .expected_boost = 2,
-        },
-        .{
-            .body =
-            \\{"full_text_search":{"match":{"field":"body","text":"paid invoice","boost":3}}}
-            ,
-            .tag = .match,
-            .expected_boost = 3,
-        },
-        .{
-            .body =
-            \\{"full_text_search":{"match_phrase":{"field":"body","text":"paid invoice","boost":4}}}
-            ,
-            .tag = .match_phrase,
-            .expected_boost = 4,
-        },
-    }) |case| {
-        var parsed = try parsePublicQueryRequest(
-            alloc,
-            null,
-            "files",
-            case.body,
-        );
-        defer parsed.deinit(alloc);
-        const full_text = parsed.req.full_text orelse
-            return error.TestExpectedEqual;
-        try std.testing.expectEqual(case.tag, std.meta.activeTag(full_text));
-        const actual_boost = switch (full_text) {
-            .term => |value| value.boost,
-            .match => |value| value.boost,
-            .match_phrase => |value| value.boost,
-            else => unreachable,
-        };
-        try std.testing.expectEqual(case.expected_boost, actual_boost);
-    }
-
-    inline for ([_][]const u8{
-        \\{"full_text_search":{"term":"invoice","match":"paid","field":"body"}}
-        ,
-        \\{"full_text_search":{"terms":["paid","invoice"],"cidr":"10.0.0.0/8","field":"body"}}
-        ,
-        \\{"full_text_search":{"location":[-122.4,37.8],"distance":"10km","min_lat":30,"min_lon":-130,"max_lat":40,"max_lon":-120,"field":"location"}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
-    }
-}
-
-test "api query contract accepts explicit empty public boolean branches" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        body: []const u8,
-        required: []const u8,
-        forbidden: ?[]const u8 = null,
-    }{
-        .{
-            .body =
-            \\{"filter_query":{"must":{"conjuncts":[]},"must_not":{"disjuncts":[{"term":"deleted","field":"status"}]}}}
-            ,
-            .required = "\"must_not\"",
-            .forbidden = "\"must\"",
-        },
-        .{
-            .body =
-            \\{"filter_query":{"must":{"conjuncts":[{"term":"active","field":"status"}]},"must_not":{"disjuncts":[]}}}
-            ,
-            .required = "\"must\"",
-            .forbidden = "\"must_not\"",
-        },
-        .{
-            .body =
-            \\{"filter_query":{"must":{"conjuncts":[]},"should":{"disjuncts":[]},"must_not":{"disjuncts":[]}}}
-            ,
-            .required = "\"match_all\"",
-        },
-    };
-    for (cases) |case| {
-        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
-        defer parsed.deinit(alloc);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            parsed.req.filter_query_json,
-            case.required,
-        ) != null);
-        if (case.forbidden) |forbidden| {
+                "\"term\":{\"status\":\"active\"}",
+            ) != null);
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 parsed.req.filter_query_json,
-                forbidden,
-            ) == null);
+                "\"bool_field\":{\"path\":\"/published\",\"value\":true}",
+            ) != null);
         }
-    }
 
-    try std.testing.expectError(
-        error.InvalidFilterQueryRequest,
-        parsePublicQueryRequest(
-            alloc,
-            null,
-            "files",
-            \\{"filter_query":{"should":{"disjuncts":[],"min":1}}}
+        test "api query contract cleans up partially parsed direct query arrays" {
+            const alloc = std.testing.allocator;
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\[{"term":"active","field":"status"},{"query_string":"status:active"}]
+            , .{});
+            defer parsed.deinit();
+
+            try std.testing.expectError(
+                error.UnsupportedQueryRequest,
+                parseDirectDslTextQueryArrayAlloc(alloc, parsed.value),
+            );
+        }
+
+        test "api query contract reports the failing nested filter node" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodePublicFilterQueryErrorBodyAlloc(
+                alloc,
+                \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"},{"query_string":"status:active"}],"min":1}}
             ,
-        ),
-    );
-}
+                "filter_query",
+                .unsupported,
+            );
+            defer alloc.free(encoded);
 
-test "api query contract preserves schema-dependent canonical ranges" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"filter_query":{"range":{"price":{"gte":10,"lt":20}}}}
-    ;
-    var parsed = try parsePublicQueryRequest(alloc, null, "products", body);
-    defer parsed.deinit(alloc);
-    try std.testing.expectEqualStrings(
-        "{\"range\":{\"price\":{\"gte\":10,\"lt\":20}}}",
-        parsed.req.filter_query_json,
-    );
-
-    inline for ([_][]const u8{
-        \\{"filter_query":{"range":{"price":{"gte":null}}}}
-        ,
-        \\{"filter_query":{"range":{"price":{"gte":10}},"term":{"path":"status","term":"active"}}}
-        ,
-    }) |invalid_body| {
-        try std.testing.expectError(
-            error.InvalidFilterQueryRequest,
-            parsePublicQueryRequest(alloc, null, "products", invalid_body),
-        );
-    }
-}
-
-test "api query contract rejects ambiguous canonical query roots" {
-    const alloc = std.testing.allocator;
-    inline for ([_][]const u8{
-        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}]},"term":{"path":"tier","value":"gold"}}}
-        ,
-        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"unknown":true}}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
-    }
-}
-
-test "api query contract accepts text-index queries in canonical boolean filters" {
-    const alloc = std.testing.allocator;
-    var parsed = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"query":{"bool":{"filter":[{"terms":["quick","fox"],"field":"body"}],"must_not":[{"match_phrase":"bad wolf","field":"body"}]}}}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    const filter_text = parsed.req.filter_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(filter_text == .phrase);
-    try std.testing.expectEqualStrings("quick", filter_text.phrase.terms[0]);
-    try std.testing.expectEqualStrings("fox", filter_text.phrase.terms[1]);
-    const exclusion_text = parsed.req.exclusion_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(exclusion_text == .match_phrase);
-    try std.testing.expectEqualStrings("bad wolf", exclusion_text.match_phrase.text);
-    try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
-    try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
-}
-
-test "api query contract preserves canonical boolean boost scope" {
-    const alloc = std.testing.allocator;
-    var parsed = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":2}},"full_text_search":{"match":"storage","field":"body"}}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(full_text == .bool_query);
-    try std.testing.expectEqual(@as(usize, 2), full_text.bool_query.must.len);
-    try std.testing.expect(full_text.bool_query.must[0] == .bool_query);
-    try std.testing.expectEqual(@as(f32, 2), full_text.bool_query.must[0].bool_query.boost);
-    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.must[0].bool_query.must.len);
-    try std.testing.expect(full_text.bool_query.must[0].bool_query.must[0] == .match);
-    try std.testing.expect(full_text.bool_query.must[1] == .match);
-}
-
-test "api query contract preserves schema-valid canonical boolean boosts" {
-    const alloc = std.testing.allocator;
-    var null_boost = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":null}}}
-        ,
-    );
-    defer null_boost.deinit(alloc);
-    try std.testing.expect(null_boost.req.full_text.? == .match);
-
-    inline for ([_]struct {
-        body: []const u8,
-        expected: f32,
-    }{
-        .{
-            .body =
-            \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":0}}}
-            ,
-            .expected = 0,
-        },
-        .{
-            .body =
-            \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":-1}}}
-            ,
-            .expected = -1,
-        },
-    }) |case| {
-        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
-        defer parsed.deinit(alloc);
-        const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
-        try std.testing.expect(full_text == .bool_query);
-        try std.testing.expectEqual(case.expected, full_text.bool_query.boost);
-    }
-}
-
-test "api query contract rejects unrepresentable canonical boolean boosts" {
-    const alloc = std.testing.allocator;
-    inline for ([_][]const u8{
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":"bad"}}}
-        ,
-        \\{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"boost":1e100}}}
-        ,
-    }) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parsePublicQueryRequest(alloc, null, "files", body),
-        );
-    }
-}
-
-test "api query contract keeps should optional beside required filters" {
-    const alloc = std.testing.allocator;
-    var parsed = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"query":{"bool":{"filter":[{"term":{"path":"status","value":"active"}}],"should":[{"match":{"field":"body","text":"computer"}}]}}}
-        ,
-    );
-    defer parsed.deinit(alloc);
-
-    const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
-    try std.testing.expect(full_text == .bool_query);
-    try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
-    try std.testing.expect(full_text.bool_query.pure_should_optional);
-    try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
-    try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
-    try std.testing.expect(full_text.bool_query.should[0] == .match);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        parsed.req.filter_query_json,
-        "\"status\"",
-    ) != null);
-}
-
-test "api query contract distinguishes explicit zero from implicit pure should minimum" {
-    const alloc = std.testing.allocator;
-    inline for ([_]struct {
-        body: []const u8,
-        optional: bool,
-        boost: f32 = 1.0,
-    }{
-        .{
-            .body =
-            \\{"full_text_search":{"should":{"disjuncts":[{"match":"computer","field":"body"}],"min":0}}}
-            ,
-            .optional = true,
-        },
-        .{
-            .body =
-            \\{"full_text_search":{"should":{"disjuncts":[{"match":"computer","field":"body"}]}}}
-            ,
-            .optional = false,
-        },
-        .{
-            .body =
-            \\{"full_text_search":{"disjuncts":[{"match":"computer","field":"body"}],"min":0,"boost":2}}
-            ,
-            .optional = true,
-            .boost = 2.0,
-        },
-    }) |case| {
-        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
-        defer parsed.deinit(alloc);
-
-        const full_text = parsed.req.full_text orelse return error.TestExpectedEqual;
-        try std.testing.expect(full_text == .bool_query);
-        try std.testing.expectEqual(@as(u32, 0), full_text.bool_query.min_should);
-        try std.testing.expectEqual(case.optional, full_text.bool_query.pure_should_optional);
-        try std.testing.expectEqual(case.boost, full_text.bool_query.boost);
-        try std.testing.expectEqual(@as(usize, 0), full_text.bool_query.must.len);
-        try std.testing.expectEqual(@as(usize, 1), full_text.bool_query.should.len);
-    }
-
-    var conjunction = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"full_text_search":{"conjuncts":[{"match":"computer","field":"body"}],"boost":3}}
-        ,
-    );
-    defer conjunction.deinit(alloc);
-    try std.testing.expectEqual(
-        @as(f32, 3.0),
-        conjunction.req.full_text.?.bool_query.boost,
-    );
-
-    var match_all = try parsePublicQueryRequest(
-        alloc,
-        null,
-        "files",
-        \\{"full_text_search":{"match_all":{},"boost":4}}
-        ,
-    );
-    defer match_all.deinit(alloc);
-    try std.testing.expect(match_all.req.full_text.? == .bool_query);
-    try std.testing.expectEqual(
-        @as(f32, 4.0),
-        match_all.req.full_text.?.bool_query.boost,
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        match_all.req.full_text.?.bool_query.must.len,
-    );
-    try std.testing.expect(match_all.req.full_text.?.bool_query.must[0] == .match_all);
-
-    var optional_filter = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"disjuncts":[{"term":"active","field":"status"}],"min":0}
-    ,
-        .{},
-    );
-    defer optional_filter.deinit();
-    const encoded_filter = try encodeSupportedPatternFilterQueryAlloc(
-        alloc,
-        optional_filter.value,
-    );
-    defer alloc.free(encoded_filter);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        encoded_filter,
-        "\"minimum_should_match\":0",
-    ) != null);
-}
-
-test "api query contract preserves text native public filter variants" {
-    const alloc = std.testing.allocator;
-    inline for ([_]struct {
-        body: []const u8,
-        expected: std.meta.Tag(db_mod.types.TextQuery),
-        exclusion: bool = false,
-    }{
-        .{
-            .body =
-            \\{"filter_query":{"terms":["quick","fox"],"field":"body"}}
-            ,
-            .expected = .phrase,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"terms":[["quick","fast"],["fox"]],"field":"body"}}
-            ,
-            .expected = .multi_phrase,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"match_phrase":"quick fox","field":"body"}}
-            ,
-            .expected = .match_phrase,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"multi_match":{"query":"quick fox","type":"bool_prefix","fields":["title","body^2"]}}}
-            ,
-            .expected = .multi_match_bool_prefix,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"cidr":"10.0.0.0/8","field":"client_ip"}}
-            ,
-            .expected = .ip_range,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"location":[-122.4,37.8],"distance":"10km","field":"location"}}
-            ,
-            .expected = .geo_distance,
-        },
-        .{
-            .body =
-            \\{"filter_query":{"field":"location","min_lat":37,"min_lon":-123,"max_lat":38,"max_lon":-122}}
-            ,
-            .expected = .geo_bbox,
-        },
-        .{
-            .body =
-            \\{"exclusion_query":{"geometry":{"shape":{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,37]]]},"relation":"within"},"field":"location"}}
-            ,
-            .expected = .geo_shape,
-            .exclusion = true,
-        },
-    }) |case| {
-        var parsed = try parsePublicQueryRequest(alloc, null, "files", case.body);
-        defer parsed.deinit(alloc);
-        const query = if (case.exclusion)
-            parsed.req.exclusion_text orelse return error.TestExpectedEqual
-        else
-            parsed.req.filter_text orelse return error.TestExpectedEqual;
-        try std.testing.expectEqual(case.expected, std.meta.activeTag(query));
-    }
-}
-
-test "api query contract rejects public filters beyond the traversal depth budget" {
-    const alloc = std.testing.allocator;
-    var body = std.ArrayListUnmanaged(u8).empty;
-    defer body.deinit(alloc);
-    try body.appendSlice(alloc, "{\"filter_query\":");
-    for (0..public_query_max_tree_depth + 1) |_| try body.append(alloc, '[');
-    try body.appendSlice(alloc, "{\"match_all\":{}}");
-    for (0..public_query_max_tree_depth + 1) |_| try body.append(alloc, ']');
-    try body.append(alloc, '}');
-
-    try std.testing.expectError(
-        error.InvalidFilterQueryRequest,
-        parsePublicQueryRequest(alloc, null, "files", body.items),
-    );
-}
-
-test "api query contract preserves canonical structured compounds without speculative parsing" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"filter_query":{"conjuncts":[{"term":{"status":"active"}},{"bool_field":{"path":"/published","value":true}}]}}
-    ;
-
-    var parsed = try parsePublicQueryRequest(alloc, null, "files", body);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        parsed.req.filter_query_json,
-        "\"term\":{\"status\":\"active\"}",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        parsed.req.filter_query_json,
-        "\"bool_field\":{\"path\":\"/published\",\"value\":true}",
-    ) != null);
-}
-
-test "api query contract cleans up partially parsed direct query arrays" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\[{"term":"active","field":"status"},{"query_string":"status:active"}]
-    , .{});
-    defer parsed.deinit();
-
-    try std.testing.expectError(
-        error.UnsupportedQueryRequest,
-        parseDirectDslTextQueryArrayAlloc(alloc, parsed.value),
-    );
-}
-
-test "api query contract reports the failing nested filter node" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodePublicFilterQueryErrorBodyAlloc(
-        alloc,
-        \\{"filter_query":{"disjuncts":[{"term":"active","field":"status"},{"query_string":"status:active"}],"min":1}}
-    ,
-        "filter_query",
-        .unsupported,
-    );
-    defer alloc.free(encoded);
-
-    const Parsed = struct {
-        status: u16,
-        field: []const u8,
-        offending_node: []const u8,
-        retryable: bool,
-    };
-    var parsed = try std.json.parseFromSlice(Parsed, alloc, encoded, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
-    try std.testing.expectEqualStrings("filter_query", parsed.value.field);
-    try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
-    try std.testing.expect(!parsed.value.retryable);
-}
-
-test "api query contract classifies typed filter errors as validation errors" {
-    inline for ([_]anyerror{
-        error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest,
-        error.InvalidFilterQueryRequest,
-        error.InvalidExclusionQueryRequest,
-        error.UnsupportedFilterQueryRequest,
-        error.UnsupportedExclusionQueryRequest,
-        error.RerankerCandidateLimitExceeded,
-    }) |err| {
-        try std.testing.expect(isPublicQueryValidationError(err));
-    }
-    try std.testing.expect(!isPublicQueryValidationError(error.OutOfMemory));
-}
-
-test "api query contract preflight summarizes query lanes and result refs" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "embeddings": {"body_embedding": [1.0, 0.0, 0.0]},
-        \\  "indexes": ["body_embedding"],
-        \\  "limit": 7,
-        \\  "count": true,
-        \\  "profile": true,
-        \\  "fields": ["title"],
-        \\  "aggregations": {
-        \\    "by_status": {
-        \\      "type": "terms",
-        \\      "field": "status",
-        \\      "sub_aggregations": {
-        \\        "doc_count": {
-        \\          "type": "count",
-        \\          "field": "status"
-        \\        }
-        \\      }
-        \\    }
-        \\  },
-        \\  "graph_queries": {
-        \\    "seeded": {
-        \\      "index": "doc_graph",
-        \\      "traverse": {
-        \\        "start": {"result_ref": "$query_results", "limit": 3},
-        \\        "max_depth": 1
-        \\      }
-        \\    },
-        \\    "related": {
-        \\      "index": "doc_graph",
-        \\      "traverse": {
-        \\        "start": {"result_ref": "$graph_results.seeded", "limit": 3},
-        \\        "max_depth": 1
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed.value);
-    defer summary.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), summary.full_text_indexes.len);
-    try std.testing.expectEqualStrings("full_text", summary.full_text_indexes[0]);
-    try std.testing.expectEqual(@as(usize, 1), summary.embedding_indexes.len);
-    try std.testing.expectEqualStrings("body_embedding", summary.embedding_indexes[0]);
-    try std.testing.expectEqual(@as(usize, 1), summary.graph_indexes.len);
-    try std.testing.expectEqualStrings("doc_graph", summary.graph_indexes[0]);
-    try std.testing.expectEqual(@as(usize, 3), summary.result_refs.len);
-    var saw_seeded = false;
-    var saw_graph = false;
-    var saw_query = false;
-    for (summary.result_refs) |result_ref| {
-        if (std.mem.eql(u8, result_ref, "$graph_results.seeded")) saw_seeded = true;
-        if (std.mem.eql(u8, result_ref, "$graph_results.related")) saw_graph = true;
-        if (std.mem.eql(u8, result_ref, "$query_results")) saw_query = true;
-    }
-    try std.testing.expect(saw_seeded);
-    try std.testing.expect(saw_graph);
-    try std.testing.expect(saw_query);
-    try std.testing.expectEqual(@as(usize, 2), summary.graph_query_order.len);
-    try std.testing.expectEqualStrings("seeded", summary.graph_query_order[0]);
-    try std.testing.expectEqualStrings("related", summary.graph_query_order[1]);
-    try std.testing.expectEqual(@as(u32, 7), summary.requested_limit);
-    try std.testing.expectEqual(@as(u32, 0), summary.requested_offset);
-    try std.testing.expectEqual(@as(u32, 2), summary.base_result_set_count);
-    try std.testing.expectEqual(@as(u32, 2), summary.graph_query_count);
-    try std.testing.expect(summary.requires_fusion);
-    try std.testing.expect(summary.count_only);
-    try std.testing.expect(summary.profile_requested);
-    try std.testing.expect(summary.include_stored);
-    try std.testing.expectEqual(@as(u32, 2), summary.aggregation_count);
-}
-
-test "api query contract rejects duplicate graph binding projections" {
-    const body =
-        \\{
-        \\  "graph_queries": {
-        \\    "matched": {
-        \\      "index": "graph_idx",
-        \\      "match": {"anchor":"node","nodes":{"node":{}},"edges":[]},
-        \\      "return": {"bindings":["node","node"]}
-        \\    }
-        \\  }
-        \\}
-    ;
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
-    );
-}
-
-test "api query contract owns the admitted graph wire for exact proxying" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "graph_queries": {
-        \\    "walk": {
-        \\      "index": "graph_idx",
-        \\      "traverse": {
-        \\        "start": {"keys":["doc:a"]},
-        \\        "direction": "both",
-        \\        "filter": {"term":"active","path":"/status"}
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
-    var owned = try parseQueryRequest(alloc, null, "docs", body);
-    defer owned.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    try std.testing.expectEqual(graph_mod.EdgeDirection.both, owned.req.graph_queries[0].query.params.direction);
-    const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.canonical, transport.dialect);
-    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, transport.operations_json, .{});
-    defer wire.deinit();
-    const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
-    const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("both", traverse.object.get("direction").?.string);
-    const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
-}
-
-test "api query contract preserves opaque legacy graph operation names" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "graph_searches": {
-        \\    "$legacy": {
-        \\      "type": "neighbors",
-        \\      "index_name": "graph_idx",
-        \\      "start_nodes": {"keys":["doc:a"]}
-        \\    }
-        \\  }
-        \\}
-    ;
-    var owned = try parseQueryRequest(alloc, null, "docs", body);
-    defer owned.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    try std.testing.expectEqualStrings("$legacy", owned.req.graph_queries[0].name);
-}
-
-test "canonical graph contract rejects modes without exact public execution" {
-    const cases = [_][]const u8{
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.$reserved\"}}}}}",
-    };
-    for (cases) |body| {
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
-        );
-    }
-}
-
-test "canonical graph traversal and paths preserve requested direction" {
-    const cases = [_]struct {
-        body: []const u8,
-        expected: graph_mod.EdgeDirection,
-    }{
-        .{
-            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",
-            .expected = .in,
-        },
-        .{
-            .body = "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
-            .expected = .both,
-        },
-        .{
-            .body = "{\"graph_queries\":{\"paths\":{\"index\":\"g\",\"k_shortest_paths\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"k\":2,\"direction\":\"in\"}}}}",
-            .expected = .in,
-        },
-    };
-    for (cases) |case| {
-        var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs", case.body);
-        defer owned.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case.expected, owned.req.graph_queries[0].query.params.direction);
-    }
-}
-
-test "api query contract preflight preserves a named full text index" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_index": "document_text",
-        \\  "full_text_search": {"match":"raft","field":"body"}
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed.value);
-    defer summary.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), summary.full_text_indexes.len);
-    try std.testing.expectEqualStrings("document_text", summary.full_text_indexes[0]);
-}
-
-test "api query contract preflight rejects count with reranker" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "count": true,
-        \\  "reranker": {"provider":"cohere","model":"rerank-english-v3.0","field":"body","top_n":5}
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
-}
-
-test "api query contract enforces provider-specific reranker candidate limits" {
-    const vertex_body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "limit": 201,
-        \\  "reranker": {"provider":"vertex","model":"semantic-ranker-default@latest","field":"body"}
-        \\}
-    ;
-    try std.testing.expectError(
-        error.RerankerCandidateLimitExceeded,
-        parsePublicQueryRequest(std.testing.allocator, null, "docs", vertex_body),
-    );
-
-    const cohere_body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "limit": 201,
-        \\  "reranker": {"provider":"cohere","model":"rerank-v4.0-pro","field":"body"}
-        \\}
-    ;
-    var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
-    cohere.deinit(std.testing.allocator);
-}
-
-test "api query contract permits semantic offset only with coordinator reranking" {
-    const alloc = std.testing.allocator;
-    const FakeResolver = struct {
-        fn resolve(
-            _: *anyopaque,
-            resolver_alloc: std.mem.Allocator,
-            _: []const u8,
-            _: []const u8,
-            _: []const u8,
-            _: ?[]const u8,
-            limit: u32,
-        ) !db_mod.types.DenseKnnQuery {
-            return .{
-                .vector = try resolver_alloc.dupe(f32, &.{ 1.0, 0.0 }),
-                .k = limit,
+            const Parsed = struct {
+                status: u16,
+                field: []const u8,
+                offending_node: []const u8,
+                retryable: bool,
             };
+            var parsed = try std.json.parseFromSlice(Parsed, alloc, encoded, .{
+                .ignore_unknown_fields = true,
+            });
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+            try std.testing.expectEqualStrings("filter_query", parsed.value.field);
+            try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
+            try std.testing.expect(!parsed.value.retryable);
+        }
+
+        test "api query contract classifies typed filter errors as validation errors" {
+            inline for ([_]anyerror{
+                error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest,
+                error.InvalidFilterQueryRequest,
+                error.InvalidExclusionQueryRequest,
+                error.UnsupportedFilterQueryRequest,
+                error.UnsupportedExclusionQueryRequest,
+                error.RerankerCandidateLimitExceeded,
+            }) |err| {
+                try std.testing.expect(isPublicQueryValidationError(err));
+            }
+            try std.testing.expect(!isPublicQueryValidationError(error.OutOfMemory));
+        }
+
+        test "api query contract preflight summarizes query lanes and result refs" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "embeddings": {"body_embedding": [1.0, 0.0, 0.0]},
+                \\  "indexes": ["body_embedding"],
+                \\  "limit": 7,
+                \\  "count": true,
+                \\  "profile": true,
+                \\  "fields": ["title"],
+                \\  "aggregations": {
+                \\    "by_status": {
+                \\      "type": "terms",
+                \\      "field": "status",
+                \\      "sub_aggregations": {
+                \\        "doc_count": {
+                \\          "type": "count",
+                \\          "field": "status"
+                \\        }
+                \\      }
+                \\    }
+                \\  },
+                \\  "graph_queries": {
+                \\    "seeded": {
+                \\      "index": "doc_graph",
+                \\      "traverse": {
+                \\        "start": {"result_ref": "$query_results", "limit": 3},
+                \\        "max_depth": 1
+                \\      }
+                \\    },
+                \\    "related": {
+                \\      "index": "doc_graph",
+                \\      "traverse": {
+                \\        "start": {"result_ref": "$graph_results.seeded", "limit": 3},
+                \\        "max_depth": 1
+                \\      }
+                \\    }
+                \\  }
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed.value);
+            defer summary.deinit(std.testing.allocator);
+
+            try std.testing.expectEqual(@as(usize, 1), summary.full_text_indexes.len);
+            try std.testing.expectEqualStrings("full_text", summary.full_text_indexes[0]);
+            try std.testing.expectEqual(@as(usize, 1), summary.embedding_indexes.len);
+            try std.testing.expectEqualStrings("body_embedding", summary.embedding_indexes[0]);
+            try std.testing.expectEqual(@as(usize, 1), summary.graph_indexes.len);
+            try std.testing.expectEqualStrings("doc_graph", summary.graph_indexes[0]);
+            try std.testing.expectEqual(@as(usize, 3), summary.result_refs.len);
+            var saw_seeded = false;
+            var saw_graph = false;
+            var saw_query = false;
+            for (summary.result_refs) |result_ref| {
+                if (std.mem.eql(u8, result_ref, "$graph_results.seeded")) saw_seeded = true;
+                if (std.mem.eql(u8, result_ref, "$graph_results.related")) saw_graph = true;
+                if (std.mem.eql(u8, result_ref, "$query_results")) saw_query = true;
+            }
+            try std.testing.expect(saw_seeded);
+            try std.testing.expect(saw_graph);
+            try std.testing.expect(saw_query);
+            try std.testing.expectEqual(@as(usize, 2), summary.graph_query_order.len);
+            try std.testing.expectEqualStrings("seeded", summary.graph_query_order[0]);
+            try std.testing.expectEqualStrings("related", summary.graph_query_order[1]);
+            try std.testing.expectEqual(@as(u32, 7), summary.requested_limit);
+            try std.testing.expectEqual(@as(u32, 0), summary.requested_offset);
+            try std.testing.expectEqual(@as(u32, 2), summary.base_result_set_count);
+            try std.testing.expectEqual(@as(u32, 2), summary.graph_query_count);
+            try std.testing.expect(summary.requires_fusion);
+            try std.testing.expect(summary.count_only);
+            try std.testing.expect(summary.profile_requested);
+            try std.testing.expect(summary.include_stored);
+            try std.testing.expectEqual(@as(u32, 2), summary.aggregation_count);
+        }
+
+        test "api query contract rejects duplicate graph binding projections" {
+            const body =
+                \\{
+                \\  "graph_queries": {
+                \\    "matched": {
+                \\      "index": "graph_idx",
+                \\      "match": {"anchor":"node","nodes":{"node":{}},"edges":[]},
+                \\      "return": {"bindings":["node","node"]}
+                \\    }
+                \\  }
+                \\}
+            ;
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
+            );
+        }
+
+        test "api query contract owns the admitted graph wire for exact proxying" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "graph_queries": {
+                \\    "walk": {
+                \\      "index": "graph_idx",
+                \\      "traverse": {
+                \\        "start": {"keys":["doc:a"]},
+                \\        "direction": "both",
+                \\        "filter": {"term":"active","path":"/status"}
+                \\      }
+                \\    }
+                \\  }
+                \\}
+            ;
+            var owned = try parseQueryRequest(alloc, null, "docs", body);
+            defer owned.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.both, owned.req.graph_queries[0].query.params.direction);
+            const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.canonical, transport.dialect);
+            var wire = try ant_json.parseFromSlice(std.json.Value, alloc, transport.operations_json, .{});
+            defer wire.deinit();
+            const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
+            const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("both", traverse.object.get("direction").?.string);
+            const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
+        }
+
+        test "api query contract preserves opaque legacy graph operation names" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "graph_searches": {
+                \\    "$legacy": {
+                \\      "type": "neighbors",
+                \\      "index_name": "graph_idx",
+                \\      "start_nodes": {"keys":["doc:a"]}
+                \\    }
+                \\  }
+                \\}
+            ;
+            var owned = try parseQueryRequest(alloc, null, "docs", body);
+            defer owned.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expectEqualStrings("$legacy", owned.req.graph_queries[0].name);
+        }
+
+        test "canonical graph contract rejects modes without exact public execution" {
+            const cases = [_][]const u8{
+                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
+                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
+                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
+                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",
+                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.$reserved\"}}}}}",
+            };
+            for (cases) |body| {
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
+                );
+            }
+        }
+
+        test "canonical graph traversal and paths preserve requested direction" {
+            const cases = [_]struct {
+                body: []const u8,
+                expected: graph_mod.EdgeDirection,
+            }{
+                .{
+                    .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",
+                    .expected = .in,
+                },
+                .{
+                    .body = "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
+                    .expected = .both,
+                },
+                .{
+                    .body = "{\"graph_queries\":{\"paths\":{\"index\":\"g\",\"k_shortest_paths\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"k\":2,\"direction\":\"in\"}}}}",
+                    .expected = .in,
+                },
+            };
+            for (cases) |case| {
+                var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs", case.body);
+                defer owned.deinit(std.testing.allocator);
+                try std.testing.expectEqual(case.expected, owned.req.graph_queries[0].query.params.direction);
+            }
+        }
+
+        test "api query contract preflight preserves a named full text index" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_index": "document_text",
+                \\  "full_text_search": {"match":"raft","field":"body"}
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed.value);
+            defer summary.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(usize, 1), summary.full_text_indexes.len);
+            try std.testing.expectEqualStrings("document_text", summary.full_text_indexes[0]);
+        }
+
+        test "api query contract preflight rejects count with reranker" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "count": true,
+                \\  "reranker": {"provider":"cohere","model":"rerank-english-v3.0","field":"body","top_n":5}
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+        }
+
+        test "api query contract enforces provider-specific reranker candidate limits" {
+            const vertex_body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "limit": 201,
+                \\  "reranker": {"provider":"vertex","model":"semantic-ranker-default@latest","field":"body"}
+                \\}
+            ;
+            try std.testing.expectError(
+                error.RerankerCandidateLimitExceeded,
+                parsePublicQueryRequest(std.testing.allocator, null, "docs", vertex_body),
+            );
+
+            const cohere_body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "limit": 201,
+                \\  "reranker": {"provider":"cohere","model":"rerank-v4.0-pro","field":"body"}
+                \\}
+            ;
+            var cohere = try parsePublicQueryRequest(std.testing.allocator, null, "docs", cohere_body);
+            cohere.deinit(std.testing.allocator);
+        }
+
+        test "api query contract permits semantic offset only with coordinator reranking" {
+            const alloc = std.testing.allocator;
+            const FakeResolver = struct {
+                fn resolve(
+                    _: *anyopaque,
+                    resolver_alloc: std.mem.Allocator,
+                    _: []const u8,
+                    _: []const u8,
+                    _: []const u8,
+                    _: ?[]const u8,
+                    limit: u32,
+                ) !db_mod.types.DenseKnnQuery {
+                    return .{
+                        .vector = try resolver_alloc.dupe(f32, &.{ 1.0, 0.0 }),
+                        .k = limit,
+                    };
+                }
+            };
+            var resolver_context: u8 = 0;
+            const resolver = SemanticResolver{
+                .ptr = &resolver_context,
+                .vtable = &.{ .resolve_dense_query = FakeResolver.resolve },
+            };
+            const reranked_body =
+                \\{
+                \\  "semantic_search": "raft consensus",
+                \\  "indexes": ["semantic"],
+                \\  "offset": 5,
+                \\  "limit": 10,
+                \\  "reranker": {"provider":"antfly","field":"body","candidate_count":50}
+                \\}
+            ;
+            var reranked = try parseQueryRequest(alloc, resolver, "docs", reranked_body);
+            defer reranked.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 5), reranked.req.offset);
+            try std.testing.expectEqual(@as(u32, 10), reranked.req.limit);
+            try std.testing.expectEqual(@as(?u32, 50), reranked.req.reranker.?.candidate_count);
+
+            const approximate_only_body =
+                \\{
+                \\  "semantic_search": "raft consensus",
+                \\  "indexes": ["semantic"],
+                \\  "offset": 5,
+                \\  "limit": 10
+                \\}
+            ;
+            try std.testing.expectError(
+                error.UnsupportedQueryRequest,
+                parseQueryRequest(alloc, resolver, "docs", approximate_only_body),
+            );
+        }
+
+        test "api query contract rejects count with stored sort" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "count": true,
+                \\  "order_by": [{"field":"created_at","desc":true}]
+                \\}
+            ;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+            try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+        }
+
+        test "api query contract rejects count with search_after cursor" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "count": true,
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_after": ["2026-01-01", "doc-9"]
+                \\}
+            ;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+            try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+        }
+
+        test "api query contract rejects count with search_before cursor" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "count": true,
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_before": ["2026-01-01", "doc-9"]
+                \\}
+            ;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+            try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+        }
+
+        test "api query contract defaults cursor pagination without sort to id order" {
+            const alloc = std.testing.allocator;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "search_after": ["doc-9"],
+                \\  "limit": 10
+                \\}
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.order_by.len);
+            try std.testing.expectEqualStrings("_id", parsed.req.order_by[0].field);
+            try std.testing.expect(!parsed.req.order_by[0].desc);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.search_after.len);
+            try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[0].string);
+        }
+
+        test "api query contract preflight rejects cursor pagination without sort when cursor is not id arity" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "search_after": ["2025-01-01", "doc-9"]
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+        }
+
+        test "api query contract preflight rejects cursor pagination over approximate vector source" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+                \\  "indexes": ["dense_idx"],
+                \\  "search_after": ["doc-9"],
+                \\  "limit": 10
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "api query contract preflight rejects search_before pagination over approximate vector source" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+                \\  "indexes": ["dense_idx"],
+                \\  "search_before": ["doc-9"],
+                \\  "limit": 10
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "api query contract preflight rejects score sort over approximate vector source" {
+            var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+                \\  "indexes": ["dense_idx"],
+                \\  "order_by": [{"field":"_score","desc":true}],
+                \\  "limit": 10
+                \\}
+            , .{});
+            defer parsed.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+        }
+
+        test "api query contract preflight rejects score sort without score-bearing source" {
+            var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_search": {"match_all": {}},
+                \\  "order_by": [{"field":"_score","desc":true}]
+                \\}
+            , .{});
+            defer parsed_match_all.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_match_all.value));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+            var parsed_filter_only = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "filter_query": {"term":{"field":"status","value":"active"}},
+                \\  "order_by": [{"field":"_score","desc":true}]
+                \\}
+            , .{});
+            defer parsed_filter_only.deinit();
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_filter_only.value));
+            const filter_diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", filter_diagnostic.field);
+            try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.reason);
+            try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.detail);
+
+            var parsed_match = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"_score","desc":true}]
+                \\}
+            , .{});
+            defer parsed_match.deinit();
+
+            var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_match.value);
+            defer summary.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
+        }
+
+        test "api query contract appends stable id sort tiebreaker for cursors" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_after": ["2026-01-01", "doc-9"],
+                \\  "limit": 10
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.order_by.len);
+            try std.testing.expectEqualStrings("created_at", parsed.req.order_by[0].field);
+            try std.testing.expect(parsed.req.order_by[0].desc);
+            try std.testing.expectEqualStrings("_id", parsed.req.order_by[1].field);
+            try std.testing.expect(!parsed.req.order_by[1].desc);
+            try std.testing.expectEqual(@as(usize, 2), parsed.req.search_after.len);
+            try std.testing.expectEqualStrings("2026-01-01", parsed.req.search_after[0].string);
+            try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[1].string);
+        }
+
+        test "api query contract rejects cursor width that omits stable id tiebreaker" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_after": ["2026-01-01"]
+                \\}
+            ;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+        }
+
+        test "api query contract records cursor arity diagnostic without sort" {
+            const alloc = std.testing.allocator;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "search_after": ["2026-01-01", "doc-9"]
+                \\}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("*", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+        }
+
+        test "api query contract rejects non replayable search_after cursor values" {
+            const alloc = std.testing.allocator;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_after": [null, "doc-9"]
+                \\}
+            ));
+            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_after": [{"value":"2026-01-01"}, "doc-9"]
+                \\}
+            ));
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"_score","desc":true}],
+                \\  "search_after": ["high", "doc-9"]
+                \\}
+            ));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+        }
+
+        test "api query contract rejects score sort without score-bearing text source" {
+            const alloc = std.testing.allocator;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match_all": {}},
+                \\  "order_by": [{"field":"_score","desc":true}]
+                \\}
+            ));
+            const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_score", diagnostic.field);
+            try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+            try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+            var parsed = try parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"_score","desc":true}]
+                \\}
+            );
+            defer parsed.deinit(alloc);
+            try std.testing.expect(db_mod.searchRequestHasScoreBearingTextSource(parsed.req));
+        }
+
+        test "api query contract rejects non replayable search_before cursor values" {
+            const alloc = std.testing.allocator;
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_before": [[], "doc-9"]
+                \\}
+            ));
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at","desc":true}],
+                \\  "search_before": ["2026-01-01", 9]
+                \\}
+            ));
+        }
+
+        test "api query contract rejects ambiguous explicit id sort tiebreaker" {
+            const alloc = std.testing.allocator;
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
+                \\}
+            ));
+            var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
+                \\}
+            ));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("_id", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+
+            db_mod.resetLastSortRejectionDiagnostic();
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{
+                \\  "full_text_search": {"match":"raft","field":"body"},
+                \\  "order_by": [{"field":"created_at"},{"field":"created_at","desc":true}]
+                \\}
+            ));
+            diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("created_at", diagnostic.field);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+            try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+        }
+
+        test "api query contract parses packed dense embeddings via antfly-json" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"limit":3}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.sparse_queries.len);
+            try std.testing.expectEqual(@as(u32, 3), parsed.req.dense_queries[0].query.k);
+            try std.testing.expectEqual(@as(usize, 3), parsed.req.dense_queries[0].query.vector.len);
+            try std.testing.expectApproxEqAbs(@as(f32, 1.0), parsed.req.dense_queries[0].query.vector[0], 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 2.0), parsed.req.dense_queries[0].query.vector[1], 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 3.0), parsed.req.dense_queries[0].query.vector[2], 0.0001);
+        }
+
+        test "api query contract does not use dense fast path for composed vector requests" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"category":"archived"}},"limit":3}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
+            try std.testing.expect(parsed.req.full_text != null);
+            try std.testing.expect(parsed.req.filter_query_json.len > 0);
+            try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
+        }
+
+        test "api query contract parses packed sparse embeddings via antfly-json" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{"embeddings":{"sparse_idx":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["sparse_idx"],"limit":9}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.dense_queries.len);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.sparse_queries.len);
+            try std.testing.expectEqual(@as(u32, 4), parsed.req.sparse_queries[0].query.k);
+            try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, parsed.req.sparse_queries[0].query.indices);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.5), parsed.req.sparse_queries[0].query.values[0], 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.req.sparse_queries[0].query.values[1], 0.0001);
+        }
+
+        test "api query contract parses explicit algebraic aggregation join" {
+            const alloc = std.testing.allocator;
+            const aggregations_json =
+                \\{
+                \\  "by_segment": {
+                \\    "type": "terms",
+                \\    "field": "segment",
+                \\    "algebraic_join": {
+                \\      "name": "orders_customers",
+                \\      "kind": "bucket",
+                \\      "group_side": "right",
+                \\      "measure_side": "left"
+                \\    },
+                \\    "sub_aggregations": {
+                \\      "amount": {"type": "sum", "field": "amount"}
+                \\    }
+                \\  }
+                \\}
+            ;
+            const requests = try parseAggregationRequestsJson(alloc, aggregations_json);
+            defer freeAggregationRequests(alloc, requests);
+
+            try std.testing.expectEqual(@as(usize, 1), requests.len);
+            const join = requests[0].algebraic_join.?;
+            try std.testing.expectEqualStrings("orders_customers", join.name);
+            try std.testing.expectEqual(db_mod.algebraic.join.TemporalMode.bucket, join.kind);
+            try std.testing.expectEqualStrings("right", join.group_side.?);
+            try std.testing.expectEqualStrings("left", join.measure_side.?);
+            try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
+            try std.testing.expect(requests[0].aggregations[0].algebraic_join == null);
+        }
+
+        test "api query contract parses multi field terms aggregation" {
+            const alloc = std.testing.allocator;
+            const aggregations_json =
+                \\{
+                \\  "by_customer_product": {
+                \\    "type": "terms",
+                \\    "fields": ["customer", "product"],
+                \\    "sub_aggregations": {
+                \\      "amount": {"type": "sum", "field": "amount"}
+                \\    }
+                \\  }
+                \\}
+            ;
+            const requests = try parseAggregationRequestsJson(alloc, aggregations_json);
+            defer freeAggregationRequests(alloc, requests);
+
+            try std.testing.expectEqual(@as(usize, 1), requests.len);
+            try std.testing.expectEqualStrings("customer", requests[0].field);
+            try std.testing.expectEqual(@as(usize, 2), requests[0].fields.len);
+            try std.testing.expectEqualStrings("customer", requests[0].fields[0]);
+            try std.testing.expectEqualStrings("product", requests[0].fields[1]);
+            try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
+            try std.testing.expectEqualStrings("amount", requests[0].aggregations[0].field);
+        }
+
+        test "api query contract rejects multi field non terms aggregation" {
+            const alloc = std.testing.allocator;
+            const aggregations_json =
+                \\{
+                \\  "amount": {
+                \\    "type": "sum",
+                \\    "fields": ["amount", "tax"]
+                \\  }
+                \\}
+            ;
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseAggregationRequestsJson(alloc, aggregations_json));
+        }
+
+        test "api query contract rejects conflicting terms field and fields" {
+            const alloc = std.testing.allocator;
+            const aggregations_json =
+                \\{
+                \\  "by_customer_product": {
+                \\    "type": "terms",
+                \\    "field": "tenant",
+                \\    "fields": ["customer", "product"]
+                \\  }
+                \\}
+            ;
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseAggregationRequestsJson(alloc, aggregations_json));
+        }
+
+        test "api query contract exposes native doc id constraint envelope for non-query worker protocols" {
+            const alloc = std.testing.allocator;
+            const source = db_mod.types.SearchRequest{
+                .filter_doc_ids_positive = true,
+                .filter_doc_ids = &.{},
+                .exclude_doc_ids = &.{"doc:c"},
+            };
+            const envelope = nativeDocIdConstraintEnvelopeFromSearchRequest(source);
+            try std.testing.expect(envelope.hasConstraints());
+
+            const encoded = try encodeNativeDocIdConstraintEnvelopeAlloc(alloc, envelope);
+            defer alloc.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"positive_filter\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_doc_ids\":[]") != null);
+
+            var parsed = try parseNativeDocIdConstraintEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expect(parsed.constraints.positive_filter);
+            try std.testing.expectEqual(@as(usize, 0), parsed.constraints.include_doc_ids.len);
+            try std.testing.expectEqual(@as(usize, 1), parsed.constraints.exclude_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:c", parsed.constraints.exclude_doc_ids[0]);
+        }
+
+        test "api query contract normalizes native include doc ids to a positive envelope" {
+            const alloc = std.testing.allocator;
+            const envelope = NativeDocIdConstraintEnvelope{
+                .positive_filter = false,
+                .include_doc_ids = &.{ "doc:b", "doc:a", "doc:b", "doc:c" },
+                .exclude_doc_ids = &.{ "doc:d", "doc:c", "doc:c" },
+            };
+
+            const encoded = try encodeNativeDocIdConstraintEnvelopeAlloc(alloc, envelope);
+            defer alloc.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"positive_filter\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_doc_ids\":[\"doc:a\",\"doc:b\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exclude_doc_ids\":[\"doc:c\",\"doc:d\"]") != null);
+
+            var parsed = try parseNativeDocIdConstraintEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expect(parsed.constraints.positive_filter);
+            try std.testing.expectEqual(@as(usize, 2), parsed.constraints.include_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:a", parsed.constraints.include_doc_ids[0]);
+            try std.testing.expectEqualStrings("doc:b", parsed.constraints.include_doc_ids[1]);
+            try std.testing.expectEqual(@as(usize, 2), parsed.constraints.exclude_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:c", parsed.constraints.exclude_doc_ids[0]);
+            try std.testing.expectEqualStrings("doc:d", parsed.constraints.exclude_doc_ids[1]);
+        }
+
+        test "api query contract exposes typed tensor access path envelope for worker protocols" {
+            const alloc = std.testing.allocator;
+            const dictionary = algebraic_lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
+            const path = algebraic_ir.PhysicalAccessPath{
+                .owner = "body_terms",
+                .layout = .full_text_postings,
+                .dictionary = dictionary,
+                .fragments = &.{ .slice, .automaton_select },
+                .output_dims = &.{.doc},
+            };
+
+            const encoded = try encodeAlgebraicTensorAccessPathEnvelopeAlloc(alloc, path);
+            defer alloc.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"owner\":\"body_terms\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"full_text_postings\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dictionary\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"analyzed_term\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"fragments\":[\"slice\",\"automaton_select\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"output_dims\":[\"doc\"]") != null);
+
+            var parsed = try parseAlgebraicTensorAccessPathEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            const parsed_path = parsed.asAccessPath();
+            try std.testing.expectEqualStrings(path.owner, parsed_path.owner);
+            try std.testing.expectEqual(path.layout, parsed_path.layout);
+            try std.testing.expect(parsed_path.dictionary != null);
+            try std.testing.expect(dictionary.eql(parsed_path.dictionary.?));
+            try std.testing.expectEqualSlices(algebraic_ir.TensorFragment, path.fragments, parsed_path.fragments);
+            try std.testing.expectEqualSlices(algebraic_ir.Dimension, path.output_dims, parsed_path.output_dims);
+            try std.testing.expectEqualSlices(algebraic_law.Id, path.law_ids, parsed_path.law_ids);
+        }
+
+        test "api query contract exposes typed tensor expression envelope for worker protocols" {
+            const alloc = std.testing.allocator;
+            const dictionary = algebraic_lexical.DictionaryIdentity.canonicalScalar("docs", "/customer", .string, "json-scalar-v1", "kind-qualified");
+            const expr = algebraic_ir.TensorExpr{
+                .fragment = .reduce,
+                .input_dims = &.{ .doc, .scalar },
+                .output_dims = &.{.bucket},
+                .semantic_id = "sum_by_customer",
+                .layout = .materialized_expr,
+                .dictionary = dictionary,
+                .law_id = .sum,
+            };
+
+            const encoded = try encodeAlgebraicTensorExprEnvelopeAlloc(alloc, expr);
+            defer alloc.free(encoded);
+            const expected_expr_id = try algebraic_ir.tensorExprIdAlloc(alloc, expr);
+            defer alloc.free(expected_expr_id);
+            const expected_expr_id_json = try std.fmt.allocPrint(alloc, "\"expr_id\":\"{s}\"", .{expected_expr_id});
+            defer alloc.free(expected_expr_id_json);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, expected_expr_id_json) != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"fragment\":\"reduce\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"input_dims\":[\"doc\",\"scalar\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"output_dims\":[\"bucket\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_id\":\"sum_by_customer\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"materialized_expr\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"canonical_scalar\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"law_id\":\"sum\"") != null);
+
+            var parsed = try parseAlgebraicTensorExprEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            const parsed_expr = parsed.asExpr();
+            try std.testing.expectEqualStrings(expected_expr_id, parsed.expr_id);
+            try std.testing.expectEqual(expr.fragment, parsed_expr.fragment);
+            try std.testing.expectEqualSlices(algebraic_ir.Dimension, expr.input_dims, parsed_expr.input_dims);
+            try std.testing.expectEqualSlices(algebraic_ir.Dimension, expr.output_dims, parsed_expr.output_dims);
+            try std.testing.expectEqualStrings(expr.semantic_id.?, parsed_expr.semantic_id.?);
+            try std.testing.expect(parsed_expr.owner == null);
+            try std.testing.expectEqual(expr.layout.?, parsed_expr.layout.?);
+            try std.testing.expect(parsed_expr.dictionary != null);
+            try std.testing.expect(dictionary.eql(parsed_expr.dictionary.?));
+            try std.testing.expectEqual(expr.law_id.?, parsed_expr.law_id.?);
+
+            var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, parsed_expr)).?;
+            defer plan.deinit(alloc);
+            try std.testing.expectEqualStrings(parsed.expr_id, plan.expr_id);
+            try std.testing.expect(algebraic_ir.accessPathCanSatisfy(plan.access_path, parsed_expr).safe());
+
+            var tampered = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
+            defer tampered.deinit(alloc);
+            try tampered.appendSlice(alloc, encoded);
+            const id_pos = std.mem.indexOf(u8, tampered.items, expected_expr_id) orelse return error.TestUnexpectedResult;
+            tampered.items[id_pos] = if (tampered.items[id_pos] == 'x') 'y' else 'x';
+            try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorExprEnvelopeAlloc(alloc, tampered.items));
+
+            const missing_id =
+                \\{
+                \\  "fragment": "reduce",
+                \\  "input_dims": ["doc", "scalar"],
+                \\  "output_dims": ["bucket"],
+                \\  "semantic_id": "sum_by_customer",
+                \\  "owner": "expr:sum_by_customer",
+                \\  "layout": "materialized_expr",
+                \\  "law_id": "sum"
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorExprEnvelopeAlloc(alloc, missing_id));
+        }
+
+        test "api query contract exposes typed tensor program envelope for worker protocols" {
+            const alloc = std.testing.allocator;
+            const dictionary = algebraic_lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
+            const input_expr = algebraic_ir.TensorExpr{
+                .fragment = .automaton_select,
+                .output_dims = &.{.doc},
+                .dictionary = dictionary,
+            };
+            const reduce_step = algebraic_ir.TensorProgramStep{
+                .expr = .{
+                    .fragment = .reduce,
+                    .input_dims = &.{.doc},
+                    .output_dims = &.{.bucket},
+                    .law_id = .count,
+                    .metadata = "fold:v1:bucket-body-count",
+                },
+                .inputs = &.{.{ .input = 0 }},
+            };
+            const program = algebraic_ir.TensorProgram{
+                .inputs = &.{input_expr},
+                .steps = &.{reduce_step},
+                .output = .{ .step = 0 },
+                .outputs = &.{ .{ .input = 0 }, .{ .step = 0 } },
+            };
+            const encoded = try encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
+            defer alloc.free(encoded);
+            const expected_program_id = try algebraic_ir.tensorProgramIdAlloc(alloc, program);
+            defer alloc.free(expected_program_id);
+            const expected_program_id_json = try std.fmt.allocPrint(alloc, "\"program_id\":\"{s}\"", .{expected_program_id});
+            defer alloc.free(expected_program_id_json);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, expected_program_id_json) != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"inputs\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"steps\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"input\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"step\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"outputs\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"analyzed_term\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metadata\":\"fold:v1:bucket-body-count\"") != null);
+
+            var parsed = try parseAlgebraicTensorProgramEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings(expected_program_id, parsed.program_id);
+            var view = try parsed.asProgramAlloc(alloc);
+            defer view.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), view.program.outputs.len);
+            try std.testing.expectEqualStrings("fold:v1:bucket-body-count", view.program.steps[0].expr.metadata.?);
+            const reparsed_id = try algebraic_ir.tensorProgramIdAlloc(alloc, view.program);
+            defer alloc.free(reparsed_id);
+            try std.testing.expectEqualStrings(expected_program_id, reparsed_id);
+
+            const paths = [_]algebraic_ir.PhysicalAccessPath{
+                algebraic_ir.lexicalAccessPath("body_terms", .full_text_postings, dictionary, true),
+            };
+            try std.testing.expect((try algebraic_ir.tensorProgramProof(alloc, &paths, view.program)).safe());
+
+            var tampered = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
+            defer tampered.deinit(alloc);
+            try tampered.appendSlice(alloc, encoded);
+            const id_pos = std.mem.indexOf(u8, tampered.items, expected_program_id) orelse return error.TestUnexpectedResult;
+            tampered.items[id_pos] = if (tampered.items[id_pos] == 'x') 'y' else 'x';
+            try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorProgramEnvelopeAlloc(alloc, tampered.items));
+
+            var bad_output_ref = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
+            defer bad_output_ref.deinit(alloc);
+            try bad_output_ref.appendSlice(alloc, encoded);
+            const output_ref_pos = std.mem.indexOf(u8, bad_output_ref.items, "\"output\":{\"kind\":\"step\",\"index\":0}") orelse return error.TestUnexpectedResult;
+            bad_output_ref.items[output_ref_pos + "\"output\":{\"kind\":\"step\",\"index\":".len] = '9';
+            try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorProgramEnvelopeAlloc(alloc, bad_output_ref.items));
+        }
+
+        test "api query contract carries vector worker tensor program and native constraints together" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
+            const candidate_input = algebraic_ir.TensorExpr{
+                .fragment = .slice,
+                .output_dims = &.{.doc},
+                .semantic_id = "native_doc_id_constraints",
+            };
+            const program = algebraic_ir.TensorProgram{
+                .inputs = &.{candidate_input},
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .input_dims = &.{.doc},
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "dense_idx",
+                        .layout = .dense_vector,
+                    },
+                    .inputs = &.{.{ .input = 0 }},
+                }},
+                .output = .{ .step = 0 },
+            };
+            const constraints = NativeDocIdConstraintEnvelope{
+                .positive_filter = true,
+                .include_doc_ids = &.{ "doc:a", "doc:b" },
+                .exclude_doc_ids = &.{"doc:c"},
+            };
+            const encoded = try encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "dense_idx",
+                .dense_vector,
+                .{ .dense = .{ .vector = &.{ 0.25, 0.5, 1.0 }, .k = 7 } },
+                .{
+                    .fields = @constCast((&[_][]const u8{ "title", "score" })[0..]),
+                    .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
+                    .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
+                    .filter_prefix = "tenant/a/",
+                    .filter_ids = &.{ 42, 99 },
+                    .exclude_ids = &.{7},
+                    .require_algebraic_filter_resolution = true,
+                    .include_all_fields = false,
+                    .defer_stored_projection = true,
+                    .limit = 9,
+                    .offset = 2,
+                    .count_only = true,
+                    .profile = true,
+                    .include_stored = false,
+                    .search_effort = 0.75,
+                    .distance_over = 0.1,
+                    .distance_under = 0.9,
+                    .return_mode = .parent_with_chunks,
+                    .max_chunks_per_parent = 2,
+                    .hierarchy_include_source = true,
+                    .hierarchy_include_unit = true,
+                    .hierarchy_omit_implicit_source_ancestor_document = true,
+                    .hierarchy_match_fields = @constCast((&[_][]const u8{"text"})[0..]),
+                    .hierarchy_match_include_all_fields = false,
+                    .hierarchy_grouped_matches = true,
+                    .hierarchy_source_fields = @constCast((&[_][]const u8{ "title", "url" })[0..]),
+                    .hierarchy_source_include_all_fields = false,
+                    .hierarchy_unit_fields = @constCast((&[_][]const u8{"page"})[0..]),
+                    .hierarchy_unit_include_all_fields = false,
+                    .identity_read_generation = 12345,
+                },
+                constraints,
+                null,
+                null,
+                &.{access_path},
+                program,
+            );
+            defer alloc.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_name\":\"dense_idx\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"dense_vector\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"dense\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"options\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"native_doc_id_constraints\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_access_paths\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_program\"") != null);
+
+            const tampered_target = try alloc.dupe(u8, encoded);
+            defer alloc.free(tampered_target);
+            const index_name_prefix = "\"index_name\":\"";
+            const index_name_pos = std.mem.indexOf(u8, tampered_target, index_name_prefix) orelse return error.TestUnexpectedResult;
+            const index_name_start = index_name_pos + index_name_prefix.len;
+            tampered_target[index_name_start] = if (tampered_target[index_name_start] == 'd') 'x' else 'd';
+            try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, tampered_target));
+
+            var parsed = try parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("dense_idx", parsed.index_name);
+            try std.testing.expectEqual(algebraic_ir.PhysicalLayout.dense_vector, parsed.layout);
+            try std.testing.expectEqual(@as(u32, 7), parsed.query.dense.k);
+            try std.testing.expectEqual(@as(u32, 9), parsed.options.limit);
+            try std.testing.expectEqual(@as(u32, 2), parsed.options.offset);
+            try std.testing.expect(parsed.options.count_only);
+            try std.testing.expect(parsed.options.profile);
+            try std.testing.expect(!parsed.options.include_stored);
+            try std.testing.expect(!parsed.options.include_all_fields);
+            try std.testing.expect(parsed.options.defer_stored_projection);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}", parsed.options.filter_query_json);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", parsed.options.exclusion_query_json);
+            try std.testing.expect(parsed.options.require_algebraic_filter_resolution);
+            try std.testing.expectEqualStrings("tenant/a/", parsed.options.filter_prefix);
+            try std.testing.expectEqual(@as(usize, 2), parsed.options.filter_ids.len);
+            try std.testing.expectEqual(@as(u64, 42), parsed.options.filter_ids[0]);
+            try std.testing.expectEqual(@as(u64, 99), parsed.options.filter_ids[1]);
+            try std.testing.expectEqual(@as(usize, 1), parsed.options.exclude_ids.len);
+            try std.testing.expectEqual(@as(u64, 7), parsed.options.exclude_ids[0]);
+            try std.testing.expectEqual(@as(usize, 2), parsed.options.fields.len);
+            try std.testing.expectEqualStrings("title", parsed.options.fields[0]);
+            try std.testing.expectEqualStrings("score", parsed.options.fields[1]);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.options.search_effort.?, 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.options.distance_over.?, 0.0001);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.9), parsed.options.distance_under.?, 0.0001);
+            try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, parsed.options.return_mode);
+            try std.testing.expectEqual(@as(u32, 2), parsed.options.max_chunks_per_parent);
+            try std.testing.expect(parsed.options.hierarchy_include_source);
+            try std.testing.expect(parsed.options.hierarchy_include_unit);
+            try std.testing.expect(parsed.options.hierarchy_omit_implicit_source_ancestor_document);
+            try std.testing.expectEqualStrings("text", parsed.options.hierarchy_match_fields[0]);
+            try std.testing.expect(!parsed.options.hierarchy_match_include_all_fields);
+            try std.testing.expect(parsed.options.hierarchy_grouped_matches);
+            try std.testing.expectEqualStrings("url", parsed.options.hierarchy_source_fields[1]);
+            try std.testing.expect(!parsed.options.hierarchy_source_include_all_fields);
+            try std.testing.expectEqualStrings("page", parsed.options.hierarchy_unit_fields[0]);
+            try std.testing.expect(!parsed.options.hierarchy_unit_include_all_fields);
+            try std.testing.expectEqual(@as(?u64, 12345), parsed.options.identity_read_generation);
+            try std.testing.expectEqual(@as(usize, 3), parsed.query.dense.vector.len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.dense.vector[0], 0.0001);
+            try std.testing.expect(parsed.native_doc_id_constraints.constraints.positive_filter);
+            try std.testing.expectEqual(@as(usize, 2), parsed.native_doc_id_constraints.constraints.include_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:c", parsed.native_doc_id_constraints.constraints.exclude_doc_ids[0]);
+            try std.testing.expectEqual(@as(usize, 1), parsed.tensor_access_paths.len);
+            try std.testing.expectEqual(algebraic_ir.PhysicalLayout.dense_vector, parsed.tensor_access_paths[0].layout);
+            try std.testing.expect((try parsed.proveTensorProgramAlloc(alloc)).safe());
+
+            var program_view = try parsed.tensor_program.asProgramAlloc(alloc);
+            defer program_view.deinit(alloc);
+            const program_id = try algebraic_ir.tensorProgramIdAlloc(alloc, program_view.program);
+            defer alloc.free(program_id);
+            try std.testing.expectEqualStrings(parsed.tensor_program.program_id, program_id);
+        }
+
+        test "api query contract keeps member mode compatible with rolling upgrade workers" {
+            const alloc = std.testing.allocator;
+            var encoded = std.ArrayListUnmanaged(u8).empty;
+            defer encoded.deinit(alloc);
+
+            try appendAlgebraicVectorWorkerRequestOptions(alloc, &encoded, .{ .return_mode = .member });
+            try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"chunk\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"member\"") == null);
+        }
+
+        test "api query contract carries sparse vector worker payload and proof" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
+            const program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "sparse_idx",
+                        .layout = .sparse_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            const encoded = try encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "sparse_idx",
+                .sparse_vector,
+                .{ .sparse = .{ .indices = &.{ 3, 9, 27 }, .values = &.{ 1.0, 0.5, 0.25 }, .k = 5 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{access_path},
+                program,
+            );
+            defer alloc.free(encoded);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"sparse\"") != null);
+
+            var parsed = try parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("sparse_idx", parsed.index_name);
+            try std.testing.expectEqual(algebraic_ir.PhysicalLayout.sparse_vector, parsed.layout);
+            try std.testing.expectEqual(@as(u32, 5), parsed.query.sparse.k);
+            try std.testing.expectEqual(@as(usize, 3), parsed.query.sparse.indices.len);
+            try std.testing.expectEqual(@as(u32, 9), parsed.query.sparse.indices[1]);
+            try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.sparse.values[2], 0.0001);
+            try std.testing.expect((try parsed.proveTensorProgramAlloc(alloc)).safe());
+        }
+
+        test "api query contract rejects sparse vector worker payload with mismatched indices and values" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
+            const program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "sparse_idx",
+                        .layout = .sparse_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "sparse_idx",
+                .sparse_vector,
+                .{ .sparse = .{ .indices = &.{ 3, 9 }, .values = &.{1.0}, .k = 5 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{access_path},
+                program,
+            ));
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"kind":"sparse","k":5,"indices":[3,9],"values":[1.0]}
+            , .{});
+            defer parsed.deinit();
+            try std.testing.expectError(
+                error.InvalidQueryRequest,
+                parseAlgebraicVectorWorkerQueryAlloc(alloc, .sparse_vector, parsed.value),
+            );
+        }
+
+        test "api query contract rejects vector worker non-finite numeric payloads" {
+            const alloc = std.testing.allocator;
+            const dense_access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
+            const dense_program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "dense_idx",
+                        .layout = .dense_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "dense_idx",
+                .dense_vector,
+                .{ .dense = .{ .vector = &.{std.math.inf(f32)}, .k = 1 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{dense_access_path},
+                dense_program,
+            ));
+            const sparse_access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
+            const sparse_program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "sparse_idx",
+                        .layout = .sparse_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "sparse_idx",
+                .sparse_vector,
+                .{ .sparse = .{ .indices = &.{1}, .values = &.{std.math.nan(f32)}, .k = 1 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{sparse_access_path},
+                sparse_program,
+            ));
+            {
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+                    \\{"kind":"dense","k":1,"vector":[1e9999]}
+                , .{});
+                defer parsed.deinit();
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parseAlgebraicVectorWorkerQueryAlloc(alloc, .dense_vector, parsed.value),
+                );
+            }
+            {
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+                    \\{"kind":"sparse","k":1,"indices":[7],"values":[-1e9999]}
+                , .{});
+                defer parsed.deinit();
+                try std.testing.expectError(
+                    error.InvalidQueryRequest,
+                    parseAlgebraicVectorWorkerQueryAlloc(alloc, .sparse_vector, parsed.value),
+                );
+            }
+        }
+
+        test "api query contract rejects vector worker envelope without matching tensor proof" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
+            const program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "dense_idx",
+                        .layout = .dense_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "sparse_idx",
+                .sparse_vector,
+                .{ .sparse = .{ .indices = &.{ 1, 5 }, .values = &.{ 1.0, 0.5 }, .k = 3 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{access_path},
+                program,
+            ));
+        }
+
+        test "api query contract rejects vector worker envelope when target does not match access path" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("other_dense_idx", .dense_vector);
+            const program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "other_dense_idx",
+                        .layout = .dense_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "dense_idx",
+                .dense_vector,
+                .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{access_path},
+                program,
+            ));
+        }
+
+        test "api query contract rejects vector worker envelope when primary output is not vector search" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
+            const candidate_input = algebraic_ir.TensorExpr{
+                .fragment = .slice,
+                .output_dims = &.{.doc},
+                .semantic_id = "native_doc_id_constraints",
+            };
+            const program = algebraic_ir.TensorProgram{
+                .inputs = &.{candidate_input},
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .input_dims = &.{.doc},
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "dense_idx",
+                        .layout = .dense_vector,
+                    },
+                    .inputs = &.{.{ .input = 0 }},
+                }},
+                .output = .{ .input = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "dense_idx",
+                .dense_vector,
+                .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
+                .{},
+                .{},
+                null,
+                null,
+                &.{access_path},
+                program,
+            ));
+        }
+
+        test "api query contract rejects vector worker envelope when native constraints are not consumed" {
+            const alloc = std.testing.allocator;
+            const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
+            const program = algebraic_ir.TensorProgram{
+                .steps = &.{.{
+                    .expr = .{
+                        .fragment = .vector_search,
+                        .output_dims = &.{ .doc, .score },
+                        .owner = "dense_idx",
+                        .layout = .dense_vector,
+                    },
+                }},
+                .output = .{ .step = 0 },
+            };
+            try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
+                alloc,
+                "dense_idx",
+                .dense_vector,
+                .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
+                .{},
+                .{ .positive_filter = true, .include_doc_ids = &.{"doc:a"} },
+                null,
+                null,
+                &.{access_path},
+                program,
+            ));
+        }
+
+        test "api query contract accepts native doc id constraint envelope on internal query route" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "native_doc_id_constraints": {
+                \\    "positive_filter": true,
+                \\    "include_doc_ids": [],
+                \\    "exclude_doc_ids": ["doc:c"]
+                \\  },
+                \\  "_identity_read_generation": 42
+                \\}
+            ;
+
+            var parsed = try parseQueryRequest(alloc, null, "docs", body);
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.filter_doc_ids_positive);
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.filter_doc_ids.len);
+            try std.testing.expectEqual(@as(usize, 1), parsed.req.exclude_doc_ids.len);
+            try std.testing.expectEqualStrings("doc:c", parsed.req.exclude_doc_ids[0]);
+            try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
+        }
+
+        test "api query contract maps timeout_ms to execution deadline" {
+            const alloc = std.testing.allocator;
+            const before_ns = platform_time.monotonicNs();
+            var parsed = try parseQueryRequest(alloc, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":250}
+            );
+            defer parsed.deinit(alloc);
+            const after_ns = platform_time.monotonicNs();
+
+            const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+            const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
+            try std.testing.expect(deadline_origin_ns >= before_ns);
+            try std.testing.expect(deadline_origin_ns <= after_ns);
+        }
+
+        test "api query contract applies timeout_ms with an escaped member name" {
+            const alloc = std.testing.allocator;
+            const before_ns = platform_time.monotonicNs();
+            var parsed = try parseQueryRequest(alloc, null, "docs",
+                \\{"query":{"match_all":{}},"t\u0069meout_ms":60000}
+            );
+            defer parsed.deinit(alloc);
+            const after_ns = platform_time.monotonicNs();
+
+            const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
+            try std.testing.expect(deadline_ns >= before_ns + 60_000 * std.time.ns_per_ms);
+            try std.testing.expect(deadline_ns <= after_ns + 60_000 * std.time.ns_per_ms);
+        }
+
+        test "api query contract rejects invalid timeout_ms" {
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":-1}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":"bad"}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
+                \\{"query":{"match_all":{}},"timeout_ms":1.5}
+            ));
+        }
+
+        test "api query contract rejects legacy native doc id constraint fields" {
+            const alloc = std.testing.allocator;
+            const body =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "_filter_doc_ids_positive": true
+                \\}
+            ;
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", body));
+
+            const old_arrays =
+                \\{
+                \\  "query": {"match_all": {}},
+                \\  "_filter_doc_ids": ["doc:a"],
+                \\  "_exclude_doc_ids": ["doc:b"]
+                \\}
+            ;
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", old_arrays));
+        }
+
+        test "api query contract defaults omitted text fields to all" {
+            const alloc = std.testing.allocator;
+            const queries = [_][]const u8{
+                "{\"match\":\"Korean history major events\"}",
+                "{\"match\":\"Korean history\",\"analyzer\":\"standard\"}",
+                "{\"term\":\"korean\"}",
+                "{\"term\":\"korean\",\"fuzziness\":1}",
+                "{\"match_phrase\":\"Korean history\"}",
+                "{\"match_phrase\":\"Korean history\",\"analyzer\":\"standard\"}",
+                "{\"prefix\":\"kore\"}",
+                "{\"wildcard\":\"kor*\"}",
+                "{\"regexp\":\"kor.*\"}",
+                "{\"fuzzy\":\"korean\"}",
+                "{\"terms\":[\"korean\",\"history\"]}",
+                "{\"terms\":[[\"korean\"],[\"history\"]]}",
+            };
+            for (queries) |query| {
+                const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s}}}", .{query});
+                defer alloc.free(body);
+                var parsed = try parsePublicQueryRequest(alloc, null, "docs", body);
+                defer parsed.deinit(alloc);
+                const text = parsed.req.full_text orelse return error.TestExpectedEqual;
+                const field = switch (text) {
+                    .match => |v| v.field,
+                    .term => |v| v.field,
+                    .match_phrase => |v| v.field,
+                    .prefix => |v| v.field,
+                    .wildcard => |v| v.field,
+                    .regexp => |v| v.field,
+                    .fuzzy => |v| v.field,
+                    .phrase => |v| v.field,
+                    .multi_phrase => |v| v.field,
+                    else => return error.TestExpectedEqual,
+                };
+                try std.testing.expectEqualStrings("_all", field);
+            }
+        }
+
+        test "api query contract bounds graph metric top k" {
+            const alloc = std.testing.allocator;
+            const accepted = try parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10000}}
+            );
+            defer freeNamedGraphMetricQueries(alloc, accepted);
+            try std.testing.expectEqual(@as(usize, 1), accepted.len);
+            try std.testing.expectEqual(@as(u32, 10_000), accepted[0].query.top_k);
+
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
+                \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
+            ));
+        }
+
+        test "api query contract uses portable graph metric filter operators" {
+            const cases = [_]struct { wire: []const u8, expected: graph_query_mod.GraphMetricFilterOp }{
+                .{ .wire = "gt", .expected = .gt },
+                .{ .wire = "gte", .expected = .gte },
+                .{ .wire = "lt", .expected = .lt },
+                .{ .wire = "lte", .expected = .lte },
+                .{ .wire = "eq", .expected = .eq },
+                .{ .wire = "neq", .expected = .neq },
+            };
+            for (cases) |case| {
+                const filters = [_]indexes_openapi.GraphMetricFilter{.{
+                    .metric = "pagerank",
+                    .op = case.wire,
+                    .value = 0.5,
+                }};
+                const parsed = try parseLegacyGraphQuery(std.testing.allocator, .{
+                    .type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .where_metric = &filters,
+                });
+                defer freeGraphQuery(std.testing.allocator, parsed);
+                try std.testing.expectEqual(case.expected, parsed.where_metric[0].op);
+            }
+
+            const legacy = [_]indexes_openapi.GraphMetricFilter{.{
+                .metric = "pagerank",
+                .op = ">=",
+                .value = 0.5,
+            }};
+            try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
+                .type = .traverse,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .where_metric = &legacy,
+            }));
+        }
+
+        test "api query contract rejects oversized and duplicate graph metric clauses" {
+            var metric_names: [graph_query_mod.graph_metric_projection_limit + 1][]const u8 = undefined;
+            @memset(&metric_names, "pagerank");
+            try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(
+                std.testing.allocator,
+                &metric_names,
+                .published,
+            ));
+
+            const duplicate_metrics = [_][]const u8{ "pagerank", "pagerank" };
+            try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
+                .type = .traverse,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .metrics = &duplicate_metrics,
+            }));
+        }
+
+        test "api query contract preserves graph metric fingerprint precision" {
+            const alloc = std.testing.allocator;
+            const converted = try toOpenApiGraphMetricStatus(alloc, .{
+                .name = @constCast("pagerank"),
+                .config_fingerprint = std.math.maxInt(u64),
+            });
+            defer alloc.free(converted.config_fingerprint.?);
+            try std.testing.expectEqualStrings("ffffffffffffffff", converted.config_fingerprint.?);
+        }
+
+        test "api query contract treats nullable graph metric extensions as absent" {
+            const alloc = std.testing.allocator;
+            var parsed = try parsePublicQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match":"needle","field":"body"},"graph_metric":null,"graph_metric_rerank":null}
+            );
+            defer parsed.deinit(alloc);
+
+            try std.testing.expect(parsed.req.full_text != null);
+            try std.testing.expectEqual(@as(usize, 0), parsed.req.graph_metric_queries.len);
+            try std.testing.expect(parsed.req.graph_metric_rerank == null);
         }
     };
-    var resolver_context: u8 = 0;
-    const resolver = SemanticResolver{
-        .ptr = &resolver_context,
-        .vtable = &.{ .resolve_dense_query = FakeResolver.resolve },
-    };
-    const reranked_body =
-        \\{
-        \\  "semantic_search": "raft consensus",
-        \\  "indexes": ["semantic"],
-        \\  "offset": 5,
-        \\  "limit": 10,
-        \\  "reranker": {"provider":"antfly","field":"body","candidate_count":50}
-        \\}
-    ;
-    var reranked = try parseQueryRequest(alloc, resolver, "docs", reranked_body);
-    defer reranked.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 5), reranked.req.offset);
-    try std.testing.expectEqual(@as(u32, 10), reranked.req.limit);
-    try std.testing.expectEqual(@as(?u32, 50), reranked.req.reranker.?.candidate_count);
-
-    const approximate_only_body =
-        \\{
-        \\  "semantic_search": "raft consensus",
-        \\  "indexes": ["semantic"],
-        \\  "offset": 5,
-        \\  "limit": 10
-        \\}
-    ;
-    try std.testing.expectError(
-        error.UnsupportedQueryRequest,
-        parseQueryRequest(alloc, resolver, "docs", approximate_only_body),
-    );
+    return Suite;
 }
-
-test "api query contract rejects count with stored sort" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "count": true,
-        \\  "order_by": [{"field":"created_at","desc":true}]
-        \\}
-    ;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
-    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
-}
-
-test "api query contract rejects count with search_after cursor" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "count": true,
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_after": ["2026-01-01", "doc-9"]
-        \\}
-    ;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
-    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
-}
-
-test "api query contract rejects count with search_before cursor" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "count": true,
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_before": ["2026-01-01", "doc-9"]
-        \\}
-    ;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
-    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
-}
-
-test "api query contract defaults cursor pagination without sort to id order" {
-    const alloc = std.testing.allocator;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "search_after": ["doc-9"],
-        \\  "limit": 10
-        \\}
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.order_by.len);
-    try std.testing.expectEqualStrings("_id", parsed.req.order_by[0].field);
-    try std.testing.expect(!parsed.req.order_by[0].desc);
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.search_after.len);
-    try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[0].string);
-}
-
-test "api query contract preflight rejects cursor pagination without sort when cursor is not id arity" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "search_after": ["2025-01-01", "doc-9"]
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-}
-
-test "api query contract preflight rejects cursor pagination over approximate vector source" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
-        \\  "indexes": ["dense_idx"],
-        \\  "search_after": ["doc-9"],
-        \\  "limit": 10
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "api query contract preflight rejects search_before pagination over approximate vector source" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
-        \\  "indexes": ["dense_idx"],
-        \\  "search_before": ["doc-9"],
-        \\  "limit": 10
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "api query contract preflight rejects score sort over approximate vector source" {
-    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
-        \\  "indexes": ["dense_idx"],
-        \\  "order_by": [{"field":"_score","desc":true}],
-        \\  "limit": 10
-        \\}
-    , .{});
-    defer parsed.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
-}
-
-test "api query contract preflight rejects score sort without score-bearing source" {
-    var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_search": {"match_all": {}},
-        \\  "order_by": [{"field":"_score","desc":true}]
-        \\}
-    , .{});
-    defer parsed_match_all.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_match_all.value));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
-
-    var parsed_filter_only = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "filter_query": {"term":{"field":"status","value":"active"}},
-        \\  "order_by": [{"field":"_score","desc":true}]
-        \\}
-    , .{});
-    defer parsed_filter_only.deinit();
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_filter_only.value));
-    const filter_diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", filter_diagnostic.field);
-    try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.reason);
-    try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.detail);
-
-    var parsed_match = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"_score","desc":true}]
-        \\}
-    , .{});
-    defer parsed_match.deinit();
-
-    var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_match.value);
-    defer summary.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
-}
-
-test "api query contract appends stable id sort tiebreaker for cursors" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_after": ["2026-01-01", "doc-9"],
-        \\  "limit": 10
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.order_by.len);
-    try std.testing.expectEqualStrings("created_at", parsed.req.order_by[0].field);
-    try std.testing.expect(parsed.req.order_by[0].desc);
-    try std.testing.expectEqualStrings("_id", parsed.req.order_by[1].field);
-    try std.testing.expect(!parsed.req.order_by[1].desc);
-    try std.testing.expectEqual(@as(usize, 2), parsed.req.search_after.len);
-    try std.testing.expectEqualStrings("2026-01-01", parsed.req.search_after[0].string);
-    try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[1].string);
-}
-
-test "api query contract rejects cursor width that omits stable id tiebreaker" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_after": ["2026-01-01"]
-        \\}
-    ;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-}
-
-test "api query contract records cursor arity diagnostic without sort" {
-    const alloc = std.testing.allocator;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "search_after": ["2026-01-01", "doc-9"]
-        \\}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-}
-
-test "api query contract rejects non replayable search_after cursor values" {
-    const alloc = std.testing.allocator;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_after": [null, "doc-9"]
-        \\}
-    ));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_after": [{"value":"2026-01-01"}, "doc-9"]
-        \\}
-    ));
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"_score","desc":true}],
-        \\  "search_after": ["high", "doc-9"]
-        \\}
-    ));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
-}
-
-test "api query contract rejects score sort without score-bearing text source" {
-    const alloc = std.testing.allocator;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match_all": {}},
-        \\  "order_by": [{"field":"_score","desc":true}]
-        \\}
-    ));
-    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_score", diagnostic.field);
-    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
-    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
-
-    var parsed = try parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"_score","desc":true}]
-        \\}
-    );
-    defer parsed.deinit(alloc);
-    try std.testing.expect(db_mod.searchRequestHasScoreBearingTextSource(parsed.req));
-}
-
-test "api query contract rejects non replayable search_before cursor values" {
-    const alloc = std.testing.allocator;
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_before": [[], "doc-9"]
-        \\}
-    ));
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at","desc":true}],
-        \\  "search_before": ["2026-01-01", 9]
-        \\}
-    ));
-}
-
-test "api query contract rejects ambiguous explicit id sort tiebreaker" {
-    const alloc = std.testing.allocator;
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
-        \\}
-    ));
-    var diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
-        \\}
-    ));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("_id", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-
-    db_mod.resetLastSortRejectionDiagnostic();
-    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
-        \\{
-        \\  "full_text_search": {"match":"raft","field":"body"},
-        \\  "order_by": [{"field":"created_at"},{"field":"created_at","desc":true}]
-        \\}
-    ));
-    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("created_at", diagnostic.field);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
-    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
-}
-
-test "api query contract parses packed dense embeddings via antfly-json" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"limit":3}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.sparse_queries.len);
-    try std.testing.expectEqual(@as(u32, 3), parsed.req.dense_queries[0].query.k);
-    try std.testing.expectEqual(@as(usize, 3), parsed.req.dense_queries[0].query.vector.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), parsed.req.dense_queries[0].query.vector[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), parsed.req.dense_queries[0].query.vector[1], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), parsed.req.dense_queries[0].query.vector[2], 0.0001);
-}
-
-test "api query contract does not use dense fast path for composed vector requests" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"embeddings":{"dense_idx":"AACAPwAAAEAAAEBA"},"indexes":["dense_idx"],"full_text_search":{"match":"alpha","field":"body"},"filter_query":{"term":{"status":"active"}},"exclusion_query":{"term":{"category":"archived"}},"limit":3}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
-    try std.testing.expect(parsed.req.full_text != null);
-    try std.testing.expect(parsed.req.filter_query_json.len > 0);
-    try std.testing.expect(parsed.req.exclusion_query_json.len > 0);
-}
-
-test "api query contract parses packed sparse embeddings via antfly-json" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{"embeddings":{"sparse_idx":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["sparse_idx"],"limit":9}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.dense_queries.len);
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.sparse_queries.len);
-    try std.testing.expectEqual(@as(u32, 4), parsed.req.sparse_queries[0].query.k);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, parsed.req.sparse_queries[0].query.indices);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), parsed.req.sparse_queries[0].query.values[0], 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.req.sparse_queries[0].query.values[1], 0.0001);
-}
-
-test "api query contract parses explicit algebraic aggregation join" {
-    const alloc = std.testing.allocator;
-    const aggregations_json =
-        \\{
-        \\  "by_segment": {
-        \\    "type": "terms",
-        \\    "field": "segment",
-        \\    "algebraic_join": {
-        \\      "name": "orders_customers",
-        \\      "kind": "bucket",
-        \\      "group_side": "right",
-        \\      "measure_side": "left"
-        \\    },
-        \\    "sub_aggregations": {
-        \\      "amount": {"type": "sum", "field": "amount"}
-        \\    }
-        \\  }
-        \\}
-    ;
-    const requests = try parseAggregationRequestsJson(alloc, aggregations_json);
-    defer freeAggregationRequests(alloc, requests);
-
-    try std.testing.expectEqual(@as(usize, 1), requests.len);
-    const join = requests[0].algebraic_join.?;
-    try std.testing.expectEqualStrings("orders_customers", join.name);
-    try std.testing.expectEqual(db_mod.algebraic.join.TemporalMode.bucket, join.kind);
-    try std.testing.expectEqualStrings("right", join.group_side.?);
-    try std.testing.expectEqualStrings("left", join.measure_side.?);
-    try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
-    try std.testing.expect(requests[0].aggregations[0].algebraic_join == null);
-}
-
-test "api query contract parses multi field terms aggregation" {
-    const alloc = std.testing.allocator;
-    const aggregations_json =
-        \\{
-        \\  "by_customer_product": {
-        \\    "type": "terms",
-        \\    "fields": ["customer", "product"],
-        \\    "sub_aggregations": {
-        \\      "amount": {"type": "sum", "field": "amount"}
-        \\    }
-        \\  }
-        \\}
-    ;
-    const requests = try parseAggregationRequestsJson(alloc, aggregations_json);
-    defer freeAggregationRequests(alloc, requests);
-
-    try std.testing.expectEqual(@as(usize, 1), requests.len);
-    try std.testing.expectEqualStrings("customer", requests[0].field);
-    try std.testing.expectEqual(@as(usize, 2), requests[0].fields.len);
-    try std.testing.expectEqualStrings("customer", requests[0].fields[0]);
-    try std.testing.expectEqualStrings("product", requests[0].fields[1]);
-    try std.testing.expectEqual(@as(usize, 1), requests[0].aggregations.len);
-    try std.testing.expectEqualStrings("amount", requests[0].aggregations[0].field);
-}
-
-test "api query contract rejects multi field non terms aggregation" {
-    const alloc = std.testing.allocator;
-    const aggregations_json =
-        \\{
-        \\  "amount": {
-        \\    "type": "sum",
-        \\    "fields": ["amount", "tax"]
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseAggregationRequestsJson(alloc, aggregations_json));
-}
-
-test "api query contract rejects conflicting terms field and fields" {
-    const alloc = std.testing.allocator;
-    const aggregations_json =
-        \\{
-        \\  "by_customer_product": {
-        \\    "type": "terms",
-        \\    "field": "tenant",
-        \\    "fields": ["customer", "product"]
-        \\  }
-        \\}
-    ;
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseAggregationRequestsJson(alloc, aggregations_json));
-}
-
-test "api query contract exposes native doc id constraint envelope for non-query worker protocols" {
-    const alloc = std.testing.allocator;
-    const source = db_mod.types.SearchRequest{
-        .filter_doc_ids_positive = true,
-        .filter_doc_ids = &.{},
-        .exclude_doc_ids = &.{"doc:c"},
-    };
-    const envelope = nativeDocIdConstraintEnvelopeFromSearchRequest(source);
-    try std.testing.expect(envelope.hasConstraints());
-
-    const encoded = try encodeNativeDocIdConstraintEnvelopeAlloc(alloc, envelope);
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"positive_filter\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_doc_ids\":[]") != null);
-
-    var parsed = try parseNativeDocIdConstraintEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(parsed.constraints.positive_filter);
-    try std.testing.expectEqual(@as(usize, 0), parsed.constraints.include_doc_ids.len);
-    try std.testing.expectEqual(@as(usize, 1), parsed.constraints.exclude_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:c", parsed.constraints.exclude_doc_ids[0]);
-}
-
-test "api query contract normalizes native include doc ids to a positive envelope" {
-    const alloc = std.testing.allocator;
-    const envelope = NativeDocIdConstraintEnvelope{
-        .positive_filter = false,
-        .include_doc_ids = &.{ "doc:b", "doc:a", "doc:b", "doc:c" },
-        .exclude_doc_ids = &.{ "doc:d", "doc:c", "doc:c" },
-    };
-
-    const encoded = try encodeNativeDocIdConstraintEnvelopeAlloc(alloc, envelope);
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"positive_filter\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"include_doc_ids\":[\"doc:a\",\"doc:b\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"exclude_doc_ids\":[\"doc:c\",\"doc:d\"]") != null);
-
-    var parsed = try parseNativeDocIdConstraintEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(parsed.constraints.positive_filter);
-    try std.testing.expectEqual(@as(usize, 2), parsed.constraints.include_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:a", parsed.constraints.include_doc_ids[0]);
-    try std.testing.expectEqualStrings("doc:b", parsed.constraints.include_doc_ids[1]);
-    try std.testing.expectEqual(@as(usize, 2), parsed.constraints.exclude_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:c", parsed.constraints.exclude_doc_ids[0]);
-    try std.testing.expectEqualStrings("doc:d", parsed.constraints.exclude_doc_ids[1]);
-}
-
-test "api query contract exposes typed tensor access path envelope for worker protocols" {
-    const alloc = std.testing.allocator;
-    const dictionary = algebraic_lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
-    const path = algebraic_ir.PhysicalAccessPath{
-        .owner = "body_terms",
-        .layout = .full_text_postings,
-        .dictionary = dictionary,
-        .fragments = &.{ .slice, .automaton_select },
-        .output_dims = &.{.doc},
-    };
-
-    const encoded = try encodeAlgebraicTensorAccessPathEnvelopeAlloc(alloc, path);
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"owner\":\"body_terms\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"full_text_postings\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dictionary\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"analyzed_term\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"fragments\":[\"slice\",\"automaton_select\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"output_dims\":[\"doc\"]") != null);
-
-    var parsed = try parseAlgebraicTensorAccessPathEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    const parsed_path = parsed.asAccessPath();
-    try std.testing.expectEqualStrings(path.owner, parsed_path.owner);
-    try std.testing.expectEqual(path.layout, parsed_path.layout);
-    try std.testing.expect(parsed_path.dictionary != null);
-    try std.testing.expect(dictionary.eql(parsed_path.dictionary.?));
-    try std.testing.expectEqualSlices(algebraic_ir.TensorFragment, path.fragments, parsed_path.fragments);
-    try std.testing.expectEqualSlices(algebraic_ir.Dimension, path.output_dims, parsed_path.output_dims);
-    try std.testing.expectEqualSlices(algebraic_law.Id, path.law_ids, parsed_path.law_ids);
-}
-
-test "api query contract exposes typed tensor expression envelope for worker protocols" {
-    const alloc = std.testing.allocator;
-    const dictionary = algebraic_lexical.DictionaryIdentity.canonicalScalar("docs", "/customer", .string, "json-scalar-v1", "kind-qualified");
-    const expr = algebraic_ir.TensorExpr{
-        .fragment = .reduce,
-        .input_dims = &.{ .doc, .scalar },
-        .output_dims = &.{.bucket},
-        .semantic_id = "sum_by_customer",
-        .layout = .materialized_expr,
-        .dictionary = dictionary,
-        .law_id = .sum,
-    };
-
-    const encoded = try encodeAlgebraicTensorExprEnvelopeAlloc(alloc, expr);
-    defer alloc.free(encoded);
-    const expected_expr_id = try algebraic_ir.tensorExprIdAlloc(alloc, expr);
-    defer alloc.free(expected_expr_id);
-    const expected_expr_id_json = try std.fmt.allocPrint(alloc, "\"expr_id\":\"{s}\"", .{expected_expr_id});
-    defer alloc.free(expected_expr_id_json);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, expected_expr_id_json) != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"fragment\":\"reduce\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"input_dims\":[\"doc\",\"scalar\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"output_dims\":[\"bucket\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_id\":\"sum_by_customer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"materialized_expr\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"canonical_scalar\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"law_id\":\"sum\"") != null);
-
-    var parsed = try parseAlgebraicTensorExprEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    const parsed_expr = parsed.asExpr();
-    try std.testing.expectEqualStrings(expected_expr_id, parsed.expr_id);
-    try std.testing.expectEqual(expr.fragment, parsed_expr.fragment);
-    try std.testing.expectEqualSlices(algebraic_ir.Dimension, expr.input_dims, parsed_expr.input_dims);
-    try std.testing.expectEqualSlices(algebraic_ir.Dimension, expr.output_dims, parsed_expr.output_dims);
-    try std.testing.expectEqualStrings(expr.semantic_id.?, parsed_expr.semantic_id.?);
-    try std.testing.expect(parsed_expr.owner == null);
-    try std.testing.expectEqual(expr.layout.?, parsed_expr.layout.?);
-    try std.testing.expect(parsed_expr.dictionary != null);
-    try std.testing.expect(dictionary.eql(parsed_expr.dictionary.?));
-    try std.testing.expectEqual(expr.law_id.?, parsed_expr.law_id.?);
-
-    var plan = (try algebraic_ir.planMaterializedExpressionAlloc(alloc, parsed_expr)).?;
-    defer plan.deinit(alloc);
-    try std.testing.expectEqualStrings(parsed.expr_id, plan.expr_id);
-    try std.testing.expect(algebraic_ir.accessPathCanSatisfy(plan.access_path, parsed_expr).safe());
-
-    var tampered = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
-    defer tampered.deinit(alloc);
-    try tampered.appendSlice(alloc, encoded);
-    const id_pos = std.mem.indexOf(u8, tampered.items, expected_expr_id) orelse return error.TestUnexpectedResult;
-    tampered.items[id_pos] = if (tampered.items[id_pos] == 'x') 'y' else 'x';
-    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorExprEnvelopeAlloc(alloc, tampered.items));
-
-    const missing_id =
-        \\{
-        \\  "fragment": "reduce",
-        \\  "input_dims": ["doc", "scalar"],
-        \\  "output_dims": ["bucket"],
-        \\  "semantic_id": "sum_by_customer",
-        \\  "owner": "expr:sum_by_customer",
-        \\  "layout": "materialized_expr",
-        \\  "law_id": "sum"
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorExprEnvelopeAlloc(alloc, missing_id));
-}
-
-test "api query contract exposes typed tensor program envelope for worker protocols" {
-    const alloc = std.testing.allocator;
-    const dictionary = algebraic_lexical.DictionaryIdentity.analyzedText("docs", "body", "default");
-    const input_expr = algebraic_ir.TensorExpr{
-        .fragment = .automaton_select,
-        .output_dims = &.{.doc},
-        .dictionary = dictionary,
-    };
-    const reduce_step = algebraic_ir.TensorProgramStep{
-        .expr = .{
-            .fragment = .reduce,
-            .input_dims = &.{.doc},
-            .output_dims = &.{.bucket},
-            .law_id = .count,
-            .metadata = "fold:v1:bucket-body-count",
-        },
-        .inputs = &.{.{ .input = 0 }},
-    };
-    const program = algebraic_ir.TensorProgram{
-        .inputs = &.{input_expr},
-        .steps = &.{reduce_step},
-        .output = .{ .step = 0 },
-        .outputs = &.{ .{ .input = 0 }, .{ .step = 0 } },
-    };
-    const encoded = try encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
-    defer alloc.free(encoded);
-    const expected_program_id = try algebraic_ir.tensorProgramIdAlloc(alloc, program);
-    defer alloc.free(expected_program_id);
-    const expected_program_id_json = try std.fmt.allocPrint(alloc, "\"program_id\":\"{s}\"", .{expected_program_id});
-    defer alloc.free(expected_program_id_json);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, expected_program_id_json) != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"inputs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"steps\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"input\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"step\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"outputs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"label_kind\":\"analyzed_term\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metadata\":\"fold:v1:bucket-body-count\"") != null);
-
-    var parsed = try parseAlgebraicTensorProgramEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expectEqualStrings(expected_program_id, parsed.program_id);
-    var view = try parsed.asProgramAlloc(alloc);
-    defer view.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), view.program.outputs.len);
-    try std.testing.expectEqualStrings("fold:v1:bucket-body-count", view.program.steps[0].expr.metadata.?);
-    const reparsed_id = try algebraic_ir.tensorProgramIdAlloc(alloc, view.program);
-    defer alloc.free(reparsed_id);
-    try std.testing.expectEqualStrings(expected_program_id, reparsed_id);
-
-    const paths = [_]algebraic_ir.PhysicalAccessPath{
-        algebraic_ir.lexicalAccessPath("body_terms", .full_text_postings, dictionary, true),
-    };
-    try std.testing.expect((try algebraic_ir.tensorProgramProof(alloc, &paths, view.program)).safe());
-
-    var tampered = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
-    defer tampered.deinit(alloc);
-    try tampered.appendSlice(alloc, encoded);
-    const id_pos = std.mem.indexOf(u8, tampered.items, expected_program_id) orelse return error.TestUnexpectedResult;
-    tampered.items[id_pos] = if (tampered.items[id_pos] == 'x') 'y' else 'x';
-    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorProgramEnvelopeAlloc(alloc, tampered.items));
-
-    var bad_output_ref = try std.ArrayListUnmanaged(u8).initCapacity(alloc, encoded.len + 16);
-    defer bad_output_ref.deinit(alloc);
-    try bad_output_ref.appendSlice(alloc, encoded);
-    const output_ref_pos = std.mem.indexOf(u8, bad_output_ref.items, "\"output\":{\"kind\":\"step\",\"index\":0}") orelse return error.TestUnexpectedResult;
-    bad_output_ref.items[output_ref_pos + "\"output\":{\"kind\":\"step\",\"index\":".len] = '9';
-    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicTensorProgramEnvelopeAlloc(alloc, bad_output_ref.items));
-}
-
-test "api query contract carries vector worker tensor program and native constraints together" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
-    const candidate_input = algebraic_ir.TensorExpr{
-        .fragment = .slice,
-        .output_dims = &.{.doc},
-        .semantic_id = "native_doc_id_constraints",
-    };
-    const program = algebraic_ir.TensorProgram{
-        .inputs = &.{candidate_input},
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .input_dims = &.{.doc},
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-            .inputs = &.{.{ .input = 0 }},
-        }},
-        .output = .{ .step = 0 },
-    };
-    const constraints = NativeDocIdConstraintEnvelope{
-        .positive_filter = true,
-        .include_doc_ids = &.{ "doc:a", "doc:b" },
-        .exclude_doc_ids = &.{"doc:c"},
-    };
-    const encoded = try encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{ 0.25, 0.5, 1.0 }, .k = 7 } },
-        .{
-            .fields = @constCast((&[_][]const u8{ "title", "score" })[0..]),
-            .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}",
-            .exclusion_query_json = "{\"term\":{\"path\":\"/deleted\",\"value\":true}}",
-            .filter_prefix = "tenant/a/",
-            .filter_ids = &.{ 42, 99 },
-            .exclude_ids = &.{7},
-            .require_algebraic_filter_resolution = true,
-            .include_all_fields = false,
-            .defer_stored_projection = true,
-            .limit = 9,
-            .offset = 2,
-            .count_only = true,
-            .profile = true,
-            .include_stored = false,
-            .search_effort = 0.75,
-            .distance_over = 0.1,
-            .distance_under = 0.9,
-            .return_mode = .parent_with_chunks,
-            .max_chunks_per_parent = 2,
-            .hierarchy_include_source = true,
-            .hierarchy_include_unit = true,
-            .hierarchy_omit_implicit_source_ancestor_document = true,
-            .hierarchy_match_fields = @constCast((&[_][]const u8{"text"})[0..]),
-            .hierarchy_match_include_all_fields = false,
-            .hierarchy_grouped_matches = true,
-            .hierarchy_source_fields = @constCast((&[_][]const u8{ "title", "url" })[0..]),
-            .hierarchy_source_include_all_fields = false,
-            .hierarchy_unit_fields = @constCast((&[_][]const u8{"page"})[0..]),
-            .hierarchy_unit_include_all_fields = false,
-            .identity_read_generation = 12345,
-        },
-        constraints,
-        null,
-        null,
-        &.{access_path},
-        program,
-    );
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_name\":\"dense_idx\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"layout\":\"dense_vector\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"dense\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"options\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"native_doc_id_constraints\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_access_paths\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"tensor_program\"") != null);
-
-    const tampered_target = try alloc.dupe(u8, encoded);
-    defer alloc.free(tampered_target);
-    const index_name_prefix = "\"index_name\":\"";
-    const index_name_pos = std.mem.indexOf(u8, tampered_target, index_name_prefix) orelse return error.TestUnexpectedResult;
-    const index_name_start = index_name_pos + index_name_prefix.len;
-    tampered_target[index_name_start] = if (tampered_target[index_name_start] == 'd') 'x' else 'd';
-    try std.testing.expectError(error.InvalidQueryRequest, parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, tampered_target));
-
-    var parsed = try parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expectEqualStrings("dense_idx", parsed.index_name);
-    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.dense_vector, parsed.layout);
-    try std.testing.expectEqual(@as(u32, 7), parsed.query.dense.k);
-    try std.testing.expectEqual(@as(u32, 9), parsed.options.limit);
-    try std.testing.expectEqual(@as(u32, 2), parsed.options.offset);
-    try std.testing.expect(parsed.options.count_only);
-    try std.testing.expect(parsed.options.profile);
-    try std.testing.expect(!parsed.options.include_stored);
-    try std.testing.expect(!parsed.options.include_all_fields);
-    try std.testing.expect(parsed.options.defer_stored_projection);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tenant\",\"value\":\"t1\"}}", parsed.options.filter_query_json);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/deleted\",\"value\":true}}", parsed.options.exclusion_query_json);
-    try std.testing.expect(parsed.options.require_algebraic_filter_resolution);
-    try std.testing.expectEqualStrings("tenant/a/", parsed.options.filter_prefix);
-    try std.testing.expectEqual(@as(usize, 2), parsed.options.filter_ids.len);
-    try std.testing.expectEqual(@as(u64, 42), parsed.options.filter_ids[0]);
-    try std.testing.expectEqual(@as(u64, 99), parsed.options.filter_ids[1]);
-    try std.testing.expectEqual(@as(usize, 1), parsed.options.exclude_ids.len);
-    try std.testing.expectEqual(@as(u64, 7), parsed.options.exclude_ids[0]);
-    try std.testing.expectEqual(@as(usize, 2), parsed.options.fields.len);
-    try std.testing.expectEqualStrings("title", parsed.options.fields[0]);
-    try std.testing.expectEqualStrings("score", parsed.options.fields[1]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.options.search_effort.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.options.distance_over.?, 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), parsed.options.distance_under.?, 0.0001);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.parent_with_chunks, parsed.options.return_mode);
-    try std.testing.expectEqual(@as(u32, 2), parsed.options.max_chunks_per_parent);
-    try std.testing.expect(parsed.options.hierarchy_include_source);
-    try std.testing.expect(parsed.options.hierarchy_include_unit);
-    try std.testing.expect(parsed.options.hierarchy_omit_implicit_source_ancestor_document);
-    try std.testing.expectEqualStrings("text", parsed.options.hierarchy_match_fields[0]);
-    try std.testing.expect(!parsed.options.hierarchy_match_include_all_fields);
-    try std.testing.expect(parsed.options.hierarchy_grouped_matches);
-    try std.testing.expectEqualStrings("url", parsed.options.hierarchy_source_fields[1]);
-    try std.testing.expect(!parsed.options.hierarchy_source_include_all_fields);
-    try std.testing.expectEqualStrings("page", parsed.options.hierarchy_unit_fields[0]);
-    try std.testing.expect(!parsed.options.hierarchy_unit_include_all_fields);
-    try std.testing.expectEqual(@as(?u64, 12345), parsed.options.identity_read_generation);
-    try std.testing.expectEqual(@as(usize, 3), parsed.query.dense.vector.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.dense.vector[0], 0.0001);
-    try std.testing.expect(parsed.native_doc_id_constraints.constraints.positive_filter);
-    try std.testing.expectEqual(@as(usize, 2), parsed.native_doc_id_constraints.constraints.include_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:c", parsed.native_doc_id_constraints.constraints.exclude_doc_ids[0]);
-    try std.testing.expectEqual(@as(usize, 1), parsed.tensor_access_paths.len);
-    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.dense_vector, parsed.tensor_access_paths[0].layout);
-    try std.testing.expect((try parsed.proveTensorProgramAlloc(alloc)).safe());
-
-    var program_view = try parsed.tensor_program.asProgramAlloc(alloc);
-    defer program_view.deinit(alloc);
-    const program_id = try algebraic_ir.tensorProgramIdAlloc(alloc, program_view.program);
-    defer alloc.free(program_id);
-    try std.testing.expectEqualStrings(parsed.tensor_program.program_id, program_id);
-}
-
-test "api query contract keeps member mode compatible with rolling upgrade workers" {
-    const alloc = std.testing.allocator;
-    var encoded = std.ArrayListUnmanaged(u8).empty;
-    defer encoded.deinit(alloc);
-
-    try appendAlgebraicVectorWorkerRequestOptions(alloc, &encoded, .{ .return_mode = .member });
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"chunk\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"member\"") == null);
-}
-
-test "api query contract carries sparse vector worker payload and proof" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
-    const program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "sparse_idx",
-                .layout = .sparse_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    const encoded = try encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "sparse_idx",
-        .sparse_vector,
-        .{ .sparse = .{ .indices = &.{ 3, 9, 27 }, .values = &.{ 1.0, 0.5, 0.25 }, .k = 5 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{access_path},
-        program,
-    );
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"kind\":\"sparse\"") != null);
-
-    var parsed = try parseAlgebraicVectorWorkerRequestEnvelopeAlloc(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expectEqualStrings("sparse_idx", parsed.index_name);
-    try std.testing.expectEqual(algebraic_ir.PhysicalLayout.sparse_vector, parsed.layout);
-    try std.testing.expectEqual(@as(u32, 5), parsed.query.sparse.k);
-    try std.testing.expectEqual(@as(usize, 3), parsed.query.sparse.indices.len);
-    try std.testing.expectEqual(@as(u32, 9), parsed.query.sparse.indices[1]);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), parsed.query.sparse.values[2], 0.0001);
-    try std.testing.expect((try parsed.proveTensorProgramAlloc(alloc)).safe());
-}
-
-test "api query contract rejects sparse vector worker payload with mismatched indices and values" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
-    const program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "sparse_idx",
-                .layout = .sparse_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "sparse_idx",
-        .sparse_vector,
-        .{ .sparse = .{ .indices = &.{ 3, 9 }, .values = &.{1.0}, .k = 5 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{access_path},
-        program,
-    ));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"kind":"sparse","k":5,"indices":[3,9],"values":[1.0]}
-    , .{});
-    defer parsed.deinit();
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        parseAlgebraicVectorWorkerQueryAlloc(alloc, .sparse_vector, parsed.value),
-    );
-}
-
-test "api query contract rejects vector worker non-finite numeric payloads" {
-    const alloc = std.testing.allocator;
-    const dense_access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
-    const dense_program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{std.math.inf(f32)}, .k = 1 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{dense_access_path},
-        dense_program,
-    ));
-    const sparse_access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
-    const sparse_program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "sparse_idx",
-                .layout = .sparse_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "sparse_idx",
-        .sparse_vector,
-        .{ .sparse = .{ .indices = &.{1}, .values = &.{std.math.nan(f32)}, .k = 1 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{sparse_access_path},
-        sparse_program,
-    ));
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-            \\{"kind":"dense","k":1,"vector":[1e9999]}
-        , .{});
-        defer parsed.deinit();
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parseAlgebraicVectorWorkerQueryAlloc(alloc, .dense_vector, parsed.value),
-        );
-    }
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-            \\{"kind":"sparse","k":1,"indices":[7],"values":[-1e9999]}
-        , .{});
-        defer parsed.deinit();
-        try std.testing.expectError(
-            error.InvalidQueryRequest,
-            parseAlgebraicVectorWorkerQueryAlloc(alloc, .sparse_vector, parsed.value),
-        );
-    }
-}
-
-test "api query contract rejects vector worker envelope without matching tensor proof" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("sparse_idx", .sparse_vector);
-    const program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "sparse_idx",
-        .sparse_vector,
-        .{ .sparse = .{ .indices = &.{ 1, 5 }, .values = &.{ 1.0, 0.5 }, .k = 3 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{access_path},
-        program,
-    ));
-}
-
-test "api query contract rejects vector worker envelope when target does not match access path" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("other_dense_idx", .dense_vector);
-    const program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "other_dense_idx",
-                .layout = .dense_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{access_path},
-        program,
-    ));
-}
-
-test "api query contract rejects vector worker envelope when primary output is not vector search" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
-    const candidate_input = algebraic_ir.TensorExpr{
-        .fragment = .slice,
-        .output_dims = &.{.doc},
-        .semantic_id = "native_doc_id_constraints",
-    };
-    const program = algebraic_ir.TensorProgram{
-        .inputs = &.{candidate_input},
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .input_dims = &.{.doc},
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-            .inputs = &.{.{ .input = 0 }},
-        }},
-        .output = .{ .input = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
-        .{},
-        .{},
-        null,
-        null,
-        &.{access_path},
-        program,
-    ));
-}
-
-test "api query contract rejects vector worker envelope when native constraints are not consumed" {
-    const alloc = std.testing.allocator;
-    const access_path = algebraic_ir.vectorAccessPath("dense_idx", .dense_vector);
-    const program = algebraic_ir.TensorProgram{
-        .steps = &.{.{
-            .expr = .{
-                .fragment = .vector_search,
-                .output_dims = &.{ .doc, .score },
-                .owner = "dense_idx",
-                .layout = .dense_vector,
-            },
-        }},
-        .output = .{ .step = 0 },
-    };
-    try std.testing.expectError(error.InvalidQueryRequest, encodeAlgebraicVectorWorkerRequestEnvelopeAlloc(
-        alloc,
-        "dense_idx",
-        .dense_vector,
-        .{ .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 2 } },
-        .{},
-        .{ .positive_filter = true, .include_doc_ids = &.{"doc:a"} },
-        null,
-        null,
-        &.{access_path},
-        program,
-    ));
-}
-
-test "api query contract accepts native doc id constraint envelope on internal query route" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "native_doc_id_constraints": {
-        \\    "positive_filter": true,
-        \\    "include_doc_ids": [],
-        \\    "exclude_doc_ids": ["doc:c"]
-        \\  },
-        \\  "_identity_read_generation": 42
-        \\}
-    ;
-
-    var parsed = try parseQueryRequest(alloc, null, "docs", body);
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.filter_doc_ids_positive);
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.filter_doc_ids.len);
-    try std.testing.expectEqual(@as(usize, 1), parsed.req.exclude_doc_ids.len);
-    try std.testing.expectEqualStrings("doc:c", parsed.req.exclude_doc_ids[0]);
-    try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
-}
-
-test "api query contract maps timeout_ms to execution deadline" {
-    const alloc = std.testing.allocator;
-    const before_ns = platform_time.monotonicNs();
-    var parsed = try parseQueryRequest(alloc, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":250}
-    );
-    defer parsed.deinit(alloc);
-    const after_ns = platform_time.monotonicNs();
-
-    const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
-    const deadline_origin_ns = deadline_ns - 250 * std.time.ns_per_ms;
-    try std.testing.expect(deadline_origin_ns >= before_ns);
-    try std.testing.expect(deadline_origin_ns <= after_ns);
-}
-
-test "api query contract applies timeout_ms with an escaped member name" {
-    const alloc = std.testing.allocator;
-    const before_ns = platform_time.monotonicNs();
-    var parsed = try parseQueryRequest(alloc, null, "docs",
-        \\{"query":{"match_all":{}},"t\u0069meout_ms":60000}
-    );
-    defer parsed.deinit(alloc);
-    const after_ns = platform_time.monotonicNs();
-
-    const deadline_ns = parsed.req.execution_deadline_ns orelse return error.TestExpectedDeadline;
-    try std.testing.expect(deadline_ns >= before_ns + 60_000 * std.time.ns_per_ms);
-    try std.testing.expect(deadline_ns <= after_ns + 60_000 * std.time.ns_per_ms);
-}
-
-test "api query contract rejects invalid timeout_ms" {
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":-1}
-    ));
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":"bad"}
-    ));
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"query":{"match_all":{}},"timeout_ms":1.5}
-    ));
-}
-
-test "api query contract bounds graph metric top k" {
-    const alloc = std.testing.allocator;
-    const accepted = try parseGraphMetricQueriesAlloc(alloc,
-        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10000}}
-    );
-    defer freeNamedGraphMetricQueries(alloc, accepted);
-    try std.testing.expectEqual(@as(usize, 1), accepted.len);
-    try std.testing.expectEqual(@as(u32, 10_000), accepted[0].query.top_k);
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricQueriesAlloc(alloc,
-        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":10001}}
-    ));
-}
-
-test "api query contract uses portable graph metric filter operators" {
-    const cases = [_]struct { wire: []const u8, expected: graph_query_mod.GraphMetricFilterOp }{
-        .{ .wire = "gt", .expected = .gt },
-        .{ .wire = "gte", .expected = .gte },
-        .{ .wire = "lt", .expected = .lt },
-        .{ .wire = "lte", .expected = .lte },
-        .{ .wire = "eq", .expected = .eq },
-        .{ .wire = "neq", .expected = .neq },
-    };
-    for (cases) |case| {
-        const filters = [_]indexes_openapi.GraphMetricFilter{.{
-            .metric = "pagerank",
-            .op = case.wire,
-            .value = 0.5,
-        }};
-        const parsed = try parseLegacyGraphQuery(std.testing.allocator, .{
-            .type = .traverse,
-            .index_name = "graph_idx",
-            .start_nodes = .{ .keys = &.{"doc:a"} },
-            .where_metric = &filters,
-        });
-        defer freeGraphQuery(std.testing.allocator, parsed);
-        try std.testing.expectEqual(case.expected, parsed.where_metric[0].op);
-    }
-
-    const legacy = [_]indexes_openapi.GraphMetricFilter{.{
-        .metric = "pagerank",
-        .op = ">=",
-        .value = 0.5,
-    }};
-    try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
-        .type = .traverse,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{"doc:a"} },
-        .where_metric = &legacy,
-    }));
-}
-
-test "api query contract rejects oversized and duplicate graph metric clauses" {
-    var metric_names: [graph_query_mod.graph_metric_projection_limit + 1][]const u8 = undefined;
-    @memset(&metric_names, "pagerank");
-    try std.testing.expectError(error.InvalidQueryRequest, parseGraphMetricReads(
-        std.testing.allocator,
-        &metric_names,
-        .published,
-    ));
-
-    const duplicate_metrics = [_][]const u8{ "pagerank", "pagerank" };
-    try std.testing.expectError(error.InvalidQueryRequest, parseLegacyGraphQuery(std.testing.allocator, .{
-        .type = .traverse,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{"doc:a"} },
-        .metrics = &duplicate_metrics,
-    }));
-}
-
-test "api query contract preserves graph metric fingerprint precision" {
-    const alloc = std.testing.allocator;
-    const converted = try toOpenApiGraphMetricStatus(alloc, .{
-        .name = @constCast("pagerank"),
-        .config_fingerprint = std.math.maxInt(u64),
-    });
-    defer alloc.free(converted.config_fingerprint.?);
-    try std.testing.expectEqualStrings("ffffffffffffffff", converted.config_fingerprint.?);
-}
-
-test "api query contract treats nullable graph metric extensions as absent" {
-    const alloc = std.testing.allocator;
-    var parsed = try parsePublicQueryRequest(alloc, null, "docs",
-        \\{"full_text_search":{"match":"needle","field":"body"},"graph_metric":null,"graph_metric_rerank":null}
-    );
-    defer parsed.deinit(alloc);
-
-    try std.testing.expect(parsed.req.full_text != null);
-    try std.testing.expectEqual(@as(usize, 0), parsed.req.graph_metric_queries.len);
-    try std.testing.expect(parsed.req.graph_metric_rerank == null);
-}
-
-test "api query contract rejects legacy native doc id constraint fields" {
-    const alloc = std.testing.allocator;
-    const body =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "_filter_doc_ids_positive": true
-        \\}
-    ;
-
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", body));
-
-    const old_arrays =
-        \\{
-        \\  "query": {"match_all": {}},
-        \\  "_filter_doc_ids": ["doc:a"],
-        \\  "_exclude_doc_ids": ["doc:b"]
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", old_arrays));
-}
-
-test "api query contract defaults omitted text fields to all" {
-    const alloc = std.testing.allocator;
-    const queries = [_][]const u8{
-        "{\"match\":\"Korean history major events\"}",
-        "{\"match\":\"Korean history\",\"analyzer\":\"standard\"}",
-        "{\"term\":\"korean\"}",
-        "{\"term\":\"korean\",\"fuzziness\":1}",
-        "{\"match_phrase\":\"Korean history\"}",
-        "{\"match_phrase\":\"Korean history\",\"analyzer\":\"standard\"}",
-        "{\"prefix\":\"kore\"}",
-        "{\"wildcard\":\"kor*\"}",
-        "{\"regexp\":\"kor.*\"}",
-        "{\"fuzzy\":\"korean\"}",
-        "{\"terms\":[\"korean\",\"history\"]}",
-        "{\"terms\":[[\"korean\"],[\"history\"]]}",
-    };
-    for (queries) |query| {
-        const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s}}}", .{query});
-        defer alloc.free(body);
-        var parsed = try parsePublicQueryRequest(alloc, null, "docs", body);
-        defer parsed.deinit(alloc);
-        const text = parsed.req.full_text orelse return error.TestExpectedEqual;
-        const field = switch (text) {
-            .match => |v| v.field,
-            .term => |v| v.field,
-            .match_phrase => |v| v.field,
-            .prefix => |v| v.field,
-            .wildcard => |v| v.field,
-            .regexp => |v| v.field,
-            .fuzzy => |v| v.field,
-            .phrase => |v| v.field,
-            .multi_phrase => |v| v.field,
-            else => return error.TestExpectedEqual,
-        };
-        try std.testing.expectEqualStrings("_all", field);
-    }
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }

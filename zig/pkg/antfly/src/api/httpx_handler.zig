@@ -59,8 +59,8 @@ const stored_destination_authorization = @import("stored_destination_authorizati
 const tables_api = @import("tables.zig");
 const table_contract = @import("table_contract.zig");
 const table_index_config = @import("table_index_config.zig");
-const table_reads = if (builtin.is_test) @import("table_reads.zig") else @import("table_read_source.zig");
-const table_writes = @import("table_writes.zig");
+const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("table_read_source.zig");
+const table_writes = @import("table_write_source.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -87,7 +87,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const casbin = @import("antfly_casbin");
 const builtin = @import("builtin");
 
-const db_mod = @import("../storage/db/mod.zig");
+const db_mod = @import("../storage/db/selected_root.zig").db;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
 const routes = @import("http_routes.zig").Routes;
@@ -5015,7 +5015,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text(table_contract.createTableRequestErrorMessage(err, body_data));
         };
         defer create_req.deinit(alloc);
-        const normalized_indexes_json = table_writes.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
+        const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
             alloc,
             create_req.indexes_json orelse tables_api.default_indexes_json,
             .{
