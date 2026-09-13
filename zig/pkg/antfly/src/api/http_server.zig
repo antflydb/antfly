@@ -4120,6 +4120,7 @@ pub const ApiHttpServer = struct {
                             continue;
                         },
                         error.InvalidBatchRequest,
+                        error.RelationalCheckViolation,
                         error.InvalidArgument,
                         error.InvalidGraphEdges,
                         error.UnsupportedTransformOperation,
@@ -10912,7 +10913,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchema(table_name, req.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidBatchRequest,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             else => {
                 std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
@@ -10938,6 +10939,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
             error.InvalidBatchRequest,
+            error.RelationalCheckViolation,
             error.InvalidArgument,
             error.InvalidGraphEdges,
             error.UnsupportedTransformOperation,

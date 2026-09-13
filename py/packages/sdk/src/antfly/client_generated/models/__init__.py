@@ -812,6 +812,12 @@ from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
+from .relational_check_constraint import RelationalCheckConstraint
+from .relational_comparison_op import RelationalComparisonOp
+from .relational_index_definition import RelationalIndexDefinition
+from .relational_index_key import RelationalIndexKey
+from .relational_index_key_direction import RelationalIndexKeyDirection
+from .relational_index_key_nulls import RelationalIndexKeyNulls
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
 from .repair_run_request_control import RepairRunRequestControl
@@ -925,6 +931,7 @@ from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
 from .table_status import TableStatus
+from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
@@ -1822,6 +1829,12 @@ __all__ = (
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
+    "RelationalCheckConstraint",
+    "RelationalComparisonOp",
+    "RelationalIndexDefinition",
+    "RelationalIndexKey",
+    "RelationalIndexKeyDirection",
+    "RelationalIndexKeyNulls",
     "RepairIssueListRequest",
     "RepairRunRequest",
     "RepairRunRequestControl",
@@ -1935,6 +1948,7 @@ __all__ = (
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",
+    "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
     "TableStorageUnreadableError",

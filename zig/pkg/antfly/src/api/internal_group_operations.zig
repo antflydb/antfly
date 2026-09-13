@@ -277,7 +277,7 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             else => {
                 std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -288,7 +288,7 @@ pub const Operations = struct {
             },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.RaftBatchWriteOutcomeUnknown => return error.RaftBatchWriteOutcomeUnknown,
             error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
@@ -324,7 +324,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             else => {
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
@@ -430,7 +430,7 @@ pub const Operations = struct {
             break :merge .merge_replication;
         } else return error.Unavailable;
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.Canceled, error.Cancelled => return error.Canceled,
@@ -468,7 +468,7 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {
@@ -496,7 +496,7 @@ pub const Operations = struct {
             writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
         const validator = self.txn_validator orelse return error.Unavailable;
         validator.validate(table_name, input.req.writes) catch |err| switch (err) {
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             else => return error.Internal,
         };
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
@@ -505,7 +505,7 @@ pub const Operations = struct {
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.TransactionTooLarge => return error.TransactionTooLarge,
-            error.InvalidBatchRequest => return error.InvalidArgument,
+            error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
             error.PreDecisionDeadlineExceeded => {

@@ -24,6 +24,8 @@ pub const replay_all_kind: u8 = 0xfe;
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
+/// One reverse ownership record per document/physical relational index.
+pub const relational_index_reverse_kind: u8 = 0x13;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
 pub const relational_columnar_prefix = "\x00\x00__columnar__:";
 pub const relational_columnar_dirty_prefix = relational_columnar_prefix ++ "dirty:";
@@ -1473,6 +1475,14 @@ pub fn isRelationalRowKey(key: []const u8) bool {
 
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+pub fn isRelationalIndexReverseKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    const start = term + 3;
+    if (start > key.len or key.len - start != 12 or key[term + 2] != relational_index_reverse_kind) return false;
+    return std.mem.readInt(u64, key[start..][0..8], .big) != 0;
 }
 
 pub fn isTtlKey(key: []const u8) bool {

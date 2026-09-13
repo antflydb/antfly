@@ -223,6 +223,12 @@ test "standalone resource manager derives elastic storage cache envelopes" {
 const schema_mod = @import("../schema.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const schema_registry_mod = @import("schema_registry.zig");
+const relational_index_plans = @import("relational_index_plan.zig");
+const relational_index_records = @import("relational_index_records.zig");
+const relational_index_catalog = @import("relational_index_catalog.zig");
+const relational_index_jobs = @import("relational_index_jobs.zig");
+const relational_constraint_jobs = @import("relational_constraint_jobs.zig");
+const relational_index_gc = @import("relational_index_gc.zig");
 const SchemaCacheAdmission = @import("schema_cache_admission.zig").Admission;
 const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -2352,6 +2358,7 @@ const BatchExecutionContext = struct {
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     async_context: ?*AsyncContext = null,
     relational_base_rows: bool = false,
+    table_catalog: ?*table_catalog_mod.Catalog = null,
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     ha_async_effect_mirror: ?HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
@@ -5200,6 +5207,9 @@ pub const DB = struct {
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
+    relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
+    relational_index_maintenance_pending: std.atomic.Value(bool) = .init(false),
+    relational_index_retry_after_ns: std.atomic.Value(u64) = .init(0),
     artifact_metadata_retry_after_ns: u64 = 0,
     artifact_repair_metadata_due_ns: u64 = 0,
     artifact_repair_metadata_pending: bool = true,
@@ -5310,6 +5320,7 @@ pub const DB = struct {
             .promotion_runtime = self.promotion_runtime,
             .async_context = self.async_context,
             .relational_base_rows = relationalColumns(self) != null,
+            .table_catalog = &self.core.table_catalog,
             .ha_async_effect_mirror = self.ha_async_effect_mirror,
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -5379,6 +5390,185 @@ pub const DB = struct {
             );
         }
         return self.core.snapshot_replay_admission.acquireMutation();
+    }
+
+    pub const ConstraintValidationStatus = struct {
+        schema_version: u32,
+        state: relational_constraint_jobs.State,
+        rows_scanned: u64,
+        failed_check: ?u16,
+    };
+
+    pub fn constraintValidationStatus(self: *DB) !ConstraintValidationStatus {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var view = self.core.acquireSchemaView() orelse return error.ConstraintNotFound;
+        defer view.release();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const progress = try relational_constraint_jobs.status(&read, view);
+        return .{ .schema_version = progress.schema_version, .state = progress.state, .rows_scanned = progress.rows_scanned, .failed_check = if (progress.state == .invalid) progress.failed_check else null };
+    }
+
+    pub fn validateConstraintsStep(self: *DB, budget: relational_constraint_jobs.Budget) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        {
+            var active = self.core.acquireSchemaView() orelse return false;
+            defer active.release();
+            const validator = active.validator() orelse return false;
+            if (validator.execution.checks == null) return false;
+        }
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        var page = (try relational_constraint_jobs.Page.prepare(self.alloc, self.backend_runtime.io(), self.core, budget)) orelse return false;
+        defer page.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceHAWriteGate();
+        try page.commit(self.core);
+        return true;
+    }
+
+    /// Retry only an observed failed epoch, never reset a newer declaration.
+    pub fn retryConstraintValidation(self: *DB, schema_version: u32) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceHAWriteGate();
+        var view = self.core.acquireSchemaView() orelse return error.ConstraintNotFound;
+        defer view.release();
+        if (view.version() != schema_version) return error.PreparedGenerationChanged;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if ((try relational_constraint_jobs.status(&txn, view)).state != .invalid) {
+            txn.abort();
+            return false;
+        }
+        try txn.delete(relational_constraint_jobs.progress_key);
+        try txn.commit();
+        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_retry_after_ns.store(0, .release);
+        return true;
+    }
+
+    pub const RelationalIndexBuildBudget = relational_index_jobs.Budget;
+    pub const RelationalIndexBuildState = relational_index_jobs.State;
+    pub const RelationalIndexBuildFailure = relational_index_jobs.Failure;
+    pub const RelationalIndexBuildStatus = struct {
+        generation: u64,
+        slot: u32,
+        state: RelationalIndexBuildState,
+        rows_scanned: u64,
+        failure: RelationalIndexBuildFailure,
+    };
+
+    /// A single bounded maintenance increment. Derived entries and local
+    /// coverage are reconstructed independently on every replica; progress is
+    /// never an HA command and cannot make a different owner query-ready.
+    pub fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        var page = (try relational_index_jobs.Page.prepare(self.alloc, self.backend_runtime.io(), self.core, name, budget)) orelse return;
+        defer page.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceHAWriteGate();
+        try page.commit(self.core);
+    }
+
+    pub fn collectRelationalIndexGarbageStep(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        var page = (try relational_index_gc.Page.prepare(self.alloc, self.backend_runtime.io(), self.core)) orelse return false;
+        defer page.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceHAWriteGate();
+        try page.commit(self.core);
+        return true;
+    }
+
+    /// Retry only the observed failed generation. Healthy/building retries
+    /// are idempotent; an old admin request cannot reset a replacement index.
+    pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.enforceHAWriteGate();
+        var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        defer pinned.deinit();
+        const index = for (pinned.plan.boundIndexes()) |index| {
+            if (std.mem.eql(u8, name, index.name)) break index;
+        } else return error.IndexNotFound;
+        if (index.generation != generation) return error.PreparedGenerationChanged;
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if ((try relational_index_jobs.status(&txn, index)).state != .failed) {
+            txn.abort();
+            return false;
+        }
+        try txn.delete(&relational_index_jobs.progressKey(index.id()));
+        try txn.commit();
+        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_retry_after_ns.store(0, .release);
+        return true;
+    }
+
+    pub const RelationalRows = @import("relational_rows.zig");
+
+    pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var indexes = self.core.relational_indexes.acquire();
+        defer if (indexes) |*pinned| pinned.deinit();
+        return try RelationalRows.Reader.open(alloc, self.core.store, view, indexes, request, currentTimeNs());
+    }
+
+    pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        defer pinned.deinit();
+        const index = for (pinned.plan.boundIndexes()) |index| {
+            if (std.mem.eql(u8, name, index.name)) break index;
+        } else return error.IndexNotFound;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const progress = try relational_index_jobs.status(&read, index);
+        return .{ .generation = progress.id.generation, .slot = progress.id.slot, .state = progress.state, .rows_scanned = progress.rows_scanned, .failure = progress.failure };
     }
 
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
@@ -7050,6 +7240,7 @@ pub const DB = struct {
                 .resolution_runtime = self.resolution_runtime,
                 .promotion_runtime = self.promotion_runtime,
                 .relational_base_rows = relationalColumns(self) != null,
+                .table_catalog = &self.core.table_catalog,
                 .ha_async_effect_mirror = self.ha_async_effect_mirror,
                 .ha_async_batch_mirror = self.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
@@ -9007,6 +9198,9 @@ pub const DB = struct {
         generated_memo: *GeneratedEmbeddingMemo,
         prepared_row_allocator: *PreparedRowAllocator,
     ) anyerror!void {
+        for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
+        for (req.deletes) |key| if (relational_index_catalog.Controller.isReservedMetadataKey(key)) return error.ReservedRelationalIndexMetadataKey;
+        for (req.transforms) |transform| if (relational_index_catalog.Controller.isReservedMetadataKey(transform.key)) return error.ReservedRelationalIndexMetadataKey;
         const schema_namespace = if (opts.transaction_resolution) |resolution|
             resolution.schema_namespace_generation orelse self.core.schemaNamespaceGeneration()
         else
@@ -9122,6 +9316,21 @@ pub const DB = struct {
         const transaction_schema_binding = if (opts.transaction_resolution) |resolution| resolution.schema_binding else null;
         var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, transaction_schema_binding);
         defer if (request_schema_view) |*view| view.release();
+        var relational_index_snapshot = self.core.relational_indexes.acquire();
+        defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
+        const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
+        defer preparation_alloc.free(index_ready);
+        var prepared_index_keys: ?relational_index_plans.Batch = if (relational_index_snapshot) |index_snapshot|
+            relational_index_plans.Batch.init(preparation_alloc, index_snapshot.plan)
+        else
+            null;
+        defer if (prepared_index_keys) |*keys| keys.deinit();
+        if (relational_index_snapshot) |index_snapshot| {
+            const view = request_schema_view orelse return error.PreparedGenerationChanged;
+            if (index_snapshot.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+        }
+        var index_writer = relational_index_records.Writer.init(preparation_alloc);
+        defer index_writer.deinit();
         // Row side effects outlive speculative preparation but are consumed as
         // borrowed slices by the serialized commit. A batch arena turns their
         // many small keys/payloads into bump allocations and one release.
@@ -9190,6 +9399,16 @@ pub const DB = struct {
                     rows,
                     opts.durable_rows,
                 );
+                if (prepared_index_keys) |*keys| {
+                    var largest_document: usize = 0;
+                    var largest_tuple: usize = 0;
+                    for (rows, effective_req.writes) |*maybe_row, write| {
+                        const index_row = try keys.appendPrepared(&maybe_row.*.?);
+                        largest_document = @max(largest_document, internal_keys.encodedComponentLen(write.key));
+                        for (keys.view.boundIndexes(), 0..) |_, index| largest_tuple = @max(largest_tuple, (try keys.key(index_row, index)).bytes.len);
+                    }
+                    try index_writer.reserve(largest_document, largest_tuple);
+                }
                 // Copy every borrowed catalog input into request-owned effects
                 // while holding only the catalog read lease. Schema/index
                 // publication may proceed after this short phase; the commit
@@ -9361,6 +9580,7 @@ pub const DB = struct {
         // A durable epoch survives active-schema publication, not replacement
         // of the entire database namespace with reused version/transaction IDs.
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
 
         if (opts.raft_applied_entry_marker) |identity| {
             switch (try raftAppliedEntryDisposition(
@@ -9475,6 +9695,9 @@ pub const DB = struct {
         // preflight remains useful for early UX feedback, but every embedded,
         // replicated, recovery, and direct DB caller gets the same contract.
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        // Coalescer draining above can release/reacquire apply. An index-only
+        // publication need not change the schema or managed-index generation.
+        if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
         const use_preprepared_rows = blk: {
             const rows = preprepared_rows orelse break :blk false;
             const pinned = request_schema_view orelse break :blk false;
@@ -9539,6 +9762,19 @@ pub const DB = struct {
         }
 
         const extract_writes_start_ns = monotonicTimeNs();
+        var index_read: ?docstore_mod.DocStore.Txn = if (relational_index_snapshot != null) try self.core.store.beginReadTxn() else null;
+        defer if (index_read) |*read| read.abort();
+        if (relational_index_snapshot) |index_snapshot| for (index_snapshot.plan.boundIndexes(), index_ready) |index, *ready| {
+            ready.* = (try relational_index_jobs.status(&index_read.?, index)).state == .ready;
+        };
+        var index_stage: ?relational_index_records.Staged = if (index_read) |*read| relational_index_records.Staged.init(preparation_alloc, read) else null;
+        defer if (index_stage) |*stage| stage.deinit();
+        // Consume the coalesced logical request, not raw input ordering. API
+        // deletes win over writes; transforms may subsequently recreate a row.
+        // Its effective write/delete sets are disjoint.
+        if (index_stage) |*stage| for (effective_req.deletes) |key| {
+            if (!isMetadataKey(key)) try stage.deleteDocument(&index_writer, key);
+        };
         var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer store_writes.deinit(self.alloc);
         var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -9661,6 +9897,11 @@ pub const DB = struct {
             else
                 null;
             defer if (prepared_relational) |*prepared| prepared.deinit(self.alloc);
+            if (index_stage) |*stage| if (prepared_relational) |*prepared| {
+                const keys = &prepared_index_keys.?;
+                const row = if (use_preprepared_rows) i else try keys.appendPrepared(prepared);
+                try stage.upsertPreparedWithReadiness(&index_writer, relational_index_snapshot.?.plan, keys, row, write.key, index_ready);
+            };
             var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try self.core.index_manager.acquireWritePlanSnapshot() else null;
             defer if (fallback_consumer_plan) |*plan| plan.release();
             if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);
@@ -10151,7 +10392,7 @@ pub const DB = struct {
         }
         var next_table_catalog: ?table_catalog_mod.Catalog = null;
         var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
-        if (pending_identity_visibility_summary) |summary| {
+        if (pending_identity_visibility_summary != null) {
             var catalog = self.core.table_catalog;
             const previous = catalog;
             catalog.mode_initialized = true;
@@ -10163,8 +10404,9 @@ pub const DB = struct {
                 catalog.active_schema_version = 0;
             }
             // Persist only the empty/non-empty transition. Exact cardinality
-            // is already transactional in the identity visibility summary.
-            catalog.row_count = @intFromBool(summary.live_ordinals != 0);
+            // is already transactional in the range-local counter. A split
+            // intentionally retains foreign identities in the shared namespace.
+            catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(self.alloc, self.core.store, identity_writes.items) != 0);
             catalog.reconciled = true;
             if (catalog.mode_initialized != previous.mode_initialized or
                 catalog.storage_mode != previous.storage_mode or
@@ -10433,6 +10675,11 @@ pub const DB = struct {
             &owned_store_values,
         );
         try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
+        if (index_stage) |*stage| {
+            const effects = try stage.seal();
+            try store_writes.appendSlice(self.alloc, effects.writes);
+            try delete_keys.appendSlice(self.alloc, effects.deletes);
+        }
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
 
         // A synchronous HA append can fail after the local transaction commit.
@@ -22090,14 +22337,20 @@ pub const DB = struct {
         var next = try cursor.seekAtOrAfter(lower);
         while (next) |row| : (next = try cursor.next()) {
             if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
-            if (!internal_keys.isPrimaryDocumentKey(row.key)) continue;
-            const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, row.key)).?;
+            if (!internal_keys.isStoredDocumentRowKey(row.key)) continue;
+            const key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, row.key)).?;
             errdefer alloc.free(key);
             if (after_key) |after| if (std.mem.order(u8, key, after) != .gt) {
                 alloc.free(key);
                 continue;
             };
-            const value = try alloc.dupe(u8, row.value);
+            const value = if (internal_keys.isRelationalRowKey(row.key)) blk: {
+                const version = try relational_store.rowSchemaVersion(row.value);
+                var view = (try self.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+                defer view.release();
+                const typed = try relational_row_codec.ordinalRowView(row.value, view.tableSchema().*, view.physicalLayout());
+                break :blk try typed.reconstructValueAlloc(alloc);
+            } else try alloc.dupe(u8, row.value);
             errdefer alloc.free(value);
             try rows.append(alloc, .{ .key = key, .value = value });
             bytes +|= key.len +| value.len;
@@ -27784,6 +28037,7 @@ pub const DB = struct {
         if (self.artifact_repair_metadata_stop.load(.acquire)) return null;
         self.runIndependentMaintenancePass();
         const active = (platform_time.monotonicNs() >= self.artifact_metadata_retry_after_ns and self.artifactRepairMetadataRebuildPending()) or
+            (self.relational_index_maintenance_pending.load(.acquire) and platform_time.monotonicNs() >= self.relational_index_retry_after_ns.load(.acquire)) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
         return std.math.divCeil(u64, scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns, std.time.ns_per_ms) catch unreachable;
@@ -27805,6 +28059,47 @@ pub const DB = struct {
             error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
             else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
         };
+        _ = self.runRelationalIndexMaintenancePass() catch |err| switch (err) {
+            error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
+            else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
+        };
+    }
+
+    /// Fair bounded dispatch on the existing std.Io maintenance scheduler.
+    /// Never scan every catalog entry or finish an entire index in one turn.
+    pub fn runRelationalIndexMaintenancePass(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
+        if (self.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        const started = platform_time.monotonicNs();
+        if (started < self.relational_index_retry_after_ns.load(.acquire)) return false;
+        errdefer self.relational_index_retry_after_ns.store(platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns, .release);
+        const validated = try self.validateConstraintsStep(.{});
+        var pinned = self.core.relational_indexes.acquire() orelse {
+            self.relational_index_maintenance_pending.store(validated, .release);
+            return validated;
+        };
+        defer pinned.deinit();
+        const collected = try self.collectRelationalIndexGarbageStep();
+        const indexes = pinned.plan.boundIndexes();
+        if (indexes.len == 0) {
+            self.relational_index_maintenance_pending.store(collected or validated, .release);
+            return collected or validated;
+        }
+        for (0..@min(indexes.len, 16)) |_| {
+            const next = self.relational_index_maintenance_cursor.fetchAdd(1, .monotonic) % indexes.len;
+            const name = indexes[next].name;
+            if ((try self.relationalIndexBuildStatus(name)).state == .building) {
+                try self.buildRelationalIndexStep(name, .{});
+                self.relational_index_maintenance_pending.store(true, .release);
+                return true;
+            }
+            if (platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
+                self.relational_index_maintenance_pending.store(true, .release);
+                return false;
+            }
+        }
+        self.relational_index_maintenance_pending.store(collected or validated or indexes.len > 16, .release);
+        return collected or validated;
     }
 
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
@@ -32245,11 +32540,13 @@ pub const DB = struct {
         identity_summary: ?doc_identity.VisibilitySummary,
         schema: ?schema_mod.TableSchema,
         schema_replacement: schema_registry_mod.Registry.PreparedReplacement,
+        relational_indexes: ?@import("relational_index_catalog.zig").WriteSnapshot,
         table_catalog: table_catalog_mod.Catalog,
         recovery: ?db_core.PreparedRecoveryRelationalState,
         target_identity: doc_identity.Namespace,
 
         pub fn deinit(self: *@This()) void {
+            if (self.relational_indexes) |*indexes| indexes.deinit();
             self.schema_replacement.deinit();
             if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
             if (self.recovery) |*recovery| recovery.deinit();
@@ -32291,6 +32588,12 @@ pub const DB = struct {
         var schema_replacement = try self.core.prepareSchemaRegistryReplacement(prepared_epoch);
         prepared_epoch_owned = false;
         errdefer schema_replacement.deinit();
+        var restored_indexes = try @import("relational_index_catalog.zig").Controller.loadSnapshot(
+            self.alloc,
+            source_store,
+            if (prepared_epoch) |epoch| .{ .epoch = epoch } else null,
+        );
+        errdefer if (restored_indexes) |*indexes| indexes.deinit();
         // Historical layouts were validated while importing the unpublished
         // image and remain durable in the restored store. Match normal startup:
         // publish only the active epoch and fault historical versions into the
@@ -32313,6 +32616,7 @@ pub const DB = struct {
             .identity_summary = identity_summary,
             .schema = restored_schema,
             .schema_replacement = schema_replacement,
+            .relational_indexes = restored_indexes,
             .table_catalog = restored_catalog,
             .recovery = prepared_recovery,
             .target_identity = target_identity,
@@ -32329,7 +32633,7 @@ pub const DB = struct {
         self.core.identity_visibility.summary = prepared.identity_summary;
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
-        self.core.replaceSchemaOwnedPrepared(prepared.schema, &prepared.schema_replacement);
+        self.core.replaceSchemaOwnedPrepared(prepared.schema, &prepared.schema_replacement, &prepared.relational_indexes);
         prepared.schema = null;
         self.core.table_catalog = prepared.table_catalog;
         self.core.identity_namespace = prepared.target_identity;
@@ -48263,8 +48567,8 @@ fn collectGraphArtifactsForDocIndex(
     return try store.scanPrefix(alloc, prefix);
 }
 
-fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []const u8, sync_level: types.SyncLevel) !void {
-    if (keys.len == 0) return;
+fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: []const []const u8, sync_level: types.SyncLevel) !u32 {
+    if (candidate_keys.len == 0) return 0;
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
@@ -48273,6 +48577,54 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     try lockApplyForPortableRuntimeContext(ctx);
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
+
+    // Expiration is a real write, not an exemption from transaction guards.
+    // Check under the same apply fence as deletion. A locked parent must not
+    // prevent unrelated expired rows in this bounded page from progressing.
+    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var manager = try transactions_mod.TxnManager.init(ctx.alloc, ctx.store);
+    defer manager.deinit();
+    var unlocked = std.ArrayListUnmanaged([]const u8).empty;
+    defer unlocked.deinit(ctx.alloc);
+    const keys = blk: {
+        manager.checkOrdinaryWriteConflicts(candidate_keys) catch |err| switch (err) {
+            error.IntentConflict => {
+                for (candidate_keys) |key| {
+                    manager.checkOrdinaryWriteConflict(key) catch |conflict| switch (conflict) {
+                        error.IntentConflict => continue,
+                        else => return conflict,
+                    };
+                    try unlocked.append(ctx.alloc, key);
+                }
+                break :blk unlocked.items;
+            },
+            else => return err,
+        };
+        break :blk candidate_keys;
+    };
+    if (keys.len == 0) {
+        ctx.apply_mutex.unlockExclusive();
+        apply_mutex_held = false;
+        return 0;
+    }
+
+    // TTL uses a stable runtime context rather than the movable DB handle.
+    // Stage every document-owned generation here too, including retired ones,
+    // and join the same primary/identity/replay commit below.
+    var index_read: ?docstore_mod.DocStore.Txn = if (ctx.relational_base_rows) try ctx.store.beginReadTxn() else null;
+    defer if (index_read) |*read| read.abort();
+    const has_relational_indexes = if (index_read) |*read| blk: {
+        _ = read.get(relational_index_catalog.head_key) catch |err| switch (err) {
+            error.NotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    } else false;
+    var index_stage: ?relational_index_records.Staged = if (has_relational_indexes) relational_index_records.Staged.init(ctx.alloc, &index_read.?) else null;
+    defer if (index_stage) |*stage| stage.deinit();
+    var index_writer = relational_index_records.Writer.init(ctx.alloc);
+    defer index_writer.deinit();
+    if (index_stage) |*stage| for (keys) |key| try stage.deleteDocument(&index_writer, key);
 
     var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer store_writes.deinit(ctx.alloc);
@@ -48399,6 +48751,26 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         &owned_store_values,
     );
     try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
+    var next_table_catalog: ?table_catalog_mod.Catalog = null;
+    var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
+    if (pending_identity_visibility_summary != null) {
+        if (ctx.table_catalog) |current| {
+            const row_count: u64 = @intFromBool(try range_cardinality.afterIdentityTransition(ctx.alloc, ctx.store, identity_writes.items) != 0);
+            if (current.reconciled and current.row_count != row_count) {
+                var next = current.*;
+                next.row_count = row_count;
+                next.generation +|= 1;
+                table_catalog_value = next.encode();
+                next_table_catalog = next;
+                try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = &table_catalog_value });
+            }
+        }
+    }
+    if (index_stage) |*stage| {
+        const effects = try stage.seal();
+        try store_writes.appendSlice(ctx.alloc, effects.writes);
+        try delete_keys.appendSlice(ctx.alloc, effects.deletes);
+    }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
@@ -48408,6 +48780,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .payload = replay_payload,
     });
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
+    if (next_table_catalog) |catalog| ctx.table_catalog.?.* = catalog;
     if (pending_identity_visibility_summary) |summary| {
         if (ctx.identity_visibility) |visibility| visibility.publish(summary);
     }
@@ -48440,6 +48813,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
     if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    return @intCast(keys.len);
 }
 
 fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
@@ -48465,8 +48839,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     }
     if (deletes.items.len == 0) return 0;
 
-    try executeDeleteBatchContext(&ctx.batch, deletes.items, .full_index);
-    return @intCast(deletes.items.len);
+    return try executeDeleteBatchContext(&ctx.batch, deletes.items, .full_index);
 }
 
 fn appendDerivedBatchRecord(self: *DB, batch: derived_types.DerivedBatch) !u64 {
@@ -59488,6 +59861,7 @@ fn finalizePrimarySplitPreservingMetadata(
     try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
+    try reconcileRelationalIndexRange(self, self.core.store, retained_range);
     try rebaseRangeCoverageMetadata(
         self.alloc,
         self.core.store,
@@ -59538,6 +59912,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     dest_indexes.updateRange(byte_range);
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
+    try relational_index_catalog.copyToUnpublished(self.alloc, self.core.store, dest_store);
     try dest_indexes.seedSplitArtifactCatalogsFrom(dest_store, self.core.index_manager);
 
     const configs = try self.core.listIndexes(self.alloc);
@@ -59600,10 +59975,19 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
         &dest_indexes,
     );
 
+    try reconcileRelationalIndexRange(self, dest_store, byte_range);
     try rebaseRangeCoverageMetadata(self.alloc, dest_store, &dest_indexes, byte_range, &.{});
 
     try dest_indexes.syncAll(true);
     try dest_store.sync(true);
+}
+
+fn reconcileRelationalIndexRange(self: *DB, store: *docstore_mod.DocStore, byte_range: types.ByteRange) !void {
+    var index_snapshot = self.core.relational_indexes.acquire() orelse return;
+    defer index_snapshot.deinit();
+    var repair = relational_index_records.RangeRepair{ .alloc = self.alloc };
+    defer repair.deinit();
+    while (!repair.done()) _ = try repair.step(store, byte_range.start, byte_range.end);
 }
 
 fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, lower: []const u8, upper: []const u8) ![][]u8 {
@@ -66121,6 +66505,747 @@ test "relational runtime-only and mixed schema epochs survive portable restore" 
     }
 }
 
+fn expectTestRelationalIndexRow(db: *DB, document: []const u8, json: []const u8, present: bool) !void {
+    const alloc = std.testing.allocator;
+    var index_snapshot = db.core.relational_indexes.acquire().?;
+    defer index_snapshot.deinit();
+    const view = index_snapshot.plan.schemaView();
+    var row = try mapper.PreparedRelationalWrite.init(alloc, document, json, view.validator(), view.tableSchema().*, view.physicalLayout());
+    defer row.deinit(alloc);
+    var keys = relational_index_plans.Batch.init(alloc, index_snapshot.plan);
+    defer keys.deinit();
+    _ = try keys.appendPrepared(&row);
+    var reverse = std.ArrayList(u8).empty;
+    defer reverse.deinit(alloc);
+    var value = std.ArrayList(u8).empty;
+    defer value.deinit(alloc);
+    var forward = std.ArrayList(u8).empty;
+    defer forward.deinit(alloc);
+    var txn = try db.core.store.beginReadTxn();
+    defer txn.abort();
+    for (index_snapshot.plan.boundIndexes(), 0..) |index, i| {
+        reverse.clearRetainingCapacity();
+        value.clearRetainingCapacity();
+        forward.clearRetainingCapacity();
+        try relational_index_records.appendReverseKey(alloc, &reverse, index.id(), document);
+        try relational_index_records.appendReverseValue(alloc, &value, reverse.items, (try keys.key(0, i)).bytes);
+        try relational_index_records.appendForwardFromReverse(alloc, &forward, reverse.items, value.items);
+        if (present) {
+            try std.testing.expectEqualSlices(u8, value.items, try txn.get(reverse.items));
+            try std.testing.expectEqualStrings("", try txn.get(forward.items));
+        } else try std.testing.expectError(error.NotFound, txn.get(forward.items));
+    }
+}
+
+test "relational rows snapshot projects exact composite ranges through writes DDL and garbage collection" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("relational-rows");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"},"payload":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    const large = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'x');
+    const wide = try std.fmt.allocPrint(alloc, "{{\"tenant\":1,\"id\":9007199254740993,\"payload\":\"{s}\"}}", .{large});
+    defer alloc.free(wide);
+    try db.batch(.{ .timestamp_ns = 100, .writes = &.{
+        .{ .key = "a", .value = "{\"tenant\":1,\"id\":9007199254740992}" },
+        .{ .key = "b", .value = wide },
+        .{ .key = "c", .value = "{\"tenant\":2,\"id\":0}" },
+    } });
+    try db.setSchemaJson(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"column":"tenant"},{"column":"id","direction":"desc"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"},"payload":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    const request = DB.RelationalRows.Request{
+        .index = "tenant_id",
+        .fields = &.{"id"},
+        .lower = .{ .values = &.{.{ .integer = 1 }} },
+        .upper = .{ .values = &.{.{ .integer = 1 }} },
+    };
+    try std.testing.expectError(error.RelationalIndexNotReady, db.beginRelationalRows(alloc, request));
+    for (0..256) |_| {
+        if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
+        _ = try db.buildRelationalIndexStep("tenant_id", .{});
+    }
+    var wrong = request;
+    wrong.lower = .{ .values = &.{.{ .number = 1 }} };
+    try std.testing.expectError(error.InvalidRelationalIndexBound, db.beginRelationalRows(alloc, wrong));
+    {
+        var filtered_request = request;
+        filtered_request.fields = &.{"tenant"};
+        filtered_request.conditions = &.{.{ .column = "id", .op = .gt, .value = .{ .integer = 9007199254740992 } }};
+        var filtered = try db.beginRelationalRows(alloc, filtered_request);
+        defer filtered.deinit();
+        var page = try filtered.nextPage(alloc, null, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("b", page.rows[0].key);
+        try std.testing.expectEqualStrings("{\"tenant\":1}", page.rows[0].json);
+    }
+    const parent_read = try db.beginTransaction(101);
+    try db.writeIntents(parent_read, &.{}, &.{.{ .key = "b", .expected_version = 100 }});
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .deletes = &.{"b"} }));
+    try db.commitTransaction(parent_read, 102);
+    var reader = try db.beginRelationalRows(alloc, request);
+    defer reader.deinit();
+    try std.testing.expectError(error.RelationalRowResultTooLarge, reader.nextPage(alloc, null, .{ .output_bytes = 1 }));
+    var memory: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    {
+        // A 1 MiB unselected column cannot fit in the execution arena. Success
+        // proves that the reader does not materialize/parse the complete row.
+        var page = try reader.nextPage(fixed.allocator(), null, .{ .rows = 1 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("b", page.rows[0].key);
+        try std.testing.expectEqualStrings("{\"id\":9007199254740993}", page.rows[0].json);
+        try std.testing.expectEqual(@as(u64, 100), page.rows[0].version);
+        try std.testing.expect(page.more);
+    }
+    try db.batch(.{ .timestamp_ns = 200, .writes = &.{.{ .key = "b", .value = "{\"tenant\":1,\"id\":1}" }}, .deletes = &.{"a"} });
+    try db.setSchemaJson(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","relational_indexes":[],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"},"payload":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    for (0..256) |_| {
+        if (!try db.collectRelationalIndexGarbageStep()) break;
+    }
+    {
+        var page = try reader.nextPage(alloc, null, .{ .rows = 1 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("a", page.rows[0].key);
+        try std.testing.expectEqualStrings("{\"id\":9007199254740992}", page.rows[0].json);
+    }
+    {
+        var page = try reader.nextPage(alloc, null, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 0), page.rows.len);
+        try std.testing.expect(!page.more);
+    }
+    try std.testing.expectError(error.IndexNotFound, db.beginRelationalRows(alloc, request));
+    var primary = try db.beginRelationalRows(alloc, .{
+        .fields = &.{"id"},
+        .conditions = &.{.{ .column = "id", .op = .gt, .value = .{ .integer = 0 } }},
+    });
+    defer primary.deinit();
+    var found: usize = 0;
+    for (0..256) |_| {
+        var page = try primary.nextPage(alloc, null, .{ .records = 2 });
+        defer page.deinit();
+        found += page.rows.len;
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+}
+
+test "relational constraint activation fences prepared writes and resumes CHECK coverage" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const initial =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const checked =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const options = OpenOptions{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, initial);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"id\":0}" }} });
+        const txn = try db.beginTransaction(100);
+        try db.writeIntents(txn, &.{.{ .key = "b", .value = "{\"id\":9007199254740993}" }}, &.{});
+        try std.testing.expectError(error.SchemaInUse, db.setSchemaJson(alloc, checked));
+        try db.commitTransaction(txn, 200);
+        try db.setSchemaJson(alloc, checked);
+        try std.testing.expectEqual(.validating, (try db.constraintValidationStatus()).state);
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"id\":9007199254740992}" }} }));
+        try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "bad"));
+        // NULL/absent evaluates UNKNOWN and passes CHECK, not WHERE.
+        try db.batch(.{ .writes = &.{.{ .key = "c", .value = "{}" }} });
+        var failed = (try relational_constraint_jobs.Page.prepare(alloc, db.backend_runtime.io(), db.core, .{ .time_ns = std.time.ns_per_s })).?;
+        defer failed.deinit();
+        try std.testing.expectEqual(.invalid, failed.next.state);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"id\":9007199254740993}" }} });
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.PreparedGenerationChanged, failed.commit(db.core));
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try std.testing.expect(try db.validateConstraintsStep(.{ .records = 1 }));
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"id\":0}" }} }));
+        try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, db.batch(.{ .deletes = &.{relational_constraint_jobs.progress_key} }));
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        for (0..128) |_| {
+            if ((try db.constraintValidationStatus()).state == .enforced) break;
+            _ = try db.runRelationalIndexMaintenancePass();
+        } else return error.ValidationDidNotConverge;
+        try std.testing.expectEqual(@as(u64, 3), (try db.constraintValidationStatus()).rows_scanned);
+        try std.testing.expect(!try db.retryConstraintValidation(2));
+        try std.testing.expectError(error.PreparedGenerationChanged, db.retryConstraintValidation(1));
+    }
+}
+
+test "relational constraint failed validation is durable and retry is epoch bound" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const options = OpenOptions{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        try db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"id\":-1}" }} });
+        try db.setSchemaJson(alloc,
+            \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        for (0..128) |_| {
+            if ((try db.constraintValidationStatus()).state == .invalid) break;
+            _ = try db.validateConstraintsStep(.{});
+        } else return error.ValidationDidNotConverge;
+        try std.testing.expectEqual(@as(?u16, 0), (try db.constraintValidationStatus()).failed_check);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try std.testing.expectEqual(.invalid, (try db.constraintValidationStatus()).state);
+        try std.testing.expect(!try db.validateConstraintsStep(.{}));
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"id\":-2}" }} }));
+        const txn = try db.beginTransaction(100);
+        defer db.abortTransaction(txn, 300) catch {};
+        try std.testing.expectError(error.RelationalCheckViolation, db.writeIntents(txn, &.{.{ .key = "new", .value = "{\"id\":-2}" }}, &.{}));
+        try db.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"id\":1}" }} });
+        try std.testing.expect(try db.retryConstraintValidation(2));
+        try std.testing.expect(!try db.retryConstraintValidation(2));
+        try std.testing.expectError(error.PreparedGenerationChanged, db.retryConstraintValidation(1));
+        for (0..128) |_| {
+            if ((try db.constraintValidationStatus()).state == .enforced) break;
+            _ = try db.validateConstraintsStep(.{});
+        } else return error.ValidationDidNotConverge;
+        try std.testing.expectEqual(@as(?u16, null), (try db.constraintValidationStatus()).failed_check);
+    }
+}
+
+test "relational index schema declarations publish atomically and maintenance backfills" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const row = "{\"tenant\":1,\"id\":9007199254740993}";
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = row }} });
+    const indexed =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"column":"tenant"},{"column":"id","direction":"desc"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const txn = try db.beginTransaction(100);
+    try db.writeIntents(txn, &.{.{ .key = "b", .value = row }}, &.{});
+    try std.testing.expectError(error.SchemaInUse, db.setSchemaJson(alloc, indexed));
+    try std.testing.expectError(error.IndexNotFound, db.relationalIndexBuildStatus("tenant_id"));
+    try db.commitTransaction(txn, 200);
+    try db.setSchemaJson(alloc, indexed);
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+    for (0..128) |_| {
+        if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
+        _ = try db.runRelationalIndexMaintenancePass();
+    } else return error.BuildDidNotConverge;
+    try expectTestRelationalIndexRow(&db, "a", row, true);
+    try expectTestRelationalIndexRow(&db, "b", row, true);
+    const ready = try db.relationalIndexBuildStatus("tenant_id");
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, db.batch(.{
+        .writes = &.{.{ .key = relational_index_catalog.head_key, .value = "forged" }},
+    }));
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, db.batch(.{
+        .deletes = &.{relational_index_jobs.progress_prefix},
+    }));
+    {
+        var pinned = db.core.relational_indexes.acquire().?;
+        defer pinned.deinit();
+        var reverse = std.ArrayList(u8).empty;
+        defer reverse.deinit(alloc);
+        try relational_index_records.appendReverseKey(alloc, &reverse, pinned.plan.boundIndexes()[0].id(), "a");
+        const original = (try db.core.getStoreValue(alloc, reverse.items)).?;
+        defer alloc.free(original);
+        try db.core.store.putBatch(&.{}, &.{reverse.items});
+        try std.testing.expectError(error.MissingRelationalIndexReverse, db.batch(.{ .writes = &.{.{ .key = "a", .value = row }} }));
+        try db.core.store.putBatch(&.{.{ .key = reverse.items, .value = original }}, &.{});
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = row }} });
+    }
+    try db.setSchemaJson(alloc, indexed);
+    try std.testing.expectEqual(ready, try db.relationalIndexBuildStatus("tenant_id"));
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    try std.testing.expectEqual(ready, try db.relationalIndexBuildStatus("tenant_id"));
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var writes: [600]types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{
+            .key = try std.fmt.allocPrint(arena.allocator(), "gc-{d:0>4}", .{i}),
+            .value = row,
+        };
+        try db.batch(.{ .writes = &writes });
+    }
+    try db.setSchemaJson(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","relational_indexes":[],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"integer"},"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try std.testing.expectError(error.IndexNotFound, db.relationalIndexBuildStatus("tenant_id"));
+    {
+        // A retired value need not be readable to be safely deleted. The
+        // generation ID and framed owner key are the cleanup authority.
+        var reverse = std.ArrayList(u8).empty;
+        defer reverse.deinit(alloc);
+        try relational_index_records.appendReverseKey(alloc, &reverse, .{ .generation = ready.generation, .slot = ready.slot }, "a");
+        try db.core.store.putBatch(&.{.{ .key = reverse.items, .value = "corrupt retired value" }}, &.{});
+        var first = (try relational_index_gc.Page.prepare(alloc, db.backend_runtime.io(), db.core)).?;
+        defer first.deinit();
+        var rival = (try relational_index_gc.Page.prepare(alloc, db.backend_runtime.io(), db.core)).?;
+        defer rival.deinit();
+        try std.testing.expect(first.next != null);
+        try std.testing.expect(first.deletes.len <= 512);
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try first.commit(db.core);
+        try std.testing.expectError(error.PreparedGenerationChanged, rival.commit(db.core));
+    }
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } });
+    // The time budget may yield after one cold record. Do not assume a
+    // minimum records-per-time-slice throughput in this convergence test.
+    for (0..1024) |_| {
+        if (!try db.collectRelationalIndexGarbageStep()) break;
+    } else return error.GcDidNotConverge;
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var blob_count: usize = 0;
+    var entry = try cursor.seekAtOrAfter("");
+    while (entry) |item| : (entry = try cursor.next()) {
+        try std.testing.expect(!relational_index_records.isForwardKey(item.key));
+        try std.testing.expect(!internal_keys.isRelationalIndexReverseKey(item.key));
+        try std.testing.expect(!std.mem.startsWith(u8, item.key, relational_index_gc.prefix));
+        try std.testing.expect(!std.mem.startsWith(u8, item.key, relational_index_jobs.progress_prefix));
+        if (std.mem.startsWith(u8, item.key, relational_index_catalog.blob_prefix)) blob_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), blob_count);
+}
+
+test "relational index build pages fence races resume after reopen and prove readiness" {
+    const alloc = std.testing.allocator;
+    const native = @import("../relational_index.zig");
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 2 } } }) |backend| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+            .{ .name = "id", .path = "id", .column_type = .integer },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        const before = "{\"tenant\":1,\"id\":9007199254740993}";
+        const after = "{\"tenant\":2,\"id\":9007199254740994}";
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = before }, .{ .key = "b", .value = before }, .{ .key = "c", .value = before } } });
+        {
+            var view = db.core.acquireSchemaView().?;
+            defer view.release();
+            var definition = try db.core.relational_indexes.prepare(view, &.{.{
+                .name = "tenant_id",
+                .owner_kind = .table,
+                .owner_name = native.relational_table_index_owner_name,
+                .access_method = .ordered_tuple,
+                .keys = &.{ .{ .column = "tenant" }, .{ .column = "id", .direction = .desc } },
+            }});
+            defer definition.deinit();
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.relational_indexes.commit(&definition, &.{});
+        }
+        try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        try std.testing.expectError(error.InvalidRelationalIndexBudget, db.buildRelationalIndexStep("tenant_id", .{ .records = 0 }));
+        {
+            const primary = try internal_keys.relationalRowKeyAlloc(alloc, "a");
+            defer alloc.free(primary);
+            const original = (try db.core.getStoreValue(alloc, primary)).?;
+            defer alloc.free(original);
+            try db.core.store.putBatch(&.{.{ .key = primary, .value = "corrupt" }}, &.{});
+            {
+                var failure = (try relational_index_jobs.Page.prepare(alloc, db.backend_runtime.io(), db.core, "tenant_id", .{ .time_ns = std.time.ns_per_s })).?;
+                defer failure.deinit();
+                try std.testing.expectEqual(.failed, failure.next.state);
+                try db.core.store.putBatch(&.{.{ .key = primary, .value = original }}, &.{});
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                try std.testing.expectError(error.PreparedGenerationChanged, failure.commit(db.core));
+            }
+            try db.core.store.putBatch(&.{.{ .key = primary, .value = "corrupt" }}, &.{});
+            try db.buildRelationalIndexStep("tenant_id", .{ .time_ns = std.time.ns_per_s });
+            const failed = try db.relationalIndexBuildStatus("tenant_id");
+            try std.testing.expectEqual(.failed, failed.state);
+            try std.testing.expectEqual(.invalid_row, failed.failure);
+            db.close();
+            db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+            try std.testing.expectEqual(failed, try db.relationalIndexBuildStatus("tenant_id"));
+            try db.core.store.putBatch(&.{.{ .key = primary, .value = original }}, &.{});
+            try std.testing.expectError(error.PreparedGenerationChanged, db.retryRelationalIndexBuild("tenant_id", failed.generation + 1));
+            try std.testing.expect(try db.retryRelationalIndexBuild("tenant_id", failed.generation));
+            try std.testing.expect(!try db.retryRelationalIndexBuild("tenant_id", failed.generation));
+            try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        }
+        // Two builders prepared from the same durable cursor. A later writer
+        // updates one source row and deletes another before either commits.
+        {
+            var first = (try relational_index_jobs.Page.prepare(alloc, db.backend_runtime.io(), db.core, "tenant_id", .{ .time_ns = std.time.ns_per_s })).?;
+            defer first.deinit();
+            var rival = (try relational_index_jobs.Page.prepare(alloc, db.backend_runtime.io(), db.core, "tenant_id", .{ .time_ns = std.time.ns_per_s })).?;
+            defer rival.deinit();
+            try db.batch(.{ .writes = &.{.{ .key = "a", .value = after }}, .deletes = &.{"b"} });
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try first.commit(db.core);
+            try std.testing.expectError(error.PreparedGenerationChanged, rival.commit(db.core));
+            try std.testing.expectError(error.RelationalIndexPageConsumed, first.commit(db.core));
+        }
+        try expectTestRelationalIndexRow(&db, "a", before, false);
+        try expectTestRelationalIndexRow(&db, "a", after, true);
+        try expectTestRelationalIndexRow(&db, "b", before, false);
+        try expectTestRelationalIndexRow(&db, "c", before, true);
+        try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        // Rebuild under a new schema generation in deliberately tiny pages.
+        try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns });
+        try db.buildRelationalIndexStep("tenant_id", .{ .records = 1 });
+        const saved = try db.relationalIndexBuildStatus("tenant_id");
+        try std.testing.expectEqual(.building, saved.state);
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        try std.testing.expectEqual(saved, try db.relationalIndexBuildStatus("tenant_id"));
+        for (0..128) |_| {
+            if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
+            try db.buildRelationalIndexStep("tenant_id", .{ .records = 1 });
+        } else return error.BuildDidNotConverge;
+        try expectTestRelationalIndexRow(&db, "a", after, true);
+        try expectTestRelationalIndexRow(&db, "c", before, true);
+        const ready = try db.relationalIndexBuildStatus("tenant_id");
+        try std.testing.expectEqual(@as(u64, 2), ready.rows_scanned);
+        try db.buildRelationalIndexStep("tenant_id", .{});
+        try std.testing.expectEqual(ready, try db.relationalIndexBuildStatus("tenant_id"));
+        // Ownership transfer invalidates readiness without reusing its cursor.
+        var split_tmp = try TestDirectory.init("db");
+        defer split_tmp.cleanup();
+        const split_path = split_tmp.path().ptr;
+        defer cleanupTempDir(split_path);
+        try db.split(db.getRange(), "b", "", std.mem.span(split_path), true);
+        try db.finalizeSplit(.{ .start = "", .end = "b" });
+        try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        for (0..128) |_| {
+            if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
+            try db.buildRelationalIndexStep("tenant_id", .{ .records = 1 });
+        } else return error.BuildDidNotConverge;
+        try std.testing.expectEqual(@as(u64, 1), (try db.relationalIndexBuildStatus("tenant_id")).rows_scanned);
+    }
+}
+
+test "relational index mutations follow primary batches transactions deletes and reopen" {
+    const alloc = std.testing.allocator;
+    const native = @import("../relational_index.zig");
+    for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 2 } } }) |backend| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{
+            .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+            .{ .name = "id", .path = "id", .column_type = .integer },
+        };
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var definition = try db.core.relational_indexes.prepare(view, &.{.{
+            .name = "tenant_id",
+            .owner_kind = .table,
+            .owner_name = native.relational_table_index_owner_name,
+            .access_method = .ordered_tuple,
+            .keys = &.{ .{ .column = "tenant" }, .{ .column = "id", .direction = .desc } },
+        }});
+        defer definition.deinit();
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.relational_indexes.commit(&definition, &.{});
+        }
+        const first = "{\"tenant\":1,\"id\":9007199254740993}";
+        const second = "{\"tenant\":2,\"id\":9007199254740994}";
+        const third = "{\"tenant\":3,\"id\":7}";
+        try db.batch(.{ .writes = &.{.{ .key = "row\x00:1", .value = first }} });
+        try expectTestRelationalIndexRow(&db, "row\x00:1", first, true);
+        try db.batch(.{ .writes = &.{ .{ .key = "row\x00:1", .value = second }, .{ .key = "row\x00:1", .value = third } }, .deletes = &.{"row\x00:1"} });
+        try expectTestRelationalIndexRow(&db, "row\x00:1", first, false);
+        try expectTestRelationalIndexRow(&db, "row\x00:1", second, false);
+        try expectTestRelationalIndexRow(&db, "row\x00:1", third, false);
+        try std.testing.expect((try db.get(alloc, "row\x00:1")) == null);
+        try db.batch(.{ .writes = &.{ .{ .key = "row\x00:1", .value = second }, .{ .key = "row\x00:1", .value = third } } });
+        try expectTestRelationalIndexRow(&db, "row\x00:1", second, false);
+        try expectTestRelationalIndexRow(&db, "row\x00:1", third, true);
+        const txn = try db.beginTransaction(100);
+        try db.writeIntents(txn, &.{.{ .key = "row\x00:1", .value = second }}, &.{});
+        try std.testing.expectError(error.SchemaInUse, db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns }));
+        try db.commitTransaction(txn, 200);
+        try db.commitTransaction(txn, 200); // Idempotent replay cannot leave old keys.
+        try expectTestRelationalIndexRow(&db, "row\x00:1", third, false);
+        try expectTestRelationalIndexRow(&db, "row\x00:1", second, true);
+        {
+            var archive = std.ArrayList(u8).empty;
+            defer archive.deinit(alloc);
+            try portable_backup.exportPortable(alloc, db.core.store, &archive);
+            for ([_]bool{ false, true }) |unpublished| {
+                var restore_tmp = try TestDirectory.init("db");
+                defer restore_tmp.cleanup();
+                const restore_path = restore_tmp.path().ptr;
+                defer cleanupTempDir(restore_path);
+                var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+                defer restored.close();
+                if (unpublished)
+                    try restored.importPortableIntoUnpublishedEmpty(alloc, archive.items, doc_identity.default_namespace)
+                else
+                    try restored.importPortableIntoEmpty(alloc, archive.items, doc_identity.default_namespace);
+                try expectTestRelationalIndexRow(&restored, "row\x00:1", second, true);
+                try expectTestRelationalIndexRow(&restored, "row\x00:1", first, false);
+                try expectTestRelationalIndexRow(&restored, "row\x00:1", third, false);
+            }
+        }
+        db.close();
+        db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+        try expectTestRelationalIndexRow(&db, "row\x00:1", second, true);
+        try db.batch(.{ .deletes = &.{"row\x00:1"} });
+        try expectTestRelationalIndexRow(&db, "row\x00:1", second, false);
+        try db.batch(.{ .deletes = &.{"row\x00:1"} });
+        try db.batch(.{ .writes = &.{ .{ .key = "a\x00", .value = first }, .{ .key = "z\x00", .value = third } } });
+        {
+            const page = try db.mergeDocumentsPage(alloc, db.getRange(), "a\x00");
+            defer {
+                for (page) |item| {
+                    alloc.free(item.key);
+                    alloc.free(item.value);
+                }
+                alloc.free(page);
+            }
+            try std.testing.expectEqual(@as(usize, 1), page.len);
+            try std.testing.expectEqualStrings("z\x00", page[0].key);
+            try std.testing.expectEqualStrings(third, page[0].value);
+        }
+        var split_tmp = try TestDirectory.init("db");
+        defer split_tmp.cleanup();
+        const split_path = split_tmp.path().ptr;
+        defer cleanupTempDir(split_path);
+        try db.split(db.getRange(), "m", "", std.mem.span(split_path), true);
+        {
+            var right = try DB.open(alloc, std.mem.span(split_path), .{ .start_optional_runtimes = false, .primary_backend = backend });
+            defer right.close();
+            try expectTestRelationalIndexRow(&right, "z\x00", third, true);
+            try expectTestRelationalIndexRow(&right, "a\x00", first, false);
+        }
+        try db.finalizeSplit(.{ .start = "", .end = "m" });
+        try expectTestRelationalIndexRow(&db, "a\x00", first, true);
+        try expectTestRelationalIndexRow(&db, "z\x00", third, false);
+        // Expiration uses its own stable runtime context. Cover both the
+        // retired schema generation and newly written current-generation keys.
+        const expired_at = currentTimeNs() - 3 * std.time.ns_per_s;
+        try db.batch(.{ .writes = &.{.{ .key = "a\x00", .value = first }}, .timestamp_ns = expired_at });
+        try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns, .ttl_duration_ns = std.time.ns_per_s });
+        try db.batch(.{ .writes = &.{.{ .key = "b\x00", .value = second }}, .timestamp_ns = expired_at });
+        try initStoppedTtlRuntimeForTest(&db, .{ .enabled = false, .grace_period_ns = 0 });
+        var expired_a = [_]u8{ 'a', 0 };
+        var expired_b = [_]u8{ 'b', 0 };
+        try std.testing.expectEqual(@as(u32, 2), try deleteExpiredDocumentsFromCandidates(db.ttl_cleanup_context.?, &.{
+            .{ .key = &expired_a, .timestamp_ns = expired_at },
+            .{ .key = &expired_b, .timestamp_ns = expired_at },
+        }));
+        const remaining_index_keys = try db.core.store.scanPrefix(alloc, relational_index_records.forward_namespace);
+        defer docstore_mod.DocStore.freeResults(alloc, remaining_index_keys);
+        try std.testing.expectEqual(@as(usize, 0), remaining_index_keys.len);
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+        const persisted_catalog = (try table_catalog_mod.load(alloc, db.core.store)).?;
+        try std.testing.expectEqual(@as(u64, 0), persisted_catalog.row_count);
+        try db.batch(.{ .writes = &.{.{ .key = "b\x00", .value = second }} });
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
+        try db.batch(.{ .deletes = &.{"b\x00"} });
+        try std.testing.expectEqual(@as(u64, 0), db.core.table_catalog.row_count);
+    }
+}
+
+test "relational index restore projects historical rows without requiring unused history columns" {
+    const alloc = std.testing.allocator;
+    var source_tmp = try TestDirectory.init("db");
+    defer source_tmp.cleanup();
+    const source_path = source_tmp.path().ptr;
+    defer cleanupTempDir(source_path);
+    var source = try DB.open(alloc, std.mem.span(source_path), .{ .start_optional_runtimes = false });
+    defer source.close();
+    try source.setSchema(.{ .version = 0, .storage_mode = .relational, .relational_columns = &.{.{ .name = "unused", .path = "unused", .column_type = .string }} });
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+        .{ .name = "id", .path = "id", .column_type = .integer },
+    };
+    try source.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const logical = "{\"tenant\":9,\"id\":9007199254740993}";
+    try source.batch(.{ .writes = &.{.{ .key = "old", .value = logical }} });
+    const reordered = [_]schema_mod.RelationalColumn{ columns[1], columns[0] };
+    try source.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &reordered });
+    var view = source.core.acquireSchemaView().?;
+    defer view.release();
+    var candidate = try source.core.relational_indexes.prepare(view, &.{.{
+        .name = "tenant_id",
+        .owner_kind = .table,
+        .owner_name = @import("../relational_index.zig").relational_table_index_owner_name,
+        .access_method = .ordered_tuple,
+        .keys = &.{ .{ .column = "tenant" }, .{ .column = "id", .direction = .desc } },
+    }});
+    defer candidate.deinit();
+    {
+        source.core.lockApply();
+        defer source.core.unlockApply();
+        _ = try source.core.relational_indexes.commit(&candidate, &.{});
+    }
+    var archive = std.ArrayList(u8).empty;
+    defer archive.deinit(alloc);
+    try portable_backup.exportPortable(alloc, source.core.store, &archive);
+    for ([_]bool{ false, true }) |unpublished| {
+        var target_tmp = try TestDirectory.init("db");
+        defer target_tmp.cleanup();
+        const target_path = target_tmp.path().ptr;
+        defer cleanupTempDir(target_path);
+        var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } });
+        defer target.close();
+        if (unpublished)
+            try target.importPortableIntoUnpublishedEmpty(alloc, archive.items, doc_identity.default_namespace)
+        else
+            try target.importPortableIntoEmpty(alloc, archive.items, doc_identity.default_namespace);
+        try expectTestRelationalIndexRow(&target, "old", logical, true);
+    }
+}
+
+test "relational index catalog core publishes schema bound plans and recovers on reopen" {
+    const alloc = std.testing.allocator;
+    const native_indexes = @import("../relational_index.zig");
+    const catalog = @import("relational_index_catalog.zig");
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const initial_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const next_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"extra":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, initial_json);
+        try std.testing.expect(db.core.relational_indexes.acquire() == null);
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        var candidate = try db.core.relational_indexes.prepare(view, &.{.{
+            .name = "by_id",
+            .owner_kind = .table,
+            .owner_name = native_indexes.relational_table_index_owner_name,
+            .access_method = .ordered_tuple,
+            .keys = &.{.{ .column = "id" }},
+        }});
+        defer candidate.deinit();
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            try std.testing.expect(try db.core.relational_indexes.commit(&candidate, &.{}));
+        }
+        var old = db.core.relational_indexes.acquire().?;
+        defer old.deinit();
+        try db.setSchemaJson(alloc, next_json);
+        var current = db.core.relational_indexes.acquire().?;
+        defer current.deinit();
+        var schema_view = db.core.acquireSchemaView().?;
+        defer schema_view.release();
+        try std.testing.expectEqual(schema_view.epoch, current.plan.schemaView().epoch);
+        try std.testing.expectEqual(@as(u32, 2), current.head.schema_version);
+        try std.testing.expect(!db.core.relational_indexes.isCurrent(old));
+        try std.testing.expectEqual(@as(u32, 1), old.plan.schemaView().version());
+        try std.testing.expectError(error.RelationalIndexColumnNotFound, db.setSchemaJson(alloc,
+            \\{"version":3,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"other":{"type":"keyword"}},"additionalProperties":false}}}}
+        ));
+        try std.testing.expect(db.core.relational_indexes.isCurrent(current));
+        // Runtime metadata is compiled from the unpublished source, never by
+        // reopening the target's old schema after durable publication.
+        var target_tmp = try TestDirectory.init("db");
+        defer target_tmp.cleanup();
+        const target_path = target_tmp.path().ptr;
+        defer cleanupTempDir(target_path);
+        var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_optional_runtimes = false });
+        defer target.close();
+        {
+            var restored = try target.preparePortableRuntimeMetadata(db.core.store, doc_identity.default_namespace);
+            defer restored.deinit();
+            try std.testing.expect(restored.relational_indexes.?.head.eql(current.head));
+            try std.testing.expectEqual(restored.schema_replacement.current.?, restored.relational_indexes.?.plan.schemaView().epoch);
+            try std.testing.expect(target.core.relational_indexes.acquire() == null);
+        }
+        try db.core.store.put(catalog.head_key, "corrupt");
+        try std.testing.expectError(error.InvalidRelationalIndexCatalog, target.preparePortableRuntimeMetadata(db.core.store, doc_identity.default_namespace));
+        try std.testing.expect(target.core.relational_indexes.acquire() == null);
+        try std.testing.expect(target.core.acquireSchemaView() == null);
+        try db.core.store.put(catalog.head_key, &current.head.encode());
+        var archive = std.ArrayList(u8).empty;
+        defer archive.deinit(alloc);
+        try portable_backup.exportPortable(alloc, db.core.store, &archive);
+        try target.importPortableIntoUnpublishedEmpty(alloc, archive.items, doc_identity.default_namespace);
+        var restored = target.core.relational_indexes.acquire().?;
+        defer restored.deinit();
+        var target_schema = target.core.acquireSchemaView().?;
+        defer target_schema.release();
+        try std.testing.expectEqual(target_schema.epoch, restored.plan.schemaView().epoch);
+        try std.testing.expect(restored.head.eql(current.head));
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        var durable = (try catalog.load(alloc, &txn)).?;
+        defer durable.deinit();
+        try std.testing.expect(durable.head.eql(current.head));
+    }
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
+        defer reopened.close();
+        var recovered = reopened.core.relational_indexes.acquire().?;
+        defer recovered.deinit();
+        var schema_view = reopened.core.acquireSchemaView().?;
+        defer schema_view.release();
+        try std.testing.expectEqual(schema_view.epoch, recovered.plan.schemaView().epoch);
+        try std.testing.expectEqual(@as(u32, 2), recovered.head.schema_version);
+        try std.testing.expectEqualStrings("by_id", recovered.plan.boundIndexes()[0].name);
+    }
+}
+
 test "relational public schema provenance rejects missing validators on reopen" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -67548,6 +68673,18 @@ test "relational columnar byte costing retains wide clean rows and switches for 
 
 test "relational columnar adaptive admission preserves age across hot updates and restart" {
     const alloc = std.testing.allocator;
+    const Progress = struct {
+        fn expectBuild(db: *DB, before: u64) !void {
+            // Admission is time-sliced. A pass may checkpoint discovery before
+            // it builds, especially under concurrent compiler/CI load. Keep
+            // the synthetic age clock frozen while allowing bounded progress.
+            for (0..16) |_| {
+                _ = try db.runRelationalColumnMaintenancePass();
+                if (db.relational_column_maintenance.blocks_written.load(.monotonic) > before) return;
+            }
+            try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > before);
+        }
+    };
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -67575,8 +68712,7 @@ test "relational columnar adaptive admission preserves age across hot updates an
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     relational_columns.test_now_ns = 111 * std.time.ns_per_s;
-    _ = try db.runRelationalColumnMaintenancePass();
-    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
+    try Progress.expectBuild(&db, 0);
     // Read pressure can admit another sparse change before the age cap.
     try db.batch(.{ .writes = &.{.{ .key = "k0000", .value = "{\"n\":7}" }} });
     for (0..20) |_| {
@@ -67584,21 +68720,37 @@ test "relational columnar adaptive admission preserves age across hot updates an
         result.deinit(alloc);
     }
     const warm_before = db.relational_column_maintenance.blocks_written.load(.monotonic);
-    _ = try db.runRelationalColumnMaintenancePass();
-    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > warm_before);
+    try Progress.expectBuild(&db, warm_before);
     // High density bypasses age admission without any read-pressure hint.
     for (writes[0..64]) |*write| write.value = "{\"n\":9}";
     try db.batch(.{ .writes = writes[0..64] });
     const dense_before = db.relational_column_maintenance.blocks_written.load(.monotonic);
-    _ = try db.runRelationalColumnMaintenancePass();
-    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > dense_before);
+    try Progress.expectBuild(&db, dense_before);
     // A backwards clock correction must not strand durable deferral records.
-    try db.batch(.{ .writes = &.{.{ .key = "k0000", .value = "{\"n\":10}" }} });
-    _ = try db.runRelationalColumnMaintenancePass();
-    const skew_before = db.relational_column_maintenance.blocks_written.load(.monotonic);
+    // Use a fresh clean range: prior read pressure and density-driven partial
+    // page rewrites may legitimately admit another write without deferring it.
+    var skew_tmp = try TestDirectory.init("db");
+    defer skew_tmp.cleanup();
+    const skew_path = skew_tmp.path().ptr;
+    defer cleanupTempDir(skew_path);
+    var skew_db = try DB.open(alloc, std.mem.span(skew_path), .{ .start_optional_runtimes = false });
+    defer skew_db.close();
+    try skew_db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    for (writes) |*write| write.value = "{\"n\":1}";
+    try skew_db.batch(.{ .writes = writes });
+    try drainTestRelationalMaintenance(&skew_db);
+    try skew_db.batch(.{ .writes = &.{.{ .key = "k0000", .value = "{\"n\":10}" }} });
+    const deferred_before = skew_db.relational_column_maintenance.ranges_deferred.load(.monotonic);
+    for (0..16) |_| {
+        _ = try skew_db.runRelationalColumnMaintenancePass();
+        if (skew_db.relational_column_maintenance.ranges_deferred.load(.monotonic) > deferred_before) break;
+    }
+    // Do not move the clock back until a deferral exists at the old time.
+    // Otherwise a yielded pass can first create it at 110s, which is not skew.
+    try std.testing.expect(skew_db.relational_column_maintenance.ranges_deferred.load(.monotonic) > deferred_before);
+    const skew_before = skew_db.relational_column_maintenance.blocks_written.load(.monotonic);
     relational_columns.test_now_ns = 110 * std.time.ns_per_s;
-    _ = try db.runRelationalColumnMaintenancePass();
-    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > skew_before);
+    try Progress.expectBuild(&skew_db, skew_before);
 }
 
 test "relational columnar overlays merge mutations in order without scanning clean primary rows" {
@@ -117545,6 +118697,33 @@ test "db ttl falls back to write timestamp when ttl field is missing" {
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 1), text.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
+}
+
+test "db ttl cleanup defers transaction guarded parents without starving other expired rows" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("ttl-read-guards");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchema(.{ .version = 1, .ttl_duration_ns = std.time.ns_per_s });
+    const timestamp = currentTimeNs() - 2 * std.time.ns_per_s;
+    try db.batch(.{ .timestamp_ns = timestamp, .writes = &.{
+        .{ .key = "parent", .value = "{}" }, .{ .key = "free", .value = "{}" },
+    } });
+    const txn = try db.beginTransaction(timestamp + 1);
+    try db.writeIntents(txn, &.{}, &.{.{ .key = "parent", .expected_version = timestamp }});
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .deletes = &.{"parent"} }));
+    var context = TtlCleanupContext{ .batch = db.batchContext(), .grace_period_ns = 0 };
+    const candidates = [_]ttl_runtime_mod.DeleteCandidate{
+        .{ .key = @constCast("parent"), .timestamp_ns = timestamp },
+        .{ .key = @constCast("free"), .timestamp_ns = timestamp },
+    };
+    try std.testing.expectEqual(@as(u32, 1), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
+    try std.testing.expectEqual(@as(?u64, timestamp), try ttl_mod.readTimestamp(db.core.store, alloc, "parent"));
+    try std.testing.expectEqual(@as(?u64, null), try ttl_mod.readTimestamp(db.core.store, alloc, "free"));
+    try db.abortTransaction(txn, timestamp + 2);
+    try std.testing.expectEqual(@as(u32, 1), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
+    try std.testing.expectEqual(@as(?u64, null), try ttl_mod.readTimestamp(db.core.store, alloc, "parent"));
 }
 
 test "db ttl cleanup reclaims expired documents through normal delete semantics" {

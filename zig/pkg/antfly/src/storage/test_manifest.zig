@@ -20,6 +20,15 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("relational_index.zig");
+    _ = @import("db/relational_index_keys.zig");
+    _ = @import("db/relational_index_plan.zig");
+    _ = @import("db/relational_index_catalog.zig");
+    _ = @import("db/relational_index_records.zig");
+    _ = @import("db/relational_index_jobs.zig");
+    _ = @import("db/relational_constraint_jobs.zig");
+    _ = @import("db/relational_index_gc.zig");
+    _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
     _ = @import("artifact_payload.zig");
     _ = @import("dense_work_admission.zig");

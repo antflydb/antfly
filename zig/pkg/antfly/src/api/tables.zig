@@ -3738,6 +3738,73 @@ test "metadata.table status encoder emits antfly-style shard map" {
     try std.testing.expectEqualStrings("postgres", replication_sources[0].object.get("type").?.string);
 }
 
+test "metadata.table relational storage mode survives create and status round trips" {
+    const alloc = std.testing.allocator;
+    var request = try parseCreateTableRequest(alloc,
+        \\{"schema":{"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"column":"tenant","collation":"ci"},{"column":"id","direction":"desc","nulls":"last"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}}
+    );
+    defer request.deinit(alloc);
+    const schema_json = request.schema_json.?;
+    var schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer schema.deinit(alloc);
+    try std.testing.expect(schema.storage_mode == .relational);
+    try std.testing.expect(schema.enforce_types);
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "rows",
+            .schema_json = schema_json,
+            .read_schema_json = schema_json,
+            .indexes_json = "{}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const detail = (try encodeSingleTableStatus(alloc, &snapshot, "rows")).?;
+    defer alloc.free(detail);
+    const list = try encodeTableList(alloc, &snapshot, null);
+    defer alloc.free(list);
+    for ([_][]const u8{ detail, list }) |encoded| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer parsed.deinit();
+        const table = if (parsed.value == .array) parsed.value.array.items[0].object else parsed.value.object;
+        try std.testing.expectEqualStrings("relational", table.get("schema").?.object.get("storage_mode").?.string);
+        const migration_schema = table.get("migration").?.object.get("read_schema").?.object;
+        try std.testing.expectEqualStrings("relational", migration_schema.get("storage_mode").?.string);
+        for ([_]std.json.ObjectMap{ table.get("schema").?.object, migration_schema }) |public_schema| {
+            const indexes = public_schema.get("relational_indexes").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), indexes.len);
+            const keys = indexes[0].object.get("keys").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("ci", keys[0].object.get("collation").?.string);
+            try std.testing.expectEqualStrings("desc", keys[1].object.get("direction").?.string);
+            try std.testing.expectEqualStrings("last", keys[1].object.get("nulls").?.string);
+        }
+    }
+}
+
+test "metadata.table document storage mode remains optional in public schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"storage_mode\":\"document\"}" }, 0..) |schema_json, i| {
+        const schema = try parseTableSchema(alloc, schema_json);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, schema, .{ .emit_null_optional_fields = false });
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{});
+        if (i == 0) {
+            try std.testing.expect(parsed.object.get("storage_mode") == null);
+        } else {
+            try std.testing.expectEqualStrings("document", parsed.object.get("storage_mode").?.string);
+        }
+    }
+}
+
 test "metadata.table detail encoder includes replication source status and action hint" {
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },

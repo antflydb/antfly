@@ -33,6 +33,13 @@ type (
 	TableStatus                  = oapi.TableStatus
 	TableMigration               = oapi.TableMigration
 	TableSchema                  = oapi.TableSchema
+	TableStorageMode             = oapi.TableStorageMode
+	RelationalIndexDefinition    = oapi.RelationalIndexDefinition
+	RelationalCheckConstraint    = oapi.RelationalCheckConstraint
+	RelationalComparisonOp       = oapi.RelationalComparisonOp
+	RelationalIndexKey           = oapi.RelationalIndexKey
+	RelationalIndexKeyDirection  = oapi.RelationalIndexKeyDirection
+	RelationalIndexKeyNulls      = oapi.RelationalIndexKeyNulls
 	IndexConfig                  = oapi.IndexConfig
 	CreateIndexRequest           = oapi.CreateIndexRequest
 	CreateFullTextIndexRequest   = oapi.CreateFullTextIndexRequest
@@ -504,6 +511,24 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 }
 
 const (
+	TableStorageModeDocument            = oapi.TableStorageModeDocument
+	TableStorageModeRelational          = oapi.TableStorageModeRelational
+	RelationalIndexKeyDirectionAsc      = oapi.RelationalIndexKeyDirectionAsc
+	RelationalIndexKeyDirectionDesc     = oapi.RelationalIndexKeyDirectionDesc
+	RelationalIndexKeyNullsDefault      = oapi.RelationalIndexKeyNullsDefault
+	RelationalIndexKeyNullsFirst        = oapi.RelationalIndexKeyNullsFirst
+	RelationalIndexKeyNullsLast         = oapi.RelationalIndexKeyNullsLast
+	RelationalComparisonOpEq            = oapi.RelationalComparisonOpEq
+	RelationalComparisonOpNe            = oapi.RelationalComparisonOpNe
+	RelationalComparisonOpGt            = oapi.RelationalComparisonOpGt
+	RelationalComparisonOpGte           = oapi.RelationalComparisonOpGte
+	RelationalComparisonOpLt            = oapi.RelationalComparisonOpLt
+	RelationalComparisonOpLte           = oapi.RelationalComparisonOpLte
+	RelationalComparisonOpIsNull        = oapi.RelationalComparisonOpIsNull
+	RelationalComparisonOpIsNotNull     = oapi.RelationalComparisonOpIsNotNull
+	RelationalComparisonOpIsDistinct    = oapi.RelationalComparisonOpIsDistinct
+	RelationalComparisonOpIsNotDistinct = oapi.RelationalComparisonOpIsNotDistinct
+
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
 

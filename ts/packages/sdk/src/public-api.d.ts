@@ -10328,6 +10328,69 @@ export interface components {
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
         CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
         /**
+         * @description Storage representation for the table. Omission selects "document".
+         *     "relational" stores schema-bound typed rows and requires exactly one
+         *     closed document schema with declared properties. It implies
+         *     enforce_types; explicitly setting enforce_types to false is invalid.
+         *     Existing JSON document write and read APIs remain available. This
+         *     setting alone does not declare primary keys or unique constraints.
+         * @enum {string}
+         */
+        TableStorageMode: "document" | "relational";
+        /** @enum {string} */
+        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        /**
+         * @description A typed scalar CHECK. New writes are checked from schema publication;
+         *     existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+         *     Comparison values must match the column type. Integer values may also
+         *     use exact decimal strings to avoid client-side floating-point rounding.
+         */
+        RelationalCheckConstraint: {
+            name: string;
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand. */
+            value?: unknown;
+            /** @description String comparison collation; uses the same rules as ordered indexes. */
+            collation?: string;
+        };
+        /**
+         * @description Direction of one ordered index key component. Omission selects asc.
+         * @enum {string}
+         */
+        RelationalIndexKeyDirection: "asc" | "desc";
+        /**
+         * @description Null placement for one ordered index key component. The default is
+         *     last for ascending keys and first for descending keys. Omission selects default.
+         * @enum {string}
+         */
+        RelationalIndexKeyNulls: "default" | "first" | "last";
+        /** @description Ordered component of a relational ordered-tuple index key. */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column: string;
+            /**
+             * @description String-key collation. Omission selects binary ordering. Supported
+             *     binary aliases are C, POSIX, and binary. The aliases ci,
+             *     case_insensitive, and antfly.case_insensitive select ASCII-only
+             *     case folding, not locale-aware or Unicode case folding.
+             */
+            collation?: string;
+            direction?: components["schemas"]["RelationalIndexKeyDirection"];
+            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
+        };
+        /**
+         * @description Declarative table-owned ordered index. Keys are compared lexicographically
+         *     in the declared order, with independent direction, null placement, and
+         *     string collation. Creation builds existing rows asynchronously; queries
+         *     must wait for range-local coverage. Unique constraints, expressions,
+         *     partial predicates, and covering payloads are not implied by this object.
+         */
+        RelationalIndexDefinition: {
+            name: string;
+            keys: components["schemas"]["RelationalIndexKey"][];
+        };
+        /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
          *     corresponding runtime type: number/integer to numeric, bool to boolean,
@@ -10509,6 +10572,22 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description Named scalar CHECK constraints for a relational schema. This is
+             *     part of the complete schema: omission or [] declares no checks.
+             *     New writes enforce every check. Existing-row validation status is
+             *     maintained separately and is never accepted from the client.
+             */
+            checks?: components["schemas"]["RelationalCheckConstraint"][];
+            /**
+             * @description Desired ordered indexes for a relational table. Names must be unique.
+             *     An explicit array replaces the declarations; an empty array drops
+             *     them. Omission preserves existing declarations during schema updates.
+             *     Index definitions commit atomically with the schema; build progress
+             *     and readiness are local to each owning shard, not client-writable.
+             */
+            relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**

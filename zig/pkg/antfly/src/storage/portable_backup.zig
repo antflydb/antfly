@@ -25,6 +25,11 @@ const doc_identity = @import("db/doc_identity.zig");
 const relational_store = @import("db/relational_store.zig");
 const relational_row_codec = @import("db/algebraic/relational_row_codec.zig");
 const table_catalog = @import("db/table_catalog.zig");
+const relational_index_catalog = @import("db/relational_index_catalog.zig");
+const relational_index_records = @import("db/relational_index_records.zig");
+const relational_index_plans = @import("db/relational_index_plan.zig");
+const relational_index_keys = @import("db/relational_index_keys.zig");
+const schema_registry = @import("db/schema_registry.zig");
 const storage_schema = @import("schema.zig");
 const SchemaSpool = @import("schema_spool.zig").Spool;
 const public_table_schema = @import("../schema/mod.zig");
@@ -563,6 +568,20 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 
     var counts = Counts{};
 
+    // Head precedes its one active immutable blob in the manifest, regardless
+    // of store key order. Retired blobs are not runtime definitions and must
+    // not make backup memory/size grow with catalog churn.
+    if (try relational_index_catalog.load(alloc, scan)) |value| {
+        var catalog = value;
+        defer catalog.deinit();
+        const key = relational_index_catalog.blobKey(catalog.head.blob_digest);
+        const payload = try backup_codec.encodeKeyValueBatch(alloc, &.{
+            .{ .key = relational_index_catalog.head_key, .value = try scan.get(relational_index_catalog.head_key) },
+            .{ .key = &key, .value = try scan.get(&key) },
+        });
+        defer alloc.free(payload);
+        try out.writeBlock(.metadata_batch, payload);
+    }
     var cursor = try scan.openCursor();
     defer cursor.close();
     // AFB2 is manifest-first regardless of the backend's physical key order.
@@ -573,6 +592,8 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     while (scan_entry) |kv| : (scan_entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, kv.key, portable_metadata_prefix)) break;
         if (!isPortableMetadataKey(kv.key)) continue;
+        if (std.mem.eql(u8, kv.key, relational_index_catalog.head_key) or
+            std.mem.startsWith(u8, kv.key, relational_index_catalog.blob_prefix)) continue;
         if (std.mem.startsWith(u8, kv.key, schema_version_prefix)) {
             const layout = try storage_schema.deserializeSchema(alloc, kv.value);
             defer storage_schema.freeSchema(alloc, layout);
@@ -601,6 +622,11 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     scan_entry = try nextPortableDataEntry(&cursor, try cursor.first(), out.stats);
     while (scan_entry) |kv| : (scan_entry = try nextPortableDataEntry(&cursor, try cursor.next(), out.stats)) {
         if (isPortableMetadataKey(kv.key)) continue;
+        // Ordered indexes are derived from canonical rows during staged import.
+        // Do not copy stale generations or serialize each tuple twice. The
+        // active definition manifest is emitted before the primary-row stream.
+        if (relational_index_records.isForwardKey(kv.key) or internal_keys.isRelationalIndexReverseKey(kv.key))
+            continue;
 
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
             try identity_batch.append(alloc, .{
@@ -1028,6 +1054,8 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
 
 pub fn isPortableMetadataKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
+        std.mem.eql(u8, key, relational_index_catalog.head_key) or
+        std.mem.startsWith(u8, key, relational_index_catalog.blob_prefix) or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json") or
         std.mem.startsWith(u8, key, public_table_schema.versioned_schema_key_prefix) or
@@ -1758,7 +1786,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
     var raw = backup_codec.SliceReader.init(data);
     var reader = try PortableArchiveReader(backup_codec.SliceReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
-    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
+    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader, opts);
 
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
@@ -1811,7 +1839,7 @@ pub fn importPortableFileWithOptions(
     var raw = backup_codec.FileReader.init(io, file, file_size);
     var reader = try PortableArchiveReader(backup_codec.FileReader).initWithBase(&raw, opts.bundle_base);
     defer reader.deinit(alloc);
-    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader);
+    const imported_identity = try importPortablePrimaryBlocks(alloc, store, &reader, opts);
     try reader.verifyFingerprint(validated_fingerprint);
     try finishPortableIdentityImport(alloc, store, opts, imported_identity);
     if (opts.import_derived_indexes) {
@@ -1838,14 +1866,14 @@ fn validateAndImportPortableStagingReader(
     store: *DocStore,
     reader: anytype,
     opts: ImportOptions,
-) !bool {
+) anyerror!bool {
     const header = try reader.readHeader();
     if (header.format_version < backup_codec.format_version) {
         // Preserve AFB1 compatibility; its metadata ordering was unspecified.
         try reader.reset(alloc);
         try validatePortableImportReader(alloc, reader, opts);
         try reader.reset(alloc);
-        const imported_identity = try importPortablePrimaryBlocks(alloc, store, reader);
+        const imported_identity = try importPortablePrimaryBlocks(alloc, store, reader, opts);
         if (opts.import_derived_indexes) {
             try reader.reset(alloc);
             try importPortableDerivedBlocks(alloc, store, reader, opts);
@@ -1853,6 +1881,16 @@ fn validateAndImportPortableStagingReader(
         return imported_identity;
     }
 
+    return try validateAndImportPortableStagingAfterHeader(alloc, store, reader, opts, header);
+}
+
+fn validateAndImportPortableStagingAfterHeader(
+    alloc: Allocator,
+    store: *DocStore,
+    reader: anytype,
+    opts: ImportOptions,
+    header: backup_codec.FileHeader,
+) !bool {
     var archive: PortableArchiveValidation = .{
         .format_version = header.format_version,
         .schema_cache_bytes = opts.schema_cache_bytes,
@@ -1925,8 +1963,16 @@ pub fn importPortableFile(alloc: Allocator, store: *DocStore, io: std.Io, file: 
     return try importPortableFileWithOptions(alloc, store, io, file, file_size, .{});
 }
 
-fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anytype) !bool {
-    _ = try reader.readHeader();
+fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anytype, opts: ImportOptions) !bool {
+    const header = try reader.readHeader();
+    if (header.format_version >= 2) {
+        // The preflight path must build exactly the same row-derived indexes
+        // as unpublished one-pass restoration. Other derived blocks retain
+        // their existing dependency-ordered second import pass.
+        var primary_opts = opts;
+        primary_opts.import_derived_indexes = false;
+        return try validateAndImportPortableStagingAfterHeader(alloc, store, reader, primary_opts, header);
+    }
     var imported_identity = false;
 
     while (reader.hasRemaining()) {
@@ -2045,6 +2091,11 @@ const PortableArchiveValidation = struct {
     saw_document_block: bool = false,
     document_row_count: u64 = 0,
     runtime_schema: ?storage_schema.TableSchema = null,
+    relational_index_head: ?relational_index_catalog.Head = null,
+    relational_index_schema_digest: ?[32]u8 = null,
+    relational_index_definitions: ?relational_index_catalog.Loaded = null,
+    relational_index_plan: ?relational_index_plans.View = null,
+    index_projection: ?IndexProjection = null,
     runtime_physical_layout: ?relational_row_codec.PhysicalLayout = null,
     layouts: std.AutoHashMapUnmanaged(u32, SchemaSpool.Ref) = .empty,
     active_public_validator: ?public_table_schema.CompiledTableValidator = null,
@@ -2066,6 +2117,20 @@ const PortableArchiveValidation = struct {
         fn deinit(self: *DecodedEpoch, alloc: Allocator) void {
             self.arena.deinit();
             alloc.destroy(self.arena);
+        }
+    };
+
+    // One hot source projection is retained independently of the bounded
+    // history cache. It owns its epoch, so cache eviction/map relocation cannot
+    // invalidate ordinal bindings. Unused schema history is never projected.
+    const IndexProjection = struct {
+        view: schema_registry.SchemaView,
+        tuples: []relational_index_keys.TuplePlan,
+
+        fn deinit(self: *IndexProjection, alloc: Allocator) void {
+            for (self.tuples) |*tuple| tuple.deinit();
+            alloc.free(self.tuples);
+            self.view.release();
         }
     };
 
@@ -2172,6 +2237,9 @@ const PortableArchiveValidation = struct {
     }
 
     fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+        if (self.index_projection) |*projection| projection.deinit(alloc);
+        if (self.relational_index_plan) |*plan| plan.release();
+        if (self.relational_index_definitions) |*definitions| definitions.deinit();
         if (self.runtime_physical_layout) |*layout| layout.deinit();
         if (self.runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
         self.clearDecoded(alloc);
@@ -2182,6 +2250,53 @@ const PortableArchiveValidation = struct {
         self.public_validators.deinit(alloc);
         self.public_digests.deinit(alloc);
         self.* = undefined;
+    }
+
+    fn ensureIndexPlan(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        if (self.relational_index_head == null or self.relational_index_plan != null) return;
+        const definitions = if (self.relational_index_definitions) |*value| value else return error.InvalidMetadataBatch;
+        const schema = self.runtime_schema orelse return error.InvalidMetadataBatch;
+        var view: schema_registry.SchemaView = .{ .epoch = try schema_registry.Epoch.createCloned(alloc, schema) };
+        defer view.release();
+        self.relational_index_plan = relational_index_catalog.bindWritePlan(alloc, view, definitions) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMetadataBatch,
+        };
+        // Metadata-only validation may already have decoded schema history.
+        self.clearDecoded(alloc);
+    }
+
+    fn projectIndexTuples(self: *PortableArchiveValidation, alloc: Allocator, source: storage_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout) ![]relational_index_keys.TuplePlan {
+        const plan = self.relational_index_plan orelse return &.{};
+        const tuples = try alloc.alloc(relational_index_keys.TuplePlan, plan.boundIndexes().len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tuples[0..initialized]) |*tuple| tuple.deinit();
+            alloc.free(tuples);
+        }
+        for (plan.boundIndexes(), tuples) |index, *tuple| {
+            tuple.* = try index.tuple.projectSource(alloc, source, layout);
+            initialized += 1;
+        }
+        return tuples;
+    }
+
+    fn indexTuplesForVersion(self: *PortableArchiveValidation, alloc: Allocator, version: u32) !?*const IndexProjection {
+        try self.ensureIndexPlan(alloc);
+        const plan = self.relational_index_plan orelse return null;
+        if (self.index_projection) |*projection| if (projection.view.version() == version) return projection;
+        // Release before replacing, bounding retained work to one projection
+        // even for archives with many wide historical layouts.
+        if (self.index_projection) |*projection| projection.deinit(alloc);
+        self.index_projection = null;
+        var view = if (plan.schemaView().version() == version) plan.schemaView().clone() else blk: {
+            const source = (try self.layoutForVersion(version)) orelse return error.InvalidBackupRequest;
+            break :blk schema_registry.SchemaView{ .epoch = try schema_registry.Epoch.createCloned(alloc, source.schema.*) };
+        };
+        errdefer view.release();
+        const tuples = try self.projectIndexTuples(alloc, view.tableSchema().*, view.physicalLayout());
+        self.index_projection = .{ .view = view, .tuples = tuples };
+        return &self.index_projection.?;
     }
 
     fn validatorForVersion(
@@ -2214,10 +2329,21 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
+        try self.ensureIndexPlan(alloc);
         if (self.saw_document_rows and self.saw_relational_rows) return error.InvalidBackupRequest;
         if (self.saw_relational_rows and self.format_version < 2) return error.InvalidBackupRequest;
 
         const runtime_relational = if (self.runtime_schema) |schema| schema.storage_mode == .relational else false;
+        if (self.relational_index_head) |head| {
+            const runtime_schema = self.runtime_schema orelse return error.InvalidMetadataBatch;
+            const expected = self.relational_index_schema_digest orelse return error.InvalidMetadataBatch;
+            if (!runtime_relational or head.schema_version != runtime_schema.version) return error.InvalidMetadataBatch;
+            const encoded = try storage_schema.serializeSchema(alloc, runtime_schema);
+            defer alloc.free(encoded);
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(encoded, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &expected)) return error.InvalidMetadataBatch;
+        }
         const public_relational = if (self.active_public_validator) |validator| validator.schema.storage_mode == .relational else false;
         if (self.active_public_validator != null and self.runtime_schema != null and runtime_relational != public_relational)
             return error.InvalidBackupRequest;
@@ -2361,11 +2487,14 @@ fn validatePortableImportBlockPayload(
 }
 
 fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8, archive: *PortableArchiveValidation) !void {
+    try archive.ensureIndexPlan(alloc);
     const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
     defer alloc.free(entries);
     var validation_arena = std.heap.ArenaAllocator.init(alloc);
     defer validation_arena.deinit();
     for (entries) |entry| {
+        if (entry.value_flags & backup_codec.doc_value_flag_relational_row != 0)
+            _ = try archive.indexTuplesForVersion(alloc, try relational_store.rowSchemaVersion(entry.value));
         try validatePortableDocumentEntryAgainstArchive(validation_arena.allocator(), entry, archive);
         _ = validation_arena.reset(.retain_capacity);
         archive.document_row_count = std.math.add(u64, archive.document_row_count, 1) catch return error.InvalidBackupRequest;
@@ -2382,12 +2511,32 @@ fn validateAndImportDocumentBatchPayload(
     payload: []const u8,
     archive: *PortableArchiveValidation,
 ) !void {
+    try archive.ensureIndexPlan(alloc);
     const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
     defer alloc.free(entries);
     var validation_arena = std.heap.ArenaAllocator.init(alloc);
     defer validation_arena.deinit();
+    var index_read: ?DocStore.Txn = if (archive.relational_index_plan != null) try store.beginReadTxn() else null;
+    defer if (index_read) |*txn| txn.abort();
+    var index_stage: ?relational_index_records.Staged = if (index_read) |*txn| relational_index_records.Staged.init(alloc, txn) else null;
+    defer if (index_stage) |*stage| stage.deinit();
+    var index_writer = relational_index_records.Writer.init(alloc);
+    defer index_writer.deinit();
+    var tuple_bytes = std.ArrayList(u8).empty;
+    defer tuple_bytes.deinit(alloc);
     for (entries) |entry| {
         try validatePortableDocumentEntryAgainstArchive(validation_arena.allocator(), entry, archive);
+        if (index_stage) |*stage| {
+            const version = try relational_store.rowSchemaVersion(entry.value);
+            const projection = (try archive.indexTuplesForVersion(alloc, version)).?;
+            const source = projection.view.tableSchema().*;
+            for (archive.relational_index_plan.?.boundIndexes(), projection.tuples) |index, tuple| {
+                const row = try relational_row_codec.ordinalRowViewTrusted(entry.value, source, tuple.layout);
+                tuple_bytes.clearRetainingCapacity();
+                _ = try tuple.append(alloc, &tuple_bytes, row);
+                _ = try index_writer.upsert(stage, index, entry.key, tuple_bytes.items, .new_or_building);
+            }
+        }
         _ = validation_arena.reset(.retain_capacity);
         archive.document_row_count = std.math.add(u64, archive.document_row_count, 1) catch
             return error.InvalidBackupRequest;
@@ -2396,7 +2545,7 @@ fn validateAndImportDocumentBatchPayload(
         else
             archive.saw_document_rows = true;
     }
-    try importDecodedDocumentEntries(alloc, store, entries);
+    try importDecodedDocumentEntries(alloc, store, entries, if (index_stage) |*stage| try stage.seal() else null);
 }
 
 fn validatePortableDocumentEntryAgainstArchive(
@@ -2485,7 +2634,21 @@ fn validateMetadataEntries(
 ) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
-        if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
+        if (std.mem.eql(u8, entry.key, relational_index_catalog.head_key)) {
+            if (archive.format_version < 2) return error.InvalidMetadataBatch;
+            if (archive.relational_index_head != null) return error.InvalidMetadataBatch;
+            archive.relational_index_head = relational_index_catalog.Head.decode(entry.value) catch return error.InvalidMetadataBatch;
+        } else if (std.mem.startsWith(u8, entry.key, relational_index_catalog.blob_prefix)) {
+            const head = archive.relational_index_head orelse return error.InvalidMetadataBatch;
+            if (archive.relational_index_schema_digest != null or
+                !std.mem.eql(u8, entry.key, &relational_index_catalog.blobKey(head.blob_digest))) return error.InvalidMetadataBatch;
+            const catalog = relational_index_catalog.decode(alloc, head, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.relational_index_schema_digest = catalog.schema_digest;
+            archive.relational_index_definitions = catalog;
+        } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
             if (archive.runtime_schema != null) return error.InvalidMetadataBatch;
             const schema = storage_schema.deserializeSchema(alloc, entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -2671,13 +2834,14 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, payload);
     defer alloc.free(entries);
 
-    try importDecodedDocumentEntries(alloc, store, entries);
+    try importDecodedDocumentEntries(alloc, store, entries, null);
 }
 
 fn importDecodedDocumentEntries(
     alloc: Allocator,
     store: *DocStore,
     entries: []const backup_codec.DocumentEntry,
+    index_effects: ?relational_index_records.Staged.Effects,
 ) !void {
     // Build KV pairs with internal keys. Decoded entry values already remain
     // alive through putBatch, so only decompressed values need another buffer.
@@ -2713,9 +2877,9 @@ fn importDecodedDocumentEntries(
         }
     }
 
-    if (writes.items.len > 0) {
-        try store.putBatch(writes.items, &.{});
-    }
+    if (index_effects) |effects| try writes.appendSlice(alloc, effects.writes);
+    if (writes.items.len > 0)
+        try store.putBatch(writes.items, if (index_effects) |effects| effects.deletes else &.{});
 }
 
 fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
@@ -3360,6 +3524,77 @@ test "portable backup round trips relational rows and schema metadata" {
     const restored_timestamp = try dst.get(alloc, timestamp_key);
     defer alloc.free(restored_timestamp);
     try std.testing.expectEqual(@as(u64, 1234), std.mem.readInt(u64, restored_timestamp[0..8], .little));
+}
+
+test "portable relational index metadata validates ordered ownership checksums and schema binding" {
+    const alloc = std.testing.allocator;
+    const native = @import("relational_index.zig");
+    const schema = storage_schema.TableSchema{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .integer }},
+    };
+    var registry = try @import("db/schema_registry.zig").Registry.initCloned(alloc, std.testing.io, schema);
+    defer registry.deinit();
+    var view = registry.acquire().?;
+    defer view.release();
+    var prepared = try relational_index_catalog.Prepared.init(alloc, view, null, &.{.{
+        .name = "by_id",
+        .owner_kind = .table,
+        .owner_name = native.relational_table_index_owner_name,
+        .access_method = .ordered_tuple,
+        .keys = &.{.{ .column = "id" }},
+    }});
+    defer prepared.deinit();
+    const encoded_schema = try storage_schema.serializeSchema(alloc, schema);
+    defer alloc.free(encoded_schema);
+    const head = prepared.head.encode();
+    const blob_key = relational_index_catalog.blobKey(prepared.head.blob_digest);
+    const entries = [_]backup_codec.KeyValueEntry{
+        .{ .key = relational_index_catalog.head_key, .value = &head },
+        .{ .key = &blob_key, .value = prepared.blob },
+        .{ .key = storage_schema.schema_key, .value = encoded_schema },
+    };
+    {
+        var archive = PortableArchiveValidation{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try validateMetadataEntries(alloc, &entries, &archive);
+        try archive.finish(alloc);
+        try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, entries[0..1], &archive));
+        try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, entries[1..2], &archive));
+    }
+    {
+        var archive = PortableArchiveValidation{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, entries[1..2], &archive));
+        try validateMetadataEntries(alloc, &.{ entries[0], entries[2] }, &archive);
+        try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+        prepared.blob[prepared.blob.len - 1] ^= 1;
+        try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, entries[1..2], &archive));
+        prepared.blob[prepared.blob.len - 1] ^= 1;
+    }
+    {
+        var archive = PortableArchiveValidation{ .format_version = backup_codec.format_version };
+        defer archive.deinit(alloc);
+        try validateMetadataEntries(alloc, entries[0..2], &archive);
+        try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+        var different = schema;
+        different.version = 2;
+        const encoded = try storage_schema.serializeSchema(alloc, different);
+        defer alloc.free(encoded);
+        try validateMetadataEntries(alloc, &.{.{ .key = storage_schema.schema_key, .value = encoded }}, &archive);
+        try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    const prefix = try relational_index_records.forwardPrefix(.{ .generation = 1, .slot = 0 });
+    try store.put(&prefix, "");
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(alloc);
+    // Orphaned derived keys are not authoritative archive contents.
+    try exportPortable(alloc, &store, &output);
 }
 
 test "portable restore validates historical rows with their public schema epoch" {

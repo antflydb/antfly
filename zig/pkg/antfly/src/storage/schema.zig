@@ -238,7 +238,7 @@ pub const TableSchema = struct {
 // Schema storage key
 // ============================================================================
 
-const schema_key = "\x00\x00__metadata__:schema";
+pub const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 // ============================================================================
@@ -1263,6 +1263,21 @@ pub fn saveEncodedSchemaWithMetadata(
     metadata_writes: []const docstore.KVPair,
     metadata_deletes: []const []const u8,
 ) !bool {
+    return saveEncodedSchemaWithMetadataAndStage(store, alloc, schema_version, data, metadata_writes, metadata_deletes, null);
+}
+
+/// A prepared participant may CAS/stage schema-dependent metadata after the
+/// schema puts, but before the SAME transaction commits. The caller publishes
+/// its already-compiled runtime state only after this function succeeds.
+pub fn saveEncodedSchemaWithMetadataAndStage(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+    participant: anytype,
+) !bool {
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
         std.mem.readInt(u32, data[8..12], .little) != schema_version)
         return error.InvalidSchema;
@@ -1306,7 +1321,9 @@ pub fn saveEncodedSchemaWithMetadata(
         };
         break :changed_blk true;
     };
-    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    if (comptime @TypeOf(participant) == @TypeOf(null)) {
+        if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    }
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
@@ -1324,6 +1341,7 @@ pub fn saveEncodedSchemaWithMetadata(
         error.NotFound => {},
         else => return err,
     };
+    if (comptime @TypeOf(participant) != @TypeOf(null)) _ = try participant.stage(&txn);
     try txn.commit();
     return schema_changed;
 }

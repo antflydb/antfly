@@ -88,6 +88,141 @@ components:
           minLength: 1
           description: Timestamp field used as the expiration reference.
 
+    TableStorageMode:
+      type: string
+      enum: [document, relational]
+      description: |
+        Storage representation for the table. Omission selects "document".
+        "relational" stores schema-bound typed rows and requires exactly one
+        closed document schema with declared properties. It implies
+        enforce_types; explicitly setting enforce_types to false is invalid.
+        Existing JSON document write and read APIs remain available. This
+        setting alone does not declare primary keys or unique constraints.
+
+    RelationalIndexAccessMethod:
+      type: string
+      enum: [scalar_column, ordered_tuple, algebraic_filter, text_search]
+      description: Physical access method of a relational index.
+
+    RelationalIndexLifecycle:
+      type: string
+      enum: [ready, building, invalid, dropping, catching_up, stale, rebuild_required, failed]
+      description: |
+        Lifecycle of a relational index generation. Query eligibility additionally
+        requires complete coverage and no unapplied mutations; ready alone is
+        not an integrity proof.
+
+    RelationalIndexKeyDirection:
+      type: string
+      enum: [asc, desc]
+      description: Direction of one ordered index key component. Omission selects asc.
+
+    RelationalIndexKeyNulls:
+      type: string
+      enum: [default, first, last]
+      description: |
+        Null placement for one ordered index key component. The default is
+        last for ascending keys and first for descending keys. Omission selects default.
+
+    RelationalIndexKey:
+      type: object
+      additionalProperties: false
+      required: [column]
+      description: Ordered component of a relational ordered-tuple index key.
+      properties:
+        column:
+          type: string
+          minLength: 1
+          description: Declared relational column used by this key component.
+        collation:
+          type: string
+          minLength: 1
+          description: |
+            String-key collation. Omission selects binary ordering. Supported
+            binary aliases are C, POSIX, and binary. The aliases ci,
+            case_insensitive, and antfly.case_insensitive select ASCII-only
+            case folding, not locale-aware or Unicode case folding.
+        direction:
+          $ref: "#/components/schemas/RelationalIndexKeyDirection"
+        nulls:
+          $ref: "#/components/schemas/RelationalIndexKeyNulls"
+
+    RelationalIndexOwnerKind:
+      type: string
+      enum: [relational_column, unique_constraint, table]
+      description: Logical schema object that owns a relational index.
+
+    ForeignKeyAction:
+      type: string
+      enum: [restrict, set_null, cascade, no_action]
+      description: Action on referencing rows when a referenced row is changed or removed.
+
+    ForeignKeyTiming:
+      type: string
+      enum: [immediate, deferred]
+      description: Whether foreign-key enforcement occurs immediately or at transaction commit.
+
+    ForeignKeyMatch:
+      type: string
+      enum: [simple, full, partial]
+      description: Null matching semantics of a composite foreign key.
+
+    RelationalConstraintValidationState:
+      type: string
+      enum: [enforced, unvalidated, validating, invalid]
+      description: Validation state of an existing-row constraint.
+
+    RelationalComparisonOp:
+      type: string
+      enum: [is_null, is_not_null, eq, ne, gt, gte, lt, lte, is_distinct, is_not_distinct]
+
+    RelationalCheckConstraint:
+      type: object
+      additionalProperties: false
+      required: [name, column, op]
+      description: |
+        A typed scalar CHECK. New writes are checked from schema publication;
+        existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+        Comparison values must match the column type. Integer values may also
+        use exact decimal strings to avoid client-side floating-point rounding.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: "#/components/schemas/RelationalComparisonOp"
+        value:
+          description: Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
+        collation:
+          type: string
+          description: String comparison collation; uses the same rules as ordered indexes.
+
+    RelationalIndexDefinition:
+      type: object
+      additionalProperties: false
+      required: [name, keys]
+      description: |
+        Declarative table-owned ordered index. Keys are compared lexicographically
+        in the declared order, with independent direction, null placement, and
+        string collation. Creation builds existing rows asynchronously; queries
+        must wait for range-local coverage. Unique constraints, expressions,
+        partial predicates, and covering payloads are not implied by this object.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/RelationalIndexKey"
+
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -97,6 +232,30 @@ components:
           format: uint32
           readOnly: true
           description: Backend-managed schema generation used for migrations. Omit it from create and update requests.
+        storage_mode:
+          $ref: "#/components/schemas/TableStorageMode"
+        checks:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalCheckConstraint"
+          description: |
+            Named scalar CHECK constraints for a relational schema. This is
+            part of the complete schema: omission or [] declares no checks.
+            New writes enforce every check. Existing-row validation status is
+            maintained separately and is never accepted from the client.
+        relational_indexes:
+          type: array
+          x-go-type-skip-optional-pointer: false
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalIndexDefinition"
+          description: |
+            Desired ordered indexes for a relational table. Names must be unique.
+            An explicit array replaces the declarations; an empty array drops
+            them. Omission preserves existing declarations during schema updates.
+            Index definitions commit atomically with the schema; build progress
+            and readiness are local to each owning shard, not client-writable.
         default_type:
           type: string
           description: Default type to use from the document_types.

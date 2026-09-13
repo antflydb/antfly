@@ -318,6 +318,11 @@ pub const PreparedRelationalWrite = struct {
     packed_row: []u8,
     semantic_hash: document_content_hash.Digest,
     schema_version: u32,
+    /// Borrowed immutable preparation identity. The request retains its epoch;
+    /// a matching numeric version from another table/registry is not sufficient
+    /// to reinterpret trusted row bytes under that registry's layout.
+    physical_layout: *const relational_row_codec.PhysicalLayout,
+    schema_columns: []const runtime_schema.RelationalColumn,
     metadata_finalized: bool = false,
     owned_region: ?*PreparedRowRegion = null,
     packed_row_owned_individually: bool = true,
@@ -478,6 +483,8 @@ pub const PreparedRelationalWrite = struct {
                 .packed_row = packed_bytes,
                 .semantic_hash = intent_digest.?,
                 .schema_version = table_schema.version,
+                .physical_layout = physical_layout,
+                .schema_columns = table_schema.relational_columns,
             };
         }
         const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
@@ -494,6 +501,8 @@ pub const PreparedRelationalWrite = struct {
             .packed_row = prepared_row.bytes,
             .semantic_hash = prepared_row.semantic_hash,
             .schema_version = table_schema.version,
+            .physical_layout = physical_layout,
+            .schema_columns = table_schema.relational_columns,
         };
     }
 
@@ -506,6 +515,9 @@ pub const PreparedRelationalWrite = struct {
     /// Trusted because this request just encoded the row. This view is valid
     /// even before timestamp/checksum finalization and borrows the row region.
     pub fn typedView(self: *const PreparedRelationalWrite, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout) !relational_row_codec.OrdinalRowView {
+        if (self.schema_version != schema.version or self.physical_layout != layout or
+            self.schema_columns.ptr != schema.relational_columns.ptr or self.schema_columns.len != schema.relational_columns.len)
+            return error.RelationalRowSchemaMismatch;
         return try relational_row_codec.ordinalRowViewTrusted(self.packed_row, schema, layout);
     }
 

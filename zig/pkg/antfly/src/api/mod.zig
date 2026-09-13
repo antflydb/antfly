@@ -40,6 +40,7 @@ const multi_node_e2e = @import("multi_node_e2e.zig");
 pub const table_catalog = @import("table_catalog.zig");
 pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
+pub const relational_contract = @import("relational_contract.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 const openapi_contract = @import("openapi_contract.zig");
@@ -243,6 +244,7 @@ test "api module compiles" {
     _ = table_catalog;
     _ = table_router;
     _ = tables;
+    _ = relational_contract;
     _ = table_contract;
     _ = indexes;
     _ = openapi_contract;

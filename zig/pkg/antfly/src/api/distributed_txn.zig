@@ -4025,6 +4025,8 @@ test "distributed txn coordinator groups by range and commits all participants" 
     const Recorder = struct {
         begins: std.ArrayListUnmanaged(u64) = .empty,
         prepares: std.ArrayListUnmanaged(u64) = .empty,
+        read_only_prepares: usize = 0,
+        coordinator_group: u64 = 7001,
         resolves: std.ArrayListUnmanaged(struct {
             group_id: u64,
             status: db_mod.types.TxnStatus,
@@ -4061,6 +4063,7 @@ test "distributed txn coordinator groups by range and commits all participants" 
         fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len > 0);
+            if (req.req.writes.len == 0 and req.req.deletes.len == 0) self.read_only_prepares += 1;
             try self.prepares.append(std.testing.allocator, group_id);
         }
 
@@ -4080,8 +4083,8 @@ test "distributed txn coordinator groups by range and commits all participants" 
 
         fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(@as(u64, 7001), group_id);
-            try std.testing.expectEqualStrings("table2:00000004:docs:7002", req.participant);
+            try std.testing.expectEqual(self.coordinator_group, group_id);
+            try std.testing.expectEqualStrings(if (group_id == 7001) "table2:00000004:docs:7002" else "table2:00000004:docs:7001", req.participant);
             try self.acknowledgements.append(std.testing.allocator, group_id);
         }
     };
@@ -4149,6 +4152,30 @@ test "distributed txn coordinator groups by range and commits all participants" 
     try std.testing.expectEqual(@as(usize, 4), recorder.resolves.items.len);
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[2].sync_level);
     try std.testing.expectEqual(db_mod.types.SyncLevel.write, recorder.resolves.items[3].sync_level);
+
+    // A parent dependency may route to a shard with no user writes. It still
+    // needs a prepare vote and terminal resolution; dropping this participant
+    // would bypass the durable shared read guard used by relational mutations.
+    recorder.coordinator_group = 7002;
+    const dependent_outcome = try executeMultiTableCommit(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        try parseTxnIdHex("20112233445566778899aabbccddeeff"),
+        30_000,
+        30_001,
+        &.{.{
+            .table_name = "docs",
+            .writes = &.{.{ .key = "doc:z", .value = "{\"child\":true}" }},
+            .predicates = &.{.{ .key = "doc:a", .expected_version = 500 }},
+        }},
+        .write,
+        null,
+    );
+    try std.testing.expect(dependent_outcome == .committed);
+    try std.testing.expectEqual(@as(usize, 2), dependent_outcome.committed.participant_count);
+    try std.testing.expectEqual(@as(usize, 1), recorder.read_only_prepares);
+    try std.testing.expectEqual(@as(usize, 6), recorder.resolves.items.len);
 }
 
 test "stable distributed transaction retry resumes a durable commit decision" {

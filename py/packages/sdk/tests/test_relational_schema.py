@@ -1,0 +1,66 @@
+"""Public relational storage-mode request and response contracts."""
+
+import pytest
+
+from antfly.client_generated.models.create_table_request import CreateTableRequest
+from antfly.client_generated.models.relational_check_constraint import RelationalCheckConstraint
+from antfly.client_generated.models.relational_comparison_op import RelationalComparisonOp
+from antfly.client_generated.models.relational_index_definition import RelationalIndexDefinition
+from antfly.client_generated.models.relational_index_key import RelationalIndexKey
+from antfly.client_generated.models.relational_index_key_direction import RelationalIndexKeyDirection
+from antfly.client_generated.models.relational_index_key_nulls import RelationalIndexKeyNulls
+from antfly.client_generated.models.table_schema import TableSchema
+from antfly.client_generated.models.table_status import TableStatus
+from antfly.client_generated.models.table_storage_mode import TableStorageMode
+
+
+@pytest.mark.parametrize("mode", list(TableStorageMode))
+def test_storage_mode_is_typed_and_survives_round_trips(mode: TableStorageMode) -> None:
+    schema = TableSchema(storage_mode=mode)
+    request = CreateTableRequest(schema=schema)
+    encoded = request.to_dict()
+    assert encoded["schema"]["storage_mode"] == mode.value
+    assert CreateTableRequest.from_dict(encoded).schema.storage_mode is mode
+    status = TableStatus.from_dict(
+        {"name": "rows", "schema": schema.to_dict(), "indexes": {}, "shards": {}, "storage_status": {}}
+    )
+    assert status.schema.storage_mode is mode
+    assert status.to_dict()["schema"]["storage_mode"] == mode.value
+
+
+def test_check_constraint_exact_integer_and_null_round_trip() -> None:
+    checks = [
+        RelationalCheckConstraint(name="positive", column="id", op=RelationalComparisonOp.GT, value="9007199254740992"),
+        RelationalCheckConstraint(name="present", column="name", op=RelationalComparisonOp.IS_NOT_NULL),
+    ]
+    encoded = TableSchema(storage_mode=TableStorageMode.RELATIONAL, checks=checks).to_dict()
+    assert encoded["checks"][0]["value"] == "9007199254740992"
+    assert "value" not in encoded["checks"][1]
+    assert TableSchema.from_dict(encoded).to_dict() == encoded
+
+
+def test_storage_mode_omission_preserves_the_document_default() -> None:
+    assert "storage_mode" not in TableSchema().to_dict()
+    assert "storage_mode" not in TableSchema.from_dict({}).to_dict()
+
+
+def test_composite_index_declarations_and_explicit_drop_round_trip() -> None:
+    declarations = [
+        RelationalIndexDefinition(
+            name="tenant_id",
+            keys=[
+                RelationalIndexKey(column="tenant", collation="ci"),
+                RelationalIndexKey(
+                    column="id", direction=RelationalIndexKeyDirection.DESC, nulls=RelationalIndexKeyNulls.LAST
+                ),
+            ],
+        )
+    ]
+    for indexes in (declarations, []):
+        encoded = TableSchema(storage_mode=TableStorageMode.RELATIONAL, relational_indexes=indexes).to_dict()
+        assert "relational_indexes" in encoded
+        decoded = TableSchema.from_dict(encoded)
+        assert decoded.to_dict() == encoded
+        assert isinstance(decoded.relational_indexes, list)
+        assert len(decoded.relational_indexes) == len(indexes)
+    assert "relational_indexes" not in TableSchema().to_dict()

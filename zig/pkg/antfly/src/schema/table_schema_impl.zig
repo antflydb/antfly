@@ -17,16 +17,11 @@ const schema_regex = @import("antfly_regex");
 const geo_mod = @import("../search/geo.zig");
 const storage_schema = @import("../storage/schema.zig");
 
-pub const StorageMode = enum {
-    document,
-    relational,
-
-    pub fn fromString(text: []const u8) ?StorageMode {
-        if (std.mem.eql(u8, text, "document")) return .document;
-        if (std.mem.eql(u8, text, "relational")) return .relational;
-        return null;
-    }
-};
+// The public vocabulary belongs to OpenAPI. storage/schema.zig separately
+// owns the explicitly tagged durable representation.
+pub const StorageMode = @import("antfly_schema_openapi").TableStorageMode;
+const relational_wire = @import("antfly_schema_openapi");
+const relational_native = @import("../storage/relational_index.zig");
 
 pub const TableSchema = struct {
     version: u32 = 0,
@@ -38,8 +33,12 @@ pub const TableSchema = struct {
     document_schemas: []DocumentSchema = &.{},
     dynamic_templates: []DynamicTemplate = &.{},
     index_sort: []IndexSortField = &.{},
+    relational_indexes: ?std.json.Parsed([]const relational_wire.RelationalIndexDefinition) = null,
+    checks: ?std.json.Parsed([]const relational_wire.RelationalCheckConstraint) = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.relational_indexes) |*indexes| indexes.deinit();
+        if (self.checks) |*checks| checks.deinit();
         alloc.free(self.default_type);
         alloc.free(self.ttl_field);
         for (self.document_schemas) |*document_schema| document_schema.deinit(alloc);
@@ -49,6 +48,32 @@ pub const TableSchema = struct {
         for (self.index_sort) |*field| field.deinit(alloc);
         if (self.index_sort.len > 0) alloc.free(self.index_sort);
         self.* = undefined;
+    }
+
+    /// Borrow definition strings from this schema and allocate only the
+    /// binding arrays in a caller-owned preparation arena. Wire enum ordinals
+    /// are deliberately not used as native/durable tags.
+    pub fn relationalIndexDefinitions(self: TableSchema, alloc: std.mem.Allocator) !?[]const relational_native.RelationalIndexDefinition {
+        const declarations = self.relational_indexes orelse return null;
+        const definitions = try alloc.alloc(relational_native.RelationalIndexDefinition, declarations.value.len);
+        for (declarations.value, definitions) |declaration, *definition| {
+            const keys = try alloc.alloc(relational_native.RelationalIndexKey, declaration.keys.len);
+            for (declaration.keys, keys) |wire, *key| key.* = .{
+                .column = wire.column,
+                .collation = wire.collation,
+                .direction = switch (wire.direction orelse .asc) {
+                    .asc => .asc,
+                    .desc => .desc,
+                },
+                .nulls = switch (wire.nulls orelse .default) {
+                    .default => .default,
+                    .first => .first,
+                    .last => .last,
+                },
+            };
+            definition.* = .{ .name = declaration.name, .keys = keys, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
+        }
+        return definitions;
     }
 };
 
@@ -384,15 +409,22 @@ pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
     properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
     patterns: std.StringHashMapUnmanaged(schema_regex.PreparedPattern) = .empty,
+    checks: ?*@import("relational_checks.zig").Set = null,
 
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
         var plan: CompiledValidationPlan = .{};
         errdefer plan.deinit(alloc);
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
+        if (schema.checks) |checks| if (checks.value.len != 0) {
+            const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
+            errdefer storage_schema.freeSchema(alloc, runtime);
+            plan.checks = try @import("relational_checks.zig").Set.createOwned(alloc, runtime, checks.value);
+        };
         return plan;
     }
 
     pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
+        if (self.checks) |checks| checks.deinit();
         var maps = self.properties.valueIterator();
         while (maps.next()) |map| map.deinit(alloc);
         self.properties.deinit(alloc);
@@ -869,6 +901,15 @@ pub fn validateDocumentValueWithPlan(
         defer path.deinit(alloc);
         try validatePhysicalDocumentValue(alloc, physical_fields, &path, value.*, false);
     }
+    if (schema.checks) |checks| if (checks.value.len != 0) {
+        if (compiled) |plan| {
+            if (try plan.checks.?.firstViolationJson(alloc, value.*) != null) return error.RelationalCheckViolation;
+        } else {
+            var plan = try CompiledValidationPlan.init(alloc, schema);
+            defer plan.deinit(alloc);
+            if (try plan.checks.?.firstViolationJson(alloc, value.*) != null) return error.RelationalCheckViolation;
+        }
+    };
 }
 
 fn validatePhysicalDocumentValue(
@@ -980,7 +1021,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
     if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
         .string => |text| {
-            if (StorageMode.fromString(text) == null) return error.InvalidSchemaUpdateRequest;
+            if (std.meta.stringToEnum(StorageMode, text) == null) return error.InvalidSchemaUpdateRequest;
         },
         else => return error.InvalidSchemaUpdateRequest,
     };
@@ -2135,7 +2176,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("storage_mode")) |storage_mode| {
         if (storage_mode != .null) {
             if (storage_mode != .string) return error.InvalidSchemaUpdateRequest;
-            parsed.storage_mode = StorageMode.fromString(storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
+            parsed.storage_mode = std.meta.stringToEnum(StorageMode, storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
         }
     }
     if (root.get("default_type")) |default_type| {
@@ -2187,6 +2228,53 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     }
     if (root.get("index_sort")) |index_sort| {
         if (index_sort != .null) parsed.index_sort = try parseIndexSort(alloc, index_sort);
+    }
+    if (root.get("relational_indexes")) |indexes| {
+        // Null is not a drop command; explicit [] makes destructive intent
+        // distinguishable from a omitted field in a schema update.
+        if (indexes != .array or indexes.array.items.len > 4096) return error.InvalidSchemaUpdateRequest;
+        parsed.relational_indexes = std.json.parseFromValue([]const relational_wire.RelationalIndexDefinition, alloc, indexes, .{
+            .allocate = .alloc_always,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var names = std.StringHashMapUnmanaged(void).empty;
+        defer names.deinit(alloc);
+        for (parsed.relational_indexes.?.value) |index| {
+            if (index.name.len == 0 or index.name.len > 256 or !std.unicode.utf8ValidateSlice(index.name) or
+                index.keys.len == 0 or index.keys.len > 32 or (try names.getOrPut(alloc, index.name)).found_existing)
+                return error.InvalidSchemaUpdateRequest;
+            var columns = std.StringHashMapUnmanaged(void).empty;
+            defer columns.deinit(alloc);
+            for (index.keys) |key| {
+                if (key.column.len == 0 or (try columns.getOrPut(alloc, key.column)).found_existing)
+                    return error.InvalidSchemaUpdateRequest;
+                if (key.collation) |collation| if (collation.len == 0) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
+    if (root.get("checks")) |checks| {
+        if (checks != .array or checks.array.items.len > 256) return error.InvalidSchemaUpdateRequest;
+        // std.json.Value.jsonParseFromValue borrows its input, even when the
+        // outer typed parser uses alloc_always. Parse scalar operands through
+        // an owned token stream so strings/blobs outlive the request DOM.
+        const checks_json = try std.json.Stringify.valueAlloc(alloc, checks, .{});
+        defer alloc.free(checks_json);
+        parsed.checks = std.json.parseFromSlice([]const relational_wire.RelationalCheckConstraint, alloc, checks_json, .{
+            .allocate = .alloc_always,
+            .parse_numbers = false,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var names = std.StringHashMapUnmanaged(void).empty;
+        defer names.deinit(alloc);
+        for (parsed.checks.?.value) |check| {
+            if (check.name.len == 0 or check.name.len > 256 or !std.unicode.utf8ValidateSlice(check.name) or
+                check.column.len == 0 or (try names.getOrPut(alloc, check.name)).found_existing)
+                return error.InvalidSchemaUpdateRequest;
+        }
     }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
@@ -2282,12 +2370,24 @@ fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
 }
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
-    if (schema.storage_mode != .relational) return;
+    if (schema.storage_mode != .relational) {
+        if (schema.relational_indexes != null or schema.checks != null) return error.InvalidSchemaUpdateRequest;
+        return;
+    }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
     if (schema.dynamic_templates.len != 0) return error.InvalidSchemaUpdateRequest;
     if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
 
     const document_schema = schema.document_schemas[0];
+    if (schema.checks) |checks| for (checks.value) |check| {
+        if (findDocumentProperty(document_schema.properties, check.column) == null) return error.InvalidSchemaUpdateRequest;
+    };
+    if (schema.relational_indexes) |indexes| {
+        for (indexes.value) |index| for (index.keys) |key| {
+            if (findDocumentProperty(document_schema.properties, key.column) == null)
+                return error.InvalidSchemaUpdateRequest;
+        };
+    }
     if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {
         return error.InvalidSchemaUpdateRequest;
     }
@@ -2483,6 +2583,7 @@ fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]Docu
         };
         const property = try parseAnonymousProperty(alloc, context, schema_value.object);
         defer alloc.destroy(property);
+        errdefer property.deinit(alloc);
         document_schemas[initialized] = try parseDocumentSchemaFromProperty(alloc, entry.key_ptr.*, property);
         initialized += 1;
     }
@@ -2558,8 +2659,10 @@ fn parseDocumentProperties(alloc: std.mem.Allocator, context: SchemaContext, obj
         };
         const property = try parseAnonymousProperty(alloc, context, property_object);
         defer alloc.destroy(property);
+        errdefer property.deinit(alloc);
+        const name = try alloc.dupe(u8, entry.key_ptr.*);
         alloc.free(property.name);
-        property.name = try alloc.dupe(u8, entry.key_ptr.*);
+        property.name = name;
         properties[initialized] = property.*;
         initialized += 1;
     }

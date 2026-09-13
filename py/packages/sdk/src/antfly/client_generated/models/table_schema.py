@@ -6,10 +6,13 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.table_storage_mode import TableStorageMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
+    from ..models.relational_check_constraint import RelationalCheckConstraint
+    from ..models.relational_index_definition import RelationalIndexDefinition
     from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
     from ..models.ttl_config import TtlConfig
 
@@ -24,6 +27,23 @@ class TableSchema:
     Attributes:
         version (int | Unset): Backend-managed schema generation used for migrations. Omit it from create and update
             requests.
+        storage_mode (TableStorageMode | Unset): Storage representation for the table. Omission selects "document".
+            "relational" stores schema-bound typed rows and requires exactly one
+            closed document schema with declared properties. It implies
+            enforce_types; explicitly setting enforce_types to false is invalid.
+            Existing JSON document write and read APIs remain available. This
+            setting alone does not declare primary keys or unique constraints.
+        checks (list[RelationalCheckConstraint] | Unset): Named scalar CHECK constraints for a relational schema. This
+            is
+            part of the complete schema: omission or [] declares no checks.
+            New writes enforce every check. Existing-row validation status is
+            maintained separately and is never accepted from the client.
+        relational_indexes (list[RelationalIndexDefinition] | Unset): Desired ordered indexes for a relational table.
+            Names must be unique.
+            An explicit array replaces the declarations; an empty array drops
+            them. Omission preserves existing declarations during schema updates.
+            Index definitions commit atomically with the schema; build progress
+            and readiness are local to each owning shard, not client-writable.
         default_type (str | Unset): Default type to use from the document_types.
         enforce_types (bool | Unset): Whether to enforce that documents must match one of the provided document types.
             If false, documents not matching any type will be accepted but not indexed.
@@ -39,6 +59,9 @@ class TableSchema:
     """
 
     version: int | Unset = UNSET
+    storage_mode: TableStorageMode | Unset = UNSET
+    checks: list[RelationalCheckConstraint] | Unset = UNSET
+    relational_indexes: list[RelationalIndexDefinition] | Unset = UNSET
     default_type: str | Unset = UNSET
     enforce_types: bool | Unset = UNSET
     document_schemas: TableSchemaDocumentSchemas | Unset = UNSET
@@ -52,6 +75,24 @@ class TableSchema:
         from ..models.ttl_config import TtlConfig
 
         version = self.version
+
+        storage_mode: str | Unset = UNSET
+        if not isinstance(self.storage_mode, Unset):
+            storage_mode = self.storage_mode.value
+
+        checks: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.checks, Unset):
+            checks = []
+            for checks_item_data in self.checks:
+                checks_item = checks_item_data.to_dict()
+                checks.append(checks_item)
+
+        relational_indexes: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.relational_indexes, Unset):
+            relational_indexes = []
+            for relational_indexes_item_data in self.relational_indexes:
+                relational_indexes_item = relational_indexes_item_data.to_dict()
+                relational_indexes.append(relational_indexes_item)
 
         default_type = self.default_type
 
@@ -85,6 +126,12 @@ class TableSchema:
         field_dict.update({})
         if version is not UNSET:
             field_dict["version"] = version
+        if storage_mode is not UNSET:
+            field_dict["storage_mode"] = storage_mode
+        if checks is not UNSET:
+            field_dict["checks"] = checks
+        if relational_indexes is not UNSET:
+            field_dict["relational_indexes"] = relational_indexes
         if default_type is not UNSET:
             field_dict["default_type"] = default_type
         if enforce_types is not UNSET:
@@ -105,11 +152,38 @@ class TableSchema:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.dynamic_template import DynamicTemplate
+        from ..models.relational_check_constraint import RelationalCheckConstraint
+        from ..models.relational_index_definition import RelationalIndexDefinition
         from ..models.table_schema_document_schemas import TableSchemaDocumentSchemas
         from ..models.ttl_config import TtlConfig
 
         d = dict(src_dict)
         version = d.pop("version", UNSET)
+
+        _storage_mode = d.pop("storage_mode", UNSET)
+        storage_mode: TableStorageMode | Unset
+        if isinstance(_storage_mode, Unset):
+            storage_mode = UNSET
+        else:
+            storage_mode = TableStorageMode(_storage_mode)
+
+        _checks = d.pop("checks", UNSET)
+        checks: list[RelationalCheckConstraint] | Unset = UNSET
+        if _checks is not UNSET:
+            checks = []
+            for checks_item_data in _checks:
+                checks_item = RelationalCheckConstraint.from_dict(checks_item_data)
+
+                checks.append(checks_item)
+
+        _relational_indexes = d.pop("relational_indexes", UNSET)
+        relational_indexes: list[RelationalIndexDefinition] | Unset = UNSET
+        if _relational_indexes is not UNSET:
+            relational_indexes = []
+            for relational_indexes_item_data in _relational_indexes:
+                relational_indexes_item = RelationalIndexDefinition.from_dict(relational_indexes_item_data)
+
+                relational_indexes.append(relational_indexes_item)
 
         default_type = d.pop("default_type", UNSET)
 
@@ -154,6 +228,9 @@ class TableSchema:
 
         table_schema = cls(
             version=version,
+            storage_mode=storage_mode,
+            checks=checks,
+            relational_indexes=relational_indexes,
             default_type=default_type,
             enforce_types=enforce_types,
             document_schemas=document_schemas,

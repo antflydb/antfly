@@ -1,0 +1,320 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Optimistic, bounded build pages. Preparation never holds apply-exclusive.
+//! Publication fences the immutable plan, namespace, owner range, progress CAS,
+//! and each source row. Live mutations already maintain the selected generation,
+//! so changed/deleted candidates can be skipped without losing coverage.
+const std = @import("std");
+const platform_time = @import("antfly_platform").time;
+const catalog = @import("relational_index_catalog.zig");
+const plans = @import("relational_index_plan.zig");
+const records = @import("relational_index_records.zig");
+const tuples = @import("relational_index_keys.zig");
+const registry = @import("schema_registry.zig");
+const codec = @import("algebraic/relational_row_codec.zig");
+const row_store = @import("relational_store.zig");
+const internal = @import("../internal_keys.zig");
+const docstore = @import("../docstore.zig");
+const range_state = @import("range_state.zig");
+const Allocator = std.mem.Allocator;
+const Digest = [32]u8;
+pub const progress_prefix = "\x00\x00__metadata__:relational_index_progress:";
+const header_len = 100;
+const max_cursor_bytes = 1024 * 1024;
+const full_range = [_]u8{0} ** 8;
+
+fn digest(bytes: []const u8) Digest {
+    var result: Digest = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &result, .{});
+    return result;
+}
+
+pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };
+pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 2 };
+
+pub const Progress = struct {
+    id: records.Id,
+    owner: Digest,
+    comparison: Digest,
+    state: State = .building,
+    rows_scanned: u64 = 0,
+    cursor: []const u8 = "",
+    failure: Failure = .none,
+
+    pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
+        if (self.cursor.len > max_cursor_bytes or (self.state == .ready and self.cursor.len != 0) or
+            (self.state == .failed) != (self.failure != .none))
+            return error.InvalidRelationalIndexProgress;
+        const out = try alloc.alloc(u8, header_len + self.cursor.len + 32);
+        @memcpy(out[0..4], "AIRP");
+        std.mem.writeInt(u32, out[4..8], 1, .little);
+        @memcpy(out[8..20], &self.id.encode());
+        @memcpy(out[20..52], &self.owner);
+        @memcpy(out[52..84], &self.comparison);
+        out[84] = @intFromEnum(self.state);
+        out[85] = @intFromEnum(self.failure);
+        @memset(out[86..88], 0);
+        std.mem.writeInt(u64, out[88..96], self.rows_scanned, .little);
+        std.mem.writeInt(u32, out[96..100], @intCast(self.cursor.len), .little);
+        @memcpy(out[header_len..][0..self.cursor.len], self.cursor);
+        @memcpy(out[out.len - 32 ..], &digest(out[0 .. out.len - 32]));
+        return out;
+    }
+
+    /// Borrows the cursor from bytes. Framing and checksum validation allocate
+    /// nothing; progress cannot force an unbounded cursor allocation on reopen.
+    pub fn decode(bytes: []const u8) !Progress {
+        if (bytes.len < header_len + 32 or bytes.len > header_len + max_cursor_bytes + 32 or
+            !std.mem.eql(u8, bytes[0..4], "AIRP") or std.mem.readInt(u32, bytes[4..8], .little) != 1 or
+            !std.mem.eql(u8, bytes[86..88], &.{ 0, 0 })) return error.InvalidRelationalIndexProgress;
+        const size = std.mem.readInt(u32, bytes[96..100], .little);
+        if (size != bytes.len - header_len - 32 or
+            !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32])))
+            return error.InvalidRelationalIndexProgress;
+        const state: State = switch (bytes[84]) {
+            0 => .building,
+            1 => .ready,
+            2 => .failed,
+            else => return error.InvalidRelationalIndexProgress,
+        };
+        if (state == .ready and size != 0) return error.InvalidRelationalIndexProgress;
+        const failure: Failure = switch (bytes[85]) {
+            0 => .none,
+            1 => .incompatible_schema,
+            2 => .invalid_row,
+            else => return error.InvalidRelationalIndexProgress,
+        };
+        if ((state == .failed) != (failure != .none)) return error.InvalidRelationalIndexProgress;
+        return .{
+            .id = try records.Id.decode(bytes[8..20]),
+            .owner = bytes[20..52].*,
+            .comparison = bytes[52..84].*,
+            .state = state,
+            .failure = failure,
+            .rows_scanned = std.mem.readInt(u64, bytes[88..96], .little),
+            .cursor = bytes[header_len..][0..size],
+        };
+    }
+
+    pub fn matches(self: Progress, index: plans.BoundIndex, owner: Digest) bool {
+        return self.id.mapKey() == index.id().mapKey() and std.mem.eql(u8, &self.owner, &owner) and
+            std.mem.eql(u8, &self.comparison, &index.tuple.fingerprint);
+    }
+};
+
+pub fn progressKey(id: records.Id) [progress_prefix.len + records.Id.encoded_len]u8 {
+    var key: [progress_prefix.len + records.Id.encoded_len]u8 = undefined;
+    @memcpy(key[0..progress_prefix.len], progress_prefix);
+    @memcpy(key[progress_prefix.len..], &id.encode());
+    return key;
+}
+
+fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
+    return txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
+    const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
+    return digest(range);
+}
+
+pub fn status(txn: *docstore.DocStore.Txn, index: plans.BoundIndex) !Progress {
+    const owner = try ownership(txn);
+    const raw = try getOptional(txn, &progressKey(index.id()));
+    if (raw) |bytes| {
+        const current = try Progress.decode(bytes);
+        if (current.matches(index, owner)) return current;
+    }
+    return .{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint };
+}
+
+pub const Budget = struct {
+    /// Includes artifact records skipped between primary rows, preventing a
+    /// high-fanout document from monopolizing the planner.
+    records: usize = 256,
+    bytes: usize = 1024 * 1024,
+    time_ns: u64 = 5 * std.time.ns_per_ms,
+
+    fn validate(self: Budget) !void {
+        if (self.records == 0 or self.records > 4096 or self.bytes == 0 or self.bytes > 16 * 1024 * 1024 or
+            self.time_ns == 0 or self.time_ns > std.time.ns_per_s) return error.InvalidRelationalIndexBudget;
+    }
+};
+
+pub const Page = struct {
+    arena: std.heap.ArenaAllocator,
+    pinned: catalog.WriteSnapshot,
+    index_offset: usize,
+    namespace_generation: u64,
+    expected: ?[]const u8,
+    next: Progress,
+    candidates: []const Candidate,
+    failed_source: ?FailedSource = null,
+    consumed: bool = false,
+
+    const Candidate = struct { primary: []const u8, document: []const u8, hash: Digest, tuple: []const u8 };
+    const FailedSource = struct { primary: []const u8, hash: Digest };
+
+    fn prepareTuple(alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, encoded: *std.ArrayList(u8)) !void {
+        const version = try row_store.rowSchemaVersion(value);
+        if (source.* == null or source.*.?.version() != version) {
+            if (projected.*) |*tuple| tuple.deinit();
+            projected.* = null;
+            if (source.*) |*view| view.release();
+            source.* = null;
+            source.* = if (pinned.plan.schemaView().version() == version) pinned.plan.schemaView().clone() else (try core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            projected.* = try index.tuple.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
+        }
+        const typed = try codec.ordinalRowView(value, source.*.?.tableSchema().*, source.*.?.physicalLayout());
+        encoded.clearRetainingCapacity();
+        _ = try projected.*.?.append(alloc, encoded, typed);
+    }
+
+    pub fn deinit(self: *Page) void {
+        self.pinned.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Core supplies immutable historical schema views. Its store and registry
+    /// must remain alive; callers hold the DB lifecycle/snapshot admission lease.
+    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget) !?Page {
+        try budget.validate();
+        if (io) |runtime_io| try runtime_io.checkCancel();
+        const namespace_generation = core.schemaNamespaceGeneration();
+        var pinned = core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        var transferred = false;
+        defer if (!transferred) pinned.deinit();
+        const index_offset = for (pinned.plan.boundIndexes(), 0..) |index, i| {
+            if (std.mem.eql(u8, index.name, name)) break i;
+        } else return error.IndexNotFound;
+        const index = pinned.plan.boundIndexes()[index_offset];
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer if (!transferred) arena.deinit();
+        const page_alloc = arena.allocator();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        var progress = try status(&read, index);
+        if (progress.state != .building) return null;
+        const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
+        const range_raw = (try getOptional(&read, range_state.range_key)) orelse &full_range;
+        const range = try range_state.decodeRangeAlloc(page_alloc, range_raw);
+        const lower = try internal.documentExactPrefixAlloc(page_alloc, range.start);
+        const upper: []const u8 = if (range.end.len != 0) try internal.documentExactPrefixAlloc(page_alloc, range.end) else &.{internal.user_namespace + 1};
+        if (progress.cursor.len != 0 and (std.mem.order(u8, progress.cursor, lower) == .lt or std.mem.order(u8, progress.cursor, upper) != .lt))
+            return error.InvalidRelationalIndexProgress;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var candidates = std.ArrayList(Candidate).empty;
+        var source: ?registry.SchemaView = null;
+        defer if (source) |*view| view.release();
+        var projected: ?tuples.TuplePlan = null;
+        defer if (projected) |*tuple| tuple.deinit();
+        var encoded = std.ArrayList(u8).empty;
+        defer encoded.deinit(alloc);
+        var inspected: usize = 0;
+        var bytes: usize = 0;
+        const started = platform_time.monotonicNs();
+        var after = progress.cursor;
+        var exhausted = true;
+        var failed_source: ?FailedSource = null;
+        var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (io) |runtime_io| try runtime_io.checkCancel();
+            if (progress.cursor.len != 0 and std.mem.order(u8, kv.key, progress.cursor) != .gt) continue;
+            if (std.mem.order(u8, kv.key, upper) != .lt) break;
+            inspected += 1;
+            bytes +|= kv.key.len;
+            after = try page_alloc.dupe(u8, kv.key);
+            if (internal.isRelationalRowKey(kv.key)) {
+                bytes +|= kv.value.len;
+                prepareTuple(alloc, core, pinned, index, kv.value, &source, &projected, &encoded) catch |err| {
+                    progress.failure = switch (err) {
+                        error.UnknownSchemaVersion, error.RelationalIndexColumnNotFound, error.RelationalIndexColumnTypeMismatch, error.RelationalRowSchemaMismatch => .incompatible_schema,
+                        error.InvalidRelationalRow, error.UnsupportedRelationalRowVersion, error.RelationalRowChecksumMismatch, error.InvalidColumnValue => .invalid_row,
+                        else => return err,
+                    };
+                    progress.state = .failed;
+                    failed_source = .{ .primary = after, .hash = digest(kv.value) };
+                    candidates.clearRetainingCapacity();
+                    break;
+                };
+                const document = (try internal.decodeStoredDocumentRowKeyAlloc(page_alloc, kv.key)).?;
+                try candidates.append(page_alloc, .{ .primary = after, .document = document, .hash = digest(kv.value), .tuple = try page_alloc.dupe(u8, encoded.items) });
+                progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
+            }
+            if (inspected >= budget.records or bytes >= budget.bytes or platform_time.monotonicNs() - started >= budget.time_ns) {
+                exhausted = false;
+                break;
+            }
+        }
+        if (failed_source == null) progress.state = if (exhausted) .ready else .building;
+        progress.cursor = if (progress.state == .ready) "" else after;
+        transferred = true;
+        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
+    }
+
+    /// Caller holds apply-exclusive and rechecks its HA/ownership authority.
+    /// No progress is published before the same transaction's index writes.
+    pub fn commit(self: *Page, core: anytype) !void {
+        if (self.consumed) return error.RelationalIndexPageConsumed;
+        self.consumed = true;
+        if (core.schemaNamespaceGeneration() != self.namespace_generation or !core.relational_indexes.isCurrent(self.pinned))
+            return error.PreparedGenerationChanged;
+        var txn = try core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (!std.mem.eql(u8, &self.next.owner, &(try ownership(&txn)))) return error.PreparedGenerationChanged;
+        const key = progressKey(self.next.id);
+        const actual = try getOptional(&txn, &key);
+        if ((actual == null) != (self.expected == null) or (actual != null and !std.mem.eql(u8, actual.?, self.expected.?)))
+            return error.PreparedGenerationChanged;
+        if (self.failed_source) |failed| {
+            // A repaired/deleted bad row invalidates failure just as a changed
+            // source invalidates successful work. Do not publish stale failure.
+            const current = (try getOptional(&txn, failed.primary)) orelse return error.PreparedGenerationChanged;
+            if (!std.mem.eql(u8, &failed.hash, &digest(current))) return error.PreparedGenerationChanged;
+        }
+        var writer = records.Writer.init(self.arena.allocator());
+        defer writer.deinit();
+        const index = self.pinned.plan.boundIndexes()[self.index_offset];
+        for (self.candidates) |candidate| {
+            const current = (try getOptional(&txn, candidate.primary)) orelse continue;
+            if (!std.mem.eql(u8, &candidate.hash, &digest(current))) continue;
+            _ = try writer.upsert(&txn, index, candidate.document, candidate.tuple, .new_or_building);
+        }
+        const encoded = try self.next.encode(self.arena.allocator());
+        try txn.put(&key, encoded);
+        try txn.commit();
+    }
+};
+
+test "relational index progress checksums framing and readiness are strict" {
+    const alloc = std.testing.allocator;
+    const original = Progress{ .id = .{ .generation = 7, .slot = 2 }, .owner = @splat(1), .comparison = @splat(2), .rows_scanned = 19, .cursor = "\x01row\x00\x00\x12" };
+    const encoded = try original.encode(alloc);
+    defer alloc.free(encoded);
+    const decoded = try Progress.decode(encoded);
+    try std.testing.expectEqualStrings(original.cursor, decoded.cursor);
+    try std.testing.expectEqual(original.rows_scanned, decoded.rows_scanned);
+    encoded[20] ^= 1;
+    try std.testing.expectError(error.InvalidRelationalIndexProgress, Progress.decode(encoded));
+    var invalid = original;
+    invalid.state = .ready;
+    try std.testing.expectError(error.InvalidRelationalIndexProgress, invalid.encode(alloc));
+}

@@ -37,6 +37,7 @@ const range_state_mod = @import("range_state.zig");
 const schema_mod = @import("../schema.zig");
 const public_schema_mod = @import("../../schema/mod.zig");
 const schema_registry_mod = @import("schema_registry.zig");
+const relational_index_catalog_mod = @import("relational_index_catalog.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const shard_mod = @import("../shard.zig");
@@ -83,6 +84,8 @@ pub const PreparedSchemaMetadata = struct {
     epoch: ?*schema_registry_mod.Epoch,
     publication: ?schema_registry_mod.Registry.PublishReservation = null,
     base_schema_view: ?schema_registry_mod.SchemaView = null,
+    base_relational_indexes: ?relational_index_catalog_mod.WriteSnapshot = null,
+    relational_indexes: ?relational_index_catalog_mod.PreparedPublication = null,
     same_version_layout_matches: bool = false,
     combined_writes: []docstore_mod.KVPair,
 
@@ -123,6 +126,8 @@ pub const PreparedSchemaMetadata = struct {
     }
 
     pub fn deinit(self: *PreparedSchemaMetadata) void {
+        if (self.relational_indexes) |*indexes| indexes.deinit();
+        if (self.base_relational_indexes) |*indexes| indexes.deinit();
         if (self.publication) |*publication| publication.deinit();
         if (self.base_schema_view) |*view| view.release();
         if (self.epoch) |epoch| epoch.release();
@@ -498,6 +503,7 @@ pub const DBCore = struct {
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     schema_registry: *schema_registry_mod.Registry,
+    relational_indexes: relational_index_catalog_mod.Controller,
     table_catalog: table_catalog_mod.Catalog,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
@@ -506,7 +512,10 @@ pub const DBCore = struct {
     pub fn fromOpened(alloc: Allocator, io: std.Io, opened: OpenedCoreResources) !DBCore {
         const schema_registry = try alloc.create(schema_registry_mod.Registry);
         errdefer alloc.destroy(schema_registry);
-        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, io, opened.schema);
+        // Install the complete active epoch once. Publishing a layout-only
+        // epoch first would make same-version deduplication discard its public
+        // validator, silently losing enforcement after every reopen.
+        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, io, null);
         errdefer schema_registry.deinit();
         // Historical layouts remain durable and are installed lazily on the
         // first row that references them. Large, long-lived tables should not
@@ -519,10 +528,10 @@ pub const DBCore = struct {
             defer if (public_json) |json| alloc.free(json);
             if (active_schema.requires_public_schema and public_json == null)
                 return error.InvalidSchemaUpdateRequest;
-            if (public_json) |json| {
-                var validator = try public_schema_mod.CompiledTableValidator.init(alloc, json);
+            {
+                var validator = if (public_json) |json| try public_schema_mod.CompiledTableValidator.init(alloc, json) else null;
                 var validator_owned = true;
-                errdefer if (validator_owned) validator.deinit(alloc);
+                errdefer if (validator_owned) if (validator) |*compiled| compiled.deinit(alloc);
                 const active_encoded = try schema_mod.serializeSchema(alloc, active_schema);
                 defer alloc.free(active_encoded);
                 const active_clone = try schema_mod.deserializeSchema(alloc, active_encoded);
@@ -534,6 +543,9 @@ pub const DBCore = struct {
                 try schema_registry.publishPrepared(active_epoch);
             }
         }
+        var index_schema_view = schema_registry.acquire();
+        defer if (index_schema_view) |*view| view.release();
+        const relational_indexes = try relational_index_catalog_mod.Controller.init(alloc, io, opened.store, index_schema_view);
         opened.index_manager.setSchemaRegistry(schema_registry);
         return .{
             .alloc = alloc,
@@ -553,6 +565,7 @@ pub const DBCore = struct {
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
             .schema_registry = schema_registry,
+            .relational_indexes = relational_indexes,
             .table_catalog = opened.table_catalog,
             .identity_namespace = opened.identity_namespace,
             .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
@@ -562,6 +575,7 @@ pub const DBCore = struct {
 
     pub fn deinit(self: *DBCore) void {
         self.index_manager.deinit();
+        self.relational_indexes.deinit();
         self.schema_registry.deinit();
         self.alloc.destroy(self.schema_registry);
         self.identity_visibility.clearLive();
@@ -1310,9 +1324,11 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
+        try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
         var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
         errdefer prepared.deinit();
         prepared.base_schema_view = self.schema_registry.acquire();
+        prepared.base_relational_indexes = self.relational_indexes.acquire();
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {
                 const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
@@ -1320,6 +1336,16 @@ pub const DBCore = struct {
                 prepared.same_version_layout_matches = std.mem.eql(u8, base_encoded, prepared.encoded);
             }
         }
+        const next_view = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
+        prepared.relational_indexes = declarations: {
+            if (next_view.validator()) |validator| {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                if (try validator.schema.relationalIndexDefinitions(arena.allocator())) |definitions|
+                    break :declarations try self.relational_indexes.prepare(next_view, definitions);
+            }
+            break :declarations try self.relational_indexes.prepareSchemaChange(next_view);
+        };
         prepared.publication = try self.schema_registry.preparePublish(table_schema.version);
         return prepared;
     }
@@ -1333,7 +1359,9 @@ pub const DBCore = struct {
     ) !bool {
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
+        try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
         if (!prepared.publication.?.isCurrent()) return error.PreparedGenerationChanged;
+        if (!self.relational_indexes.isCurrent(prepared.base_relational_indexes)) return error.PreparedGenerationChanged;
         if (prepared.base_schema_view) |view| {
             if (!self.schema_registry.isCurrent(view)) return error.PreparedGenerationChanged;
         } else if (self.schema != null) {
@@ -1350,6 +1378,16 @@ pub const DBCore = struct {
                 return error.InvalidSchemaUpdateRequest;
         }
         if (self.schema == null and table_schema.storage_mode == .relational) {
+            var manager = try self.initTxnManager();
+            defer manager.deinit();
+            if (try manager.hasSchemaLeases()) return error.SchemaInUse;
+        }
+        // An outstanding durable intent cannot be reinterpreted under a new
+        // index generation. Ordinary request pins may retry, but transaction
+        // leases must finish before an indexed table changes its schema.
+        const check_constraints = (if (prepared.base_schema_view) |view| if (view.validator()) |validator| validator.execution.checks != null else false else false) or
+            (if (prepared.epoch.?.validator) |validator| validator.execution.checks != null else false);
+        if (!same_active_epoch and (prepared.base_relational_indexes != null or prepared.relational_indexes != null or check_constraints)) {
             var manager = try self.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.SchemaInUse;
@@ -1374,7 +1412,15 @@ pub const DBCore = struct {
         const catalog_data = next_catalog.encode();
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
         prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
-        const changed = try schema_mod.saveEncodedSchemaWithMetadata(
+        const changed = if (prepared.relational_indexes) |*indexes| try schema_mod.saveEncodedSchemaWithMetadataAndStage(
+            self.store,
+            self.alloc,
+            table_schema.version,
+            prepared.encoded,
+            prepared.combined_writes,
+            metadata_deletes,
+            &indexes.metadata,
+        ) else try schema_mod.saveEncodedSchemaWithMetadata(
             self.store,
             self.alloc,
             table_schema.version,
@@ -1400,6 +1446,7 @@ pub const DBCore = struct {
         prepared.epoch = null;
         prepared.publication.?.publish(next_epoch);
         prepared.publication = null;
+        if (prepared.relational_indexes) |*indexes| self.relational_indexes.publishCommitted(indexes);
         self.table_catalog = next_catalog;
         return changed;
     }
@@ -1548,7 +1595,9 @@ pub const DBCore = struct {
         var replacement = try self.schema_registry.prepareReplaceAll(next_epoch);
         epoch_owned = false;
         defer replacement.deinit();
-        self.replaceSchemaOwnedPrepared(next_schema, &replacement);
+        var indexes = try relational_index_catalog_mod.Controller.loadSnapshot(self.alloc, self.store, if (next_epoch) |epoch| .{ .epoch = epoch } else null);
+        defer if (indexes) |*snapshot| snapshot.deinit();
+        self.replaceSchemaOwnedPrepared(next_schema, &replacement, &indexes);
     }
 
     pub fn prepareSchemaRegistryReplacement(
@@ -1590,12 +1639,15 @@ pub const DBCore = struct {
         self: *DBCore,
         next_schema: ?schema_mod.TableSchema,
         replacement: *schema_registry_mod.Registry.PreparedReplacement,
+        indexes: *?relational_index_catalog_mod.WriteSnapshot,
     ) void {
         std.debug.assert((next_schema == null) == (replacement.current == null));
         if (next_schema) |schema| std.debug.assert(replacement.current.?.schema.version == schema.version);
+        if (indexes.*) |snapshot| std.debug.assert(snapshot.plan.schemaView().epoch == replacement.current.?);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
         self.schema_registry.replaceAllPrepared(replacement);
+        self.relational_indexes.replacePrepared(indexes);
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
