@@ -357,7 +357,7 @@ test "boundary training run selected profiles match exact pinned optimizer group
             expected: ?struct { groups: []const struct { params: []const []const u8, lr: f32, weight_decay: f32 } } = null,
         },
     };
-    const bytes = try @import("../util/c_file.zig").readFileMax(a, "testdata/gliner25/training_optimizer_groups.json", 1024 * 1024);
+    const bytes = try @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(a, "training_optimizer_groups.json");
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(Fixture, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();

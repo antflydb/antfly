@@ -21,9 +21,10 @@ SUPERVISOR = HERE / "process_supervision.py"
 SCOPE = "gliner25_training_attention_supervision/v2"
 MAX_ARTIFACT_BYTES = 64 * 1024**2
 PINS = {
+    "fixture_support.py": {"size_bytes": 2851, "sha256": "07df9f1240763dbf96125481893ae229a31e1b418c916587f2266b4e60da88a4"},
     "capture_training_attention.py": {"size_bytes": 20879, "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f"},
     "training_attention_contract_v1.json": {"size_bytes": 12057, "sha256": "7e512fe4418d006619088093ed7410ddd9a209dcb421954c9fbb14287bbecfcc"},
-    "test_training_attention.py": {"size_bytes": 5899, "sha256": "8c0e7baa07646b2e2b8e3cb2a5dce0ab5dbc467af72f94df359ee2fe555bbcae"},
+    "test_training_attention.py": {"size_bytes": 6003, "sha256": "32a1cea343fbca8f189aaff3a3a0f8f8d6ed1c44a71c2de52f726bfc7f419cc1"},
     "oracle.py": {"size_bytes": 28555, "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752"},
     "oracle_manifest.json": {"size_bytes": 4097, "sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f"},
 }

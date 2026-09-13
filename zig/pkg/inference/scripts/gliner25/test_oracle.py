@@ -14,6 +14,7 @@ from unittest import mock
 import oracle
 import download_model
 import generate_pipeline_cases
+import fixture_support
 
 
 class ProvenanceTest(unittest.TestCase):
@@ -26,6 +27,35 @@ class ProvenanceTest(unittest.TestCase):
         report = oracle.verify_reference_fixtures()
         self.assertGreater(len(report["files"]), 20)
         self.assertFalse(report["native_runtime_qualified"])
+
+    def test_external_references_verify_present_bytes_and_report_missing_coverage(self):
+        report = fixture_support.verify_external_fixtures()
+        self.assertEqual(set(fixture_support.external_inventory()), set(report["files"]) | set(report["missing"]))
+        self.assertEqual(not report["missing"], report["complete"])
+
+    def test_external_policy_skips_only_declared_absence_and_rejects_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(oracle, "FIXTURES", Path(tmp)):
+            pin = {"size_bytes": 8, "sha256": hashlib.sha256(b"original").hexdigest()}
+            manifest = {"format_version": 1, "upstream_commit": oracle.UPSTREAM_COMMIT,
+                        "files": {}, "external_files": {"payload": pin}}
+            oracle.write_json(Path(tmp) / "reference_manifest.json", manifest)
+            with self.assertRaises(unittest.SkipTest):
+                fixture_support.require_fixtures("payload")
+            with self.assertRaises(oracle.ContractError):
+                fixture_support.require_fixtures("unknown")
+            path = Path(tmp) / "payload"
+            path.write_bytes(b"original")
+            fixture_support.require_fixtures("payload")
+            self.assertTrue(fixture_support.verify_external_fixtures()["complete"])
+            path.write_bytes(b"replaced")
+            with self.assertRaisesRegex(oracle.ContractError, "SHA256 mismatch"):
+                fixture_support.require_fixtures("payload")
+            with self.assertRaises(oracle.ContractError):
+                fixture_support.verify_external_fixtures()
+            path.unlink()
+            path.symlink_to(Path(tmp) / "absent")
+            with self.assertRaises(oracle.ContractError):
+                fixture_support.require_fixtures("payload")
 
     def test_same_size_substitution_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

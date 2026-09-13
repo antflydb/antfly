@@ -109,7 +109,7 @@ fixture files byte-identically.
 | `...inactive-adapters-probe-v2/process.json` | 4.04 s | 494,469,120 B | Eight profiles, exit zero, reaped |
 | `...inactive-adapters-probe-v3/process.json` | 2.80 s | 492,027,904 B | Byte-identical repeat, exit zero, reaped |
 
-The stable files are checked in under `testdata/gliner25/training_inactive_adapters/`:
+The external files restore under `testdata/gliner25/training_inactive_adapters/`:
 
 | File | Bytes | SHA-256 |
 |---|---:|---|
@@ -176,7 +176,7 @@ with 494,944,256 bytes peak child-tree RSS; v2 completed in 2.99 s with
 one of their seven output files is byte-identical. Process receipts are under
 `/private/tmp/gliner25-training-inactive-native-epoch-probe-v{1,2}/process.json`.
 
-All seven files are checked in together under
+The small input files remain checked in; the external capture and tensors restore under
 `testdata/gliner25/training_inactive_native_epoch/`, totaling 634,237 bytes.
 The 423,554-byte `capture.json` has SHA-256
 `24cefafa4dde1f7067b3ba81e7b9209495a58a0cb31620c5805b00bec9abdc24`;
@@ -226,7 +226,7 @@ three updates and exact fresh-owner resume within each backend. Their final
 adapters also underwent strict upstream CPU reload and ten fixed requests.
 Those process receipts and output artifacts are campaign data, not fixtures.
 
-The retained tiny source fixtures above remain the numerical regression
+The source fixtures above remain pinned for restoration as the numerical regression
 contract. Published restart/reload consistency does not establish published
 Fastino VJP parity, equality of CPU/Metal updates, broader ranks/backbones,
 full-context training, useful trained quality or release readiness. See

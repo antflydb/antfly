@@ -79,9 +79,9 @@ through shared query/key projections.
 | LoRA | 37 / 36 / 36 | Exact |
 | DoRA | 37 / 36 / 36 | Exact |
 
-The two files under
-[`training_step_dropout`](../../testdata/gliner25/training_step_dropout)
-total 3,263,333 bytes. The capture and tensor hashes are:
+The two external files under `training_step_dropout` total 3,263,333 bytes.
+They are omitted from Git; restore the pinned files to repeat the historical
+validation described here. The capture and tensor hashes are:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |

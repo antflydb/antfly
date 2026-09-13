@@ -756,17 +756,7 @@ const TestTokenizer = struct {
 };
 
 fn readGolden(allocator: Allocator) ![]u8 {
-    const c_file = @import("../util/c_file.zig");
-    for ([_][]const u8{ "", "pkg/inference/", "zig/pkg/inference/" }) |prefix| {
-        const path = try std.fmt.allocPrint(allocator, "{s}testdata/gliner25/preprocessing.json", .{prefix});
-        defer allocator.free(path);
-        const bytes = c_file.readFile(allocator, path) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        return bytes;
-    }
-    return error.FileNotFound;
+    return @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(allocator, "preprocessing.json");
 }
 
 fn expectGolden(allocator: Allocator, tokenizer: Tokenizer, golden: std.json.Value, compare_token_ids: bool) !void {

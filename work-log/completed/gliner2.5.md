@@ -224,7 +224,19 @@ From the repository root, verify checked-in source and fixture identities:
 ```sh
 python3 zig/pkg/inference/scripts/gliner25/oracle.py verify-fixtures
 python3 zig/pkg/inference/scripts/gliner25/oracle.py verify-references
+python3 zig/pkg/inference/scripts/gliner25/fixture_support.py
 ```
+
+Larger numerical payloads are intentionally omitted from this PR pending a
+future object-storage integration. `reference_manifest.json` retains their
+exact names, sizes, and hashes in `external_files`; the generators and tests
+remain. Restored payloads are verified before use. Missing external inputs
+produce explicit test skips, while missing checked-in inputs and corrupt
+restored payloads fail. Default CI therefore has reduced large-fixture parity
+coverage; a passing run does not reproduce the historical full-fixture checks.
+The verifier above reports missing coverage. Add `--require-all` when restoring
+the full set. No download, cloud credentials, or new environment setting is
+required by this interim arrangement.
 
 Source regeneration requires the exact checkout, model artifacts, and
 [pinned environment](../../zig/pkg/inference/scripts/gliner25/requirements.txt).

@@ -10,6 +10,7 @@ import struct
 import sys
 import unittest
 
+import fixture_support
 import capture_training_inactive_adapters as capture
 
 DIRECTORY=capture.oracle.FIXTURES/'training_inactive_adapters'
@@ -61,22 +62,23 @@ def tensor_header(raw):
 
 
 class InactiveAdapterSourceContract(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.metadata=capture.step_capture.expand_metadata(capture.oracle.read_json(DIRECTORY/'capture.json'))
+    def load_fixture(self):
+        fixture_support.require_fixtures("training_inactive_adapters/capture.json", "training_inactive_adapters/tensors.safetensors")
+        self.metadata=capture.step_capture.expand_metadata(capture.oracle.read_json(DIRECTORY/'capture.json'))
         with (DIRECTORY/'tensors.safetensors').open('rb') as stream:
-            cls.raw=stream.read(8 * 1024**2 + 1)
-        cls.header,cls.start=tensor_header(cls.raw)
+            self.raw=stream.read(8 * 1024**2 + 1)
+        self.header,self.start=tensor_header(self.raw)
 
-    @classmethod
-    def floats(cls,key):
-        item=cls.header[key]
+    def floats(self,key):
+        item=self.header[key]
         if item['dtype']!='F32':raise ValueError('expected fixture float32')
         start,end=item['data_offsets'];count=math.prod(item['shape'])
         if end-start!=count*4:raise ValueError('invalid fixture tensor geometry')
-        return struct.unpack('<'+str(count)+'f',cls.raw[cls.start+start:cls.start+end])
+        return struct.unpack('<'+str(count)+'f',self.raw[self.start+start:self.start+end])
 
     def test_pins_tensor_headers_and_provenance_have_no_numerical_import(self):
+        self.load_fixture()
+        fixture_support.require_fixtures("training_step/capture.json", "training_step/tensors.safetensors")
         for name,(size,pin) in PINS.items():
             raw=(DIRECTORY/name).read_bytes();self.assertEqual(size,len(raw));self.assertEqual(pin,hashlib.sha256(raw).hexdigest())
         value=self.metadata;contract=capture.oracle.read_json(capture.CONTRACT)
@@ -114,16 +116,19 @@ class InactiveAdapterSourceContract(unittest.TestCase):
     def test_compact_capture_bindings_resolve_to_bounded_tensor_headers(self):
         for family in ('tasks','training_step','training_step_dropout',
                        'training_inactive_adapters','training_inactive_native_epoch'):
-            directory=capture.oracle.FIXTURES/family
-            metadata=capture.oracle.read_json(directory/'capture.json')
-            for name in ('weights','tensors'):
-                if name not in metadata:continue
-                binding=metadata[name]
-                self.assertEqual({'file','sha256','size_bytes'},set(binding))
-                with (directory/binding['file']).open('rb') as stream:raw=stream.read(8 * 1024**2 + 1)
-                self.assertEqual(binding['size_bytes'],len(raw))
-                self.assertEqual(binding['sha256'],hashlib.sha256(raw).hexdigest())
-                tensor_header(raw)
+            with self.subTest(family=family):
+                names = [name for name in fixture_support.external_inventory() if name.startswith(family + "/")]
+                fixture_support.require_fixtures(*names)
+                directory=capture.oracle.FIXTURES/family
+                metadata=capture.oracle.read_json(directory/'capture.json')
+                for name in ('weights','tensors'):
+                    if name not in metadata:continue
+                    binding=metadata[name]
+                    self.assertEqual({'file','sha256','size_bytes'},set(binding))
+                    with (directory/binding['file']).open('rb') as stream:raw=stream.read(8 * 1024**2 + 1)
+                    self.assertEqual(binding['size_bytes'],len(raw))
+                    self.assertEqual(binding['sha256'],hashlib.sha256(raw).hexdigest())
+                    tensor_header(raw)
 
     def test_tensor_header_rejects_invalid_geometry_and_duplicate_keys(self):
         def encoded(value,payload=b'\0'*8):
@@ -168,6 +173,7 @@ class InactiveAdapterSourceContract(unittest.TestCase):
                 capture.step_capture.expand_metadata(changed)
 
     def test_classifier_fallback_is_zero_present_and_zero_window_advances_all_slots(self):
+        self.load_fixture()
         for profile in self.metadata['profiles']:
             if not profile['id'].endswith('.classifier_only'):continue
             self.assertEqual([2,3,5],profile['flush_after']);self.assertEqual(5,len(profile['microbatches']))
@@ -193,6 +199,7 @@ class InactiveAdapterSourceContract(unittest.TestCase):
                 for name,slot in after['parameters'].items()))
 
     def test_optional_head_touch_keeps_nonzero_objective_and_present_zero_slots(self):
+        self.load_fixture()
         selected=[p for p in self.metadata['profiles'] if p['id'].endswith(('.record_only','.relation_only'))]
         self.assertEqual(4,len(selected))
         for profile in selected:
@@ -204,6 +211,7 @@ class InactiveAdapterSourceContract(unittest.TestCase):
             for slot in profile['flushes'][0]['parameters'].values():self.assertEqual(1,slot['step'])
 
     def test_other_live_path_keeps_unsupervised_classifier_absent_without_losing_prior_accumulation(self):
+        self.load_fixture()
         for profile in self.metadata['profiles']:
             if not profile['id'].endswith('.encoder_classifier'):continue
             micro=profile['microbatches'][1]

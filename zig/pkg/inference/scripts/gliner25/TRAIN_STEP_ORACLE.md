@@ -1,5 +1,9 @@
 # Tiny mixed-task training-step oracle
 
+The validation below used the complete fixture set. Larger captures and tensors
+are now omitted from Git and pinned as external inputs; restore them before
+repeating these checks. See the [fixture policy](../../testdata/gliner25/README.md).
+
 The tiny source capture is complete for full-parameter, head-only, LoRA and
 DoRA profiles. All four native CPU consumers passed exact preprocessing and
 mention targets, every scalar loss, every trainable gradient's presence/value,
@@ -10,7 +14,7 @@ not qualify a production training run. The capture targets upstream commit
 Torch/Transformers/PEFT runtime. It needs no downloaded model.
 
 [`capture_training_step.py`](capture_training_step.py) writes
-[`training_step/capture.json`](../../testdata/gliner25/training_step/capture.json),
+`training_step/capture.json`,
 the typed tensor file, and the exact tiny tokenizer artifacts. The tensor file
 is 1,228,022 bytes; total fixture size stays below 2 MiB. Each profile contains
 three microbatches, two exact source AdamW flushes, all parameter gradients with

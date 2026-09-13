@@ -1,5 +1,31 @@
 # Local training and validation outputs.
 output/
 
-# Versioned GLiNER2.5 evidence ledgers require their bounded raw receipts.
-!testdata/gliner25/**/*.log
+# Optional GLiNER2.5 numerical payloads are pinned in reference_manifest.json.
+/testdata/gliner25/joint_candidates.json
+/testdata/gliner25/joint_optimizer_source_v1/capture.json
+/testdata/gliner25/preprocessing.json
+/testdata/gliner25/records.json
+/testdata/gliner25/regex.json
+/testdata/gliner25/relation_dedup.json
+/testdata/gliner25/small_reference/entity_attributes.safetensors
+/testdata/gliner25/tasks/weights.safetensors
+/testdata/gliner25/tiny/boundary_weights.safetensors
+/testdata/gliner25/training_candidates.json
+/testdata/gliner25/training_encoder/tensors.safetensors
+/testdata/gliner25/training_explicit.json
+/testdata/gliner25/training_head.json
+/testdata/gliner25/training_inactive_adapters/capture.json
+/testdata/gliner25/training_inactive_adapters/tensors.safetensors
+/testdata/gliner25/training_inactive_native_epoch/capture.json
+/testdata/gliner25/training_inactive_native_epoch/tensors.safetensors
+/testdata/gliner25/training_losses.json
+/testdata/gliner25/training_optimizer_groups.json
+/testdata/gliner25/training_record_loss.json
+/testdata/gliner25/training_records.json
+/testdata/gliner25/training_relations.json
+/testdata/gliner25/training_selection.json
+/testdata/gliner25/training_step/capture.json
+/testdata/gliner25/training_step/tensors.safetensors
+/testdata/gliner25/training_step_dropout/capture.json
+/testdata/gliner25/training_step_dropout/tensors.safetensors

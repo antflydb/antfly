@@ -117,10 +117,39 @@ test "gliner boundary Python parity rectangular assignment scipy tie profile" {
 }
 
 pub fn fixtureBytes(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    // Only the explicitly external inventory permits missing-fixture skips.
+    // Restored bytes retain their original identity; malformed or substituted
+    // fixtures fail rather than silently reducing numerical coverage.
+    const manifest_bytes = try readFixtureBytes(allocator, "reference_manifest.json", 128 * 1024);
+    defer allocator.free(manifest_bytes);
+    const Pin = struct { size_bytes: usize, sha256: []const u8 };
+    const manifest = try std.json.parseFromSlice(struct {
+        external_files: std.json.ArrayHashMap(Pin),
+    }, allocator, manifest_bytes, .{ .ignore_unknown_fields = true });
+    defer manifest.deinit();
+    const pin = manifest.value.external_files.map.get(name);
+    const bytes = readFixtureBytes(allocator, name, if (pin) |p| p.size_bytes else 16 * 1024 * 1024) catch |err| {
+        if (err == error.FileNotFound and pin != null) {
+            std.debug.print("GLiNER2.5 external fixture omitted: {s}; restore the pinned file to run this test\n", .{name});
+            return error.SkipZigTest;
+        }
+        return err;
+    };
+    errdefer allocator.free(bytes);
+    if (pin) |p| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if (bytes.len != p.size_bytes or !std.mem.eql(u8, p.sha256, &std.fmt.bytesToHex(digest, .lower)))
+            return error.InvalidExternalFixture;
+    }
+    return bytes;
+}
+
+fn readFixtureBytes(allocator: std.mem.Allocator, name: []const u8, max_bytes: usize) ![]u8 {
     for ([_][]const u8{ "", "pkg/inference/", "zig/pkg/inference/" }) |prefix| {
         const path = try std.fmt.allocPrint(allocator, "{s}testdata/gliner25/{s}", .{ prefix, name });
         defer allocator.free(path);
-        return c_file.readFile(allocator, path) catch |err| switch (err) {
+        return c_file.readFileMax(allocator, path, max_bytes) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };

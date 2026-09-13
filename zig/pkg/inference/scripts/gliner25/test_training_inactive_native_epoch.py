@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import fixture_support
 import capture_training_inactive_adapters as control
 import capture_training_inactive_native_epoch as epoch
 from test_training_inactive_adapters import tensor_header
@@ -117,6 +118,7 @@ class InactiveNativeEpochContract(unittest.TestCase):
                 self.assertEqual([destination], list(Path(temporary).iterdir()))
 
     def test_captured_fixture_pins_native_rows_and_source_generator_provenance(self):
+        fixture_support.require_fixtures('training_inactive_native_epoch/capture.json', 'training_inactive_native_epoch/tensors.safetensors')
         directory = epoch.oracle.FIXTURES / "training_inactive_native_epoch"
         expected = {
             "capture.json": {"size_bytes": 423554, "sha256": "24cefafa4dde1f7067b3ba81e7b9209495a58a0cb31620c5805b00bec9abdc24"},
@@ -144,6 +146,7 @@ class InactiveNativeEpochContract(unittest.TestCase):
             self.assertEqual(raw, (directory / name).read_bytes())
 
     def test_captured_epoch_changes_only_classifier_schedule_and_preserves_initial_state(self):
+        fixture_support.require_fixtures('training_inactive_native_epoch/capture.json', 'training_inactive_native_epoch/tensors.safetensors', 'training_inactive_adapters/capture.json', 'training_inactive_adapters/tensors.safetensors')
         directory = epoch.oracle.FIXTURES / "training_inactive_native_epoch"
         original = epoch.oracle.FIXTURES / "training_inactive_adapters"
         report = control.step_capture.expand_metadata(epoch.oracle.read_json(directory / "capture.json"))

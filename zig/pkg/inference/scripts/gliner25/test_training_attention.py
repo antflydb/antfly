@@ -7,6 +7,7 @@ import sys
 import unittest
 
 import capture_training_attention as capture
+import fixture_support
 
 
 class TrainingAttentionContractTest(unittest.TestCase):
@@ -36,6 +37,7 @@ class TrainingAttentionContractTest(unittest.TestCase):
                     capture.control(case, invalid)
 
     def test_counter_matches_prior_actual_transformers_probability_masks(self):
+        fixture_support.require_fixtures("training_encoder/tensors.safetensors")
         directory = capture.oracle.FIXTURES / "training_encoder"
         manifest = json.loads((directory / "capture.json").read_bytes())
         raw = (directory / "tensors.safetensors").read_bytes()
