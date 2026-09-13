@@ -1,4 +1,4 @@
-# Antfly HA: Hot Standby WAL Replication
+# Hot Standby WAL Replication
 
 This document describes the Postgres-style hot-standby HA mode built for the
 supported Zig implementation of Antfly. It does not replace every use of Raft.

@@ -235,7 +235,7 @@ file's own title and a one-line description taken from its first paragraph.
   control-plane contract for adding/removing data capacity and safe scale-down.
 - [GROUPS.md](GROUPS.md) — Group IDs: the shared `u64` Raft group ID space
   across metadata and data groups.
-- [HA.md](HA.md) — Antfly HA: Hot Standby WAL Replication: a Postgres-style
+- [HOT_STANDBY.md](HOT_STANDBY.md) — Hot Standby WAL Replication: a Postgres-style
   single-primary replication mode for read replicas, DR, and online upgrades.
 - [CDC.md](CDC.md) — CDC: the Postgres replication-source / CDC subsystem.
 - [SCHEMA.md](SCHEMA.md) — Schema: the current split in how schema is defined
